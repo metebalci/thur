@@ -308,3 +308,58 @@ pub fn opcode_name(op: u8) -> &'static str {
 pub fn drive_mfg_serial_fallback(lun: u8) -> String {
     format!("THUR-MFG-{:03}", lun)
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn put_be_u32_writes_big_endian() {
+        let mut buf = [0u8; 4];
+        put_be_u32(&mut buf, 0x0102_0304);
+        assert_eq!(buf, [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn pdu_expected_xfer_len_reads_edtl_from_the_bhs() {
+        let pdu = Pdu::synth(&[0x12], 0, 0x1234, &[]);
+        assert_eq!(pdu_expected_xfer_len(&pdu), 0x1234);
+    }
+
+    #[test]
+    fn limit_len_truncates_only_when_over_the_cap() {
+        assert_eq!(limit_len(vec![1, 2, 3, 4], 2), vec![1, 2]);
+        assert_eq!(limit_len(vec![1, 2, 3], 8), vec![1, 2, 3]);
+        assert_eq!(limit_len(vec![1, 2, 3], 3), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn opcode_name_labels_known_pdu_opcodes() {
+        assert_eq!(opcode_name(0x01), "SCSI Command");
+        assert_eq!(opcode_name(0x03), "Login Req");
+        assert_eq!(opcode_name(0x21), "SCSI Resp");
+        // The high two bits are masked off before lookup.
+        assert_eq!(opcode_name(0xC1), "SCSI Command");
+        assert_eq!(opcode_name(0x10), "Unknown");
+    }
+
+    #[test]
+    fn drive_mfg_serial_fallback_is_zero_padded() {
+        assert_eq!(drive_mfg_serial_fallback(7), "THUR-MFG-007");
+        assert_eq!(drive_mfg_serial_fallback(123), "THUR-MFG-123");
+    }
+
+    #[test]
+    fn scsi_resp_constructors_set_the_expected_status() {
+        assert_eq!(ScsiResp::good().status, ScsiStatus::Good);
+        assert!(ScsiResp::good().sense.is_none());
+
+        let cc = ScsiResp::check_condition();
+        assert_eq!(cc.status, ScsiStatus::CheckCondition);
+        assert!(cc.sense.is_none());
+
+        let with_sense = ScsiResp::check_condition_with_sense(vec![0x70, 0x00]);
+        assert_eq!(with_sense.status, ScsiStatus::CheckCondition);
+        assert_eq!(with_sense.sense.as_deref(), Some(&[0x70, 0x00][..]));
+    }
+}

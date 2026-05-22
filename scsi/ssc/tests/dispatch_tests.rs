@@ -207,9 +207,10 @@ fn standard_inquiry_returns_at_least_36_bytes() {
 #[test]
 fn inquiry_vpd_pages_are_served() {
     let fx = Fixture::new();
-    // 0x00 supported pages, 0x80 unit serial, 0x83 device id,
-    // 0xB0 sequential-access chars, 0xB1 mfg serial, 0xB2 tapealert.
-    for page in [0x00u8, 0x80, 0x83, 0xB0, 0xB1, 0xB2] {
+    // 0x00 supported pages, 0x80 unit serial, 0x83 device id, 0xB0
+    // sequential-access chars, 0xB1 mfg serial, 0xB2 tapealert, 0xB3
+    // automation device serial, 0xC0 firmware info.
+    for page in [0x00u8, 0x80, 0x83, 0xB0, 0xB1, 0xB2, 0xB3, 0xC0] {
         let mut c = cdb(0x12);
         c[1] = 0x01; // EVPD
         c[2] = page;
@@ -437,4 +438,281 @@ fn diagnostic_handlers_run() {
         recv.status,
         ScsiStatus::Good | ScsiStatus::CheckCondition
     ));
+}
+
+/// MAINTENANCE IN (0xA3): service action in CDB byte 1, allocation
+/// length in bytes 6..10.
+fn maintenance_in_cdb(service_action: u8) -> [u8; 16] {
+    let mut c = cdb(0xA3);
+    c[1] = service_action;
+    c[6..10].copy_from_slice(&4096u32.to_be_bytes());
+    c
+}
+
+#[test]
+fn maintenance_in_serves_every_supported_service_action() {
+    let fx = Fixture::new();
+    // 0x0C report supported opcodes, 0x1E read DRA, 0x1F host table,
+    // 0x0D task-mgmt functions, 0x0A target port groups, 0x0F timestamp.
+    for sa in [0x0Cu8, 0x1E, 0x1F, 0x0D, 0x0A, 0x0F] {
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, maintenance_in_cdb(sa));
+        let resp = handlers::handle_maintenance_in(&mut ctx).unwrap();
+        assert_eq!(resp.status, ScsiStatus::Good, "service action {sa:#04x}");
+        assert!(!resp.data_out.is_empty(), "SA {sa:#04x} returned no data");
+    }
+}
+
+#[test]
+fn maintenance_in_report_supported_opcodes_differs_on_a_changer_lun() {
+    let fx = Fixture::new();
+    // Drive LUN gets the tape opcode list.
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, maintenance_in_cdb(0x0C));
+    let drive = handlers::handle_maintenance_in(&mut ctx).unwrap();
+    // Changer LUN gets the changer opcode list.
+    let mut p = pdu();
+    let mut ctx = fx.ctx_at(&mut p, maintenance_in_cdb(0x0C), 0, 0, true);
+    let changer = handlers::handle_maintenance_in(&mut ctx).unwrap();
+    assert_eq!(drive.status, ScsiStatus::Good);
+    assert_eq!(changer.status, ScsiStatus::Good);
+    assert_ne!(drive.data_out, changer.data_out);
+}
+
+#[test]
+fn maintenance_in_rejects_an_unknown_service_action() {
+    let fx = Fixture::new();
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, maintenance_in_cdb(0x15));
+    let resp = handlers::handle_maintenance_in(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+}
+
+#[test]
+fn maintenance_out_accepts_set_timestamp_and_write_dra() {
+    let fx = Fixture::new();
+    for sa in [0x0Fu8, 0x1E] {
+        let mut c = cdb(0xA4);
+        c[1] = sa;
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, c);
+        assert_eq!(
+            handlers::handle_maintenance_out(&mut ctx).unwrap().status,
+            ScsiStatus::Good,
+            "service action {sa:#04x}",
+        );
+    }
+    // An unsupported service action is refused.
+    let mut c = cdb(0xA4);
+    c[1] = 0x07;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_maintenance_out(&mut ctx).unwrap().status,
+        ScsiStatus::CheckCondition,
+    );
+}
+
+#[test]
+fn persistent_reserve_in_answers_every_service_action() {
+    let fx = Fixture::new();
+    for sa in [0x00u8, 0x01, 0x02, 0x03] {
+        let mut c = cdb(0x5E);
+        c[1] = sa;
+        c[7..9].copy_from_slice(&256u16.to_be_bytes());
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, c);
+        let resp = handlers::handle_persistent_reserve_in(&mut ctx).unwrap();
+        assert_eq!(resp.status, ScsiStatus::Good, "SA {sa:#04x}");
+    }
+    // Unknown service action.
+    let mut c = cdb(0x5E);
+    c[1] = 0x1F;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_persistent_reserve_in(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+}
+
+#[test]
+fn persistent_reserve_out_is_always_refused() {
+    let fx = Fixture::new();
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x5F));
+    assert_eq!(
+        handlers::handle_persistent_reserve_out(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+}
+
+#[test]
+fn security_protocol_in_serves_the_tape_encryption_pages() {
+    let fx = Fixture::new();
+    // Protocol 0x00 = report supported security protocols.
+    let mut c = cdb(0xA2);
+    c[6..10].copy_from_slice(&512u32.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_security_protocol_in(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+    assert!(!resp.data_out.is_empty());
+
+    // Protocol 0x20 = Tape Data Encryption, each supported page.
+    for spsp in [0x0000u16, 0x0001, 0x0010, 0x0011, 0x0020, 0x0021] {
+        let mut c = cdb(0xA2);
+        c[1] = 0x20;
+        c[2..4].copy_from_slice(&spsp.to_be_bytes());
+        c[6..10].copy_from_slice(&512u32.to_be_bytes());
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, c);
+        let resp = handlers::handle_security_protocol_in(&mut ctx).unwrap();
+        assert_eq!(resp.status, ScsiStatus::Good, "SPSP {spsp:#06x}");
+    }
+
+    // Unknown SPSP under protocol 0x20 is refused.
+    let mut c = cdb(0xA2);
+    c[1] = 0x20;
+    c[2..4].copy_from_slice(&0x00FFu16.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_security_protocol_in(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+}
+
+#[test]
+fn security_protocol_out_clears_the_drive_encryption_key() {
+    let fx = Fixture::new();
+    // A 16-byte SET DATA ENCRYPTION page with both modes = Disable
+    // decodes to "Clear".
+    let mut page = vec![0u8; 16];
+    page[0..2].copy_from_slice(&0x0010u16.to_be_bytes()); // PAGE_SET_DATA_ENCRYPTION
+    page[2..4].copy_from_slice(&12u16.to_be_bytes()); // page length
+    // bytes 6 (encryption mode) and 7 (decryption mode) stay 0 = Disable.
+
+    let mut c = cdb(0xB5);
+    c[1] = 0x20; // SECURITY_PROTOCOL_TAPE_DATA_ENC
+    c[2..4].copy_from_slice(&0x0010u16.to_be_bytes()); // PAGE_SET_DATA_ENCRYPTION
+    let mut p = Pdu::synth(&c, 1, 0, &page);
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_security_protocol_out(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+}
+
+#[test]
+fn security_protocol_out_rejects_bad_input() {
+    let fx = Fixture::new();
+    // Unsupported security protocol.
+    let mut c = cdb(0xB5);
+    c[1] = 0x00;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_security_protocol_out(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+
+    // Right protocol, wrong SPSP.
+    let mut c = cdb(0xB5);
+    c[1] = 0x20;
+    c[2..4].copy_from_slice(&0x00FFu16.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_security_protocol_out(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+
+    // Right protocol + SPSP, but a garbage parameter list.
+    let mut c = cdb(0xB5);
+    c[1] = 0x20;
+    c[2..4].copy_from_slice(&0x0010u16.to_be_bytes());
+    let mut p = Pdu::synth(&c, 1, 0, &[0xFFu8; 4]);
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_security_protocol_out(&mut ctx)
+            .unwrap()
+            .status,
+        ScsiStatus::CheckCondition,
+    );
+}
+
+#[test]
+fn partition_fence_is_a_noop_for_an_unbound_session() {
+    let fx = Fixture::new();
+    let mut p = pdu();
+    let ctx = fx.ctx(&mut p, cdb(0x08));
+    // The fixture binds no session_partition — the fence must pass.
+    assert!(handlers::check_partition_fence(&ctx).unwrap().is_none());
+}
+
+#[test]
+fn inquiry_unsupported_vpd_page_is_rejected() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x12);
+    c[1] = 0x01; // EVPD
+    c[2] = 0xEE; // not a page the drive dispatcher serves
+    c[3..5].copy_from_slice(&256u16.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = inquiry::handle_inquiry(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+}
+
+#[test]
+fn read_position_serves_short_long_and_extended_forms() {
+    let fx = Fixture::new();
+    // Service action in CDB byte 1: 0x00/0x01 short, 0x06 long,
+    // 0x08 extended — each returns Good with a form-sized buffer.
+    for (svc, len) in [(0x00u8, 20usize), (0x01, 20), (0x06, 32), (0x08, 32)] {
+        let mut c = cdb(0x34);
+        c[1] = svc;
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, c);
+        let resp = handlers::handle_read_position(&mut ctx).unwrap();
+        assert_eq!(resp.status, ScsiStatus::Good, "service action {svc:#04x}");
+        assert_eq!(resp.data_out.len(), len, "service action {svc:#04x}");
+    }
+    // An unsupported service action is INVALID FIELD IN CDB.
+    let mut c = cdb(0x34);
+    c[1] = 0x0A;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_read_position(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+}
+
+#[test]
+fn load_unload_loads_and_then_ejects_the_cartridge() {
+    let fx = Fixture::new();
+    // LOAD (cdb[4] bit 0 = 1): rewind and stay loaded.
+    let mut c = cdb(0x1B);
+    c[4] = 0x01;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_load_unload(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // UNLOAD (cdb[4] bit 0 = 0): eject — drops the cartridge.
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x1B));
+    assert_eq!(
+        handlers::handle_load_unload(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
 }
