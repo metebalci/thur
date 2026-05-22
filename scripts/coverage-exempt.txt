@@ -50,3 +50,8 @@
 #     exercised by the end-to-end suites) ---
 ./shared/admin-http/src/lib.rs
 ./vtl/daemon/src/http/mod.rs
+
+# --- covered by a crate integration-test suite (tests/), not an
+#     inline #[cfg(test)] block ---
+./scsi/smc/src/dispatch/handlers.rs
+./scsi/smc/src/dispatch/mod.rs
