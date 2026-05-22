@@ -1124,4 +1124,281 @@ mod tests {
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
     }
+
+    /// Generic NVM I/O SQE: opcode at byte 0, CID at 2, NSID = 1 at
+    /// byte 4, SLBA split across CDW10/11, NLB (zero-based) in CDW12.
+    fn sqe_io(opcode: NvmOpcode, slba: u64, nlb_zero_based: u16) -> nvme_base::Sqe {
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = opcode as u8;
+        b[2] = 0x05;
+        b[4] = 0x01;
+        b[40..44].copy_from_slice(&((slba & 0xFFFF_FFFF) as u32).to_le_bytes());
+        b[44..48].copy_from_slice(&((slba >> 32) as u32).to_le_bytes());
+        b[48..52].copy_from_slice(&u32::from(nlb_zero_based).to_le_bytes());
+        nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    /// Admin SQE: opcode at byte 0, NSID at 4, CDW10 at bytes 40..44.
+    fn sqe_admin(opcode: u8, nsid: u32, cdw10: u32) -> nvme_base::Sqe {
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = opcode;
+        b[2] = 0x07;
+        b[4..8].copy_from_slice(&nsid.to_le_bytes());
+        b[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn flush_over_namespace_succeeds() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Flush, 0, 0),
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn compare_matches_written_data() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let payload = vec![0xABu8; 4096];
+        disp.handle_io(IoCommand {
+            sqe: sqe_io(NvmOpcode::Write, 0, 0),
+            data_out: Some(&payload),
+            data_in_max: 0,
+        })
+        .await;
+
+        let same = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Compare, 0, 0),
+                data_out: Some(&payload),
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(same.cqe.status, StatusField::SUCCESS);
+
+        let differs = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Compare, 0, 0),
+                data_out: Some(&vec![0x00u8; 4096]),
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(differs.cqe.status, StatusField::compare_failure());
+    }
+
+    #[tokio::test]
+    async fn compare_wrong_length_is_invalid_field() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Compare, 0, 0),
+                data_out: Some(&[1, 2, 3]),
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_field());
+    }
+
+    #[tokio::test]
+    async fn write_zeroes_then_read_back_all_zero() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        // Dirty the sector first so the zero-fill is observable.
+        disp.handle_io(IoCommand {
+            sqe: sqe_io(NvmOpcode::Write, 0, 0),
+            data_out: Some(&vec![0xFFu8; 4096]),
+            data_in_max: 0,
+        })
+        .await;
+
+        let wz = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::WriteZeroes, 0, 0),
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(wz.cqe.status, StatusField::SUCCESS);
+
+        let rd = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Read, 0, 0),
+                data_out: None,
+                data_in_max: 4096,
+            })
+            .await;
+        assert_eq!(rd.cqe.status, StatusField::SUCCESS);
+        assert!(rd.data_in.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn dsm_deallocate_one_range_succeeds() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::DatasetManagement as u8;
+        b[4] = 0x01; // NSID = 1
+        // CDW10 NR = 0 (one range, zero-based); CDW11 bit 2 = AD.
+        b[44] = 0x04;
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        // One 16-byte range descriptor: ctx(4) | nlb(4) | slba(8).
+        let mut range = vec![0u8; 16];
+        range[4..8].copy_from_slice(&1u32.to_le_bytes()); // nlb = 1 block
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: Some(&range),
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn dsm_without_ad_bit_is_a_noop_success() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::DatasetManagement as u8;
+        b[4] = 0x01;
+        // No AD bit → integral-dataset hint path, no payload required.
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn verify_in_range_succeeds() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Verify, 0, 0),
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn io_unknown_opcode_is_invalid_opcode() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = 0x7E; // not an NVM Command Set opcode
+        b[4] = 0x01;
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
+    }
+
+    #[tokio::test]
+    async fn identify_namespace_returns_4096_bytes() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x06, 1, 0x00), // CNS = 0x00 Namespace
+                data_out: None,
+                data_in_max: 4096,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        assert_eq!(resp.data_in.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn identify_active_namespace_list_and_descriptors() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        for cns in [0x02u32, 0x03, 0x06] {
+            let resp = disp
+                .handle_admin(AdminCommand {
+                    sqe: sqe_admin(0x06, 1, cns),
+                    data_out: None,
+                    data_in_max: 4096,
+                })
+                .await;
+            assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
+            assert!(!resp.data_in.is_empty(), "CNS {cns:#x} returned no data");
+        }
+    }
+
+    #[tokio::test]
+    async fn identify_unsupported_cns_is_invalid_field() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x06, 1, 0x55), // CNS 0x55 is unsupported
+                data_out: None,
+                data_in_max: 4096,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_field());
+    }
+
+    #[tokio::test]
+    async fn admin_keep_alive_succeeds() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x18, 0, 0), // KeepAlive
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn admin_abort_reports_command_not_aborted() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x08, 0, 0), // Abort
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        // DW0 bit 0 = 1 means "command was not aborted".
+        assert_eq!(resp.cqe.dw0 & 1, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_async_event_request_is_rejected() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x0C, 0, 0), // AsyncEventRequest
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
+    }
+
+    #[tokio::test]
+    async fn admin_unknown_opcode_is_invalid_opcode() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x03, 0, 0), // unassigned admin opcode
+                data_out: None,
+                data_in_max: 0,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
+    }
 }
