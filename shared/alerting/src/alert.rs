@@ -108,3 +108,65 @@ impl Alert {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alert_class_labels_are_stable() {
+        assert_eq!(
+            AlertClass::BackendReachability.as_str(),
+            "backend_reachability",
+        );
+        assert_eq!(AlertClass::AuditFailure.as_str(), "audit_failure");
+        assert_eq!(
+            AlertClass::DiskCacheBackpressure.as_str(),
+            "disk_cache_backpressure",
+        );
+        assert_eq!(AlertClass::ChapFailures.as_str(), "chap_failures");
+        // ALL must enumerate every variant exactly once.
+        assert_eq!(AlertClass::ALL.len(), 4);
+    }
+
+    #[test]
+    fn alert_class_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AlertClass::ChapFailures).expect("serialize"),
+            "\"chap_failures\"",
+        );
+        let back: AlertClass = serde_json::from_str("\"audit_failure\"").expect("deserialize");
+        assert_eq!(back, AlertClass::AuditFailure);
+    }
+
+    #[test]
+    fn severity_labels_match_the_wire_strings() {
+        assert_eq!(Severity::Info.as_str(), "info");
+        assert_eq!(Severity::Warn.as_str(), "warn");
+        assert_eq!(Severity::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn alert_new_then_to_json_carries_every_field() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("backend".to_string(), serde_json::json!("primary"));
+        let alert = Alert::new(
+            AlertClass::BackendReachability,
+            Severity::Error,
+            "backend unreachable",
+            fields,
+            "backend:primary:failure",
+        );
+        // dedup_key is the rate-limiter key, kept off the wire.
+        assert_eq!(alert.dedup_key, "backend:primary:failure");
+
+        let json = alert.to_json("thurvtl", "1.2.3");
+        assert_eq!(json["product"], "thurvtl");
+        assert_eq!(json["version"], "1.2.3");
+        assert_eq!(json["class"], "backend_reachability");
+        assert_eq!(json["severity"], "error");
+        assert_eq!(json["message"], "backend unreachable");
+        assert_eq!(json["fields"]["backend"], "primary");
+        assert!(json["timestamp"].is_string());
+    }
+}

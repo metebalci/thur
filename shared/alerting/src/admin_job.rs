@@ -115,3 +115,33 @@ pub async fn run_test(emitter: JobEmitter, body: serde_json::Value) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_params_default_severity_is_warn() {
+        let p: TestParams =
+            serde_json::from_value(serde_json::json!({"sink": "email"})).expect("parse");
+        assert_eq!(p.sink, "email");
+        assert_eq!(p.severity, "warn");
+        assert_eq!(default_severity(), "warn");
+    }
+
+    #[test]
+    fn test_params_accepts_an_explicit_severity() {
+        let p: TestParams =
+            serde_json::from_value(serde_json::json!({"sink": "webhook", "severity": "error"}))
+                .expect("parse");
+        assert_eq!(p.sink, "webhook");
+        assert_eq!(p.severity, "error");
+    }
+
+    #[test]
+    fn test_params_requires_a_sink() {
+        let r: std::result::Result<TestParams, _> =
+            serde_json::from_value(serde_json::json!({"severity": "info"}));
+        assert!(r.is_err());
+    }
+}
