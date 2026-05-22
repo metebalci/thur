@@ -579,3 +579,146 @@ fn print_bench_line(
     }
     println!("{}", line);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn bench_options_defaults_match_the_cli_flag_defaults() {
+        let o = BenchOptions::defaults();
+        assert_eq!(o.total_gb, 32);
+        assert_eq!(o.chunk_size_mb, 8);
+        assert_eq!(o.concurrency, 16);
+        assert!(o.chunk_size_mb_sweep.is_empty());
+        assert!(o.concurrency_sweep.is_empty());
+        assert!(!o.skip_download);
+        assert!(!o.yes);
+    }
+
+    #[test]
+    fn fill_random_is_deterministic_for_a_given_seed() {
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        let mut sa = 0x9E37_79B9_7F4A_7C15u64;
+        let mut sb = sa;
+        fill_random(&mut a, &mut sa);
+        fill_random(&mut b, &mut sb);
+        assert_eq!(a, b, "same seed must yield the same bytes");
+        assert_ne!(a, [0u8; 64], "xorshift must not leave the buffer zeroed");
+    }
+
+    #[test]
+    fn fill_random_handles_a_non_multiple_of_eight_buffer() {
+        let mut buf = [0u8; 13];
+        let mut state = 1u64;
+        fill_random(&mut buf, &mut state);
+        // The 5-byte tail is filled without panicking on the short chunk.
+        assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn load_cloud_config_rejects_a_missing_file() {
+        let err = load_cloud_config(Path::new("/nonexistent/thur-bench-test.yaml"));
+        assert!(matches!(err, Err(BenchError::LoadConfig { .. })));
+    }
+
+    #[test]
+    fn load_cloud_config_rejects_invalid_yaml() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("bad.yaml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(b"cloud: [this is not a map").expect("write");
+        assert!(matches!(
+            load_cloud_config(&path),
+            Err(BenchError::LoadConfig { .. }),
+        ));
+    }
+
+    #[test]
+    fn load_cloud_config_parses_a_minimal_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("ok.yaml");
+        std::fs::write(&path, "{}").expect("write");
+        let cfg = load_cloud_config(&path).expect("parse");
+        assert!(cfg.backend_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_options_before_touching_a_backend() {
+        // total_gb == 0
+        let mut o = BenchOptions::defaults();
+        o.total_gb = 0;
+        assert!(matches!(
+            run(Vec::new(), o).await,
+            Err(BenchError::InvalidArg(_)),
+        ));
+
+        // chunk size larger than the total transfer
+        let mut o = BenchOptions::defaults();
+        o.total_gb = 1;
+        o.chunk_size_mb = 5000;
+        assert!(matches!(
+            run(Vec::new(), o).await,
+            Err(BenchError::InvalidArg(_)),
+        ));
+
+        // zero chunk size
+        let mut o = BenchOptions::defaults();
+        o.chunk_size_mb = 0;
+        assert!(matches!(
+            run(Vec::new(), o).await,
+            Err(BenchError::InvalidArg(_)),
+        ));
+
+        // zero concurrency
+        let mut o = BenchOptions::defaults();
+        o.concurrency = 0;
+        assert!(matches!(
+            run(Vec::new(), o).await,
+            Err(BenchError::InvalidArg(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_empty_target_list() {
+        // Valid options, but no backends supplied.
+        let err = run(Vec::new(), BenchOptions::defaults()).await;
+        assert!(matches!(err, Err(BenchError::NoTargets)));
+    }
+
+    #[tokio::test]
+    async fn run_from_config_path_rejects_a_missing_config() {
+        let err = run_from_config_path(
+            Path::new("/nonexistent/thur-bench.yaml"),
+            Vec::new(),
+            BenchOptions::defaults(),
+        )
+        .await;
+        assert!(matches!(err, Err(BenchError::LoadConfig { .. })));
+    }
+
+    #[tokio::test]
+    async fn run_from_config_path_rejects_a_config_with_no_backends() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("empty.yaml");
+        std::fs::write(&path, "{}").expect("write");
+        let err = run_from_config_path(&path, Vec::new(), BenchOptions::defaults()).await;
+        assert!(matches!(err, Err(BenchError::InvalidArg(_))));
+    }
+
+    #[test]
+    fn bench_error_display_messages_are_readable() {
+        assert_eq!(BenchError::NoTargets.to_string(), "no targets supplied",);
+        assert_eq!(
+            BenchError::Aborted.to_string(),
+            "operator aborted at sweep prompt",
+        );
+        assert!(
+            BenchError::InvalidArg("bad".to_string())
+                .to_string()
+                .contains("bad"),
+        );
+    }
+}
