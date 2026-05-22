@@ -55,3 +55,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tempfile = "3"
 # Property-based tests over FastCDC find_cut / StreamingChunker::feed.
 proptest = "1"
+# In-memory CloudBackend mock for the legal-hold unit tests.
+async-trait = "0.1"

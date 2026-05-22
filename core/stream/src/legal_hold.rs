@@ -301,3 +301,248 @@ pub async fn read_legal_hold_for_keys(
         .map(|(_, k, r)| (k, r))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_cloud::{CloudBackend, CloudError, LockState};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// In-memory `CloudBackend` mock. `LocalBackend` returns
+    /// `NotSupported` for the legal-hold ops, so the legal-hold module
+    /// can only be exercised against a backend that implements them —
+    /// this mock keeps the hold flags in a `HashMap` and replays a
+    /// configured key list from `list_objects`. Every other trait
+    /// method is an inert stub.
+    #[derive(Debug, Clone)]
+    struct HoldMock {
+        holds: Arc<Mutex<HashMap<String, bool>>>,
+        listing: Arc<Vec<String>>,
+        fail: bool,
+    }
+
+    impl HoldMock {
+        fn new(listing: Vec<String>) -> Self {
+            Self {
+                holds: Arc::new(Mutex::new(HashMap::new())),
+                listing: Arc::new(listing),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                holds: Arc::new(Mutex::new(HashMap::new())),
+                listing: Arc::new(Vec::new()),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CloudBackend for HoldMock {
+        async fn upload_chunk(
+            &self,
+            _key: &str,
+            data: &[u8],
+        ) -> shared_cloud::Result<(u64, Option<u64>, Option<shared_cloud::CompressionAlgo>)>
+        {
+            Ok((data.len() as u64, None, None))
+        }
+        async fn upload_chunk_zerocopy(
+            &self,
+            _key: &str,
+            _path: &Path,
+        ) -> shared_cloud::Result<u64> {
+            Ok(0)
+        }
+        async fn download_chunk(&self, _key: &str) -> shared_cloud::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn download_chunks_parallel(
+            &self,
+            _keys: &[String],
+        ) -> shared_cloud::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        async fn upload_manifest(&self, _key: &str, _json: &str) -> shared_cloud::Result<()> {
+            Ok(())
+        }
+        async fn download_manifest(&self, _key: &str) -> shared_cloud::Result<String> {
+            Ok(String::new())
+        }
+        async fn chunk_exists(&self, _key: &str) -> shared_cloud::Result<bool> {
+            Ok(false)
+        }
+        async fn list_objects(&self, prefix: &str) -> shared_cloud::Result<Vec<String>> {
+            Ok(self
+                .listing
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+        async fn delete_object(&self, _key: &str) -> shared_cloud::Result<()> {
+            Ok(())
+        }
+        fn backend_type(&self) -> &'static str {
+            "mock"
+        }
+        async fn lock_state(&self) -> shared_cloud::Result<LockState> {
+            Ok(LockState::Off)
+        }
+        async fn set_object_legal_hold(&self, key: &str, held: bool) -> shared_cloud::Result<()> {
+            if self.fail {
+                return Err(CloudError::NotSupported("mock failure".to_string()));
+            }
+            self.holds
+                .lock()
+                .expect("mock lock")
+                .insert(key.to_string(), held);
+            Ok(())
+        }
+        async fn get_object_legal_hold(&self, key: &str) -> shared_cloud::Result<bool> {
+            if self.fail {
+                return Err(CloudError::NotSupported("mock failure".to_string()));
+            }
+            Ok(self
+                .holds
+                .lock()
+                .expect("mock lock")
+                .get(key)
+                .copied()
+                .unwrap_or(false))
+        }
+        fn clone_box(&self) -> Box<dyn CloudBackend> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn backend(mock: HoldMock) -> Arc<dyn CloudBackend> {
+        Arc::new(mock)
+    }
+
+    #[test]
+    fn sentinel_key_is_the_manifest_latest_object() {
+        assert_eq!(
+            manifest_latest_sentinel_key("TAPE01"),
+            "manifests/TAPE01/manifest-latest.json",
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_cartridge_keys_splits_sentinel_from_the_body() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cart_dir = tmp.path().join("TAPE01");
+        std::fs::create_dir_all(&cart_dir).expect("cart dir");
+        let hash = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        std::fs::write(
+            cart_dir.join("manifest.json"),
+            format!(r#"{{"label":"TAPE01","chunks":[{{"hash":"{hash}"}}]}}"#),
+        )
+        .expect("write manifest");
+
+        let sentinel = manifest_latest_sentinel_key("TAPE01");
+        let versioned = "manifests/TAPE01/manifest-20260101T000000Z.json".to_string();
+        let mock = HoldMock::new(vec![sentinel.clone(), versioned.clone()]);
+
+        let keys = collect_cartridge_keys(tmp.path(), "TAPE01".to_string(), backend(mock))
+            .await
+            .expect("collect");
+        assert_eq!(keys.sentinel.as_deref(), Some(sentinel.as_str()));
+        // The chunk key + the versioned manifest backup, sentinel excluded.
+        assert!(keys.others.iter().any(|k| k.contains(hash)));
+        assert!(keys.others.contains(&versioned));
+        assert!(!keys.others.contains(&sentinel));
+    }
+
+    #[tokio::test]
+    async fn collect_cartridge_keys_rejects_a_label_mismatch() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cart_dir = tmp.path().join("TAPE01");
+        std::fs::create_dir_all(&cart_dir).expect("cart dir");
+        std::fs::write(
+            cart_dir.join("manifest.json"),
+            r#"{"label":"WRONG","chunks":[]}"#,
+        )
+        .expect("write manifest");
+        let mock = HoldMock::new(Vec::new());
+        let err = collect_cartridge_keys(tmp.path(), "TAPE01".to_string(), backend(mock)).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_legal_hold_to_keys_tallies_successes_and_failures() {
+        let keys = vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()];
+
+        let ok =
+            apply_legal_hold_to_keys(backend(HoldMock::new(Vec::new())), keys.clone(), true, 4)
+                .await;
+        assert_eq!(ok.total, 2);
+        assert_eq!(ok.successes, 2);
+        assert!(ok.failures.is_empty());
+
+        let bad = apply_legal_hold_to_keys(backend(HoldMock::failing()), keys, true, 4).await;
+        assert_eq!(bad.total, 2);
+        assert_eq!(bad.successes, 0);
+        assert_eq!(bad.failures.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_cartridge_legal_hold_set_then_clear_round_trips() {
+        let mock = HoldMock::new(Vec::new());
+        let b = backend(mock.clone());
+        let keys = CartridgeKeys {
+            others: vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()],
+            sentinel: Some(manifest_latest_sentinel_key("TAPE01")),
+        };
+
+        // Set: body first, sentinel last — every key ends up held.
+        let set = apply_cartridge_legal_hold(Arc::clone(&b), &keys, true, 4).await;
+        assert_eq!(set.total, 3);
+        assert_eq!(set.successes, 3);
+        assert!(set.failures.is_empty());
+        assert!(
+            read_cartridge_held(Arc::clone(&b), "TAPE01".to_string())
+                .await
+                .expect("status")
+        );
+
+        // Clear: sentinel first, then body.
+        let clear = apply_cartridge_legal_hold(Arc::clone(&b), &keys, false, 4).await;
+        assert_eq!(clear.total, 3);
+        assert_eq!(clear.successes, 3);
+        assert!(
+            !read_cartridge_held(b, "TAPE01".to_string())
+                .await
+                .expect("status")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_cartridge_legal_hold_set_skips_sentinel_when_body_fails() {
+        let keys = CartridgeKeys {
+            others: vec!["chunks/a.dat".to_string()],
+            sentinel: Some(manifest_latest_sentinel_key("TAPE01")),
+        };
+        let report = apply_cartridge_legal_hold(backend(HoldMock::failing()), &keys, true, 4).await;
+        // Body key fails, and the sentinel is reported as skipped.
+        assert_eq!(report.total, 2);
+        assert_eq!(report.successes, 0);
+        assert_eq!(report.failures.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_legal_hold_for_keys_reports_per_key_state() {
+        let b = backend(HoldMock::new(Vec::new()));
+        let keys = vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()];
+        apply_legal_hold_to_keys(Arc::clone(&b), keys.clone(), true, 4).await;
+        let states = read_legal_hold_for_keys(b, keys, 4).await;
+        assert_eq!(states.len(), 2);
+        for (_, r) in states {
+            assert!(r.expect("state read"));
+        }
+    }
+}

@@ -74,3 +74,47 @@ impl LibraryDriveState {
         self.drives.values().all(|d| d.is_empty())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_drive_state_is_empty() {
+        assert!(DriveState::new().is_empty());
+    }
+
+    #[test]
+    fn a_saved_mode_page_makes_the_drive_state_non_empty() {
+        let mut ds = DriveState::new();
+        ds.mode_pages.set(0x0F, 0x00, vec![1]);
+        assert!(!ds.is_empty());
+    }
+
+    #[test]
+    fn library_state_is_empty_until_a_drive_saves_a_page() {
+        let mut lib = LibraryDriveState::new();
+        assert!(lib.is_empty());
+        // A drive entry whose state is still default keeps it "empty".
+        lib.drives.insert(0, DriveState::new());
+        assert!(lib.is_empty());
+        // Saving a page on that drive flips it.
+        lib.drives
+            .get_mut(&0)
+            .expect("drive 0")
+            .mode_pages
+            .set(0x10, 0x01, vec![0xAB]);
+        assert!(!lib.is_empty());
+    }
+
+    #[test]
+    fn library_state_survives_a_serde_round_trip() {
+        let mut lib = LibraryDriveState::new();
+        let mut ds = DriveState::new();
+        ds.mode_pages.set(0x0A, 0xF0, vec![7, 7]);
+        lib.drives.insert(2, ds);
+        let json = serde_json::to_string(&lib).expect("serialize");
+        let back: LibraryDriveState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, lib);
+    }
+}

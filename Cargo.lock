@@ -1140,7 +1140,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-block"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1181,7 +1181,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-mediachanger"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1213,8 +1213,9 @@ dependencies = [
 
 [[package]]
 name = "core-stream"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",
@@ -2974,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-base"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "proptest",
  "shared-naming",
@@ -2984,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-nvm"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "async-trait",
  "core-block",
@@ -2999,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-tcp"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4098,7 +4099,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scsi-sbc"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4119,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "scsi-smc"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4139,7 +4140,7 @@ dependencies = [
 
 [[package]]
 name = "scsi-spc"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "blake3",
  "tracing",
@@ -4147,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "scsi-ssc"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4385,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-audit"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "chrono",
  "serde",
@@ -4397,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-client"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4413,7 +4414,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-http"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -4438,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-iscsi"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "axum",
  "chrono",
@@ -4451,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-proto"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4459,7 +4460,7 @@ dependencies = [
 
 [[package]]
 name = "shared-admin-server"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4479,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "shared-alerting"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4504,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "shared-audit"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "blake3",
  "chrono",
@@ -4522,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4533,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cli-alerting"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "serde",
@@ -4545,7 +4546,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cli-iscsi"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4558,7 +4559,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cli-system"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "rpassword",
@@ -4573,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cloud"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4611,7 +4612,7 @@ dependencies = [
 
 [[package]]
 name = "shared-cloud-bench"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "bytes",
  "futures",
@@ -4624,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "shared-crypto"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -4633,11 +4634,11 @@ dependencies = [
 
 [[package]]
 name = "shared-dedup-stats"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 
 [[package]]
 name = "shared-health"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "axum",
  "serde_json",
@@ -4647,7 +4648,7 @@ dependencies = [
 
 [[package]]
 name = "shared-iscsi"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4669,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "shared-keystore"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "aes-gcm",
  "aes-kw",
@@ -4707,11 +4708,11 @@ dependencies = [
 
 [[package]]
 name = "shared-naming"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 
 [[package]]
 name = "shared-pool"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "blake3",
  "fs2",
@@ -4728,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "shared-telemetry"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "axum",
  "opentelemetry",
@@ -4744,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "shared-upload-worker"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4759,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "shared-verify-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "futures",
  "shared-cloud",
@@ -5476,7 +5477,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsa-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -5507,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "vsa-daemon"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5559,7 +5560,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vtl-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -5593,7 +5594,7 @@ dependencies = [
 
 [[package]]
 name = "vtl-daemon"
-version = "0.1.0-alpha.3"
+version = "0.1.0-dev.4"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -774,4 +774,45 @@ mod tests {
 
     // PoolBudget unit tests now live in shared/pool/src/budget.rs
     // alongside the lifted impl.
+
+    #[test]
+    fn set_capacity_overwrites_the_cap() {
+        let mut cache = DiskCacheManager::new(PathBuf::from("/tmp"), "primary", 1000);
+        cache.set_capacity(5_000);
+        assert_eq!(cache.capacity(), 5_000);
+        // set_recent_seal_pin_seconds is pure local-state mutation.
+        cache.set_recent_seal_pin_seconds(120);
+    }
+
+    #[test]
+    fn calculate_usage_is_zero_for_an_empty_data_dir() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut cache = DiskCacheManager::new(tmp.path().to_path_buf(), "primary", 1 << 20);
+        assert_eq!(cache.calculate_usage().expect("usage"), 0);
+        assert_eq!(cache.current_usage(), 0);
+    }
+
+    #[test]
+    fn calculate_usage_counts_a_cartridges_staging_chunks() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cart = tmp.path().join("tapes").join("TAPE01");
+        std::fs::create_dir_all(cart.join(".staging")).expect("dirs");
+        // manifest.json routes the cartridge to the "primary" backend.
+        std::fs::write(
+            cart.join("manifest.json"),
+            r#"{"label":"TAPE01","chunks":[],"backend":"primary","dedup":"global"}"#,
+        )
+        .expect("manifest");
+        // An unsealed staging chunk takes real disk space.
+        std::fs::write(cart.join(".staging").join("chunk-0001"), vec![0u8; 4096])
+            .expect("staging chunk");
+
+        let mut cache = DiskCacheManager::new(tmp.path().to_path_buf(), "primary", 1 << 20);
+        assert_eq!(cache.calculate_usage().expect("usage"), 4096);
+        assert_eq!(cache.current_usage(), 4096);
+
+        // A cartridge bound to a different backend is not counted.
+        let mut other = DiskCacheManager::new(tmp.path().to_path_buf(), "archive", 1 << 20);
+        assert_eq!(other.calculate_usage().expect("usage"), 0);
+    }
 }

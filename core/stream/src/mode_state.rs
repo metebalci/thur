@@ -81,3 +81,48 @@ impl DrivePageStore {
         self.pages.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_store_is_empty() {
+        let store = DrivePageStore::new();
+        assert!(store.is_empty());
+        assert!(!store.has_any_saved());
+        assert_eq!(store.get(0x0F, 0x00), None);
+    }
+
+    #[test]
+    fn set_then_get_round_trips_a_page_body() {
+        let mut store = DrivePageStore::new();
+        store.set(0x0F, 0x00, vec![1, 2, 3]);
+        assert_eq!(store.get(0x0F, 0x00), Some(&[1, 2, 3][..]));
+        assert!(store.has_any_saved());
+        assert!(!store.is_empty());
+        // A different (code, subcode) pair is still absent.
+        assert_eq!(store.get(0x0F, 0x01), None);
+    }
+
+    #[test]
+    fn set_replaces_an_existing_entry_in_place() {
+        let mut store = DrivePageStore::new();
+        store.set(0x10, 0x01, vec![0xAA]);
+        store.set(0x10, 0x01, vec![0xBB, 0xCC]);
+        assert_eq!(store.get(0x10, 0x01), Some(&[0xBB, 0xCC][..]));
+        // Replacement did not add a second entry.
+        store.set(0x11, 0x00, vec![0]);
+        assert_eq!(store.get(0x10, 0x01), Some(&[0xBB, 0xCC][..]));
+    }
+
+    #[test]
+    fn store_survives_a_serde_round_trip() {
+        let mut store = DrivePageStore::new();
+        store.set(0x0A, 0xF0, vec![9, 9]);
+        let json = serde_json::to_string(&store).expect("serialize");
+        let back: DrivePageStore = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, store);
+        assert_eq!(back.get(0x0A, 0xF0), Some(&[9, 9][..]));
+    }
+}
