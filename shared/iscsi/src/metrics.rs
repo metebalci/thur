@@ -44,3 +44,61 @@ pub mod record {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// Counting sink — captures the last value passed to
+    /// `sessions_active` so the test can assert the forwarding path.
+    struct CountingSink {
+        last: Arc<AtomicI64>,
+    }
+
+    use std::sync::Arc;
+
+    impl MetricsSink for CountingSink {
+        fn sessions_active(&self, n: i64) {
+            self.last.store(n, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn record_no_sink_is_noop() {
+        // With no sink installed (this runs before install_sink in
+        // the single-binary test process if scheduled first, but the
+        // call must never panic regardless of install order).
+        record::sessions_active(7);
+    }
+
+    #[test]
+    fn install_sink_then_record_forwards_and_first_call_wins() {
+        let last = Arc::new(AtomicI64::new(-1));
+        let installed = install_sink(Box::new(CountingSink {
+            last: Arc::clone(&last),
+        }));
+        // `install_sink` returns true only when this call won the
+        // OnceLock race. Either way the sink is now installed.
+        let _ = installed;
+
+        record::sessions_active(42);
+        assert_eq!(last.load(Ordering::SeqCst), 42);
+
+        record::sessions_active(0);
+        assert_eq!(last.load(Ordering::SeqCst), 0);
+
+        // A second install must not replace the live sink (first call
+        // wins) — returns false.
+        let other = Arc::new(AtomicI64::new(-99));
+        let second = install_sink(Box::new(CountingSink {
+            last: Arc::clone(&other),
+        }));
+        assert!(!second, "second install_sink must not win the OnceLock");
+
+        // The original sink is still the one that receives values.
+        record::sessions_active(5);
+        assert_eq!(last.load(Ordering::SeqCst), 5);
+        assert_eq!(other.load(Ordering::SeqCst), -99);
+    }
+}

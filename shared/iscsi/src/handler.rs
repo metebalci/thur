@@ -54,3 +54,120 @@ pub trait ScsiHandler: Send + Sync + 'static {
     /// transport).
     async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// Minimal handler exercising the trait surface: the IQN getter,
+    /// the default `on_session_close` no-op (overridden here so we can
+    /// observe it), and a trivial `dispatch`.
+    struct StubHandler {
+        iqn: String,
+        last_closed_tsih: AtomicU16,
+    }
+
+    #[async_trait]
+    impl ScsiHandler for StubHandler {
+        fn target_iqn(&self) -> &str {
+            &self.iqn
+        }
+
+        fn on_session_close(&self, tsih: u16, _cid: u16) {
+            self.last_closed_tsih.store(tsih, Ordering::SeqCst);
+        }
+
+        async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
+            // Echo the LUN back through the status so the test can
+            // confirm the request threaded through unchanged.
+            let mut resp = ScsiResponse::good(Vec::new());
+            resp.data_in = vec![req.lun as u8];
+            resp
+        }
+    }
+
+    /// A handler that does not override `on_session_close` — exercises
+    /// the trait's default no-op body.
+    struct DefaultHookHandler;
+
+    #[async_trait]
+    impl ScsiHandler for DefaultHookHandler {
+        fn target_iqn(&self) -> &str {
+            "iqn.2025-10.com.metebalci:thurvsa"
+        }
+        async fn dispatch(&self, _req: ScsiRequest<'_>) -> ScsiResponse {
+            ScsiResponse::good(Vec::new())
+        }
+    }
+
+    #[test]
+    fn target_iqn_is_returned_verbatim() {
+        let h = StubHandler {
+            iqn: "iqn.2025-10.com.metebalci:thurvtl".into(),
+            last_closed_tsih: AtomicU16::new(0),
+        };
+        assert_eq!(h.target_iqn(), "iqn.2025-10.com.metebalci:thurvtl");
+    }
+
+    #[test]
+    fn on_session_close_override_observes_tsih() {
+        let h = StubHandler {
+            iqn: "x".into(),
+            last_closed_tsih: AtomicU16::new(0),
+        };
+        h.on_session_close(99, 1);
+        assert_eq!(h.last_closed_tsih.load(Ordering::SeqCst), 99);
+    }
+
+    #[test]
+    fn default_on_session_close_is_a_noop() {
+        // The default trait body must not panic and must not require
+        // an override.
+        DefaultHookHandler.on_session_close(7, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_threads_the_request_through() {
+        let h = StubHandler {
+            iqn: "x".into(),
+            last_closed_tsih: AtomicU16::new(0),
+        };
+        let cdb = [0u8; 16];
+        let req = ScsiRequest {
+            tsih: 1,
+            cid: 0,
+            lun: 3,
+            cdb: &cdb,
+            data_out: &[],
+            data_in_max: 0,
+            initiator_iqn: None,
+            peer: "127.0.0.1:1",
+            session_partition: None,
+        };
+        let resp = h.dispatch(req).await;
+        assert_eq!(resp.data_in, vec![3u8]);
+    }
+
+    #[tokio::test]
+    async fn handler_is_dyn_compatible() {
+        // The transport holds an Arc<dyn ScsiHandler>; confirm the
+        // trait object resolves and dispatches.
+        let h: std::sync::Arc<dyn ScsiHandler> = std::sync::Arc::new(DefaultHookHandler);
+        assert_eq!(h.target_iqn(), "iqn.2025-10.com.metebalci:thurvsa");
+        let cdb = [0u8; 16];
+        let req = ScsiRequest {
+            tsih: 0,
+            cid: 0,
+            lun: 0,
+            cdb: &cdb,
+            data_out: &[],
+            data_in_max: 0,
+            initiator_iqn: None,
+            peer: "p",
+            session_partition: None,
+        };
+        let resp = h.dispatch(req).await;
+        assert!(matches!(resp.status, ScsiStatus::Good));
+    }
+}

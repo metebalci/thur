@@ -708,6 +708,7 @@ async fn send_login_rejection(
 
 /// Outcome of the login phase, threaded back into [`serve_connection`]
 /// so the FFP loop knows the session bindings.
+#[derive(Debug)]
 pub struct LoginOutcome {
     pub is_discovery: bool,
     pub tsih: u16,
@@ -1681,6 +1682,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::ScsiResponse;
 
     #[test]
     fn r2t_ttt_avoids_unsolicited_sentinel() {
@@ -1844,5 +1846,958 @@ mod tests {
             Arc::new(|| Err(anyhow::anyhow!("simulated config_load_failed")));
         let err = factory().unwrap_err();
         assert!(err.to_string().contains("simulated config_load_failed"));
+    }
+
+    // ===== Pure-function coverage =====
+
+    #[test]
+    fn u24_and_put_u24_round_trip() {
+        let mut buf = [0u8; 3];
+        for v in [0u32, 1, 255, 256, 0x00FF_FFFF, 0x0012_3456] {
+            put_u24(&mut buf, v);
+            assert_eq!(u24(&buf), v, "u24 round-trip for {v}");
+        }
+    }
+
+    #[test]
+    fn opcode_name_covers_initiator_and_target_opcodes() {
+        // High bits are masked off — 0x40|0x01 still names "SCSI Command".
+        assert_eq!(opcode_name(0x40 | 0x01), "SCSI Command");
+        assert_eq!(opcode_name(0x00), "NOP-Out");
+        assert_eq!(opcode_name(0x03), "Login Req");
+        assert_eq!(opcode_name(0x05), "Data-Out");
+        assert_eq!(opcode_name(0x06), "Logout Req");
+        assert_eq!(opcode_name(0x20), "NOP-In");
+        assert_eq!(opcode_name(0x21), "SCSI Resp");
+        assert_eq!(opcode_name(0x25), "Data-In");
+        assert_eq!(opcode_name(0x3F), "Reject");
+        assert_eq!(opcode_name(0x1A), "Unknown");
+    }
+
+    #[test]
+    fn preview_truncates_and_marks_overflow() {
+        let short = preview(&[0xDE, 0xAD], 8);
+        assert_eq!(short, "de ad");
+        let long = preview(&[0x11, 0x22, 0x33, 0x44], 2);
+        assert!(long.starts_with("11 22"));
+        assert!(long.ends_with('…'));
+        assert_eq!(preview(&[], 4), "");
+    }
+
+    #[test]
+    fn format_text_data_joins_nul_separated_pairs() {
+        let data = b"TargetName=iqn.x\0AuthMethod=None\0";
+        assert_eq!(format_text_data(data), "TargetName=iqn.x, AuthMethod=None");
+        // Empty segments between NULs are dropped.
+        assert_eq!(format_text_data(b"\0\0A=1\0\0"), "A=1");
+    }
+
+    #[test]
+    fn parse_text_kv_ignores_segments_without_equals() {
+        let parsed = parse_text_kv(b"Key=Val\0junk\0K2=V2\0");
+        assert_eq!(parsed.get("Key"), Some(&"Val".to_string()));
+        assert_eq!(parsed.get("K2"), Some(&"V2".to_string()));
+        assert_eq!(parsed.len(), 2, "the 'junk' segment carries no '='");
+    }
+
+    #[test]
+    fn parse_text_kv_keeps_empty_value() {
+        let parsed = parse_text_kv(b"Empty=\0");
+        assert_eq!(parsed.get("Empty"), Some(&String::new()));
+    }
+
+    #[test]
+    fn next_exp_cmdsn_wraps_at_u32_max() {
+        let mut pdu = build_empty_pdu(0x01, false, false);
+        pdu.cmdsn = u32::MAX;
+        assert_eq!(next_exp_cmdsn(&pdu), 0, "non-immediate CmdSN wraps");
+        pdu.immediate = true;
+        assert_eq!(next_exp_cmdsn(&pdu), u32::MAX, "immediate echoes verbatim");
+    }
+
+    #[test]
+    fn stamp_serials_writes_three_be_u32s() {
+        let mut bhs = [0u8; 48];
+        stamp_serials_for_response(&mut bhs, 0x1111_2222, 0x3333_4444, 0x5555_6666);
+        assert_eq!(&bhs[24..28], &0x1111_2222u32.to_be_bytes());
+        assert_eq!(&bhs[28..32], &0x3333_4444u32.to_be_bytes());
+        assert_eq!(&bhs[32..36], &0x5555_6666u32.to_be_bytes());
+    }
+
+    #[test]
+    fn derive_r2t_ttt_always_sets_high_bit() {
+        for (itt, r2tsn) in [(0u32, 0u32), (1, 5), (0xFFFF_FFFF, 7), (0x7FFF_FFFF, 0)] {
+            let ttt = derive_r2t_ttt(itt, r2tsn);
+            assert_ne!(ttt, 0xFFFF_FFFF, "TTT must avoid the unsolicited sentinel");
+            assert_ne!(ttt, 0, "TTT must not collide with build_empty_pdu default");
+        }
+    }
+
+    #[test]
+    fn build_empty_pdu_sets_opcode_and_flags() {
+        let p = build_empty_pdu(0x23, false, true);
+        assert_eq!(p.opcode, 0x23);
+        assert!(!p.immediate);
+        assert!(p.final_bit);
+        assert!(p.data.is_empty());
+        assert_eq!(p.bhs, [0u8; 48]);
+    }
+
+    #[test]
+    fn session_params_default_matches_wire_constants() {
+        let p = SessionParams::default();
+        assert_eq!(p.max_recv_data_segment_length, MAX_RECV_DATA_SEGMENT_LENGTH);
+        assert_eq!(p.max_burst_length, MAX_BURST_LENGTH);
+        assert_eq!(p.first_burst_length, FIRST_BURST_LENGTH);
+        assert!(p.immediate_data);
+        assert!(!p.initial_r2t);
+        assert_eq!(p.max_connections, 1);
+    }
+
+    #[test]
+    fn append_opneg_response_keys_echoes_offered_keys() {
+        let mut req = HashMap::new();
+        req.insert("HeaderDigest".to_string(), "CRC32C,None".to_string());
+        req.insert("DataDigest".to_string(), "CRC32C,None".to_string());
+        req.insert("OFMarker".to_string(), "Yes".to_string());
+        req.insert("IFMarker".to_string(), "Yes".to_string());
+        req.insert("ErrorRecoveryLevel".to_string(), "0".to_string());
+        req.insert("DefaultTime2Wait".to_string(), "5".to_string());
+        let mut out = Vec::new();
+        append_opneg_response_keys(&req, &SessionParams::default(), false, &mut out);
+        let kv = parse_text_kv(&out);
+        // Digests / markers are pinned to the safe target-side value.
+        assert_eq!(kv.get("HeaderDigest"), Some(&"None".to_string()));
+        assert_eq!(kv.get("DataDigest"), Some(&"None".to_string()));
+        assert_eq!(kv.get("OFMarker"), Some(&"No".to_string()));
+        assert_eq!(kv.get("IFMarker"), Some(&"No".to_string()));
+        assert_eq!(kv.get("ErrorRecoveryLevel"), Some(&"0".to_string()));
+        // Offered DefaultTime2Wait is echoed back.
+        assert_eq!(kv.get("DefaultTime2Wait"), Some(&"5".to_string()));
+        // Operational-session-only keys are present for non-discovery.
+        assert_eq!(kv.get("ImmediateData"), Some(&"Yes".to_string()));
+        assert_eq!(kv.get("InitialR2T"), Some(&"No".to_string()));
+        assert!(kv.contains_key("TargetPortalGroupTag"));
+        assert!(kv.contains_key("MaxConnections"));
+    }
+
+    #[test]
+    fn append_opneg_response_keys_discovery_omits_session_keys() {
+        let req = HashMap::new();
+        let mut out = Vec::new();
+        append_opneg_response_keys(&req, &SessionParams::default(), true, &mut out);
+        let kv = parse_text_kv(&out);
+        // Discovery sessions get no TPGT / ImmediateData / MaxConnections.
+        assert!(!kv.contains_key("TargetPortalGroupTag"));
+        assert!(!kv.contains_key("ImmediateData"));
+        assert!(!kv.contains_key("MaxConnections"));
+        // Default time2* are emitted when not offered.
+        assert!(kv.contains_key("DefaultTime2Wait"));
+        assert!(kv.contains_key("DefaultTime2Retain"));
+        assert!(kv.contains_key("MaxRecvDataSegmentLength"));
+    }
+
+    // ===== read_pdu / write_pdu round-trips =====
+
+    #[tokio::test]
+    async fn write_then_read_pdu_round_trips_header_and_data() {
+        let mut p = build_empty_pdu(0x01, false, true);
+        p.itt = 0xABCD_1234;
+        p.ttt = 0x5678_9ABC;
+        p.lun = [0, 3, 0, 0, 0, 0, 0, 0];
+        p.bhs[8..16].copy_from_slice(&p.lun);
+        p.bhs[24..28].copy_from_slice(&77u32.to_be_bytes()); // CmdSN
+        p.data = b"hello-iscsi".to_vec(); // 11 bytes, needs 1 pad byte
+        let mut wire = Vec::new();
+        write_pdu(&mut wire, &mut p).await.unwrap();
+        // 48 BHS + 11 data + 1 pad = 60, a multiple of 4.
+        assert_eq!(wire.len(), 60);
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let parsed = read_pdu(&mut cursor).await.unwrap();
+        assert_eq!(parsed.opcode, 0x01);
+        assert!(parsed.final_bit);
+        assert_eq!(parsed.itt, 0xABCD_1234);
+        assert_eq!(parsed.ttt, 0x5678_9ABC);
+        assert_eq!(parsed.lun, [0, 3, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(parsed.cmdsn, 77);
+        assert_eq!(parsed.data, b"hello-iscsi");
+        assert_eq!(parsed.data_segment_len, 11);
+    }
+
+    #[tokio::test]
+    async fn read_pdu_eof_is_graceful_disconnect() {
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let err = read_pdu(&mut empty).await.unwrap_err();
+        assert!(err.to_string().contains("graceful disconnect"));
+    }
+
+    #[tokio::test]
+    async fn read_pdu_truncated_bhs_is_graceful_disconnect() {
+        // Only 10 bytes of the 48-byte BHS — read_exact hits EOF.
+        let mut partial = std::io::Cursor::new(vec![0u8; 10]);
+        let err = read_pdu(&mut partial).await.unwrap_err();
+        assert!(err.to_string().contains("graceful disconnect"));
+    }
+
+    #[tokio::test]
+    async fn read_pdu_rejects_oversized_data_segment() {
+        // Hand-craft a BHS whose u24 DataSegmentLength exceeds the cap.
+        let mut bhs = [0u8; 48];
+        bhs[0] = 0x01;
+        let oversize = MAX_RECV_DATA_SEGMENT_LENGTH + 1;
+        put_u24(&mut bhs[5..8], oversize);
+        let mut cursor = std::io::Cursor::new(bhs.to_vec());
+        let err = read_pdu(&mut cursor).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds MaxRecvDataSegmentLength"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pdu_skips_additional_header_segment() {
+        // total_ahs_len = 1 → 4 AHS bytes follow the BHS, then data.
+        let mut bhs = [0u8; 48];
+        bhs[0] = 0x01;
+        bhs[4] = 1; // TotalAHSLength in 4-byte units
+        put_u24(&mut bhs[5..8], 4); // 4 data bytes
+        let mut wire = bhs.to_vec();
+        wire.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]); // AHS
+        wire.extend_from_slice(&[1, 2, 3, 4]); // data (4, no pad)
+        let mut cursor = std::io::Cursor::new(wire);
+        let parsed = read_pdu(&mut cursor).await.unwrap();
+        assert_eq!(parsed.total_ahs_len, 1);
+        assert_eq!(parsed.data, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn read_pdu_truncated_data_segment_is_graceful_disconnect() {
+        let mut bhs = [0u8; 48];
+        bhs[0] = 0x01;
+        put_u24(&mut bhs[5..8], 16); // claims 16 data bytes
+        let mut wire = bhs.to_vec();
+        wire.extend_from_slice(&[0u8; 4]); // only 4 supplied
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = read_pdu(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("graceful disconnect"));
+    }
+
+    #[tokio::test]
+    async fn write_pdu_no_data_emits_bare_bhs() {
+        let mut p = build_empty_pdu(0x20, true, true);
+        p.itt = 1;
+        let mut wire = Vec::new();
+        write_pdu(&mut wire, &mut p).await.unwrap();
+        assert_eq!(wire.len(), 48);
+        // Immediate bit (0x40) and final bit (0x80) are stamped.
+        assert_eq!(wire[0] & 0x40, 0x40);
+        assert_eq!(wire[1] & 0x80, 0x80);
+    }
+
+    // ===== send_login_rejection =====
+
+    #[tokio::test]
+    async fn send_login_rejection_emits_status_class_and_detail() {
+        // Drive send_login_rejection over a TCP pair; the rejection PDU
+        // is a Login Response (0x23) with status class/detail in BHS
+        // bytes 36/37.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = build_empty_pdu(0x03, false, false);
+            let mut statsn = 5u32;
+            send_login_rejection(
+                &mut sock,
+                &req,
+                0,
+                &[1, 2, 3, 4, 5, 6],
+                &mut statsn,
+                0x02,
+                0x01,
+            )
+            .await
+            .unwrap();
+            statsn
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(resp.opcode, 0x23, "Login Response opcode");
+        assert_eq!(resp.bhs[36], 0x02, "status class = authentication failure");
+        assert_eq!(resp.bhs[37], 0x01, "status detail");
+        let final_statsn = server.await.unwrap();
+        assert_eq!(final_statsn, 6, "statsn advanced once");
+    }
+
+    // ===== collect_write_data: unsolicited + R2T phases =====
+
+    /// Build a Data-Out PDU (opcode 0x05) for the R2T loop tests.
+    fn make_data_out(
+        itt: u32,
+        ttt: u32,
+        buffer_offset: u32,
+        payload: &[u8],
+        final_bit: bool,
+    ) -> Pdu {
+        let mut p = build_empty_pdu(0x05, false, final_bit);
+        p.itt = itt;
+        p.ttt = ttt;
+        p.data = payload.to_vec();
+        p.bhs[40..44].copy_from_slice(&buffer_offset.to_be_bytes());
+        p
+    }
+
+    /// Spin up a session + connection so collect_write_data can read
+    /// the StatSN for its R2T PDUs.
+    fn session_with_connection() -> (Arc<SessionManager>, u16, u16) {
+        let mgr = Arc::new(SessionManager::new());
+        let tsih = mgr.create_session([9, 9, 9, 9, 9, 9]);
+        mgr.add_connection(tsih, 0, MAX_RECV_DATA_SEGMENT_LENGTH)
+            .expect("add_connection");
+        (mgr, tsih, 0)
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_unsolicited_burst_then_done() {
+        // cmd carries no immediate data, final_bit clear → phase 1
+        // drains one unsolicited Data-Out that completes the EDTL.
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x1000;
+        let edtl = 8u32;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        tx.send(make_data_out(
+            0x1000,
+            0xFFFF_FFFF,
+            0,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            true,
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut sink = Vec::new();
+        collect_write_data(&mut sink, &mut cmd, edtl, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap();
+        assert_eq!(cmd.data, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_r2t_solicited_burst() {
+        // cmd.final_bit set so phase 1 is skipped; phase 2 issues one
+        // R2T and the matching Data-Out completes the burst.
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, true);
+        cmd.itt = 0x2000;
+        let edtl = 4u32;
+        let ttt = derive_r2t_ttt(cmd.itt, 0);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        tx.send(make_data_out(
+            0x2000,
+            ttt,
+            0,
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            true,
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut sink = Vec::new();
+        collect_write_data(&mut sink, &mut cmd, edtl, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap();
+        assert_eq!(cmd.data, [0xDE, 0xAD, 0xBE, 0xEF]);
+        // An R2T PDU (opcode 0x31) was written to the sink.
+        let mut cursor = std::io::Cursor::new(sink);
+        let r2t = read_pdu(&mut cursor).await.unwrap();
+        assert_eq!(r2t.opcode & 0x3F, 0x31, "an R2T was sent");
+        assert_eq!(r2t.itt, 0x2000);
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_rejects_wrong_opcode() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x3000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        // A SCSI Command (0x01) instead of Data-Out (0x05).
+        let mut wrong = build_empty_pdu(0x01, false, true);
+        wrong.itt = 0x3000;
+        tx.send(wrong).await.unwrap();
+        drop(tx);
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("expected unsolicited Data-Out"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_rejects_itt_mismatch() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x4000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        tx.send(make_data_out(0xBADD, 0xFFFF_FFFF, 0, &[0u8; 4], true))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ITT mismatch"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_rejects_unsolicited_non_default_ttt() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x5000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        // Unsolicited Data-Out must carry TTT=0xFFFFFFFF.
+        tx.send(make_data_out(0x5000, 0x1234, 0, &[0u8; 4], true))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-default TTT"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_rejects_buffer_offset_gap() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x6000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        // BufferOffset 4 but nothing accumulated yet.
+        tx.send(make_data_out(0x6000, 0xFFFF_FFFF, 4, &[0u8; 4], true))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("BufferOffset"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_rejects_edtl_overrun() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x7000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        // 8 bytes when EDTL is only 4.
+        tx.send(make_data_out(0x7000, 0xFFFF_FFFF, 0, &[0u8; 8], true))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 4, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("overruns EDTL"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_channel_close_is_error() {
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, false);
+        cmd.itt = 0x8000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        drop(tx); // reader "closed" before any Data-Out arrived
+        let mut sink = Vec::new();
+        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("PDU reader closed"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_data_nothing_to_do_when_data_already_complete() {
+        // cmd.final_bit set and data already covers EDTL → both phases
+        // are no-ops, returns Ok immediately.
+        let (mgr, tsih, cid) = session_with_connection();
+        let mut cmd = build_empty_pdu(0x01, false, true);
+        cmd.itt = 0x9000;
+        cmd.data = vec![1, 2, 3, 4];
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
+        let mut sink = Vec::new();
+        collect_write_data(&mut sink, &mut cmd, 4, &mgr, tsih, cid, &mut rx)
+            .await
+            .unwrap();
+        assert_eq!(cmd.data, [1, 2, 3, 4]);
+        assert!(sink.is_empty(), "no R2T needed");
+    }
+
+    // ===== End-to-end: handle_login_phase / serve_connection / run =====
+
+    /// Test handler: records session-close calls and answers a fixed
+    /// INQUIRY-shaped Data-In so the FFP path exercises the Data-In
+    /// branch.
+    struct TestHandler {
+        iqn: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ScsiHandler for TestHandler {
+        fn target_iqn(&self) -> &str {
+            &self.iqn
+        }
+        async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
+            // Opcode 0x12 (INQUIRY) → Data-In; everything else → GOOD
+            // with no data so the SCSI-Response-only branch runs.
+            if req.cdb[0] == 0x12 {
+                ScsiResponse::good(vec![0xAA; 8])
+            } else if req.cdb[0] == 0xFF {
+                // Force a CHECK CONDITION with no sense → default sense
+                // path in the transport.
+                ScsiResponse {
+                    status: ScsiStatus::CheckCondition,
+                    sense: None,
+                    data_in: Vec::new(),
+                }
+            } else {
+                ScsiResponse::good(Vec::new())
+            }
+        }
+    }
+
+    /// Build a Login Request PDU. `csg`/`nsg`/`transit` go into BHS[1].
+    fn make_login_pdu(csg: u8, nsg: u8, transit: bool, cmdsn: u32, kv: &[(&str, &str)]) -> Pdu {
+        let mut p = build_empty_pdu(0x03, true, false);
+        p.bhs[1] = ((csg & 0x3) << 2) | (nsg & 0x3);
+        if transit {
+            p.bhs[1] |= 0x80;
+        }
+        p.bhs[8..14].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // ISID
+        p.bhs[24..28].copy_from_slice(&cmdsn.to_be_bytes());
+        let mut data = Vec::new();
+        for (k, v) in kv {
+            push_kv(&mut data, k, v);
+        }
+        p.data = data;
+        p
+    }
+
+    /// Build a SCSI Command PDU with the given single-byte opcode CDB.
+    /// EDTL lives at BHS bytes 20..24 — the same offset `write_pdu`
+    /// stamps from `Pdu::ttt`, so we route the EDTL through `ttt`.
+    fn make_scsi_cmd(itt: u32, cmdsn: u32, lun: u8, cdb0: u8, edtl: u32) -> Pdu {
+        let mut p = build_empty_pdu(0x01, false, true);
+        p.itt = itt;
+        p.ttt = edtl; // write_pdu stamps ttt into BHS[20..24] = EDTL
+        p.bhs[1] = 0x80; // final
+        p.bhs[8..16].copy_from_slice(&[0, lun, 0, 0, 0, 0, 0, 0]);
+        p.bhs[24..28].copy_from_slice(&cmdsn.to_be_bytes());
+        p.bhs[32] = cdb0;
+        p
+    }
+
+    #[tokio::test]
+    async fn login_phase_no_auth_reaches_full_feature_phase() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_login_phase(
+                &mut sock,
+                "iqn.test:tgt",
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:1",
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Single-PDU login: CSG=security, NSG=full, transit set.
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[
+                ("InitiatorName", "iqn.init:host"),
+                ("SessionType", "Normal"),
+            ],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(resp.opcode, 0x23, "Login Response");
+        // Transit bit set → entering FFP, TSIH non-zero in BHS[14..16].
+        let tsih = u16::from_be_bytes([resp.bhs[14], resp.bhs[15]]);
+        assert_ne!(tsih, 0, "operational session got a real TSIH");
+
+        let outcome = server.await.unwrap().unwrap();
+        assert!(!outcome.is_discovery);
+        assert_ne!(outcome.tsih, 0);
+        assert_eq!(outcome.initiator_iqn.as_deref(), Some("iqn.init:host"));
+        assert!(mgr.session_exists(outcome.tsih));
+    }
+
+    #[tokio::test]
+    async fn login_phase_discovery_session_keeps_tsih_zero() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_login_phase(
+                &mut sock,
+                "iqn.test:tgt",
+                mgr,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:2",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[
+                ("InitiatorName", "iqn.init:disc"),
+                ("SessionType", "Discovery"),
+            ],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        let outcome = server.await.unwrap().unwrap();
+        assert!(outcome.is_discovery);
+        assert_eq!(outcome.tsih, 0, "discovery session uses TSIH 0");
+    }
+
+    #[tokio::test]
+    async fn login_phase_rejects_non_login_opcode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_login_phase(
+                &mut sock,
+                "iqn.test:tgt",
+                mgr,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:3",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // A NOP-Out (0x00) where a Login Request is expected.
+        let mut bad = build_empty_pdu(0x00, false, false);
+        write_pdu(&mut client, &mut bad).await.unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("expected Login Request"));
+    }
+
+    #[tokio::test]
+    async fn login_phase_auth_required_rejects_skipped_security_stage() {
+        use crate::auth::{ChapAlgorithm, ChapUser};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let factory: ChapAuthFactory = Arc::new(|| {
+            Ok(ChapAuthenticator::new(
+                vec![ChapUser::new("u".into(), "pw".into(), false)],
+                None,
+                None,
+                vec![ChapAlgorithm::Sha256],
+            ))
+        });
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_login_phase(
+                &mut sock,
+                "iqn.test:tgt",
+                mgr,
+                Some(&factory),
+                &NoopLoginAudit,
+                "127.0.0.1:4",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Jump straight to opneg (CSG=1) without the security stage.
+        let mut login = make_login_pdu(
+            STAGE_OPNEG,
+            STAGE_FULL,
+            true,
+            0,
+            &[("InitiatorName", "iqn.init:host")],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        // Target sends a rejection Login Response then errors out.
+        let resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(resp.bhs[36], 0x02, "authentication failure class");
+        let err = server.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("Authentication required"));
+    }
+
+    #[tokio::test]
+    async fn login_phase_chap_config_load_failure_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let factory: ChapAuthFactory = Arc::new(|| Err(anyhow!("iscsi-users.json unreadable")));
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_login_phase(
+                &mut sock,
+                "iqn.test:tgt",
+                mgr,
+                Some(&factory),
+                &NoopLoginAudit,
+                "127.0.0.1:5",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(resp.bhs[36], 0x02, "rejection: authentication failure");
+        let err = server.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("CHAP config load failed"));
+    }
+
+    #[tokio::test]
+    async fn serve_connection_handles_nop_scsi_and_logout() {
+        // Full end-to-end: login (no auth), NOP-Out ping, INQUIRY
+        // (Data-In branch), TEST UNIT READY (Response-only branch),
+        // CHECK CONDITION with default sense, then Logout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:tgt".into(),
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(sock, handler, mgr_srv, None, &NoopLoginAudit, "127.0.0.1:6").await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[("InitiatorName", "iqn.init:e2e")],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let login_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(login_resp.opcode, 0x23);
+
+        // NOP-Out ping (immediate) → NOP-In.
+        let mut nop = build_empty_pdu(0x00, true, true);
+        nop.itt = 0x0101;
+        write_pdu(&mut client, &mut nop).await.unwrap();
+        let nop_in = read_pdu(&mut client).await.unwrap();
+        assert_eq!(nop_in.opcode, 0x20, "NOP-In");
+        assert_eq!(nop_in.itt, 0x0101);
+        assert_eq!(nop_in.ttt, 0xFFFF_FFFF);
+
+        // SendTargets Text Request.
+        let mut text = build_empty_pdu(0x04, true, true);
+        text.itt = 0x0202;
+        push_kv(&mut text.data, "SendTargets", "All");
+        write_pdu(&mut client, &mut text).await.unwrap();
+        let text_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(text_resp.opcode, 0x24, "Text Response");
+        let kv = parse_text_kv(&text_resp.data);
+        assert_eq!(kv.get("TargetName"), Some(&"iqn.test:tgt".to_string()));
+
+        // INQUIRY (opcode 0x12) → Data-In PDU.
+        let mut inq = make_scsi_cmd(0x0303, 1, 0, 0x12, 8);
+        write_pdu(&mut client, &mut inq).await.unwrap();
+        let din = read_pdu(&mut client).await.unwrap();
+        assert_eq!(din.opcode, 0x25, "Data-In");
+        assert_eq!(din.data, vec![0xAA; 8]);
+
+        // TEST UNIT READY (opcode 0x00 CDB) → SCSI Response, no data.
+        let mut tur = make_scsi_cmd(0x0404, 2, 0, 0x00, 0);
+        write_pdu(&mut client, &mut tur).await.unwrap();
+        let tur_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(tur_resp.opcode, 0x21, "SCSI Response");
+        assert_eq!(tur_resp.bhs[3], 0x00, "GOOD status");
+
+        // CHECK CONDITION path with no sense → transport default sense.
+        let mut cc = make_scsi_cmd(0x0505, 3, 0, 0xFF, 0);
+        write_pdu(&mut client, &mut cc).await.unwrap();
+        let cc_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(cc_resp.opcode, 0x21);
+        assert_eq!(cc_resp.bhs[3], 0x02, "CHECK CONDITION status");
+        assert!(!cc_resp.data.is_empty(), "default sense payload present");
+
+        // Task Management request → TMF Response.
+        let mut tmf = build_empty_pdu(0x02, false, true);
+        tmf.itt = 0x0606;
+        tmf.bhs[24..28].copy_from_slice(&4u32.to_be_bytes());
+        write_pdu(&mut client, &mut tmf).await.unwrap();
+        let tmf_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(tmf_resp.opcode, 0x22, "Task Mgmt Response");
+
+        // Logout → Logout Response, then the loop breaks.
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0x0707;
+        logout.bhs[24..28].copy_from_slice(&5u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let logout_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(logout_resp.opcode, 0x26, "Logout Response");
+
+        server.await.unwrap().unwrap();
+        // Session was cleaned up by the SessionGuard on exit.
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn serve_connection_unsupported_opcode_emits_reject() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:tgt".into(),
+        });
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(sock, handler, mgr, None, &NoopLoginAudit, "127.0.0.1:7").await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+
+        // Opcode 0x1E (PREVENT/ALLOW-ish, unsupported by the transport
+        // dispatcher) → Reject PDU.
+        let mut bad = build_empty_pdu(0x1E, false, true);
+        bad.itt = 0x0808;
+        bad.bhs[24..28].copy_from_slice(&1u32.to_be_bytes());
+        write_pdu(&mut client, &mut bad).await.unwrap();
+        let rej = read_pdu(&mut client).await.unwrap();
+        assert_eq!(rej.opcode, 0x3F, "Reject PDU");
+        assert_eq!(rej.bhs[2], 0x09, "command not supported reason");
+
+        // Close the connection so serve_connection returns.
+        drop(client);
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_connection_stray_data_out_emits_reject() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:tgt".into(),
+        });
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(sock, handler, mgr, None, &NoopLoginAudit, "127.0.0.1:8").await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+
+        // Data-Out (0x05) with no matching Cmd route → stray, Reject.
+        let mut stray = build_empty_pdu(0x05, false, true);
+        stray.itt = 0xDEAD;
+        stray.ttt = 0xFFFF_FFFF;
+        stray.bhs[24..28].copy_from_slice(&1u32.to_be_bytes());
+        write_pdu(&mut client, &mut stray).await.unwrap();
+        let rej = read_pdu(&mut client).await.unwrap();
+        assert_eq!(rej.opcode, 0x3F, "Reject PDU");
+        assert_eq!(rej.bhs[2], 0x04, "protocol error reason");
+        drop(client);
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_binds_and_serves_a_connection() {
+        // Exercise `run`: bind, accept, serve one connection through
+        // login + logout, then the task is aborted.
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:run".into(),
+        });
+        let config = ServerConfig {
+            listen_address: "127.0.0.1:0".to_string(),
+            session_manager: Arc::clone(&mgr),
+            auth: None,
+            audit: Arc::new(NoopLoginAudit),
+            stale_session_timeout_secs: 300,
+        };
+        // `run` takes the listen_address by value and binds it; bind
+        // to port 0 then discover the port is not possible through
+        // `run` directly, so bind a probe listener, take its port,
+        // drop it, and reuse — small race but fine for a unit test.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = ServerConfig {
+            listen_address: format!("127.0.0.1:{port}"),
+            ..config
+        };
+        let server = tokio::spawn(run(config, handler));
+
+        // Give the listener a moment to bind, then connect.
+        let mut client = None;
+        for _ in 0..50 {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let mut client = client.expect("connect to run() listener");
+        let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(resp.opcode, 0x23, "run() served the login");
+
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0x01;
+        logout.bhs[24..28].copy_from_slice(&1u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let logout_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(logout_resp.opcode, 0x26);
+
+        server.abort();
+    }
+
+    #[test]
+    fn server_config_carries_transport_hooks() {
+        let config = ServerConfig {
+            listen_address: "0.0.0.0:3260".to_string(),
+            session_manager: Arc::new(SessionManager::new()),
+            auth: None,
+            audit: Arc::new(NoopLoginAudit),
+            stale_session_timeout_secs: 600,
+        };
+        assert_eq!(config.listen_address, "0.0.0.0:3260");
+        assert_eq!(config.stale_session_timeout_secs, 600);
+        assert!(config.auth.is_none());
     }
 }
