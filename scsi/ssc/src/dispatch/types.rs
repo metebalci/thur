@@ -49,6 +49,81 @@ pub struct Pdu {
     pub data: Vec<u8>,
 }
 
+impl Pdu {
+    /// Build a synthetic `Pdu` from the raw fields a single SCSI
+    /// command carries. Used by the transport adapter — which converts
+    /// a `shared_iscsi::ScsiRequest` into the PDU view handlers read —
+    /// and by dispatch unit tests. Only the fields per-opcode handlers
+    /// reach into are populated:
+    /// - `bhs[1]` / `lun[1]` — single-level LUN byte (LUNs < 256)
+    /// - `bhs[20..24]` — Expected Data Transfer Length, synthesized
+    ///   from `data_in_max` so [`pdu_expected_xfer_len`] keeps working
+    /// - `bhs[32..48]` — 16-byte CDB, zero-padded if shorter
+    /// - `data` — the Data-Out payload already drained by the transport
+    pub fn synth(cdb: &[u8], lun: u64, data_in_max: usize, data_out: &[u8]) -> Pdu {
+        let mut bhs = [0u8; 48];
+        let lun_byte = (lun & 0xFF) as u8;
+        bhs[1] = lun_byte;
+        let edtl = u32::try_from(data_in_max).unwrap_or(u32::MAX);
+        bhs[20..24].copy_from_slice(&edtl.to_be_bytes());
+        let n = cdb.len().min(16);
+        bhs[32..32 + n].copy_from_slice(&cdb[..n]);
+
+        let mut lun_field = [0u8; 8];
+        lun_field[1] = lun_byte;
+
+        Pdu {
+            opcode: 0x01, // SCSI Command
+            immediate: false,
+            final_bit: true,
+            total_ahs_len: 0,
+            data_segment_len: data_out.len() as u32,
+            lun: lun_field,
+            itt: 0,
+            ttt: 0,
+            cmdsn: 0,
+            expstatsn: 0,
+            bhs,
+            data: data_out.to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pdu_tests {
+    use super::*;
+
+    #[test]
+    fn synth_populates_cdb_lun_and_edtl() {
+        let cdb = [0x12u8, 0x00, 0x00, 0x00, 0x60, 0x00];
+        let pdu = Pdu::synth(&cdb, 3, 0x60, &[]);
+        assert_eq!(pdu.opcode, 0x01);
+        assert_eq!(pdu.bhs[1], 3);
+        assert_eq!(pdu.lun[1], 3);
+        assert_eq!(&pdu.bhs[32..38], &cdb);
+        assert_eq!(pdu_expected_xfer_len(&pdu), 0x60);
+        assert!(pdu.data.is_empty());
+        assert_eq!(pdu.data_segment_len, 0);
+    }
+
+    #[test]
+    fn synth_truncates_overlong_cdb_and_carries_data_out() {
+        let cdb = [0xAAu8; 20];
+        let data = [1u8, 2, 3, 4];
+        let pdu = Pdu::synth(&cdb, 0, 0, &data);
+        // CDB clamped to the 16-byte BHS window.
+        assert_eq!(&pdu.bhs[32..48], &[0xAA; 16]);
+        assert_eq!(pdu.data, data);
+        assert_eq!(pdu.data_segment_len, 4);
+    }
+
+    #[test]
+    fn synth_clamps_oversized_data_in_max_to_u32_max() {
+        let pdu = Pdu::synth(&[0], 0, usize::MAX, &[]);
+        assert_eq!(pdu_expected_xfer_len(&pdu), u32::MAX);
+    }
+}
+
 /// SCSI status code for `ScsiResp`. The dispatcher only ever emits
 /// `Good` or `CheckCondition` — RESERVATION CONFLICT / BUSY / TASK SET
 /// FULL etc. aren't modeled.

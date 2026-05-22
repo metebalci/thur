@@ -67,50 +67,6 @@ pub struct IscsiLibraryHandler {
 }
 
 impl IscsiLibraryHandler {
-    /// Construct a synthetic [`Pdu`] from a transport-supplied
-    /// [`ScsiRequest`]. Only the fields the per-opcode handlers
-    /// reach into are populated:
-    /// - `bhs[8..16]` — 8-byte LUN field (single-level, byte 1)
-    /// - `bhs[20..24]` — Expected Data Transfer Length (we synthesize
-    ///   from `data_in_max` so `pdu_expected_xfer_len` keeps
-    ///   working)
-    /// - `bhs[32..48]` — 16-byte CDB (handlers slice this)
-    /// - `data` — concatenated Data-Out payload (already drained by
-    ///   the shared transport)
-    fn synth_pdu(req: &ScsiRequest<'_>) -> Pdu {
-        let mut bhs = [0u8; 48];
-        // LUN: simple peripheral-device addressing puts the LUN byte
-        // at offset 1. The scsi-spc canonical type carries LUN as
-        // u64 (SAM-5 flat-space-friendly); narrow here since thurvtl
-        // stays within single-level addressing (LUNs < 256).
-        let lun_byte = (req.lun & 0xFF) as u8;
-        bhs[1] = lun_byte;
-        // EDTL → bytes 20..24 BE.
-        let edtl = u32::try_from(req.data_in_max).unwrap_or(u32::MAX);
-        bhs[20..24].copy_from_slice(&edtl.to_be_bytes());
-        // CDB → bytes 32..48 (zero-padded if shorter than 16).
-        let n = req.cdb.len().min(16);
-        bhs[32..32 + n].copy_from_slice(&req.cdb[..n]);
-
-        let mut lun = [0u8; 8];
-        lun[1] = lun_byte;
-
-        Pdu {
-            opcode: 0x01, // SCSI Command
-            immediate: false,
-            final_bit: true,
-            total_ahs_len: 0,
-            data_segment_len: req.data_out.len() as u32,
-            lun,
-            itt: 0,
-            ttt: 0,
-            cmdsn: 0,
-            expstatsn: 0,
-            bhs,
-            data: req.data_out.to_vec(),
-        }
-    }
-
     /// Convert thurvtl's `ScsiResp` (Data-In bytes lives in
     /// `data_out`, sense optional) into the transport-facing
     /// [`ScsiResponse`]. The legacy thurvtl pipeline produces sense
@@ -236,7 +192,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         let peer = req.peer.to_string();
         let partition = req.session_partition.map(str::to_string);
         let diag = Arc::clone(&self.diagnostic_store);
-        let mut pdu = Self::synth_pdu(&req);
+        let mut pdu = Pdu::synth(req.cdb, req.lun, req.data_in_max, req.data_out);
 
         let resp_result: Result<ScsiResp> = tokio::task::spawn_blocking(move || {
             protocol::handle_scsi_command(
