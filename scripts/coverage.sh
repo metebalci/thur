@@ -46,7 +46,8 @@ zero_mode() {
         fi
         echo "  $f"
         missing=$((missing + 1))
-    done < <(find . -path ./target -prune -o -name '*.rs' -path '*/src/*' -print | sort)
+    done < <(find . \( -path ./target -o -path ./.git -o -path ./.claude \) -prune \
+        -o -name '*.rs' -path '*/src/*' -print | sort)
 
     if [[ "$missing" -eq 0 ]]; then
         echo "All non-trivial source files have a #[cfg(test)] block."
