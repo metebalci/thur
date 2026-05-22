@@ -158,3 +158,94 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn audit_dir_defaults_under_data_dir() {
+        let settings = AuditSettings::default();
+        let data_dir = Path::new("/var/lib/thurvsa");
+        assert_eq!(
+            audit_dir(&settings, data_dir),
+            PathBuf::from("/var/lib/thurvsa/audit")
+        );
+    }
+
+    #[test]
+    fn audit_dir_honors_explicit_override() {
+        let settings = AuditSettings {
+            enabled: true,
+            dir: Some("/var/log/thurvsa/audit".to_string()),
+        };
+        assert_eq!(
+            audit_dir(&settings, Path::new("/var/lib/thurvsa")),
+            PathBuf::from("/var/log/thurvsa/audit")
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_audit_log_creates_dir_and_stamps_start() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        let boot = boot_audit_log(dir.clone(), Some("inst-123"))
+            .await
+            .expect("audit log boots");
+        // The audit directory is created on demand.
+        assert!(dir.is_dir());
+        // Drain the writer so the queued daemon.start entry hits disk.
+        boot.writer.shutdown().await;
+        // A daily-rotating JSONL file exists and carries the start row.
+        let mut found = false;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let body = std::fs::read_to_string(&path).unwrap();
+                if body.contains("daemon.start") {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "daemon.start entry must be persisted");
+    }
+
+    #[tokio::test]
+    async fn login_audit_sink_forwards_chap_events() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        let boot = boot_audit_log(dir.clone(), None)
+            .await
+            .expect("audit log boots");
+        let sink = IscsiDiskLoginAudit::new(boot.channel.clone());
+
+        sink.record(LoginAuditEvent::ChapSuccess {
+            peer: "10.0.0.1:3260",
+            initiator: Some("iqn.host"),
+            user: "alice",
+            algorithm: "SHA-256",
+        });
+        sink.record(LoginAuditEvent::ChapFailure {
+            peer: "10.0.0.2:3260",
+            initiator: Some("iqn.bad"),
+            user: Some("mallory"),
+            reason: "secret mismatch",
+            error: "auth failed".to_string(),
+        });
+
+        boot.writer.shutdown().await;
+
+        let mut combined = String::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                combined.push_str(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+        assert!(combined.contains("iscsi.chap.success"));
+        assert!(combined.contains("iscsi.chap.failure"));
+        assert!(combined.contains("alice"));
+        assert!(combined.contains("mallory"));
+    }
+}

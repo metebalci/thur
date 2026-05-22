@@ -160,3 +160,95 @@ fn print_human(r: &VolumeVerifyReport, verbose: bool) {
         r.gc_hint_count(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_block::verify::{CloudReport, NamespaceReport, PoolReport, VolumeReport};
+
+    /// A clean, empty report renders the header + result lines without
+    /// touching any error/warning branch.
+    #[test]
+    fn empty_report_prints() {
+        let r = VolumeVerifyReport::default();
+        assert_eq!(r.error_count(), 0);
+        assert_eq!(r.warning_count(), 0);
+        assert_eq!(r.gc_hint_count(), 0);
+        print_human(&r, false);
+        print_human(&r, true);
+    }
+
+    /// A report exercising every print branch: volume with errors +
+    /// warnings, failed pages.idx, missing local + cloud chunks, a pool
+    /// with namespaces, cloud counters, GC hints, and orphan dirs.
+    #[test]
+    fn populated_report_prints_all_branches() {
+        let mut vol = VolumeReport {
+            volume: "vol-a".into(),
+            backend: Some("primary".into()),
+            scope: Some("local".into()),
+            pages_idx_ok: false,
+            allocated_pages: 12,
+            local_chunks_missing: 3,
+            cloud_chunks_missing: Some(2),
+            ..Default::default()
+        };
+        // More than three errors so the "... N more" branch fires.
+        for i in 0..5 {
+            vol.errors.push(format!("error number {i}"));
+        }
+        vol.warnings.push("a warning".into());
+
+        let pool = PoolReport {
+            backend: "primary".into(),
+            shared_chunks: 100,
+            shared_orphans: 4,
+            shared_orphan_bytes: 4096,
+            namespaces: vec![NamespaceReport {
+                namespace: "ns1".into(),
+                chunks: 50,
+                orphans: 2,
+                orphan_bytes: 2048,
+            }],
+            orphan_namespace_dirs: vec!["stale-ns".into()],
+            gc_hints: vec!["run gc to reclaim 4096 bytes".into()],
+            cloud: Some(CloudReport {
+                chunk_objects: 200,
+                chunk_orphans: 5,
+            }),
+            errors: vec!["pool error".into()],
+            warnings: vec!["pool warning".into()],
+        };
+
+        let report = VolumeVerifyReport {
+            volumes: vec![vol],
+            pool: vec![pool],
+        };
+
+        assert_eq!(report.error_count(), 6); // 5 vol + 1 pool
+        assert_eq!(report.warning_count(), 2);
+        assert_eq!(report.gc_hint_count(), 1);
+
+        // Non-verbose truncates the error list; verbose dumps everything.
+        print_human(&report, false);
+        print_human(&report, true);
+    }
+
+    /// The CLI's `VolumeVerifyReport` arrives over the job stream as
+    /// JSON — confirm the daemon's serialized shape deserializes.
+    #[test]
+    fn report_round_trips_through_json() {
+        let report = VolumeVerifyReport {
+            volumes: vec![VolumeReport {
+                volume: "v".into(),
+                pages_idx_ok: true,
+                ..Default::default()
+            }],
+            pool: vec![],
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        let back: VolumeVerifyReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.volumes.len(), 1);
+        assert_eq!(back.volumes[0].volume, "v");
+    }
+}

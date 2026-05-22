@@ -790,3 +790,566 @@ enum NvmetcpPsksAction {
         cancel: bool,
     },
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own consistency check — catches conflicting arg ids,
+    /// duplicate short flags, malformed `requires`/`conflicts_with`.
+    #[test]
+    fn command_tree_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    /// Parse `args`, then destructure to one expected `Commands`
+    /// variant via `match`. The `_` arm yields `None` so the caller's
+    /// `.expect()` reports a clear "wrong variant" failure rather than
+    /// a bare `panic!`.
+    #[test]
+    fn volume_create_minimal() {
+        let cli = parse(&["thurvsa", "volume", "create", "vol1", "--size", "1T"])
+            .expect("valid create parses");
+        let action = match cli.command {
+            Commands::Volume { action } => Some(action),
+            _ => None,
+        }
+        .expect("expected volume action");
+        let fields = match action {
+            VolumeAction::Create {
+                name,
+                size,
+                page_size,
+                dedup,
+                worm,
+                sync_after,
+                lun,
+                ..
+            } => Some((name, size, page_size, dedup, worm, sync_after, lun)),
+            _ => None,
+        }
+        .expect("expected volume create");
+        let (name, size, page_size, dedup, worm, sync_after, lun) = fields;
+        assert_eq!(name, "vol1");
+        assert_eq!(size, "1T");
+        // Defaults straight off the clap attributes.
+        assert_eq!(page_size, "64K");
+        assert_eq!(dedup, "local");
+        assert!(!worm);
+        assert_eq!(sync_after, "cloud");
+        assert!(lun.is_none());
+    }
+
+    #[test]
+    fn volume_create_requires_size() {
+        // --size is a required arg; omitting it is a parse error.
+        assert!(parse(&["thurvsa", "volume", "create", "vol1"]).is_err());
+    }
+
+    #[test]
+    fn volume_create_full_flag_set() {
+        let cli = parse(&[
+            "thurvsa",
+            "volume",
+            "create",
+            "secret-vol",
+            "--size",
+            "500G",
+            "--backend",
+            "s3",
+            "--page-size",
+            "128K",
+            "--dedup",
+            "global",
+            "--worm",
+            "--encrypt",
+            "--keystore",
+            "vault",
+            "--dek-source",
+            "backend",
+            "--sync-after",
+            "disk",
+            "--lun",
+            "7",
+        ])
+        .expect("full flag set parses");
+        let action = match cli.command {
+            Commands::Volume { action } => Some(action),
+            _ => None,
+        }
+        .expect("expected volume action");
+        let create = match action {
+            VolumeAction::Create {
+                backend,
+                dedup,
+                worm,
+                encrypt,
+                keystore,
+                dek_source,
+                sync_after,
+                lun,
+                ..
+            } => Some((
+                backend, dedup, worm, encrypt, keystore, dek_source, sync_after, lun,
+            )),
+            _ => None,
+        }
+        .expect("expected volume create");
+        let (backend, dedup, worm, encrypt, keystore, dek_source, sync_after, lun) = create;
+        assert_eq!(backend.as_deref(), Some("s3"));
+        assert_eq!(dedup, "global");
+        assert!(worm);
+        assert!(encrypt);
+        assert_eq!(keystore.as_deref(), Some("vault"));
+        assert_eq!(dek_source.as_deref(), Some("backend"));
+        assert_eq!(sync_after, "disk");
+        assert_eq!(lun, Some(7));
+    }
+
+    #[test]
+    fn volume_create_encrypt_requires_keystore() {
+        // `--encrypt` has `requires = "keystore"` — bare --encrypt fails.
+        assert!(
+            parse(&[
+                "thurvsa", "volume", "create", "v", "--size", "1G", "--encrypt"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn volume_create_key_file_requires_encrypt() {
+        // `--key-file` has `requires = "encrypt"`.
+        assert!(
+            parse(&[
+                "thurvsa",
+                "volume",
+                "create",
+                "v",
+                "--size",
+                "1G",
+                "--key-file",
+                "/tmp/k",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn volume_create_rejects_unknown_dedup() {
+        // `--dedup` has a fixed value_parser list.
+        assert!(
+            parse(&[
+                "thurvsa", "volume", "create", "v", "--size", "1G", "--dedup", "regional",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn volume_create_rejects_unknown_sync_after() {
+        assert!(
+            parse(&[
+                "thurvsa",
+                "volume",
+                "create",
+                "v",
+                "--size",
+                "1G",
+                "--sync-after",
+                "ram",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn volume_list_and_info_json_flag() {
+        let cli = parse(&["thurvsa", "volume", "list", "--json"]).expect("list parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::List { json: true }
+            }
+        ));
+        let cli = parse(&["thurvsa", "volume", "info", "vol1"]).expect("info parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::Info { name, json: false }
+            } if name == "vol1"
+        ));
+    }
+
+    #[test]
+    fn volume_destroy_force_flag() {
+        let cli =
+            parse(&["thurvsa", "volume", "destroy", "vol1", "--force"]).expect("destroy parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::Destroy { name, force: true }
+            } if name == "vol1"
+        ));
+    }
+
+    #[test]
+    fn volume_modify_sync_after() {
+        let cli = parse(&["thurvsa", "volume", "modify", "vol1", "--sync-after", "memory"])
+            .expect("modify parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::Modify { name, sync_after }
+            } if name == "vol1" && sync_after == "memory"
+        ));
+        // --sync-after is required for modify.
+        assert!(parse(&["thurvsa", "volume", "modify", "vol1"]).is_err());
+    }
+
+    #[test]
+    fn volume_key_subcommands() {
+        let cli = parse(&[
+            "thurvsa", "volume", "key", "migrate", "vol1", "--to", "awskms",
+        ])
+        .expect("key migrate parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::Key {
+                    action: KeyAction::Migrate { name, to, purge_local: false }
+                }
+            } if name == "vol1" && to == "awskms"
+        ));
+
+        let cli = parse(&[
+            "thurvsa", "volume", "key", "export", "vol1", "--to", "/tmp/env",
+        ])
+        .expect("key export parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Volume {
+                action: VolumeAction::Key {
+                    action: KeyAction::Export { name, iter, .. }
+                }
+            } if name == "vol1" && iter == 600_000
+        ));
+    }
+
+    #[test]
+    fn system_gc_flags() {
+        let cli =
+            parse(&["thurvsa", "system", "gc", "--dry-run", "--cloud"]).expect("gc parses");
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Gc {
+                    dry_run: true,
+                    cloud: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn system_verify_collects_volume_names() {
+        let cli = parse(&[
+            "thurvsa", "system", "verify", "--skip-cloud", "--verbose", "vol1", "vol2",
+        ])
+        .expect("verify parses");
+        let verify = match cli.command {
+            Commands::System {
+                action:
+                    SystemAction::Verify {
+                        skip_cloud,
+                        verbose,
+                        json,
+                        volumes,
+                    },
+            } => Some((skip_cloud, verbose, json, volumes)),
+            _ => None,
+        }
+        .expect("expected system verify");
+        let (skip_cloud, verbose, json, volumes) = verify;
+        assert!(skip_cloud);
+        assert!(verbose);
+        assert!(!json);
+        assert_eq!(volumes, vec!["vol1", "vol2"]);
+    }
+
+    #[test]
+    fn system_cloud_benchmark_defaults_and_sweeps() {
+        let cli = parse(&[
+            "thurvsa",
+            "system",
+            "cloud",
+            "benchmark",
+            "--backend",
+            "s3",
+            "--concurrency-sweep",
+            "8,16,32",
+        ])
+        .expect("benchmark parses");
+        let bench = match cli.command {
+            Commands::System {
+                action:
+                    SystemAction::Cloud {
+                        action:
+                            CloudAction::Benchmark {
+                                backends,
+                                total_gb,
+                                chunk_size_mb,
+                                concurrency,
+                                concurrency_sweep,
+                                ..
+                            },
+                    },
+            } => Some((
+                backends,
+                total_gb,
+                chunk_size_mb,
+                concurrency,
+                concurrency_sweep,
+            )),
+            _ => None,
+        }
+        .expect("expected cloud benchmark");
+        let (backends, total_gb, chunk_size_mb, concurrency, concurrency_sweep) = bench;
+        assert_eq!(backends, vec!["s3"]);
+        assert_eq!(total_gb, 32);
+        assert_eq!(chunk_size_mb, 8);
+        assert_eq!(concurrency, 16);
+        assert_eq!(concurrency_sweep, vec![8, 16, 32]);
+    }
+
+    #[test]
+    fn system_audit_tail_defaults() {
+        let cli = parse(&["thurvsa", "system", "audit", "tail"]).expect("audit tail parses");
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Audit {
+                    action: AuditAction::Tail {
+                        follow: false,
+                        lines: 20
+                    }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn system_audit_export_rejects_bad_format() {
+        // --format value_parser is ["jsonl", "csv"].
+        assert!(parse(&["thurvsa", "system", "audit", "export", "--format", "xml"]).is_err());
+        let cli = parse(&["thurvsa", "system", "audit", "export", "--format", "csv"])
+            .expect("csv format parses");
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Audit {
+                    action: AuditAction::Export { format, .. }
+                }
+            } if format == "csv"
+        ));
+    }
+
+    #[test]
+    fn system_audit_rotate_accept_break() {
+        let cli = parse(&["thurvsa", "system", "audit", "rotate", "--accept-break"])
+            .expect("audit rotate parses");
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Audit {
+                    action: AuditAction::Rotate { accept_break: true }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn system_alerting_test_rejects_bad_severity() {
+        assert!(
+            parse(&["thurvsa", "system", "alerting", "test", "sink1", "--severity", "panic"])
+                .is_err()
+        );
+        let cli = parse(&["thurvsa", "system", "alerting", "test", "sink1"])
+            .expect("alerting test parses");
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Alerting {
+                    action: AlertingAction::Test { sink, severity }
+                }
+            } if sink == "sink1" && severity == "warn"
+        ));
+    }
+
+    #[test]
+    fn iscsi_users_add_password_conflicts_with_stdin() {
+        // `--password` conflicts_with `--password-stdin`.
+        assert!(
+            parse(&[
+                "thurvsa",
+                "iscsi",
+                "users",
+                "add",
+                "alice",
+                "--password",
+                "hunter2-long",
+                "--password-stdin",
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "thurvsa",
+            "iscsi",
+            "users",
+            "add",
+            "alice",
+            "--password",
+            "hunter2-long",
+            "--mutual-chap",
+        ])
+        .expect("users add parses");
+        let add = match cli.command {
+            Commands::Iscsi {
+                action:
+                    IscsiAction::Users {
+                        action:
+                            IscsiUsersAction::Add {
+                                name,
+                                password,
+                                mutual_chap,
+                                ..
+                            },
+                    },
+            } => Some((name, password, mutual_chap)),
+            _ => None,
+        }
+        .expect("expected users add");
+        let (name, password, mutual_chap) = add;
+        assert_eq!(name, "alice");
+        assert_eq!(password.as_deref(), Some("hunter2-long"));
+        assert!(mutual_chap);
+    }
+
+    #[test]
+    fn iscsi_users_rotate_grace_default_and_cancel() {
+        let cli = parse(&["thurvsa", "iscsi", "users", "rotate", "bob", "--cancel"])
+            .expect("users rotate --cancel parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Iscsi {
+                action: IscsiAction::Users {
+                    action: IscsiUsersAction::Rotate { name, grace, cancel: true, .. }
+                }
+            } if name == "bob" && grace == "24h"
+        ));
+        // `--password` conflicts_with `--cancel`.
+        assert!(
+            parse(&[
+                "thurvsa",
+                "iscsi",
+                "users",
+                "rotate",
+                "bob",
+                "--cancel",
+                "--password",
+                "newpass-long12",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn iscsi_target_set_requires_username() {
+        assert!(parse(&["thurvsa", "iscsi", "target", "set"]).is_err());
+        let cli = parse(&[
+            "thurvsa",
+            "iscsi",
+            "target",
+            "set",
+            "--username",
+            "tgt",
+            "--password",
+            "secret-pass12",
+        ])
+        .expect("target set parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Iscsi {
+                action: IscsiAction::Target {
+                    action: IscsiTargetAction::Set { username, .. }
+                }
+            } if username == "tgt"
+        ));
+    }
+
+    #[test]
+    fn nvmetcp_psks_add_and_rotate() {
+        let cli = parse(&[
+            "thurvsa",
+            "nvmetcp",
+            "psks",
+            "add",
+            "--host-nqn",
+            "nqn.host",
+            "--key",
+            "NVMeTLSkey-1:01:abc:",
+        ])
+        .expect("psks add parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Nvmetcp {
+                action: NvmetcpAction::Psks {
+                    action: NvmetcpPsksAction::Add { host_nqn, key }
+                }
+            } if host_nqn == "nqn.host" && key == "NVMeTLSkey-1:01:abc:"
+        ));
+
+        let cli = parse(&[
+            "thurvsa", "nvmetcp", "psks", "rotate", "--host-nqn", "nqn.host", "--cancel",
+        ])
+        .expect("psks rotate --cancel parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Nvmetcp {
+                action: NvmetcpAction::Psks {
+                    action: NvmetcpPsksAction::Rotate { grace, cancel: true, .. }
+                }
+            } if grace == "24h"
+        ));
+    }
+
+    #[test]
+    fn config_completion_subcommand() {
+        let cli = parse(&["thurvsa", "config", "defaults"]).expect("config defaults parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Config {
+                action: shared_cli::ConfigAction::Defaults
+            }
+        ));
+    }
+
+    #[test]
+    fn global_config_flag_threads_through() {
+        let cli = parse(&["thurvsa", "--config", "/etc/x.yaml", "volume", "list"])
+            .expect("global --config parses");
+        assert_eq!(cli.args.config.as_deref(), Some("/etc/x.yaml"));
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert!(parse(&["thurvsa", "frobnicate"]).is_err());
+        // Missing subcommand entirely.
+        assert!(parse(&["thurvsa"]).is_err());
+    }
+}

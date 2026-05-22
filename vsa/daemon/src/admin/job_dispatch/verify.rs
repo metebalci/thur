@@ -121,3 +121,43 @@ async fn finish(emitter: &JobEmitter, report: VolumeVerifyReport) {
     let exit = if errors > 0 { 1 } else { 0 };
     emitter.emit(JobEvent::done(exit)).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_params_default_when_body_empty() {
+        let params: VerifyParams =
+            serde_json::from_value(serde_json::json!({})).expect("empty body deserializes");
+        assert!(!params.skip_cloud);
+        assert!(params.volumes.is_empty());
+    }
+
+    #[test]
+    fn verify_params_round_trip_full_body() {
+        let params: VerifyParams = serde_json::from_value(serde_json::json!({
+            "skip_cloud": true,
+            "volumes": ["vol-a", "vol-b"],
+        }))
+        .expect("full body deserializes");
+        assert!(params.skip_cloud);
+        assert_eq!(params.volumes, vec!["vol-a", "vol-b"]);
+    }
+
+    #[test]
+    fn verify_params_default_impl_matches_empty_body() {
+        let from_default = VerifyParams::default();
+        assert!(!from_default.skip_cloud);
+        assert!(from_default.volumes.is_empty());
+    }
+
+    #[test]
+    fn verify_params_rejects_wrong_type() {
+        // `skip_cloud` is a bool — a string must fail to deserialize.
+        let bad = serde_json::from_value::<VerifyParams>(serde_json::json!({
+            "skip_cloud": "yes",
+        }));
+        assert!(bad.is_err());
+    }
+}

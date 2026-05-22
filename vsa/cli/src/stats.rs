@@ -189,3 +189,90 @@ fn print_skipped(r: &StatsReport) {
     }
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_bytes_scales_each_unit() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.00 KiB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.00 MiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024 * 1024), "2.00 TiB");
+    }
+
+    #[test]
+    fn fmt_ratio_handles_zero_and_real_dividends() {
+        assert_eq!(fmt_ratio(100, 0), "—");
+        assert_eq!(fmt_ratio(0, 10), "0.00x");
+        assert_eq!(fmt_ratio(1000, 250), "4.00x");
+    }
+
+    /// A populated report deserializes from the daemon's JSON shape and
+    /// renders without panicking through every print branch.
+    #[test]
+    fn stats_report_round_trips_and_prints() {
+        let json = serde_json::json!({
+            "backends": [{
+                "backend": "primary",
+                "volumes_global": 1,
+                "volumes_local": 2,
+                "allocated_pages": 30,
+                "logical_bytes": 3_000_000u64,
+                "unique_pool_bytes": 1_000_000u64,
+            }],
+            "volumes": [{
+                "volume": "vol-a",
+                "backend": "primary",
+                "scope": "local",
+                "allocated_pages": 10,
+                "logical_bytes": 1_000_000u64,
+                "volume_unique_bytes": 800_000u64,
+                "exclusive_bytes": 600_000u64,
+                "shared_bytes": 200_000u64,
+            }],
+            "skipped": [{ "volume": "vol-bad", "reason": "manifest unreadable" }],
+        });
+        let report: StatsReport =
+            serde_json::from_value(json).expect("daemon stats shape deserializes");
+        assert_eq!(report.backends.len(), 1);
+        assert_eq!(report.volumes.len(), 1);
+        assert_eq!(report.skipped.len(), 1);
+        // Exercises the populated-backend + per-volume + skipped branches.
+        print_human(&report);
+    }
+
+    /// An empty report exercises the "No volumes found" early-return path.
+    #[test]
+    fn empty_report_prints_no_volumes() {
+        let report = StatsReport {
+            backends: vec![],
+            volumes: vec![],
+            skipped: vec![],
+        };
+        print_human(&report);
+        // Empty backends + a skip entry: the "No volumes found" branch
+        // still surfaces the skipped list.
+        let report = StatsReport {
+            backends: vec![],
+            volumes: vec![],
+            skipped: vec![SkippedVolume {
+                volume: "v".into(),
+                reason: "io error".into(),
+            }],
+        };
+        print_human(&report);
+    }
+
+    #[test]
+    fn default_backend_stats_zeroes_out() {
+        let b = BackendStats::default();
+        assert_eq!(b.backend, "");
+        assert_eq!(b.allocated_pages, 0);
+        assert_eq!(b.logical_bytes, 0);
+        assert_eq!(b.unique_pool_bytes, 0);
+    }
+}
