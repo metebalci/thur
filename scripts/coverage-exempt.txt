@@ -1,0 +1,4 @@
+# Coverage-exempt files — reviewed as trivial (pure re-exports, or bare
+# type/enum/const/error definitions with no executable logic). These are
+# excluded from the "no zero-test module" rule by scripts/coverage.sh --zero.
+# One repo-relative path per line.

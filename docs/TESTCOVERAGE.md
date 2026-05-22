@@ -18,10 +18,13 @@ every push.
 
 The figures below are **line coverage measured by `cargo llvm-cov`**
 over the `cargo test` suite — a snapshot of 2026-05-22. Reproduce it
-with:
+with `scripts/coverage.sh`:
 
 ```bash
-cargo llvm-cov --workspace --summary-only
+scripts/coverage.sh            # per-file table (cargo llvm-cov --summary-only)
+scripts/coverage.sh --crates   # per-crate line % against the tier floors
+scripts/coverage.sh --gate     # same, but exit 1 if any crate is below floor
+scripts/coverage.sh --zero     # source files with no #[cfg(test)] block
 ```
 
 **Overall: 55% line, 59% region.** That single figure needs the
@@ -110,6 +113,27 @@ and `core-block`'s verify tests exercise it. The 0% crates — the CLI
 helper crates, `shared-admin-audit`, `shared-admin-iscsi`,
 `shared-cloud-bench` — are thin cross-product glue reached only through
 their consumers and the end-to-end suites.
+
+## Coverage floors
+
+Every crate has a **line-coverage floor**, and every non-trivial source
+file must carry at least one `#[cfg(test)]` block. `scripts/coverage.sh`
+measures both; `--zero` lists files with no test block, minus the
+reviewed-trivial paths in `scripts/coverage-exempt.txt` (pure re-export
+`lib.rs` files and bare type / enum / const / error definitions).
+
+| Tier | Crates | Floor |
+|---|---|---|
+| Critical — core | `core/stream`, `core/mediachanger`, `core/block` | 80% |
+| Critical — protocol | `scsi/*`, `nvme/*` | 80% |
+| Critical — shared | `crypto`, `pool`, `iscsi`, `audit`, `keystore`, `cloud` | 80% |
+| Standard — shared | all other `shared/*` crates | 50% |
+| Products | `vtl/daemon`, `vtl/cli`, `vsa/daemon`, `vsa/cli` | 30% |
+
+The product daemons and CLIs carry the lower 30% floor because their
+request paths are exercised by the end-to-end shell suites, which
+`cargo llvm-cov` does not instrument — the unit-test floor covers only
+their pure logic (config parsing, registries, job-argument handling).
 
 ## Known gaps
 
