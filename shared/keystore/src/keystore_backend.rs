@@ -204,3 +204,115 @@ impl Clone for Box<dyn KeyStoreBackend> {
         self.clone_box()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::KeyStoreError;
+
+    #[test]
+    fn dek_source_as_str_round_trips_parse() {
+        for src in [DekSource::Daemon, DekSource::Backend] {
+            let s = src.as_str();
+            assert_eq!(DekSource::parse(s), Some(src));
+        }
+        assert_eq!(DekSource::Daemon.as_str(), "daemon");
+        assert_eq!(DekSource::Backend.as_str(), "backend");
+    }
+
+    #[test]
+    fn dek_source_parse_rejects_unknown() {
+        assert_eq!(DekSource::parse("hsm"), None);
+        assert_eq!(DekSource::parse(""), None);
+        assert_eq!(DekSource::parse("Daemon"), None);
+    }
+
+    #[test]
+    fn dek_len_matches_aes256() {
+        assert_eq!(DEK_LEN, 32);
+    }
+
+    #[test]
+    fn secret_bytes_new_and_borrow() {
+        let raw = [0x5Au8; DEK_LEN];
+        let secret = SecretBytes::new(raw);
+        assert_eq!(secret.as_bytes(), &raw);
+        assert_eq!(secret.0, raw);
+    }
+
+    #[test]
+    fn secret_bytes_debug_is_redacted() {
+        let secret = SecretBytes::new([0xFFu8; DEK_LEN]);
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "SecretBytes(<redacted>)");
+        // The raw byte value must not leak into the Debug output.
+        assert!(!rendered.contains("255"));
+        assert!(!rendered.to_lowercase().contains("ff ff"));
+    }
+
+    /// Minimal backend so the trait's default `manages_local_blob` and
+    /// the `Clone for Box<dyn KeyStoreBackend>` blanket impl are
+    /// exercised without standing up a real keystore.
+    #[derive(Debug, Clone)]
+    struct StubBackend;
+
+    #[async_trait]
+    impl KeyStoreBackend for StubBackend {
+        async fn generate_and_wrap(
+            &self,
+            _wrap_context: &[u8; 16],
+            _source: DekSource,
+        ) -> Result<(SecretBytes, Vec<u8>), KeyStoreError> {
+            Ok((SecretBytes::new([0u8; DEK_LEN]), Vec::new()))
+        }
+
+        async fn wrap(
+            &self,
+            _wrap_context: &[u8; 16],
+            _plaintext: &SecretBytes,
+        ) -> Result<Vec<u8>, KeyStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn unwrap(
+            &self,
+            _wrap_context: &[u8; 16],
+            _wrapped: &[u8],
+        ) -> Result<SecretBytes, KeyStoreError> {
+            Ok(SecretBytes::new([0u8; DEK_LEN]))
+        }
+
+        async fn forget(&self, _wrap_context: &[u8; 16]) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+
+        fn backend_type(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn health_check(&self) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+
+        fn wrap_target_fingerprint(&self) -> String {
+            "stub:fixture".to_string()
+        }
+
+        fn clone_box(&self) -> Box<dyn KeyStoreBackend> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn manages_local_blob_defaults_false() {
+        assert!(!StubBackend.manages_local_blob());
+    }
+
+    #[test]
+    fn boxed_backend_clones_via_clone_box() {
+        let boxed: Box<dyn KeyStoreBackend> = Box::new(StubBackend);
+        let cloned = boxed.clone();
+        assert_eq!(cloned.backend_type(), "stub");
+        assert_eq!(cloned.wrap_target_fingerprint(), "stub:fixture");
+    }
+}

@@ -341,6 +341,245 @@ where
 mod tests {
     use super::*;
     use crate::error::KeyStoreFailureKind;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn fixture_uuid() -> [u8; 16] {
+        [0x33; 16]
+    }
+
+    fn fixture_key() -> [u8; DEK_LEN] {
+        let mut k = [0u8; DEK_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7);
+        }
+        k
+    }
+
+    /// Build a KMS backend pointed at a wiremock server. KMS speaks
+    /// AWS JSON 1.1 over plain HTTP POST to `/`; the SDK is happy to
+    /// talk to any endpoint we hand it.
+    async fn backend_for(server: &MockServer) -> AwsKmsBackend {
+        AwsKmsBackend::new(
+            "alias/thurvsa-kek".into(),
+            "us-east-1".into(),
+            Some(server.uri()),
+            Some(ResolvedAwsKmsAuth::Static {
+                access_key_id: "AKIDTEST".into(),
+                secret_access_key: "SECRETTEST".into(),
+                session_token: None,
+            }),
+        )
+        .await
+        .expect("construct KMS backend")
+    }
+
+    #[tokio::test]
+    async fn wrap_round_trips_through_wiremock() {
+        let server = MockServer::start().await;
+        // KMS Encrypt: the ciphertext_blob comes back base64 in the
+        // AWS JSON wire form.
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Encrypt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyId": "alias/thurvsa-kek",
+                "CiphertextBlob": B64.encode(b"kms-wrapped-blob"),
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let wrapped = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("wrap");
+        assert_eq!(wrapped, b"kms-wrapped-blob");
+    }
+
+    #[tokio::test]
+    async fn unwrap_round_trips_through_wiremock() {
+        let server = MockServer::start().await;
+        let key = fixture_key();
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Decrypt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyId": "alias/thurvsa-kek",
+                "Plaintext": B64.encode(key),
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let plain = backend
+            .unwrap(&fixture_uuid(), b"kms-wrapped-blob")
+            .await
+            .expect("unwrap");
+        assert_eq!(plain.as_bytes(), &key);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_daemon_uses_encrypt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Encrypt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyId": "alias/thurvsa-kek",
+                "CiphertextBlob": B64.encode(b"daemon-wrapped"),
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let (plain, wrapped) = backend
+            .generate_and_wrap(&fixture_uuid(), DekSource::Daemon)
+            .await
+            .expect("generate");
+        assert_eq!(wrapped, b"daemon-wrapped");
+        // The daemon-side path mints 32 bytes from OsRng.
+        assert_eq!(plain.as_bytes().len(), DEK_LEN);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_backend_uses_generate_data_key() {
+        let server = MockServer::start().await;
+        let key = fixture_key();
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.GenerateDataKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyId": "alias/thurvsa-kek",
+                "Plaintext": B64.encode(key),
+                "CiphertextBlob": B64.encode(b"hsm-wrapped"),
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let (plain, wrapped) = backend
+            .generate_and_wrap(&fixture_uuid(), DekSource::Backend)
+            .await
+            .expect("generate via data key");
+        assert_eq!(plain.as_bytes(), &key);
+        assert_eq!(wrapped, b"hsm-wrapped");
+    }
+
+    #[tokio::test]
+    async fn health_check_calls_describe_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.DescribeKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyMetadata": { "KeyId": "alias/thurvsa-kek" }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        backend.health_check().await.expect("describe-key OK");
+    }
+
+    #[tokio::test]
+    async fn forget_is_a_noop() {
+        let server = MockServer::start().await;
+        let backend = backend_for(&server).await;
+        // KMS holds no per-context state — forget never touches the
+        // network.
+        backend.forget(&fixture_uuid()).await.expect("noop forget");
+    }
+
+    #[tokio::test]
+    async fn access_denied_classifies_as_authz() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Encrypt"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "__type": "AccessDeniedException",
+                "message": "no kms:Encrypt for this principal",
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let err = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect_err("access denied");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn not_found_classifies_as_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Decrypt"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "__type": "NotFoundException",
+                "message": "key id not found",
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let err = backend
+            .unwrap(&fixture_uuid(), b"blob")
+            .await
+            .expect_err("not found");
+        assert_eq!(err.kind(), KeyStoreFailureKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn throttling_classifies_as_retryable_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Encrypt"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "__type": "ThrottlingException",
+                "message": "rate exceeded",
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let err = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect_err("throttled");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Other);
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn unwrap_rejects_wrong_length_plaintext() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "TrentService.Decrypt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "KeyId": "alias/thurvsa-kek",
+                "Plaintext": B64.encode(b"too-short"),
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = backend_for(&server).await;
+        let err = backend
+            .unwrap(&fixture_uuid(), b"blob")
+            .await
+            .expect_err("short plaintext");
+        match err {
+            KeyStoreError::Other(msg) => assert!(msg.contains("expected 32")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_type_is_awskms() {
+        let server = MockServer::start().await;
+        let backend = backend_for(&server).await;
+        assert_eq!(backend.backend_type(), "awskms");
+        assert_eq!(backend.clone_box().backend_type(), "awskms");
+    }
 
     #[test]
     fn context_carries_volume_uuid_hex() {

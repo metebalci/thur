@@ -732,4 +732,334 @@ mod tests {
         let err = backend.health_check().await.unwrap_err();
         assert!(format!("{err}").contains("sealed"));
     }
+
+    async fn token_backend(server: &MockServer) -> VaultBackend {
+        VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .expect("construct token-auth backend")
+    }
+
+    #[tokio::test]
+    async fn health_check_501_is_uninitialized_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let err = backend.health_check().await.expect_err("501 is fatal");
+        assert!(format!("{err}").contains("not initialized"));
+    }
+
+    #[tokio::test]
+    async fn health_check_other_status_classifies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("denied"))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let err = backend.health_check().await.expect_err("403 is fatal");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
+    }
+
+    #[tokio::test]
+    async fn datakey_backend_source_round_trips() {
+        let server = MockServer::start().await;
+        let plaintext_b64 = B64.encode(fixture_key());
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/datakey/plaintext/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "plaintext": plaintext_b64,
+                    "ciphertext": "vault:v1:DATAKEY",
+                }
+            })))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let (plain, wrapped) = backend
+            .generate_and_wrap(&fixture_uuid(), DekSource::Backend)
+            .await
+            .expect("datakey");
+        assert_eq!(plain.as_bytes(), &fixture_key());
+        assert_eq!(wrapped, b"vault:v1:DATAKEY");
+    }
+
+    #[tokio::test]
+    async fn generate_daemon_source_uses_encrypt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "ciphertext": "vault:v1:DAEMONKEY" }
+            })))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let (plain, wrapped) = backend
+            .generate_and_wrap(&fixture_uuid(), DekSource::Daemon)
+            .await
+            .expect("encrypt path");
+        assert_eq!(plain.as_bytes().len(), DEK_LEN);
+        assert_eq!(wrapped, b"vault:v1:DAEMONKEY");
+    }
+
+    #[tokio::test]
+    async fn unwrap_rejects_wrong_length_plaintext() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/decrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "plaintext": B64.encode(b"short") }
+            })))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let err = backend
+            .unwrap(&fixture_uuid(), b"vault:v1:X")
+            .await
+            .expect_err("short plaintext");
+        match err {
+            KeyStoreError::Other(msg) => assert!(msg.contains("expected 32")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unwrap_rejects_non_utf8_blob() {
+        let server = MockServer::start().await;
+        let backend = token_backend(&server).await;
+        // 0xFF is not valid UTF-8: the decrypt path rejects before any
+        // network call.
+        let err = backend
+            .unwrap(&fixture_uuid(), &[0xFF, 0xFE])
+            .await
+            .expect_err("non-utf8 blob");
+        match err {
+            KeyStoreError::Other(msg) => assert!(msg.contains("not UTF-8")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_classifies_as_retryable_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let err = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect_err("500");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Other);
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn token_auth_does_not_refresh_on_403() {
+        // Static-token auth: a 403 fails fast, no AppRole re-login.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("perm denied"))
+            .mount(&server)
+            .await;
+        let backend = token_backend(&server).await;
+        let err = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect_err("403");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
+    }
+
+    #[tokio::test]
+    async fn approle_login_mints_initial_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": { "client_token": "s.approle-token" }
+            })))
+            .mount(&server)
+            .await;
+        // The encrypt call must carry the AppRole-minted token.
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .and(header("x-vault-token", "s.approle-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "ciphertext": "vault:v1:APPROLE" }
+            })))
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::AppRole {
+                role_id: "role-1".into(),
+                secret_id: "secret-1".into(),
+            },
+        )
+        .await
+        .expect("approle login");
+        let wrapped = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("wrap with approle token");
+        assert_eq!(wrapped, b"vault:v1:APPROLE");
+    }
+
+    #[tokio::test]
+    async fn approle_login_failure_classifies() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid role"))
+            .mount(&server)
+            .await;
+        let err = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::AppRole {
+                role_id: "bad".into(),
+                secret_id: "bad".into(),
+            },
+        )
+        .await
+        .expect_err("login must fail");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Other);
+    }
+
+    #[tokio::test]
+    async fn approle_refreshes_token_on_403_then_retries() {
+        // The first encrypt 403s; the backend re-logs in via AppRole
+        // and retries. The 403 mock is capped at one hit and given a
+        // lower priority so the header-matched success mock answers
+        // the post-refresh retry.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": { "client_token": "s.fresh-token" }
+            })))
+            .mount(&server)
+            .await;
+        // The retry carries the fresh token and succeeds.
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .and(header("x-vault-token", "s.fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "ciphertext": "vault:v1:RETRIED" }
+            })))
+            .mount(&server)
+            .await;
+        // The initial call 403s exactly once, forcing the refresh.
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("token expired"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::AppRole {
+                role_id: "role-1".into(),
+                secret_id: "secret-1".into(),
+            },
+        )
+        .await
+        .expect("initial approle login");
+        let wrapped = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("retry after refresh");
+        assert_eq!(wrapped, b"vault:v1:RETRIED");
+    }
+
+    #[tokio::test]
+    async fn classify_reqwest_err_connect_is_network() {
+        // No server listening on this port — reqwest fails to connect.
+        let backend = VaultBackend::new(
+            "http://127.0.0.1:1".into(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .expect("construct (no eager connect for token auth)");
+        let err = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect_err("connection refused");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Network);
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn forget_is_a_noop() {
+        let server = MockServer::start().await;
+        let backend = token_backend(&server).await;
+        backend.forget(&fixture_uuid()).await.expect("noop");
+    }
+
+    #[tokio::test]
+    async fn backend_type_and_clone_box() {
+        let server = MockServer::start().await;
+        let backend = token_backend(&server).await;
+        assert_eq!(backend.backend_type(), "vault");
+        assert_eq!(backend.clone_box().backend_type(), "vault");
+    }
+
+    #[tokio::test]
+    async fn namespace_header_is_sent_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .and(header("x-vault-namespace", "team-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "ciphertext": "vault:v1:NS" }
+            })))
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            Some("team-b".into()),
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .expect("construct");
+        let wrapped = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("wrap with namespace");
+        assert_eq!(wrapped, b"vault:v1:NS");
+    }
 }

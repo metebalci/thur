@@ -422,6 +422,100 @@ mod tests {
         assert_eq!(f1, f2, "trailing-slash variants must fold");
     }
 
+    #[test]
+    fn data_dir_returns_anchor_path() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        assert_eq!(backend.data_dir(), dir.path());
+    }
+
+    #[tokio::test]
+    async fn health_check_ok_on_missing_keys_dir() {
+        // Brand-new daemon: no encrypted volume yet, so `keys/` does
+        // not exist. health_check treats that as healthy.
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        backend.health_check().await.expect("missing dir is OK");
+    }
+
+    #[tokio::test]
+    async fn health_check_ok_after_wrap() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("wrap");
+        // `wrap` created `keys/` at mode 0700 — health_check passes.
+        backend.health_check().await.expect("0700 keys dir is OK");
+    }
+
+    #[tokio::test]
+    async fn health_check_flags_keys_dir_mode_drift() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .expect("wrap");
+        // Operator (or a backup tool) loosened the keys dir perms.
+        let kdir = backend.dir();
+        let mut p = fs::metadata(&kdir).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&kdir, p).unwrap();
+        let err = backend.health_check().await.expect_err("drift must fail");
+        match err {
+            KeyStoreError::Other(msg) => assert!(msg.contains("755")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_persists_a_loadable_key() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let uuid = fixture_uuid();
+        // `local` ignores DekSource::Backend (no remote RNG).
+        let (minted, wrapped) = backend
+            .generate_and_wrap(&uuid, DekSource::Backend)
+            .await
+            .expect("generate");
+        assert!(wrapped.is_empty(), "local wrap blob is always empty");
+        let loaded = backend.unwrap(&uuid, &[]).await.expect("unwrap");
+        assert_eq!(loaded.as_bytes(), minted.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn backend_type_and_manages_local_blob() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        assert_eq!(backend.backend_type(), "local");
+        assert!(backend.manages_local_blob());
+    }
+
+    #[tokio::test]
+    async fn clone_box_yields_equivalent_backend() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let boxed = backend.clone_box();
+        assert_eq!(boxed.backend_type(), "local");
+        assert_eq!(
+            boxed.wrap_target_fingerprint(),
+            backend.wrap_target_fingerprint()
+        );
+    }
+
+    #[tokio::test]
+    async fn unwrap_missing_key_file_is_io_error() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let err = backend
+            .unwrap(&fixture_uuid(), &[])
+            .await
+            .expect_err("no key file");
+        assert!(matches!(err, KeyStoreError::Io(_)));
+    }
+
     #[tokio::test]
     async fn generate_returns_unique_keys() {
         let dir = TempDir::new().unwrap();
