@@ -128,3 +128,70 @@ pub async fn run(emitter: JobEmitter, _body: serde_json::Value, state: Arc<Daemo
         emitter.emit(JobEvent::done_with_error(1, summary)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{DaemonState, DaemonStateConfig};
+    use core_mediachanger::{AuditRateLimiter, CloudConfig};
+    use scsi_smc::changer::ElementAddressConfig;
+    use shared_admin_server::JobRegistry;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{Mutex as TokioMutex, broadcast};
+
+    /// Build a `DaemonState` with an empty `CloudConfig` — the cloud
+    /// check then iterates zero backends and takes the all-passed
+    /// branch.
+    fn empty_state(dir: &std::path::Path) -> Arc<DaemonState> {
+        let lib_root = dir.join("library");
+        let tapes_root = dir.join("tapes");
+        let library = core_mediachanger::Library::initialize(
+            &lib_root,
+            &tapes_root,
+            5,
+            0,
+            1,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .expect("init library");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let cfg = DaemonStateConfig {
+            data_dir: dir.to_path_buf(),
+            tapes_root,
+            library: Arc::new(Mutex::new(library)),
+            element_config: ElementAddressConfig::new(0, 1001, 5, 101, 0, 1, 1),
+            target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
+            listen_address: "0.0.0.0:3260".to_string(),
+            event_tx,
+            audit_log: None,
+            audit_dir: dir.join("audit"),
+            audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
+            cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
+            cloud_config: Arc::new(CloudConfig::default()),
+            keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
+            num_drives: 1,
+            drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,
+            drive_compression_zstd_level: 3,
+            pool_budgets: HashMap::new(),
+            backpressure_max_wait: Duration::from_secs(30),
+        };
+        Arc::new(DaemonState::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn cloud_check_passes_with_no_backends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = empty_state(dir.path());
+        let registry = JobRegistry::new();
+        let (_id, _started, emitter) = registry.create("system.cloud_check").await;
+        run(emitter, serde_json::json!({}), state).await;
+        // The job reaches a terminal Done event without panicking.
+    }
+}

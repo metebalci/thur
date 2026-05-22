@@ -125,3 +125,38 @@ async fn finish(emitter: &JobEmitter, report: core_mediachanger::verify::VerifyR
     let exit = if errors > 0 { 1 } else { 0 };
     emitter.emit(JobEvent::done(exit)).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_params_default() {
+        let p = VerifyParams::default();
+        assert!(!p.skip_cloud);
+        assert!(p.barcodes.is_empty());
+    }
+
+    #[test]
+    fn verify_params_empty_json_uses_defaults() {
+        let p: VerifyParams = serde_json::from_value(serde_json::json!({})).expect("empty body");
+        assert!(!p.skip_cloud);
+        assert!(p.barcodes.is_empty());
+    }
+
+    #[test]
+    fn verify_params_parses_skip_cloud_and_barcodes() {
+        let p: VerifyParams =
+            serde_json::from_value(serde_json::json!({"skip_cloud": true, "barcodes": ["A", "B"]}))
+                .expect("explicit body");
+        assert!(p.skip_cloud);
+        assert_eq!(p.barcodes, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn verify_params_rejects_non_array_barcodes() {
+        assert!(
+            serde_json::from_value::<VerifyParams>(serde_json::json!({"barcodes": "A"})).is_err()
+        );
+    }
+}

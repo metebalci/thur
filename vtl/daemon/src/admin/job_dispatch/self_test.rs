@@ -136,3 +136,36 @@ async fn finish_self_test(
         emitter.emit(JobEvent::done(1)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_self_test_params_parses_drive_id() {
+        let p: DriveSelfTestParams =
+            serde_json::from_value(serde_json::json!({"drive": 3})).expect("body");
+        assert_eq!(p.drive, 3);
+    }
+
+    #[test]
+    fn drive_self_test_params_requires_drive() {
+        assert!(serde_json::from_value::<DriveSelfTestParams>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn drive_self_test_params_rejects_negative_drive() {
+        assert!(
+            serde_json::from_value::<DriveSelfTestParams>(serde_json::json!({"drive": -1}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn drive_self_test_params_rejects_string_drive() {
+        assert!(
+            serde_json::from_value::<DriveSelfTestParams>(serde_json::json!({"drive": "two"}))
+                .is_err()
+        );
+    }
+}

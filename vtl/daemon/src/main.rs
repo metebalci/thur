@@ -2084,4 +2084,139 @@ mod config_parse_tests {
             serde_yaml::from_str(&yaml).expect("daemon must parse thurvtl.defaults.yaml");
         assert_eq!(cfg.data_dir, "/tmp/thur-test");
     }
+
+    #[test]
+    fn minimal_yaml_only_data_dir_fills_every_default() {
+        // A bare `data_dir:` config: every other section must take
+        // its `#[serde(default)]` fallback.
+        let cfg: Config =
+            serde_yaml::from_str("data_dir: /srv/thur\n").expect("minimal config parses");
+        assert_eq!(cfg.data_dir, "/srv/thur");
+        assert_eq!(cfg.audit.retention_days, default_audit_retention_days());
+        assert!(cfg.audit.compress_rotated);
+        assert_eq!(
+            cfg.memory_buffers.write_gb_per_tape,
+            default_write_gb_per_tape()
+        );
+        assert_eq!(
+            cfg.memory_buffers.read_gb_per_tape,
+            default_read_gb_per_tape()
+        );
+        // The optional sections default to absent.
+        assert!(cfg.iscsi.is_none());
+        assert!(cfg.http.is_none());
+        assert!(cfg.drive.is_none());
+    }
+
+    #[test]
+    fn iscsi_config_block_fills_serde_defaults() {
+        let cfg: Config = serde_yaml::from_str("data_dir: /srv/thur\niscsi: {}\n")
+            .expect("config with empty iscsi block");
+        let iscsi = cfg.iscsi.expect("iscsi block present");
+        assert_eq!(iscsi.listen, default_iscsi_listen());
+        assert_eq!(iscsi.target_iqn, default_target_iqn());
+        assert_eq!(iscsi.max_sessions, default_max_sessions());
+    }
+
+    #[test]
+    fn http_config_block_fills_serde_defaults() {
+        let cfg: Config = serde_yaml::from_str("data_dir: /srv/thur\nhttp: {}\n")
+            .expect("config with empty http block");
+        let http = cfg.http.expect("http block present");
+        assert_eq!(http.listen, default_http_listen());
+    }
+
+    #[test]
+    fn config_default_helper_values() {
+        assert!(default_true());
+        assert!(default_audit_compress_rotated());
+        assert_eq!(default_audit_retention_days(), 90);
+        assert_eq!(default_otlp_protocol(), "grpc");
+        assert_eq!(default_otlp_interval_seconds(), 30);
+        assert_eq!(default_session_timeout(), 300);
+        assert_eq!(default_max_sessions(), 10);
+        assert_eq!(
+            default_drive_compression_algorithm(),
+            core_mediachanger::CompressionAlgo::Lz4
+        );
+        assert!(default_otlp_endpoint().contains("4317"));
+        assert!(!default_chap_algorithms().is_empty());
+    }
+
+    #[test]
+    fn args_get_config_path_override_and_default() {
+        let args = Args {
+            config: Some("/etc/x.yaml".to_string()),
+            test: false,
+        };
+        assert_eq!(args.get_config_path(), "/etc/x.yaml");
+        let args = Args {
+            config: None,
+            test: false,
+        };
+        assert_eq!(
+            args.get_config_path(),
+            shared_naming::TAPE_LIBRARY.config_path
+        );
+    }
+
+    #[test]
+    fn args_clap_parses_config_and_test_flags() {
+        use clap::Parser;
+        let args = Args::parse_from(["thurvtld", "--config", "/tmp/c.yaml", "--test"]);
+        assert_eq!(args.config.as_deref(), Some("/tmp/c.yaml"));
+        assert!(args.test);
+        let args = Args::parse_from(["thurvtld"]);
+        assert!(args.config.is_none());
+        assert!(!args.test);
+    }
+
+    #[test]
+    fn read_cartridge_backend_missing_manifest_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_cartridge_backend(dir.path(), "ABSENT").is_none());
+    }
+
+    #[test]
+    fn read_cartridge_backend_reads_backend_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tape = dir.path().join("TAPE001");
+        std::fs::create_dir_all(&tape).expect("mkdir tape");
+        std::fs::write(tape.join("manifest.json"), r#"{"backend":"s3b"}"#).expect("write manifest");
+        assert_eq!(
+            read_cartridge_backend(dir.path(), "TAPE001"),
+            Some("s3b".to_string())
+        );
+    }
+
+    #[test]
+    fn read_cartridge_backend_empty_backend_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tape = dir.path().join("TAPE001");
+        std::fs::create_dir_all(&tape).expect("mkdir tape");
+        std::fs::write(tape.join("manifest.json"), r#"{"backend":""}"#).expect("write manifest");
+        assert!(read_cartridge_backend(dir.path(), "TAPE001").is_none());
+    }
+
+    #[test]
+    fn read_cartridge_backend_malformed_json_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tape = dir.path().join("TAPE001");
+        std::fs::create_dir_all(&tape).expect("mkdir tape");
+        std::fs::write(tape.join("manifest.json"), "{not json").expect("write manifest");
+        assert!(read_cartridge_backend(dir.path(), "TAPE001").is_none());
+    }
+
+    #[test]
+    fn emit_audit_ratelimit_rollup_noop_without_log() {
+        let rollup = core_mediachanger::AuditRateLimitRollup {
+            op: "scsi.move_medium".to_string(),
+            actor: core_mediachanger::AuditActor::cli("tester".to_string()),
+            key: "drive-0".to_string(),
+            suppressed_count: 7,
+            window_seconds: 60,
+        };
+        // No audit channel — must return without panicking.
+        emit_audit_ratelimit_rollup(None, &rollup);
+    }
 }

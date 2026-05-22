@@ -245,3 +245,69 @@ fn print_human(r: &VerifyReport, verbose: bool) {
         r.gc_hint_count(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_human_handles_empty_report() {
+        let report = VerifyReport::default();
+        // No cartridges, no pools, library.json absent — exercises
+        // the MISSING branches.
+        print_human(&report, false);
+        assert_eq!(report.error_count(), 0);
+    }
+
+    #[test]
+    fn print_human_renders_present_library_and_cartridges() {
+        // Build a populated report via JSON so the test doesn't have
+        // to enumerate every field of the (large) report structs.
+        let report: VerifyReport = serde_json::from_value(serde_json::json!({
+            "library": {
+                "library_json_present": true,
+                "inventory_json_present": true,
+                "num_storage_slots": 40,
+                "num_mail_slots": 5,
+                "num_drives": 3,
+                "missing_cartridges": ["GHOST1"],
+                "orphan_cartridges": ["ORPHAN1"],
+                "errors": ["a library error"],
+                "warnings": ["a library warning"],
+            },
+            "cartridges": [{
+                "dir": "TAPE001",
+                "label": "TAPE001",
+                "backend": "s3b",
+                "dedup": "global",
+                "manifest_ok": true,
+                "chunks_idx_present": true,
+                "chunks_idx_records": 10,
+                "chunks_with_hash": 10,
+                "partitions": [],
+                "local_chunks_missing": 0,
+                "local_chunks_size_mismatch": 0,
+                "cloud_chunks_missing": null,
+                "cloud_index_pages_missing": null,
+                "cloud_sentinel_present": null,
+                "errors": ["e1", "e2", "e3", "e4"],
+                "warnings": [],
+            }],
+            "pool": [],
+        }))
+        .expect("populated verify report");
+        // verbose=false caps printed errors at 3.
+        print_human(&report, false);
+        // verbose=true prints partitions + all errors.
+        print_human(&report, true);
+        assert_eq!(report.error_count(), 5);
+    }
+
+    #[test]
+    fn verify_report_round_trips_through_json() {
+        let report = VerifyReport::default();
+        let json = serde_json::to_value(&report).expect("serialize");
+        let back: VerifyReport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.cartridges.len(), 0);
+    }
+}

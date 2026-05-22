@@ -591,3 +591,130 @@ fn print_legal_hold_mutate(verb: &str, barcode: &str, resp: &LegalHoldMutateResp
         eprintln!("  [FAIL] {}: {}", f.key, f.error);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_admin_proto::JobEvent;
+
+    #[test]
+    fn cartridge_defaults() {
+        assert_eq!(default_cartridge_chunk_size_mb(), 8);
+        assert_eq!(default_cartridge_chunking(), "fastcdc");
+        assert_eq!(default_cartridge_dedup(), "global");
+    }
+
+    #[test]
+    fn render_job_event_handles_every_variant() {
+        // Smoke: each arm should not panic.
+        render_job_event(JobEvent::Log {
+            level: "info".to_string(),
+            message: "hello".to_string(),
+        });
+        render_job_event(JobEvent::Log {
+            level: "warn".to_string(),
+            message: "careful".to_string(),
+        });
+        render_job_event(JobEvent::Done {
+            exit_code: 1,
+            error: Some("boom".to_string()),
+        });
+        render_job_event(JobEvent::Done {
+            exit_code: 0,
+            error: None,
+        });
+        render_job_event(JobEvent::Progress {
+            stage: "upload".to_string(),
+            current: 1,
+            total: Some(2),
+        });
+    }
+
+    #[test]
+    fn print_legal_hold_mutate_with_failures() {
+        let resp: LegalHoldMutateResp = serde_json::from_value(serde_json::json!({
+            "barcode": "TAPE001",
+            "backend": "s3b",
+            "key_count": 3,
+            "succeeded": 2,
+            "failed": 1,
+            "sentinel_present": true,
+            "failures": [{"key": "chunks/aa/bb.dat", "error": "access denied"}],
+        }))
+        .expect("parse mutate resp");
+        print_legal_hold_mutate("Engaged", "TAPE001", &resp);
+        assert_eq!(resp.failed, 1);
+    }
+
+    #[test]
+    fn print_legal_hold_mutate_all_succeeded() {
+        let resp: LegalHoldMutateResp = serde_json::from_value(serde_json::json!({
+            "barcode": "TAPE001",
+            "backend": "s3b",
+            "key_count": 5,
+            "succeeded": 5,
+            "failed": 0,
+            "sentinel_present": true,
+        }))
+        .expect("parse mutate resp");
+        print_legal_hold_mutate("Released", "TAPE001", &resp);
+        assert!(resp.failures.is_empty());
+    }
+
+    #[test]
+    fn cartridge_list_response_round_trips() {
+        let resp = CartridgeListResponse {
+            cartridges: vec![CartridgeListResponseItem {
+                barcode: "TAPE001".to_string(),
+                location: "storage".to_string(),
+                slot_id: 3,
+            }],
+        };
+        let json = serde_json::to_value(&resp).expect("serialize");
+        let back: CartridgeListResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.cartridges.len(), 1);
+        assert_eq!(back.cartridges[0].barcode, "TAPE001");
+    }
+
+    #[test]
+    fn legal_hold_status_resp_deserializes_each_mode() {
+        let sentinel: LegalHoldStatusResp = serde_json::from_value(serde_json::json!({
+            "mode": "sentinel",
+            "barcode": "T1",
+            "backend": "s3b",
+            "held": true,
+        }))
+        .expect("sentinel mode");
+        assert!(matches!(
+            sentinel,
+            LegalHoldStatusResp::Sentinel { held: true, .. }
+        ));
+
+        let empty: LegalHoldStatusResp = serde_json::from_value(serde_json::json!({
+            "mode": "empty",
+            "barcode": "T1",
+            "backend": "s3b",
+        }))
+        .expect("empty mode");
+        assert!(matches!(empty, LegalHoldStatusResp::Empty { .. }));
+
+        let full: LegalHoldStatusResp = serde_json::from_value(serde_json::json!({
+            "mode": "full",
+            "barcode": "T1",
+            "backend": "s3b",
+            "held": 4,
+            "not_held": 1,
+            "errors": 0,
+            "details": [{"key": "chunks/aa.dat", "state": "held"}],
+        }))
+        .expect("full mode");
+        assert!(matches!(
+            full,
+            LegalHoldStatusResp::Full {
+                held: 4,
+                not_held: 1,
+                ..
+            }
+        ));
+    }
+}

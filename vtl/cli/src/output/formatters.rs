@@ -17,3 +17,25 @@ pub fn create_table() -> Table {
     table.apply_modifier(UTF8_ROUND_CORNERS);
     table
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_table_starts_empty_and_renders() {
+        let mut table = create_table();
+        table.set_header(vec!["A", "B"]);
+        table.add_row(vec!["1", "2"]);
+        let rendered = table.to_string();
+        assert!(rendered.contains('1'));
+        assert!(rendered.contains('2'));
+    }
+
+    #[test]
+    fn format_bytes_renders_iec_suffixes() {
+        assert!(format_bytes(0).contains('0'));
+        let kib = format_bytes(2048);
+        assert!(kib.contains("KiB") || kib.contains('2'));
+    }
+}

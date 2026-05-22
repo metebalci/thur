@@ -1082,3 +1082,109 @@ fn handle_log_sense(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
 // FIRST_BURST / MAX_BURST bounds) lifted to
 // `shared_iscsi::transport::tests` in Step 3c phase 2 alongside the
 // PDU/R2T code they cover.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_cfg() -> ElementAddressConfig {
+        ElementAddressConfig::new(0, 1001, 40, 101, 5, 1, 3)
+    }
+
+    #[test]
+    fn changer_page_1d_encodes_element_topology() {
+        let cfg = sample_cfg();
+        let mut out = Vec::new();
+        append_changer_page_1d(&mut out, &cfg);
+        // page code 0x1D, page length 0x12 (18), total 20 bytes.
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0], 0x1D);
+        assert_eq!(out[1], 0x12);
+        // storage_start at bytes 6..8 big-endian.
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 1001);
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 40);
+        // data_transfer_count at bytes 16..18.
+        assert_eq!(u16::from_be_bytes([out[16], out[17]]), 3);
+    }
+
+    #[test]
+    fn changer_page_1e_is_fixed_four_bytes() {
+        let mut out = Vec::new();
+        append_changer_page_1e(&mut out);
+        assert_eq!(out, vec![0x1E, 0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn changer_page_1f_is_twenty_bytes() {
+        let mut out = Vec::new();
+        append_changer_page_1f(&mut out);
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0], 0x1F);
+        assert_eq!(out[1], 0x12);
+    }
+
+    #[test]
+    fn changer_page_1c_is_tape_alert_twelve_bytes() {
+        let mut out = Vec::new();
+        append_changer_page_1c(&mut out);
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[0], 0x1C);
+        assert_eq!(out[1], 0x0A);
+    }
+
+    #[test]
+    fn changer_page_0a_sets_subpage_form_bit() {
+        let mut out = Vec::new();
+        append_changer_page_0a(&mut out);
+        assert_eq!(out.len(), 32);
+        // SPF bit (0x40) is set on byte 0.
+        assert_eq!(out[0], 0x40 | 0x0A);
+        assert_eq!(out[1], 0x01);
+    }
+
+    #[test]
+    fn build_changer_mode_pages_single_page() {
+        let cfg = sample_cfg();
+        let page = build_changer_mode_pages(0x1D, 0x00, &cfg).expect("page 1D exists");
+        assert_eq!(page[0], 0x1D);
+        assert_eq!(page.len(), 20);
+    }
+
+    #[test]
+    fn build_changer_mode_pages_all_pages_no_subpages() {
+        let cfg = sample_cfg();
+        let pages = build_changer_mode_pages(0x3F, 0x00, &cfg).expect("all pages");
+        // 0x1C(12) + 0x1D(20) + 0x1E(4) + 0x1F(20) = 56; no 0x0A subpage.
+        assert_eq!(pages.len(), 56);
+    }
+
+    #[test]
+    fn build_changer_mode_pages_all_pages_with_subpages() {
+        let cfg = sample_cfg();
+        let pages = build_changer_mode_pages(0x3F, 0xFF, &cfg).expect("all pages + subpages");
+        // Includes the 32-byte 0x0A subpage on top of the 56 above.
+        assert_eq!(pages.len(), 88);
+    }
+
+    #[test]
+    fn build_changer_mode_pages_subpage_only() {
+        let cfg = sample_cfg();
+        let page = build_changer_mode_pages(0x0A, 0x01, &cfg).expect("0x0A subpage");
+        assert_eq!(page.len(), 32);
+        assert_eq!(page[0], 0x40 | 0x0A);
+    }
+
+    #[test]
+    fn build_changer_mode_pages_unknown_page_is_none() {
+        let cfg = sample_cfg();
+        assert!(build_changer_mode_pages(0x55, 0x00, &cfg).is_none());
+    }
+
+    #[test]
+    fn build_changer_mode_pages_plain_page_with_subpage_query_is_none() {
+        let cfg = sample_cfg();
+        // A plain (SPF=0) page requested with a specific non-zero,
+        // non-0xFF subpage code yields nothing.
+        assert!(build_changer_mode_pages(0x1D, 0x07, &cfg).is_none());
+    }
+}

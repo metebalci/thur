@@ -157,3 +157,81 @@ fn print_library_summary(lib: &LibraryInfoResp, inv: &InventoryResp) {
     );
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_drives_status_renders_loaded_and_empty() {
+        let drives: DrivesListResp = serde_json::from_value(serde_json::json!({
+            "drives": [
+                {
+                    "id": 0,
+                    "loaded": true,
+                    "barcode": "TAPE001",
+                    "home_slot": 5,
+                    "next_lba": 100,
+                    "total_blocks": 1000,
+                },
+                {
+                    "id": 1,
+                    "loaded": false,
+                    "barcode": null,
+                    "home_slot": null,
+                    "next_lba": null,
+                    "total_blocks": null,
+                },
+            ],
+        }))
+        .expect("parse drives list");
+        // Exercises both the populated and "-" placeholder branches.
+        print_drives_status(&drives);
+        assert_eq!(drives.drives.len(), 2);
+    }
+
+    #[test]
+    fn print_drives_status_handles_empty_list() {
+        let drives: DrivesListResp =
+            serde_json::from_value(serde_json::json!({"drives": []})).expect("parse empty");
+        print_drives_status(&drives);
+    }
+
+    #[test]
+    fn print_library_summary_counts_by_slot_type() {
+        let lib: LibraryInfoResp = serde_json::from_value(serde_json::json!({
+            "storage_slots": 40,
+            "mail_slots": 5,
+            "drives": 3,
+            "lto_generation": 8,
+            "firmware": "NVL8",
+        }))
+        .expect("parse library info");
+        let inv: InventoryResp = serde_json::from_value(serde_json::json!({
+            "entries": [
+                {"slot_type": "storage", "slot_id": 0, "barcode": "A"},
+                {"slot_type": "storage", "slot_id": 1, "barcode": "B"},
+                {"slot_type": "mail", "slot_id": 0, "barcode": "C"},
+                {"slot_type": "drive", "slot_id": 0, "barcode": "D"},
+            ],
+        }))
+        .expect("parse inventory");
+        print_library_summary(&lib, &inv);
+        assert_eq!(lib.storage_slots, 40);
+    }
+
+    #[test]
+    fn print_library_summary_handles_empty_inventory() {
+        let lib: LibraryInfoResp = serde_json::from_value(serde_json::json!({
+            "storage_slots": 10,
+            "mail_slots": 0,
+            "drives": 1,
+            "lto_generation": 8,
+            "firmware": "NVL8",
+        }))
+        .expect("parse library info");
+        let inv: InventoryResp =
+            serde_json::from_value(serde_json::json!({"entries": []})).expect("parse inventory");
+        print_library_summary(&lib, &inv);
+    }
+}

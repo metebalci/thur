@@ -138,3 +138,139 @@ fn cli_actor() -> AuditActor {
         .unwrap_or_else(|_| "unknown".to_string());
     AuditActor::cli(user)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn audit_yaml_default_enabled_and_compress() {
+        let y = AuditYaml::default();
+        assert!(y.enabled);
+        assert!(y.compress_rotated);
+        assert!(y.dir.is_none());
+    }
+
+    #[test]
+    fn load_audit_yaml_missing_file_returns_default() {
+        let y = load_audit_yaml("/nonexistent/path/to/thurvtl.yaml");
+        assert!(y.enabled);
+        assert!(y.dir.is_none());
+    }
+
+    #[test]
+    fn load_audit_yaml_parses_explicit_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        let mut f = std::fs::File::create(&cfg).expect("create cfg");
+        writeln!(f, "audit:\n  enabled: false\n  dir: /var/log/thur-audit").expect("write cfg");
+        let y = load_audit_yaml(cfg.to_str().expect("utf8 path"));
+        assert!(!y.enabled);
+        assert_eq!(y.dir.as_deref(), Some("/var/log/thur-audit"));
+    }
+
+    #[test]
+    fn load_audit_yaml_missing_audit_block_uses_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        let mut f = std::fs::File::create(&cfg).expect("create cfg");
+        writeln!(f, "data_dir: /srv/thur").expect("write cfg");
+        let y = load_audit_yaml(cfg.to_str().expect("utf8 path"));
+        assert!(y.enabled);
+        assert!(y.dir.is_none());
+    }
+
+    #[test]
+    fn load_audit_yaml_malformed_returns_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        let mut f = std::fs::File::create(&cfg).expect("create cfg");
+        writeln!(f, "audit: [this is not a map").expect("write cfg");
+        let y = load_audit_yaml(cfg.to_str().expect("utf8 path"));
+        assert!(y.enabled);
+    }
+
+    #[test]
+    fn audit_dir_falls_back_to_data_dir_subdir() {
+        let yaml = AuditYaml::default();
+        let d = audit_dir("/srv/thur", &yaml);
+        assert_eq!(d, PathBuf::from("/srv/thur/audit"));
+    }
+
+    #[test]
+    fn audit_dir_honours_explicit_override() {
+        let yaml = AuditYaml {
+            enabled: true,
+            dir: Some("/var/log/thur-audit".to_string()),
+            compress_rotated: true,
+        };
+        let d = audit_dir("/srv/thur", &yaml);
+        assert_eq!(d, PathBuf::from("/var/log/thur-audit"));
+    }
+
+    #[test]
+    fn record_ok_noop_when_audit_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        let mut f = std::fs::File::create(&cfg).expect("create cfg");
+        writeln!(f, "audit:\n  enabled: false").expect("write cfg");
+        // Disabled audit must not create the pending queue dir.
+        record_ok(
+            dir.path().to_str().expect("utf8"),
+            cfg.to_str().expect("utf8"),
+            "library.init",
+            serde_json::json!({"slots": 10}),
+        );
+        assert!(!dir.path().join("audit").join("pending").exists());
+    }
+
+    #[test]
+    fn record_ok_queues_entry_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let cfg = dir.path().join("thurvtl.yaml");
+        std::fs::write(&cfg, "audit:\n  enabled: true\n").expect("write cfg");
+        record_ok(
+            data_dir.to_str().expect("utf8"),
+            cfg.to_str().expect("utf8"),
+            "library.init",
+            serde_json::json!({"slots": 10}),
+        );
+        let pending = data_dir.join("audit").join("pending");
+        assert!(pending.is_dir());
+        let count = std::fs::read_dir(&pending).expect("read pending").count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn record_result_passes_through_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        std::fs::write(&cfg, "audit:\n  enabled: false\n").expect("write cfg");
+        let r: Result<i32> = record_result(
+            dir.path().to_str().expect("utf8"),
+            cfg.to_str().expect("utf8"),
+            "library.modify",
+            serde_json::json!({}),
+            Ok(42),
+        );
+        assert_eq!(r.expect("ok value"), 42);
+    }
+
+    #[test]
+    fn record_result_passes_through_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        std::fs::write(&cfg, "audit:\n  enabled: false\n").expect("write cfg");
+        let r: Result<i32> = record_result(
+            dir.path().to_str().expect("utf8"),
+            cfg.to_str().expect("utf8"),
+            "library.modify",
+            serde_json::json!({}),
+            Err(anyhow::anyhow!("boom")),
+        );
+        assert!(r.is_err());
+    }
+}

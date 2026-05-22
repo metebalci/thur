@@ -204,3 +204,88 @@ fn print_skipped(r: &StatsReport) {
     }
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_bytes_picks_iec_unit() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.00 KiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.00 MiB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.00 GiB");
+        assert_eq!(fmt_bytes(2 * 1024_u64.pow(4)), "2.00 TiB");
+    }
+
+    #[test]
+    fn fmt_ratio_handles_zero_unique() {
+        assert_eq!(fmt_ratio(1000, 0), "—");
+    }
+
+    #[test]
+    fn fmt_ratio_computes_dedup_factor() {
+        assert_eq!(fmt_ratio(4000, 1000), "4.00x");
+        assert_eq!(fmt_ratio(1500, 1000), "1.50x");
+    }
+
+    #[test]
+    fn print_human_empty_report_takes_no_cartridges_branch() {
+        let report: StatsReport = serde_json::from_value(serde_json::json!({
+            "backends": [],
+            "cartridges": [],
+            "skipped": [],
+        }))
+        .expect("parse empty report");
+        print_human(&report);
+    }
+
+    #[test]
+    fn print_human_empty_with_skipped() {
+        let report: StatsReport = serde_json::from_value(serde_json::json!({
+            "backends": [],
+            "cartridges": [],
+            "skipped": [{"barcode": "T9", "reason": "manifest unreadable"}],
+        }))
+        .expect("parse report with skipped");
+        print_human(&report);
+    }
+
+    #[test]
+    fn print_human_renders_backend_and_cartridges() {
+        let report: StatsReport = serde_json::from_value(serde_json::json!({
+            "backends": [{
+                "backend": "s3b",
+                "cartridges_global": 2,
+                "cartridges_local": 1,
+                "sealed_chunks": 100,
+                "logical_bytes": 4000000,
+                "unique_pool_bytes": 1000000,
+                "location": {"local_only": 1, "both": 2, "cloud_only": 3},
+            }],
+            "cartridges": [{
+                "barcode": "TAPE001",
+                "backend": "s3b",
+                "scope": "global",
+                "sealed_chunks": 50,
+                "logical_bytes": 2000000,
+                "cart_unique_bytes": 800000,
+                "exclusive_bytes": 500000,
+                "shared_bytes": 300000,
+                "location": {"local_only": 0, "both": 0, "cloud_only": 0},
+            }],
+            "skipped": [],
+        }))
+        .expect("parse full report");
+        print_human(&report);
+    }
+
+    #[test]
+    fn location_counts_default_is_zero() {
+        let c = LocationCounts::default();
+        assert_eq!(c.local_only, 0);
+        assert_eq!(c.both, 0);
+        assert_eq!(c.cloud_only, 0);
+    }
+}

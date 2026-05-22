@@ -564,3 +564,195 @@ impl MemoryBufferManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_mediachanger::PositionChangeReason;
+
+    /// Build a manager with small (1 GiB) per-tape limits and 4-deep
+    /// channels. Returns the manager plus the receivers so a test can
+    /// drain dispatched upload/prefetch requests.
+    fn make_manager() -> (
+        MemoryBufferManager,
+        mpsc::Receiver<UploadRequest>,
+        mpsc::Receiver<PrefetchRequest>,
+    ) {
+        let (_event_tx, event_rx) = broadcast::channel(16);
+        let (upload_tx, upload_rx) = mpsc::channel(8);
+        let (prefetch_tx, prefetch_rx) = mpsc::channel(8);
+        let mgr = MemoryBufferManager::new(event_rx, 1, 1, upload_tx, prefetch_tx);
+        (mgr, upload_rx, prefetch_rx)
+    }
+
+    #[test]
+    fn tape_buffer_state_new_starts_empty() {
+        let st = TapeBufferState::new("TAPE001".to_string(), 100, 200);
+        assert_eq!(st.tape_id, "TAPE001");
+        assert_eq!(st.head_position, 0);
+        assert!(st.loaded_drive.is_none());
+        assert_eq!(st.write_buffer_usage, 0);
+        assert_eq!(st.write_buffer_limit, 100);
+        assert_eq!(st.read_buffer_limit, 200);
+        assert!(st.pending_uploads.is_empty());
+        assert!(st.chunk_bytes.is_empty());
+        assert!(st.last_read_chunk.is_none());
+    }
+
+    #[test]
+    fn clear_prefetch_resets_sequence_tracking() {
+        let mut st = TapeBufferState::new("T".to_string(), 1, 1);
+        st.prefetched_chunks.insert(7);
+        st.last_read_chunk = Some(5);
+        clear_prefetch_and_break_sequence(&mut st);
+        assert!(st.prefetched_chunks.is_empty());
+        assert!(st.last_read_chunk.is_none());
+    }
+
+    #[tokio::test]
+    async fn block_written_increments_write_buffer_usage() {
+        let (mut mgr, _u, _p) = make_manager();
+        mgr.on_block_written("T1", 0, 0, 4096).await;
+        mgr.on_block_written("T1", 1, 1, 8192).await;
+        let tape = mgr.tapes.get("T1").expect("tape created");
+        assert_eq!(tape.write_buffer_usage, 12288);
+        assert_eq!(tape.head_position, 2);
+        assert_eq!(tape.pending_uploads.len(), 2);
+        assert_eq!(tape.chunk_bytes.get(&0).copied(), Some(4096));
+    }
+
+    #[tokio::test]
+    async fn block_written_same_chunk_accumulates_bytes() {
+        let (mut mgr, _u, _p) = make_manager();
+        mgr.on_block_written("T1", 5, 0, 1000).await;
+        mgr.on_block_written("T1", 5, 1, 2000).await;
+        let tape = mgr.tapes.get("T1").expect("tape created");
+        assert_eq!(tape.chunk_bytes.get(&5).copied(), Some(3000));
+        // Same chunk id only counts once in the pending set.
+        assert_eq!(tape.pending_uploads.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cartridge_loaded_then_unloaded_resets_state() {
+        let (mut mgr, _u, _p) = make_manager();
+        mgr.on_cartridge_loaded("T1", 2);
+        {
+            let tape = mgr.tapes.get("T1").expect("tape created");
+            assert_eq!(tape.loaded_drive, Some(2));
+        }
+        mgr.on_block_written("T1", 0, 0, 4096).await;
+        mgr.on_cartridge_unloaded("T1", 2).await;
+        let tape = mgr.tapes.get("T1").expect("tape still tracked");
+        assert!(tape.loaded_drive.is_none());
+        assert_eq!(tape.write_buffer_usage, 0);
+        assert!(tape.pending_uploads.is_empty());
+        assert!(tape.chunk_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trigger_upload_batch_dispatches_and_decrements() {
+        let (mut mgr, mut upload_rx, _p) = make_manager();
+        for cid in 0..3u32 {
+            mgr.on_block_written("T1", cid, cid as u64, 1000).await;
+        }
+        mgr.trigger_upload_batch("T1").await;
+        let req = upload_rx.try_recv().expect("upload request dispatched");
+        assert_eq!(req.tape_id, "T1");
+        assert_eq!(req.chunk_ids, vec![0, 1, 2]);
+        let tape = mgr.tapes.get("T1").expect("tape tracked");
+        assert_eq!(tape.write_buffer_usage, 0);
+        assert!(tape.pending_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trigger_upload_batch_caps_at_max_batch_size() {
+        let (mut mgr, mut upload_rx, _p) = make_manager();
+        for cid in 0..12u32 {
+            mgr.on_block_written("T1", cid, cid as u64, 100).await;
+        }
+        mgr.trigger_upload_batch("T1").await;
+        let req = upload_rx.try_recv().expect("upload request dispatched");
+        // MAX_BATCH_SIZE is 8 — the oldest 8 chunk ids go first.
+        assert_eq!(req.chunk_ids.len(), 8);
+        assert_eq!(req.chunk_ids, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let tape = mgr.tapes.get("T1").expect("tape tracked");
+        assert_eq!(tape.pending_uploads.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn trigger_upload_batch_noop_for_unknown_tape() {
+        let (mut mgr, mut upload_rx, _p) = make_manager();
+        mgr.trigger_upload_batch("ghost").await;
+        assert!(upload_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sequential_reads_trigger_prefetch() {
+        let (mut mgr, _u, mut prefetch_rx) = make_manager();
+        mgr.on_block_read("T1", 0, 0).await;
+        // chunk 1 follows chunk 0 -> sequential, prefetch fires.
+        mgr.on_block_read("T1", 1, 1).await;
+        let req = prefetch_rx.try_recv().expect("prefetch dispatched");
+        assert_eq!(req.tape_id, "T1");
+        assert!(req.chunk_ids.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn non_sequential_read_does_not_prefetch() {
+        let (mut mgr, _u, mut prefetch_rx) = make_manager();
+        mgr.on_block_read("T1", 0, 0).await;
+        // Re-reading chunk 0 is not sequential.
+        mgr.on_block_read("T1", 0, 1).await;
+        assert!(prefetch_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn head_position_changed_rewind_clears_prefetch() {
+        let (mut mgr, _u, _p) = make_manager();
+        {
+            let tape = mgr.get_or_create_tape("T1");
+            tape.prefetched_chunks.insert(3);
+            tape.last_read_chunk = Some(2);
+        }
+        mgr.on_head_position_changed("T1", 10, 0, PositionChangeReason::Rewind);
+        let tape = mgr.tapes.get("T1").expect("tape tracked");
+        assert_eq!(tape.head_position, 0);
+        assert!(tape.prefetched_chunks.is_empty());
+        assert!(tape.last_read_chunk.is_none());
+    }
+
+    #[tokio::test]
+    async fn head_position_changed_sequential_keeps_prefetch() {
+        let (mut mgr, _u, _p) = make_manager();
+        {
+            let tape = mgr.get_or_create_tape("T1");
+            tape.prefetched_chunks.insert(3);
+            tape.last_read_chunk = Some(2);
+        }
+        mgr.on_head_position_changed("T1", 5, 6, PositionChangeReason::SequentialRead);
+        let tape = mgr.tapes.get("T1").expect("tape tracked");
+        assert_eq!(tape.head_position, 6);
+        // Sequential ops must not break the prefetch window.
+        assert!(tape.prefetched_chunks.contains(&3));
+        assert_eq!(tape.last_read_chunk, Some(2));
+    }
+
+    #[tokio::test]
+    async fn handle_event_routes_block_written() {
+        let (mut mgr, _u, _p) = make_manager();
+        mgr.handle_event(TapeEvent::BlockWritten {
+            tape_id: "T1".to_string(),
+            chunk_id: 0,
+            lba: 0,
+            size: 2048,
+        })
+        .await;
+        assert_eq!(
+            mgr.tapes
+                .get("T1")
+                .map(|t| t.write_buffer_usage)
+                .unwrap_or(0),
+            2048
+        );
+    }
+}

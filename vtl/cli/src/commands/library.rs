@@ -1110,3 +1110,196 @@ fn load_cloud_config_from_yaml(config_path: &str) -> Result<CloudConfig> {
         .with_context(|| format!("parse YAML conffile {}", config_path))?;
     Ok(parsed.cloud)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_mediachanger::library::restore::{CartridgeOutcome, RestoreReport};
+
+    fn range(start: u32, end: u32) -> SlotRange {
+        SlotRange { start, end }
+    }
+
+    #[test]
+    fn cross_partition_suffix_branches() {
+        assert_eq!(cross_partition_suffix(true), " (crossed partitions)");
+        assert_eq!(cross_partition_suffix(false), "");
+    }
+
+    #[test]
+    fn absorb_range_empty_source_is_noop() {
+        let mut dst = range(0, 10);
+        absorb_range(&mut dst, &range(5, 5), "storage").expect("noop");
+        assert_eq!(dst, range(0, 10));
+    }
+
+    #[test]
+    fn absorb_range_empty_dest_takes_source() {
+        let mut dst = range(5, 5);
+        absorb_range(&mut dst, &range(10, 20), "storage").expect("adopt");
+        assert_eq!(dst, range(10, 20));
+    }
+
+    #[test]
+    fn absorb_range_appends_adjacent_after() {
+        let mut dst = range(0, 10);
+        absorb_range(&mut dst, &range(10, 20), "storage").expect("append");
+        assert_eq!(dst, range(0, 20));
+    }
+
+    #[test]
+    fn absorb_range_prepends_adjacent_before() {
+        let mut dst = range(10, 20);
+        absorb_range(&mut dst, &range(0, 10), "storage").expect("prepend");
+        assert_eq!(dst, range(0, 20));
+    }
+
+    #[test]
+    fn absorb_range_rejects_non_adjacent() {
+        let mut dst = range(0, 10);
+        let err = absorb_range(&mut dst, &range(15, 25), "storage");
+        assert!(err.is_err());
+        assert!(
+            err.expect_err("non-adjacent must fail")
+                .to_string()
+                .contains("not adjacent")
+        );
+    }
+
+    #[test]
+    fn print_partition_table_handles_empty_layout() {
+        // Smoke: exercises the empty branch (prints the legacy note).
+        print_partition_table(&[]);
+    }
+
+    #[test]
+    fn print_partition_table_renders_partitions() {
+        let parts = vec![
+            LibraryPartition {
+                name: "p1".to_string(),
+                storage_slots: range(0, 20),
+                mail_slots: range(0, 2),
+                drives: vec![0, 1],
+            },
+            LibraryPartition {
+                name: "p2".to_string(),
+                storage_slots: range(20, 40),
+                mail_slots: SlotRange::default(),
+                drives: vec![],
+            },
+        ];
+        // Exercises both the populated and the "(none)" cell branches.
+        print_partition_table(&parts);
+    }
+
+    #[test]
+    fn print_restore_report_dry_run_branch() {
+        let report = RestoreReport {
+            backend_name: "s3b".to_string(),
+            discovered: vec!["A".to_string(), "B".to_string()],
+            filtered_out: vec!["B".to_string()],
+            skipped_existing: vec![],
+            cartridges: vec![],
+            dry_run: true,
+        };
+        print_restore_report(&report);
+    }
+
+    #[test]
+    fn print_restore_report_success_and_failure_branches() {
+        let report = RestoreReport {
+            backend_name: "s3b".to_string(),
+            discovered: vec!["A".to_string(), "B".to_string()],
+            filtered_out: vec![],
+            skipped_existing: vec!["C".to_string()],
+            cartridges: vec![
+                CartridgeOutcome {
+                    barcode: "A".to_string(),
+                    result: Ok(()),
+                },
+                CartridgeOutcome {
+                    barcode: "B".to_string(),
+                    result: Err("download failed".to_string()),
+                },
+            ],
+            dry_run: false,
+        };
+        assert_eq!(report.successes(), vec!["A"]);
+        assert_eq!(report.failures(), vec!["B"]);
+        print_restore_report(&report);
+    }
+
+    #[test]
+    fn open_library_for_chassis_fails_on_uninitialized_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = open_library_for_chassis(dir.path().to_str().expect("utf8"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn open_library_for_chassis_opens_initialized_library() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib_root = dir.path().join("library");
+        let tapes = dir.path().join("tapes");
+        core_mediachanger::Library::initialize(
+            &lib_root, &tapes, 10, 0, 2, 8, None, 0, 1001, 101, 1,
+        )
+        .expect("init library");
+        let lib = open_library_for_chassis(dir.path().to_str().expect("utf8"))
+            .expect("open initialized library");
+        assert_eq!(lib.storage_slots().len(), 10);
+    }
+
+    #[test]
+    fn load_cloud_config_from_yaml_missing_file_errors() {
+        let err = load_cloud_config_from_yaml("/nonexistent/thurvtl.yaml");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn load_cloud_config_from_yaml_empty_cloud_block_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("thurvtl.yaml");
+        std::fs::write(&cfg, "data_dir: /srv/thur\n").expect("write cfg");
+        let cloud = load_cloud_config_from_yaml(cfg.to_str().expect("utf8"))
+            .expect("parse yaml with no cloud block");
+        assert!(cloud.backend_names().is_empty());
+    }
+
+    #[test]
+    fn rebuild_inventory_seats_restored_cartridges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib_root = dir.path().join("library");
+        let tapes = dir.path().join("tapes");
+        core_mediachanger::Library::initialize(
+            &lib_root, &tapes, 5, 0, 1, 8, None, 0, 1001, 101, 1,
+        )
+        .expect("init library");
+        // The cartridge dir must exist for add_or_create_tape to take
+        // the "seat existing" path.
+        std::fs::create_dir_all(tapes.join("TAPE001")).expect("mkdir tape dir");
+        rebuild_inventory(&lib_root, &tapes, &["TAPE001".to_string()], "local")
+            .expect("rebuild inventory");
+        let lib = Library::open(&lib_root, &tapes).expect("reopen");
+        assert_eq!(lib.storage_slots().iter().filter(|s| s.occupied).count(), 1);
+    }
+
+    #[test]
+    fn rebuild_inventory_rejects_when_too_many_for_free_slots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib_root = dir.path().join("library");
+        let tapes = dir.path().join("tapes");
+        core_mediachanger::Library::initialize(
+            &lib_root, &tapes, 2, 0, 1, 8, None, 0, 1001, 101, 1,
+        )
+        .expect("init library");
+        let barcodes = vec!["T1".to_string(), "T2".to_string(), "T3".to_string()];
+        let err = rebuild_inventory(&lib_root, &tapes, &barcodes, "local");
+        assert!(err.is_err());
+        assert!(
+            err.expect_err("over capacity must fail")
+                .to_string()
+                .contains("free storage slot")
+        );
+    }
+}

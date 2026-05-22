@@ -272,3 +272,79 @@ fn audit_failure(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_params_minimal() {
+        let p: ArchiveParams = serde_json::from_value(serde_json::json!({
+            "barcode": "T1",
+            "target_backend": "s3b",
+            "label": "snap1",
+        }))
+        .expect("minimal body");
+        assert_eq!(p.barcode, "T1");
+        assert_eq!(p.target_backend, "s3b");
+        assert_eq!(p.label, "snap1");
+        assert!(!p.dry_run);
+    }
+
+    #[test]
+    fn archive_params_parses_dry_run() {
+        let p: ArchiveParams = serde_json::from_value(serde_json::json!({
+            "barcode": "T1",
+            "target_backend": "s3b",
+            "label": "snap1",
+            "dry_run": true,
+        }))
+        .expect("explicit body");
+        assert!(p.dry_run);
+    }
+
+    #[test]
+    fn archive_params_requires_label() {
+        assert!(
+            serde_json::from_value::<ArchiveParams>(
+                serde_json::json!({"barcode": "T1", "target_backend": "s3b"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn archive_params_requires_barcode() {
+        assert!(
+            serde_json::from_value::<ArchiveParams>(
+                serde_json::json!({"target_backend": "s3b", "label": "snap1"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_backend_and_worm_reads_fields() {
+        let (backend, worm) =
+            parse_backend_and_worm(r#"{"backend":"s3b","worm":true}"#).expect("parse");
+        assert_eq!(backend, "s3b");
+        assert!(worm);
+    }
+
+    #[test]
+    fn parse_backend_and_worm_worm_defaults_false() {
+        let (backend, worm) = parse_backend_and_worm(r#"{"backend":"local"}"#).expect("parse");
+        assert_eq!(backend, "local");
+        assert!(!worm);
+    }
+
+    #[test]
+    fn parse_backend_and_worm_rejects_missing_backend() {
+        assert!(parse_backend_and_worm(r#"{"worm":true}"#).is_err());
+    }
+
+    #[test]
+    fn parse_backend_and_worm_rejects_malformed_json() {
+        assert!(parse_backend_and_worm("not json at all").is_err());
+    }
+}

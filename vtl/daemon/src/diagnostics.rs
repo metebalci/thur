@@ -158,3 +158,116 @@ pub async fn run_and_record(
 
     store.record(lun, entry);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_mediachanger::CloudConfig;
+
+    /// A `CloudConfig` with no named backends — the library
+    /// diagnostic skips the cloud-probe loop entirely.
+    fn empty_cloud_config() -> CloudConfig {
+        CloudConfig::default()
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_fails_on_missing_library_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(!entry.passed);
+        assert!(entry.detail.contains("library.json"));
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_fails_on_malformed_library_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{not valid json").expect("write");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(!entry.passed);
+        assert!(entry.detail.contains("parse failed"));
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_fails_on_missing_inventory_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{}").expect("write lib");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(!entry.passed);
+        assert!(entry.detail.contains("inventory.json"));
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_passes_with_empty_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{}").expect("write lib");
+        std::fs::write(
+            lib.join("inventory.json"),
+            r#"{"storage_slots":[],"mail_slots":[],"drives":[]}"#,
+        )
+        .expect("write inv");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(entry.passed, "detail: {}", entry.detail);
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_fails_on_missing_cartridge_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{}").expect("write lib");
+        std::fs::write(
+            lib.join("inventory.json"),
+            r#"{"storage_slots":[{"barcode":"TAPE001"}],"mail_slots":[],"drives":[]}"#,
+        )
+        .expect("write inv");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(!entry.passed);
+        assert!(entry.detail.contains("TAPE001"));
+        assert!(entry.detail.contains("manifest.json"));
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_passes_with_readable_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{}").expect("write lib");
+        std::fs::write(
+            lib.join("inventory.json"),
+            r#"{"storage_slots":[{"barcode":"TAPE001"}],"mail_slots":[],"drives":[]}"#,
+        )
+        .expect("write inv");
+        let manifest_dir = dir.path().join("tapes").join("TAPE001");
+        std::fs::create_dir_all(&manifest_dir).expect("mkdir tape dir");
+        std::fs::write(
+            manifest_dir.join("manifest.json"),
+            r#"{"barcode":"TAPE001"}"#,
+        )
+        .expect("write manifest");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(entry.passed, "detail: {}", entry.detail);
+    }
+
+    #[tokio::test]
+    async fn library_diagnostic_skips_empty_barcodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("mkdir library");
+        std::fs::write(lib.join("library.json"), "{}").expect("write lib");
+        // An empty barcode means the slot is unoccupied — no manifest
+        // is expected, so the diagnostic still passes.
+        std::fs::write(
+            lib.join("inventory.json"),
+            r#"{"storage_slots":[{"barcode":""}],"mail_slots":[],"drives":[]}"#,
+        )
+        .expect("write inv");
+        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        assert!(entry.passed, "detail: {}", entry.detail);
+    }
+}

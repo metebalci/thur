@@ -100,3 +100,74 @@ pub fn dispatch(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_mediachanger::{AuditRateLimiter, CloudConfig};
+    use scsi_smc::changer::ElementAddressConfig;
+    use shared_admin_server::JobRegistry;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::{Mutex as TokioMutex, broadcast};
+
+    use crate::state::{DaemonState, DaemonStateConfig};
+
+    fn minimal_state(dir: &std::path::Path) -> Arc<DaemonState> {
+        let lib_root = dir.join("library");
+        let tapes_root = dir.join("tapes");
+        let library = core_mediachanger::Library::initialize(
+            &lib_root,
+            &tapes_root,
+            5,
+            0,
+            1,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .expect("init library");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let cfg = DaemonStateConfig {
+            data_dir: dir.to_path_buf(),
+            tapes_root,
+            library: Arc::new(Mutex::new(library)),
+            element_config: ElementAddressConfig::new(0, 1001, 5, 101, 0, 1, 1),
+            target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
+            listen_address: "0.0.0.0:3260".to_string(),
+            event_tx,
+            audit_log: None,
+            audit_dir: dir.join("audit"),
+            audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
+            cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
+            cloud_config: Arc::new(CloudConfig::default()),
+            keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
+            num_drives: 1,
+            drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,
+            drive_compression_zstd_level: 3,
+            pool_budgets: HashMap::new(),
+            backpressure_max_wait: Duration::from_secs(30),
+        };
+        Arc::new(DaemonState::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_kind_returns_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = minimal_state(dir.path());
+        let registry = JobRegistry::new();
+        let (_id, _started, emitter) = registry.create("bogus.kind").await;
+        let result = dispatch("bogus.kind", serde_json::json!({}), emitter, state);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap_or_default()
+                .contains("unknown job kind")
+        );
+    }
+}

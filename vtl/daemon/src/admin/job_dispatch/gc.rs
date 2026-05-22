@@ -651,4 +651,155 @@ mod tests {
     fn parse_index_page_key_rejects_manifest_backups() {
         assert!(parse_index_page_key("manifests/TAPE001/manifest-latest.json").is_none());
     }
+
+    #[test]
+    fn gc_params_default_is_all_false() {
+        let p = GcParams::default();
+        assert!(!p.dry_run);
+        assert!(!p.cloud);
+    }
+
+    #[test]
+    fn gc_params_empty_json_uses_defaults() {
+        let p: GcParams = serde_json::from_value(serde_json::json!({})).expect("empty body");
+        assert!(!p.dry_run);
+        assert!(!p.cloud);
+    }
+
+    #[test]
+    fn gc_params_parses_explicit_flags() {
+        let p: GcParams =
+            serde_json::from_value(serde_json::json!({"dry_run": true, "cloud": true}))
+                .expect("explicit body");
+        assert!(p.dry_run);
+        assert!(p.cloud);
+    }
+
+    #[test]
+    fn gc_params_rejects_wrong_type() {
+        assert!(serde_json::from_value::<GcParams>(serde_json::json!({"dry_run": "yes"})).is_err());
+    }
+
+    #[test]
+    fn is_two_hex_accepts_only_two_hex_chars() {
+        assert!(is_two_hex("aa"));
+        assert!(is_two_hex("0f"));
+        assert!(is_two_hex("FF"));
+        assert!(!is_two_hex("a"));
+        assert!(!is_two_hex("abc"));
+        assert!(!is_two_hex("zz"));
+    }
+
+    #[test]
+    fn collect_live_hashes_empty_when_no_tapes_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = collect_live_hashes(dir.path()).expect("collect on bare dir");
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn collect_live_hashes_skips_tape_without_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A tape dir with no manifest.json is silently skipped.
+        std::fs::create_dir_all(dir.path().join("tapes").join("TAPE001")).expect("mkdir tape");
+        let live = collect_live_hashes(dir.path()).expect("collect");
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn collect_live_index_pages_empty_when_no_tapes_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pages = collect_live_index_pages(dir.path()).expect("collect index pages");
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn collect_live_index_pages_skips_tape_without_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tapes").join("TAPE001")).expect("mkdir tape");
+        let pages = collect_live_index_pages(dir.path()).expect("collect");
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn collect_live_index_pages_reads_index_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tape = dir.path().join("tapes").join("TAPE001");
+        std::fs::create_dir_all(&tape).expect("mkdir tape");
+        std::fs::write(
+            tape.join("manifest.json"),
+            r#"{"backend":"s3b","label":"TAPE001","index_epoch":{"chunks":{"pages":4}}}"#,
+        )
+        .expect("write manifest");
+        let pages = collect_live_index_pages(dir.path()).expect("collect");
+        let entry = pages
+            .get(&("s3b".to_string(), "TAPE001".to_string()))
+            .expect("entry present");
+        assert_eq!(entry.get("chunks").copied(), Some(4));
+    }
+
+    #[test]
+    fn remove_empty_pool_dir_noop_on_missing_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        remove_empty_pool_dir(&dir.path().join("absent")).expect("noop");
+    }
+
+    #[test]
+    fn remove_empty_pool_dir_clears_empty_two_level_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = dir.path().join("pool");
+        std::fs::create_dir_all(pool.join("aa").join("bb")).expect("mkdir tree");
+        remove_empty_pool_dir(&pool).expect("remove empty tree");
+        assert!(!pool.exists());
+    }
+
+    #[test]
+    fn sweep_one_pool_deletes_orphans_keeps_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ChunkStore::new(dir.path(), "s3b").expect("chunk store");
+        let (live_hash, _) = store.insert_bytes(b"keep me").expect("insert live");
+        let (orphan_hash, _) = store.insert_bytes(b"orphan bytes").expect("insert orphan");
+        let mut live: HashSet<String> = HashSet::new();
+        live.insert(live_hash.clone());
+        let mut lines = Vec::new();
+        let freed =
+            sweep_one_pool(&store, &live, false, "test pool", None, &mut lines).expect("sweep");
+        assert!(freed > 0);
+        // Live chunk survives; orphan is gone.
+        let remaining: Vec<String> = store
+            .iter_chunks()
+            .expect("iter")
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert!(remaining.contains(&live_hash));
+        assert!(!remaining.contains(&orphan_hash));
+    }
+
+    #[test]
+    fn sweep_one_pool_dry_run_keeps_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ChunkStore::new(dir.path(), "s3b").expect("chunk store");
+        store.insert_bytes(b"orphan").expect("insert");
+        let live: HashSet<String> = HashSet::new();
+        let mut lines = Vec::new();
+        // dry_run reports 0 freed and leaves the chunk in place.
+        let freed =
+            sweep_one_pool(&store, &live, true, "dry pool", None, &mut lines).expect("dry sweep");
+        assert_eq!(freed, 0);
+        assert_eq!(store.iter_chunks().expect("iter").len(), 1);
+    }
+
+    #[test]
+    fn run_local_gc_removes_orphan_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ChunkStore::new(dir.path(), "s3b").expect("chunk store");
+        store.insert_bytes(b"an orphan chunk").expect("insert");
+        // Empty live set -> the one chunk is an orphan.
+        let live: LiveSet = HashMap::new();
+        let (lines, freed) = run_local_gc(dir.path(), "s3b", &live, false).expect("run local gc");
+        assert!(freed > 0);
+        assert!(lines.iter().any(|l| l.contains("deleted local chunk")));
+        assert_eq!(store.iter_chunks().expect("iter").len(), 0);
+    }
 }

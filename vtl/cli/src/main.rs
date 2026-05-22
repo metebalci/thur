@@ -707,3 +707,590 @@ mod config_parse_tests {
         assert_eq!(cfg.data_dir, "/tmp/thur-test");
     }
 }
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Helper: parse an argv array into a `Cli`. `Cli` doesn't derive
+    /// `Debug`, so `Result::expect` isn't available; go through
+    /// `Result::ok()` + `Option::expect`, which has no `Debug` bound.
+    /// `clippy::ok_expect` would suggest `Result::expect`, which the
+    /// missing `Debug` impl rules out — hence the targeted allow.
+    #[allow(clippy::ok_expect)]
+    fn parse<const N: usize>(args: [&str; N]) -> Cli {
+        Cli::try_parse_from(args).ok().expect("argv must parse")
+    }
+
+    #[test]
+    fn bare_binary_with_no_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["thurvtl"]).is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["thurvtl", "frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn help_flag_short_circuits() {
+        // clap returns an Err whose kind is DisplayHelp for `--help`.
+        // `Cli` has no `Debug`, so `unwrap_err` is unavailable — read
+        // the error kind through `.err()`.
+        let kind = Cli::try_parse_from(["thurvtl", "--help"])
+            .err()
+            .map(|e| e.kind());
+        assert_eq!(kind, Some(clap::error::ErrorKind::DisplayHelp));
+    }
+
+    #[test]
+    fn version_flag_short_circuits() {
+        let kind = Cli::try_parse_from(["thurvtl", "--version"])
+            .err()
+            .map(|e| e.kind());
+        assert_eq!(kind, Some(clap::error::ErrorKind::DisplayVersion));
+    }
+
+    #[test]
+    fn global_config_flag_is_captured() {
+        let cli = parse(["thurvtl", "--config", "/etc/x.yaml", "library", "info"]);
+        assert_eq!(cli.args.config.as_deref(), Some("/etc/x.yaml"));
+        assert_eq!(cli.get_config_path(), "/etc/x.yaml");
+    }
+
+    #[test]
+    fn config_path_defaults_to_etc() {
+        let cli = parse(["thurvtl", "library", "info"]);
+        assert!(cli.args.config.is_none());
+        assert_eq!(
+            cli.get_config_path(),
+            shared_naming::TAPE_LIBRARY.config_path
+        );
+    }
+
+    #[test]
+    fn target_user_override_and_default() {
+        let cli = parse(["thurvtl", "--user", "operator", "library", "info"]);
+        assert_eq!(cli.target_user(), "operator");
+        let cli = parse(["thurvtl", "library", "info"]);
+        assert_eq!(cli.target_user(), shared_naming::TAPE_LIBRARY.system_user);
+    }
+
+    // ---- daemon-down classification ----
+
+    #[test]
+    fn library_init_is_daemon_down() {
+        let cli = parse([
+            "thurvtl",
+            "library",
+            "init",
+            "--slots",
+            "10",
+            "--drives",
+            "2",
+            "--lto-generation",
+            "8",
+        ]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn library_modify_is_daemon_down() {
+        let cli = parse(["thurvtl", "library", "modify", "--slots", "20"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn library_partition_is_daemon_down() {
+        let cli = parse(["thurvtl", "library", "partition", "list"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn library_restore_is_daemon_down() {
+        let cli = parse(["thurvtl", "library", "restore", "--dry-run"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn cloud_benchmark_is_daemon_down() {
+        let cli = parse(["thurvtl", "system", "cloud", "benchmark"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn regenerate_cert_is_daemon_down() {
+        let cli = parse(["thurvtl", "system", "regenerate-cert"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn cartridge_key_is_daemon_down() {
+        let cli = parse(["thurvtl", "cartridge", "key", "show", "TAPE001"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn library_info_is_daemon_routed() {
+        let cli = parse(["thurvtl", "library", "info"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    #[test]
+    fn cartridge_list_is_daemon_routed() {
+        let cli = parse(["thurvtl", "cartridge", "list"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    #[test]
+    fn system_gc_is_daemon_routed() {
+        let cli = parse(["thurvtl", "system", "gc"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    // ---- library init flag validation ----
+
+    #[test]
+    fn library_init_requires_slots_and_drives() {
+        assert!(
+            Cli::try_parse_from(["thurvtl", "library", "init", "--lto-generation", "8"]).is_err()
+        );
+    }
+
+    #[test]
+    fn library_init_rejects_zero_slots() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "library",
+                "init",
+                "--slots",
+                "0",
+                "--drives",
+                "1",
+                "--lto-generation",
+                "8",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn library_init_rejects_too_many_drives() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "library",
+                "init",
+                "--slots",
+                "1",
+                "--drives",
+                "256",
+                "--lto-generation",
+                "8",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn library_init_rejects_lto_generation_other_than_8() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "library",
+                "init",
+                "--slots",
+                "1",
+                "--drives",
+                "1",
+                "--lto-generation",
+                "9",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn library_init_parses_element_bases() {
+        let cli = parse([
+            "thurvtl",
+            "library",
+            "init",
+            "--slots",
+            "40",
+            "--mail-slots",
+            "5",
+            "--drives",
+            "3",
+            "--lto-generation",
+            "8",
+            "--storage-base",
+            "2000",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                action: LibraryAction::Init {
+                    slots: 40,
+                    mail_slots: 5,
+                    drives: 3,
+                    storage_base: 2000,
+                    transport_base: 0,
+                    ..
+                },
+            }
+        ));
+    }
+
+    // ---- cartridge create flag validation ----
+
+    #[test]
+    fn cartridge_create_minimal() {
+        let cli = parse(["thurvtl", "cartridge", "create", "TAPE001"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Cartridge {
+                action: CartridgeAction::Create {
+                    ref barcode,
+                    multi: 1,
+                    worm: false,
+                    ..
+                },
+            } if barcode == "TAPE001"
+        ));
+    }
+
+    #[test]
+    fn cartridge_create_rejects_zero_multi() {
+        assert!(
+            Cli::try_parse_from(["thurvtl", "cartridge", "create", "T1", "--multi", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cartridge_create_encrypt_requires_keystore() {
+        assert!(
+            Cli::try_parse_from(["thurvtl", "cartridge", "create", "T1", "--encrypt"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cartridge_create_encrypt_with_keystore_ok() {
+        let cli = parse([
+            "thurvtl",
+            "cartridge",
+            "create",
+            "T1",
+            "--encrypt",
+            "--keystore",
+            "kms1",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Cartridge {
+                action: CartridgeAction::Create {
+                    encrypt: true,
+                    ref keystore,
+                    ..
+                },
+            } if keystore.as_deref() == Some("kms1")
+        ));
+    }
+
+    #[test]
+    fn cartridge_create_rejects_bad_chunking() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "cartridge",
+                "create",
+                "T1",
+                "--chunking",
+                "bogus",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cartridge_create_rejects_bad_dedup_scope() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "cartridge",
+                "create",
+                "T1",
+                "--dedup",
+                "regional"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cartridge_create_rejects_lto_generation_9() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "cartridge",
+                "create",
+                "T1",
+                "--lto-generation",
+                "9",
+            ])
+            .is_err()
+        );
+    }
+
+    // ---- changer ----
+
+    #[test]
+    fn changer_move_parses_slots() {
+        let cli = parse(["thurvtl", "changer", "move", "3", "9"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Changer {
+                action: ChangerAction::Move {
+                    from_slot: 3,
+                    to_slot: 9,
+                    cross_partition: false,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn changer_unload_slot_is_optional() {
+        let cli = parse(["thurvtl", "changer", "unload", "1", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Changer {
+                action: ChangerAction::Unload {
+                    drive: 1,
+                    slot: None,
+                    force: true,
+                    ..
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn changer_move_rejects_non_numeric_slot() {
+        assert!(Cli::try_parse_from(["thurvtl", "changer", "move", "abc", "9"]).is_err());
+    }
+
+    // ---- drive ----
+
+    #[test]
+    fn drive_status_parses_id() {
+        let cli = parse(["thurvtl", "drive", "status", "2", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Drive {
+                action: DriveAction::Status {
+                    drive: 2,
+                    json: true
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn drive_self_test_parses_id() {
+        let cli = parse(["thurvtl", "drive", "self-test", "0"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Drive {
+                action: DriveAction::SelfTest {
+                    drive: 0,
+                    json: false
+                }
+            }
+        ));
+    }
+
+    // ---- system audit ----
+
+    #[test]
+    fn audit_export_rejects_bad_format() {
+        assert!(
+            Cli::try_parse_from(["thurvtl", "system", "audit", "export", "--format", "xml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_export_default_format_is_jsonl() {
+        let cli = parse(["thurvtl", "system", "audit", "export"]);
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Audit {
+                    action: AuditAction::Export { ref format, .. },
+                },
+            } if format == "jsonl"
+        ));
+    }
+
+    #[test]
+    fn audit_tail_default_lines_is_twenty() {
+        let cli = parse(["thurvtl", "system", "audit", "tail"]);
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::Audit {
+                    action: AuditAction::Tail {
+                        follow: false,
+                        lines: 20
+                    },
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn audit_verify_offline_requires_dir() {
+        assert!(Cli::try_parse_from(["thurvtl", "system", "audit", "verify-offline"]).is_err());
+    }
+
+    // ---- iscsi ----
+
+    #[test]
+    fn iscsi_users_add_password_conflicts_with_stdin() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "iscsi",
+                "users",
+                "add",
+                "alice",
+                "--password",
+                "p",
+                "--password-stdin",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn iscsi_users_add_minimal() {
+        let cli = parse(["thurvtl", "iscsi", "users", "add", "alice"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Iscsi {
+                action: IscsiAction::Users {
+                    action: IscsiUsersAction::Add { ref name, mutual_chap: false, .. },
+                },
+            } if name == "alice"
+        ));
+    }
+
+    #[test]
+    fn iscsi_users_rotate_default_grace() {
+        let cli = parse(["thurvtl", "iscsi", "users", "rotate", "bob"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Iscsi {
+                action: IscsiAction::Users {
+                    action: IscsiUsersAction::Rotate { ref grace, cancel: false, .. },
+                },
+            } if grace == "24h"
+        ));
+    }
+
+    #[test]
+    fn iscsi_target_set_requires_username() {
+        assert!(Cli::try_parse_from(["thurvtl", "iscsi", "target", "set"]).is_err());
+    }
+
+    // ---- cartridge migrate / archive ----
+
+    #[test]
+    fn cartridge_migrate_default_mode_is_move() {
+        let cli = parse([
+            "thurvtl",
+            "cartridge",
+            "migrate",
+            "T1",
+            "--target-backend",
+            "s3b",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Cartridge {
+                action: CartridgeAction::Migrate {
+                    ref mode,
+                    no_verify: false,
+                    dry_run: false,
+                    ..
+                },
+            } if mode == "move"
+        ));
+    }
+
+    #[test]
+    fn cartridge_migrate_rejects_bad_mode() {
+        assert!(
+            Cli::try_parse_from([
+                "thurvtl",
+                "cartridge",
+                "migrate",
+                "T1",
+                "--target-backend",
+                "s3b",
+                "--mode",
+                "teleport",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cartridge_archive_requires_target_backend() {
+        assert!(Cli::try_parse_from(["thurvtl", "cartridge", "archive", "T1"]).is_err());
+    }
+
+    // ---- config subcommand ----
+
+    #[test]
+    fn config_defaults_parses() {
+        let cli = parse(["thurvtl", "config", "defaults"]);
+        assert!(matches!(cli.command, Commands::Config { .. }));
+    }
+
+    // ---- library partition create ----
+
+    #[test]
+    fn partition_create_parses_drive_list() {
+        let cli = parse([
+            "thurvtl",
+            "library",
+            "partition",
+            "create",
+            "p1",
+            "--storage-start",
+            "0",
+            "--storage-end",
+            "20",
+            "--drives",
+            "0,1,2",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                action: LibraryAction::Partition {
+                    action: PartitionAction::Create {
+                        ref name,
+                        storage_start: 0,
+                        storage_end: 20,
+                        ref drives,
+                        ..
+                    },
+                },
+            } if name == "p1" && *drives == [0, 1, 2]
+        ));
+    }
+}

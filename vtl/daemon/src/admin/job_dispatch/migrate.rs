@@ -320,3 +320,86 @@ fn audit_failure(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_params_minimal_uses_defaults() {
+        let p: MigrateParams =
+            serde_json::from_value(serde_json::json!({"barcode": "T1", "target_backend": "s3b"}))
+                .expect("minimal body");
+        assert_eq!(p.barcode, "T1");
+        assert_eq!(p.target_backend, "s3b");
+        assert_eq!(p.mode, "move");
+        assert!(p.verify);
+        assert!(!p.dry_run);
+    }
+
+    #[test]
+    fn migrate_params_parses_explicit_fields() {
+        let p: MigrateParams = serde_json::from_value(serde_json::json!({
+            "barcode": "T1",
+            "target_backend": "s3b",
+            "mode": "rebind",
+            "verify": false,
+            "dry_run": true,
+        }))
+        .expect("explicit body");
+        assert_eq!(p.mode, "rebind");
+        assert!(!p.verify);
+        assert!(p.dry_run);
+    }
+
+    #[test]
+    fn migrate_params_requires_barcode() {
+        assert!(
+            serde_json::from_value::<MigrateParams>(serde_json::json!({"target_backend": "s3b"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migrate_params_requires_target_backend() {
+        assert!(
+            serde_json::from_value::<MigrateParams>(serde_json::json!({"barcode": "T1"})).is_err()
+        );
+    }
+
+    #[test]
+    fn default_mode_is_move_and_default_true() {
+        assert_eq!(default_mode(), "move");
+        assert!(default_true());
+    }
+
+    #[test]
+    fn parse_backend_and_worm_reads_fields() {
+        let (backend, worm) =
+            parse_backend_and_worm(r#"{"backend":"s3b","worm":true}"#).expect("parse");
+        assert_eq!(backend, "s3b");
+        assert!(worm);
+    }
+
+    #[test]
+    fn parse_backend_and_worm_worm_defaults_false() {
+        let (backend, worm) = parse_backend_and_worm(r#"{"backend":"s3b"}"#).expect("parse");
+        assert_eq!(backend, "s3b");
+        assert!(!worm);
+    }
+
+    #[test]
+    fn parse_backend_and_worm_rejects_missing_backend() {
+        assert!(parse_backend_and_worm(r#"{"worm":false}"#).is_err());
+    }
+
+    #[test]
+    fn parse_backend_and_worm_rejects_empty_backend() {
+        assert!(parse_backend_and_worm(r#"{"backend":""}"#).is_err());
+    }
+
+    #[test]
+    fn parse_backend_and_worm_rejects_malformed_json() {
+        assert!(parse_backend_and_worm("{not json").is_err());
+    }
+}

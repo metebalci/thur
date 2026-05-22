@@ -2207,3 +2207,239 @@ async fn read_position(data_dir: &std::path::Path, barcode: &str) -> (Option<u64
     let total_blocks = v["blocks"].as_array().map(|b| b.len());
     (next_lba, total_blocks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `CartridgeCreateRequest` with the given chunking string and
+    /// chunk size; every other field at its default.
+    fn create_req(chunking: &str, chunk_size_bytes: u64) -> CartridgeCreateRequest {
+        CartridgeCreateRequest {
+            barcode: "TAPE001".to_string(),
+            lto_generation: None,
+            chunk_size_bytes,
+            chunking: chunking.to_string(),
+            chunking_min_bytes: None,
+            chunking_max_bytes: None,
+            multi: default_multi(),
+            backend: None,
+            worm: false,
+            dedup: default_dedup(),
+            encrypt: false,
+            keystore: None,
+        }
+    }
+
+    #[test]
+    fn default_multi_is_one_and_default_dedup_is_global() {
+        assert_eq!(default_multi(), 1);
+        assert_eq!(default_dedup(), "global");
+    }
+
+    #[test]
+    fn parse_chunking_mode_fixed() {
+        let req = create_req("fixed", 128 * 1024 * 1024);
+        let (mode, label) = parse_chunking_mode(&req).expect("fixed mode parses");
+        assert_eq!(label, "fixed");
+        assert!(matches!(
+            mode,
+            ChunkingMode::Fixed { size_bytes } if size_bytes == 128 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn parse_chunking_mode_fixed_rejects_fastcdc_bounds() {
+        let mut req = create_req("fixed", 1024);
+        req.chunking_min_bytes = Some(512);
+        let err = parse_chunking_mode(&req);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_chunking_mode_fastcdc_derives_min_max() {
+        let req = create_req("fastcdc", 8 * 1024 * 1024);
+        let (mode, label) = parse_chunking_mode(&req).expect("fastcdc parses");
+        assert_eq!(label, "fastcdc");
+        assert!(matches!(
+            mode,
+            ChunkingMode::FastCdc { min, avg, max }
+                if min <= avg && avg <= max && avg == 8 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn parse_chunking_mode_fastcdc_zero_size_uses_default_avg() {
+        let req = create_req("fastcdc", 0);
+        let (mode, _) = parse_chunking_mode(&req).expect("fastcdc with default avg");
+        assert!(matches!(mode, ChunkingMode::FastCdc { .. }));
+    }
+
+    #[test]
+    fn parse_chunking_mode_fastcdc_rejects_min_over_avg() {
+        let mut req = create_req("fastcdc", 1024 * 1024);
+        req.chunking_min_bytes = Some(8 * 1024 * 1024);
+        let err = parse_chunking_mode(&req);
+        assert!(err.is_err());
+        assert!(err.expect_err("min>avg fails").contains("exceeds avg"));
+    }
+
+    #[test]
+    fn parse_chunking_mode_fastcdc_rejects_avg_over_max() {
+        let mut req = create_req("fastcdc", 64 * 1024 * 1024);
+        req.chunking_max_bytes = Some(1024 * 1024);
+        let err = parse_chunking_mode(&req);
+        assert!(err.is_err());
+        assert!(err.expect_err("avg>max fails").contains("exceeds max"));
+    }
+
+    #[test]
+    fn parse_chunking_mode_rejects_unknown_strategy() {
+        let req = create_req("bogus", 1024);
+        let err = parse_chunking_mode(&req);
+        assert!(err.is_err());
+        assert!(
+            err.expect_err("unknown strategy fails")
+                .contains("unknown chunking strategy")
+        );
+    }
+
+    #[test]
+    fn expand_barcodes_multi_zero_is_error() {
+        assert!(expand_barcodes("TAPE001", 0).is_err());
+    }
+
+    #[test]
+    fn expand_barcodes_multi_one_returns_single() {
+        let v = expand_barcodes("TAPE001", 1).expect("multi=1");
+        assert_eq!(v, vec!["TAPE001".to_string()]);
+    }
+
+    #[test]
+    fn expand_barcodes_increments_and_preserves_width() {
+        let v = expand_barcodes("TAPE001", 3).expect("multi=3");
+        assert_eq!(
+            v,
+            vec![
+                "TAPE001".to_string(),
+                "TAPE002".to_string(),
+                "TAPE003".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_barcodes_requires_numeric_suffix() {
+        let err = expand_barcodes("TAPE", 2);
+        assert!(err.is_err());
+        assert!(err.expect_err("no suffix fails").contains("numeric suffix"));
+    }
+
+    #[test]
+    fn expand_barcodes_detects_width_overflow() {
+        // 1-digit suffix starting at 9, multi 5 -> would reach 14,
+        // past the single-digit field's 0..9 range.
+        let err = expand_barcodes("TAPE9", 5);
+        assert!(err.is_err());
+        assert!(err.expect_err("overflow fails").contains("overflow"));
+    }
+
+    #[test]
+    fn bad_request_carries_400_status() {
+        let resp = bad_request("nope");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn server_error_carries_500_status() {
+        let resp = server_error("boom");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn copy_dir_all_replicates_a_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(src.join("nested")).expect("mkdir nested");
+        std::fs::write(src.join("a.txt"), b"alpha").expect("write a");
+        std::fs::write(src.join("nested").join("b.txt"), b"beta").expect("write b");
+        copy_dir_all(&src, &dst).expect("copy tree");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).expect("read a"),
+            "alpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nested").join("b.txt")).expect("read b"),
+            "beta"
+        );
+    }
+
+    #[test]
+    fn resolve_lto_generation_accepts_8_rejects_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = core_mediachanger::Library::initialize(
+            &dir.path().join("library"),
+            &dir.path().join("tapes"),
+            5,
+            0,
+            1,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .expect("init library");
+        let req8 = create_req("fixed", 1024);
+        assert_eq!(resolve_lto_generation(&req8, &lib), Ok(8));
+        let mut req9 = create_req("fixed", 1024);
+        req9.lto_generation = Some(9);
+        assert!(resolve_lto_generation(&req9, &lib).is_err());
+    }
+
+    #[test]
+    fn cartridge_present_false_on_empty_library() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = core_mediachanger::Library::initialize(
+            &dir.path().join("library"),
+            &dir.path().join("tapes"),
+            5,
+            0,
+            1,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .expect("init library");
+        assert!(!cartridge_present(&lib, "TAPE001"));
+    }
+
+    #[test]
+    fn read_position_missing_runtime_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (lba, blocks) = rt.block_on(read_position(dir.path(), "ABSENT"));
+        assert!(lba.is_none());
+        assert!(blocks.is_none());
+    }
+
+    #[test]
+    fn cartridge_create_request_deserializes_minimal() {
+        let req: CartridgeCreateRequest = serde_json::from_value(serde_json::json!({
+            "barcode": "T1",
+            "chunk_size_bytes": 8388608,
+            "chunking": "fastcdc",
+        }))
+        .expect("minimal create request");
+        assert_eq!(req.barcode, "T1");
+        assert_eq!(req.multi, 1);
+        assert_eq!(req.dedup, "global");
+        assert!(!req.worm);
+        assert!(!req.encrypt);
+    }
+}

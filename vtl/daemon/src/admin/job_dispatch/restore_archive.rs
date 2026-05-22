@@ -229,3 +229,60 @@ fn audit_failure(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_archive_params_minimal() {
+        let p: RestoreArchiveParams = serde_json::from_value(serde_json::json!({
+            "backend": "s3b",
+            "barcode": "T1",
+            "label": "snap1",
+        }))
+        .expect("minimal body");
+        assert_eq!(p.backend, "s3b");
+        assert_eq!(p.barcode, "T1");
+        assert_eq!(p.label, "snap1");
+        assert!(p.as_barcode.is_none());
+        assert!(!p.allow_existing);
+        assert!(!p.dry_run);
+    }
+
+    #[test]
+    fn restore_archive_params_parses_optional_fields() {
+        let p: RestoreArchiveParams = serde_json::from_value(serde_json::json!({
+            "backend": "s3b",
+            "barcode": "T1",
+            "label": "snap1",
+            "as_barcode": "T2",
+            "allow_existing": true,
+            "dry_run": true,
+        }))
+        .expect("explicit body");
+        assert_eq!(p.as_barcode.as_deref(), Some("T2"));
+        assert!(p.allow_existing);
+        assert!(p.dry_run);
+    }
+
+    #[test]
+    fn restore_archive_params_requires_backend() {
+        assert!(
+            serde_json::from_value::<RestoreArchiveParams>(
+                serde_json::json!({"barcode": "T1", "label": "snap1"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn restore_archive_params_requires_label() {
+        assert!(
+            serde_json::from_value::<RestoreArchiveParams>(
+                serde_json::json!({"backend": "s3b", "barcode": "T1"})
+            )
+            .is_err()
+        );
+    }
+}
