@@ -3,14 +3,24 @@
 # Copyright (c) 2026 Mete Balci
 # SPDX-License-Identifier: Apache-2.0
 #
-# Pre-commit hook — two checks on the staged changes:
-#   1. gitleaks (https://github.com/gitleaks/gitleaks) — block secrets.
-#   2. license header — every staged .rs/.sh/.py file must carry a
+# Pre-commit hook — three checks on the staged changes:
+#   1. author email — must be info@metebalci.com.
+#   2. gitleaks (https://github.com/gitleaks/gitleaks) — block secrets.
+#   3. license header — every staged .rs/.sh/.py file must carry a
 #      Copyright line + SPDX-License-Identifier in its first lines.
 #
 # Bypass for a single commit with:  git commit --no-verify
 #
 set -eu
+
+# Author-email check. Refuse to commit under the wrong identity.
+expected_email="info@metebalci.com"
+author_email=$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+if [ "$author_email" != "$expected_email" ]; then
+    echo "pre-commit: author email is '$author_email', expected '$expected_email'." >&2
+    echo "            fix it with: git config user.email '$expected_email'" >&2
+    exit 1
+fi
 
 if ! command -v gitleaks >/dev/null 2>&1; then
     echo "pre-commit: gitleaks not found on PATH — refusing to commit unscanned." >&2
