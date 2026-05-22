@@ -1,4 +1,52 @@
 # Coverage-exempt files — reviewed as trivial (pure re-exports, or bare
 # type/enum/const/error definitions with no executable logic). These are
 # excluded from the "no zero-test module" rule by scripts/coverage.sh --zero.
-# One repo-relative path per line.
+# One repo-relative path per line (the ./ prefix is required).
+
+# --- pure re-export shells (pub use only) ---
+./core/block/src/chunk_pool.rs
+./core/stream/src/chunk_store.rs
+./scsi/sbc/src/types.rs
+./shared/iscsi/src/sense.rs
+./vtl/daemon/src/iscsi/auth.rs
+./vtl/daemon/src/iscsi/session.rs
+./vtl/daemon/src/iscsi/unit_attention.rs
+./vtl/daemon/src/iscsi/scsi/mod.rs
+
+# --- module-declaration files (pub mod / pub use only) ---
+./core/block/src/lib.rs
+./core/mediachanger/src/lib.rs
+./core/stream/src/lib.rs
+./nvme/base/src/lib.rs
+./nvme/nvm/src/lib.rs
+./nvme/tcp/src/lib.rs
+./scsi/sbc/src/lib.rs
+./scsi/smc/src/lib.rs
+./scsi/spc/src/lib.rs
+./scsi/ssc/src/lib.rs
+./scsi/ssc/src/scsi/mod.rs
+./shared/admin-server/src/lib.rs
+./shared/audit/src/lib.rs
+./shared/cli-system/src/lib.rs
+./shared/cloud/src/lib.rs
+./shared/iscsi/src/lib.rs
+./shared/keystore/src/lib.rs
+./shared/upload-worker/src/lib.rs
+./vtl/cli/src/commands/mod.rs
+./vtl/cli/src/output/mod.rs
+./vsa/cli/src/commands/mod.rs
+./vtl/daemon/src/iscsi/mod.rs
+
+# --- bare type / enum / trait / error definitions (no executable logic) ---
+./core/stream/src/drive_topology.rs
+./core/stream/src/tape.rs
+./nvme/base/src/error.rs
+./scsi/smc/src/dispatch/types.rs
+./shared/alerting/src/sinks/mod.rs
+./shared/cloud/src/error.rs
+./shared/iscsi/src/error.rs
+
+# --- process-global / framework glue (no unit-testable surface;
+#     exercised by the end-to-end suites) ---
+./shared/admin-http/src/lib.rs
+./vtl/daemon/src/http/mod.rs
