@@ -1,5 +1,10 @@
 # Thur
 
+> **Status: alpha — under active development.** Thur has not had a
+> stable release. On-disk formats, configuration keys, and the
+> SCSI / NVMe surface may change without notice or migration path.
+> Not recommended for production use.
+
 Thur is two sibling cloud-backed storage targets built on a shared Rust
 codebase. Each presents an ordinary storage device to the host, but the
 data lives in cloud object storage — local disk holds only a warm,
