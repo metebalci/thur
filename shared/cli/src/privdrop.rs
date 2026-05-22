@@ -62,3 +62,38 @@ pub fn drop_to_user_if_root(target_user: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The test suite runs as an unprivileged user (euid != 0), so
+    // `drop_to_user_if_root` must hit the non-root early return — a
+    // no-op `Ok(())` that never touches the passwd database. This is
+    // the only branch reachable without root; the setgid/setuid path
+    // is exercised by the daemon-down integration scripts.
+
+    #[test]
+    fn non_root_is_a_noop_for_any_target() {
+        if geteuid().as_raw() == 0 {
+            // Skip if the suite is somehow running as root — calling
+            // the function would actually drop privileges.
+            return;
+        }
+        // A user that almost certainly does not exist: the early
+        // return must fire before any passwd lookup, so this still
+        // succeeds.
+        assert!(drop_to_user_if_root("definitely-not-a-real-user-xyz").is_ok());
+    }
+
+    #[test]
+    fn non_root_noop_for_realistic_product_users() {
+        if geteuid().as_raw() == 0 {
+            return;
+        }
+        // The default targets the products pass — still a no-op when
+        // not root, regardless of whether they exist on the box.
+        assert!(drop_to_user_if_root("thurvtl").is_ok());
+        assert!(drop_to_user_if_root("thurvsa").is_ok());
+    }
+}

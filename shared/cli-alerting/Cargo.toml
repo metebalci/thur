@@ -22,3 +22,8 @@ shared-naming = { path = "../naming" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# `list` / `test` are async; the daemon-down refusal path is reached
+# by driving them against an admin socket that does not exist.
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -160,3 +160,140 @@ pub fn emit_defaults(content: &str) {
 pub fn emit_systemd_unit(content: &str) {
     print!("{}", content);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// Synthetic top-level CLI: flattens [`GlobalArgs`] and carries the
+    /// `config` subcommand exactly the way every product binary does.
+    #[derive(clap::Parser, Debug)]
+    #[command(name = "synthetic")]
+    struct Cli {
+        #[command(flatten)]
+        global: GlobalArgs,
+        #[command(subcommand)]
+        action: Option<TopCmd>,
+    }
+
+    #[derive(clap::Subcommand, Debug)]
+    enum TopCmd {
+        Config {
+            #[command(subcommand)]
+            action: ConfigAction,
+        },
+    }
+
+    #[test]
+    fn global_args_defaults_are_none_and_false() {
+        let cli = Cli::parse_from(["synthetic"]);
+        assert!(cli.global.config.is_none());
+        assert!(cli.global.user.is_none());
+        assert!(!cli.global.copyright);
+        assert!(cli.action.is_none());
+    }
+
+    #[test]
+    fn global_args_parse_config_and_user() {
+        let cli = Cli::parse_from(["synthetic", "--config", "/tmp/x.yaml", "--user", "svc"]);
+        assert_eq!(cli.global.config.as_deref(), Some("/tmp/x.yaml"));
+        assert_eq!(cli.global.user.as_deref(), Some("svc"));
+    }
+
+    #[test]
+    fn global_args_short_config_flag() {
+        let cli = Cli::parse_from(["synthetic", "-c", "/etc/p.yaml"]);
+        assert_eq!(cli.global.config.as_deref(), Some("/etc/p.yaml"));
+    }
+
+    #[test]
+    fn copyright_flag_parses() {
+        let cli = Cli::parse_from(["synthetic", "--copyright"]);
+        assert!(cli.global.copyright);
+    }
+
+    #[test]
+    fn config_defaults_subcommand_parses() {
+        let cli = Cli::parse_from(["synthetic", "config", "defaults"]);
+        assert!(matches!(
+            cli.action,
+            Some(TopCmd::Config {
+                action: ConfigAction::Defaults
+            })
+        ));
+    }
+
+    #[test]
+    fn config_systemd_unit_subcommand_parses() {
+        let cli = Cli::parse_from(["synthetic", "config", "systemd-unit"]);
+        assert!(matches!(
+            cli.action,
+            Some(TopCmd::Config {
+                action: ConfigAction::SystemdUnit
+            })
+        ));
+    }
+
+    #[test]
+    fn config_completion_without_shell_parses_to_none() {
+        let cli = Cli::parse_from(["synthetic", "config", "completion"]);
+        assert!(matches!(
+            cli.action,
+            Some(TopCmd::Config {
+                action: ConfigAction::Completion { shell: None }
+            })
+        ));
+    }
+
+    #[test]
+    fn config_completion_with_explicit_shell_parses() {
+        let cli = Cli::parse_from(["synthetic", "config", "completion", "bash"]);
+        assert!(matches!(
+            cli.action,
+            Some(TopCmd::Config {
+                action: ConfigAction::Completion {
+                    shell: Some(Shell::Bash)
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn config_completion_rejects_unknown_shell() {
+        let err = Cli::try_parse_from(["synthetic", "config", "completion", "tcsh"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn emit_completion_with_explicit_shell_succeeds() {
+        // An explicit shell never touches $SHELL, so this is a pure
+        // generate-to-stdout call with no env dependency.
+        let mut cmd = Cli::command();
+        assert!(emit_completion(&mut cmd, Some(Shell::Zsh)).is_ok());
+    }
+
+    #[test]
+    fn emit_completion_each_supported_shell() {
+        for sh in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::Elvish,
+            Shell::PowerShell,
+        ] {
+            let mut cmd = Cli::command();
+            assert!(emit_completion(&mut cmd, Some(sh)).is_ok());
+        }
+    }
+
+    #[test]
+    fn emit_defaults_and_unit_accept_arbitrary_content() {
+        // These are thin print wrappers; exercising them confirms they
+        // accept content of any shape without panicking.
+        emit_defaults("data_dir: /var/lib/x\n");
+        emit_defaults("");
+        emit_systemd_unit("[Unit]\nDescription=x\n");
+        emit_systemd_unit("");
+    }
+}

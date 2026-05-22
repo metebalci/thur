@@ -149,3 +149,135 @@ fn relay_event(ev: JobEvent) {
         JobEvent::Result { .. } | JobEvent::Progress { .. } | JobEvent::Done { .. } => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use shared_audit::{AuditActor, AuditConfig, AuditLog, AuditMode, AuditResult};
+    use shared_naming::TAPE_LIBRARY;
+
+    /// Build a valid tamper-evident audit chain of `n` entries in
+    /// `dir`. Returns the entry count actually written.
+    fn seed_chain(dir: &Path, n: u64) -> u64 {
+        let log = AuditLog::open(AuditConfig::new(dir, AuditMode::TamperEvident))
+            .expect("open audit log");
+        for i in 0..n {
+            log.append(
+                "test.op",
+                AuditActor::system(),
+                json!({ "i": i }),
+                AuditResult::Ok,
+            )
+            .expect("append entry");
+        }
+        n
+    }
+
+    #[test]
+    fn verify_offline_empty_dir_is_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No audit-*.jsonl files: verify_chain returns an empty report,
+        // so the offline verify reports OK (exit 0).
+        let exit = cmd_verify_offline(tmp.path(), false).unwrap();
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn verify_offline_valid_chain_exit_zero_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_chain(tmp.path(), 5);
+        let exit = cmd_verify_offline(tmp.path(), false).unwrap();
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn verify_offline_valid_chain_exit_zero_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_chain(tmp.path(), 3);
+        let exit = cmd_verify_offline(tmp.path(), true).unwrap();
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn verify_offline_corrupted_chain_exit_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_chain(tmp.path(), 4);
+        // Tamper with a chain entry so the BLAKE3 recompute mismatches.
+        // verify_chain returns AuditError::ChainBroken -> exit code 1.
+        let file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("audit-") && n.ends_with(".jsonl"))
+                    .unwrap_or(false)
+            })
+            .expect("audit jsonl file");
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let tampered = contents.replacen("\"i\":0", "\"i\":999", 1);
+        assert_ne!(contents, tampered, "expected to mutate a chain entry");
+        std::fs::write(&file, tampered).unwrap();
+
+        let exit = cmd_verify_offline(tmp.path(), false).unwrap();
+        assert_eq!(exit, 1);
+        // The JSON branch must also classify the break as exit 1.
+        let exit_json = cmd_verify_offline(tmp.path(), true).unwrap();
+        assert_eq!(exit_json, 1);
+    }
+
+    #[test]
+    fn verify_offline_unparsable_file_exit_two() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A file matching the audit-*.jsonl glob but holding garbage:
+        // read_all_entries fails to parse -> not a ChainBroken error,
+        // so the offline verify maps it to exit 2.
+        std::fs::write(
+            tmp.path().join("audit-2026-05-22.jsonl"),
+            b"this is not json\n",
+        )
+        .unwrap();
+        let exit = cmd_verify_offline(tmp.path(), false).unwrap();
+        assert_eq!(exit, 2);
+        let exit_json = cmd_verify_offline(tmp.path(), true).unwrap();
+        assert_eq!(exit_json, 2);
+    }
+
+    #[tokio::test]
+    async fn rotate_refuses_without_accept_break() {
+        // The refusal fires before any admin-socket await, so this is
+        // a pure daemon-down path: exit 1, no transport touched.
+        let exit = cmd_rotate(&TAPE_LIBRARY, false).await.unwrap();
+        assert_eq!(exit, 1);
+    }
+
+    #[test]
+    fn relay_event_accepts_every_variant() {
+        // Smoke: relay_event must handle each JobEvent arm without
+        // panicking (log levels route to stdout vs stderr).
+        relay_event(JobEvent::Log {
+            level: "info".into(),
+            message: "an info line".into(),
+        });
+        relay_event(JobEvent::Log {
+            level: "warn".into(),
+            message: "a warning".into(),
+        });
+        relay_event(JobEvent::Log {
+            level: "error".into(),
+            message: "an error".into(),
+        });
+        relay_event(JobEvent::Result { data: json!({}) });
+        relay_event(JobEvent::Progress {
+            stage: "scanning".into(),
+            current: 1,
+            total: Some(2),
+        });
+        relay_event(JobEvent::Done {
+            exit_code: 0,
+            error: None,
+        });
+    }
+}

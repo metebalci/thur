@@ -281,3 +281,189 @@ fn print_users_table(rows: &[UserRow]) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- parse_grace ----------
+
+    #[test]
+    fn parse_grace_hours_minutes_days() {
+        assert_eq!(parse_grace("24h").unwrap(), 24 * 3600);
+        assert_eq!(parse_grace("5m").unwrap(), 5 * 60);
+        assert_eq!(parse_grace("1d").unwrap(), 24 * 3600);
+        assert_eq!(parse_grace("30s").unwrap(), 30);
+    }
+
+    #[test]
+    fn parse_grace_compound_string() {
+        assert_eq!(parse_grace("1d12h").unwrap(), 36 * 3600);
+        assert_eq!(parse_grace("1h30m").unwrap(), 5400);
+    }
+
+    #[test]
+    fn parse_grace_rejects_zero() {
+        let err = parse_grace("0s").unwrap_err().to_string();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_grace_rejects_garbage() {
+        for bad in ["", "abc", "12", "5x", "h"] {
+            let err = parse_grace(bad).unwrap_err().to_string();
+            assert!(err.contains("invalid --grace"), "input {bad:?} gave: {err}");
+        }
+    }
+
+    // ---------- resolve_password ----------
+
+    #[test]
+    fn resolve_password_returns_arg_value() {
+        let p = resolve_password(Some("hunter2"), false).unwrap();
+        assert_eq!(p, "hunter2");
+    }
+
+    #[test]
+    fn resolve_password_rejects_both_sources() {
+        let err = resolve_password(Some("x"), true).unwrap_err().to_string();
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_password_rejects_no_source() {
+        let err = resolve_password(None, false).unwrap_err().to_string();
+        assert!(
+            err.contains("--password VALUE or --password-stdin"),
+            "got: {err}"
+        );
+    }
+
+    // ---------- wire-type serde round-trips ----------
+
+    #[test]
+    fn user_row_serde_round_trip() {
+        let json = r#"{
+            "username": "alice",
+            "mutual_chap": true,
+            "partition": "p1",
+            "disabled": false,
+            "in_grace": true,
+            "previous_expires_at": "2026-05-22T10:00:00Z"
+        }"#;
+        let row: UserRow = serde_json::from_str(json).unwrap();
+        assert_eq!(row.username, "alice");
+        assert!(row.mutual_chap);
+        assert_eq!(row.partition.as_deref(), Some("p1"));
+        assert!(row.in_grace);
+        assert!(row.previous_expires_at.is_some());
+        // Re-serialize and parse back — fields must survive the trip.
+        let again: UserRow = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(again.username, "alice");
+    }
+
+    #[test]
+    fn user_row_accepts_null_partition_and_grace() {
+        let json = r#"{
+            "username": "bob",
+            "mutual_chap": false,
+            "partition": null,
+            "disabled": true,
+            "in_grace": false,
+            "previous_expires_at": null
+        }"#;
+        let row: UserRow = serde_json::from_str(json).unwrap();
+        assert!(row.partition.is_none());
+        assert!(row.previous_expires_at.is_none());
+        assert!(row.disabled);
+    }
+
+    #[test]
+    fn users_list_response_deserializes() {
+        let json = r#"{"users":[]}"#;
+        let resp: UsersListResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.users.is_empty());
+    }
+
+    #[test]
+    fn target_show_response_serde() {
+        let set: TargetShowResponse =
+            serde_json::from_str(r#"{"username":"t","password_set":true}"#).unwrap();
+        assert_eq!(set.username.as_deref(), Some("t"));
+        assert!(set.password_set);
+
+        let unset: TargetShowResponse =
+            serde_json::from_str(r#"{"username":null,"password_set":false}"#).unwrap();
+        assert!(unset.username.is_none());
+        assert!(!unset.password_set);
+    }
+
+    // ---------- print helpers (smoke; confirm no panic on shapes) ----------
+
+    #[test]
+    fn print_users_table_handles_empty_and_populated() {
+        print_users_table(&[]);
+        let rows = vec![
+            UserRow {
+                username: "alice".into(),
+                mutual_chap: true,
+                partition: Some("p1".into()),
+                disabled: false,
+                in_grace: true,
+                previous_expires_at: Some(Utc::now()),
+            },
+            UserRow {
+                username: "bob".into(),
+                mutual_chap: false,
+                partition: None,
+                disabled: true,
+                in_grace: false,
+                previous_expires_at: None,
+            },
+        ];
+        print_users_table(&rows);
+    }
+
+    #[test]
+    fn print_target_handles_set_and_unset() {
+        print_target(&TargetShowResponse {
+            username: Some("tgt".into()),
+            password_set: true,
+        });
+        print_target(&TargetShowResponse {
+            username: None,
+            password_set: false,
+        });
+    }
+
+    // ---------- require_daemon ----------
+
+    #[tokio::test]
+    async fn require_daemon_refuses_when_socket_dead() {
+        // A path with no daemon bound: ping() fails, so require_daemon
+        // must bail with the daemon-routed refusal message.
+        let dead = std::path::PathBuf::from("/tmp/thur-cli-iscsi-test-no-such.sock");
+        let admin = AdminClient::new(dead, shared_naming::TAPE_LIBRARY.name);
+        let err = require_daemon(&shared_naming::TAPE_LIBRARY, &admin)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("admin socket unreachable") && err.contains("daemon-routed"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_daemon_message_names_the_socket_path() {
+        let dead = std::path::PathBuf::from("/tmp/thur-cli-iscsi-test-named.sock");
+        let admin = AdminClient::new(dead, shared_naming::DISK.name);
+        let err = require_daemon(&shared_naming::DISK, &admin)
+            .await
+            .unwrap_err()
+            .to_string();
+        // The refusal embeds the socket path so an operator with
+        // multiple data_dirs can tell which daemon to start.
+        assert!(err.contains("thur-cli-iscsi-test-named.sock"), "got: {err}");
+    }
+}

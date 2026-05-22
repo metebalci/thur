@@ -55,3 +55,57 @@ pub fn write_mode_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn write_mode_0600_creates_file_with_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sealed.env");
+        let payload = b"sealed-envelope-bytes";
+        write_mode_0600(&path, payload).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+
+    #[test]
+    fn write_mode_0600_sets_owner_only_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("perms.env");
+        write_mode_0600(&path, b"x").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        // Only the low 12 permission bits are meaningful; group/other
+        // must be zero, owner read+write set.
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_mode_0600_refuses_to_clobber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("once.env");
+        write_mode_0600(&path, b"first").unwrap();
+        // create_new makes the second open fail with AlreadyExists;
+        // the original bytes must be untouched.
+        let err = write_mode_0600(&path, b"second").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn write_mode_0600_accepts_empty_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("empty.env");
+        write_mode_0600(&path, b"").unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_mode_0600_errors_on_missing_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("no-such-dir").join("child.env");
+        // The parent directory does not exist, so the open fails.
+        assert!(write_mode_0600(&path, b"x").is_err());
+    }
+}

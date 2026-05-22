@@ -4543,6 +4543,7 @@ dependencies = [
  "shared-admin-client",
  "shared-admin-proto",
  "shared-naming",
+ "tokio",
 ]
 
 [[package]]
@@ -4556,6 +4557,7 @@ dependencies = [
  "serde_json",
  "shared-admin-client",
  "shared-naming",
+ "tokio",
 ]
 
 [[package]]
@@ -4571,6 +4573,8 @@ dependencies = [
  "shared-admin-proto",
  "shared-audit",
  "shared-naming",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

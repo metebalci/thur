@@ -27,3 +27,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# `require_daemon` is async; its refusal path is reached by probing
+# an admin socket path that has no daemon bound.
+tokio = { version = "1", features = ["rt", "macros"] }

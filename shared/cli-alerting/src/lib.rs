@@ -115,3 +115,80 @@ pub async fn test(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_naming::{DISK, TAPE_LIBRARY};
+
+    // ---------- wire-type serde ----------
+
+    #[test]
+    fn alerting_list_response_deserializes_full_shape() {
+        let json = r#"{
+            "enabled": true,
+            "dedup_window_seconds": 300,
+            "sinks": [
+                {"name": "ops-email", "type": "email"},
+                {"name": "pager", "type": "webhook"}
+            ]
+        }"#;
+        let resp: AlertingListResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.enabled);
+        assert_eq!(resp.dedup_window_seconds, 300);
+        assert_eq!(resp.sinks.len(), 2);
+        assert_eq!(resp.sinks[0].name, "ops-email");
+        assert_eq!(resp.sinks[0].r#type, "email");
+        assert_eq!(resp.sinks[1].r#type, "webhook");
+    }
+
+    #[test]
+    fn alerting_list_response_disabled_no_sinks() {
+        let json = r#"{"enabled": false, "dedup_window_seconds": 0, "sinks": []}"#;
+        let resp: AlertingListResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.enabled);
+        assert!(resp.sinks.is_empty());
+    }
+
+    #[test]
+    fn alerting_sink_row_type_field_uses_raw_keyword() {
+        // `type` is a Rust keyword; the wire field must still bind via
+        // the raw identifier `r#type`.
+        let row: AlertingSinkRow =
+            serde_json::from_str(r#"{"name":"s","type":"webhook"}"#).unwrap();
+        assert_eq!(row.name, "s");
+        assert_eq!(row.r#type, "webhook");
+    }
+
+    // ---------- daemon-down refusal ----------
+
+    /// Whether the product's discovered admin socket is live. The
+    /// refusal-path tests only assert when no daemon is reachable.
+    async fn daemon_absent(product: &'static ProductIdentity) -> bool {
+        !AdminClient::auto_discover(product).ping().await
+    }
+
+    #[tokio::test]
+    async fn list_bails_when_daemon_unreachable() {
+        if !daemon_absent(&TAPE_LIBRARY).await {
+            return; // a real daemon is up; skip the refusal assertion
+        }
+        let err = list(&TAPE_LIBRARY, false).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unreachable") && err.contains("start the daemon"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bails_when_daemon_unreachable() {
+        if !daemon_absent(&DISK).await {
+            return;
+        }
+        let err = test(&DISK, "some-sink", "warning")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unreachable"), "got: {err}");
+    }
+}
