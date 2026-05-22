@@ -82,3 +82,83 @@ pub fn ratelimit_key_for(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor(peer: &str) -> AuditActor {
+        AuditActor::iscsi(None::<String>, peer.to_string())
+    }
+
+    #[test]
+    fn chap_failure_keys_by_peer_user_and_reason() {
+        let params = serde_json::json!({"chap_user": "alice", "reason": "bad_secret"});
+        let key = ratelimit_key_for("iscsi.chap.failure", &actor("10.0.0.1"), &params);
+        assert_eq!(
+            key.as_deref(),
+            Some("iscsi.chap.failure:10.0.0.1:alice:bad_secret"),
+        );
+    }
+
+    #[test]
+    fn chap_failure_falls_back_when_fields_are_absent() {
+        let key = ratelimit_key_for(
+            "iscsi.chap.failure",
+            &actor("10.0.0.1"),
+            &serde_json::json!({}),
+        );
+        assert_eq!(
+            key.as_deref(),
+            Some("iscsi.chap.failure:10.0.0.1:-:unknown")
+        );
+    }
+
+    #[test]
+    fn move_medium_is_rate_limited_only_on_refusal() {
+        let refused = serde_json::json!({"refused": "partition_fence"});
+        assert_eq!(
+            ratelimit_key_for("iscsi.move_medium", &actor("p"), &refused).as_deref(),
+            Some("iscsi.move_medium:p:partition_fence"),
+        );
+        // The success-path emission carries no `refused` field, so it
+        // bypasses the rate limiter entirely.
+        let ok = serde_json::json!({"action": "load"});
+        assert_eq!(
+            ratelimit_key_for("iscsi.move_medium", &actor("p"), &ok),
+            None,
+        );
+    }
+
+    #[test]
+    fn other_ops_are_never_rate_limited() {
+        assert_eq!(
+            ratelimit_key_for("iscsi.drive.load", &actor("p"), &serde_json::json!({})),
+            None,
+        );
+    }
+
+    #[test]
+    fn audit_append_with_no_channel_is_a_silent_noop() {
+        let rl = AuditRateLimiter::new(std::time::Duration::from_secs(60));
+        let no_channel: Option<AuditChannel> = None;
+        // Must not panic when audit_log is None — the rate-limited
+        // path and the pass-through path are both exercised.
+        audit_append(
+            &no_channel,
+            &rl,
+            "iscsi.chap.failure",
+            actor("p"),
+            serde_json::json!({"chap_user": "u", "reason": "r"}),
+            AuditResult::Ok,
+        );
+        audit_append(
+            &no_channel,
+            &rl,
+            "iscsi.drive.load",
+            actor("p"),
+            serde_json::json!({}),
+            AuditResult::Ok,
+        );
+    }
+}

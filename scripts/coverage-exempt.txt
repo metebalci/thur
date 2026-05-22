@@ -55,3 +55,6 @@
 #     inline #[cfg(test)] block ---
 ./scsi/smc/src/dispatch/handlers.rs
 ./scsi/smc/src/dispatch/mod.rs
+./scsi/ssc/src/dispatch/handlers.rs
+./scsi/ssc/src/dispatch/inquiry.rs
+./scsi/ssc/src/dispatch/mod.rs
