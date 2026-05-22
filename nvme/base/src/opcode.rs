@@ -103,3 +103,50 @@ impl Psdt {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_opcode_from_u8_round_trips_known_values() {
+        for (byte, op) in [
+            (0x00u8, AdminOpcode::DeleteIoSubmissionQueue),
+            (0x02, AdminOpcode::GetLogPage),
+            (0x06, AdminOpcode::Identify),
+            (0x09, AdminOpcode::SetFeatures),
+            (0x18, AdminOpcode::KeepAlive),
+            (0x7F, AdminOpcode::Fabrics),
+        ] {
+            assert_eq!(AdminOpcode::from_u8(byte), Some(op));
+            // The enum's repr value must equal the wire opcode byte.
+            assert_eq!(op as u8, byte);
+        }
+    }
+
+    #[test]
+    fn admin_opcode_from_u8_rejects_unimplemented_opcodes() {
+        assert_eq!(AdminOpcode::from_u8(0x03), None);
+        assert_eq!(AdminOpcode::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn fuse_from_bits_masks_to_low_two_bits() {
+        assert_eq!(Fuse::from_bits(0b00), Fuse::Normal);
+        assert_eq!(Fuse::from_bits(0b01), Fuse::First);
+        assert_eq!(Fuse::from_bits(0b10), Fuse::Second);
+        // 0b11 is reserved, and high bits beyond [1:0] are ignored.
+        assert_eq!(Fuse::from_bits(0b11), Fuse::Normal);
+        assert_eq!(Fuse::from_bits(0xFE), Fuse::Second);
+    }
+
+    #[test]
+    fn psdt_from_bits_reads_the_top_two_bits() {
+        assert_eq!(Psdt::from_bits(0b00 << 6), Psdt::Prp);
+        assert_eq!(Psdt::from_bits(0b01 << 6), Psdt::SglInline);
+        assert_eq!(Psdt::from_bits(0b10 << 6), Psdt::SglPointer);
+        // 0b11 is reserved; low bits are ignored.
+        assert_eq!(Psdt::from_bits(0b11 << 6), Psdt::Prp);
+        assert_eq!(Psdt::from_bits(0x7F), Psdt::SglInline);
+    }
+}

@@ -100,3 +100,73 @@ pub trait NvmeCommandHandler: Send + Sync + 'static {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqe_with_cid(cid: u16) -> Sqe {
+        let mut buf = [0u8; nvme_base::SQE_SIZE];
+        // CDW0[31:16] carries the Command Identifier — LE bytes 2..4.
+        buf[2..4].copy_from_slice(&cid.to_le_bytes());
+        Sqe::parse(&buf).expect("64-byte SQE parses")
+    }
+
+    fn io_command(cid: u16) -> IoCommand<'static> {
+        IoCommand {
+            sqe: sqe_with_cid(cid),
+            data_out: None,
+            data_in_max: 0,
+        }
+    }
+
+    #[test]
+    fn response_just_carries_an_empty_data_in() {
+        let resp = NvmeResponse::just(Cqe::success(7, 0, 0, 0));
+        assert_eq!(resp.cqe.cid, 7);
+        assert!(resp.data_in.is_empty());
+    }
+
+    #[test]
+    fn response_with_data_keeps_the_payload() {
+        let resp = NvmeResponse::with_data(Cqe::success(1, 0, 0, 0), vec![9, 8, 7]);
+        assert_eq!(resp.cqe.cid, 1);
+        assert_eq!(resp.data_in, vec![9, 8, 7]);
+    }
+
+    /// Handler that does not override `handle_fused_compare_write`, so
+    /// the trait's default impl is what the test below exercises.
+    struct StubHandler;
+
+    #[async_trait]
+    impl NvmeCommandHandler for StubHandler {
+        fn subnqn(&self) -> &str {
+            "nqn.test"
+        }
+        async fn handle_admin(&self, cmd: AdminCommand<'_>) -> NvmeResponse {
+            NvmeResponse::just(Cqe::success(cmd.sqe.cid, 0, 0, 0))
+        }
+        async fn handle_io(&self, cmd: IoCommand<'_>) -> NvmeResponse {
+            NvmeResponse::just(Cqe::success(cmd.sqe.cid, 0, 0, 0))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_fused_compare_write_fails_both_halves() {
+        let handler = StubHandler;
+        assert_eq!(handler.subnqn(), "nqn.test");
+
+        let (compare_cqe, write_cqe) = handler
+            .handle_fused_compare_write(io_command(0x11), io_command(0x22))
+            .await;
+
+        // Each half's CQE echoes its own command identifier.
+        assert_eq!(compare_cqe.cid, 0x11);
+        assert_eq!(write_cqe.cid, 0x22);
+
+        // The default impl rejects the unsupported fused pair.
+        let invalid = StatusField::invalid_opcode().to_u16();
+        assert_eq!(compare_cqe.status.to_u16(), invalid);
+        assert_eq!(write_cqe.status.to_u16(), invalid);
+    }
+}

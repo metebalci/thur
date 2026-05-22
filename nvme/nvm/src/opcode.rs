@@ -58,3 +58,55 @@ impl NvmOpcode {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_u8_round_trips_known_opcodes() {
+        for (byte, op) in [
+            (0x00u8, NvmOpcode::Flush),
+            (0x01, NvmOpcode::Write),
+            (0x02, NvmOpcode::Read),
+            (0x05, NvmOpcode::Compare),
+            (0x08, NvmOpcode::WriteZeroes),
+            (0x0C, NvmOpcode::Verify),
+            (0x15, NvmOpcode::ReservationRelease),
+        ] {
+            assert_eq!(NvmOpcode::from_u8(byte), Some(op));
+            assert_eq!(op as u8, byte);
+        }
+    }
+
+    #[test]
+    fn from_u8_rejects_unknown_opcodes() {
+        // 0x03 sits between Read and WriteUncorrectable — unassigned.
+        assert_eq!(NvmOpcode::from_u8(0x03), None);
+        assert_eq!(NvmOpcode::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn is_write_flags_only_data_mutating_opcodes() {
+        for op in [
+            NvmOpcode::Write,
+            NvmOpcode::WriteUncorrectable,
+            NvmOpcode::WriteZeroes,
+            NvmOpcode::DatasetManagement,
+            NvmOpcode::ReservationRegister,
+            NvmOpcode::ReservationAcquire,
+            NvmOpcode::ReservationRelease,
+        ] {
+            assert!(op.is_write(), "{op:?} should classify as a write");
+        }
+        for op in [
+            NvmOpcode::Flush,
+            NvmOpcode::Read,
+            NvmOpcode::Compare,
+            NvmOpcode::Verify,
+            NvmOpcode::ReservationReport,
+        ] {
+            assert!(!op.is_write(), "{op:?} should not classify as a write");
+        }
+    }
+}
