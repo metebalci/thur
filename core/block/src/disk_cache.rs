@@ -1,0 +1,870 @@
+// Copyright (c) 2026 Mete Balci
+// SPDX-License-Identifier: Apache-2.0
+
+//! Block-side parallel of `core_stream::disk_cache`. Two surfaces:
+//!
+//! - [`refresh_pool_budget_from_volumes`] — daemon-startup walker
+//!   that seeds `PoolBudget::current_bytes` from whatever survived a
+//!   previous run, so a restart doesn't silently re-grant the
+//!   on-disk bytes.
+//! - [`DiskCacheManager`] — per-backend eviction state used by the
+//!   daemon's eviction worker. Mirrors `core_stream::DiskCacheManager`
+//!   structurally and shares the same refcount-safe contract:
+//!   eviction must skip any chunk whose pages still have a pending
+//!   cloud upload, because dropping a pool entry that doesn't yet
+//!   have a cloud copy is data loss. The per-volume `upload.idx`
+//!   sidecar records `LocalOnly` vs `Uploaded`; the eviction filter
+//!   `OR`s across every referencing page so a chunk shared by an
+//!   uploaded page and a pending-upload page stays pinned until the
+//!   pending PUT acks.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use shared_pool::PoolBudget;
+use tracing::{debug, info, warn};
+
+use crate::chunk_pool::{ChunkPool, ChunkPoolError};
+use crate::lru_index::LruIndexFile;
+use crate::page_index::PageIndex;
+use crate::upload_index::{UploadIndexFile, UploadState};
+use crate::volume::{DedupScope, VolumeManifest, namespace_from_uuid};
+
+/// Walk every chunk on disk under `backend_name` and seed
+/// `budget.set_current_bytes(total)`. Counts the shared per-backend
+/// pool plus each `DedupScope::Local` volume's per-volume namespace —
+/// both consume the same disk-cache budget and therefore both must
+/// show up in the reservation count.
+///
+/// Mirrors `core_stream::disk_cache::refresh_pool_budget_from_tapes`
+/// modulo terminology: VSA walks `<data_dir>/volumes/<name>/manifest.json`
+/// instead of `<data_dir>/tapes/<barcode>/manifest.json`, and there
+/// is no `.staging/` directory to account for — `VolumeWriter` goes
+/// straight from RAM (`PageCache`) to the chunk pool without a
+/// disk-staging step.
+pub fn refresh_pool_budget_from_volumes(
+    budget: &PoolBudget,
+    data_dir: &Path,
+    backend_name: &str,
+) -> Result<u64, ChunkPoolError> {
+    let mut total: u64 = 0;
+
+    let pool = ChunkPool::new(data_dir, backend_name)?;
+    total += pool
+        .iter_chunks()?
+        .into_iter()
+        .map(|(_, sz)| sz)
+        .sum::<u64>();
+
+    let volumes_dir = data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
+    if volumes_dir.is_dir() {
+        for entry in fs::read_dir(&volumes_dir)? {
+            let entry = entry?;
+            let routing = match manifest_routing_for_backend(&entry.path(), backend_name) {
+                Some(r) => r,
+                None => continue,
+            };
+            if routing.dedup_scope != DedupScope::Local {
+                continue;
+            }
+            let ns = namespace_from_uuid(&routing.uuid);
+            let ns_pool = ChunkPool::new_namespaced(data_dir, backend_name, &ns)?;
+            total += ns_pool
+                .iter_chunks()?
+                .into_iter()
+                .map(|(_, sz)| sz)
+                .sum::<u64>();
+        }
+    }
+
+    budget.set_current_bytes(total);
+    Ok(total)
+}
+
+/// Per-backend eviction state. The daemon owns one
+/// `DiskCacheManager` per configured cloud backend; total cache
+/// budget is shared at the daemon-coordinator layer (per-backend
+/// `PoolBudget` map).
+///
+/// Eviction is LRU-keyed via the per-volume `lru.idx` sidecar
+/// ([`LruIndexFile`]) and refcount-gated by the per-volume
+/// `upload.idx` sidecar ([`UploadIndexFile`]). For each pool
+/// chunk, the manager walks every volume's `pages.idx` whose
+/// `manifest.backend == backend_name`, takes the max touch
+/// timestamp across any page that references the hash, ANDs the
+/// upload state across the same set, and evicts oldest-first
+/// among the **uploaded** chunks until usage is back under cap.
+/// A chunk pinned by even a single `LocalOnly` reference stays
+/// resident until the upload worker drains — dropping it before
+/// the cloud PUT acks would be the only-copy data-loss path the
+/// pre-async-upload era didn't have to worry about. `read_page`
+/// refetches on pool miss transparently.
+pub struct DiskCacheManager {
+    data_dir: PathBuf,
+    backend_name: String,
+    cache_bytes: u64,
+    current_bytes: u64,
+    /// Optional handle to the same backend's `PoolBudget`. When
+    /// set, successful chunk evictions call `release(size)` so any
+    /// `VolumeWriter::write_page` blocked on backpressure wakes
+    /// immediately. None for tests / standalone callers.
+    pool_budget: Option<Arc<PoolBudget>>,
+    /// Soft floor on chunk "recency" below which eviction skips a
+    /// candidate. See [`Self::set_recent_seal_pin_seconds`]. `0`
+    /// (the default) disables the pin.
+    recent_seal_pin_seconds: u64,
+}
+
+/// A sealed pool chunk eligible for eviction. `namespace` selects
+/// which `ChunkPool` layout the file lives in: `None` for shared
+/// per-backend pool entries (`DedupScope::Global`), `Some(volume)`
+/// for per-volume namespaces (`DedupScope::Local`). `uploaded` is
+/// `false` iff at least one page referencing this hash still has
+/// `upload.idx[page_id] == LocalOnly`; `evict_lru_chunks` filters
+/// non-uploaded candidates out before sorting so a pending PUT can
+/// never lose its only copy.
+#[derive(Debug, Clone)]
+struct EvictableChunk {
+    hash: String,
+    size: u64,
+    last_accessed: u64,
+    namespace: Option<String>,
+    uploaded: bool,
+}
+
+impl DiskCacheManager {
+    /// Create a cache manager scoped to the named backend's pool.
+    pub fn new(data_dir: PathBuf, backend_name: &str, cache_bytes: u64) -> Self {
+        Self {
+            data_dir,
+            backend_name: backend_name.to_string(),
+            cache_bytes,
+            current_bytes: 0,
+            pool_budget: None,
+            recent_seal_pin_seconds: 0,
+        }
+    }
+
+    /// Wire the per-backend pool budget into this manager so
+    /// eviction frees backpressure quota in addition to disk space.
+    /// Must be the same `Arc<PoolBudget>` the volumes of this
+    /// backend hold.
+    pub fn set_pool_budget(&mut self, budget: Arc<PoolBudget>) {
+        self.pool_budget = Some(budget);
+    }
+
+    /// Pin chunks whose most recent `lru.idx` touch is within the
+    /// last `seconds` against eviction. Operates on the same touch
+    /// timestamp the LRU sort already consults: every
+    /// `write_page_unsynced` and every `read_page` bumps the
+    /// referencing page's `lru.idx` entry to `now_unix_secs()`, so
+    /// the window covers freshly-sealed chunks AND cache hits in
+    /// the same `seconds`-wide horizon. `0` (the default) disables
+    /// the pin and restores pure LRU. The
+    /// `disk_cache.recent_seal_pin_seconds` YAML knob drives this
+    /// from `vsa/daemon`.
+    pub fn set_recent_seal_pin_seconds(&mut self, seconds: u64) {
+        self.recent_seal_pin_seconds = seconds;
+    }
+
+    /// Backend name this manager is scoped to.
+    pub fn backend_name(&self) -> &str {
+        &self.backend_name
+    }
+
+    /// Overwrite the cache cap. The eviction worker calls this on
+    /// every tick when the operator picked `disk_cache.size_gb:
+    /// auto` so external disk pressure shrinks the effective cap
+    /// reactively (clamped by `min_size_gb` / `max_size_gb`). Cheap
+    /// to invoke on every tick — pure local-state mutation, no
+    /// scan.
+    pub fn set_capacity(&mut self, bytes: u64) {
+        self.cache_bytes = bytes;
+    }
+
+    /// Cache capacity limit.
+    pub fn capacity(&self) -> u64 {
+        self.cache_bytes
+    }
+
+    /// Current cache usage (must call [`Self::calculate_usage`] first
+    /// to refresh).
+    pub fn current_usage(&self) -> u64 {
+        self.current_bytes
+    }
+
+    /// Is the cache currently over capacity?
+    pub fn is_over_capacity(&self) -> bool {
+        self.current_bytes > self.cache_bytes
+    }
+
+    /// Cache usage as a percentage.
+    pub fn usage_percent(&self) -> f64 {
+        if self.cache_bytes == 0 {
+            0.0
+        } else {
+            (self.current_bytes as f64 / self.cache_bytes as f64) * 100.0
+        }
+    }
+
+    /// Recompute usage by walking every chunk in this backend's
+    /// slice of the pool. Sums the Global per-backend pool plus
+    /// each Local-scope volume's per-volume namespace. Updates the
+    /// internal `current_bytes` and returns the total.
+    pub fn calculate_usage(&mut self) -> Result<u64, ChunkPoolError> {
+        let chunks = self.scan_chunks()?;
+        let total = chunks.iter().map(|c| c.size).sum::<u64>();
+        self.current_bytes = total;
+        Ok(total)
+    }
+
+    /// Evict LRU chunks until usage is under cap. Returns the
+    /// number of bytes freed. On every successful pool-file delete
+    /// the per-backend `PoolBudget` is released, so any
+    /// `VolumeWriter` parked on backpressure wakes immediately.
+    ///
+    /// Filters out any chunk whose pages still have a `LocalOnly`
+    /// upload-state record (cloud PUT not yet acked). The chunk
+    /// stays pinned until the upload worker flips the sidecar back
+    /// to `Uploaded` — at which point the next eviction tick (or
+    /// the upload-completion `Notify`) considers it again.
+    pub fn evict_lru_chunks(&mut self) -> Result<u64, ChunkPoolError> {
+        if self.current_bytes <= self.cache_bytes {
+            debug!(
+                "Cache pool '{}' under capacity ({} / {} bytes), no eviction needed",
+                self.backend_name, self.current_bytes, self.cache_bytes
+            );
+            return Ok(0);
+        }
+
+        let bytes_to_free = self.current_bytes - self.cache_bytes;
+        let mut chunks = self.scan_chunks()?;
+        let (touches, uploaded) = self.collect_lru_touches_and_upload_state()?;
+        for c in chunks.iter_mut() {
+            // Per-namespace lookup: Global chunks have None key,
+            // Local-scope chunks key by their owning volume.
+            c.last_accessed = touches
+                .get(&c.namespace)
+                .and_then(|m| m.get(&c.hash))
+                .copied()
+                .unwrap_or(0);
+            // Default uploaded = true when no record exists: a
+            // legacy chunk written before async upload landed (no
+            // upload.idx entry) was synchronously uploaded under
+            // the old write path, so dropping it from the pool is
+            // safe — `read_page` will refetch from cloud on miss.
+            c.uploaded = uploaded
+                .get(&c.namespace)
+                .and_then(|m| m.get(&c.hash))
+                .copied()
+                .unwrap_or(true);
+        }
+        let total_candidates = chunks.len();
+        chunks.retain(|c| c.uploaded);
+        let pinned_localonly = total_candidates - chunks.len();
+        let pinned_recent = if self.recent_seal_pin_seconds > 0 {
+            let cutoff = now_unix_secs().saturating_sub(self.recent_seal_pin_seconds);
+            let before = chunks.len();
+            chunks.retain(|c| c.last_accessed < cutoff);
+            before - chunks.len()
+        } else {
+            0
+        };
+        chunks.sort_by_key(|c| c.last_accessed);
+
+        if chunks.is_empty() {
+            if pinned_localonly > 0 || pinned_recent > 0 {
+                warn!(
+                    "Backend '{}': all {} candidate chunk(s) pinned ({} pending upload, {} within recent-seal window {}s) - eviction can't proceed",
+                    self.backend_name,
+                    pinned_localonly + pinned_recent,
+                    pinned_localonly,
+                    pinned_recent,
+                    self.recent_seal_pin_seconds,
+                );
+            } else {
+                warn!(
+                    "No chunks eligible for eviction on backend '{}'",
+                    self.backend_name
+                );
+            }
+            return Ok(0);
+        }
+
+        info!(
+            "Backend '{}' over budget: {} candidates ({} pinned by pending upload, {} pinned by recent-seal {}s), need to free {} bytes",
+            self.backend_name,
+            chunks.len(),
+            pinned_localonly,
+            pinned_recent,
+            self.recent_seal_pin_seconds,
+            bytes_to_free
+        );
+
+        let mut freed = 0u64;
+        for c in chunks {
+            if self.current_bytes - freed <= self.cache_bytes {
+                break;
+            }
+            let pool = match c.namespace.as_deref() {
+                Some(ns) => ChunkPool::new_namespaced(&self.data_dir, &self.backend_name, ns)?,
+                None => ChunkPool::new(&self.data_dir, &self.backend_name)?,
+            };
+            match pool.remove(&c.hash) {
+                Ok(()) => {
+                    freed += c.size;
+                    if let Some(budget) = self.pool_budget.as_ref() {
+                        budget.release(c.size);
+                    }
+                    debug!(
+                        "Evicted chunk {}.. ({} B, ns {:?}) from backend '{}'",
+                        &c.hash[..16.min(c.hash.len())],
+                        c.size,
+                        c.namespace,
+                        self.backend_name
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Eviction failed on chunk {}.. (backend '{}'): {}",
+                        &c.hash[..16.min(c.hash.len())],
+                        self.backend_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        self.current_bytes = self.current_bytes.saturating_sub(freed);
+        info!(
+            "Eviction pass on backend '{}' freed {} bytes",
+            self.backend_name, freed
+        );
+        Ok(freed)
+    }
+
+    /// List every pool chunk under this backend with its namespace
+    /// (None = Global shared pool, Some(volume) = per-volume Local
+    /// namespace) and on-disk size. Used by [`Self::calculate_usage`]
+    /// and as the candidate set for eviction.
+    fn scan_chunks(&self) -> Result<Vec<EvictableChunk>, ChunkPoolError> {
+        let mut out = Vec::new();
+
+        // Global per-backend pool (DedupScope::Global volumes share
+        // these chunks).
+        let pool = ChunkPool::new(&self.data_dir, &self.backend_name)?;
+        for (hash, size) in pool.iter_chunks()? {
+            out.push(EvictableChunk {
+                hash,
+                size,
+                last_accessed: 0,
+                namespace: None,
+                uploaded: true,
+            });
+        }
+
+        // Local-scope per-volume namespaces.
+        let volumes_dir = self.data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
+        if volumes_dir.is_dir() {
+            for entry in fs::read_dir(&volumes_dir)? {
+                let entry = entry?;
+                let routing = match manifest_routing_for_backend(&entry.path(), &self.backend_name)
+                {
+                    Some(r) => r,
+                    None => continue,
+                };
+                if routing.dedup_scope != DedupScope::Local {
+                    continue;
+                }
+                let ns = namespace_from_uuid(&routing.uuid);
+                let ns_pool = ChunkPool::new_namespaced(&self.data_dir, &self.backend_name, &ns)?;
+                for (hash, size) in ns_pool.iter_chunks()? {
+                    out.push(EvictableChunk {
+                        hash,
+                        size,
+                        last_accessed: 0,
+                        namespace: Some(ns.clone()),
+                        uploaded: true,
+                    });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Walk every volume's `pages.idx` + `lru.idx` + `upload.idx`
+    /// in one pass and build two `namespace → hash → ...` maps:
+    ///
+    /// - touches: `namespace → hash → max(last_accessed)` — drives
+    ///   the eviction LRU sort.
+    /// - uploaded: `namespace → hash → AND(is_uploaded for every
+    ///   referencing page)` — `false` iff at least one page
+    ///   referencing the hash still has `upload.idx[page_id] ==
+    ///   LocalOnly`, which pins the chunk against eviction.
+    ///
+    /// For Local-scope volumes the namespace is the volume UUID hex;
+    /// for Global-scope volumes the namespace is `None` (shared
+    /// pool). Errors on a single volume's index files are logged +
+    /// skipped rather than propagated — a corrupt or in-flux index
+    /// should not stall the whole eviction pass.
+    #[allow(clippy::type_complexity)]
+    fn collect_lru_touches_and_upload_state(
+        &self,
+    ) -> Result<
+        (
+            HashMap<Option<String>, HashMap<String, u64>>,
+            HashMap<Option<String>, HashMap<String, bool>>,
+        ),
+        ChunkPoolError,
+    > {
+        let mut touches: HashMap<Option<String>, HashMap<String, u64>> = HashMap::new();
+        let mut uploaded: HashMap<Option<String>, HashMap<String, bool>> = HashMap::new();
+        let volumes_dir = self.data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
+        if !volumes_dir.is_dir() {
+            return Ok((touches, uploaded));
+        }
+        for entry in fs::read_dir(&volumes_dir)? {
+            let entry = entry?;
+            let vol_path = entry.path();
+            // Backend-match filter only — the namespace below comes
+            // from the loaded manifest's UUID, not this routing probe.
+            if manifest_routing_for_backend(&vol_path, &self.backend_name).is_none() {
+                continue;
+            }
+            let name = match vol_path.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            // Load manifest to recover the uuid + page_size_bytes
+            // PageIndex::open needs to validate the header.
+            let manifest = match VolumeManifest::load(&self.data_dir, &name) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("LRU walk: load manifest '{}' failed: {}", name, e);
+                    continue;
+                }
+            };
+            let idx_path = PageIndex::path_for(&vol_path);
+            let page_index = match PageIndex::open(
+                &idx_path,
+                manifest.uuid,
+                u64::from(manifest.page_size_bytes),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("LRU walk: open pages.idx for '{}' failed: {}", name, e);
+                    continue;
+                }
+            };
+            let lru_index = match LruIndexFile::open_or_create(&vol_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("LRU walk: open lru.idx for '{}' failed: {}", name, e);
+                    continue;
+                }
+            };
+            // Optional sidecar: a failed open (lost / corrupt
+            // file) falls through to the safe default (every page
+            // reads as Uploaded → evictable). Keep walking the
+            // volume's touches so LRU sort still sees this volume's
+            // pages.
+            let upload_idx: Option<UploadIndexFile> = match UploadIndexFile::open_or_create(
+                &vol_path,
+            ) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(
+                        "LRU walk: open upload.idx for '{}' failed: {} (treating chunks as Uploaded for this pass)",
+                        name, e
+                    );
+                    None
+                }
+            };
+            let namespace_key: Option<String> = manifest.pool_namespace();
+            let bucket_t = touches.entry(namespace_key.clone()).or_default();
+            let bucket_u = uploaded.entry(namespace_key).or_default();
+            for record in page_index.iter() {
+                let (page_id, hash) = match record {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("LRU walk: iterate pages.idx for '{}' failed: {}", name, e);
+                        break;
+                    }
+                };
+                let ts = lru_index.read(page_id).unwrap_or(0);
+                let is_uploaded = match upload_idx.as_ref().map(|u| u.read(page_id)) {
+                    Some(Ok(UploadState::Uploaded)) | None => true,
+                    Some(Ok(UploadState::LocalOnly)) => false,
+                    // Read error on a single record: assume
+                    // Uploaded so a transient IO blip doesn't
+                    // freeze the cache. The eviction worker is
+                    // periodic; the next pass re-reads.
+                    Some(Err(_)) => true,
+                };
+                let hash_hex = hex::encode(hash);
+                bucket_t
+                    .entry(hash_hex.clone())
+                    .and_modify(|cur| {
+                        if ts > *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+                // AND across every reference: a single LocalOnly
+                // page pins the chunk against eviction.
+                bucket_u
+                    .entry(hash_hex)
+                    .and_modify(|cur| *cur &= is_uploaded)
+                    .or_insert(is_uploaded);
+            }
+        }
+        Ok((touches, uploaded))
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Lightweight summary of a volume manifest for cache scans —
+/// matches `core_stream::disk_cache::ManifestRouting` in shape. The
+/// volume's `backend` has already been matched against
+/// `backend_name` before construction, so we don't carry it here.
+/// `uuid` is the durable identity the `Local`-scope namespace is
+/// keyed on (see [`namespace_from_uuid`]).
+struct ManifestRouting {
+    dedup_scope: DedupScope,
+    uuid: [u8; 16],
+}
+
+/// Return `Some(routing)` iff the volume directory at `vol_path`
+/// carries a `manifest.json` whose `backend` field equals
+/// `backend_name`. Missing / unparseable / empty-`backend` / missing
+/// or malformed `uuid` manifest → `None` (skip rather than fail the
+/// scan; bad manifests get fixed at load time, not by the cache
+/// layer).
+fn manifest_routing_for_backend(vol_path: &Path, backend_name: &str) -> Option<ManifestRouting> {
+    let manifest_path = vol_path.join(VolumeManifest::FILENAME);
+    if !manifest_path.is_file() {
+        return None;
+    }
+    let json = fs::read_to_string(&manifest_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let resolved = v.get("backend").and_then(|s| s.as_str())?;
+    if resolved.is_empty() || resolved != backend_name {
+        return None;
+    }
+    let dedup_scope = match v.get("dedup_scope").and_then(|s| s.as_str()) {
+        Some("global") => DedupScope::Global,
+        // Missing / unknown / "local" → Local. Matches `Default` impl
+        // on `DedupScope` (local is the volume-side default).
+        _ => DedupScope::Local,
+    };
+    let uuid_hex = v.get("uuid").and_then(|s| s.as_str())?;
+    let uuid: [u8; 16] = hex::decode(uuid_hex).ok()?.try_into().ok()?;
+    Some(ManifestRouting { dedup_scope, uuid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk_pool::ChunkPool;
+    use crate::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
+    use tempfile::TempDir;
+
+    fn make_volume(
+        data_dir: &Path,
+        name: &str,
+        backend: &str,
+        scope: DedupScope,
+    ) -> VolumeManifest {
+        VolumeManifest::new(
+            name.to_string(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            backend.to_string(),
+            scope,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(data_dir)
+        .unwrap()
+    }
+
+    #[test]
+    fn refresh_empty_pool_seeds_zero() {
+        let tmp = TempDir::new().unwrap();
+        let budget = PoolBudget::unbounded(tmp.path().to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, tmp.path(), "primary").unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(budget.current_bytes(), 0);
+    }
+
+    #[test]
+    fn refresh_counts_global_pool_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        pool.insert_bytes(&[0xAB; 1024]).unwrap();
+        pool.insert_bytes(&[0xCD; 2048]).unwrap();
+        let budget = PoolBudget::unbounded(tmp.path().to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, tmp.path(), "primary").unwrap();
+        assert_eq!(total, 1024 + 2048);
+        assert_eq!(budget.current_bytes(), 1024 + 2048);
+    }
+
+    #[test]
+    fn refresh_counts_local_namespace_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = make_volume(tmp.path(), "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+        let ns_pool = ChunkPool::new_namespaced(tmp.path(), "primary", &ns).unwrap();
+        ns_pool.insert_bytes(&[0x11; 4096]).unwrap();
+        let budget = PoolBudget::unbounded(tmp.path().to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, tmp.path(), "primary").unwrap();
+        assert_eq!(total, 4096);
+    }
+
+    #[test]
+    fn refresh_skips_other_backends() {
+        let tmp = TempDir::new().unwrap();
+        // Chunk under "primary" only.
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        pool.insert_bytes(&[0x77; 512]).unwrap();
+        // Volume under "archive" has its own namespace — must not be
+        // counted when refreshing the "primary" budget.
+        let manifest = make_volume(tmp.path(), "vol-archive", "archive", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+        let ns_archive = ChunkPool::new_namespaced(tmp.path(), "archive", &ns).unwrap();
+        ns_archive.insert_bytes(&[0x88; 4096]).unwrap();
+
+        let budget = PoolBudget::unbounded(tmp.path().to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, tmp.path(), "primary").unwrap();
+        assert_eq!(total, 512);
+    }
+
+    #[test]
+    fn refresh_skips_global_scope_volumes_for_namespace_walk() {
+        // A Global-scope volume's chunks live in the shared pool
+        // (already counted), not in a per-volume namespace. The walker
+        // must not try to open a non-existent namespace dir for it.
+        let tmp = TempDir::new().unwrap();
+        make_volume(tmp.path(), "vol-global", "primary", DedupScope::Global);
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        pool.insert_bytes(&[0x55; 8192]).unwrap();
+        let budget = PoolBudget::unbounded(tmp.path().to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, tmp.path(), "primary").unwrap();
+        assert_eq!(total, 8192);
+    }
+
+    /// A destroy + recreate under the same volume name must NOT make
+    /// the new volume inherit the dead one's namespace. The namespace
+    /// is keyed on the durable UUID, so a fresh `create` mints a fresh
+    /// UUID → fresh namespace → zero inherited chunks. The orphan
+    /// chunks from the dead volume linger under the old namespace
+    /// until `system gc` reclaims them.
+    #[test]
+    fn recreate_same_name_does_not_inherit_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        let first = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns_first = first.pool_namespace().unwrap();
+        let pool_first = ChunkPool::new_namespaced(data_dir, "primary", &ns_first).unwrap();
+        pool_first.insert_bytes(&[0x42; 4096]).unwrap();
+        assert_eq!(pool_first.iter_chunks().unwrap().len(), 1);
+
+        // Destroy the volume. `volume destroy` removes the manifest +
+        // page index but leaves the pool chunks (the orphans GC
+        // reclaims) — model that by dropping only the volume dir.
+        fs::remove_dir_all(VolumeManifest::dir_for(data_dir, "vol-a")).unwrap();
+
+        // Recreate under the same name → fresh UUID → fresh namespace.
+        let second = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns_second = second.pool_namespace().unwrap();
+        assert_ne!(
+            ns_first, ns_second,
+            "recreate-same-name must mint a distinct namespace"
+        );
+
+        let pool_second = ChunkPool::new_namespaced(data_dir, "primary", &ns_second).unwrap();
+        assert!(
+            pool_second.iter_chunks().unwrap().is_empty(),
+            "new volume must not inherit the dead volume's chunks"
+        );
+        // The dead volume's chunk still sits under the old namespace,
+        // an orphan until GC sweeps it.
+        assert_eq!(
+            ChunkPool::new_namespaced(data_dir, "primary", &ns_first)
+                .unwrap()
+                .iter_chunks()
+                .unwrap()
+                .len(),
+            1,
+            "dead volume's chunk lingers as an orphan until GC"
+        );
+    }
+
+    /// Pin-against-eviction contract: a chunk whose owning page is
+    /// marked `LocalOnly` in `upload.idx` must not be evicted, even
+    /// when it's the only candidate and the cache is over cap.
+    /// `Uploaded` chunks under the same volume are still evictable.
+    /// Mirrors `core_stream::disk_cache`'s `collect_pinned_hashes`
+    /// filter — same load-bearing safety property both products
+    /// rely on.
+    #[test]
+    fn evict_lru_chunks_skips_localonly_pinned_pages() {
+        use crate::page_index::PageIndex;
+        use crate::upload_index::{UploadIndexFile, UploadState};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+
+        // Seed two pool chunks under the per-volume namespace.
+        let ns_pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (pinned_hash, _) = ns_pool.insert_bytes(&[0xAA; 2048]).unwrap();
+        let (evictable_hash, _) = ns_pool.insert_bytes(&[0xBB; 4096]).unwrap();
+
+        // Map both into pages.idx so the LRU walker sees them as
+        // referenced by the volume.
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let pinned_bytes: [u8; 32] = hex::decode(&pinned_hash).unwrap().try_into().unwrap();
+        let evictable_bytes: [u8; 32] = hex::decode(&evictable_hash).unwrap().try_into().unwrap();
+        pages.set(0, &pinned_bytes).unwrap();
+        pages.set(1, &evictable_bytes).unwrap();
+
+        // Mark page 0 LocalOnly (upload still pending); page 1 is
+        // the default Uploaded (legacy / sidecar-empty).
+        let upload_idx = UploadIndexFile::open_or_create(&vol_dir).unwrap();
+        upload_idx.set(0, UploadState::LocalOnly).unwrap();
+
+        // Tiny cap forces eviction: 4 KiB cap vs ~6 KiB on disk.
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 4 * 1024);
+        let used = mgr.calculate_usage().unwrap();
+        assert_eq!(used, 2048 + 4096);
+        assert!(mgr.is_over_capacity());
+
+        let freed = mgr.evict_lru_chunks().unwrap();
+        // Evictable chunk goes; pinned chunk stays.
+        assert_eq!(freed, 4096);
+        assert!(
+            !ns_pool.exists(&evictable_hash),
+            "evictable chunk should be gone"
+        );
+        assert!(
+            ns_pool.exists(&pinned_hash),
+            "LocalOnly chunk must NOT be evicted (would lose the only copy)"
+        );
+    }
+
+    /// `recent_seal_pin_seconds > 0` pins chunks whose most recent
+    /// `lru.idx` touch is inside the window, even when LRU would
+    /// otherwise evict them. The ancient chunk goes; the freshly-
+    /// touched one stays. Mirrors the policy the
+    /// `disk_cache.recent_seal_pin_seconds` YAML knob drives.
+    #[test]
+    fn evict_lru_chunks_pins_recently_touched() {
+        use crate::lru_index::LruIndexFile;
+        use crate::page_index::PageIndex;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+
+        let ns_pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (recent_hash, _) = ns_pool.insert_bytes(&[0xDD; 2048]).unwrap();
+        let (ancient_hash, _) = ns_pool.insert_bytes(&[0xEE; 4096]).unwrap();
+
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let recent_bytes: [u8; 32] = hex::decode(&recent_hash).unwrap().try_into().unwrap();
+        let ancient_bytes: [u8; 32] = hex::decode(&ancient_hash).unwrap().try_into().unwrap();
+        pages.set(0, &recent_bytes).unwrap();
+        pages.set(1, &ancient_bytes).unwrap();
+
+        let lru = LruIndexFile::open_or_create(&vol_dir).unwrap();
+        let now = now_unix_secs();
+        lru.touch(0, now).unwrap();
+        lru.touch(1, now.saturating_sub(3600)).unwrap();
+
+        // Cap 4 KiB vs ~6 KiB on disk; needs to free ~2 KiB. A
+        // 300-second pin window covers page 0, leaves page 1 evictable.
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 4 * 1024);
+        mgr.set_recent_seal_pin_seconds(300);
+        mgr.calculate_usage().unwrap();
+        assert!(mgr.is_over_capacity());
+
+        let freed = mgr.evict_lru_chunks().unwrap();
+        assert_eq!(freed, 4096, "ancient chunk should be evicted");
+        assert!(
+            ns_pool.exists(&recent_hash),
+            "chunk touched within pin window must stay resident"
+        );
+        assert!(
+            !ns_pool.exists(&ancient_hash),
+            "chunk older than pin window should be gone"
+        );
+    }
+
+    /// Mixed-reference pin: a chunk referenced by both an Uploaded
+    /// page and a LocalOnly page stays pinned (the AND across refs
+    /// in `collect_lru_touches_and_upload_state` enforces this).
+    #[test]
+    fn evict_lru_chunks_pins_shared_chunk_if_any_ref_is_localonly() {
+        use crate::page_index::PageIndex;
+        use crate::upload_index::{UploadIndexFile, UploadState};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+
+        // One chunk referenced by two pages.
+        let ns_pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (shared_hash, _) = ns_pool.insert_bytes(&[0xCC; 8192]).unwrap();
+
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let raw: [u8; 32] = hex::decode(&shared_hash).unwrap().try_into().unwrap();
+        pages.set(0, &raw).unwrap();
+        pages.set(1, &raw).unwrap();
+
+        // Page 0 = Uploaded, Page 1 = LocalOnly. The chunk pins.
+        let upload_idx = UploadIndexFile::open_or_create(&vol_dir).unwrap();
+        upload_idx.set(0, UploadState::Uploaded).unwrap();
+        upload_idx.set(1, UploadState::LocalOnly).unwrap();
+
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 0);
+        mgr.calculate_usage().unwrap();
+        let freed = mgr.evict_lru_chunks().unwrap();
+        assert_eq!(freed, 0);
+        assert!(ns_pool.exists(&shared_hash));
+    }
+}

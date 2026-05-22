@@ -1,0 +1,27 @@
+[package]
+name = "shared-admin-iscsi"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product admin HTTP handlers for the iSCSI CHAP user lifecycle
+# + the mutual-CHAP target credential. Both daemons (thurvtl,
+# thurvsa) mount these on the same `/api/v1/iscsi/{users,target}`
+# routes; the only per-product variation is how the AdminState wires
+# `data_dir` + `audit_channel`, which is captured by the
+# [`IscsiUsersState`] trait.
+
+[dependencies]
+shared-admin-server = { path = "../admin-server" }
+shared-audit = { path = "../audit" }
+shared-iscsi = { path = "../iscsi" }
+
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,23 @@
+# Cargo build output.
+target/
+
+# rustfmt backup files (rare in modern rustfmt, but cheap to ignore).
+**/*.rs.bk
+
+# Release pipeline outputs (.deb / .rpm / .tar.gz / .asc) — produced
+# by release/release.sh, not checked in. Lives at the top level so a
+# stray `cargo clean` can't wipe signed artifacts.
+/release-artifacts/
+
+# PDFs are never checked in — local-only reference material stays
+# out of the tree as large binary blobs.
+*.pdf
+
+# Editor / tool local state.
+.claude/
+.*.swp
+
+# Maintainer-private state (cloud credentials for integration tests,
+# vendor reference PDFs, GPG signing-key backup notes). Local-only —
+# never check anything under here into the repo.
+/private/

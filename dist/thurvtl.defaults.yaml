@@ -1,0 +1,451 @@
+# thurvtl — full configuration reference
+#
+# Every key the daemon (`thurvtld`) and CLI (`thurvtl`)
+# accept in thurvtl.yaml. Keys with a built-in default are set to
+# that default and left uncommented. Keys with no default are written
+# commented-out so you can see they exist and what shape the value
+# takes — uncomment and fill in to use them.
+#
+# First-time setup: at minimum, set `data_dir` and one entry under
+# `cloud.backends`, then run `thurvtl library init` before
+# starting the daemon.
+#
+# Print this content from the CLI with `thurvtl config generate`.
+# The checked-in copy at `dist/thurvtl.defaults.yaml` is
+# auto-maintained by `vtl/cli/build.rs` whenever this file changes.
+
+# Local storage directory for the disk cache, manifests, library
+# state, and the shared chunk pool. No default — must be set.
+# data_dir: "./.thurvtl"
+
+# Per-tape RAM-staged memory buffers. Distinct from `disk_cache`
+# below — these are scratch the daemon keeps alive between iSCSI ops,
+# not the on-disk chunk pool.
+memory_buffers:
+  # Per-tape write-buffer size in GB (RAM stage for tape writes
+  # before cloud upload).
+  write_gb_per_tape: 10
+  # Per-tape read-buffer size in GB (RAM stage for prefetched
+  # chunks from cloud).
+  read_gb_per_tape: 5
+  # Chunks to prefetch ahead during sequential reads (0 disables;
+  # 1-3 typical).
+  read_prefetch_chunks_ahead: 2
+
+# Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
+# applied per cloud backend. Independent of per-tape memory_buffers
+# above. `size_gb` here is the **per-backend default**; individual
+# entries under `cloud.backends:` below may override with their own
+# `disk_cache_size_gb` field for asymmetric workloads. A chunk-seal
+# that would push a backend's pool past its cap (or take free
+# filesystem space below `disk_free_min_gb`) blocks until the upload
+# worker frees space — this is the upload-backpressure gate that
+# prevents disk-fill from turning into MEDIUM ERROR. See
+# `upload.backpressure_max_wait_seconds` under cloud for the per-seal
+# timeout, after which the SCSI surface returns NOT READY (host backup
+# software treats as transient and retries).
+disk_cache:
+  # Default per-backend disk-cache budget. Two shapes:
+  #   - integer (GB) pins the cap (operator chose; min/max ignored).
+  #   - `auto` (default) — statvfs the data_dir filesystem every
+  #     eviction tick and pin the cap to `min(50% of free,
+  #     max_size_gb)`, floored at `min_size_gb`. Multi-backend
+  #     installs with several `auto` entries split the 50%-of-free
+  #     share evenly so two `auto` backends can't combined commit
+  #     100% of free space. External disk pressure shrinks the cap
+  #     reactively; recovery grows it.
+  # Each cloud.backends entry uses this unless it sets its own
+  # `disk_cache_size_gb` (same shape).
+  size_gb: auto
+  # Floor (GB) applied when size_gb resolves under `auto`. Honored
+  # only when size_gb is `auto`; explicit GB values pin the cap and
+  # skip both bounds.
+  min_size_gb: 4
+  # Ceiling (GB) applied when size_gb resolves under `auto`. Bounds
+  # the eviction-worker scan cost on very large filesystems where
+  # 50% of free could otherwise be terabytes.
+  max_size_gb: 500
+  # Soft watermark as a percentage of size_gb. Crossing it logs a
+  # warn-level message — early signal before the hard cap fires.
+  localonly_soft_watermark_pct: 80
+  # Reserve free filesystem bytes (GB) below which chunk-seal also
+  # backpressures, regardless of pool occupancy. Catches disk-fill
+  # from sources outside the pool: bloated audit retention, manifest
+  # growth on huge tapes, external writers. Set to 0 to disable.
+  disk_free_min_gb: 5
+  # Pin pool chunks whose most recent lru.idx touch (seal or read)
+  # is within this many seconds against LRU eviction. Counters the
+  # verify-after-write pattern (backup software re-reading freshly
+  # written tapes within seconds) at the cost of capping effective
+  # cache capacity by recent write+read volume. 0 disables the pin
+  # (pure LRU); the default may change before RC/GA after a
+  # workload-trace validation pass — see ROADMAP.md.
+  recent_seal_pin_seconds: 0
+
+# Drive-level (per-block) compression. Separate from `iscsi` — this
+# governs the emulated tape drive itself, not the iSCSI transport.
+# Applied before encryption. DCE itself starts OFF at every
+# cartridge load (matching real LTO drives); the host turns it on
+# via MODE SELECT page 0x0F per session. This section configures
+# *which* algorithm and zstd level the drive uses if/when the host
+# flips DCE on. Drive-side compression cuts cross-cartridge dedup
+# ratio because block bytes change with surrounding context — for
+# best dedup, leave the host alone and rely on cloud.compression
+# (post-dedup) below.
+drive:
+  compression:
+    # Algorithm used when DCE is on. `lz4` (default) is streaming,
+    # ~3 GiB/s/core, closest off-the-shelf to LTO hardware's SLDC.
+    # `zstd` trades speed for ratio (~100-300 MiB/s/core at level 3).
+    # `sldc` is reserved (ECMA-321 codec stub; selecting it errors
+    # — encoder not yet shipped). The choice is recorded per-block
+    # in the manifest so changing this knob doesn't break reads of
+    # older blocks.
+    algorithm: lz4
+    # Zstd level (1-22; 3 balanced). Only used when algorithm: zstd.
+    zstd_level: 3
+
+# iSCSI target.
+iscsi:
+  # Listen address for the iSCSI target.
+  listen: "0.0.0.0:3260"
+  # iSCSI Qualified Name advertised to initiators.
+  target_iqn: "iqn.2025-10.com.metebalci:thurvtl"
+  # Maximum concurrent iSCSI sessions.
+  max_sessions: 10
+  # Per-session inactivity timeout in seconds.
+  session_timeout_seconds: 300
+  # CHAP authentication. Users + mutual-CHAP target creds live in
+  # <data_dir>/iscsi-users.json (daemon-managed) — only the method
+  # selector and the algorithm policy live here.
+  auth:
+    # "None" (default; unauthenticated) or "CHAP".
+    method: "None"
+    # Allowed CHAP digest algorithms, in target preference order
+    # (strongest first). Recognized: "SHA3-256" (CHAP_A=8),
+    # "SHA-256" (CHAP_A=7), "SHA-1" (CHAP_A=6), "MD5" (CHAP_A=5).
+    # MD5 is the only RFC 7143 standard algorithm; the rest are
+    # de-facto extensions implemented by Linux LIO and open-iscsi
+    # 3.x+.
+    allowed_algorithms: ["SHA3-256", "SHA-256", "SHA-1", "MD5"]
+
+# Cloud storage. Workspace-wide tuning knobs (compression, upload
+# concurrency, retention-mode check) plus the named backend
+# definitions under `cloud.backends:`. Each cartridge picks one
+# backend at create time (`cartridge create --backend NAME`) and is
+# bound to it for life; every chunk upload, manifest backup,
+# prefetch and refetch routes through that backend.
+#
+# See docs/AUTH.md for the per-backend `auth:` block shapes
+# (S3 / GCS / Azure / local).
+cloud:
+  # Opt out of bucket-immutability validation at startup and in
+  # `cloud check`. When true:
+  #   - lock_state() is never called against any backend.
+  #   - Azure backends with retention_mode != none no longer require
+  #     subscription_id + resource_group (those fields exist solely
+  #     for the management-plane immutability-policy query).
+  #   - retention_mode is still parsed and still gates `cartridge
+  #     create --worm` (which refuses against retention_mode: none),
+  #     but the daemon does not verify the bucket actually has
+  #     retention configured.
+  # Useful when the principal thurvtl runs as cannot be granted the
+  # management-plane IAM (s3:GetBucketObjectLockConfiguration /
+  # storage.buckets.get / Azure 'Storage Account Contributor').
+  # Default: false (validation runs; recommended for compliance setups).
+  # skip_retention_mode_check: false
+
+  # Cloud-layer compression (S3/GCS/Azure only; ignored for local).
+  # Applied per-chunk on upload, post-dedup. Default zstd because
+  # chunk-sized inputs (1-128 MiB) amortize the heavier algorithm
+  # well; lz4 is faster but compresses less.
+  compression:
+    # Algorithm: none | lz4 | zstd.
+    algorithm: zstd
+    # zstd level (1-22; 3 is balanced). Ignored for lz4/none.
+    level: 3
+
+  # Upload worker (S3/GCS/Azure only — ignored for local backend).
+  upload:
+    # Maximum concurrent in-flight chunk uploads per backend per
+    # cartridge. `0` (default) means "auto-scale": at daemon start,
+    # resolve to min(16, available_parallelism * 4). On 4+ core hosts
+    # this caps at 16, which captures most cloud-backend throughput
+    # while bounding the in-flight memory footprint (N × chunk_size).
+    # Operators who want higher concurrency at the cost of memory can
+    # set this to an explicit value (e.g. 32). Resolved value + source
+    # ("auto-detected" vs "operator override") is logged at startup.
+    max_concurrent: 0
+    # Maximum retry attempts per upload (exponential backoff 1 s -> 30 s).
+    retry_max_attempts: 10
+    # Maximum seconds a chunk-seal blocks on the per-backend pool
+    # budget before surfacing SCSI NOT READY (host backup software
+    # treats this as transient and retries). Range 1-600.
+    backpressure_max_wait_seconds: 60
+
+  # Named backend definitions. Each entry's key (e.g. `primary`,
+  # `cold-archive`) is the name cartridges bind to via
+  # `cartridge create --backend NAME`. The discriminant is the
+  # `type:` field — exactly one of local / s3 / gcs / azure per
+  # entry. Empty map is fine at boot; cartridge creates that
+  # reference an undefined backend fail at op time. Operators on a
+  # packaged install start from the commented-out example in
+  # /etc/thurvtl/thurvtl.yaml and uncomment one entry to begin.
+  # backends:
+  #   primary:
+  #     type: s3
+  #     bucket: my-bucket-name
+  #     region: us-east-1
+  #     prefix: thur/
+  #     auth:
+  #       type: env
+  #       access_key_id_env: THUR_S3_ACCESS_KEY_ID
+  #       secret_access_key_env: THUR_S3_SECRET_ACCESS_KEY
+
+# Audit log. Append-only event journal at <data_dir>/audit/ by default,
+# rolled over daily at UTC midnight. Always on. Records administrative
+# and data-plane state changes (cartridge create/import/export,
+# library init/modify, drive load/unload/move, drive WORM/encryption
+# changes, daemon start/stop, CHAP auth success/failure). Read paths
+# are NOT logged.
+#
+# Tamper evidence: every entry carries a BLAKE3 prev_hash +
+# entry_hash; the daemon refuses to start if the chain is broken
+# (recover with `thurvtl system audit rotate --accept-break`,
+# which is a deliberate operator action that's itself audited). There
+# is no way to disable.
+audit:
+  # Audit dir. Default: <data_dir>/audit. No default written here so
+  # the actual path follows data_dir; uncomment to override.
+  # dir: "/var/log/thurvtl/audit"
+  # zstd-compress yesterday's audit-YYYY-MM-DD.jsonl on rollover.
+  # Default: true. Set false to keep rotated files grep-friendly.
+  compress_rotated: true
+  # How many days of audit history the daemon keeps locally before
+  # pruning rotated files. Default: 90.
+  retention_days: 90
+
+# HTTP server (health, metrics, sessions, drives). Endpoints
+# (paths under http.listen):
+#   /health   - Health check (JSON)
+#   /metrics  - Prometheus metrics (text format, OpenTelemetry-sourced)
+#   /sessions - iSCSI sessions and drive status (JSON)
+#   /drives   - Drive details (JSON)
+http:
+  # Listen address for the HTTP server.
+  listen: "0.0.0.0:9090"
+  tls:
+    # PEM-encoded server cert chain. Empty -> plaintext HTTP.
+    # When both cert_file and key_file are set but both files
+    # are missing on disk, the daemon auto-generates a self-signed
+    # cert+key on first boot (logged at WARN with fingerprint).
+    # Replace with a CA-issued cert for production.
+    cert_file: ""
+    # PKCS#8 private key matching cert_file. Must be set when
+    # cert_file is set; partial config is rejected at boot.
+    key_file: ""
+    # PEM CA bundle. When set, the listener requires a client
+    # cert signed by this CA (mTLS). Empty -> server auth only.
+    # Prometheus scrapes will need a matching client cert.
+    client_ca_file: ""
+    # Extra Subject Alternative Names (DNS names or IPs) baked into
+    # the auto-generated self-signed cert, on top of the built-in
+    # hostname / localhost / 127.0.0.1 / ::1 set. Ignored when a
+    # CA-issued cert is supplied. Re-run `thurvtl system
+    # regenerate-cert` after editing. Example: ["vtl.example.com", "10.0.0.5"]
+    extra_sans: []
+
+# Telemetry. The daemon instruments once on the OpenTelemetry SDK and
+# exposes two parallel readers off the same MeterProvider:
+#   1. Prometheus pull — unconditionally wired at GET /metrics on the
+#      http: listener above. No knob; drop the http: block to disable
+#      metrics entirely.
+#   2. OTLP push — opt-in via telemetry.otlp.enabled. Periodic reader
+#      pushes the same metric snapshot to a Collector / SaaS backend.
+# Both readers see the same instrument values; record once, both
+# surfaces emit. Full instrument inventory in docs/SPEC.md § Telemetry.
+telemetry:
+  # OTLP push exporter. Omit the otlp: block (or set enabled: false) to
+  # serve only the Prometheus /metrics endpoint.
+  # otlp:
+  #   # Set false to keep the block but disable export.
+  #   enabled: true
+  #   # Collector / SaaS endpoint. Defaults map to a local Collector.
+  #   #   gRPC:        http://host:4317
+  #   #   HTTP/proto:  http://host:4318/v1/metrics
+  #   endpoint: "http://localhost:4317"
+  #   # Wire protocol. `grpc` (default) needs OTLP/gRPC on the server;
+  #   # `http` (alias `http_protobuf`) is the fallback for proxied
+  #   # environments that can't egress gRPC.
+  #   protocol: grpc
+  #   # Push cadence. Smaller = fresher data + more network traffic.
+  #   # 30s mirrors the default of most managed observability backends.
+  #   interval_seconds: 30
+  #   # Per-request headers. Set the bearer token / API key your SaaS
+  #   # backend expects here.
+  #   headers:
+  #     authorization: "Bearer <token>"
+
+# Appliance-side at-rest encryption. Independent of host-driven AME
+# (SSC-4 SECURITY PROTOCOL OUT). `keystore.backends:` is the named
+# keystore-backend map. At-rest encryption is opt-in per cartridge:
+# `cartridge create --encrypt --keystore NAME` mints a per-cartridge
+# AES-256-GCM DEK wrapped by the named backend. Both flags are
+# required together; a cartridge created without `--encrypt` stays
+# plaintext. Nothing in this YAML block enables encryption. Sticky
+# for the cartridge's lifetime; move via `cartridge key migrate
+# --to NEW`.
+#
+# See docs/AUTH.md § VSA keystore backends for the full
+# per-provider `auth:` block schema (Static / Env / Profile / SP /
+# SP-Env / SA-Key / ADC / Token / AppRole / ClientCert / ...).
+keystore:
+  # Named keystore-backend definitions. Each entry's `type:` picks
+  # the provider (local | awskms | vault | azurekv | gcpkms | kmip).
+  # Default: empty. Cartridge ops that reference a backend by name
+  # fail at op time with UnknownBackend when the named entry is
+  # absent.
+  # backends:
+  #   local-example:
+  #     type: local                                # plaintext sidecar at <data_dir>/keys/<uuid>.key
+  #
+  #   awskms-example:
+  #     type: awskms
+  #     key_id: alias/thur-keystore                # CMK alias / id / ARN
+  #     region: us-east-1
+  #     # endpoint_url: https://kms.example.com    # optional (LocalStack, VPC)
+  #     auth:
+  #       type: env
+  #       access_key_id_env: THUR_KMS_ACCESS_KEY_ID
+  #       secret_access_key_env: THUR_KMS_SECRET_ACCESS_KEY
+  #
+  #   vault-example:
+  #     type: vault
+  #     address: https://vault.example.com
+  #     transit_mount: transit                     # default
+  #     transit_key: thurvtl-cartridge-deks
+  #     auth:
+  #       type: token_env
+  #       env: VAULT_TOKEN
+  #
+  #   azurekv-example:
+  #     type: azurekv
+  #     vault_uri: https://mykv.vault.azure.net
+  #     key_name: thurvtl-kek
+  #     auth:
+  #       type: service_principal_env
+  #       tenant_id_env: THUR_AZURE_TENANT_ID
+  #       client_id_env: THUR_AZURE_CLIENT_ID
+  #       client_secret_env: THUR_AZURE_CLIENT_SECRET
+  #
+  #   gcpkms-example:
+  #     type: gcpkms
+  #     key_name: projects/p/locations/global/keyRings/r/cryptoKeys/k
+  #     auth:
+  #       type: adc                                # or service_account_key{_env}
+  #
+  #   kmip-example:
+  #     type: kmip
+  #     endpoint: kms.corp.example:5696
+  #     kek_uid: kek-1
+  #     mtls:
+  #       type: client_cert
+  #       cert_path: /etc/thurvtl/kmip-client.crt
+  #       key_path: /etc/thurvtl/kmip-client.key
+
+# First-party alerting (email + generic webhook).
+#
+# Off by default; flip enabled to true and list at least one sink.
+# Four event classes fire alerts: audit-log append failures, CHAP login
+# failures (per-user threshold), disk-cache watermark /
+# backpressure-timeout, and cloud-backend reachability
+# (operator-invoked `system cloud_check`). Each class has an on/off
+# knob under `events:`.
+#
+# Sinks support two types: `email` (SMTP via lettre) and `webhook`
+# (HTTP POST with a Tera-templated body — one code path covers
+# PagerDuty, Slack, Discord, ntfy.sh, ServiceNow). Per-class dedup
+# window (default 300 s) collapses repeats inside a window;
+# sink-side credentials honor `${ENV_VAR}` interpolation.
+#
+# Test a sink end-to-end with `thurvtl alerting test SINK_NAME`.
+# Full design + worked PagerDuty / Slack / Discord examples:
+# docs/ALERTING.md.
+alerting:
+  # Master switch. enabled=false (default) means no alerts fire, no
+  # sinks are constructed, the dispatcher is not installed. Flip to
+  # true and add at least one sinks: entry; the daemon refuses to
+  # start with enabled=true and sinks=[].
+  enabled: false
+
+  # Per-class dedup window. Two alerts with the same (class,
+  # dedup_key) pair inside the window collapse to one. Also resets
+  # the chap_failures per-user counter.
+  dedup_window_seconds: 300
+
+  # CHAP failure WARN fires after this many failures from the same
+  # user inside one dedup window. 0 disables the alert (the
+  # individual audit rows still record). Default 3.
+  chap_failures_threshold: 3
+
+  # Per-class on/off. Defaults: audit_failure / chap_failures on
+  # (high-signal), backend_reachability / disk_cache_backpressure
+  # off (noisier, opt in once you've verified the wiring).
+  events:
+    backend_reachability: false
+    audit_failure: true
+    disk_cache_backpressure: false
+    chap_failures: true
+
+  # Configured sinks. Empty (the shipped default) means no sinks;
+  # required to be non-empty when enabled: true.
+  sinks: []
+
+  # -- Email (SMTP) example --
+  #
+  # sinks:
+  #   - name: ops
+  #     type: email
+  #     host: smtp.example.com
+  #     port: 587
+  #     starttls: true              # alternative: false for plaintext + PLAIN
+  #     username: alerts@example.com
+  #     password: ${SMTP_PASSWORD}  # ${ENV_VAR} resolved at boot
+  #     from: thurvtl@example.com
+  #     to:
+  #       - oncall@example.com
+  #     # Optional subject prefix; default "[thurvtl ALERT]"
+  #     # subject_prefix: "[prod-east thurvtl]"
+  #
+  # -- Webhook (PagerDuty Events API v2) example --
+  #
+  # sinks:
+  #   - name: pagerduty
+  #     type: webhook
+  #     url: https://events.pagerduty.com/v2/enqueue
+  #     headers: {}
+  #     body_template: |
+  #       {
+  #         "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+  #         "event_action": "trigger",
+  #         "payload": {
+  #           "summary": "{{message}}",
+  #           "severity": "{{severity}}",
+  #           "source": "{{product}}"
+  #         }
+  #       }
+  #
+  # -- Webhook (Slack incoming webhook) example --
+  #
+  # sinks:
+  #   - name: slack
+  #     type: webhook
+  #     url: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXX
+  #     body_template: |
+  #       {"text": "[{{severity}}] {{product}} {{class}}: {{message}}"}
+
+# Library topology (slots, drives, LTO generation) is NOT in this file.
+# It is initialized once via `thurvtl library init` and persisted in
+# <data_dir>/library/library.json. Use `thurvtl library info` to view
+# and `thurvtl library modify` to change.
+

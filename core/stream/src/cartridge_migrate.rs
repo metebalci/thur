@@ -1,0 +1,521 @@
+// Copyright (c) 2026 Mete Balci
+// SPDX-License-Identifier: Apache-2.0
+
+//! Cartridge migration — move a cartridge from one cloud backend to
+//! another. Same barcode, same logical identity; only the bound
+//! backend changes.
+//!
+//! Two modes:
+//!
+//! - **Move** — copy every cloud-referenced chunk from source to
+//!   target (BLAKE3-verified inline), copy the manifest + index page
+//!   backups, move the local pool files under the new backend prefix,
+//!   atomically flip `manifest.backend`, then delete source objects.
+//!   Source-side delete is best-effort: failures become warnings, the
+//!   future GC sweep cleans up orphans. Source-side chunk deletes are
+//!   skipped entirely under `Global` dedup — chunks under that scope
+//!   may be referenced by other cartridges on the source backend.
+//!
+//! - **Rebind** — pointer-rewrite only, for operators who already run
+//!   bucket-level cross-region / cross-provider replication
+//!   out-of-band. Optionally HEADs every chunk + the manifest sentinel
+//!   on the target first (default); operator can pass `verify: false`
+//!   to skip the check and vouch for the target's contents. No data
+//!   movement, no source-side mutation.
+//!
+//! Manifest mutation is the commit point. A crash before the manifest
+//! flip leaves orphan chunks on the target backend (and source-side
+//! state intact); a crash after the flip but before source delete
+//! leaves orphans on the source. Both states are recoverable via
+//! `system gc` on the affected backend.
+//!
+//! Library inventory is untouched — the cartridge stays in whatever
+//! storage slot it occupied. The daemon-side gate refuses migration
+//! while the cartridge is loaded in a drive (the in-memory drive state
+//! still references the pre-migration backend handle).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use shared_cloud::CloudBackend;
+use shared_pool::ChunkPool;
+
+use crate::chunk_index::ChunkIndexFile;
+use crate::errors::{Result, SmcError};
+
+/// What migration variant the operator asked for.
+#[derive(Debug, Clone, Copy)]
+pub enum MigrateMode {
+    /// Copy data from source to target, flip the manifest, delete source.
+    Move,
+    /// Pointer rewrite. `verify=true` HEADs every chunk + the manifest
+    /// sentinel on the target first; `verify=false` skips the check.
+    Rebind { verify: bool },
+}
+
+impl MigrateMode {
+    fn label(self) -> &'static str {
+        match self {
+            MigrateMode::Move => "move",
+            MigrateMode::Rebind { verify: true } => "rebind",
+            MigrateMode::Rebind { verify: false } => "rebind-noverify",
+        }
+    }
+}
+
+/// All inputs to [`run_migrate`]. Borrows are scoped to one call;
+/// nothing escapes.
+pub struct MigrateOptions<'a> {
+    /// `<data_dir>/tapes/` — the cartridge dir lives at
+    /// `tapes_dir.join(barcode)`. Pool root is derived as
+    /// `tapes_dir.parent()` (matches [`crate::cartridge`]'s
+    /// `derive_chunk_store`).
+    pub tapes_dir: &'a Path,
+    pub barcode: &'a str,
+    /// Backend handles. Source and target must be distinct named
+    /// backends (the operator-stated names below are validated against
+    /// `manifest.backend`).
+    pub source: &'a dyn CloudBackend,
+    pub source_name: &'a str,
+    pub target: &'a dyn CloudBackend,
+    pub target_name: &'a str,
+    pub mode: MigrateMode,
+    /// `true` short-circuits before any mutation. The report carries
+    /// the chunk inventory + sizes so callers can render the plan.
+    pub dry_run: bool,
+    /// Optional progress hook. Called synchronously between major
+    /// phases with a short label ("copying chunks …", "deleting
+    /// source …"). Daemon job workers wire this into `JobEmitter`
+    /// via a sync→async forwarder; CLI-direct callers pass `None`.
+    pub progress: Option<&'a (dyn Fn(&str) + Send + Sync)>,
+}
+
+/// Outcome of one migrate invocation. Returned regardless of mode;
+/// fields irrelevant to the chosen mode stay zero.
+#[derive(Debug, Default, Serialize)]
+pub struct MigrateReport {
+    pub barcode: String,
+    /// Mode label — `"move"` | `"rebind"` | `"rebind-noverify"`.
+    pub mode: String,
+    pub from_backend: String,
+    pub to_backend: String,
+    /// Sealed chunks in `chunks.idx` (every entry with a hash).
+    pub chunks_total: u64,
+    /// Chunks the move mode actually PUT to the target (after skipping
+    /// idempotent target-already-has-it cases).
+    pub chunks_copied: u64,
+    /// Chunks the rebind+verify mode HEADed and found on the target.
+    pub chunks_verified: u64,
+    /// Bytes pulled across the wire in move mode.
+    pub bytes_copied: u64,
+    /// Manifest-prefix objects copied in move mode (manifest-latest +
+    /// versioned manifests + index pages).
+    pub manifest_objects_copied: u64,
+    /// Source objects successfully deleted in move mode. Always 0 in
+    /// rebind mode.
+    pub source_objects_deleted: u64,
+    /// Local pool files renamed under the new backend's prefix.
+    pub local_files_moved: u64,
+    /// Non-fatal source-delete failures. Move mode only.
+    pub source_delete_warnings: Vec<String>,
+    pub dry_run: bool,
+}
+
+/// Lightweight slice of the cartridge manifest — just the fields
+/// migrate needs to know. Deserialized permissively so future schema
+/// additions don't break us.
+#[derive(Debug, Deserialize)]
+struct ManifestSlice {
+    label: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    dedup: DedupSlice,
+}
+
+/// Mirror of the public `DedupScope` enum, narrow on the JSON shape
+/// we need. Kept private to this module so the migration path doesn't
+/// depend on the full `cartridge::DedupScope` import surface.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DedupSlice {
+    #[default]
+    Global,
+    Local,
+}
+
+impl DedupSlice {
+    /// Cloud-key namespace for chunks in this dedup scope.
+    /// `Local` → the cartridge barcode; `Global` → none (shared pool).
+    fn cloud_namespace(self, barcode: &str) -> Option<&str> {
+        match self {
+            DedupSlice::Local => Some(barcode),
+            DedupSlice::Global => None,
+        }
+    }
+}
+
+/// Run a migration. Returns a populated [`MigrateReport`] on success.
+///
+/// Failures during the per-chunk copy stage abort the migration before
+/// the manifest flip — the cartridge stays bound to the source
+/// backend, no source-side mutation has happened, and the partial
+/// state on the target is recoverable via `system gc` on the target.
+/// Once the manifest flip commits, source-side delete failures
+/// degrade to warnings: the migration succeeds and the orphans clean
+/// up on the next GC sweep.
+pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
+    let cart_root = opts.tapes_dir.join(opts.barcode);
+    let manifest_path = cart_root.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Err(SmcError::InvalidOp(
+            "cartridge directory or manifest.json missing",
+        ));
+    }
+    if opts.source_name == opts.target_name {
+        return Err(SmcError::InvalidOp("source and target backend must differ"));
+    }
+    if opts.source_name.is_empty() || opts.target_name.is_empty() {
+        return Err(SmcError::InvalidOp("backend names must be non-empty"));
+    }
+
+    // Parse just the fields we need from the manifest.
+    let manifest_json = fs::read_to_string(&manifest_path)?;
+    let slice: ManifestSlice = serde_json::from_str(&manifest_json)?;
+    if slice.backend != opts.source_name {
+        return Err(SmcError::InvalidOp(
+            "manifest backend disagrees with operator-stated source",
+        ));
+    }
+    if slice.label != opts.barcode {
+        return Err(SmcError::InvalidOp(
+            "manifest label disagrees with operator-stated barcode",
+        ));
+    }
+    let namespace = slice.dedup.cloud_namespace(opts.barcode);
+
+    // Walk chunks.idx, collecting hashes + sizes. We hold the index
+    // file open only across this loop; the cartridge is not mutated.
+    let chunk_idx = ChunkIndexFile::open_or_create(&cart_root)?;
+    let mut chunk_hashes: Vec<String> = Vec::new();
+    let mut chunk_keys: Vec<String> = Vec::new();
+    let mut chunk_sizes: Vec<u64> = Vec::new();
+    for entry in chunk_idx.iter() {
+        let (_id, rec) = entry?;
+        if let Some(hash) = rec.hash {
+            chunk_keys.push(ChunkPool::cloud_key_for(namespace, &hash));
+            chunk_hashes.push(hash);
+            chunk_sizes.push(rec.size);
+        }
+    }
+    drop(chunk_idx);
+
+    let mut report = MigrateReport {
+        barcode: opts.barcode.to_string(),
+        mode: opts.mode.label().to_string(),
+        from_backend: opts.source_name.to_string(),
+        to_backend: opts.target_name.to_string(),
+        chunks_total: chunk_hashes.len() as u64,
+        dry_run: opts.dry_run,
+        ..Default::default()
+    };
+
+    let log = |msg: &str| {
+        if let Some(p) = opts.progress {
+            p(msg);
+        }
+    };
+
+    if opts.dry_run {
+        log(&format!(
+            "dry-run: would migrate {} ({} chunks) {} -> {}",
+            opts.barcode,
+            chunk_hashes.len(),
+            opts.source_name,
+            opts.target_name
+        ));
+        return Ok(report);
+    }
+
+    match opts.mode {
+        MigrateMode::Move => {
+            // Phase 1: copy chunks. Idempotent (HEAD on target first).
+            log(&format!(
+                "copying {} chunks {} -> {}",
+                chunk_hashes.len(),
+                opts.source_name,
+                opts.target_name
+            ));
+            for (i, (hash, key)) in chunk_hashes.iter().zip(chunk_keys.iter()).enumerate() {
+                let exists_on_target = opts.target.chunk_exists(key).await.map_err(cloud_err)?;
+                if !exists_on_target {
+                    let bytes = opts.source.download_chunk(key).await.map_err(cloud_err)?;
+                    let actual = blake3_hex(&bytes);
+                    if &actual != hash {
+                        return Err(SmcError::ContentHashMismatch {
+                            expected: hash.clone(),
+                            actual,
+                        });
+                    }
+                    let size = bytes.len() as u64;
+                    opts.target
+                        .upload_chunk(key, &bytes)
+                        .await
+                        .map_err(cloud_err)?;
+                    report.chunks_copied += 1;
+                    report.bytes_copied += size;
+                }
+                if (i + 1).is_multiple_of(64) {
+                    log(&format!("copied {}/{} chunks", i + 1, chunk_hashes.len()));
+                }
+            }
+
+            // Phase 2: copy manifest backups. Source carries
+            //   manifests/<barcode>/manifest-latest.json
+            //   manifests/<barcode>/manifest-<ts>.json (versioned)
+            //   manifests/<barcode>/chunks/page-NNNNNN.dat
+            //   manifests/<barcode>/blocks-pN/page-NNNNNN.dat
+            // Copy them all under the same keys.
+            log("copying manifest backups");
+            let manifest_prefix = format!("manifests/{}/", opts.barcode);
+            let manifest_keys = opts
+                .source
+                .list_objects(&manifest_prefix)
+                .await
+                .map_err(cloud_err)?;
+            for key in &manifest_keys {
+                copy_one_object(opts.source, opts.target, key).await?;
+                report.manifest_objects_copied += 1;
+            }
+
+            // Phase 3: move local pool files under the new backend prefix.
+            log("moving local pool files");
+            report.local_files_moved = move_local_pool_files(
+                opts.tapes_dir,
+                opts.source_name,
+                opts.target_name,
+                namespace,
+                &chunk_hashes,
+            )?;
+
+            // Phase 4: commit point. Flip manifest.backend atomically.
+            log("flipping manifest.backend");
+            rewrite_manifest_backend(&cart_root, opts.target_name)?;
+
+            // Phase 5: source-side delete. Best-effort; warnings only.
+            // Under Global dedup chunks may be referenced by other
+            // cartridges on the source — leave them; the future GC
+            // sweep handles orphans correctly.
+            let delete_chunks = matches!(slice.dedup, DedupSlice::Local);
+            log(if delete_chunks {
+                "deleting source objects (chunks + manifests)"
+            } else {
+                "deleting source manifest backups (chunks shared under Global dedup; leave for GC)"
+            });
+            let delete_keys: Vec<&String> = if delete_chunks {
+                chunk_keys.iter().chain(manifest_keys.iter()).collect()
+            } else {
+                manifest_keys.iter().collect()
+            };
+            for key in delete_keys {
+                match opts.source.delete_object(key).await {
+                    Ok(()) => report.source_objects_deleted += 1,
+                    Err(e) => report
+                        .source_delete_warnings
+                        .push(format!("{}: {}", key, e)),
+                }
+            }
+        }
+        MigrateMode::Rebind { verify } => {
+            if verify {
+                log(&format!(
+                    "verifying {} chunks + sentinel on target {}",
+                    chunk_hashes.len(),
+                    opts.target_name
+                ));
+                let mut missing: Vec<String> = Vec::new();
+                for key in &chunk_keys {
+                    if opts.target.chunk_exists(key).await.map_err(cloud_err)? {
+                        report.chunks_verified += 1;
+                    } else {
+                        missing.push(key.clone());
+                        if missing.len() >= 16 {
+                            // Cap the list; report.failures clamps too.
+                            break;
+                        }
+                    }
+                }
+                if missing.is_empty() {
+                    let sentinel = format!("manifests/{}/manifest-latest.json", opts.barcode);
+                    if !opts
+                        .target
+                        .chunk_exists(&sentinel)
+                        .await
+                        .map_err(cloud_err)?
+                    {
+                        missing.push(sentinel);
+                    }
+                }
+                if !missing.is_empty() {
+                    return Err(SmcError::RebindTargetMissing { keys: missing });
+                }
+            } else {
+                log("skipping verify pass (operator vouches for target)");
+            }
+            log("moving local pool files");
+            report.local_files_moved = move_local_pool_files(
+                opts.tapes_dir,
+                opts.source_name,
+                opts.target_name,
+                namespace,
+                &chunk_hashes,
+            )?;
+            log("flipping manifest.backend");
+            rewrite_manifest_backend(&cart_root, opts.target_name)?;
+        }
+    }
+
+    log("migration complete");
+    Ok(report)
+}
+
+/// Translate `shared_cloud` errors into `SmcError` for `?` propagation.
+fn cloud_err(e: shared_cloud::CloudError) -> SmcError {
+    SmcError::CloudError(e.to_string())
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(bytes);
+    hex::encode(h.finalize().as_bytes())
+}
+
+async fn copy_one_object(
+    source: &dyn CloudBackend,
+    target: &dyn CloudBackend,
+    key: &str,
+) -> Result<()> {
+    // Two key shapes live under `manifests/<barcode>/`:
+    //   - `manifest-latest.json` / `manifest-<ts>.json` — UTF-8 JSON,
+    //     uploaded via `upload_manifest` (no compression layer).
+    //   - `chunks/page-NNNNNN.dat` / `blocks-p<N>/page-NNNNNN.dat` —
+    //     binary index pages, uploaded via `upload_chunk` so the
+    //     backend's compression config applies.
+    // Pick the right copy primitive based on the key suffix. The
+    // backend's own compression handling round-trips correctly:
+    // `download_chunk` decompresses on read, `upload_chunk` re-applies
+    // the target's config on the way back.
+    if key.ends_with(".json") {
+        let body = source.download_manifest(key).await.map_err(cloud_err)?;
+        target
+            .upload_manifest(key, &body)
+            .await
+            .map_err(cloud_err)?;
+    } else {
+        // Index pages: versioned key (re-migrating the same cartridge
+        // would copy potentially-different bytes under the same key).
+        // `upload_versioned` bypasses the meta-cache.
+        let bytes = source.download_chunk(key).await.map_err(cloud_err)?;
+        target
+            .upload_versioned(key, &bytes)
+            .await
+            .map_err(cloud_err)?;
+    }
+    Ok(())
+}
+
+/// Rewrite the `backend` field of manifest.json in place. Uses
+/// `serde_json::Value` so we don't depend on the private `Manifest`
+/// struct's exact shape — future schema additions stay round-tripped.
+fn rewrite_manifest_backend(cart_root: &Path, new_backend: &str) -> Result<()> {
+    let manifest_path = cart_root.join("manifest.json");
+    let src = fs::read_to_string(&manifest_path)?;
+    let mut v: serde_json::Value = serde_json::from_str(&src)?;
+    let obj = v
+        .as_object_mut()
+        .ok_or(SmcError::InvalidOp("manifest.json root is not an object"))?;
+    obj.insert(
+        "backend".to_string(),
+        serde_json::Value::String(new_backend.to_string()),
+    );
+    let body = serde_json::to_string(&v)?;
+    let tmp = cart_root.join("manifest.json.tmp");
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, &manifest_path)?;
+    Ok(())
+}
+
+/// Move every local pool file referenced by the cartridge from the
+/// source backend's prefix to the target's. Pool root is
+/// `<tapes_dir.parent()>/chunks/<backend>/[<namespace>/]<aa>/<bb>/<hash>.dat`
+/// — matches [`shared_pool::ChunkPool::pool_dir`].
+///
+/// Returns the count of files actually renamed (missing source files
+/// are skipped silently — chunks marked `CloudOnly` in the index are
+/// not expected to be local).
+fn move_local_pool_files(
+    tapes_dir: &Path,
+    source_backend: &str,
+    target_backend: &str,
+    namespace: Option<&str>,
+    hashes: &[String],
+) -> Result<u64> {
+    let parent = tapes_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let source_pool = pool_dir_for(&parent, source_backend, namespace);
+    let target_pool = pool_dir_for(&parent, target_backend, namespace);
+    let mut moved = 0u64;
+    for hash in hashes {
+        let (s1, s2) = shard_pair(hash);
+        let src = source_pool.join(s1).join(s2).join(format!("{hash}.dat"));
+        if !src.is_file() {
+            continue;
+        }
+        let dst_dir = target_pool.join(s1).join(s2);
+        fs::create_dir_all(&dst_dir)?;
+        let dst = dst_dir.join(format!("{hash}.dat"));
+        if dst.is_file() {
+            // Target already has it (re-run after partial failure, or
+            // dedup hit). Drop the source copy and move on.
+            fs::remove_file(&src)?;
+            moved += 1;
+            continue;
+        }
+        match fs::rename(&src, &dst) {
+            Ok(()) => moved += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                fs::copy(&src, &dst)?;
+                fs::remove_file(&src)?;
+                moved += 1;
+            }
+            Err(e) => return Err(SmcError::Io(e)),
+        }
+    }
+    Ok(moved)
+}
+
+fn pool_dir_for(parent: &Path, backend: &str, namespace: Option<&str>) -> PathBuf {
+    let base = parent.join("chunks").join(backend);
+    match namespace {
+        Some(ns) => base.join(ns),
+        None => base,
+    }
+}
+
+fn shard_pair(hash_hex: &str) -> (&str, &str) {
+    let s1 = if hash_hex.len() >= 2 {
+        &hash_hex[..2]
+    } else {
+        "00"
+    };
+    let s2 = if hash_hex.len() >= 4 {
+        &hash_hex[2..4]
+    } else {
+        "00"
+    };
+    (s1, s2)
+}

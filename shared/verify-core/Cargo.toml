@@ -1,0 +1,24 @@
+[package]
+name = "shared-verify-core"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product chunk-pool + cloud verification core. Both products'
+# `system verify` reduce to the same two sweeps — a local pool orphan
+# scan and a cloud HEAD storm — over a content-addressed chunk pool.
+# A product implements `VerifyTarget` (its live chunk set + per-entity
+# cloud expectations); `sweep_local_pool` / `sweep_cloud` do the rest.
+# Product-specific checks (tape library/partition, block page-table)
+# and report assembly stay per-product.
+
+[dependencies]
+shared-pool = { path = "../pool" }
+shared-cloud = { path = "../cloud" }
+
+futures = "0.3"

@@ -1,0 +1,54 @@
+[package]
+name = "nvme-tcp"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# NVMe SQE / CQE / status / Connect / Identify decoded from
+# capsule payloads. nvme-tcp is a transport for nvme-base + the
+# command-set crates layered on top.
+nvme-base = { path = "../base" }
+# The product-side handler trait the transport dispatches commands
+# through. nvme-nvm's NvmeNvmDispatcher will impl this; future
+# admin / discovery command sets will impl their own variants.
+# (Equivalent of shared-iscsi's ScsiHandler trait.)
+nvme-nvm = { path = "../nvm" }
+
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+bytes = "1"
+
+# TLS-PSK helpers (NVMe-TCP §3.6.1.5). openssl is already vendored
+# in the workspace dep graph via shared-cloud / shared-keystore; we
+# use it for HKDF + HMAC so there's a single crypto source of truth
+# alongside the openssl-backed TLS handshake the server uses.
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+crc32fast = "1"
+openssl = { version = "0.10", features = ["vendored"] }
+# Identity-file (de)serialization (`<data_dir>/nvmetcp-psks.json`).
+# Mirrors the iscsi-users.json pattern in shared-iscsi.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# TLS 1.3 + external PSK for the NVMe/TCP server-side path
+# (NVMe-TCP §3.6.1.5). s2n-tls is the only Rust TLS stack that
+# exposes a server-side external-PSK API today — see
+# memory project_tls_dependency_landscape for the full rationale.
+# Used here ONLY for nvme-tcp server-side TLS; shared-cloud /
+# shared-keystore stay on rustls + reqwest as before.
+s2n-tls = "0.3"
+s2n-tls-tokio = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+hex = "0.4"

@@ -1,0 +1,735 @@
+// Copyright (c) 2026 Mete Balci
+// SPDX-License-Identifier: Apache-2.0
+
+//! HashiCorp Vault Transit keystore backend.
+//!
+//! Hand-rolled `reqwest` client — vaultrs adds a heavyweight builder
+//! surface for the four endpoints we need (encrypt, decrypt, datakey,
+//! sys/health) plus AppRole login. Mirrors `shared-cloud`'s posture
+//! against the Azure / GCP SDK split: lean on the official SDK when
+//! it's first-party, otherwise hand-roll the JSON.
+//!
+//! Endpoints:
+//! - `POST /v1/{mount}/encrypt/{key}`             — wrap a plaintext DEK
+//! - `POST /v1/{mount}/decrypt/{key}`             — unwrap
+//! - `POST /v1/{mount}/datakey/plaintext/{key}`   — HSM-grade DEK + wrap
+//! - `GET  /v1/sys/health`                        — readiness probe
+//! - `POST /v1/auth/approle/login`                — AppRole token mint
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
+
+use crate::error::KeyStoreError;
+use crate::keystore_backend::{DEK_LEN, DekSource, KeyStoreBackend, SecretBytes};
+use crate::keystore_config::ResolvedVaultAuth;
+
+const VAULT_TOKEN_HEADER: &str = "x-vault-token";
+const VAULT_NAMESPACE_HEADER: &str = "x-vault-namespace";
+
+/// HashiCorp Vault Transit-backed keystore.
+///
+/// The session token lives behind a `RwLock`: AppRole logs in once at
+/// `new()` and re-logs in lazily on 401/403 (covers token TTL
+/// expiry). Static-token auth fails fast with `KeyStoreError::Auth`
+/// on the same status codes — operators should rotate the token and
+/// restart.
+#[derive(Clone, Debug)]
+pub struct VaultBackend {
+    inner: Arc<VaultInner>,
+}
+
+#[derive(Debug)]
+struct VaultInner {
+    client: Client,
+    address: String,
+    transit_mount: String,
+    transit_key: String,
+    namespace: Option<String>,
+    auth: ResolvedVaultAuth,
+    token: RwLock<String>,
+}
+
+impl VaultBackend {
+    pub async fn new(
+        address: String,
+        transit_mount: String,
+        transit_key: String,
+        namespace: Option<String>,
+        tls_skip_verify: bool,
+        auth: ResolvedVaultAuth,
+    ) -> Result<Self, KeyStoreError> {
+        let address = address.trim_end_matches('/').to_string();
+        let client = build_http_client(tls_skip_verify)?;
+        let initial_token = match &auth {
+            ResolvedVaultAuth::Token(t) => t.clone(),
+            ResolvedVaultAuth::AppRole { role_id, secret_id } => {
+                approle_login(&client, &address, namespace.as_deref(), role_id, secret_id).await?
+            }
+        };
+        let inner = Arc::new(VaultInner {
+            client,
+            address,
+            transit_mount,
+            transit_key,
+            namespace,
+            auth,
+            token: RwLock::new(initial_token),
+        });
+        Ok(Self { inner })
+    }
+
+    async fn auth_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let token = self.inner.token.read().await.clone();
+        if let Ok(v) = HeaderValue::from_str(&token) {
+            headers.insert(HeaderName::from_static(VAULT_TOKEN_HEADER), v);
+        }
+        if let Some(ns) = self.inner.namespace.as_deref()
+            && let Ok(v) = HeaderValue::from_str(ns)
+        {
+            headers.insert(HeaderName::from_static(VAULT_NAMESPACE_HEADER), v);
+        }
+        headers
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}/v1/{}", self.inner.address, path.trim_start_matches('/'))
+    }
+
+    /// Retry the closure once after refreshing the AppRole token on a
+    /// 401/403. Static-token auth bypasses the refresh (returns the
+    /// classified error immediately).
+    async fn with_token_refresh<F, Fut, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> Result<T, KeyStoreError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, KeyStoreError>>,
+    {
+        match f().await {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                let should_refresh =
+                    matches!(&err, KeyStoreError::Auth(_) | KeyStoreError::Authz(_))
+                        && matches!(&self.inner.auth, ResolvedVaultAuth::AppRole { .. });
+                if !should_refresh {
+                    return Err(err);
+                }
+                debug!(
+                    "vault: {} returned auth failure; refreshing AppRole token and retrying",
+                    op
+                );
+                if let ResolvedVaultAuth::AppRole { role_id, secret_id } = &self.inner.auth {
+                    let new = approle_login(
+                        &self.inner.client,
+                        &self.inner.address,
+                        self.inner.namespace.as_deref(),
+                        role_id,
+                        secret_id,
+                    )
+                    .await?;
+                    *self.inner.token.write().await = new;
+                }
+                f().await
+            }
+        }
+    }
+
+    async fn encrypt_call(
+        &self,
+        wrap_context: &[u8; 16],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, KeyStoreError> {
+        let body = EncryptRequest {
+            plaintext: B64.encode(plaintext),
+            // Vault Transit's `context` field is the wire-format AAD
+            // binding; it accepts any opaque bytes. We feed the 16-byte
+            // wrap context (a volume UUID or daemon-identity binding).
+            context: B64.encode(wrap_context),
+        };
+        let path = format!(
+            "{}/encrypt/{}",
+            self.inner.transit_mount, self.inner.transit_key
+        );
+        self.with_token_refresh("transit.encrypt", || async {
+            let headers = self.auth_headers().await;
+            let resp = self
+                .inner
+                .client
+                .post(self.url(&path))
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| classify_reqwest_err("transit.encrypt", e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(classify_vault_status(
+                    "transit.encrypt",
+                    status,
+                    read_body(resp).await,
+                ));
+            }
+            let parsed: VaultDataResponse<EncryptResponse> = resp
+                .json()
+                .await
+                .map_err(|e| KeyStoreError::Other(format!("transit.encrypt parse: {e}")))?;
+            Ok(parsed.data.ciphertext.into_bytes())
+        })
+        .await
+    }
+
+    async fn decrypt_call(
+        &self,
+        wrap_context: &[u8; 16],
+        wrapped: &[u8],
+    ) -> Result<[u8; DEK_LEN], KeyStoreError> {
+        let ct = std::str::from_utf8(wrapped).map_err(|e| {
+            KeyStoreError::Other(format!(
+                "transit.decrypt: wrapped blob is not UTF-8 ({e}) — expected 'vault:v1:…' string"
+            ))
+        })?;
+        let body = DecryptRequest {
+            ciphertext: ct.to_string(),
+            context: B64.encode(wrap_context),
+        };
+        let path = format!(
+            "{}/decrypt/{}",
+            self.inner.transit_mount, self.inner.transit_key
+        );
+        self.with_token_refresh("transit.decrypt", || async {
+            let headers = self.auth_headers().await;
+            let resp = self
+                .inner
+                .client
+                .post(self.url(&path))
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| classify_reqwest_err("transit.decrypt", e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(classify_vault_status(
+                    "transit.decrypt",
+                    status,
+                    read_body(resp).await,
+                ));
+            }
+            let parsed: VaultDataResponse<DecryptResponse> = resp
+                .json()
+                .await
+                .map_err(|e| KeyStoreError::Other(format!("transit.decrypt parse: {e}")))?;
+            let raw = B64.decode(parsed.data.plaintext.as_bytes()).map_err(|e| {
+                KeyStoreError::Other(format!("transit.decrypt: plaintext base64 decode: {e}"))
+            })?;
+            if raw.len() != DEK_LEN {
+                return Err(KeyStoreError::Other(format!(
+                    "transit.decrypt: plaintext was {} bytes, expected {}",
+                    raw.len(),
+                    DEK_LEN
+                )));
+            }
+            let mut out = [0u8; DEK_LEN];
+            out.copy_from_slice(&raw);
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn datakey_call(
+        &self,
+        wrap_context: &[u8; 16],
+    ) -> Result<([u8; DEK_LEN], Vec<u8>), KeyStoreError> {
+        let body = DataKeyRequest {
+            context: B64.encode(wrap_context),
+            bits: 256,
+        };
+        let path = format!(
+            "{}/datakey/plaintext/{}",
+            self.inner.transit_mount, self.inner.transit_key
+        );
+        self.with_token_refresh("transit.datakey", || async {
+            let headers = self.auth_headers().await;
+            let resp = self
+                .inner
+                .client
+                .post(self.url(&path))
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| classify_reqwest_err("transit.datakey", e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(classify_vault_status(
+                    "transit.datakey",
+                    status,
+                    read_body(resp).await,
+                ));
+            }
+            let parsed: VaultDataResponse<DataKeyResponse> = resp
+                .json()
+                .await
+                .map_err(|e| KeyStoreError::Other(format!("transit.datakey parse: {e}")))?;
+            let plain = B64.decode(parsed.data.plaintext.as_bytes()).map_err(|e| {
+                KeyStoreError::Other(format!("transit.datakey: plaintext base64 decode: {e}"))
+            })?;
+            if plain.len() != DEK_LEN {
+                return Err(KeyStoreError::Other(format!(
+                    "transit.datakey: plaintext was {} bytes, expected {}",
+                    plain.len(),
+                    DEK_LEN
+                )));
+            }
+            let mut key = [0u8; DEK_LEN];
+            key.copy_from_slice(&plain);
+            Ok((key, parsed.data.ciphertext.into_bytes()))
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl KeyStoreBackend for VaultBackend {
+    async fn generate_and_wrap(
+        &self,
+        wrap_context: &[u8; 16],
+        source: DekSource,
+    ) -> Result<(SecretBytes, Vec<u8>), KeyStoreError> {
+        match source {
+            DekSource::Backend => {
+                let (plain, wrapped) = self.datakey_call(wrap_context).await?;
+                Ok((SecretBytes::new(plain), wrapped))
+            }
+            DekSource::Daemon => {
+                use shared_crypto::{OsRng, RngCore};
+                let mut plain = [0u8; DEK_LEN];
+                OsRng.fill_bytes(&mut plain);
+                let wrapped = self.encrypt_call(wrap_context, &plain).await?;
+                Ok((SecretBytes::new(plain), wrapped))
+            }
+        }
+    }
+
+    async fn wrap(
+        &self,
+        wrap_context: &[u8; 16],
+        plaintext: &SecretBytes,
+    ) -> Result<Vec<u8>, KeyStoreError> {
+        self.encrypt_call(wrap_context, plaintext.as_bytes()).await
+    }
+
+    async fn unwrap(
+        &self,
+        wrap_context: &[u8; 16],
+        wrapped: &[u8],
+    ) -> Result<SecretBytes, KeyStoreError> {
+        let bytes = self.decrypt_call(wrap_context, wrapped).await?;
+        Ok(SecretBytes::new(bytes))
+    }
+
+    async fn forget(&self, _wrap_context: &[u8; 16]) -> Result<(), KeyStoreError> {
+        // Vault Transit holds no per-context state. The wrapped blob
+        // at the caller's persistence layer is the only thing tied
+        // to this call site. (`transit/keys/<name>/rotate` is a
+        // CMK-level rotation event, not per-context.)
+        Ok(())
+    }
+
+    fn backend_type(&self) -> &'static str {
+        "vault"
+    }
+
+    fn wrap_target_fingerprint(&self) -> String {
+        // Address + mount + key is the wrap target. Namespace
+        // (Enterprise) lives in a separate routing dimension; include
+        // it so two entries that share address/mount/key but differ in
+        // namespace don't alias.
+        let ns = self
+            .inner
+            .namespace
+            .as_deref()
+            .map(|n| format!(":ns={n}"))
+            .unwrap_or_default();
+        format!(
+            "vault:{}/{}/{}{}",
+            self.inner.address, self.inner.transit_mount, self.inner.transit_key, ns
+        )
+    }
+
+    async fn health_check(&self) -> Result<(), KeyStoreError> {
+        let headers = self.auth_headers().await;
+        let resp = self
+            .inner
+            .client
+            .get(self.url("sys/health"))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_err("sys.health", e))?;
+        let status = resp.status();
+        // Vault returns rich status codes from sys/health:
+        //   200 — initialized, unsealed, active
+        //   429 — standby (HA secondary). Still healthy for our use.
+        //   472 — performance-standby (Enterprise). Healthy.
+        //   473 — DR-secondary. Healthy.
+        //   501 — uninitialized.
+        //   503 — sealed.
+        // Everything in 200/429/472/473 is OK for transit calls
+        // routed through the active node (Vault transparently
+        // forwards). 501/503 are fatal.
+        match status.as_u16() {
+            200 | 429 | 472 | 473 => Ok(()),
+            501 => Err(KeyStoreError::Other("vault: not initialized".into())),
+            503 => Err(KeyStoreError::Other("vault: sealed".into())),
+            _ => Err(classify_vault_status(
+                "sys.health",
+                status,
+                read_body(resp).await,
+            )),
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn KeyStoreBackend> {
+        Box::new(self.clone())
+    }
+}
+
+fn build_http_client(tls_skip_verify: bool) -> Result<Client, KeyStoreError> {
+    let mut builder = Client::builder().user_agent("thurvsa-keystore/0.1");
+    if tls_skip_verify {
+        warn!("vault: tls_skip_verify=true (development only - TLS cert validation disabled)");
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
+        .build()
+        .map_err(|e| KeyStoreError::Other(format!("vault: build reqwest client: {e}")))
+}
+
+async fn approle_login(
+    client: &Client,
+    address: &str,
+    namespace: Option<&str>,
+    role_id: &str,
+    secret_id: &str,
+) -> Result<String, KeyStoreError> {
+    let url = format!("{}/v1/auth/approle/login", address.trim_end_matches('/'));
+    let body = AppRoleLoginRequest { role_id, secret_id };
+    let mut req = client.post(&url).json(&body);
+    if let Some(ns) = namespace
+        && let Ok(v) = HeaderValue::from_str(ns)
+    {
+        req = req.header(VAULT_NAMESPACE_HEADER, v);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| classify_reqwest_err("auth.approle.login", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(classify_vault_status(
+            "auth.approle.login",
+            status,
+            read_body(resp).await,
+        ));
+    }
+    let parsed: AppRoleLoginResponse = resp
+        .json()
+        .await
+        .map_err(|e| KeyStoreError::Other(format!("auth.approle.login parse: {e}")))?;
+    Ok(parsed.auth.client_token)
+}
+
+async fn read_body(resp: reqwest::Response) -> String {
+    resp.text()
+        .await
+        .unwrap_or_else(|_| "<no body>".to_string())
+}
+
+/// Map an HTTP status from Vault to a [`KeyStoreError`]. 401 → Auth,
+/// 403 → Authz, 404 → NotFound, 5xx → Other (transient).
+pub(crate) fn classify_vault_status(op: &str, status: StatusCode, body: String) -> KeyStoreError {
+    let label = format!("{op}: HTTP {status} — {body}");
+    match status.as_u16() {
+        401 => KeyStoreError::Auth(label),
+        403 => KeyStoreError::Authz(label),
+        404 => KeyStoreError::NotFound(label),
+        408 => KeyStoreError::Timeout(label),
+        500..=599 => KeyStoreError::Other(label),
+        _ => KeyStoreError::Other(label),
+    }
+}
+
+fn classify_reqwest_err(op: &'static str, err: reqwest::Error) -> KeyStoreError {
+    if err.is_timeout() {
+        return KeyStoreError::Timeout(format!("{op}: {err}"));
+    }
+    if err.is_connect() || err.is_request() {
+        return KeyStoreError::Network(format!("{op}: {err}"));
+    }
+    KeyStoreError::Other(format!("{op}: {err}"))
+}
+
+#[derive(Debug, Serialize)]
+struct EncryptRequest {
+    plaintext: String,
+    context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EncryptResponse {
+    ciphertext: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DecryptRequest {
+    ciphertext: String,
+    context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecryptResponse {
+    plaintext: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DataKeyRequest {
+    context: String,
+    bits: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataKeyResponse {
+    plaintext: String,
+    ciphertext: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultDataResponse<T> {
+    data: T,
+}
+
+#[derive(Debug, Serialize)]
+struct AppRoleLoginRequest<'a> {
+    role_id: &'a str,
+    secret_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppRoleLoginResponse {
+    auth: AppRoleAuth,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppRoleAuth {
+    client_token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::KeyStoreFailureKind;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn fixture_uuid() -> [u8; 16] {
+        [0x11; 16]
+    }
+
+    fn fixture_key() -> [u8; DEK_LEN] {
+        let mut k = [0u8; DEK_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        k
+    }
+
+    #[test]
+    fn classify_status_table() {
+        assert!(matches!(
+            classify_vault_status("op", StatusCode::UNAUTHORIZED, "x".into()).kind(),
+            KeyStoreFailureKind::Auth
+        ));
+        assert!(matches!(
+            classify_vault_status("op", StatusCode::FORBIDDEN, "x".into()).kind(),
+            KeyStoreFailureKind::Authz
+        ));
+        assert!(matches!(
+            classify_vault_status("op", StatusCode::NOT_FOUND, "x".into()).kind(),
+            KeyStoreFailureKind::NotFound
+        ));
+        assert!(matches!(
+            classify_vault_status("op", StatusCode::INTERNAL_SERVER_ERROR, "x".into()).kind(),
+            KeyStoreFailureKind::Other
+        ));
+        assert!(matches!(
+            classify_vault_status("op", StatusCode::REQUEST_TIMEOUT, "x".into()).kind(),
+            KeyStoreFailureKind::Timeout
+        ));
+    }
+
+    #[test]
+    fn encrypt_request_serializes() {
+        let req = EncryptRequest {
+            plaintext: B64.encode([1u8, 2, 3]),
+            context: B64.encode([0xABu8; 16]),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("plaintext"));
+        assert!(s.contains("context"));
+    }
+
+    #[tokio::test]
+    async fn wrap_round_trips_through_wiremock() {
+        let server = MockServer::start().await;
+
+        // /encrypt returns a synthetic vault:v1:… string.
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/encrypt/thurvsa-volumes"))
+            .and(header("x-vault-token", "s.devroot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "ciphertext": "vault:v1:DEADBEEF" }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+
+        let wrapped = backend
+            .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
+            .await
+            .unwrap();
+        assert_eq!(wrapped, b"vault:v1:DEADBEEF");
+    }
+
+    #[tokio::test]
+    async fn unwrap_round_trips_through_wiremock() {
+        let server = MockServer::start().await;
+        let plaintext_b64 = B64.encode(fixture_key());
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transit/decrypt/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "plaintext": plaintext_b64 }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+
+        let plain = backend
+            .unwrap(&fixture_uuid(), b"vault:v1:DEADBEEF")
+            .await
+            .unwrap();
+        assert_eq!(plain.as_bytes(), &fixture_key());
+    }
+
+    #[tokio::test]
+    async fn wrap_target_fingerprint_includes_namespace_when_set() {
+        let server = MockServer::start().await;
+        let no_ns = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        let with_ns = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            Some("team-a".into()),
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            no_ns.wrap_target_fingerprint(),
+            format!("vault:{}/transit/thurvsa-volumes", server.uri())
+        );
+        assert_eq!(
+            with_ns.wrap_target_fingerprint(),
+            format!("vault:{}/transit/thurvsa-volumes:ns=team-a", server.uri())
+        );
+        assert_ne!(
+            no_ns.wrap_target_fingerprint(),
+            with_ns.wrap_target_fingerprint()
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_treats_429_as_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        backend.health_check().await.expect("standby still healthy");
+    }
+
+    #[tokio::test]
+    async fn health_check_503_is_sealed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        let err = backend.health_check().await.unwrap_err();
+        assert!(format!("{err}").contains("sealed"));
+    }
+}

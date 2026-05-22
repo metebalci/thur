@@ -1,0 +1,72 @@
+[Unit]
+Description=thurvsa Block Storage Daemon
+Documentation=https://github.com/metebalci/thur
+After=network.target
+
+# Restart policy: limit restart attempts to prevent infinite loops
+# Maximum 5 restart attempts within 300 seconds (5 minutes)
+# After hitting the limit, service enters failed state
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/thurvsad --config /etc/thurvsa/thurvsa.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=thurvsad
+
+# Optional daemon environment file. Leading `-` makes it
+# optional — if /etc/thurvsa/thurvsa.env doesn't exist the unit
+# starts anyway (useful when every env var comes from elsewhere,
+# e.g. cloud VM instance identity). Holds cloud credentials,
+# ${ENV_VAR} secrets referenced from thurvsa.yaml (alerting
+# webhook tokens, SMTP passwords, etc.), and any future env-var
+# feature flags. 0640 root:thurvsa. See README.md § Configuring
+# cloud credentials for systemd.
+EnvironmentFile=-/etc/thurvsa/thurvsa.env
+
+User=thurvsa
+Group=thurvsa
+
+# Provision /run/thurvsa/ at boot for the admin Unix socket
+# (`/run/thurvsa/admin.sock`). systemd creates the directory
+# owned by User/Group with the requested mode and tears it down
+# on stop. Mode 0750 lets the daemon (owner) and any operator in
+# the `thurvsa` group `connect()` to the socket; non-members
+# get EACCES at the directory walk before they ever reach the
+# socket itself. The CLI client connects here unconditionally;
+# decoupling the socket path from the daemon's `data_dir` is what
+# lets daemon-routed CLI commands run without reading the
+# 0640 conffile.
+RuntimeDirectory=thurvsa
+RuntimeDirectoryMode=0750
+
+# thurvsa binds3260(iSCSI) and 9090 (HTTP/Prometheus) by default,
+# both above the 1024 privileged-port boundary so no capability is
+# strictly needed today. We keep CAP_NET_BIND_SERVICE in the
+# bounding set anyway so an operator who remaps to a privileged
+# port via thurvsa.yaml's `iscsi.listen` / `http.listen` doesn't
+# need to edit the unit too.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/thurvsa
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

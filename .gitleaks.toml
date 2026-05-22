@@ -1,0 +1,15 @@
+# gitleaks configuration. Extends the upstream default ruleset with a
+# project allowlist. The pre-commit hook (.githooks/pre-commit) picks
+# this up automatically from the repo root.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Unit-test fixture credentials — not real secrets."
+regexes = [
+  # CHAP auth unit tests use obviously-fake passwords shaped
+  # `<name>-pw-1234567890` inside #[cfg(test)] modules
+  # (e.g. vsa/daemon/src/auth.rs). Not real credentials.
+  '''[a-z]+-pw-1234567890''',
+]

@@ -1,0 +1,62 @@
+# Thur Workspace Clippy Configuration
+# Enforces strict safety and code quality standards
+
+# Clippy configuration file uses a flat key-value format
+# NOT the Cargo.toml [lints] table format
+
+# Minimum supported Rust version (for clippy compatibility checks).
+# Keep aligned with `[workspace.package].rust-version` in Cargo.toml,
+# rust-toolchain.toml's `channel`, and `release/Containerfile.builder`'s
+# RUST_VERSION ARG — clippy reads this file directly and ignores the
+# Cargo.toml setting if they differ, so they need to march in lockstep.
+msrv = "1.92"
+
+# Cognitive complexity threshold (warn on functions with >25 complexity)
+cognitive-complexity-threshold = 25
+
+# Too many arguments threshold. SCSI / ISCSI handlers and the
+# Cartridge constructors naturally take 8-11 parameters because the
+# protocol contracts they implement do. 12 is wide enough to cover
+# the legitimate cases without losing the lint as a guard against new
+# code accidentally drifting wider.
+too-many-arguments-threshold = 12
+
+# Too many lines threshold (we're refactoring to <50 lines per function)
+too-many-lines-threshold = 100
+
+# Large types threshold (warn if passing >256 bytes by value)
+pass-by-value-size-limit = 256
+
+# Trivial copy size limit
+trivial-copy-size-limit = 128
+
+# Stack size threshold
+stack-size-threshold = 512000
+
+# Type complexity threshold
+type-complexity-threshold = 250
+
+# Vec-box size threshold
+vec-box-size-threshold = 4096
+
+# Array size threshold (warn on arrays >512KB on stack)
+array-size-threshold = 524288
+
+# Enum variant size threshold (warn if variants differ by >200 bytes)
+enum-variant-size-threshold = 200
+
+# Large error threshold (errors should be small)
+large-error-threshold = 128
+
+# Allow certain names (common abbreviations)
+disallowed-names = []
+
+# Allow unwrap/panic in tests (tests are allowed to fail fast)
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+
+# Lint levels are set in [workspace.lints] in Cargo.toml. Release
+# is gated on three deny-level lints: unwrap_used, panic,
+# unwrap_in_result. pedantic / nursery / missing_docs stay at
+# default (allow) — they surface ~1500 advisory style nits on this
+# workspace and aren't worth gating release on.

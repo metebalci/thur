@@ -1,0 +1,21 @@
+[package]
+name = "nvme-base"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Vendor / model identity strings burned into Identify Controller
+# (Subsystem NQN, Serial Number, Model Number).
+shared-naming = { path = "../../shared/naming" }
+
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,24 @@
+[package]
+name = "shared-cli-alerting"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product CLI implementations for `system alerting {list,test}`.
+# Both thurvtl and thurvsa funnel through these helpers so
+# the wire shape (JobEvent stream from `system.alerting.test`) is
+# identical across products.
+
+[dependencies]
+shared-admin-client = { path = "../admin-client" }
+shared-admin-proto = { path = "../admin-proto" }
+shared-naming = { path = "../naming" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

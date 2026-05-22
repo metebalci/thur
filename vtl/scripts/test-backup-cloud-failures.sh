@@ -1,0 +1,250 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Mete Balci
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Thur VTL Cloud Failure-Path Tests
+#
+# Drives the upload worker through `thurvtld --test` with the
+# `LocalBackend` failure-injection env var (THUR_CLOUD_INJECT_FAIL) set
+# per sub-test, then greps the daemon log for the expected error-class
+# strings. CI-friendly: no real cloud creds, no sudo, no kernel iSCSI
+# initiator.
+#
+# Covers two scenarios. The third — "partial-upload resume" — would
+# require chunk-level resume logic that the daemon doesn't currently
+# implement (whole-chunk retry only). Tracked in ROADMAP.md.
+#
+#   1. Auth failure        — inject auth@chunks/*; assert
+#                            "failed with permanent error (AUTH)" lands
+#                            in daemon log and the worker did NOT
+#                            push the chunk to the LocalBackend root.
+#   2. Network timeout     — inject timeout@chunks/* with a small retry
+#                            budget; assert at least one
+#                            "retrying in" line and the final
+#                            "failed after N attempts" give-up line.
+#
+# Other --test sub-tests (s3_smoke, parallel_upload, etc.) will also
+# hit the injection and emit errors — that's expected. This script
+# scores pass/fail on log-content patterns, not on the daemon's exit
+# code.
+#
+# Usage (invoke from repo root):
+#   ./vtl/scripts/test-backup-cloud-failures.sh [OPTIONS]
+#
+# Options:
+#   --release       Use ./target/release/ binaries (default is ./target/debug/)
+#   --keep-data     Don't clean up the test data dir on exit
+#
+
+# Not using `set -e` — sub-tests must run independently of each other.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
+
+BUILD_PROFILE="debug"
+TEST_DIR="/tmp/test-backup-cloud-failures-$$"
+KEEP_DATA=0
+DAEMON_PATH=""
+CLI_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --release)
+            BUILD_PROFILE="release"
+            shift
+            ;;
+        --keep-data)
+            KEEP_DATA=1
+            shift
+            ;;
+        --daemon-path)
+            DAEMON_PATH="$2"
+            shift 2
+            ;;
+        --cli-path)
+            CLI_PATH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvtld}"
+: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvtl}"
+
+cleanup() {
+    if [[ $KEEP_DATA -eq 0 ]]; then
+        rm -rf "$TEST_DIR"
+    else
+        log_info "Keeping test directory: $TEST_DIR"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+check_prerequisites() {
+    if [[ ! -x "$DAEMON_PATH" ]]; then
+        log_error "Daemon not found at: $DAEMON_PATH (build with: cargo build [--release])"
+        exit 1
+    fi
+    if [[ ! -x "$CLI_PATH" ]]; then
+        log_error "CLI not found at: $CLI_PATH (build with: cargo build [--release])"
+        exit 1
+    fi
+}
+
+# Fresh data dir + YAML conffile (with cloud.backends:) + library init for each sub-test.
+prepare_fixture() {
+    local sub="$1"
+    local fixture="${TEST_DIR}/${sub}"
+    local data_dir="${fixture}/data"
+    local local_root="${fixture}/local-backend"
+    local config="${fixture}/config.yaml"
+
+    mkdir -p "$data_dir" "$local_root"
+
+    cat > "$config" <<EOFCONFIG
+data_dir: "$data_dir"
+license:
+  file: "${fixture}/no-such.lic"
+cloud:
+  backends:
+    primary:
+      type: local
+      root_dir: "$local_root"
+
+EOFCONFIG
+
+    "$CLI_PATH" --config "$config" library init --slots 4 --drives 1 --lto-generation 8 > /dev/null
+    echo "$fixture"
+}
+
+# Run `thurvtld --test` with the given THUR_CLOUD_INJECT_FAIL
+# value. Captures stderr+stdout to ${fixture}/daemon.log. Returns the
+# daemon's exit code (may be non-zero — sub-tests grep the log).
+run_under_injection() {
+    local fixture="$1"
+    local inject="$2"
+    local log="${fixture}/daemon.log"
+
+    THUR_CLOUD_INJECT_FAIL="$inject" \
+        RUST_LOG=info \
+        "$DAEMON_PATH" --test --config "${fixture}/config.yaml" \
+        > "$log" 2>&1
+    echo "$log"
+}
+
+# Sub-test 1: auth failure — assert permanent error landed in log,
+# and no chunk reached the local-backend root.
+test_auth_failure() {
+    log_test "auth failure (THUR_CLOUD_INJECT_FAIL=auth@chunks/*)"
+
+    local fixture
+    fixture=$(prepare_fixture auth)
+    local log
+    log=$(run_under_injection "$fixture" "auth@chunks/*")
+
+    if grep -Eq 'failed with permanent error \(AUTH\)' "$log"; then
+        log_info "  ✓ daemon log contains 'failed with permanent error (AUTH)'"
+    else
+        log_error "  ✗ expected 'failed with permanent error (AUTH)' in daemon log"
+        log_error "    last 30 lines of log:"
+        tail -30 "$log" >&2
+        return 1
+    fi
+
+    # Verify NO chunk landed in the local-backend root (PUT was short-circuited).
+    if [[ -d "${fixture}/local-backend/chunks" ]] \
+        && find "${fixture}/local-backend/chunks" -type f | grep -q .; then
+        log_error "  ✗ chunks/ contains files — injection did not short-circuit upload"
+        find "${fixture}/local-backend/chunks" -type f | head -5 >&2
+        return 1
+    fi
+    log_info "  ✓ no chunks landed under local-backend/chunks/ (PUT short-circuited)"
+
+    return 0
+}
+
+# Sub-test 2: network timeout with retry budget — assert retry log
+# lines AND the final give-up line both appear.
+test_network_timeout_with_retry() {
+    log_test "network timeout (THUR_CLOUD_INJECT_FAIL=timeout@chunks/*)"
+
+    local fixture
+    fixture=$(prepare_fixture timeout)
+    local log
+    log=$(run_under_injection "$fixture" "timeout@chunks/*")
+
+    if grep -Eq 'failed \(attempt [0-9]+/[0-9]+\):.*retrying in' "$log"; then
+        log_info "  ✓ daemon log contains at least one retry line"
+    else
+        log_error "  ✗ expected 'failed (attempt N/M): ... retrying in' in daemon log"
+        log_error "    last 30 lines of log:"
+        tail -30 "$log" >&2
+        return 1
+    fi
+
+    if grep -Eq 'failed after [0-9]+ attempts' "$log"; then
+        log_info "  ✓ daemon log contains the 'failed after N attempts' give-up line"
+    else
+        log_error "  ✗ expected 'failed after N attempts' give-up line in daemon log"
+        log_error "    last 30 lines of log:"
+        tail -30 "$log" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+main() {
+    echo "========================================"
+    echo "Thur VTL Cloud Failure-Path Tests"
+    echo "========================================"
+    echo ""
+
+    check_prerequisites
+    mkdir -p "$TEST_DIR"
+
+    local passed=0
+    local failed=0
+    local tests=(
+        "test_auth_failure"
+        "test_network_timeout_with_retry"
+    )
+
+    for t in "${tests[@]}"; do
+        if $t; then
+            ((passed++))
+        else
+            ((failed++))
+        fi
+        echo ""
+    done
+
+    echo "========================================"
+    echo "Test Summary"
+    echo "========================================"
+    echo "Total: $((passed + failed))"
+    echo "Passed: $passed"
+    echo "Failed: $failed"
+    echo ""
+
+    if [[ $failed -eq 0 ]]; then
+        log_info "✓ All failure-path tests passed"
+        exit 0
+    else
+        log_error "✗ $failed sub-test(s) failed"
+        echo "Debug: test artifacts kept under $TEST_DIR (re-run with --keep-data)"
+        exit 1
+    fi
+}
+
+main

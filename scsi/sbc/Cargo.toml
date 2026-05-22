@@ -1,0 +1,42 @@
+[package]
+name = "scsi-sbc"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# PageCache + manifest types backing the data path / VPD pages /
+# sizing responses.
+core-block = { path = "../../core/block" }
+# Canonical ScsiRequest / ScsiResponse / SenseData / SenseKey, plus
+# the sense-byte builders the data path reaches for.
+scsi-spc = { path = "../spc" }
+# Vendor / product identity strings rendered by INQUIRY + VPD.
+shared-naming = { path = "../../shared/naming" }
+# The product-side ScsiHandler trait the dispatcher implements; the
+# daemon's iSCSI transport binds via this trait.
+shared-iscsi = { path = "../../shared/iscsi" }
+
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# UUID hex rendering for VPD 0x80 (Unit Serial Number) + VPD 0x83
+# (Device Identification, T10 vendor descriptor).
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+shared-cloud = { path = "../../shared/cloud" }
+# Async runtime for #[tokio::test] cases.
+tokio = { version = "1", features = ["macros", "rt"] }
+# Property-based tests for parse_10 / parse_16 CDB decoders.
+proptest = "1"

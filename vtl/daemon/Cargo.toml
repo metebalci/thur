@@ -1,0 +1,97 @@
+[package]
+name = "vtl-daemon"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thurvtld"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+core-mediachanger = { path = "../../core/mediachanger" }
+shared-admin-audit = { path = "../../shared/admin-audit" }
+shared-admin-http = { path = "../../shared/admin-http" }
+shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
+shared-admin-proto = { path = "../../shared/admin-proto" }
+shared-alerting = { path = "../../shared/alerting", features = ["http"] }
+shared-audit = { path = "../../shared/audit" }
+shared-admin-server = { path = "../../shared/admin-server" }
+shared-cloud = { path = "../../shared/cloud" }
+shared-dedup-stats = { path = "../../shared/dedup-stats" }
+shared-health = { path = "../../shared/health" }
+shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }
+# Keystore backends for cartridge at-rest wrap targets; the daemon
+# reads `keystore.backends:` on every boot.
+shared-keystore = { path = "../../shared/keystore" }
+shared-naming = { path = "../../shared/naming" }
+# Direct dep with `http` feature to mount the shared `/metrics` axum
+# handler. The Telemetry type itself reaches here transitively via
+# core-mediachanger; the direct dep is just the feature lever.
+shared-telemetry = { path = "../../shared/telemetry", features = ["http"] }
+# Direct dep so the daemon's upload-worker glue can call
+# `shared_upload_worker::run_upload_pipeline` without reaching through
+# core-mediachanger. The PendingUpload / UploadOutcome types are re-exported by
+# core-mediachanger under their legacy `PendingUploadPayload` /
+# `ChunkUploadOutcome` names; that path stays for call-site continuity.
+shared-upload-worker = { path = "../../shared/upload-worker" }
+scsi-spc = { path = "../../scsi/spc" }
+scsi-ssc = { path = "../../scsi/ssc" }
+scsi-smc = { path = "../../scsi/smc" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+md5 = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+hex = "0.4"
+rand = "0.8"
+# Manifest at-rest wrapped_dek round-trip on `cartridge create`:
+# external keystore backends (KMS / Vault / KV / KMIP) return binary
+# wrapped blobs that we base64-encode into the manifest's
+# `encryption.wrapped_dek` field. Mirrors the VSA daemon's usage.
+base64 = "0.22"
+
+# Used by license_state for grace-period configuration (the
+# `LicenseCaps` it owns embeds a `chrono::Duration`).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Metrics HTTP server (Milestone 3 Phase 3)
+axum = "0.7"
+
+# Hyper is pulled in transitively by axum; we depend on it explicitly
+# to drive the admin Unix-socket transport (axum::serve only accepts
+# TcpListener, so we run hyper directly over a tokio UnixListener).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+tower-service = "0.3"
+# axum 0.7's FromRequestParts trait uses #[async_trait]; implementations
+# of it need the matching attribute.
+async-trait = "0.1"
+# NDJSON streaming bodies for `/api/v1/jobs/{id}/events` — async-stream
+# turns an async block with `yield` into a `Stream<Item = Result<Bytes,
+# Infallible>>` that axum's `Body::from_stream` accepts.
+async-stream = "0.3"
+# `futures::stream::buffer_unordered` for the pipelined cloud-upload
+# worker. The drain-batch JoinSet pattern gated the whole batch on its
+# slowest task; the pipelined variant launches a fresh upload as soon
+# as any in-flight one settles.
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the
+# pipelined upload's deterministic timing test.
+tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros", "time"] }

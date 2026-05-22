@@ -1,0 +1,76 @@
+[package]
+name = "vsa-daemon"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thurvsad"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-block = { path = "../../core/block" }
+shared-admin-audit = { path = "../../shared/admin-audit" }
+shared-admin-http = { path = "../../shared/admin-http" }
+shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
+shared-admin-server = { path = "../../shared/admin-server" }
+shared-alerting = { path = "../../shared/alerting", features = ["http"] }
+shared-audit = { path = "../../shared/audit" }
+shared-cloud = { path = "../../shared/cloud" }
+# At-rest volume encryption: keystore.rs uses KEY_LEN constant + OsRng
+# re-export for auto-generated keys; the daemon also passes the key
+# bytes into core-block::VolumeWriter::open_with_key at boot / create.
+shared-crypto = { path = "../../shared/crypto" }
+shared-dedup-stats = { path = "../../shared/dedup-stats" }
+shared-health = { path = "../../shared/health" }
+shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }
+shared-keystore = { path = "../../shared/keystore" }
+shared-naming = { path = "../../shared/naming" }
+# PoolBudget + per-backend chunk-pool gate. Daemon constructs one
+# `Arc<PoolBudget>` per `cloud.backends` entry at boot, threads it
+# into every VolumeWriter via discover_and_register, and drives the
+# eviction worker.
+shared-pool = { path = "../../shared/pool" }
+# Direct dep so the daemon's upload_worker.rs can call
+# `upload_chunk_inert` per task. PendingUpload / UploadOutcome /
+# UploadTask come through core-block which re-exports the relevant
+# bits.
+shared-upload-worker = { path = "../../shared/upload-worker" }
+scsi-sbc = { path = "../../scsi/sbc" }
+scsi-spc = { path = "../../scsi/spc" }
+# NVMe/TCP transport stack — chosen by `transport: nvmetcp` in
+# thurvsa.yaml. Mutually exclusive with the iSCSI path; only one
+# listener binds at boot.
+nvme-base = { path = "../../nvme/base" }
+nvme-nvm = { path = "../../nvme/nvm" }
+nvme-tcp = { path = "../../nvme/tcp" }
+shared-telemetry = { path = "../../shared/telemetry", features = ["http"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tempfile = "3"
+thiserror = "1"
+
+# Admin Unix socket + Prometheus HTTP server. Mirrors thurvtld's
+# transport stack (axum 0.7 over hyper-util's UnixListener).
+axum = "0.7"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+tower-service = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

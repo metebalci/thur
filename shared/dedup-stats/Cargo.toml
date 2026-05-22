@@ -1,0 +1,19 @@
+[package]
+name = "shared-dedup-stats"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product dedup math for `system stats`. A plain data boundary
+# (no trait, no I/O): the caller reduces each scanned entity — a VTL
+# cartridge or a VSA volume — to an `EntityScan`, and `compute_dedup`
+# returns the per-entity exclusive/shared split + per-backend unique
+# pool bytes. Entity enumeration (chunks.idx vs pages.idx) stays
+# per-product.
+
+[dependencies]

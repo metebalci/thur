@@ -1,0 +1,276 @@
+[package]
+name = "vtl-cli"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Thur VTL — virtual tape library with iSCSI target and cloud-backed deduplicated storage"
+homepage = "https://github.com/metebalci/thur"
+repository = "https://github.com/metebalci/thur"
+authors = ["Mete Balci <info@metebalci.com>"]
+
+[lints]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# Release packaging metadata. The .deb and .rpm both ship the *same*
+# combined package: `thurvtl` containing thurvtld + thurvtl +
+# the systemd unit + completions + reference yaml. We attach the
+# metadata to this crate (rather than splitting per-binary) because
+# cargo-deb and cargo-generate-rpm are both single-crate-rooted and
+# listing both binaries via `assets` is simpler than running each tool
+# twice.
+#
+# Postinst scripts deliberately do NOT enable or start the unit. The
+# daemon needs an edited /etc/thurvtl/thurvtl.yaml + an initialized
+# library before it can run; auto-enable would just produce noisy
+# failed-unit logs. Operator runs `systemctl enable --now
+# thurvtld` after configuring.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "thurvtl"
+maintainer = "Mete Balci <info@metebalci.com>"
+copyright = "2026 Mete Balci"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Thur VTL presents a virtual tape library as an iSCSI target speaking
+standard SCSI Sequential-Access (SSC-2) and Medium Changer (SMC-3),
+with LTO-5 through LTO-10 cartridge emulation. Storage is content-
+addressed and deduplicated, with chunks tiered out to S3, GCS, Azure,
+or a local filesystem. Compatible with enterprise backup software
+that drives a SCSI tape changer + drive (Veeam, NetBackup, Commvault,
+Bacula, Windows Server Backup)."""
+section = "admin"
+priority = "optional"
+depends = "$auto"
+assets = [
+    # Drop the `../` prefix on the two binaries even though they live
+    # in the workspace's target dir, not the crate's: cargo-deb's
+    # auto-build detector matches paths starting with exactly
+    # `target/release/`, and its workspace-aware path resolver maps
+    # that to the right `<workspace>/target/release/...` location.
+    # `../target/release/...` works at runtime but trips the
+    # "won't be built" warning on every cut.
+    ["target/release/thurvtld", "usr/bin/", "755"],
+    ["target/release/thurvtl", "usr/bin/", "755"],
+    ["../../release/thurvtl.yaml", "etc/thurvtl/thurvtl.yaml", "640"],
+    ["../../release/thurvtl.env", "etc/thurvtl/thurvtl.env", "640"],
+    ["../../dist/thurvtl.defaults.yaml", "usr/share/doc/thurvtl/thurvtl.defaults.yaml", "644"],
+    ["../../README.md", "usr/share/doc/thurvtl/README.md", "644"],
+    ["../../dist/thurvtl-completion.bash", "usr/share/bash-completion/completions/thurvtl", "644"],
+    ["../../dist/thurvtl-completion.zsh", "usr/share/zsh/site-functions/_thurvtl", "644"],
+]
+conf-files = ["/etc/thurvtl/thurvtl.yaml", "/etc/thurvtl/thurvtl.env"]
+maintainer-scripts = "../../release/thurvtl/"
+# systemd-units handles installing thurvtld.service into
+# /usr/lib/systemd/system/ AND wiring the #DEBHELPER# token in our
+# maintainer scripts to invoke deb-systemd-helper. We deliberately
+# don't auto-enable/start — daemon needs config + library init first.
+# unit-scripts points at the dir holding the .service file.
+systemd-units = [{ unit-name = "thurvtld", unit-scripts = "../../release", enable = false, start = false }]
+
+[package.metadata.generate-rpm]
+name = "thurvtl"
+summary = "Virtual tape library with iSCSI target and cloud-backed deduplicated storage"
+# cargo-generate-rpm reads this table directly and does NOT resolve
+# `license.workspace = true` inheritance — the field must be a literal
+# string. Keep in sync with [workspace.package].license in the root
+# Cargo.toml.
+license = "Apache-2.0"
+# Auto-detect runtime requires from ELF symbol scan. With vendored
+# openssl + zstd, the only dynamic deps are glibc (libc.so.6,
+# libgcc_s.so.1, libm.so.6) — which auto-req captures with the
+# correct minimum version pulled from the build host's glibc. Build
+# inside the Debian 11 builder image (glibc 2.31) so the floor is
+# correct; building on a newer host bakes in too-new symbols.
+auto-req = "auto"
+# Source paths are resolved relative to this crate's Cargo.toml, same
+# as cargo-deb. Hence the leading `../` reaching into the workspace
+# root for the build outputs and shared release/ assets.
+assets = [
+    { source = "../../target/release/thurvtld", dest = "/usr/bin/thurvtld", mode = "755" },
+    { source = "../../target/release/thurvtl", dest = "/usr/bin/thurvtl", mode = "755" },
+    { source = "../../release/thurvtld.service", dest = "/usr/lib/systemd/system/thurvtld.service", mode = "644" },
+    { source = "../../release/thurvtl.yaml", dest = "/etc/thurvtl/thurvtl.yaml", mode = "640", config = "noreplace" },
+    { source = "../../release/thurvtl.env", dest = "/etc/thurvtl/thurvtl.env", mode = "640", config = "noreplace" },
+    { source = "../../dist/thurvtl.defaults.yaml", dest = "/usr/share/doc/thurvtl/thurvtl.defaults.yaml", mode = "644", doc = true },
+    { source = "../../README.md", dest = "/usr/share/doc/thurvtl/README.md", mode = "644", doc = true },
+    { source = "../../dist/thurvtl-completion.bash", dest = "/usr/share/bash-completion/completions/thurvtl", mode = "644" },
+    { source = "../../dist/thurvtl-completion.zsh", dest = "/usr/share/zsh/site-functions/_thurvtl", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/thurvtl/LICENSE", mode = "644", doc = true },
+]
+# Inline scriptlets. cargo-generate-rpm reads these as literal strings
+# rather than paths, so we keep them here. The .deb side reads matching
+# files from release/thurvtl/ via cargo-deb's maintainer-scripts dir.
+pre_install_script = """
+#!/bin/sh
+set -e
+if ! getent group thurvtl >/dev/null; then
+    groupadd --system thurvtl
+fi
+if ! getent passwd thurvtl >/dev/null; then
+    useradd --system --gid thurvtl --home-dir /var/lib/thurvtl \\
+            --shell /usr/sbin/nologin --comment "Thur VTL daemon" thurvtl
+fi
+# On upgrade ($1 >= 2) stop the running daemon before the new binary
+# replaces it on disk, mirroring the .deb prerm so both package
+# formats behave identically. The marker lets the post-install
+# scriptlet report that the daemon was stopped.
+if [ "$1" -ge 2 ] && [ -d /run/systemd/system ] && systemctl is-active --quiet thurvtld; then
+    systemctl stop thurvtld || true
+    touch /run/thurvtl.upgrade-stopped 2>/dev/null || true
+fi
+exit 0
+"""
+post_install_script = """
+#!/bin/sh
+set -e
+install -d -m 0750 -o thurvtl -g thurvtl /var/lib/thurvtl
+if [ -f /etc/thurvtl/thurvtl.yaml ]; then
+    chown root:thurvtl /etc/thurvtl/thurvtl.yaml
+    chmod 0640 /etc/thurvtl/thurvtl.yaml
+fi
+if [ -f /etc/thurvtl/thurvtl.env ]; then
+    chown root:thurvtl /etc/thurvtl/thurvtl.env
+    chmod 0640 /etc/thurvtl/thurvtl.env
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = "1" ]; then
+    cat <<'EOF'
+
+Thur VTL installed. To get running:
+  1. Edit /etc/thurvtl/thurvtl.yaml — minimal starter; data_dir
+     defaults to /var/lib/thurvtl, you just uncomment a
+     cloud.backends entry. Full reference for every key:
+     /usr/share/doc/thurvtl/thurvtl.defaults.yaml
+  2. sudo thurvtl library init --slots 40 --drives 3 --lto-generation 8
+     (slots 1-640, drives 1-48, lto-generation 7 or 8 — adjust to need)
+     (sudo drops privs to thurvtl; --user NAME overrides,
+      or run as `sudo -u thurvtl ...` directly)
+  3. sudo systemctl enable --now thurvtld
+
+To use thurvtl against the running daemon, the admin socket
+(/run/thurvtl/admin.sock) is mode 0660 and owned by thurvtl:thurvtl.
+Pick one:
+  - Add operator users to the thurvtl group:
+      sudo usermod -aG thurvtl <user>     # log out / log back in to apply
+  - Or run the CLI as the daemon user each time:
+      sudo -u thurvtl thurvtl ...
+
+Logs: sudo journalctl -u thurvtld -f
+EOF
+elif [ -f /run/thurvtl.upgrade-stopped ]; then
+    # Upgrade over a running daemon: %pre stopped it, and the package
+    # does not restart it. Tell the operator.
+    rm -f /run/thurvtl.upgrade-stopped
+    cat <<'EOF'
+
+Thur VTL upgraded. The daemon was running and has been stopped for the
+upgrade; it is NOT restarted automatically. Start it when ready:
+  sudo systemctl start thurvtld
+EOF
+fi
+exit 0
+"""
+pre_uninstall_script = """
+#!/bin/sh
+set -e
+if [ "$1" = "0" ]; then
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet thurvtld; then
+        systemctl stop thurvtld || true
+    fi
+    if [ -d /run/systemd/system ] && systemctl is-enabled --quiet thurvtld; then
+        systemctl disable thurvtld || true
+    fi
+fi
+exit 0
+"""
+post_uninstall_script = """
+#!/bin/sh
+set -e
+if [ "$1" = "0" ]; then
+    if getent passwd thurvtl >/dev/null; then
+        userdel thurvtl >/dev/null 2>&1 || true
+    fi
+    if getent group thurvtl >/dev/null; then
+        groupdel thurvtl >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+fi
+exit 0
+"""
+
+[dependencies]
+core-mediachanger = { path = "../../core/mediachanger" }
+shared-admin-client = { path = "../../shared/admin-client" }
+# Credential-lifecycle CLI (`iscsi users`, `iscsi target`) needs the
+# IscsiUsersFile load + atomic-save helpers for its daemon-down
+# fallback branch.
+shared-iscsi = { path = "../../shared/iscsi" }
+shared-admin-proto = { path = "../../shared/admin-proto" }
+shared-cli = { path = "../../shared/cli" }
+shared-cli-alerting = { path = "../../shared/cli-alerting" }
+shared-cli-iscsi = { path = "../../shared/cli-iscsi" }
+shared-cli-system = { path = "../../shared/cli-system" }
+# Direct shared-cloud dep so `library restore` (daemon-down) can read
+# `<data_dir>/cloud-backends.json` and instantiate a `CloudBackend`
+# without going through the daemon. Every other CLI verb routes
+# through the admin socket so the daemon owns this file.
+shared-cloud = { path = "../../shared/cloud" }
+# `system cloud benchmark` reuses the daemon-down benchmark engine.
+shared-cloud-bench = { path = "../../shared/cloud-bench" }
+# `cartridge key migrate` round-trips key material through a keystore
+# backend offline; same crate the daemon links.
+shared-keystore = { path = "../../shared/keystore" }
+shared-naming = { path = "../../shared/naming" }
+# `cartridge key migrate` round-trips a wrapped DEK base64 through
+# the cartridge manifest (mirrors the VSA pattern). Same crate the
+# daemon uses for the matching admin handler.
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+# `generate-completion <shell>` emits the shell-specific completion
+# script on stdout. Source = the clap derive tree, so completions
+# can never drift from the actual CLI surface.
+clap_complete = "4.5"
+comfy-table = "7.1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+# `--grace` accepts humantime duration strings ("24h", "5m", "1d12h")
+# on the iscsi-users `rotate` verb.
+humantime = "2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Same clap stack as the binary — build.rs `include!`s `src/cli.rs`,
+# instantiates the same `Cli` derive struct, and feeds it to
+# clap_complete to (re)generate `thurvtl-completion.bash` at
+# the workspace root. The `cargo:rerun-if-changed=src/cli.rs` guard
+# in build.rs keeps this off the hot rebuild path; the script also
+# byte-compares before writing so an unchanged Cli leaves the file
+# alone (no `git status` churn). `shared-cli` carries the
+# `GlobalArgs` + `ConfigAction` types `cli.rs` references, so the
+# build script needs it too.
+[build-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+shared-cli = { path = "../../shared/cli" }
+
+[[bin]]
+name = "thurvtl"
+path = "src/main.rs"

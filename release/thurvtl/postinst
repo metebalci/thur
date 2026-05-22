@@ -1,0 +1,93 @@
+#!/bin/sh
+# thurvtl postinst — runs after .deb install/upgrade.
+#
+# Notably this does NOT enable or start the daemon. The daemon needs
+# /etc/thurvtl/thurvtl.yaml filled in and `thurvtl library
+# init` run before it can start, so auto-enable would just produce
+# noisy failed-unit logs. Operator runs `systemctl enable --now
+# thurvtld` after configuring.
+set -e
+
+case "$1" in
+    configure)
+        # Create system user/group if missing
+        if ! getent group thurvtl >/dev/null; then
+            groupadd --system thurvtl
+        fi
+        if ! getent passwd thurvtl >/dev/null; then
+            useradd --system \
+                    --gid thurvtl \
+                    --home-dir /var/lib/thurvtl \
+                    --shell /usr/sbin/nologin \
+                    --comment "Thur VTL daemon" \
+                    thurvtl
+        fi
+
+        # Create the daemon's data dir. cargo-deb only creates parent
+        # dirs for files it installs and we ship nothing under
+        # /var/lib/thurvtl/, so postinst is the only chance to lay it
+        # down. systemd's `ReadWritePaths=/var/lib/thurvtl` in the
+        # unit refuses to start the daemon without it. `install -d`
+        # is idempotent on upgrade.
+        install -d -m 0750 -o thurvtl -g thurvtl /var/lib/thurvtl
+
+        # Conffile + cloud-credentials env file — readable by the
+        # daemon's group (thurvtl), opaque to other users. The
+        # packaged mode is 0640, but cargo-deb installs files
+        # root:root by default; the daemon runs as thurvtl and
+        # would hit EACCES without the chown. Idempotent: re-runs
+        # on every upgrade reset operator-fiddled perms back to
+        # the intended root:thurvtl 0640.
+        if [ -f /etc/thurvtl/thurvtl.yaml ]; then
+            chown root:thurvtl /etc/thurvtl/thurvtl.yaml
+            chmod 0640 /etc/thurvtl/thurvtl.yaml
+        fi
+        if [ -f /etc/thurvtl/thurvtl.env ]; then
+            chown root:thurvtl /etc/thurvtl/thurvtl.env
+            chmod 0640 /etc/thurvtl/thurvtl.env
+        fi
+
+        # First-install hint (only on configure-from-no-prior-version)
+        if [ -z "$2" ]; then
+            cat <<'EOF'
+
+Thur VTL installed. To get running:
+  1. Edit /etc/thurvtl/thurvtl.yaml — minimal starter; data_dir
+     defaults to /var/lib/thurvtl, you just uncomment a
+     cloud.backends entry. Full reference for every key:
+     /usr/share/doc/thurvtl/thurvtl.defaults.yaml
+  2. sudo thurvtl library init --slots 40 --drives 3 --lto-generation 8
+     (sudo drops privs to thurvtl; --user NAME overrides,
+      or run as `sudo -u thurvtl …` directly)
+  3. sudo systemctl enable --now thurvtld
+
+To use thurvtl against the running daemon, the admin socket
+(/run/thurvtl/admin.sock) is mode 0660 and owned by thurvtl:thurvtl.
+Pick one:
+  - Add operator users to the thurvtl group:
+      sudo usermod -aG thurvtl <user>     # log out / log back in to apply
+  - Or run the CLI as the daemon user each time:
+      sudo -u thurvtl thurvtl ...
+
+Logs: sudo journalctl -u thurvtld -f
+EOF
+        elif [ -f /run/thurvtl.upgrade-stopped ]; then
+            # Upgrade over a running daemon: prerm stopped it, and the
+            # package does not restart it. Tell the operator.
+            rm -f /run/thurvtl.upgrade-stopped
+            cat <<'EOF'
+
+Thur VTL upgraded. The daemon was running and has been stopped for the
+upgrade; it is NOT restarted automatically. Start it when ready:
+  sudo systemctl start thurvtld
+EOF
+        fi
+        ;;
+esac
+
+# cargo-deb injects the systemd unit registration here (daemon-reload,
+# *not* enable/start — that's controlled by the systemd-units metadata
+# block in thurvtl/Cargo.toml).
+#DEBHELPER#
+
+exit 0

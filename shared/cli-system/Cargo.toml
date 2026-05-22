@@ -1,0 +1,33 @@
+[package]
+name = "shared-cli-system"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Lifted `system <verb>` CLI commands. Kept separate from `shared-cli`
+# (which is pure clap/print plumbing) so the admin transport stack
+# (hyper / tokio / serde) only flows into CLI crates that actually
+# need to talk to the daemon.
+
+[dependencies]
+shared-admin-client = { path = "../admin-client" }
+shared-admin-http = { path = "../admin-http" }
+# `system audit` consumes the job-event stream (`JobEvent`) and
+# offline-verifies a copied audit directory (`verify_chain`).
+shared-admin-proto = { path = "../admin-proto" }
+shared-audit = { path = "../audit" }
+shared-naming = { path = "../naming" }
+
+anyhow = "1"
+# Passphrase prompt for the export/import verbs (the same shared
+# helper backs `volume key export/import` on the VSA side).
+rpassword = "7"
+# `daemon-health` deserializes the `/api/v1/health` response and
+# re-serializes it for `--json`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

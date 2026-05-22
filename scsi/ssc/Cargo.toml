@@ -1,0 +1,48 @@
+[package]
+name = "scsi-ssc"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Tape-cartridge primitives + per-drive state + LTO encryption types,
+# plus the `DriveTopology` trait the dispatcher walks drives through.
+core-stream = { path = "../../core/stream" }
+# `TapeDeviceFacade` trait, audit channel, cloud config, legal-hold
+# sentinel helpers, library-side `DriveInfo`, and the `SmcError` type
+# the SSC sense walker pattern-matches on.
+core-mediachanger = { path = "../../core/mediachanger" }
+# SPC-4 baseline (sense, INQUIRY/VPD/mode/report-luns helpers,
+# canonical ScsiRequest/ScsiResponse).
+scsi-spc = { path = "../spc" }
+# AES-256-GCM key/IV length constants for the at-rest DEK cache on
+# `DriveManager` (one entry per encrypted cartridge, populated by
+# the daemon's boot-time keystore unwrap).
+shared-crypto = { path = "../../shared/crypto" }
+# `ScsiHandler` trait wrapper consumed by the iSCSI transport, plus the
+# generic SCSI sense surface this crate's tape-flavor sense module
+# re-exports.
+shared-iscsi = { path = "../../shared/iscsi" }
+# Per-product identity bundles (target IQN, vendor inquiry strings).
+shared-naming = { path = "../../shared/naming" }
+
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+async-trait = "0.1"
+anyhow = "1"
+# Zero-copy buffer ownership for WRITE(6) — the handler takes the
+# PDU's payload `Vec` and wraps it in `Bytes::from(Vec)` to forward
+# into the cartridge layer without re-allocation.
+bytes = "1"
+# Timestamps on `DiagnosticEntry` (RFC-3339 in admin job results).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

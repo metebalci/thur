@@ -1,0 +1,56 @@
+name: ci
+
+# Workspace build / test / clippy / rustfmt gate. The toolchain
+# (channel 1.92.0 + rustfmt + clippy components) is pinned by
+# rust-toolchain.toml and auto-installed by rustup on the first cargo
+# invocation — no setup-toolchain step needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".clippy.toml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".clippy.toml"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # rustfmt first — cheap, fails the run before the slow steps.
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      # No `-D warnings`: the deny-level lints in [workspace.lints]
+      # (rust unsafe_code; clippy unwrap_used / panic / unwrap_in_result)
+      # already fail this step on their own. The ~1500 aspirational
+      # style warnings are deliberately not gated — see the root
+      # Cargo.toml.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: build
+        run: cargo build --workspace --all-targets
+
+      # The single external-service test (shared-keystore kmip_pykmip)
+      # is #[ignore]'d, so a plain run stays self-contained.
+      - name: test
+        run: cargo test --workspace

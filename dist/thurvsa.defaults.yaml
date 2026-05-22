@@ -1,0 +1,465 @@
+# thurvsa — full configuration reference
+#
+# Every key the daemon (`thurvsad`) and CLI (`thurvsa`)
+# accept in thurvsa.yaml. Keys with a built-in default are set to
+# that default and left uncommented. Keys with no default are written
+# commented-out so you can see they exist and what shape the value
+# takes — uncomment and fill in to use them.
+#
+# First-time setup: at minimum, set `data_dir`, uncomment a
+# `cloud.backends:` entry below, then start the daemon and create a
+# volume via `thurvsa volume create NAME --size SIZE`.
+#
+# Print this content from the CLI with `thurvsa config defaults`.
+# The checked-in copy at `dist/thurvsa.defaults.yaml` is
+# auto-maintained by `vsa/cli/build.rs` whenever this file changes.
+
+# Local storage directory for the per-volume manifests + page
+# indexes, the per-volume in-memory write-back cache spill area
+# (future), the per-backend chunk pool, and the audit log. No
+# default — must be set.
+# data_dir: "/var/lib/thurvsa"
+
+# Wire transport for the host-facing data path. "iscsi" (default)
+# binds the SCSI-over-TCP listener; "nvmetcp" binds the
+# NVMe-over-Fabrics TCP listener instead. Mutually exclusive — only
+# one listener binds. Their default ports don't collide
+# (3260 vs. 4420) so the only knob you need to flip is `transport:`.
+# transport: "iscsi"
+
+# iSCSI target. thurvsa binds3260by default so it can coexist
+# with a tape VTL on the canonical 3260 (operator distinguishes
+# between the two by port).
+iscsi:
+  # Listen address for the iSCSI target. Test scripts may pin an
+  # ephemeral port to avoid clashing across concurrent runs.
+  # listen: "0.0.0.0:3260"
+
+  # iSCSI target IQN advertised to initiators in the Login /
+  # SendTargets response. Defaults to the per-product identity
+  # when unset.
+  # target_iqn: "iqn.2025-10.com.metebalci:thurvsa"
+
+  # CHAP authentication. Users + mutual-CHAP target creds live in
+  # <data_dir>/iscsi-users.json (daemon-managed) — only the method
+  # selector and the algorithm policy live here.
+  auth:
+    # "None" (default; unauthenticated) or "CHAP".
+    method: "None"
+    # Allowed CHAP digest algorithms, in target preference order
+    # (strongest first). Recognized: "SHA3-256" (CHAP_A=8),
+    # "SHA-256" (CHAP_A=7), "SHA-1" (CHAP_A=6), "MD5" (CHAP_A=5).
+    # MD5 is the only RFC 7143 standard algorithm; the rest are
+    # de-facto extensions implemented by Linux LIO and open-iscsi
+    # 3.x+. Empty falls back to ["SHA3-256", "SHA-256", "SHA-1", "MD5"].
+    allowed_algorithms: []
+
+# NVMe/TCP target. Only consulted when `transport: nvmetcp`. Binds
+# 0.0.0.0:4420 (IANA-registered nvme-tcp port) by default.
+# nvmetcp:
+#   # Listen address override. Test scripts may pin an ephemeral
+#   # port to avoid clashing across concurrent runs.
+#   listen: "0.0.0.0:4420"
+#
+#   # NVMe Subsystem NQN advertised to hosts (`nvme connect --nqn=`
+#   # must match this exactly). Defaults to the per-product identity
+#   # when unset. The TLS-PSK derivation binds to this value, so
+#   # changing it rederives every per-host PSK.
+#   subnqn: "nqn.2025-10.com.metebalci:thurvsa"
+#
+#   # Wire encryption + auth. The PSK material itself lives in the
+#   # identity file (default <data_dir>/nvmetcp-psks.json,
+#   # daemon-managed) — same split iSCSI uses for CHAP creds.
+#   tls:
+#     # "disabled" (default; cleartext) or "psk" (TLS 1.3 with the
+#     # two NVMe-TCP §3.6.1.5 mandated cipher suites:
+#     # TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384). Restart to
+#     # reload identity-file changes — same as iscsi-users.json.
+#     # Generate per-host keys on the initiator with
+#     # `nvme gen-tls-key --identity 1 --hmac 1 --subsysnqn=... --hostnqn=...`
+#     # and paste the NVMeTLSkey-... string into the identity file
+#     # under that host's NQN entry. See docs/AUTH.md
+#     # § NVMe/TCP TLS-PSK.
+#     mode: "disabled"
+#     # Override the identity-file path. Default:
+#     # <data_dir>/nvmetcp-psks.json.
+#     # identity_file: "/etc/thurvsa/nvmetcp-psks.json"
+
+# Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
+# applied per cloud backend. `size_gb` here is the **per-backend
+# default**; individual entries under `cloud.backends:` below may
+# override with their own `disk_cache_size_gb` field for asymmetric
+# workloads.
+# A page-seal that would push a backend's pool past its cap (or take
+# free filesystem space below `disk_free_min_gb`) blocks until the
+# eviction worker frees space — this is the upload-backpressure gate
+# that prevents disk-fill from turning into SBC-3 MEDIUM ERROR. After
+# `backpressure_max_wait_seconds` the SCSI surface returns NOT READY
+# + ASC/ASCQ 0x04/0x07 (LOGICAL UNIT NOT READY, OPERATION IN
+# PROGRESS); host backup software treats it as transient and retries.
+disk_cache:
+  # Default per-backend disk-cache budget. Two shapes:
+  #   - integer (GB) pins the cap (operator chose; min/max ignored).
+  #   - `auto` (default) — statvfs the data_dir filesystem every
+  #     eviction tick and pin the cap to `min(50% of free,
+  #     max_size_gb)`, floored at `min_size_gb`. Multi-backend
+  #     installs with several `auto` entries split the 50%-of-free
+  #     share evenly so two `auto` backends can't combined commit
+  #     100% of free space. External disk pressure shrinks the cap
+  #     reactively; recovery grows it.
+  # Each cloud.backends entry uses this unless it sets its own
+  # `disk_cache_size_gb` (same shape).
+  size_gb: auto
+  # Floor (GB) applied when size_gb resolves under `auto`. Honored
+  # only when size_gb is `auto`; explicit GB values pin the cap and
+  # skip both bounds.
+  min_size_gb: 4
+  # Ceiling (GB) applied when size_gb resolves under `auto`. Bounds
+  # the eviction-worker scan cost on very large filesystems where
+  # 50% of free could otherwise be terabytes.
+  max_size_gb: 500
+  # Soft watermark as a percentage of size_gb. Crossing it logs a
+  # warn-level message — early signal before the hard cap fires.
+  localonly_soft_watermark_pct: 80
+  # Reserve free filesystem bytes (GB) below which page-seal also
+  # backpressures, regardless of pool occupancy. Catches disk-fill
+  # from sources outside the pool: bloated audit retention,
+  # external writers on the same partition. Set to 0 to disable.
+  disk_free_min_gb: 5
+  # Max seconds a page-seal will park on backpressure before
+  # surfacing SBC-3 NOT READY + ASC/ASCQ 0x04/0x07. Tune up only if
+  # the eviction worker's recovery latency outruns the cloud's
+  # PUT-then-HEAD cadence.
+  backpressure_max_wait_seconds: 30
+  # How often the eviction worker re-scans every backend's pool
+  # slice and trims down to cap. Tighter intervals catch read-miss
+  # downloads faster; looser intervals keep the per-volume
+  # pages.idx walks off the hot path.
+  eviction_interval_seconds: 300
+  # Pin pool chunks whose most recent lru.idx touch (write or read)
+  # is within this many seconds against LRU eviction. Counters the
+  # verify-after-write pattern (backup software re-reading freshly
+  # written data within seconds) at the cost of capping effective
+  # cache capacity by recent write+read volume. 0 disables the pin
+  # (pure LRU); the default may change before RC/GA after a
+  # workload-trace validation pass — see ROADMAP.md.
+  recent_seal_pin_seconds: 0
+
+# HTTP server (health, metrics). Endpoints under http.listen:
+#   /health   - Health check (JSON; daemon, version, volume_count)
+#   /metrics  - Prometheus metrics (text format, OpenTelemetry-sourced)
+http:
+  # Listen address for the HTTP server. Distinct from thurvtl's
+  # 9090 so co-resident installs don't fight for the port.
+  # listen: "0.0.0.0:9090"
+  tls:
+    # PEM-encoded server cert chain. Empty -> plaintext HTTP.
+    # When both cert_file and key_file are set but both files
+    # are missing on disk, the daemon auto-generates a self-signed
+    # cert+key on first boot (logged at WARN with fingerprint).
+    # Replace with a CA-issued cert for production.
+    cert_file: ""
+    # PKCS#8 private key matching cert_file. Must be set when
+    # cert_file is set; partial config is rejected at boot.
+    key_file: ""
+    # PEM CA bundle. When set, the listener requires a client
+    # cert signed by this CA (mTLS). Empty -> server auth only.
+    # Prometheus scrapes will need a matching client cert.
+    client_ca_file: ""
+    # Extra Subject Alternative Names (DNS names or IPs) baked into
+    # the auto-generated self-signed cert, on top of the built-in
+    # hostname / localhost / 127.0.0.1 / ::1 set. Ignored when a
+    # CA-issued cert is supplied. Re-run `thurvsa system
+    # regenerate-cert` after editing. Example: ["vsa.example.com", "10.0.0.5"]
+    extra_sans: []
+
+# Cloud storage. Workspace-wide tuning knobs (compression, upload
+# concurrency, retention-mode check) plus the named backend
+# definitions under `cloud.backends:`. Each volume picks one backend
+# at create time (`volume create --backend NAME`) and is bound to it
+# for life. See docs/AUTH.md for the per-backend `auth:`
+# block shapes (S3 / GCS / Azure / local).
+cloud:
+  # Opt out of bucket-immutability validation at startup. When true,
+  # lock_state() is never called against any backend; retention_mode
+  # is still parsed and still gates `volume create --worm`, but thurvsa
+  # does not verify the bucket actually has retention configured.
+  # Useful when the principal thurvsa runs as cannot be granted the
+  # management-plane IAM. Default: false.
+  # skip_retention_mode_check: false
+
+  # Cloud-layer compression (S3/GCS/Azure only; ignored for local).
+  # Applied per-page on upload, post-dedup. Default zstd because
+  # page-sized inputs (64 KiB-1 MiB) compress well with the heavier
+  # algorithm; lz4 is faster but compresses less.
+  compression:
+    # Algorithm: none | lz4 | zstd.
+    algorithm: zstd
+    # zstd level (1-22; 3 is balanced). Ignored for lz4/none.
+    level: 3
+
+  # Upload worker (S3/GCS/Azure only — ignored for local backend).
+  upload:
+    # Maximum concurrent in-flight page uploads per backend per
+    # volume. `0` (default) means "auto-scale": at daemon start,
+    # resolve to min(16, available_parallelism * 4). On 4+ core hosts
+    # this caps at 16, which captures most cloud-backend throughput
+    # while bounding the in-flight memory footprint (N × chunk_size).
+    # Operators who want higher concurrency at the cost of memory can
+    # set this to an explicit value (e.g. 32). Resolved value + source
+    # ("auto-detected" vs "operator override") is logged at startup.
+    max_concurrent: 0
+    # Maximum retry attempts per upload (exponential backoff 1 s -> 30 s).
+    retry_max_attempts: 10
+    # Maximum seconds a page upload blocks on the per-backend pool
+    # budget before surfacing an error to the SCSI layer. Range 1-600.
+    backpressure_max_wait_seconds: 60
+
+  # Named backend definitions. Each entry's key (e.g. `primary`,
+  # `cold-archive`) is the name volumes bind to via
+  # `volume create --backend NAME`. The discriminant is the `type:`
+  # field — exactly one of local / s3 / gcs / azure per entry.
+  # Empty map is fine at boot; volume creates that reference an
+  # undefined backend fail at op time. Operators on a packaged
+  # install start from the commented-out example in
+  # /etc/thurvsa/thurvsa.yaml and uncomment one entry to begin.
+  # backends:
+  #   primary:
+  #     type: s3
+  #     bucket: my-bucket-name
+  #     region: us-east-1
+  #     prefix: thur/
+  #     auth:
+  #       type: env
+  #       access_key_id_env: THUR_S3_ACCESS_KEY_ID
+  #       secret_access_key_env: THUR_S3_SECRET_ACCESS_KEY
+
+# At-rest volume encryption is opt-in, configured *per-volume* at
+# create time, not via this YAML. The flags on
+# `thurvsa volume create`:
+#
+#   --encrypt           enable at-rest encryption. Required to encrypt;
+#                       a volume created without it stays plaintext.
+#                       Requires --keystore.
+#   --keystore NAME     `keystore.backends:` entry that wraps the
+#                       volume DEK (local | awskms | vault | azurekv
+#                       | gcpkms | kmip). Required together with
+#                       --encrypt.
+#   --key-file PATH     operator supplies the DEK (64 hex chars,
+#                       e.g. `openssl rand -hex 32 > vol.key`) instead
+#                       of the daemon minting one. Requires --encrypt.
+#   --dek-source MODE   'daemon' (default; OsRng + backend wrap) or
+#                       'backend' (KMS GenerateDataKey / Vault
+#                       transit/datakey, HSM-grade RNG). Ignored for
+#                       the local backend. Requires --encrypt.
+#
+# Encryption applies to that volume only — sibling volumes stay
+# plaintext unless created with --encrypt. Sticky for the volume's
+# lifetime. Backend configuration (KMS key ID, Vault address +
+# AppRole creds, etc.) lives under `keystore.backends:` below —
+# see docs/AUTH.md § VSA keystore backends.
+#
+# Per-volume DEK lifecycle verbs (all daemon-down — stop thurvsad first):
+#
+#   thurvsa volume key migrate NAME --to NEW_BACKEND [--purge-local]
+#     Move a volume's DEK wrap-target from one keystore backend to
+#     another in place. Volume data is NOT rewritten.
+#
+#   thurvsa volume key export NAME --to PATH [--iter N]
+#     Passphrase-seal the DEK into a JWE/PBES2 file (RFC 7516 + 7518
+#     PBES2-HS512+A256KW / A256GCM). One base64 token storable in any
+#     escrow vehicle; cryptographically bound to the volume UUID. The
+#     passphrase is prompted on the tty (THURVSA_PASSPHRASE env var
+#     bypasses the prompt for automation). Default --iter is 600 000
+#     (~1 s of PBKDF2 work on modern x86_64).
+#
+#   thurvsa volume key import NAME --from PATH [--keystore NAME]
+#     Unwrap a JWE envelope and rewrap the DEK into the named
+#     keystore backend. Refuses if the envelope's UUID doesn't match
+#     the volume's UUID, or if the target keystore already holds an
+#     unwrappable DEK (use `migrate` to swap wrap targets in place).
+#     Intended for the "keystore lost during DR" case.
+keystore:
+
+  # Named keystore-backend definitions. Each entry's `type:` picks
+  # the provider (local | awskms | vault | azurekv | gcpkms | kmip).
+  # See docs/AUTH.md § VSA keystore backends for the full
+  # per-provider `auth:` block schema (Static / Env / Profile / SP /
+  # SP-Env / SA-Key / ADC / Token / AppRole / ClientCert / ...).
+  # Default: empty. Volume ops that reference a backend by name fail
+  # at op time with UnknownBackend when the named entry is absent.
+  # backends:
+  #   local-example:
+  #     type: local                                # plaintext sidecar at <data_dir>/keys/<uuid>.key
+  #
+  #   awskms-example:
+  #     type: awskms
+  #     key_id: alias/thur-keystore                # CMK alias / id / ARN
+  #     region: us-east-1
+  #     # endpoint_url: https://kms.example.com    # optional (LocalStack, VPC)
+  #     auth:
+  #       type: env
+  #       access_key_id_env: THUR_KMS_ACCESS_KEY_ID
+  #       secret_access_key_env: THUR_KMS_SECRET_ACCESS_KEY
+  #
+  #   vault-example:
+  #     type: vault
+  #     address: https://vault.example.com
+  #     transit_mount: transit                     # default
+  #     transit_key: thurvsa-volume-deks
+  #     # namespace: ops                           # Vault Enterprise only
+  #     auth:
+  #       type: token_env
+  #       env: VAULT_TOKEN
+  #
+  #   azurekv-example:
+  #     type: azurekv
+  #     vault_uri: https://mykv.vault.azure.net
+  #     key_name: thurvsa-kek
+  #     auth:
+  #       type: service_principal_env
+  #       tenant_id_env: THUR_AZURE_TENANT_ID
+  #       client_id_env: THUR_AZURE_CLIENT_ID
+  #       client_secret_env: THUR_AZURE_CLIENT_SECRET
+  #
+  #   gcpkms-example:
+  #     type: gcpkms
+  #     key_name: projects/p/locations/global/keyRings/r/cryptoKeys/k
+  #     auth:
+  #       type: adc                                # or service_account_key{_env}
+  #
+  #   kmip-example:
+  #     type: kmip
+  #     endpoint: kms.corp.example:5696
+  #     kek_uid: kek-1
+  #     mtls:
+  #       type: client_cert
+  #       cert_path: /etc/thurvsa/kmip-client.crt
+  #       key_path: /etc/thurvsa/kmip-client.key
+
+# Audit log. Append-only event journal at <data_dir>/audit/ by default,
+# rolled over daily at UTC midnight. Records administrative and
+# data-plane state changes (volume.create / volume.destroy,
+# daemon.start / daemon.stop, iscsi.chap.success / iscsi.chap.failure).
+# Read paths are NOT logged.
+audit:
+  # On by default. Disable only for development / ephemeral runs —
+  # auditing is a compliance signal, not an operational knob.
+  enabled: true
+  # Audit dir. Default: <data_dir>/audit. Uncomment to override.
+  # dir: "/var/log/thurvsa/audit"
+
+# First-party alerting (email + generic webhook).
+#
+# Off by default; flip enabled to true and list at least one sink.
+# Four event classes fire alerts: audit-log append failures,
+# CHAP login failures (per-user threshold), disk-cache watermark /
+# backpressure-timeout, and cloud-backend reachability. Each class
+# has an on/off knob under `events:`.
+#
+# Sinks support two types: `email` (SMTP via lettre) and `webhook`
+# (HTTP POST with a Tera-templated body — one code path covers
+# PagerDuty, Slack, Discord, ntfy.sh, ServiceNow). Per-class dedup
+# window (default 300 s) collapses repeats inside a window;
+# sink-side credentials honor `${ENV_VAR}` interpolation.
+#
+# Test a sink end-to-end with `thurvsa alerting test SINK_NAME`.
+# Full design + worked PagerDuty / Slack / Discord examples:
+# docs/ALERTING.md.
+alerting:
+  # Master switch. enabled=false (default) means no alerts fire, no
+  # sinks are constructed, the dispatcher is not installed. Flip to
+  # true and add at least one sinks: entry; the daemon refuses to
+  # start with enabled=true and sinks=[].
+  enabled: false
+
+  # Per-class dedup window. Two alerts with the same (class,
+  # dedup_key) pair inside the window collapse to one. Also resets
+  # the chap_failures per-user counter.
+  dedup_window_seconds: 300
+
+  # CHAP failure WARN fires after this many failures from the same
+  # user inside one dedup window. 0 disables the alert (the
+  # individual audit rows still record). Default 3.
+  chap_failures_threshold: 3
+
+  # Per-class on/off. Defaults: audit_failure / chap_failures on
+  # (high-signal), backend_reachability / disk_cache_backpressure
+  # off (noisier, opt in once you've verified the wiring).
+  events:
+    backend_reachability: false
+    audit_failure: true
+    disk_cache_backpressure: false
+    chap_failures: true
+
+  # Configured sinks. Empty (the shipped default) means no sinks;
+  # required to be non-empty when enabled: true.
+  sinks: []
+
+  # -- Email (SMTP) example --
+  #
+  # sinks:
+  #   - name: ops
+  #     type: email
+  #     host: smtp.example.com
+  #     port: 587
+  #     starttls: true              # alternative: false for plaintext + PLAIN
+  #     username: alerts@example.com
+  #     password: ${SMTP_PASSWORD}  # ${ENV_VAR} resolved at boot
+  #     from: thurvsa@example.com
+  #     to:
+  #       - oncall@example.com
+  #     # Optional subject prefix; default "[thurvsa ALERT]"
+  #     # subject_prefix: "[prod-east thurvsa]"
+  #
+  # -- Webhook (PagerDuty Events API v2) example --
+  #
+  # sinks:
+  #   - name: pagerduty
+  #     type: webhook
+  #     url: https://events.pagerduty.com/v2/enqueue
+  #     # Default POST. Override only if your endpoint needs PUT.
+  #     # method: POST
+  #     # Default Content-Type: application/json. Add Authorization
+  #     # or routing-key headers as the upstream API requires.
+  #     headers: {}
+  #     body_template: |
+  #       {
+  #         "routing_key": "${PAGERDUTY_ROUTING_KEY}",
+  #         "event_action": "trigger",
+  #         "payload": {
+  #           "summary": "{{message}}",
+  #           "severity": "{{severity}}",
+  #           "source": "{{product}}",
+  #           "custom_details": {
+  #             "class": "{{class}}",
+  #             "timestamp": "{{timestamp}}"
+  #           }
+  #         }
+  #       }
+  #     # Request timeout in seconds. Default 10.
+  #     # timeout_seconds: 10
+  #
+  # -- Webhook (Slack incoming webhook) example --
+  #
+  # sinks:
+  #   - name: slack
+  #     type: webhook
+  #     url: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXX
+  #     body_template: |
+  #       {"text": "[{{severity}}] {{product}} {{class}}: {{message}}"}
+  #
+  # -- Webhook (ntfy.sh self-hosted or public) example --
+  #
+  # sinks:
+  #   - name: ntfy
+  #     type: webhook
+  #     url: https://ntfy.sh/your-private-topic
+  #     headers:
+  #       Title: "thurvsa alert"
+  #       Priority: "high"
+  #       Tags: "warning,storage"
+  #     body_template: |
+  #       [{{severity}}] {{class}}: {{message}}
+  #     # ntfy expects text/plain by default; the daemon also sets
+  #     # this when an operator omits Content-Type.

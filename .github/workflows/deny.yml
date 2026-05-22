@@ -1,0 +1,44 @@
+name: cargo-deny
+
+# License audit + advisory + supply-chain gate. Policy, allow-list,
+# and rationale in deny.toml at the repo root.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/deny.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/deny.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SHA-pinned to the v2 tag; bump alongside the rust-toolchain.toml bump.
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2
+        with:
+          command: check licenses bans sources
+          # Advisories run in a separate, non-blocking step so a new
+          # unmaintained-crate advisory doesn't block merges.
+
+  cargo-deny-advisories:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2
+        with:
+          command: check advisories

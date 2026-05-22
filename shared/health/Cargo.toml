@@ -1,0 +1,24 @@
+[package]
+name = "shared-health"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Tiny axum handler for `GET /health` — a liveness probe, conceptually
+# separate from telemetry / metrics. Lives in its own crate so neither
+# `shared-telemetry` (Prometheus / OTLP infra) nor `shared-naming`
+# (identity strings) inherits axum.
+
+[dependencies]
+shared-naming = { path = "../naming" }
+
+axum = "0.7"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

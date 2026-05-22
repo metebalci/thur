@@ -1,0 +1,29 @@
+[package]
+name = "shared-cli-iscsi"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product CLI implementations for `iscsi users {add,remove,
+# disable,enable,rotate,rotate-cancel,list}` and `iscsi target
+# {set,clear,show}`. Both thurvtl and thurvsa funnel through
+# these helpers so the wire shapes + daemon-routed-only posture +
+# audit op names stay in lockstep.
+#
+# VSA's NVMe-TCP PSK lifecycle (`iscsi psks ...`) is intentionally
+# NOT lifted — it has no VTL counterpart and lives in vsa/cli only.
+
+[dependencies]
+shared-admin-client = { path = "../admin-client" }
+shared-naming = { path = "../naming" }
+
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

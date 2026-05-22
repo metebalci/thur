@@ -1,0 +1,57 @@
+[package]
+name = "core-stream"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Cloud backends + compression primitives.
+shared-cloud = { path = "../../shared/cloud" }
+# AES-256-GCM primitives + IV derivation. Lifted out so core-block can
+# share them; the SCSI-flavored types (EncryptionMode, KeyScope,
+# DriveEncryptionState, algorithm-code constants) stay in this crate
+# because they're SSC-4 surface.
+shared-crypto = { path = "../../shared/crypto" }
+# Content-addressed chunk pool. `ssc_core::ChunkStore` is a re-exported
+# alias for `shared_pool::ChunkPool` so internal call sites compile
+# unchanged.
+shared-pool = { path = "../../shared/pool" }
+# Telemetry record::* free functions consumed by cartridge / disk_cache.
+shared-telemetry = { path = "../../shared/telemetry" }
+# Cloud-upload pipeline scaffolding lifted out so the block product
+# can share PendingUpload / UploadOutcome / upload_chunk_inert. The
+# cartridge module re-exports these types under their historical names
+# (PendingUploadPayload / ChunkUploadOutcome) for call-site continuity.
+shared-upload-worker = { path = "../../shared/upload-worker" }
+
+bytes = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+hex = "0.4"
+pathdiff = "0.2"
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# Async stream combinators used by legal_hold.rs.
+futures = "0.3"
+
+# Disk free-space probe used by disk_cache.
+fs2 = "0.4"
+
+# ISO-8601 UTC timestamp formatting for cartridge_archive's
+# `archived_at` provenance field. The clock feature is the only one
+# needed; serde stays in core-mediachanger which already depends on chrono.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Property-based tests over FastCDC find_cut / StreamingChunker::feed.
+proptest = "1"

@@ -1,0 +1,267 @@
+[package]
+name = "vsa-cli"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Thur VSA — block-storage iSCSI target backed by cloud-tiered deduplicated chunks"
+homepage = "https://github.com/metebalci/thur"
+repository = "https://github.com/metebalci/thur"
+authors = ["Mete Balci <info@metebalci.com>"]
+
+[lints]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# Release packaging metadata. The .deb and .rpm both ship the *same*
+# combined package: `thurvsa` containing thurvsad + thurvsa +
+# the systemd unit + completions + reference yaml. We attach the
+# metadata to this crate (rather than splitting per-binary) because
+# cargo-deb and cargo-generate-rpm are both single-crate-rooted and
+# listing both binaries via `assets` is simpler than running each tool
+# twice.
+#
+# Postinst scripts deliberately do NOT enable or start the unit. The
+# daemon needs an edited /etc/thurvsa/thurvsa.yaml (at least one cloud
+# backend uncommented) before it can usefully run; auto-enable would
+# just produce noisy failed-unit logs. Operator runs `systemctl
+# enable --now thurvsad` after configuring.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "thurvsa"
+maintainer = "Mete Balci <info@metebalci.com>"
+copyright = "2026 Mete Balci"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Thur VSA presents block-storage volumes as an iSCSI target speaking
+standard SCSI Block Commands (SBC-3). Storage is content-addressed
+and deduplicated at a per-volume page granularity, with chunks tiered
+out to S3, GCS, Azure, or a local filesystem. Designed for VMware,
+Hyper-V, and Linux hosts that want a thin-provisioned cloud-backed
+LUN with VAAI primitives (ATS / WRITE SAME / UNMAP) and persistent
+reservations."""
+section = "admin"
+priority = "optional"
+depends = "$auto"
+assets = [
+    # Drop the `../` prefix on the binaries even though they live in
+    # the workspace's target dir, not the crate's: cargo-deb's
+    # auto-build detector matches paths starting with exactly
+    # `target/release/`, and its workspace-aware path resolver maps
+    # that to the right `<workspace>/target/release/...` location.
+    ["target/release/thurvsad", "usr/bin/", "755"],
+    ["target/release/thurvsa", "usr/bin/", "755"],
+    ["../../release/thurvsa.yaml", "etc/thurvsa/thurvsa.yaml", "640"],
+    ["../../release/thurvsa.env", "etc/thurvsa/thurvsa.env", "640"],
+    ["../../dist/thurvsa.defaults.yaml", "usr/share/doc/thurvsa/thurvsa.defaults.yaml", "644"],
+    ["../../README.md", "usr/share/doc/thurvsa/README.md", "644"],
+    ["../../dist/thurvsa-completion.bash", "usr/share/bash-completion/completions/thurvsa", "644"],
+    ["../../dist/thurvsa-completion.zsh", "usr/share/zsh/site-functions/_thurvsa", "644"],
+]
+conf-files = ["/etc/thurvsa/thurvsa.yaml", "/etc/thurvsa/thurvsa.env"]
+maintainer-scripts = "../../release/thurvsa/"
+# systemd-units handles installing thurvsad.service into
+# /usr/lib/systemd/system/ AND wiring the #DEBHELPER# token in our
+# maintainer scripts to invoke deb-systemd-helper. We deliberately
+# don't auto-enable/start — daemon needs config first.
+# unit-scripts points at the dir holding the .service file.
+systemd-units = [{ unit-name = "thurvsad", unit-scripts = "../../release", enable = false, start = false }]
+
+[package.metadata.generate-rpm]
+name = "thurvsa"
+summary = "Block-storage iSCSI target backed by cloud-tiered deduplicated chunks"
+# cargo-generate-rpm reads this table directly and does NOT resolve
+# `license.workspace = true` inheritance — the field must be a literal
+# string. Keep in sync with [workspace.package].license in the root
+# Cargo.toml.
+license = "Apache-2.0"
+# Auto-detect runtime requires from ELF symbol scan. With vendored
+# openssl + zstd, the only dynamic deps are glibc (libc.so.6,
+# libgcc_s.so.1, libm.so.6) — which auto-req captures with the
+# correct minimum version pulled from the build host's glibc. Build
+# inside the Debian 11 builder image (glibc 2.31) so the floor is
+# correct; building on a newer host bakes in too-new symbols.
+auto-req = "auto"
+assets = [
+    { source = "../../target/release/thurvsad", dest = "/usr/bin/thurvsad", mode = "755" },
+    { source = "../../target/release/thurvsa", dest = "/usr/bin/thurvsa", mode = "755" },
+    { source = "../../release/thurvsad.service", dest = "/usr/lib/systemd/system/thurvsad.service", mode = "644" },
+    { source = "../../release/thurvsa.yaml", dest = "/etc/thurvsa/thurvsa.yaml", mode = "640", config = "noreplace" },
+    { source = "../../release/thurvsa.env", dest = "/etc/thurvsa/thurvsa.env", mode = "640", config = "noreplace" },
+    { source = "../../dist/thurvsa.defaults.yaml", dest = "/usr/share/doc/thurvsa/thurvsa.defaults.yaml", mode = "644", doc = true },
+    { source = "../../README.md", dest = "/usr/share/doc/thurvsa/README.md", mode = "644", doc = true },
+    { source = "../../dist/thurvsa-completion.bash", dest = "/usr/share/bash-completion/completions/thurvsa", mode = "644" },
+    { source = "../../dist/thurvsa-completion.zsh", dest = "/usr/share/zsh/site-functions/_thurvsa", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/thurvsa/LICENSE", mode = "644", doc = true },
+]
+# Inline scriptlets. cargo-generate-rpm reads these as literal strings
+# rather than paths, so we keep them here. The .deb side reads matching
+# files from release/thurvsa/ via cargo-deb's maintainer-scripts dir.
+pre_install_script = """
+#!/bin/sh
+set -e
+if ! getent group thurvsa >/dev/null; then
+    groupadd --system thurvsa
+fi
+if ! getent passwd thurvsa >/dev/null; then
+    useradd --system --gid thurvsa --home-dir /var/lib/thurvsa \\
+            --shell /usr/sbin/nologin --comment "Thur VSA daemon" thurvsa
+fi
+# On upgrade ($1 >= 2) stop the running daemon before the new binary
+# replaces it on disk, mirroring the .deb prerm so both package
+# formats behave identically. The marker lets the post-install
+# scriptlet report that the daemon was stopped.
+if [ "$1" -ge 2 ] && [ -d /run/systemd/system ] && systemctl is-active --quiet thurvsad; then
+    systemctl stop thurvsad || true
+    touch /run/thurvsa.upgrade-stopped 2>/dev/null || true
+fi
+exit 0
+"""
+post_install_script = """
+#!/bin/sh
+set -e
+install -d -m 0750 -o thurvsa -g thurvsa /var/lib/thurvsa
+if [ -f /etc/thurvsa/thurvsa.yaml ]; then
+    chown root:thurvsa /etc/thurvsa/thurvsa.yaml
+    chmod 0640 /etc/thurvsa/thurvsa.yaml
+fi
+if [ -f /etc/thurvsa/thurvsa.env ]; then
+    chown root:thurvsa /etc/thurvsa/thurvsa.env
+    chmod 0640 /etc/thurvsa/thurvsa.env
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = "1" ]; then
+    cat <<'EOF'
+
+Thur VSA installed. To get running:
+  1. Edit /etc/thurvsa/thurvsa.yaml — minimal starter; data_dir
+     defaults to /var/lib/thurvsa, you just uncomment a
+     cloud.backends entry. Full reference for every key:
+     /usr/share/doc/thurvsa/thurvsa.defaults.yaml
+  2. sudo systemctl enable --now thurvsad
+  3. thurvsa volume create myvol --size 100G
+     (creates an iSCSI LUN backed by the configured backend;
+      target IQN is iqn.2025-10.com.metebalci:thurvsa on port 3260)
+
+To use thurvsa against the running daemon, the admin socket
+(/run/thurvsa/admin.sock) is mode 0660 and owned by thurvsa:thurvsa.
+Pick one:
+  - Add operator users to the thurvsa group:
+      sudo usermod -aG thurvsa <user>     # log out / log back in to apply
+  - Or run the CLI as the daemon user each time:
+      sudo -u thurvsa thurvsa ...
+
+Logs: sudo journalctl -u thurvsad -f
+EOF
+elif [ -f /run/thurvsa.upgrade-stopped ]; then
+    # Upgrade over a running daemon: %pre stopped it, and the package
+    # does not restart it. Tell the operator.
+    rm -f /run/thurvsa.upgrade-stopped
+    cat <<'EOF'
+
+Thur VSA upgraded. The daemon was running and has been stopped for the
+upgrade; it is NOT restarted automatically. Start it when ready:
+  sudo systemctl start thurvsad
+EOF
+fi
+exit 0
+"""
+pre_uninstall_script = """
+#!/bin/sh
+set -e
+if [ "$1" = "0" ]; then
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet thurvsad; then
+        systemctl stop thurvsad || true
+    fi
+    if [ -d /run/systemd/system ] && systemctl is-enabled --quiet thurvsad; then
+        systemctl disable thurvsad || true
+    fi
+fi
+exit 0
+"""
+post_uninstall_script = """
+#!/bin/sh
+set -e
+if [ "$1" = "0" ]; then
+    if getent passwd thurvsa >/dev/null; then
+        userdel thurvsa >/dev/null 2>&1 || true
+    fi
+    if getent group thurvsa >/dev/null; then
+        groupdel thurvsa >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+fi
+exit 0
+"""
+
+[dependencies]
+core-block = { path = "../../core/block" }
+# Credential-lifecycle CLI (`iscsi users`, `iscsi target`,
+# `nvmetcp psks`) needs the IscsiUsersFile / NvmetcpPsksFile load +
+# atomic-save helpers for its daemon-down fallback branch, and
+# `parse_interchange_key` for CLI-side `--key` validation before
+# sending to the daemon.
+nvme-tcp = { path = "../../nvme/tcp" }
+shared-iscsi = { path = "../../shared/iscsi" }
+shared-admin-client = { path = "../../shared/admin-client" }
+shared-admin-proto = { path = "../../shared/admin-proto" }
+shared-cli = { path = "../../shared/cli" }
+shared-cli-alerting = { path = "../../shared/cli-alerting" }
+shared-cli-iscsi = { path = "../../shared/cli-iscsi" }
+shared-cli-system = { path = "../../shared/cli-system" }
+# `system cloud benchmark` (daemon-down) reads
+# `<data_dir>/cloud-backends.json` and instantiates a `CloudBackend`
+# without going through the daemon.
+shared-cloud = { path = "../../shared/cloud" }
+shared-cloud-bench = { path = "../../shared/cloud-bench" }
+shared-crypto = { path = "../../shared/crypto" }
+# Offline `volume key migrate` resolves the old + new keystore
+# backends from <data_dir>/keystore-backends.json and round-trips
+# the DEK through their wrap/unwrap. Same crate the daemon links.
+shared-keystore = { path = "../../shared/keystore" }
+shared-naming = { path = "../../shared/naming" }
+clap = { version = "4.5", features = ["derive"] }
+# `config completion <shell>` emits the shell-specific completion
+# script on stdout. Source = the clap derive tree, so completions
+# can never drift from the actual CLI surface.
+clap_complete = "4.5"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+hex = "0.4"
+# base64 for the manifest's wrapped_dek round-trip in
+# `volume key migrate` (matches the daemon's encoding).
+base64 = "0.22"
+# Timestamp parsing for the `system identity` admin response.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# `--grace` accepts humantime duration strings ("24h", "5m", "1d12h")
+# on the iscsi-users and nvmetcp-psks `rotate` verbs.
+humantime = "2"
+
+
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+
+# Same clap stack as the binary — build.rs `include!`s `src/cli.rs`,
+# instantiates the same `Cli` derive struct, and feeds it to
+# clap_complete to (re)generate `thurvsa-completion.{bash,zsh}` at
+# the workspace root. The `cargo:rerun-if-changed=src/cli.rs` guard
+# in build.rs keeps this off the hot rebuild path; the script also
+# byte-compares before writing so an unchanged Cli leaves the file
+# alone (no `git status` churn). `shared-cli` carries the
+# `GlobalArgs` + `ConfigAction` types `cli.rs` references, so the
+# build script needs it too.
+[build-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+shared-cli = { path = "../../shared/cli" }
+
+[[bin]]
+name = "thurvsa"
+path = "src/main.rs"

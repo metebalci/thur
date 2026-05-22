@@ -1,0 +1,30 @@
+[package]
+name = "shared-telemetry"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "reqwest-rustls"] }
+opentelemetry-prometheus = "0.31"
+opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
+prometheus = "0.14"
+thiserror = "1"
+tonic = { version = "0.14", default-features = false }
+tracing = "0.1"
+
+# Optional axum metrics-handler. Enabled by daemons that mount
+# `/metrics` on their TCP HTTP server; off by default so CLI / non-HTTP
+# consumers don't pay the axum compile cost.
+axum = { version = "0.7", optional = true }
+
+[features]
+default = []
+http = ["dep:axum"]

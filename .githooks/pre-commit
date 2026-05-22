@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2026 Mete Balci
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pre-commit hook — two checks on the staged changes:
+#   1. gitleaks (https://github.com/gitleaks/gitleaks) — block secrets.
+#   2. license header — every staged .rs/.sh/.py file must carry a
+#      Copyright line + SPDX-License-Identifier in its first lines.
+#
+# Bypass for a single commit with:  git commit --no-verify
+#
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks not found on PATH — refusing to commit unscanned." >&2
+    echo "            install it, or bypass once with: git commit --no-verify" >&2
+    exit 1
+fi
+
+if ! gitleaks protect --staged --redact --no-banner; then
+    echo >&2
+    echo "pre-commit: gitleaks flagged a potential secret in the staged changes." >&2
+    echo "            review the finding above; commit blocked." >&2
+    echo "            false positive? add it to .gitleaks.toml, or bypass: git commit --no-verify" >&2
+    exit 1
+fi
+
+# License-header check. Every staged source file (.rs / .sh / .py)
+# must carry a Copyright line and an SPDX-License-Identifier within
+# its first 5 lines. Checks the staged blob, not the working tree.
+missing=""
+while IFS= read -r f; do
+    case "$f" in
+        *.rs|*.sh|*.py) ;;
+        *) continue ;;
+    esac
+    hdr=$(git show ":$f" 2>/dev/null | head -n 5)
+    if ! grep -q 'SPDX-License-Identifier:' <<<"$hdr" \
+       || ! grep -q 'Copyright' <<<"$hdr"; then
+        missing="${missing}  ${f}"$'\n'
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ -n "$missing" ]; then
+    echo >&2
+    echo "pre-commit: staged source files are missing the license header" >&2
+    echo "            (a Copyright line + SPDX-License-Identifier in the first 5 lines):" >&2
+    printf '%s' "$missing" >&2
+    echo "            add the header, or bypass once with: git commit --no-verify" >&2
+    exit 1
+fi

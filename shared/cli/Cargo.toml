@@ -1,0 +1,23 @@
+[package]
+name = "shared-cli"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+# `privdrop::drop_to_user_if_root` resolves passwd entries and
+# performs setuid/setgid/initgroups. The workspace lints
+# `deny(unsafe_code)`, so calling getpwnam_r / setresuid via raw
+# libc isn't an option — nix wraps them safely.
+nix = { version = "0.29", default-features = false, features = ["user"] }
+# `handle_copyright_flag` prints `shared_naming::COPYRIGHT_NOTICE`
+# so the year / license bump touches one file across the workspace.
+shared-naming = { path = "../naming" }

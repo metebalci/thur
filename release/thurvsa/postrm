@@ -1,0 +1,25 @@
+#!/bin/sh
+# thurvsa postrm — runs after .deb removal/purge.
+#
+# Removes the system user only on `purge`, not `remove`, so an
+# upgrade/reinstall doesn't churn the user account. /var/lib/thurvsa
+# (volume manifests, page indexes, chunk pool, audit log) is
+# never touched — that's the operator's data and removal must be
+# manual. /etc/thurvsa/thurvsa.yaml is a conffile and dpkg handles
+# its lifecycle.
+set -e
+
+case "$1" in
+    purge)
+        if getent passwd thurvsa >/dev/null; then
+            userdel thurvsa >/dev/null 2>&1 || true
+        fi
+        if getent group thurvsa >/dev/null; then
+            groupdel thurvsa >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,24 @@
+[package]
+name = "shared-cloud-bench"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Trait + types the bench drives. The `run_from_config_path` entry
+# point parses a daemon YAML conffile into a `CloudConfig`, then
+# constructs each named backend via `CloudConfig::create_backend_named`
+# and hands the lot to `run` as a list of `BenchTarget`s.
+shared-cloud = { path = "../cloud" }
+
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "macros"] }

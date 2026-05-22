@@ -1,0 +1,20 @@
+#!/bin/sh
+# thurvtl prerm — runs before .deb removal/upgrade.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop the unit if it's running. Don't disable on upgrade —
+        # the operator's enable-state should survive the upgrade.
+        if [ -d /run/systemd/system ] && systemctl is-active --quiet thurvtld; then
+            systemctl stop thurvtld || true
+            # On upgrade, drop a marker so postinst can tell the operator
+            # the daemon was running and is now stopped (not auto-restarted).
+            [ "$1" = upgrade ] && touch /run/thurvtl.upgrade-stopped 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

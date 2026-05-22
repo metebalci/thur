@@ -1,0 +1,88 @@
+[workspace]
+members = [
+    "shared/admin-audit",
+    "shared/admin-client",
+    "shared/admin-http",
+    "shared/admin-iscsi",
+    "shared/admin-proto",
+    "shared/admin-server",
+    "shared/alerting",
+    "shared/audit",
+    "shared/cli",
+    "shared/cli-alerting",
+    "shared/cli-iscsi",
+    "shared/cli-system",
+    "shared/cloud",
+    "shared/cloud-bench",
+    "shared/crypto",
+    "shared/dedup-stats",
+    "shared/health",
+    "shared/iscsi",
+    "shared/keystore",
+    "shared/naming",
+    "shared/pool",
+    "shared/telemetry",
+    "shared/upload-worker",
+    "shared/verify-core",
+    "scsi/spc",
+    "scsi/ssc",
+    "scsi/smc",
+    "scsi/sbc",
+    "nvme/base",
+    "nvme/nvm",
+    "nvme/tcp",
+    "core/stream",
+    "core/mediachanger",
+    "core/block",
+    "vtl/daemon",
+    "vtl/cli",
+    "vsa/daemon",
+    "vsa/cli",
+]
+resolver = "2"
+
+[workspace.package]
+# Single source of truth for every workspace crate's version. Each
+# crate's Cargo.toml inherits via `version.workspace = true` so a
+# release bump touches one line. release.sh reads this same field
+# (top-level `awk` on root Cargo.toml) to stamp tarball / .deb / .rpm
+# filenames. SemVer prerelease tags (`-alpha.N`, `-beta.N`, `-rc.N`)
+# flow through to .deb via cargo-deb's `-` -> `~` translation; for RPM
+# release.sh splits them into Version + Release (Fedora convention).
+version = "0.1.0-dev.4"
+license = "Apache-2.0"
+# This is an application workspace — no member crate is published to
+# crates.io. Marking every crate `publish = false` (inherited via
+# `publish.workspace = true`) blocks an accidental `cargo publish`
+# and lets `cargo deny`'s `[licenses.private] ignore = true` skip our
+# own crates from the license allow-list. See deny.toml for the
+# license-policy rationale.
+publish = false
+# Match the channel pinned in rust-toolchain.toml. Telling clippy our
+# real floor silences the "stable since 1.7x" MSRV warnings on
+# `let-else`, `unsigned_abs`, etc. — features we already use.
+rust-version = "1.92"
+
+# Workspace-wide lints enforced across all crates
+# See .clippy.toml for additional clippy configuration
+[workspace.lints.rust]
+unsafe_code = "deny"      # No unsafe code allowed
+
+[workspace.lints.clippy]
+# Safety-critical lints. Releases are gated on these — `cargo clippy
+# --workspace --release --all-targets` must exit 0. `unwrap_used` +
+# `panic` + `unwrap_in_result` together stop unwrap- / panic-driven
+# crashes from leaking into Result-returning paths and forces honest
+# error handling everywhere.
+unwrap_used = "deny"
+panic = "deny"
+unwrap_in_result = "deny"
+
+# Everything else (`expect_used`, `clone_on_ref_ptr`,
+# `needless_pass_by_value`, `pedantic`, `nursery`, `missing_docs`)
+# stays at the rust/clippy defaults — they surface ~1500 style
+# warnings on this workspace (doc-backtick nits, format-string
+# inlining, `const fn` candidates, struct-field doc gaps). These are
+# aspirational, not correctness; gating release on them would either
+# churn most of the codebase or train us to ignore clippy entirely.
+# Re-enable individually if a concrete pattern bites us.

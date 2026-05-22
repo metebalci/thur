@@ -1,0 +1,98 @@
+[package]
+name = "core-mediachanger"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+io-uring-support = ["io-uring"]
+
+[dependencies]
+# Cloud backends + compression primitives live in shared-cloud so
+# the sibling block-storage product (core-block) can consume them
+# without depending on core-mediachanger. core-mediachanger re-exports the same
+# module paths it used to own (`compression`, `cloud_backend`,
+# `cloud_config`, `cloud_helpers`, `s3`, `gcs`, `azure`, `local`)
+# so downstream callers (thurvtld, thurvtl) don't change.
+shared-cloud = { path = "../../shared/cloud" }
+# `From<shared_iscsi::IscsiError> for SmcError` lives here so the
+# session/auth modules in shared-iscsi propagate cleanly through every
+# `?` in the iscsi handler tree without each consumer re-deriving the
+# bridge.
+shared-iscsi = { path = "../../shared/iscsi" }
+# Content-addressed chunk pool extracted in Step 5 Milestone 5.A.3.
+# `smc_core::ChunkStore` is a re-exported alias for
+# `shared_pool::ChunkPool` so internal call sites compile unchanged.
+shared-pool = { path = "../../shared/pool" }
+# Local pool + cloud HEAD verification sweeps shared with the block
+# product; `verify.rs` keeps the tape library/partition checks.
+shared-verify-core = { path = "../../shared/verify-core" }
+# Tape-side primitives (cartridge, indexes, chunking, encryption,
+# disk cache, prefetch, legal-hold sentinel) extracted in Step 5
+# Milestone 5.B.1. core-mediachanger re-exports the same flat names so
+# downstream callers (thurvtld, thurvtl, integration tests)
+# continue compiling unchanged.
+core-stream = { path = "../stream" }
+# Audit chain + channel + ratelimiter live in shared-audit so thurvsa
+# can produce login-phase audit entries without depending on
+# core-mediachanger. core-mediachanger re-exports the same flat type names
+# downstream callers historically pulled in via `smc_core::AuditLog`
+# etc.
+shared-audit = { path = "../../shared/audit" }
+# OpenTelemetry + Prometheus instrumentation lives in shared-telemetry
+# so thurvsa can wire the same Telemetry handle. core-mediachanger re-exports
+# `Telemetry`, `TelemetryConfig`, the `record::*` free functions, etc.
+# under the historical `smc_core::metrics::*` paths so thurvtld
+# and existing call sites compile unchanged.
+shared-telemetry = { path = "../../shared/telemetry" }
+
+bytes = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+# Castagnoli CRC32C (poly 0x1EDC6F41). Used to validate the optional
+# 4-byte trailer on host WRITE / READ when LTO-7+ Logical Block
+# Protection (Mode Page 0x0A subpage 0xF0) is enabled. The crate has
+# zero dependencies and ships hardware-accelerated x86 SSE 4.2 +
+# aarch64 PMULL paths.
+crc32c = "0.6"
+hex = "0.4"
+pathdiff = "0.2"
+
+# Timestamp parsing for cartridge timestamps.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# Async stream combinators used by verify.rs and legal_hold.rs.
+futures = "0.3"
+
+# Telemetry stack now lives in shared-telemetry (OpenTelemetry SDK +
+# Prometheus + OTLP push). core-mediachanger re-exports the surface so
+# downstream callers keep their existing import paths. `axum` was
+# only ever a doc-comment reference in legal_hold.rs; dropped here.
+
+# File locking (Milestone 6 Phase 1)
+fs2 = "0.4"
+
+# Zero-copy I/O (Milestone 5 Phase 3)
+io-uring = { version = "0.6", optional = true }
+libc = "0.2"
+
+# Drive-level LTO encryption (AES-256-GCM)
+aes-gcm = "0.10"
+
+# Used by audit-test fixtures + library serial generation.
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+serde_yaml = "0.9"

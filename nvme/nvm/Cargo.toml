@@ -1,0 +1,33 @@
+[package]
+name = "nvme-nvm"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# PageCache + manifest types backing the I/O command path. Mirrors
+# scsi-sbc's core-block dep — the dispatcher resolves NSID through
+# the NamespaceLookup trait and then issues page-grain reads /
+# writes directly against PageCache (the same boundary that SCSI
+# uses).
+core-block = { path = "../../core/block" }
+# SQE / CQE / status / opcodes / Identify primitives. nvme-nvm is
+# the NVM Command Set layered on the base.
+nvme-base = { path = "../base" }
+# Vendor / model identity strings rendered by Identify Namespace.
+shared-naming = { path = "../../shared/naming" }
+
+async-trait = "0.1"
+thiserror = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+shared-cloud = { path = "../../shared/cloud" }

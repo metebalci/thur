@@ -1,0 +1,47 @@
+[package]
+name = "shared-iscsi"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Lifted from thurvtld's iscsi/* — kept identical so the moved
+# files compile with no import diff beyond the error type. The
+# transport-layer additions (Step 3c phase 2) bring tokio + anyhow
+# + hex + async-trait alongside.
+scsi-spc = { path = "../../scsi/spc" }
+
+anyhow = "1"
+async-trait = "0.1"
+# Grace-period expiry timestamps on `UserEntry.previous_expires_at`
+# (and the same shape on the NVMe-TCP PSK entries). Features pinned to
+# match `shared-audit`'s spec so we don't end up with two chrono
+# featuresets in the dep graph.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hex = "0.4"
+md5 = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "time", "macros"] }
+tracing = "0.1"
+
+# Optional axum `/sessions` handler. Enabled by daemons that mount it
+# on their TCP HTTP server; off by default so non-HTTP consumers
+# don't pay the axum compile cost.
+axum = { version = "0.7", optional = true }
+
+[features]
+default = []
+http = ["dep:axum"]
+
+[dev-dependencies]

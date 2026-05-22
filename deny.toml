@@ -1,0 +1,102 @@
+# cargo-deny configuration.
+#
+# Thur is licensed Apache-2.0 (see Cargo.toml / LICENSE) — a
+# permissive license. To keep it permissive for downstream users —
+# who may embed Thur in a proprietary product — every third-party
+# dependency must itself be non-copyleft: a GPL / LGPL / AGPL
+# dependency would force the combined work copyleft and defeat the
+# point of the permissive license.
+#
+# The allow-list below is therefore the narrow set of *non-copyleft*,
+# distribution-permissive SPDX expressions cleared for redistribution
+# — no GPL / LGPL / AGPL, no SSPL / BSL, no other source-available
+# terms.
+#
+# Run locally:
+#   cargo deny check licenses
+#   cargo deny check                  # all checks (licenses + bans + advisories + sources)
+#
+# CI:
+#   .github/workflows/deny.yml runs `cargo deny check` on push / PR.
+
+[graph]
+# Audit the full dependency graph (all targets, all features) so a
+# Linux-only dep doesn't slip past a macOS-host scan.
+all-features = true
+
+[licenses]
+version = 2
+# Non-copyleft, distribution-permissive licenses (see header for why
+# the bar is "non-copyleft"). Order is informational; cargo-deny
+# treats this as a set.
+#
+# Explicitly NOT allowed (and not in this list on purpose):
+#   - GPL-* / LGPL-* / AGPL-*       copyleft — would force Thur's
+#                                   combined work copyleft
+#   - SSPL                          source-available, MongoDB
+#   - BSL-1.1 (Business Source)     time-bombed source-available
+#   - WTFPL / Beerware / etc.       legally ambiguous "fun" licenses
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",        # Boost Software License (NOT Business Source License)
+    # webpki-roots / webpki-root-certs ship Mozilla's CA root bundle
+    # under the Linux Foundation's Community Data License Agreement
+    # Permissive 2.0 — a permissive license for data (not code). The
+    # crate is the de-facto Rust source for trusted CAs and is pulled
+    # in transitively by reqwest / rustls / aws-sdk. Reviewed: CDLA-
+    # Permissive-2.0 imposes no copyleft and permits redistribution.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+# Crate-specific exceptions go here with a justification comment.
+# Empty today; populated only if a transitive dep ships an unusual
+# but reviewed license that doesn't belong in the global allow-list.
+exceptions = []
+
+[licenses.private]
+# Skip the license check for unpublished workspace members. Every
+# Thur crate carries `publish = false` (inherited from
+# workspace.package) and is Apache-2.0 — our own code, no need to
+# vet it against the allow-list. This skips ONLY the workspace
+# crates' own license field; their dependency trees are still
+# checked against `allow` above.
+ignore = true
+
+[bans]
+# Multiple versions of the same crate are common in the Rust
+# ecosystem (different deps pulling in different versions of `syn`,
+# etc.) and not a correctness issue. Warn so we can see drift; don't
+# fail the build.
+multiple-versions = "warn"
+wildcards = "warn"
+# Workspace deps with `path = "..."` references can legitimately use
+# wildcards.
+allow-wildcard-paths = true
+
+[advisories]
+version = 2
+# rustsec advisory database. Yanked crates often coincide with a
+# security or correctness fix; warn so we notice without blocking.
+yanked = "warn"
+# `ignore = [...]` is the place to silence a specific RUSTSEC-XXXX
+# advisory with a justification. Empty today.
+ignore = []
+
+[sources]
+# All deps must come from crates.io or a known git source. Anything
+# else is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

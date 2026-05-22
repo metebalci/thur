@@ -1,0 +1,132 @@
+# Thur VTL — minimal starter configuration
+#
+# This file ships as /etc/thurvtl/thurvtl.yaml. It contains only
+# the keys you usually need to set on first install; everything else
+# uses sensible defaults baked into the daemon.
+#
+# To see EVERY key the daemon understands (with full per-key
+# documentation), open the reference shipped alongside the package:
+#   /usr/share/doc/thurvtl/thurvtl.defaults.yaml
+# or get the same content on stdout from the CLI:
+#   thurvtl config defaults
+
+# Local storage directory for the disk cache, manifests, library
+# state, and the shared chunk pool. The packaged systemd unit runs
+# as user `thurvtl`, which owns /var/lib/thurvtl/ — point
+# data_dir there unless you have a reason to host it elsewhere
+# (separate filesystem, NVMe scratch, etc.). Whatever you set, the
+# daemon must be able to read+write it.
+data_dir: "/var/lib/thurvtl"
+
+# Cloud backends live under `cloud.backends:` below. Pick the
+# provider you need (local | s3 | gcs | azure), uncomment that block,
+# fill in the values. Each cartridge binds to one named backend at
+# create time via `--backend NAME`; multiple entries are allowed for
+# multi-tier deployments (hot S3 + cold GCS, etc.).
+#
+# See /usr/share/doc/thurvtl/AUTH.md (or docs/AUTH.md in
+# source) for the per-provider `auth:` block schema in detail.
+#
+# cloud:
+#   compression: { algorithm: zstd, level: 3 }
+#   upload: { max_concurrent: 0 }
+#
+#   backends:
+#
+#     local-example:
+#       type: local
+#       root_dir: /var/lib/thurvtl/cloud-local        # any local path
+#
+#     s3-example:
+#       type: s3
+#       bucket: my-bucket-name
+#       region: us-east-1
+#       prefix: thur/
+#       # endpoint_url: https://s3.example.com        # optional (MinIO, Wasabi, …)
+#       # retention_mode: governance                  # none | governance | compliance
+#       auth:
+#         type: env
+#         access_key_id_env: THUR_S3_ACCESS_KEY_ID
+#         secret_access_key_env: THUR_S3_SECRET_ACCESS_KEY
+#
+#     gcs-example:
+#       type: gcs
+#       bucket: my-bucket-name
+#       project_id: my-project
+#       prefix: thur/
+#       service_account_key_file: /etc/thurvtl/gcs-sa.json
+#
+#     azure-example:
+#       type: azure
+#       storage_account: mystorageacct
+#       container: mycontainer
+#       prefix: thur/
+#       auth:
+#         type: service_principal_env
+#         tenant_id_env: THUR_AZURE_TENANT_ID
+#         client_id_env: THUR_AZURE_CLIENT_ID
+#         client_secret_env: THUR_AZURE_CLIENT_SECRET
+
+# Cartridge at-rest encryption (the daemon-side appliance layer;
+# distinct from host-driven AME via SECURITY PROTOCOL). Keystore
+# backends live under
+# `keystore.backends:` below. Pick a backend type (local | awskms |
+# vault | azurekv | gcpkms | kmip), uncomment that block, fill in
+# the values. Each encrypted cartridge binds to one named backend at
+# create time via `--keystore NAME`.
+#
+# See /usr/share/doc/thurvtl/AUTH.md (or docs/AUTH.md in
+# source) for the per-provider `auth:` block schema in detail.
+#
+# keystore:
+#   # Default backend picked when `cartridge create` omits
+#   # `--keystore`. Leave unset to leave at-rest off by default.
+#   # default: my-vault
+#
+#   backends:
+#
+#     local-example:
+#       type: local                                   # plaintext sidecar at <data_dir>/keys/<uuid>.key
+#
+#     awskms-example:
+#       type: awskms
+#       key_id: alias/thur-keystore                   # CMK alias / id / ARN
+#       region: us-east-1
+#       auth:
+#         type: env
+#         access_key_id_env: THUR_KMS_ACCESS_KEY_ID
+#         secret_access_key_env: THUR_KMS_SECRET_ACCESS_KEY
+#
+#     vault-example:
+#       type: vault
+#       address: https://vault.example.com
+#       transit_mount: transit                        # default
+#       transit_key: thurvtl-cartridge-deks
+#       auth:
+#         type: token_env
+#         env: VAULT_TOKEN
+#
+#     azurekv-example:
+#       type: azurekv
+#       vault_uri: https://mykv.vault.azure.net
+#       key_name: thurvtl-kek
+#       auth:
+#         type: service_principal_env
+#         tenant_id_env: THUR_AZURE_TENANT_ID
+#         client_id_env: THUR_AZURE_CLIENT_ID
+#         client_secret_env: THUR_AZURE_CLIENT_SECRET
+#
+#     gcpkms-example:
+#       type: gcpkms
+#       key_name: projects/p/locations/global/keyRings/r/cryptoKeys/k
+#       auth:
+#         type: adc                                   # or service_account_key{_env}
+#
+#     kmip-example:
+#       type: kmip
+#       endpoint: kms.corp.example:5696
+#       kek_uid: kek-1
+#       mtls:
+#         type: client_cert
+#         cert_path: /etc/thurvtl/kmip-client.crt
+#         key_path: /etc/thurvtl/kmip-client.key

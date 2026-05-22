@@ -1,0 +1,29 @@
+[package]
+name = "shared-audit"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shared-telemetry = { path = "../telemetry" }
+
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hex = "0.4"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing = "0.1"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+# Multi-thread runtime for AuditChannel concurrent-producer tests.
+tokio = { version = "1", features = ["rt-multi-thread"] }

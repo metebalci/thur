@@ -1,0 +1,20 @@
+[package]
+name = "shared-crypto"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# AES-256-GCM. Pin to the same major as core-stream historically used so
+# both products track a single transitive aes-gcm version.
+aes-gcm = "0.10"
+# BLAKE3 backs `derive_iv`: hashes (uuid, counter_a, counter_b) into a
+# 12-byte AES-GCM nonce. Same primitive the content-addressed pool
+# already uses, so adopting it here costs no new dep weight.
+blake3 = "1"
+thiserror = "1"

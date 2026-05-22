@@ -1,0 +1,10 @@
+[toolchain]
+# Pin every build (host and in-container) to the same rustc. Floor is
+# set by whichever transitive dep has the highest `rust-version` —
+# bump deliberately, in lockstep with `release/Containerfile.builder`'s
+# RUST_VERSION ARG, so dev / release / CI rebuilds all share the same
+# compiler. Keeps the binary closer to byte-reproducible across
+# rebuilds, even before we wire SOURCE_DATE_EPOCH and friends.
+channel = "1.92.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

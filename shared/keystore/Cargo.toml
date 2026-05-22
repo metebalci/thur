@@ -1,0 +1,108 @@
+[package]
+name = "shared-keystore"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Shared infrastructure (mirrors shared-cloud's dependency profile so
+# KMS / Vault clients reuse the same TLS + async substrate).
+async-trait = "0.1"
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parsing the `keystore:` block out of the YAML conffile for daemon-down
+# CLI paths (`volume key {migrate,export,import}`).
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# AES-256 primitives, OsRng, KEY_LEN const — the daemon-side DEK
+# generation path mints fresh bytes here before asking the backend to
+# wrap them.
+shared-crypto = { path = "../crypto" }
+
+# Passphrase-sealed JWE envelope for `thurvsa volume key
+# export/import` (RFC 7516 Compact + RFC 7518 PBES2-HS512+A256KW /
+# A256GCM). All four crates are pure RustCrypto — no openssl path on
+# top of the existing rustls + s2n-tls + transitive openssl trio.
+# `aes-gcm` is already a transitive dep via `shared-crypto`; pinning
+# it here keeps it part of the source-of-truth deps for direct callers.
+aes-gcm = "0.10"
+aes-kw = "0.2"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
+sha2 = "0.10"
+
+# AWS KMS — same `aws-config` / `aws-credential-types` profile as
+# shared-cloud (rt-tokio, behavior-version-latest, default-https-client).
+# `default-features = false` drops the legacy rustls 0.21 path the
+# Dependabot alert flags.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process"] }
+aws-credential-types = "1"
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+
+# Vault Transit hand-rolled client. reqwest already in the workspace
+# graph via shared-cloud; rustls-tls keeps the TLS stack consistent.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Azure Key Vault keys client. Matches the azure_core 0.35 line
+# already pulled in by shared-cloud's `azure_storage_blob` 0.12 +
+# `azure_identity` 0.35 deps, so the AAD TokenCredential trait is
+# unified across cloud + keystore paths. `wrap_key` / `unwrap_key` on
+# RSA keys does NOT accept service-side AAD (only symmetric AES
+# algorithms do); we bind context to volume_uuid in a JSON envelope
+# around the wrapped blob — see azurekv.rs for the schema.
+azure_core = "0.35"
+azure_identity = "0.35"
+azure_security_keyvault_keys = "0.14"
+
+# GCP Cloud KMS (Google's googleapis/google-cloud-rust line — same
+# vendor as the `google-cloud-storage` 1.x already pulled by
+# shared-cloud). Symmetric `encrypt` / `decrypt` accept a native
+# `additional_authenticated_data` field which we bind to
+# hex(volume_uuid); KMS rejects mismatching AAD on decrypt. Auth via
+# `google-cloud-auth` 1.10 — same crate shared-cloud's GCS backend
+# uses for credentials (ADC chain or service-account JSON).
+# `google-cloud-gax` is the transport/error layer shared across every
+# googleapis Rust client; we need it for the `Code` enum to classify
+# service errors into the keystore failure taxonomy.
+google-cloud-auth = "1.10"
+google-cloud-gax = "1.10"
+google-cloud-kms-v1 = "1.9"
+# `Bytes` is the request/response body type Cloud KMS uses for
+# plaintext / ciphertext fields. Already transitively in the dep
+# graph via the kms-v1 crate, but pinning it here keeps it part of
+# the source-of-truth deps.
+bytes = "1"
+
+# Force vendored openssl across the dep graph (same rationale as
+# shared-cloud: reqwest's transitive native-tls feature pulls
+# openssl-sys; vendoring statically links it so one binary runs on
+# every distro regardless of system openssl version).
+openssl = { version = "0.10", features = ["vendored"] }
+
+# KMIP backend: raw TLS over TCP (KMIP is not HTTP). `rustls` +
+# `tokio-rustls` are already in the workspace dep graph via the AWS /
+# GCP / Azure SDKs and reqwest. PEM parsing for the operator's client
+# cert / key + CA bundle goes through `rustls-pki-types`' `PemObject`
+# trait (re-exported via `rustls::pki_types`); `rustls-native-certs`
+# loads the host's system trust store when the KMIP config omits a
+# CA bundle. Pinned to the major lines already on the lock so we
+# don't fork the rustls dep set.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+# In-process HTTP mock server for Vault Transit request/response shape
+# tests + classify_vault_status table tests.
+wiremock = "0.6"

@@ -1,0 +1,43 @@
+[package]
+name = "scsi-smc"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Library + element-address topology + tape events the changer ops
+# read and mutate. Direct dep is fine; SMC handlers are inherently
+# library-coupled (no trait wrapper buys anything here).
+core-mediachanger = { path = "../../core/mediachanger" }
+# Cartridge / drive types referenced by READ ELEMENT STATUS
+# descriptors (DVCID, mixed-extension).
+core-stream = { path = "../../core/stream" }
+# Canonical ScsiRequest / ScsiResponse / sense framing.
+scsi-spc = { path = "../spc" }
+# The shared ScsiCtx that SmcScsiCtx wraps; audit helpers
+# (audit_append, ratelimit_key_for); sense walker.
+scsi-ssc = { path = "../ssc" }
+# AuditChannel + AuditRateLimiter consumed via ScsiCtx fields.
+shared-audit = { path = "../../shared/audit" }
+# UnitAttentionTracker (carried via ScsiCtx.ua_tracker) +
+# UnitAttentionCode constants the MOVE/EXCHANGE MEDIUM handlers
+# push after a successful changer move.
+shared-iscsi = { path = "../../shared/iscsi" }
+# VENDOR_INQUIRY for the DVCID vendor field in READ ELEMENT STATUS
+# data-transfer descriptors — kept identical to the drive INQUIRY.
+shared-naming = { path = "../../shared/naming" }
+
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+bytes = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

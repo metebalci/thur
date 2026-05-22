@@ -1,0 +1,69 @@
+[package]
+name = "core-block"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hex = "0.4"
+thiserror = "1"
+# UUID generation. Already pinned by the workspace via rand → getrandom,
+# but depending directly avoids pulling rand into core-block.
+getrandom = "0.3"
+
+# Step 3b: chunk-pool sealing + cloud upload pipeline. blake3 hashes
+# every page on the write path; tracing surfaces dedup-hit / upload
+# decisions at debug level. shared-cloud carries the CloudBackend
+# trait + S3/GCS/Azure/Local impls — path-dep is fine, the surface
+# is already extracted and stable.
+shared-cloud = { path = "../../shared/cloud" }
+shared-pool = { path = "../../shared/pool" }
+# Local pool + cloud HEAD verification sweeps, shared with the tape
+# product; `verify.rs` adds the block page-table integrity check.
+shared-verify-core = { path = "../../shared/verify-core" }
+# Cloud-upload pipeline scaffold (PendingUpload / UploadOutcome,
+# upload_chunk_inert, run_upload_pipeline). VolumeWriter constructs
+# PendingUpload at the hand-off boundary; an in-process
+# upload_chunk_inert is the fallback when no async dispatcher is
+# wired (tests, CLI). VSA daemon plugs an async dispatcher in.
+shared-upload-worker = { path = "../../shared/upload-worker" }
+# AES-256-GCM primitives + IV derivation for at-rest volume encryption.
+# Pure byte-slice surface — `core-block` calls encrypt_block /
+# decrypt_block / derive_iv directly; the key bytes themselves come
+# from the daemon's per-volume keystore (vsa/daemon/src/keystore.rs)
+# and are passed into VolumeWriter::open at construction.
+shared-crypto = { path = "../../shared/crypto" }
+# Cache eviction counter — `record::cache_eviction` no-ops when the
+# daemon hasn't installed the process-global handle (CLI / tests),
+# so the dependency is pure plumbing.
+shared-telemetry = { path = "../../shared/telemetry" }
+blake3 = "1"
+tracing = "0.1"
+# Cache layer: tokio::sync primitives (Mutex / Notify) for the
+# write-back page cache. The flush worker also uses tokio::time;
+# the daemon spawns it, but core-block stays runtime-agnostic
+# (no `rt-multi-thread`).
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+# Bounded-concurrency primitive for parallel page flushes via
+# `stream::iter(...).buffer_unordered(N).collect()`. Same pattern
+# VTL uses in `upload_worker::run_upload_pipeline`.
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+# Async runtime for the uploader's #[tokio::test] cases. The crate
+# itself is runtime-agnostic — only tests need a runtime.
+tokio = { version = "1", features = ["macros", "rt"] }
+# Cache parallel-flush tests build a delaying decorator around
+# `CloudBackend`; the trait uses #[async_trait] so the impl must too.
+async-trait = "0.1"
+# perf_volume_cloud example parses the daemon YAML conffile.
+serde_yaml = "0.9"

@@ -1,0 +1,25 @@
+#!/bin/sh
+# thurvtl postrm — runs after .deb removal/purge.
+#
+# Removes the system user only on `purge`, not `remove`, so an
+# upgrade/reinstall doesn't churn the user account. /var/lib/thurvtl
+# (cartridge data, indexes, audit log, license usage snapshot) is
+# never touched — that's the operator's data and removal must be
+# manual. /etc/thurvtl/thurvtl.yaml is a conffile and dpkg handles
+# its lifecycle.
+set -e
+
+case "$1" in
+    purge)
+        if getent passwd thurvtl >/dev/null; then
+            userdel thurvtl >/dev/null 2>&1 || true
+        fi
+        if getent group thurvtl >/dev/null; then
+            groupdel thurvtl >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
