@@ -124,10 +124,23 @@ pub struct DaemonState {
     /// …). Populated as work is dispatched through the
     /// `/api/v1/jobs/*` endpoints; see `admin::jobs`.
     pub jobs: Arc<JobRegistry>,
+    /// Unix epoch seconds the daemon started at. Captured once in
+    /// `DaemonState::new`. Surfaces in `system monitor`'s header row
+    /// (uptime = now - started_at).
+    pub started_at_unix: i64,
+    /// Cloned copy of the pool-budgets map for read-only consumers
+    /// (the `system.monitor` job handler). The authoritative copy
+    /// lives inside `DriveManager`; both share the same
+    /// `Arc<PoolBudget>` instances so reads are coherent.
+    pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
 }
 
 impl DaemonState {
     pub fn new(cfg: DaemonStateConfig) -> Self {
+        // Clone the budgets before handing them to DriveManager so the
+        // `system.monitor` handler can read used / cap / waiters_now
+        // without going through the manager's internal accessors.
+        let pool_budgets = cfg.pool_budgets.clone();
         let drive_manager = {
             let mut dm = DriveManager::with_compression_settings(
                 cfg.num_drives,
@@ -167,6 +180,11 @@ impl DaemonState {
             keystore_config: cfg.keystore_config,
             diagnostic_store: Arc::new(DiagnosticStore::new()),
             jobs: Arc::new(JobRegistry::new()),
+            started_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            pool_budgets,
         }
     }
 }

@@ -39,6 +39,55 @@ pub struct AdminState {
     pub daemon: Arc<DaemonState>,
 }
 
+// `system.monitor` per-tick view. The handler in `shared-admin-monitor`
+// calls these accessors once per second to compose the JSON payload.
+impl shared_admin_monitor::MonitorState for AdminState {
+    fn daemon_name(&self) -> &str {
+        "thurvtld"
+    }
+    fn version(&self) -> &str {
+        crate::THURVTL_VERSION_STR
+    }
+    fn started_at_unix(&self) -> i64 {
+        self.daemon.started_at_unix
+    }
+    fn live_stats(&self) -> Arc<shared_telemetry::LiveStats> {
+        // The global is always set on the daemon side (see main.rs
+        // boot); the fallback keeps the `--test` smoke path harmless.
+        shared_telemetry::global()
+            .map(|t| t.live_stats())
+            .unwrap_or_else(|| Arc::new(shared_telemetry::LiveStats::default()))
+    }
+    fn pool_budgets(
+        &self,
+    ) -> std::collections::HashMap<String, Arc<core_mediachanger::PoolBudget>> {
+        self.daemon.pool_budgets.clone()
+    }
+    fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
+        let (cartridges_loaded, cartridges_total, drives_busy, drives_total) = {
+            let lib = self.daemon.library.lock().expect("library mutex poisoned");
+            let storage_occupied = lib.storage_slots().iter().filter(|s| s.occupied).count();
+            let mail_occupied = lib.mail_slots().iter().filter(|s| s.occupied).count();
+            let drives_occupied = lib.drives().iter().filter(|d| d.occupied).count();
+            let total = lib.storage_slots().len() + lib.mail_slots().len() + lib.drives().len();
+            (
+                storage_occupied + mail_occupied + drives_occupied,
+                total,
+                drives_occupied,
+                lib.drives().len(),
+            )
+        };
+        let sessions_active = self.daemon.session_manager.session_count() as u64;
+        shared_admin_monitor::ProductSnapshot::Vtl {
+            cartridges_loaded: cartridges_loaded as u64,
+            cartridges_total: cartridges_total as u64,
+            drives_busy: drives_busy as u64,
+            drives_total: drives_total as u64,
+            sessions_active,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /api/v1/library/info
 // ---------------------------------------------------------------------------

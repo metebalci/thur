@@ -96,6 +96,19 @@ pub fn dispatch(
         "library.restore_archive" => {
             tokio::spawn(restore_archive::run(emitter, body, state));
         }
+        "system.monitor" => {
+            // The shared handler is generic over a `MonitorState` impl;
+            // `AdminState` (which wraps the same `Arc<DaemonState>` we
+            // already have) is the type that carries the impl. Building
+            // it here keeps `shared-admin-monitor` from depending on
+            // VTL's daemon crate.
+            let admin_state = crate::admin::handlers::AdminState { daemon: state };
+            tokio::spawn(shared_admin_monitor::run_monitor(
+                emitter,
+                body,
+                admin_state,
+            ));
+        }
         other => return Err(format!("unknown job kind: {}", other)),
     }
     Ok(())

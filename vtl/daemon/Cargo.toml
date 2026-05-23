@@ -19,6 +19,7 @@ core-mediachanger = { path = "../../core/mediachanger" }
 shared-admin-audit = { path = "../../shared/admin-audit" }
 shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
+shared-admin-monitor = { path = "../../shared/admin-monitor" }
 shared-admin-proto = { path = "../../shared/admin-proto" }
 shared-alerting = { path = "../../shared/alerting", features = ["http"] }
 shared-audit = { path = "../../shared/audit" }
