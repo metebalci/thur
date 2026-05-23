@@ -57,3 +57,57 @@ impl<S: Send + Sync> FromRequestParts<S> for PeerCred {
             }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    #[test]
+    fn audit_descriptor_includes_pid_when_present() {
+        let cred = PeerCred {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        };
+        assert_eq!(cred.audit_descriptor(), "unix:1000:12345");
+    }
+
+    #[test]
+    fn audit_descriptor_omits_pid_when_absent() {
+        let cred = PeerCred {
+            uid: 1000,
+            gid: 1000,
+            pid: None,
+        };
+        assert_eq!(cred.audit_descriptor(), "unix:1000");
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_returns_the_injected_cred() {
+        let (mut parts, _) = Request::builder().body(()).expect("build").into_parts();
+        let injected = PeerCred {
+            uid: 42,
+            gid: 7,
+            pid: Some(99),
+        };
+        parts.extensions.insert(injected.clone());
+        let got = PeerCred::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
+        assert_eq!(got.uid, 42);
+        assert_eq!(got.gid, 7);
+        assert_eq!(got.pid, Some(99));
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_falls_back_to_anonymous_when_no_extension() {
+        let (mut parts, _) = Request::builder().body(()).expect("build").into_parts();
+        let got = PeerCred::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
+        assert_eq!(got.uid, u32::MAX);
+        assert_eq!(got.gid, u32::MAX);
+        assert_eq!(got.pid, None);
+    }
+}
