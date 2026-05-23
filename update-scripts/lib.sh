@@ -18,10 +18,38 @@
 # Initiators on remote hosts are not touched — stopping the daemon
 # still drops their sessions, so quiesce those hosts yourself.
 #
+# These scripts are *upgrade* tools — a clean first-install of the
+# .deb / .rpm goes through plain `dpkg -i` / `rpm -i`, which leaves
+# the daemon stopped on purpose so the operator can edit the
+# conffile before `systemctl enable --now`. The wrapper refuses to
+# run on a host with no prior installation (see `require_installed`).
+#
+# Three mutually-exclusive end states:
+#
+#   default            unmount + logout + stop + install + start +
+#                      login + remount.  Session-continuity for a
+#                      routine upgrade.  State file removed on
+#                      success.
+#
+#   --dont-restart     unmount + logout + stop + install.  Stops
+#                      short of `systemctl start`, leaving the daemon
+#                      down so the operator can review the conffile
+#                      (matches the postinst's stance).  State file
+#                      kept; paste-ready reattach commands printed.
+#
+#   --disconnect-only  unmount + logout only.  Daemon stays running;
+#                      no package swap.  Use to quiesce the host
+#                      before unrelated maintenance.  State file
+#                      kept; paste-ready reattach commands printed.
+#
+# --dry-run and --force are orthogonal and compose with any of them.
+# --dry-run prints every system-changing command instead of running
+# it; read-only discovery still runs so the plan is accurate.
+#
 #   VSA: a LUN is logged in over iSCSI / NVMe-TCP and a filesystem is
-#        mounted on it. Sequence: unmount -> log sessions out -> stop
-#        -> install -> start -> log back in -> remount by filesystem
-#        UUID (a device rename across re-login then doesn't matter).
+#        mounted on it. The remount on the default path keys on
+#        filesystem UUID, so a device rename across re-login doesn't
+#        matter.
 #
 #   VTL: clients usually drive the tape device through backup
 #        software (no mount). The exception is LTFS — `ltfs` mounts a
@@ -29,14 +57,13 @@
 #        automatically from the running `ltfs` processes, unmounted
 #        before the stop (which flushes the tape index), and the same
 #        `ltfs` command line is replayed afterwards. No LTFS mounts ->
-#        the run is just stop -> install -> start.
-#
-# --dry-run prints every system-changing command instead of running
-# it; read-only discovery still runs so the plan is accurate.
+#        the default run is just stop -> install -> start.
 
 # --- options / state, set by parse_args ----------------------------
 DRYRUN=0
 force=0
+DONT_RESTART=0
+DISCONNECT_ONLY=0
 PKGDIR=$PWD
 TAG=update
 # DONE is global (not function-local) so the EXIT trap can still read
@@ -48,12 +75,18 @@ die() { printf '[%s] ERROR: %s\n' "$TAG" "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<EOF
-usage: $(basename "${0:-update script}") [--dry-run] [--force] [package-dir]
+usage: $(basename "${0:-update script}") [--dry-run] [--force]
+              [--dont-restart | --disconnect-only] [package-dir]
 
-  --dry-run      show the commands that would run; change nothing
-  --force        VTL only: proceed even if backup sessions are connected
-  package-dir    directory holding the package (default: current dir);
-                 the newest matching package in it is installed
+  --dry-run          show the commands that would run; change nothing
+  --force            VTL only: proceed even if backup sessions are connected
+  --dont-restart     unmount + logout + stop + install, then exit;
+                     leaves the daemon stopped so the operator can
+                     review the conffile before starting it back up
+  --disconnect-only  unmount + logout only; do not touch the daemon
+                     or the package (no stop, no install, no start)
+  package-dir        directory holding the package (default: current dir);
+                     the newest matching package in it is installed
 EOF
 }
 
@@ -61,13 +94,18 @@ parse_args() {
   local a
   for a in "$@"; do
     case "$a" in
-      --dry-run) DRYRUN=1 ;;
-      --force)   force=1 ;;
-      -h|--help) usage; exit 0 ;;
-      --*)       usage; die "unknown option: $a" ;;
-      *)         PKGDIR=$a ;;
+      --dry-run)         DRYRUN=1 ;;
+      --force)           force=1 ;;
+      --dont-restart)    DONT_RESTART=1 ;;
+      --disconnect-only) DISCONNECT_ONLY=1 ;;
+      -h|--help)         usage; exit 0 ;;
+      --*)               usage; die "unknown option: $a" ;;
+      *)                 PKGDIR=$a ;;
     esac
   done
+  if [[ $DONT_RESTART -eq 1 && $DISCONNECT_ONLY -eq 1 ]]; then
+    die "--dont-restart and --disconnect-only are mutually exclusive"
+  fi
   PKGDIR=$(cd "$PKGDIR" 2>/dev/null && pwd) || die "package dir not found: $PKGDIR"
   [[ $DRYRUN -eq 1 ]] && log "DRY-RUN: nothing will be changed; planned commands shown as '[would run] ...'"
   return 0
@@ -129,20 +167,22 @@ install_pkg() {
   esac
 }
 
-# stop_if_loaded SERVICE — `systemctl stop` only when systemd has
-# the unit loaded. On a fresh host where the .deb / .rpm has never
-# been installed, the unit file does not exist and `systemctl stop`
-# would fail the `set -e` check and trigger the EXIT trap's
-# "INTERRUPTED" notice for what is really a clean first-install run.
+# require_installed SERVICE — refuse to run on a host where the
+# daemon's systemd unit has never been on disk. This wrapper is the
+# *upgrade* path; a clean first install goes through plain
+# `dpkg -i` / `rpm -i`. Probed BEFORE the EXIT trap arms so die()
+# exits cleanly without the trap's "INTERRUPTED" trailer.
 # `systemctl cat <svc>` returns non-zero when the unit isn't on disk
 # and is the canonical existence probe.
-stop_if_loaded() {
-  local svc=$1
-  if systemctl cat "$svc" >/dev/null 2>&1; then
-    log "stopping $svc"
-    run systemctl stop "$svc"
+require_installed() {
+  local svc=$1 hint
+  if [[ $PKGFMT == deb ]]; then
+    hint='sudo dpkg -i thurv{sa,tl}_*.deb'
   else
-    log "$svc not installed yet — skipping stop (first-install run)"
+    hint='sudo rpm -i thurv{sa,tl}-*.rpm'
+  fi
+  if ! systemctl cat "$svc" >/dev/null 2>&1; then
+    die "$svc is not installed on this host — first-install path is \`$hint\`; this script only handles in-place upgrades of an already-installed daemon."
   fi
 }
 
@@ -175,6 +215,81 @@ remount_fs_line() {
     || run mount "UUID=$uuid" "$mp"
 }
 
+# print_vsa_next_steps SERVICE STATE DAEMON_UP — paste-ready
+# reattach instructions for --dont-restart / --disconnect-only on
+# VSA. DAEMON_UP=1 means the daemon is still active (so step 1 is
+# reattach); DAEMON_UP=0 means it was stopped and the package swapped
+# (so the operator must edit the conffile + start it first).
+print_vsa_next_steps() {
+  local svc=$1 state=$2 up=$3
+  local step=1 printed=0
+  printf '\n[%s] next steps:\n' "$TAG"
+  if [[ $up -eq 0 ]]; then
+    printf '  %d. edit /etc/thurvsa/thurvsa.yaml if needed (the package has been swapped)\n' "$step"; step=$((step+1))
+    printf '  %d. sudo systemctl start %s\n' "$step" "$svc"; step=$((step+1))
+  fi
+  printf '  %d. reattach sessions and remount (paste each line):\n' "$step"
+  local _ iqn portal nqn traddr trsvcid mp uuid fstype opts cmd
+  while IFS='|' read -r _ iqn portal; do
+    [[ -n "$iqn" ]] || continue
+    printf '       sudo iscsiadm -m node -T %s -p %s --login\n' "$iqn" "$portal"; printed=1
+  done < <(grep '^ISCSI|' "$state" 2>/dev/null || true)
+  while IFS='|' read -r _ nqn traddr trsvcid; do
+    [[ -n "$nqn" ]] || continue
+    printf '       sudo nvme connect -t tcp -a %s -s %s -n %s\n' "$traddr" "$trsvcid" "$nqn"; printed=1
+  done < <(grep '^NVME|' "$state" 2>/dev/null || true)
+  while IFS='|' read -r _ mp uuid fstype opts; do
+    [[ -n "$mp" ]] || continue
+    cmd='sudo mount'
+    [[ -n "$fstype" ]] && cmd="$cmd -t $fstype"
+    [[ -n "$opts"   ]] && cmd="$cmd -o $opts"
+    if [[ -n "$uuid" ]]; then
+      printf '       %s UUID=%s %s\n' "$cmd" "$uuid" "$mp"
+    else
+      printf '       # no UUID captured for %s — mount by hand\n' "$mp"
+    fi
+    printed=1
+  done < <(grep '^MOUNT|' "$state" 2>/dev/null || true)
+  [[ $printed -eq 0 ]] && printf '       (nothing to reattach — discovery found no thurvsa-backed sessions or mounts)\n'
+  printf '  state file kept at %s\n\n' "$state"
+}
+
+# print_vtl_next_steps SERVICE STATED DAEMON_UP — paste-ready
+# reattach + LTFS-replay instructions for --dont-restart /
+# --disconnect-only on VTL. Reads $STATED/iscsi.list (one
+# <iqn>|<portal> per line) and each $STATED/ltfs.<n>.argv (null-
+# separated argv of the original `ltfs` invocation).
+print_vtl_next_steps() {
+  local svc=$1 stated=$2 up=$3
+  local step=1 printed=0
+  printf '\n[%s] next steps:\n' "$TAG"
+  if [[ $up -eq 0 ]]; then
+    printf '  %d. edit /etc/thurvtl/thurvtl.yaml if needed (the package has been swapped)\n' "$step"; step=$((step+1))
+    printf '  %d. sudo systemctl start %s\n' "$step" "$svc"; step=$((step+1))
+  fi
+  printf '  %d. reattach sessions and replay LTFS mounts (paste each line):\n' "$step"
+  local iqn portal f
+  if [[ -f "$stated/iscsi.list" ]]; then
+    while IFS='|' read -r iqn portal; do
+      [[ -n "$iqn" ]] || continue
+      printf '       sudo iscsiadm -m node -T %s -p %s --login\n' "$iqn" "$portal"; printed=1
+    done < "$stated/iscsi.list"
+  fi
+  for f in "$stated"/ltfs.*.argv; do
+    [[ -f "$f" ]] || continue
+    local -a argv
+    mapfile -d '' argv < "$f"
+    [[ ${#argv[@]} -gt 0 && -z "${argv[-1]}" ]] && unset 'argv[-1]'
+    [[ ${#argv[@]} -gt 0 ]] || continue
+    printf '       sudo '
+    printf '%q ' "${argv[@]}"
+    printf '\n'
+    printed=1
+  done
+  [[ $printed -eq 0 ]] && printf '       (nothing to reattach — discovery found no LTFS mounts or sessions)\n'
+  printf '  state dir kept at %s\n\n' "$stated"
+}
+
 # =====================================================================
 # VSA — block LUNs over iSCSI / NVMe-TCP
 # =====================================================================
@@ -182,12 +297,14 @@ update_vsa() {
   TAG=vsa-update
   local SERVICE=thurvsad IQN_MATCH=':thurvsa' NQN_MATCH='thurvsa'
   local STATE=/var/tmp/vsa-update.state DEV_WAIT=90
-  DONE=0
-  trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vsa-update] INTERRUPTED — teardown state is in %s\n" "'"$STATE"'" >&2' EXIT
 
   need_root
   local pkg; pkg=$(pick_pkg thurvsa)
   log "package: $pkg"
+  require_installed "$SERVICE"      # upgrade-only gate (bails clean)
+
+  DONE=0
+  trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vsa-update] INTERRUPTED — teardown state is in %s\n" "'"$STATE"'" >&2' EXIT
 
   # ---- discover (read-only) -----------------------------------------
   : > "$STATE"
@@ -260,14 +377,31 @@ update_vsa() {
     run nvme disconnect -n "$nqn" || true
   done < <(grep '^NVME|' "$STATE" || true)
 
+  # ---- mode: --disconnect-only --------------------------------------
+  if [[ $DISCONNECT_ONLY -eq 1 ]]; then
+    DONE=1
+    log "disconnect-only: stopped after unmount / logout / disconnect — daemon left running"
+    print_vsa_next_steps "$SERVICE" "$STATE" 1
+    return 0
+  fi
+
   # ---- swap the package ---------------------------------------------
-  stop_if_loaded "$SERVICE"
+  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
   install_pkg "$pkg"
+
+  # ---- mode: --dont-restart -----------------------------------------
+  if [[ $DONT_RESTART -eq 1 ]]; then
+    DONE=1
+    log "dont-restart: package swapped — daemon left stopped"
+    print_vsa_next_steps "$SERVICE" "$STATE" 0
+    return 0
+  fi
+
+  # ---- default path: restart, reattach, remount ---------------------
   log "starting $SERVICE"; run systemctl start "$SERVICE"
   wait_active "$SERVICE"
   [[ $DRYRUN -eq 1 ]] || sleep 2
 
-  # ---- reattach sessions --------------------------------------------
   while IFS='|' read -r _ iqn portal; do
     log "iSCSI login $iqn"
     run iscsiadm -m node -T "$iqn" -p "$portal" --login || true
@@ -278,7 +412,6 @@ update_vsa() {
   done < <(grep '^NVME|' "$STATE" || true)
   [[ $DRYRUN -eq 1 ]] || { command -v udevadm >/dev/null 2>&1 && udevadm settle || true; }
 
-  # ---- remount ------------------------------------------------------
   local rc=0 j
   while read -r line; do
     IFS='|' read -r _ mp uuid _ _ <<<"$line"
@@ -303,12 +436,15 @@ update_vtl() {
   TAG=vtl-update
   local SERVICE=thurvtld IQN_MATCH=':thurvtl'
   local STATED=/var/tmp/vtl-update.state.d DEV_WAIT=90
-  DONE=0
-  trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vtl-update] INTERRUPTED — teardown state is in %s\n" "'"$STATED"'" >&2' EXIT
 
   need_root
   local pkg; pkg=$(pick_pkg thurvtl)
   log "package: $pkg"
+  require_installed "$SERVICE"      # upgrade-only gate (bails clean)
+
+  DONE=0
+  trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vtl-update] INTERRUPTED — teardown state is in %s\n" "'"$STATED"'" >&2' EXIT
+
   rm -rf "$STATED"; mkdir -p "$STATED"
 
   # ---- discover LTFS mounts from the running ltfs processes ---------
@@ -328,12 +464,17 @@ update_vtl() {
   fi
 
   # ---- discover iSCSI sessions to our target ------------------------
+  # Sessions go into both a bash array (for default-mode reattach)
+  # and $STATED/iscsi.list (so print_vtl_next_steps can read state
+  # uniformly from disk).
   local -a ISCSI=()
   local _ sid portal iqn
+  : > "$STATED/iscsi.list"
   if command -v iscsiadm >/dev/null 2>&1; then
     while read -r _ sid portal iqn _; do
       [[ "$iqn" == *"$IQN_MATCH"* ]] || continue
       ISCSI+=("$iqn|${portal%,*}")
+      echo "$iqn|${portal%,*}" >> "$STATED/iscsi.list"
       log "found iSCSI session ${sid//[\[\]]/} -> $iqn @ ${portal%,*}"
     done < <(iscsiadm -m session 2>/dev/null || true)
   fi
@@ -344,7 +485,7 @@ update_vtl() {
        was found — backup software may be mid-job. Quiesce it and retry, or
        pass --force to proceed anyway."
   fi
-  [[ ${#LTFS_MP[@]} -eq 0 && ${#ISCSI[@]} -eq 0 ]] && log "no LTFS mounts or sessions — plain stop/install/start"
+  [[ ${#LTFS_MP[@]} -eq 0 && ${#ISCSI[@]} -eq 0 ]] && log "no LTFS mounts or sessions on this host"
 
   # ---- unmount LTFS (flushes the index to the virtual tape) ---------
   local i
@@ -361,14 +502,31 @@ update_vtl() {
     run iscsiadm -m node -T "$iqn" -p "$portal" --logout || true
   done
 
+  # ---- mode: --disconnect-only --------------------------------------
+  if [[ $DISCONNECT_ONLY -eq 1 ]]; then
+    DONE=1
+    log "disconnect-only: stopped after LTFS unmount / iSCSI logout — daemon left running"
+    print_vtl_next_steps "$SERVICE" "$STATED" 1
+    return 0
+  fi
+
   # ---- swap the package ---------------------------------------------
-  stop_if_loaded "$SERVICE"
+  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
   install_pkg "$pkg"
+
+  # ---- mode: --dont-restart -----------------------------------------
+  if [[ $DONT_RESTART -eq 1 ]]; then
+    DONE=1
+    log "dont-restart: package swapped — daemon left stopped"
+    print_vtl_next_steps "$SERVICE" "$STATED" 0
+    return 0
+  fi
+
+  # ---- default path: restart, reattach, replay LTFS ----------------
   log "starting $SERVICE"; run systemctl start "$SERVICE"
   wait_active "$SERVICE"
   [[ $DRYRUN -eq 1 ]] || sleep 2
 
-  # ---- reattach iSCSI sessions --------------------------------------
   for i in "${ISCSI[@]}"; do
     IFS='|' read -r iqn portal <<<"$i"
     log "iSCSI login $iqn"
