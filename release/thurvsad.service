@@ -1,5 +1,5 @@
 [Unit]
-Description=thurvsa Block Storage Daemon
+Description=Thur VSA Daemon
 Documentation=https://github.com/metebalci/thur
 After=network.target
 

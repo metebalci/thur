@@ -10,7 +10,7 @@ images, air-gapped hosts) where you'd rather lay things out by hand.
 ## What's inside
 
 ```
-thurvsad                   Block-storage daemon (iSCSI on :3260, HTTP on :9090)
+thurvsad                   Thur VSA Daemon (iSCSI on :3260, HTTP on :9090)
 thurvsa                      Management CLI
 thurvsad.service           systemd unit reference
 thurvsa.yaml                     Minimal starter config — install to /etc/thurvsa/, edit

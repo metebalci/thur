@@ -10,7 +10,7 @@ images, air-gapped hosts) where you'd rather lay things out by hand.
 ## What's inside
 
 ```
-thurvtld                   Tape library daemon (iSCSI on :3260, HTTP on :9090)
+thurvtld                   Thur VTL Daemon (iSCSI on :3260, HTTP on :9090)
 thurvtl                      Management CLI
 thurvtld.service           systemd unit reference
 thurvtl.yaml                     Minimal starter config — install to /etc/thurvtl/, edit
