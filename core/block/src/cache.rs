@@ -873,7 +873,14 @@ impl PageCache {
                     // owe the host durability — the host hasn't
                     // issued SYNC for these bytes.
                     match self.writer.write_page_unsynced(pid, &bytes).await {
-                        Ok(_) => {
+                        Ok(out) => {
+                            // Inline-upload path returns Some(n);
+                            // async path returns None (the worker
+                            // bumps the counter itself). The bump
+                            // is `bump()`-guarded against 0.
+                            if let Some(n) = out.put_bytes {
+                                self.bump_backend_bytes_written(n);
+                            }
                             shared_telemetry::record::cache_eviction(self.volume_name(), "dirty");
                             let mut inner = self.inner.lock().await;
                             match inner.pages.get(&pid) {
@@ -1001,7 +1008,13 @@ impl PageCache {
             }
         };
         match self.writer.write_page_unsynced(page_id, &bytes).await {
-            Ok(_) => {
+            Ok(out) => {
+                // Inline-upload path returns Some(n); async path
+                // returns None (the worker bumps the counter after
+                // the PUT completes).
+                if let Some(n) = out.put_bytes {
+                    self.bump_backend_bytes_written(n);
+                }
                 let mut inner = self.inner.lock().await;
                 // If another writer dirtied it again while we were
                 // flushing the older bytes, leave it dirty — the next
@@ -1424,18 +1437,39 @@ mod tests {
         let (tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
         cache.write_bytes(0, &pattern(0x22, PAGE)).await.unwrap();
         cache.read_bytes(0, SECTOR).await.unwrap();
-        // backend_bytes_written is bumped by the daemon's upload
-        // worker; drive it directly here via the public hook.
-        cache.bump_backend_bytes_written(4096);
+        // `fixture_cache` builds a `VolumeWriter` without an upload
+        // sender, so `flush_all`'s `write_page_unsynced` takes the
+        // inline upload path — which now bumps
+        // `backend_bytes_written` by the on-wire PUT size itself.
+        // No manual `bump_backend_bytes_written` needed.
         cache.flush_all().await.unwrap();
 
         let vol_dir = VolumeManifest::dir_for(tmp.path(), "vol1");
         let r = crate::runtime_state::VolumeRuntime::load(&vol_dir).unwrap();
         assert_eq!(r.host_bytes_written, PAGE as u64);
         assert_eq!(r.host_bytes_read, SECTOR as u64);
-        assert_eq!(r.backend_bytes_written, 4096);
+        // LocalBackend doesn't compress and the fixture is not
+        // encrypted, so the PUT bytes equal the page size exactly.
+        assert_eq!(r.backend_bytes_written, PAGE as u64);
         // No cloud miss in this test, so backend_bytes_read stays 0.
         assert_eq!(r.backend_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn inline_upload_path_bumps_backend_bytes_written_per_page() {
+        // Regression test for the "inline upload path silently
+        // skipped backend_bytes_written" bug. The fix threads
+        // `put_bytes` up through `WritePageOutcome` so the PageCache
+        // caller can bump the counter even when no async upload
+        // sender is wired (tests, CLI tools).
+        let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0x11, PAGE)).await.unwrap();
+        cache.write_bytes(PAGE as u64, &pattern(0x22, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let snap = cache.runtime_snapshot();
+        // Two pages flushed, no compression / encryption — each PUT
+        // is one page-sized write to LocalBackend.
+        assert_eq!(snap.backend_bytes_written, 2 * PAGE as u64);
     }
 
     #[tokio::test]

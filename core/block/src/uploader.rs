@@ -264,6 +264,15 @@ pub struct WritePageOutcome {
     /// under retry-after-crash, where an idempotent re-PUT is
     /// preferable to a race-prone HEAD-skip.
     pub cloud_dedup_hit: bool,
+    /// On-wire bytes the upload actually transferred, when known
+    /// at return time. `Some(n)` on the inline upload path (no
+    /// async sender — `n` is `upload_chunk_inert`'s `put_bytes`,
+    /// `None` when that inner call short-circuited on a cloud HEAD
+    /// hit). `None` on the async path, where the worker bumps the
+    /// per-volume `backend_bytes_written` meter itself after the
+    /// PUT completes — the caller has no PUT size to report at
+    /// this point in the flow.
+    pub put_bytes: Option<u64>,
 }
 
 /// Bundle of (manifest + page index + pool + backend) needed to
@@ -731,7 +740,12 @@ impl VolumeWriter {
         // `apply_page_upload_outcome` on completion. Without one
         // (tests, CLI), run the upload inline so the legacy
         // "returns means cloud-durable" semantic stands.
+        //
+        // `inline_put_bytes` is the on-wire PUT size for the inline
+        // path; the async path leaves it `None` because the worker
+        // handles its own `backend_bytes_written` bump after the PUT.
         let cloud_dedup_hit;
+        let inline_put_bytes: Option<u64>;
         if let Some(sender) = &self.upload_sender {
             self.pending_uploads.mark_pending(page_id).await;
             let task = UploadTask {
@@ -752,6 +766,7 @@ impl VolumeWriter {
             // will hit; report it as miss for now. Outcome wired
             // through telemetry on the worker side.
             cloud_dedup_hit = false;
+            inline_put_bytes = None;
         } else {
             // Inline path — used by tests and any future CLI tool
             // that wants strict synchronous semantics. Same
@@ -760,6 +775,11 @@ impl VolumeWriter {
             // flip the sidecar back to Uploaded.
             let outcome = upload_chunk_inert(&*self.backend, &payload_obj).await?;
             cloud_dedup_hit = outcome.dedup_hit;
+            // Forward `put_bytes` up to the caller so it can bump
+            // `PageCache::backend_bytes_written` — the async worker
+            // does this itself, but the inline path has no `cache`
+            // handle and must surface it via the return value.
+            inline_put_bytes = outcome.put_bytes;
             self.apply_page_upload_outcome(&outcome).await?;
         }
 
@@ -785,6 +805,7 @@ impl VolumeWriter {
             hash_hex,
             local_dedup_hit: !was_new,
             cloud_dedup_hit,
+            put_bytes: inline_put_bytes,
         })
     }
 
