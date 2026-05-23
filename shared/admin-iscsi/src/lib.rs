@@ -435,6 +435,7 @@ fn validate_password(s: &str) -> Result<(), ApiError> {
 
 // ---------- error type ----------
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
@@ -470,5 +471,334 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use shared_admin_server::PeerCred;
+    use shared_iscsi::auth::UserEntry;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct MockState {
+        dir: PathBuf,
+    }
+
+    impl IscsiUsersState for MockState {
+        fn data_dir(&self) -> &Path {
+            &self.dir
+        }
+        fn audit_channel(&self) -> Option<&AuditChannel> {
+            None
+        }
+    }
+
+    fn fresh_state() -> (TempDir, MockState) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let state = MockState {
+            dir: tmp.path().to_path_buf(),
+        };
+        (tmp, state)
+    }
+
+    fn peer() -> PeerCred {
+        PeerCred {
+            uid: 0,
+            gid: 0,
+            pid: Some(1),
+        }
+    }
+
+    #[test]
+    fn validate_username_rejects_empty_and_too_long() {
+        assert!(validate_username("alice").is_ok());
+        let err = validate_username("").expect_err("empty");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("empty"));
+        let long = "a".repeat(257);
+        let err = validate_username(&long).expect_err("too long");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("256"));
+    }
+
+    #[test]
+    fn validate_password_enforces_the_rfc_3720_floor() {
+        assert!(validate_password("123456789012").is_ok()); // exactly 12
+        let err = validate_password("short").expect_err("under 12");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("12 bytes"));
+    }
+
+    #[test]
+    fn api_error_constructors_pick_the_right_status() {
+        assert_eq!(ApiError::bad_request("x").status, StatusCode::BAD_REQUEST,);
+        assert_eq!(ApiError::not_found("x").status, StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::conflict("x").status, StatusCode::CONFLICT);
+        assert_eq!(
+            ApiError::internal("x").status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+
+    #[test]
+    fn sweep_expired_previous_clears_expired_grace_passwords() {
+        let mut file = IscsiUsersFile::default();
+        // No previous_password -> not swept.
+        file.users.push(UserEntry {
+            username: "fresh".into(),
+            password: "long-enough-12".into(),
+            mutual_chap: false,
+            partition: None,
+            disabled: false,
+            previous_password: None,
+            previous_expires_at: None,
+        });
+        // Expired grace -> swept.
+        file.users.push(UserEntry {
+            username: "expired".into(),
+            password: "current-password-1".into(),
+            mutual_chap: false,
+            partition: None,
+            disabled: false,
+            previous_password: Some("old".into()),
+            previous_expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+        });
+        // Future expiry -> not swept yet.
+        file.users.push(UserEntry {
+            username: "active".into(),
+            password: "current-password-2".into(),
+            mutual_chap: false,
+            partition: None,
+            disabled: false,
+            previous_password: Some("still-valid".into()),
+            previous_expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        });
+
+        let swept = sweep_expired_previous(&mut file);
+        assert_eq!(swept, vec!["expired".to_string()]);
+
+        // The expired entry's grace fields are zeroed.
+        let expired = file.users.iter().find(|u| u.username == "expired").unwrap();
+        assert!(expired.previous_password.is_none());
+        assert!(expired.previous_expires_at.is_none());
+
+        // The still-active entry is untouched.
+        let active = file.users.iter().find(|u| u.username == "active").unwrap();
+        assert_eq!(active.previous_password.as_deref(), Some("still-valid"));
+    }
+
+    #[test]
+    fn add_request_serde_round_trip() {
+        let json =
+            r#"{"username":"u","password":"123456789012","mutual_chap":true,"partition":"backup"}"#;
+        let req: AddRequest = serde_json::from_str(json).expect("parse");
+        assert_eq!(req.username, "u");
+        assert_eq!(req.password, "123456789012");
+        assert!(req.mutual_chap);
+        assert_eq!(req.partition.as_deref(), Some("backup"));
+    }
+
+    #[test]
+    fn name_only_request_round_trip() {
+        let req: NameOnlyRequest =
+            serde_json::from_value(serde_json::json!({"name": "alice"})).expect("parse");
+        assert_eq!(req.name, "alice");
+    }
+
+    #[test]
+    fn rotate_request_round_trip() {
+        let req: RotateRequest = serde_json::from_value(serde_json::json!({
+            "name": "u",
+            "password": "newpassword-1234",
+            "grace_seconds": 600,
+        }))
+        .expect("parse");
+        assert_eq!(req.name, "u");
+        assert_eq!(req.password, "newpassword-1234");
+        assert_eq!(req.grace_seconds, 600);
+    }
+
+    #[test]
+    fn target_set_request_round_trip() {
+        let req: TargetSetRequest = serde_json::from_value(serde_json::json!({
+            "username": "tgt",
+            "password": "target-pw-12345",
+        }))
+        .expect("parse");
+        assert_eq!(req.username, "tgt");
+        assert_eq!(req.password, "target-pw-12345");
+    }
+
+    #[test]
+    fn users_path_joins_the_data_dir() {
+        let (_t, state) = fresh_state();
+        let p = users_path(&state);
+        assert!(p.ends_with("iscsi-users.json"));
+        assert!(p.starts_with(&state.dir));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_users_file() {
+        let (_t, state) = fresh_state();
+        let path = users_path(&state);
+        let mut file = IscsiUsersFile::default();
+        file.users.push(UserEntry {
+            username: "alice".into(),
+            password: "password-1234".into(),
+            mutual_chap: false,
+            partition: None,
+            disabled: false,
+            previous_password: None,
+            previous_expires_at: None,
+        });
+        save_users(&path, &file).expect("save");
+
+        let (_p, loaded) = load_users(&state).expect("load");
+        assert_eq!(loaded.users.len(), 1);
+        assert_eq!(loaded.users[0].username, "alice");
+    }
+
+    #[tokio::test]
+    async fn list_on_an_empty_data_dir_returns_an_empty_user_list() {
+        let (_t, state) = fresh_state();
+        let resp = list(State(state), peer()).await.expect("list ok");
+        assert!(resp.0.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_then_list_surfaces_the_new_user() {
+        let (_t, state) = fresh_state();
+        let req = AddRequest {
+            username: "alice".into(),
+            password: "password-1234".into(),
+            mutual_chap: false,
+            partition: None,
+        };
+        let _ = add(State(state.clone()), peer(), axum::Json(req))
+            .await
+            .expect("add ok");
+
+        let resp = list(State(state), peer()).await.expect("list ok");
+        assert_eq!(resp.0.users.len(), 1);
+        assert_eq!(resp.0.users[0].username, "alice");
+        assert!(!resp.0.users[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn add_rejects_a_short_password() {
+        let (_t, state) = fresh_state();
+        let req = AddRequest {
+            username: "alice".into(),
+            password: "short".into(),
+            mutual_chap: false,
+            partition: None,
+        };
+        let err = add(State(state), peer(), axum::Json(req))
+            .await
+            .expect_err("must reject");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    fn add_req(username: &str, password: &str) -> AddRequest {
+        AddRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+            mutual_chap: false,
+            partition: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_conflicts_on_a_duplicate_username() {
+        let (_t, state) = fresh_state();
+        let _ = add(
+            State(state.clone()),
+            peer(),
+            axum::Json(add_req("alice", "password-1234")),
+        )
+        .await
+        .expect("first add ok");
+        let err = add(
+            State(state),
+            peer(),
+            axum::Json(add_req("alice", "password-1234")),
+        )
+        .await
+        .expect_err("duplicate");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn remove_succeeds_for_an_existing_user_and_404s_otherwise() {
+        let (_t, state) = fresh_state();
+        let add_req = AddRequest {
+            username: "alice".into(),
+            password: "password-1234".into(),
+            mutual_chap: false,
+            partition: None,
+        };
+        let _ = add(State(state.clone()), peer(), axum::Json(add_req))
+            .await
+            .expect("add ok");
+
+        // Existing user removes cleanly.
+        let _ = remove(
+            State(state.clone()),
+            peer(),
+            axum::Json(NameOnlyRequest {
+                name: "alice".into(),
+            }),
+        )
+        .await
+        .expect("remove ok");
+
+        // Repeating the remove returns 404.
+        let err = remove(
+            State(state),
+            peer(),
+            axum::Json(NameOnlyRequest {
+                name: "alice".into(),
+            }),
+        )
+        .await
+        .expect_err("repeat");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn target_set_show_clear_round_trips() {
+        let (_t, state) = fresh_state();
+        // Nothing set yet -> show returns username=None.
+        let shown = target_show(State(state.clone()), peer())
+            .await
+            .expect("show ok");
+        assert!(shown.0.username.is_none());
+
+        target_set(
+            State(state.clone()),
+            peer(),
+            axum::Json(TargetSetRequest {
+                username: "tgt".into(),
+                password: "target-pw-12345".into(),
+            }),
+        )
+        .await
+        .expect("set ok");
+
+        let shown = target_show(State(state.clone()), peer())
+            .await
+            .expect("show ok");
+        assert_eq!(shown.0.username.as_deref(), Some("tgt"));
+
+        target_clear(State(state.clone()), peer())
+            .await
+            .expect("clear ok");
+        let shown = target_show(State(state), peer()).await.expect("show ok");
+        assert!(shown.0.username.is_none());
     }
 }

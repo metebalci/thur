@@ -25,3 +25,9 @@ axum = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# Tempdir for the on-disk iscsi-users.json round-trip tests.
+tempfile = "3"
+# Multi-thread runtime + macros to drive the axum handlers in tests.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
