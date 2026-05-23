@@ -653,6 +653,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zerocopy_upload_copies_file_into_backend() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+
+        // Stage a source file outside the backend root.
+        let src_dir = TempDir::new().unwrap();
+        let src_path = src_dir.path().join("chunk.bin");
+        let payload = b"zero-copy payload bytes";
+        tokio::fs::write(&src_path, payload).await.unwrap();
+
+        let size = backend
+            .upload_chunk_zerocopy("chunks/ZC/obj-1.dat", &src_path)
+            .await
+            .unwrap();
+        assert_eq!(size, payload.len() as u64);
+
+        let got = backend
+            .download_chunk("chunks/ZC/obj-1.dat")
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn zerocopy_upload_missing_source_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let err = backend
+            .upload_chunk_zerocopy("chunks/ZC/missing.dat", Path::new("/nonexistent/src.bin"))
+            .await
+            .expect_err("missing source must error");
+        // The spawn_blocking copy failure surfaces as an IO error.
+        assert!(matches!(err, CloudError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn list_objects_on_absent_prefix_is_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let listed = backend.list_objects("never/created/").await.unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_objects_walks_nested_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        backend
+            .upload_chunk("chunks/T/a/obj-1.dat", b"1")
+            .await
+            .unwrap();
+        backend
+            .upload_chunk("chunks/T/b/obj-2.dat", b"2")
+            .await
+            .unwrap();
+        let mut listed = backend.list_objects("chunks/T/").await.unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                "chunks/T/a/obj-1.dat".to_string(),
+                "chunks/T/b/obj-2.dat".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_absent_object_is_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        // Deleting a key that was never written must not error.
+        backend.delete_object("chunks/never.dat").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_missing_chunk_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let err = backend
+            .download_chunk("chunks/absent.dat")
+            .await
+            .expect_err("missing chunk must error");
+        assert!(matches!(err, CloudError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn lock_state_is_always_off() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        assert_eq!(
+            backend.lock_state().await.unwrap(),
+            crate::cloud_backend::LockState::Off
+        );
+        assert_eq!(backend.backend_type(), "local");
+    }
+
+    #[tokio::test]
+    async fn legal_hold_is_not_supported() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        assert!(!backend.supports_legal_hold());
+        let set_err = backend
+            .set_object_legal_hold("chunks/x.dat", true)
+            .await
+            .expect_err("set legal hold must be unsupported");
+        assert!(matches!(set_err, CloudError::NotSupported(_)));
+        let get_err = backend
+            .get_object_legal_hold("chunks/x.dat")
+            .await
+            .expect_err("get legal hold must be unsupported");
+        assert!(matches!(get_err, CloudError::NotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn new_creates_root_directory_when_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("a/b/c");
+        assert!(!nested.exists());
+        let backend = LocalBackend::new(&nested).await.unwrap();
+        assert!(nested.exists());
+        assert_eq!(backend.backend_type(), "local");
+    }
+
+    #[test]
+    fn injection_plan_from_env_absent_var_is_none() {
+        // A var name guaranteed not to be set yields no plan.
+        assert!(InjectionPlan::from_env("THUR_CLOUD_INJECT_FAIL_UNSET_XYZ").is_none());
+    }
+
+    #[test]
+    fn injection_plan_parse_empty_spec_is_none() {
+        assert!(InjectionPlan::parse("").is_none());
+        assert!(InjectionPlan::parse("   ,  , ").is_none());
+    }
+
+    #[test]
+    fn clone_box_yields_local_backend() {
+        // Build directly so the test stays sync.
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend {
+            root_dir: temp_dir.path().to_path_buf(),
+            inject: None,
+        };
+        let cloned = backend.clone_box();
+        assert_eq!(cloned.backend_type(), "local");
+    }
+
+    #[tokio::test]
+    async fn injection_retryable_kind_exhausts_budget() {
+        // A timeout rule is retryable; the op should exhaust the small
+        // local retry budget and then surface the synthetic error.
+        let temp_dir = TempDir::new().unwrap();
+        let plan = InjectionPlan::parse("timeout@slow/*").expect("valid plan");
+        let backend = LocalBackend {
+            root_dir: temp_dir.path().to_path_buf(),
+            inject: Some(Arc::new(plan)),
+        };
+        let err = backend
+            .download_chunk("slow/k")
+            .await
+            .expect_err("timeout injection must fail after retries");
+        assert_eq!(classify(&err), FailureKind::Timeout);
+    }
+
+    #[tokio::test]
+    async fn injection_blocks_list_and_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let plan = InjectionPlan::parse("authz@*").expect("valid plan");
+        let backend = LocalBackend {
+            root_dir: temp_dir.path().to_path_buf(),
+            inject: Some(Arc::new(plan)),
+        };
+        let list_err = backend
+            .list_objects("anything/")
+            .await
+            .expect_err("list must be injected");
+        assert_eq!(classify(&list_err), FailureKind::Authz);
+        let del_err = backend
+            .delete_object("anything/k")
+            .await
+            .expect_err("delete must be injected");
+        assert_eq!(classify(&del_err), FailureKind::Authz);
+    }
+
+    #[tokio::test]
+    async fn manifest_download_missing_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let err = backend
+            .download_manifest("manifests/absent.json")
+            .await
+            .expect_err("missing manifest must error");
+        assert!(matches!(err, CloudError::Io(_)));
+    }
+
+    #[tokio::test]
     async fn test_local_backend_parallel_download() {
         let temp_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();

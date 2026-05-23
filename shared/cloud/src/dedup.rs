@@ -109,4 +109,17 @@ mod tests {
         assert_eq!(DedupScope::Global.namespace("vol1"), None);
         assert_eq!(DedupScope::Local.namespace("vol1"), Some("vol1"));
     }
+
+    #[test]
+    fn as_str_and_display_match_serde_tag() {
+        assert_eq!(DedupScope::Local.as_str(), "local");
+        assert_eq!(DedupScope::Global.as_str(), "global");
+        assert_eq!(format!("{}", DedupScope::Local), "local");
+        assert_eq!(format!("{}", DedupScope::Global), "global");
+    }
+
+    #[test]
+    fn default_is_global() {
+        assert_eq!(DedupScope::default(), DedupScope::Global);
+    }
 }

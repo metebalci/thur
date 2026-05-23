@@ -243,3 +243,74 @@ impl Clone for Box<dyn CloudBackend> {
         self.clone_box()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LocalBackend;
+    use tempfile::TempDir;
+
+    #[test]
+    fn lock_state_is_locked_per_variant() {
+        assert!(!LockState::Off.is_locked());
+        assert!(LockState::Governance { default_days: 7 }.is_locked());
+        assert!(LockState::Compliance { default_days: 30 }.is_locked());
+    }
+
+    #[test]
+    fn lock_state_label_per_variant() {
+        assert_eq!(LockState::Off.label(), "off");
+        assert_eq!(
+            LockState::Governance { default_days: 7 }.label(),
+            "governance"
+        );
+        assert_eq!(
+            LockState::Compliance { default_days: 30 }.label(),
+            "compliance"
+        );
+    }
+
+    #[test]
+    fn lock_state_is_copy_and_eq() {
+        let a = LockState::Governance { default_days: 5 };
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(LockState::Off, LockState::Compliance { default_days: 5 });
+    }
+
+    #[tokio::test]
+    async fn default_upload_versioned_delegates_to_upload_chunk() {
+        let dir = TempDir::new().expect("tempdir");
+        let backend = LocalBackend::new(dir.path()).await.expect("backend");
+        // The default trait impl of upload_versioned forwards to
+        // upload_chunk and discards the size tuple.
+        backend
+            .upload_versioned("versioned/key", b"payload")
+            .await
+            .expect("versioned upload");
+        let got = backend
+            .download_chunk("versioned/key")
+            .await
+            .expect("download");
+        assert_eq!(got, b"payload");
+    }
+
+    #[tokio::test]
+    async fn default_warmup_prefix_is_a_noop() {
+        let dir = TempDir::new().expect("tempdir");
+        let backend = LocalBackend::new(dir.path()).await.expect("backend");
+        // Concrete backends have no cache; the default warmup returns 0.
+        let primed = backend.warmup_prefix("chunks/").await.expect("warmup");
+        assert_eq!(primed, 0);
+    }
+
+    #[tokio::test]
+    async fn boxed_backend_clone_yields_independent_handle() {
+        let dir = TempDir::new().expect("tempdir");
+        let backend = LocalBackend::new(dir.path()).await.expect("backend");
+        let boxed: Box<dyn CloudBackend> = Box::new(backend);
+        let cloned = boxed.clone();
+        assert_eq!(cloned.backend_type(), "local");
+        assert_eq!(boxed.backend_type(), "local");
+    }
+}

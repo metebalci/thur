@@ -2088,4 +2088,184 @@ backends:
             err
         );
     }
+
+    // ----- FailureKind diagnostic strings --------------------------
+    //
+    // `label` / `diagnosis` / `hints` are pure lookup tables wired
+    // into the CLI's `cloud check` output; pin every variant so a
+    // missing arm fails the build.
+
+    #[test]
+    fn failure_kind_label_diagnosis_hints_cover_every_variant() {
+        for kind in [
+            FailureKind::Network,
+            FailureKind::Auth,
+            FailureKind::Authz,
+            FailureKind::NotFound,
+            FailureKind::RegionMismatch,
+            FailureKind::Timeout,
+            FailureKind::Other,
+        ] {
+            assert!(!kind.label().is_empty(), "label empty for {kind:?}");
+            assert!(
+                !kind.diagnosis().is_empty(),
+                "diagnosis empty for {kind:?}"
+            );
+            assert!(!kind.hints().is_empty(), "hints empty for {kind:?}");
+        }
+        assert_eq!(FailureKind::Auth.label(), "AUTH");
+        assert_eq!(FailureKind::Authz.label(), "PERMISSION");
+        assert_eq!(FailureKind::NotFound.label(), "NOT_FOUND");
+        assert_eq!(FailureKind::RegionMismatch.label(), "REGION");
+    }
+
+    // ----- CloudConfigError::step / kind ---------------------------
+
+    #[test]
+    fn cloud_config_error_step_and_kind() {
+        let unknown = CloudConfigError::UnknownBackend("x".to_string());
+        assert_eq!(unknown.step(), "config");
+        assert_eq!(unknown.kind(), FailureKind::Other);
+
+        let auth_missing = CloudConfigError::AuthEnvVarMissing("VAR".to_string());
+        assert_eq!(auth_missing.step(), "config");
+        assert_eq!(auth_missing.kind(), FailureKind::Other);
+
+        let init = CloudConfigError::BackendInit {
+            backend: "S3",
+            source: crate::CloudError::Other("AccessDenied".to_string()),
+        };
+        assert_eq!(init.step(), "init");
+        assert_eq!(init.kind(), FailureKind::Authz);
+
+        let listed = CloudConfigError::ListFailed {
+            bucket: "b".to_string(),
+            prefix: "p".to_string(),
+            source: crate::CloudError::Other("NoSuchBucket".to_string()),
+        };
+        assert_eq!(listed.step(), "list");
+        assert_eq!(listed.kind(), FailureKind::NotFound);
+
+        let wrote = CloudConfigError::WriteFailed {
+            bucket: "b".to_string(),
+            source: crate::CloudError::Other("boom".to_string()),
+        };
+        assert_eq!(wrote.step(), "write");
+
+        let deleted = CloudConfigError::DeleteFailed {
+            bucket: "b".to_string(),
+            source: crate::CloudError::Other("boom".to_string()),
+        };
+        assert_eq!(deleted.step(), "delete");
+
+        let lock = CloudConfigError::LockStateQueryFailed {
+            name: "n".to_string(),
+            source: crate::CloudError::Other("InvalidAccessKeyId".to_string()),
+        };
+        assert_eq!(lock.step(), "lock_state");
+        assert_eq!(lock.kind(), FailureKind::Auth);
+
+        let mismatch = CloudConfigError::RetentionMismatch {
+            name: "n".to_string(),
+            configured: "compliance",
+            actual: "off",
+            hint: "h",
+        };
+        assert_eq!(mismatch.step(), "lock_state");
+        assert_eq!(mismatch.kind(), FailureKind::Other);
+        // Display formatting carries the backend name.
+        assert!(format!("{mismatch}").contains("'n'"));
+    }
+
+    // ----- reject_legacy_cloud_backends_json -----------------------
+
+    #[test]
+    fn reject_legacy_json_passes_when_absent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        reject_legacy_cloud_backends_json(
+            temp.path(),
+            std::path::Path::new("/etc/thurvtl/thurvtl.yaml"),
+        )
+        .expect("absent legacy file is OK");
+    }
+
+    #[test]
+    fn reject_legacy_json_refuses_when_present() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("cloud-backends.json"), "{}").unwrap();
+        let err = reject_legacy_cloud_backends_json(
+            temp.path(),
+            std::path::Path::new("/etc/thurvtl/thurvtl.yaml"),
+        )
+        .expect_err("legacy file must refuse start");
+        assert!(err.contains("cloud-backends.json"));
+        assert!(err.contains("cloud.backends:"));
+    }
+
+    // ----- CompressionConfigYaml::to_core --------------------------
+
+    #[test]
+    fn compression_yaml_to_core_maps_each_algorithm() {
+        let none = CompressionConfigYaml {
+            algorithm: CompressionAlgoYaml::None,
+            level: 3,
+        };
+        assert!(!none.to_core().enabled());
+
+        let lz4 = CompressionConfigYaml {
+            algorithm: CompressionAlgoYaml::Lz4,
+            level: 3,
+        };
+        assert_eq!(lz4.to_core().algorithm, Some(CompressionAlgo::Lz4));
+
+        let zstd = CompressionConfigYaml {
+            algorithm: CompressionAlgoYaml::Zstd,
+            level: 9,
+        };
+        let core = zstd.to_core();
+        assert_eq!(core.algorithm, Some(CompressionAlgo::Zstd));
+        assert_eq!(core.level, 9);
+
+        // Default is zstd at the standard level.
+        let def = CompressionConfigYaml::default();
+        assert_eq!(def.algorithm, CompressionAlgoYaml::Zstd);
+    }
+
+    // ----- create_backend_named for a local backend ----------------
+
+    #[tokio::test]
+    async fn create_backend_named_builds_local_backend() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(temp.path());
+        let backend = cfg
+            .create_backend_named("archive")
+            .await
+            .expect("local backend builds");
+        assert_eq!(backend.backend_type(), "local");
+    }
+
+    #[tokio::test]
+    async fn create_backend_named_unknown_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(temp.path());
+        let err = cfg
+            .create_backend_named("nope")
+            .await
+            .expect_err("unknown backend must error");
+        assert!(matches!(err, CloudConfigError::UnknownBackend(_)));
+    }
+
+    #[test]
+    fn target_label_for_local_is_root_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(temp.path());
+        assert_eq!(
+            cfg.target_label_named("archive").unwrap(),
+            temp.path().to_string_lossy()
+        );
+        // Local has no object-key prefix.
+        assert_eq!(cfg.prefix_named("archive"), "");
+        // Unknown name yields no label.
+        assert!(cfg.target_label_named("missing").is_none());
+    }
 }

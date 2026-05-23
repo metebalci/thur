@@ -1032,4 +1032,294 @@ mod tests {
         let err = capture_azure_list_error(server).await;
         assert_eq!(classify(&err), FailureKind::NotFound);
     }
+
+    // -- Success-path tests --------------------------------------------------
+    //
+    // Drive the happy path: a wiremock that answers each Azure Blob
+    // verb with a realistic 2xx response. Upload is a PUT block blob,
+    // download is HEAD (get_properties) then GET, exists is HEAD,
+    // list is GET with an EnumerationResults XML body, delete is a
+    // 202. Routed by HTTP method since the data-plane verbs map
+    // 1:1 onto methods here.
+
+    use wiremock::matchers::method;
+
+    #[tokio::test]
+    async fn azure_upload_chunk_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let (uncompressed, compressed, algo) = backend
+            .upload_chunk("chunks/T1/obj-1.dat", b"azure-payload")
+            .await
+            .expect("upload must succeed against 201 mock");
+        assert_eq!(uncompressed, 13);
+        assert_eq!(compressed, None);
+        assert_eq!(algo, None);
+    }
+
+    #[tokio::test]
+    async fn azure_upload_manifest_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        backend
+            .upload_manifest("manifests/T1/m.json", "{\"v\":1}")
+            .await
+            .expect("manifest upload");
+    }
+
+    #[tokio::test]
+    async fn azure_zerocopy_upload_streams_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("chunk.bin");
+        tokio::fs::write(&path, b"zero-copy-azure").await.unwrap();
+        let size = backend
+            .upload_chunk_zerocopy("chunks/T1/zc.dat", &path)
+            .await
+            .expect("zerocopy upload");
+        assert_eq!(size, 15);
+    }
+
+    #[tokio::test]
+    async fn azure_delete_object_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        backend
+            .delete_object("chunks/T1/obj-1.dat")
+            .await
+            .expect("delete");
+    }
+
+    #[tokio::test]
+    async fn azure_chunk_exists_true_on_head_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "10")
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("ETag", "\"0x1\"")
+                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        assert!(
+            backend
+                .chunk_exists("chunks/T1/obj-1.dat")
+                .await
+                .expect("exists head")
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_chunk_exists_false_on_head_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("Content-Type", "application/xml")
+                    .insert_header("x-ms-error-code", "BlobNotFound")
+                    .set_body_string(azure_xml(
+                        "BlobNotFound",
+                        "The specified blob does not exist.",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        assert!(
+            !backend
+                .chunk_exists("chunks/T1/missing.dat")
+                .await
+                .expect("head 404 maps to false")
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_download_chunk_uncompressed() {
+        let server = MockServer::start().await;
+        // HEAD (get_properties) returns the compression metadata.
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "13")
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("x-ms-meta-compression", "none")
+                    .insert_header("ETag", "\"0x1\"")
+                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+        // GET returns the body bytes.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "13")
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .set_body_bytes(b"azure-content".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let got = backend
+            .download_chunk("chunks/T1/obj-1.dat")
+            .await
+            .expect("download");
+        assert_eq!(got, b"azure-content");
+    }
+
+    #[tokio::test]
+    async fn azure_download_chunk_decompresses_zstd() {
+        let server = MockServer::start().await;
+        let original = vec![5u8; 2048];
+        let compressed = crate::compression::compress_data(
+            crate::compression::CompressionAlgo::Zstd,
+            &original,
+            3,
+        )
+        .expect("compress");
+        let clen = compressed.len().to_string();
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", clen.as_str())
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("x-ms-meta-compression", "zstd")
+                    .insert_header("ETag", "\"0x1\"")
+                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", clen.as_str())
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .set_body_bytes(compressed),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let got = backend
+            .download_chunk("chunks/T1/z.dat")
+            .await
+            .expect("download+decompress");
+        assert_eq!(got, original);
+    }
+
+    #[tokio::test]
+    async fn azure_download_manifest_returns_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "13")
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .set_body_string("{\"version\":3}"),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let json = backend
+            .download_manifest("manifests/T1/m.json")
+            .await
+            .expect("manifest download");
+        assert_eq!(json, "{\"version\":3}");
+    }
+
+    #[tokio::test]
+    async fn azure_list_objects_parses_enumeration_xml() {
+        let server = MockServer::start().await;
+        // EnumerationResults with two blobs under the "tapes/" prefix
+        // configured by mock_azure_backend; list_objects strips it.
+        let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+            <EnumerationResults ServiceEndpoint=\"http://x\" ContainerName=\"testcontainer\">\
+            <Prefix>tapes/</Prefix><MaxResults>5000</MaxResults>\
+            <Blobs>\
+            <Blob><Name>tapes/chunks/a.dat</Name><Properties>\
+            <Content-Length>1</Content-Length><BlobType>BlockBlob</BlobType>\
+            </Properties></Blob>\
+            <Blob><Name>tapes/chunks/b.dat</Name><Properties>\
+            <Content-Length>2</Content-Length><BlobType>BlockBlob</BlobType>\
+            </Properties></Blob>\
+            </Blobs><NextMarker/></EnumerationResults>";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        let mut keys = backend.list_objects("chunks/").await.expect("list");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_lock_state_off_without_sub_and_rg() {
+        // mock_azure_backend supplies no subscription_id / resource_group,
+        // so lock_state short-circuits to Off without any ARM call.
+        let server = MockServer::start().await;
+        let backend = mock_azure_backend(&server).await;
+        assert_eq!(
+            backend.lock_state().await.expect("lock state"),
+            crate::cloud_backend::LockState::Off
+        );
+        assert_eq!(backend.backend_type(), "azure");
+        assert!(backend.supports_legal_hold());
+    }
+
+    #[tokio::test]
+    async fn azure_get_object_legal_hold_reads_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "10")
+                    .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("x-ms-legal-hold", "true")
+                    .insert_header("ETag", "\"0x1\"")
+                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_azure_backend(&server).await;
+        assert!(
+            backend
+                .get_object_legal_hold("chunks/T1/obj-1.dat")
+                .await
+                .expect("get legal hold")
+        );
+    }
+
+    #[tokio::test]
+    async fn azure_clone_box_yields_azure_backend() {
+        let server = MockServer::start().await;
+        let backend = mock_azure_backend(&server).await;
+        let boxed = backend.clone_box();
+        assert_eq!(boxed.backend_type(), "azure");
+    }
 }

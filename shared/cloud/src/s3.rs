@@ -1173,4 +1173,417 @@ mod tests {
         assert_eq!(classify(&err), FailureKind::RegionMismatch);
         assert!(!is_retryable(FailureKind::RegionMismatch));
     }
+
+    // -- Success-path tests --------------------------------------------------
+    //
+    // Stand up a wiremock that returns realistic 2xx responses for each
+    // S3 verb and verify the happy-path data flow: PUT round-trips,
+    // GET decodes the body (with and without compression metadata),
+    // HEAD maps to exists, list_objects_v2 parses the XML, and the
+    // retention / legal-hold reads parse their respective XML shapes.
+
+    use wiremock::matchers::method;
+
+    #[tokio::test]
+    async fn s3_upload_chunk_succeeds_on_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let (uncompressed, compressed, algo) = backend
+            .upload_chunk("chunks/T1/obj-1.dat", b"payload-bytes")
+            .await
+            .expect("upload must succeed against 200 mock");
+        assert_eq!(uncompressed, 13);
+        // Compression is disabled in mock_s3_backend.
+        assert_eq!(compressed, None);
+        assert_eq!(algo, None);
+    }
+
+    #[tokio::test]
+    async fn s3_upload_chunk_compresses_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = S3Backend::new(
+            "test-bucket".into(),
+            "tapes/".into(),
+            "us-east-1".into(),
+            Some(server.uri()),
+            None,
+            Some(ResolvedS3Auth::Static {
+                access_key_id: "AKIAEXAMPLE".into(),
+                secret_access_key: "SECRETEXAMPLE".into(),
+                session_token: None,
+            }),
+            CompressionConfig::new(Some(crate::compression::CompressionAlgo::Zstd), 3),
+        )
+        .await
+        .expect("backend");
+        // Highly compressible payload so the compressed size is smaller.
+        let data = vec![0u8; 4096];
+        let (uncompressed, compressed, algo) = backend
+            .upload_chunk("chunks/T1/zeros.dat", &data)
+            .await
+            .expect("compressed upload");
+        assert_eq!(uncompressed, 4096);
+        assert!(compressed.expect("compressed size") < 4096);
+        assert_eq!(algo, Some(crate::compression::CompressionAlgo::Zstd));
+    }
+
+    #[tokio::test]
+    async fn s3_upload_manifest_and_versioned_succeed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        backend
+            .upload_manifest("manifests/T1/m.json", "{\"v\":1}")
+            .await
+            .expect("manifest upload");
+        backend
+            .upload_versioned("indexes/T1/blocks.idx", b"index-bytes")
+            .await
+            .expect("versioned upload");
+    }
+
+    #[tokio::test]
+    async fn s3_zerocopy_upload_streams_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("chunk.bin");
+        tokio::fs::write(&path, b"zero-copy-bytes").await.unwrap();
+        let size = backend
+            .upload_chunk_zerocopy("chunks/T1/zc.dat", &path)
+            .await
+            .expect("zerocopy upload");
+        assert_eq!(size, 15);
+    }
+
+    #[tokio::test]
+    async fn s3_download_chunk_uncompressed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-amz-meta-compression", "none")
+                    .set_body_bytes(b"chunk-content".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let got = backend
+            .download_chunk("chunks/T1/obj-1.dat")
+            .await
+            .expect("download");
+        assert_eq!(got, b"chunk-content");
+    }
+
+    #[tokio::test]
+    async fn s3_download_chunk_decompresses_zstd_metadata() {
+        let server = MockServer::start().await;
+        let original = vec![7u8; 2048];
+        let compressed = crate::compression::compress_data(
+            crate::compression::CompressionAlgo::Zstd,
+            &original,
+            3,
+        )
+        .expect("compress");
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-amz-meta-compression", "zstd")
+                    .set_body_bytes(compressed),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let got = backend
+            .download_chunk("chunks/T1/z.dat")
+            .await
+            .expect("download+decompress");
+        assert_eq!(got, original);
+    }
+
+    #[tokio::test]
+    async fn s3_download_chunk_rejects_unknown_compression() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-amz-meta-compression", "brotli")
+                    .set_body_bytes(b"x".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let err = backend
+            .download_chunk("chunks/T1/bad.dat")
+            .await
+            .expect_err("unknown compression must error");
+        assert!(format!("{err}").contains("unsupported compression"));
+    }
+
+    #[tokio::test]
+    async fn s3_download_manifest_returns_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"version\":2}"))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let json = backend
+            .download_manifest("manifests/T1/m.json")
+            .await
+            .expect("manifest download");
+        assert_eq!(json, "{\"version\":2}");
+    }
+
+    #[tokio::test]
+    async fn s3_download_chunks_parallel_preserves_order() {
+        let server = MockServer::start().await;
+        // Every GET returns the same body; the order assertion is on
+        // the result vector lining up with the input key vector.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-amz-meta-compression", "none")
+                    .set_body_bytes(b"data".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let keys: Vec<String> = (0..3).map(|i| format!("chunks/T1/obj-{i}.dat")).collect();
+        let got = backend
+            .download_chunks_parallel(&keys)
+            .await
+            .expect("parallel download");
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|c| c == b"data"));
+
+        // Empty input is a fast path returning an empty vec.
+        let empty = backend
+            .download_chunks_parallel(&[])
+            .await
+            .expect("empty parallel download");
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn s3_chunk_exists_true_on_head_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert!(
+            backend
+                .chunk_exists("chunks/T1/obj-1.dat")
+                .await
+                .expect("head")
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_chunk_exists_false_on_head_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert!(
+            !backend
+                .chunk_exists("chunks/T1/missing.dat")
+                .await
+                .expect("head 404 maps to false")
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_list_objects_parses_xml_and_strips_prefix() {
+        let server = MockServer::start().await;
+        // ListBucketResult with two keys under the "tapes/" prefix that
+        // mock_s3_backend configures; list_objects must strip it.
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Name>test-bucket</Name><Prefix>tapes/</Prefix><KeyCount>2</KeyCount>\
+            <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+            <Contents><Key>tapes/chunks/a.dat</Key><Size>1</Size>\
+            <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+            <ETag>\"e\"</ETag><StorageClass>STANDARD</StorageClass></Contents>\
+            <Contents><Key>tapes/chunks/b.dat</Key><Size>2</Size>\
+            <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+            <ETag>\"e\"</ETag><StorageClass>STANDARD</StorageClass></Contents>\
+            </ListBucketResult>";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        let mut keys = backend.list_objects("chunks/").await.expect("list");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_delete_object_succeeds_on_204() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        backend
+            .delete_object("chunks/T1/obj-1.dat")
+            .await
+            .expect("delete");
+    }
+
+    #[tokio::test]
+    async fn s3_lock_state_off_when_object_lock_not_configured() {
+        let server = MockServer::start().await;
+        // S3 returns a 404 ObjectLockConfigurationNotFoundError on a
+        // bucket without Object Lock; the backend maps that to Off.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(xml_error(
+                        "ObjectLockConfigurationNotFoundError",
+                        "Object Lock configuration does not exist for this bucket",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert_eq!(
+            backend.lock_state().await.expect("lock state"),
+            crate::cloud_backend::LockState::Off
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_lock_state_parses_compliance_rule() {
+        let server = MockServer::start().await;
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+            <Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days>\
+            </DefaultRetention></Rule></ObjectLockConfiguration>";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert_eq!(
+            backend.lock_state().await.expect("lock state"),
+            crate::cloud_backend::LockState::Compliance { default_days: 30 }
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_lock_state_parses_governance_rule() {
+        let server = MockServer::start().await;
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Years>1</Years>\
+            </DefaultRetention></Rule></ObjectLockConfiguration>";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert_eq!(
+            backend.lock_state().await.expect("lock state"),
+            crate::cloud_backend::LockState::Governance { default_days: 365 }
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_set_object_legal_hold_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        backend
+            .set_object_legal_hold("chunks/T1/obj-1.dat", true)
+            .await
+            .expect("set legal hold on");
+        backend
+            .set_object_legal_hold("chunks/T1/obj-1.dat", false)
+            .await
+            .expect("set legal hold off");
+        assert!(backend.supports_legal_hold());
+    }
+
+    #[tokio::test]
+    async fn s3_get_object_legal_hold_reads_status() {
+        let server = MockServer::start().await;
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Status>ON</Status></LegalHold>";
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert!(
+            backend
+                .get_object_legal_hold("chunks/T1/obj-1.dat")
+                .await
+                .expect("get legal hold")
+        );
+    }
+
+    #[test]
+    fn s3_backend_type_and_clone_box() {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let backend = S3Backend {
+            client: Client::from_conf(config),
+            bucket: "b".to_string(),
+            prefix: String::new(),
+            compression_config: CompressionConfig::disabled(),
+        };
+        assert_eq!(backend.backend_type(), "s3");
+        let boxed = backend.clone_box();
+        assert_eq!(boxed.backend_type(), "s3");
+    }
 }

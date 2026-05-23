@@ -322,4 +322,52 @@ mod tests {
         let z: CompressionAlgo = serde_yaml::from_str("zstd").unwrap();
         assert_eq!(z, CompressionAlgo::Zstd);
     }
+
+    #[test]
+    fn algo_as_str_and_display_cover_every_variant() {
+        assert_eq!(CompressionAlgo::Lz4.as_str(), "lz4");
+        assert_eq!(CompressionAlgo::Zstd.as_str(), "zstd");
+        assert_eq!(CompressionAlgo::Sldc.as_str(), "sldc");
+        assert_eq!(format!("{}", CompressionAlgo::Lz4), "lz4");
+        assert_eq!(format!("{}", CompressionAlgo::Zstd), "zstd");
+        assert_eq!(format!("{}", CompressionAlgo::Sldc), "sldc");
+    }
+
+    #[test]
+    fn sldc_compress_and_decompress_are_unimplemented() {
+        let c = compress_data(CompressionAlgo::Sldc, b"data", 3);
+        assert!(matches!(c, Err(CloudError::Compression(_))));
+        let d = decompress_data(CompressionAlgo::Sldc, b"data");
+        assert!(matches!(d, Err(CloudError::Compression(_))));
+    }
+
+    #[test]
+    fn compression_config_new_carries_fields() {
+        let cfg = CompressionConfig::new(Some(CompressionAlgo::Zstd), 9);
+        assert_eq!(cfg.algorithm, Some(CompressionAlgo::Zstd));
+        assert_eq!(cfg.level, 9);
+        assert!(cfg.enabled());
+
+        let off = CompressionConfig::new(None, 3);
+        assert!(!off.enabled());
+    }
+
+    #[test]
+    fn drive_compression_state_constructors() {
+        let with_algo = DriveCompressionState::enabled_with(CompressionAlgo::Zstd);
+        assert!(with_algo.dce);
+        assert_eq!(with_algo.algorithm, CompressionAlgo::Zstd);
+        assert_eq!(with_algo.level, ZSTD_DEFAULT_LEVEL);
+
+        let with_level = DriveCompressionState::enabled_with_level(CompressionAlgo::Zstd, 19);
+        assert!(with_level.dce);
+        assert_eq!(with_level.algorithm, CompressionAlgo::Zstd);
+        assert_eq!(with_level.level, 19);
+        assert!(with_level.compress_on_write());
+
+        let off = DriveCompressionState::disabled();
+        assert!(!off.dce);
+        assert_eq!(off.algorithm, CompressionAlgo::Lz4);
+        assert!(!off.compress_on_write());
+    }
 }
