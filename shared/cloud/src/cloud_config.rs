@@ -2305,4 +2305,321 @@ backends:
         // Unknown name yields no label.
         assert!(cfg.target_label_named("missing").is_none());
     }
+
+    // ----- check_retention_state + probe_data_plane ---------------
+    //
+    // These are private to the module but reachable from the test
+    // submodule. The public `validate_cloud_backend` short-circuits
+    // for Local backends, so end-to-end calls don't exercise either
+    // function — these tests drive them directly with a real
+    // `LocalBackend` (success path: `RetentionMode::None` matches
+    // `LockState::Off`; data-plane probe: list / write / delete on
+    // disk) and with a fake-lock-state wrapper for the mismatch
+    // arms `LocalBackend` can't produce on its own.
+
+    use crate::cloud_backend::LockState as LS;
+    use std::path::Path;
+
+    /// Wraps `LocalBackend` but returns a caller-supplied `LockState`
+    /// from `lock_state()`. Every other trait method delegates
+    /// straight to the inner backend.
+    #[derive(Debug)]
+    struct FakeLockBackend {
+        inner: LocalBackend,
+        fake: LS,
+    }
+    #[async_trait::async_trait]
+    impl CloudBackend for FakeLockBackend {
+        async fn upload_chunk(
+            &self,
+            k: &str,
+            d: &[u8],
+        ) -> crate::Result<(
+            u64,
+            Option<u64>,
+            Option<crate::compression::CompressionAlgo>,
+        )> {
+            self.inner.upload_chunk(k, d).await
+        }
+        async fn upload_chunk_zerocopy(&self, k: &str, p: &Path) -> crate::Result<u64> {
+            self.inner.upload_chunk_zerocopy(k, p).await
+        }
+        async fn download_chunk(&self, k: &str) -> crate::Result<Vec<u8>> {
+            self.inner.download_chunk(k).await
+        }
+        async fn download_chunks_parallel(
+            &self,
+            k: &[String],
+        ) -> crate::Result<Vec<Vec<u8>>> {
+            self.inner.download_chunks_parallel(k).await
+        }
+        async fn upload_manifest(&self, k: &str, j: &str) -> crate::Result<()> {
+            self.inner.upload_manifest(k, j).await
+        }
+        async fn download_manifest(&self, k: &str) -> crate::Result<String> {
+            self.inner.download_manifest(k).await
+        }
+        async fn chunk_exists(&self, k: &str) -> crate::Result<bool> {
+            self.inner.chunk_exists(k).await
+        }
+        async fn list_objects(&self, p: &str) -> crate::Result<Vec<String>> {
+            self.inner.list_objects(p).await
+        }
+        async fn delete_object(&self, k: &str) -> crate::Result<()> {
+            self.inner.delete_object(k).await
+        }
+        fn backend_type(&self) -> &'static str {
+            "fake-lock"
+        }
+        async fn lock_state(&self) -> crate::Result<LS> {
+            Ok(self.fake)
+        }
+        async fn set_object_legal_hold(&self, k: &str, h: bool) -> crate::Result<()> {
+            self.inner.set_object_legal_hold(k, h).await
+        }
+        async fn get_object_legal_hold(&self, k: &str) -> crate::Result<bool> {
+            self.inner.get_object_legal_hold(k).await
+        }
+        fn clone_box(&self) -> Box<dyn CloudBackend> {
+            Box::new(Self {
+                inner: self.inner.clone(),
+                fake: self.fake,
+            })
+        }
+    }
+
+    async fn local_backend(dir: &Path) -> LocalBackend {
+        LocalBackend::new(dir.to_string_lossy().into_owned())
+            .await
+            .expect("LocalBackend constructs")
+    }
+
+    fn s3_cloud_config_for_hint_term() -> CloudConfig {
+        // An S3 entry is enough for `backend_entry(name).backend_type()`
+        // to return "s3", which steers the hint formatter into the
+        // "Object Lock" branch. We never actually touch this backend.
+        parse_cfg(
+            r#"
+backends:
+  archive:
+    type: s3
+    bucket: b
+    prefix: ""
+    region: us-east-1
+"#,
+        )
+    }
+
+    fn azure_cloud_config_for_hint_term() -> CloudConfig {
+        parse_cfg(
+            r#"
+backends:
+  archive:
+    type: azure
+    storage_account: a
+    container: c
+    prefix: ""
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_none_matches_off_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(tmp.path());
+        let backend = local_backend(tmp.path()).await;
+        let mut steps: Vec<String> = Vec::new();
+        check_retention_state(&backend, &cfg, "archive", RetentionMode::None, &mut |s| {
+            steps.push(s.name.to_string())
+        })
+        .await
+        .expect("None matches Off");
+        assert_eq!(steps, vec!["lock_state".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_skip_flag_emits_only_note() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = CloudConfig {
+            skip_retention_mode_check: true,
+            ..local_cloud_config(tmp.path())
+        };
+        let backend = local_backend(tmp.path()).await;
+        let mut details: Vec<String> = Vec::new();
+        check_retention_state(&backend, &cfg, "archive", RetentionMode::Governance, &mut |s| {
+            details.push(s.detail);
+        })
+        .await
+        .expect("skip flag bypasses the lock_state comparison");
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("skip_retention_mode_check"));
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_governance_vs_off_local_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(tmp.path());
+        let backend = local_backend(tmp.path()).await;
+        let err = check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Governance,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("Governance requires a locked bucket");
+        assert!(matches!(err, CloudConfigError::RetentionMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_compliance_vs_off_with_s3_hint_term() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = s3_cloud_config_for_hint_term();
+        let backend = local_backend(tmp.path()).await;
+        let err = check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Compliance,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("Compliance requires a locked bucket");
+        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+            assert!(hint.contains("Object Lock"), "hint = {hint}");
+        } else {
+            panic!("expected RetentionMismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_none_vs_locked_azure_hint_term() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = azure_cloud_config_for_hint_term();
+        let backend = FakeLockBackend {
+            inner: local_backend(tmp.path()).await,
+            fake: LS::Compliance { default_days: 30 },
+        };
+        let err = check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::None,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("None vs locked bucket is a mismatch");
+        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+            assert!(
+                hint.contains("immutability policy"),
+                "azure hint term, got {hint}",
+            );
+        } else {
+            panic!("expected RetentionMismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_governance_vs_compliance_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = s3_cloud_config_for_hint_term();
+        let backend = FakeLockBackend {
+            inner: local_backend(tmp.path()).await,
+            fake: LS::Compliance { default_days: 7 },
+        };
+        let err = check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Governance,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("Governance vs Compliance must mismatch");
+        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+            assert!(hint.contains("compliance"), "hint = {hint}");
+        } else {
+            panic!();
+        }
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_compliance_vs_governance_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = s3_cloud_config_for_hint_term();
+        let backend = FakeLockBackend {
+            inner: local_backend(tmp.path()).await,
+            fake: LS::Governance { default_days: 7 },
+        };
+        let err = check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Compliance,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("Compliance vs Governance must mismatch");
+        assert!(matches!(err, CloudConfigError::RetentionMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn check_retention_state_governance_matches_governance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = s3_cloud_config_for_hint_term();
+        let backend = FakeLockBackend {
+            inner: local_backend(tmp.path()).await,
+            fake: LS::Governance { default_days: 7 },
+        };
+        let mut steps: Vec<String> = Vec::new();
+        check_retention_state(&backend, &cfg, "archive", RetentionMode::Governance, &mut |s| {
+            steps.push(s.detail.clone())
+        })
+        .await
+        .expect("Governance matches Governance");
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].contains("matches"));
+    }
+
+    #[tokio::test]
+    async fn probe_data_plane_local_round_trip_lists_writes_deletes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(tmp.path());
+        let backend = local_backend(tmp.path()).await;
+        let mut steps: Vec<String> = Vec::new();
+        probe_data_plane(&backend, &cfg, "archive", RetentionMode::None, &mut |s| {
+            steps.push(s.name.to_string());
+        })
+        .await
+        .expect("local probe succeeds");
+        assert_eq!(
+            steps,
+            vec![
+                "list".to_string(),
+                "write".to_string(),
+                "delete".to_string()
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_data_plane_skips_write_delete_for_locked_bucket() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = local_cloud_config(tmp.path());
+        let backend = local_backend(tmp.path()).await;
+        let mut steps: Vec<String> = Vec::new();
+        probe_data_plane(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Governance,
+            &mut |s| {
+                steps.push(s.name.to_string());
+            },
+        )
+        .await
+        .expect("locked-mode probe skips write/delete");
+        assert_eq!(steps, vec!["list".to_string(), "skip_probe".to_string()]);
+    }
 }

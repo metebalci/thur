@@ -870,4 +870,198 @@ mod tests {
             "default upload_versioned must delegate to upload_chunk"
         );
     }
+
+    // ===== upload_chunk_zerocopy — same cache states as the byte form.
+
+    /// Helper: write a small payload to a tempdir and return the path.
+    fn write_tmp(payload: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, payload).expect("write tempfile");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn zerocopy_cache_hit_returns_size_without_second_put() {
+        let (mock, c) = MockBackend::new();
+        let cache = wrap(mock);
+        let (_dir, path) = write_tmp(&vec![0u8; 4096]);
+
+        let first = cache.upload_chunk_zerocopy("k", &path).await.unwrap();
+        assert_eq!(first, 4096);
+        assert_eq!(c.puts.load(Ordering::SeqCst), 1);
+
+        let second = cache.upload_chunk_zerocopy("k", &path).await.unwrap();
+        assert_eq!(second, 4096);
+        assert_eq!(
+            c.puts.load(Ordering::SeqCst),
+            1,
+            "second zerocopy call must hit the Uploaded cache entry",
+        );
+    }
+
+    #[tokio::test]
+    async fn zerocopy_singleflight_coalesces_concurrent_calls() {
+        let (mock, c) = MockBackend::new();
+        // Slow the first PUT so 49 followers see the InFlight entry.
+        c.upload_delay_ms.store(20, Ordering::SeqCst);
+        let cache = Arc::new(wrap(mock));
+        let (_dir, path) = write_tmp(&vec![0u8; 8192]);
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let cache = Arc::clone(&cache);
+            let path = path.clone();
+            handles.push(tokio::spawn(async move {
+                cache.upload_chunk_zerocopy("kz", &path).await
+            }));
+        }
+        for h in join_all(handles).await {
+            let size = h.unwrap().unwrap();
+            assert_eq!(size, 8192);
+        }
+        // MockBackend's upload_chunk_zerocopy increments `puts` too.
+        // CachingCloudBackend's singleflight collapses to one inner call.
+        assert_eq!(
+            c.puts.load(Ordering::SeqCst),
+            1,
+            "all 50 zerocopy PUTs should coalesce into one backend call",
+        );
+    }
+
+    #[tokio::test]
+    async fn zerocopy_failure_clears_inflight_entry() {
+        // MockBackend's zerocopy impl doesn't honour fail_next_upload,
+        // so use a DefaultMock-style local impl whose zerocopy errors.
+        #[derive(Debug)]
+        struct ErrZeroMock;
+        #[async_trait]
+        impl CloudBackend for ErrZeroMock {
+            async fn upload_chunk(
+                &self,
+                _: &str,
+                _: &[u8],
+            ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
+                Ok((0, None, None))
+            }
+            async fn upload_chunk_zerocopy(&self, _: &str, _: &Path) -> Result<u64> {
+                Err(CloudError::Other("zerocopy boom".into()))
+            }
+            async fn download_chunk(&self, _: &str) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            async fn download_chunks_parallel(&self, _: &[String]) -> Result<Vec<Vec<u8>>> {
+                Ok(vec![])
+            }
+            async fn upload_manifest(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn download_manifest(&self, _: &str) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn chunk_exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn list_objects(&self, _: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn delete_object(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn backend_type(&self) -> &'static str {
+                "errzero"
+            }
+            async fn lock_state(&self) -> Result<LockState> {
+                Ok(LockState::Off)
+            }
+            async fn set_object_legal_hold(&self, _: &str, _: bool) -> Result<()> {
+                Ok(())
+            }
+            async fn get_object_legal_hold(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn clone_box(&self) -> Box<dyn CloudBackend> {
+                Box::new(Self)
+            }
+        }
+        let cache = CachingCloudBackend::new(Box::new(ErrZeroMock), "test");
+        let (_dir, path) = write_tmp(b"hello");
+        // First call errors; the cache must have removed the InFlight
+        // entry so a retry sees a fresh Miss (still errors, but goes
+        // through the upload path again).
+        assert!(cache.upload_chunk_zerocopy("kerr", &path).await.is_err());
+        assert!(cache.upload_chunk_zerocopy("kerr", &path).await.is_err());
+    }
+
+    /// Exercises the trivial pass-through trait methods on the cache
+    /// wrapper (download_chunks_parallel, upload_manifest,
+    /// download_manifest, list_objects, lock_state,
+    /// {set,get}_object_legal_hold) plus the Debug impl for CloudState.
+    /// One call per method — no caching semantics to assert.
+    #[tokio::test]
+    async fn trivial_passthroughs_delegate_to_inner() {
+        let (mock, c) = MockBackend::new();
+        let cache = wrap(mock);
+        // download_chunks_parallel
+        let _ = cache
+            .download_chunks_parallel(&[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(c.gets.load(Ordering::SeqCst), 3);
+        // upload_manifest + download_manifest
+        cache
+            .upload_manifest("m", "{\"v\":1}")
+            .await
+            .expect("manifest upload");
+        let _ = cache.download_manifest("m").await.expect("manifest download");
+        // list_objects
+        let listed = cache.list_objects("").await.expect("list");
+        assert!(listed.is_empty());
+        assert_eq!(c.list_calls.load(Ordering::SeqCst), 1);
+        // lock_state
+        assert_eq!(cache.lock_state().await.unwrap(), LockState::Off);
+        // legal-hold pass-throughs (MockBackend stubs return Ok)
+        cache
+            .set_object_legal_hold("k", true)
+            .await
+            .expect("set legal hold");
+        let held = cache
+            .get_object_legal_hold("k")
+            .await
+            .expect("get legal hold");
+        assert!(!held);
+        // Debug printout exercises CloudState::Probed/Uploaded/InFlight arms.
+        cache.upload_chunk("u", b"x").await.unwrap(); // Uploaded
+        c.head_returns.store(true, Ordering::SeqCst);
+        assert!(cache.chunk_exists("p").await.unwrap()); // Probed
+        let dbg = format!("{:?}", cache);
+        assert!(dbg.contains("CachingCloudBackend"));
+    }
+
+    #[tokio::test]
+    async fn zerocopy_after_positive_head_still_uploads_for_size() {
+        // chunk_exists()==true installs a Probed (sizeless) cache entry.
+        // upload_chunk_zerocopy on a Probed entry MUST fall through
+        // to a real PUT because Probed carries no authoritative size.
+        let (mock, c) = MockBackend::new();
+        c.head_returns.store(true, Ordering::SeqCst);
+        let cache = wrap(mock);
+        // Populate Probed via chunk_exists.
+        assert!(cache.chunk_exists("kp").await.unwrap());
+        assert_eq!(c.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(c.puts.load(Ordering::SeqCst), 0);
+
+        let (_dir, path) = write_tmp(&vec![0u8; 1024]);
+        let size = cache.upload_chunk_zerocopy("kp", &path).await.unwrap();
+        assert_eq!(size, 1024);
+        assert_eq!(
+            c.puts.load(Ordering::SeqCst),
+            1,
+            "Probed (no size) must fall through to a real PUT",
+        );
+    }
 }

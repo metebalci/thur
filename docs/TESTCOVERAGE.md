@@ -2,7 +2,7 @@
 
 Thur's automated testing is **two-tier**:
 
-- **Unit + integration tests** — 1,299 per-crate Rust tests run by
+- **Unit + integration tests** — ~2,000 per-crate Rust tests run by
   `cargo test`. These cover the storage engines, the SCSI / NVMe
   command sets, dedup, crypto, and the cloud chunk pool — the
   correctness-critical logic.
@@ -17,7 +17,7 @@ every push.
 ## Line coverage
 
 The figures below are **line coverage measured by `cargo llvm-cov`**
-over the `cargo test` suite — a snapshot of 2026-05-22. Reproduce it
+over the `cargo test` suite — a snapshot of 2026-05-23. Reproduce it
 with `scripts/coverage.sh`:
 
 ```bash
@@ -27,92 +27,94 @@ scripts/coverage.sh --gate     # same, but exit 1 if any crate is below floor
 scripts/coverage.sh --zero     # source files with no #[cfg(test)] block
 ```
 
-**Overall: 55% line, 59% region.** That single figure needs the
+**Overall: 70% line, 72% region.** That single figure needs the
 two-tier context to read correctly: `cargo llvm-cov` instruments only
 the `cargo test` suite, and the end-to-end shell suites run the
 compiled daemon as a black box — they are *not* instrumented. So:
 
 - The **logic crates** — storage, SCSI/NVMe command sets, dedup,
   crypto, chunk pool — are what the unit/integration suite is
-  responsible for, and they sit at **75–95%**.
-- The **daemon and CLI crates** read **1–29%** here: their request
-  paths are covered by the end-to-end suites instead, which this
-  measurement does not capture. The low number reflects what
-  `cargo llvm-cov` can see, not how well that code is exercised.
+  responsible for, and they sit at **80–95%**, every one over its
+  80% floor.
+- The **daemon and CLI crates** read **30–40%** here, just above
+  their 30% floor: their request paths are covered by the end-to-end
+  suites instead, which this measurement does not capture.
 
 ### `shared/` — cross-product crates
 
-| Crate | Tests | Line cov | Coverage focus |
-|---|---:|---:|---|
-| `shared-admin-audit` | 0 | 0% | `system.audit.*` job handlers — reached via the daemon audit verbs |
-| `shared-admin-client` | 13 | 32% | admin Unix-socket dialer, NDJSON job-stream consumer |
-| `shared-admin-http` | 21 | 80% | admin HTTP listener, TLS config, self-signed cert gen / regen |
-| `shared-admin-iscsi` | 0 | 0% | cross-product iSCSI admin handlers — reached via both daemons |
-| `shared-admin-proto` | 12 | 95% | admin-socket wire types (`JobEvent`, `JobAccepted`) round-trips |
-| `shared-admin-server` | 3 | 44% | job registry / emitter / NDJSON event streaming |
-| `shared-alerting` | 18 | 49% | email + webhook sinks, Tera templating, per-class dedup |
-| `shared-audit` | 33 | 85% | BLAKE3 hash chain, append / verify / rotate, tail cursor |
-| `shared-cli` | 0 | 0% | CLI UX helpers — reached via the shipped CLIs |
-| `shared-cli-alerting` | 0 | 0% | `system alerting` CLI — reached via the CLIs + scripts |
-| `shared-cli-iscsi` | 0 | 8% | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
-| `shared-cli-system` | 0 | 0% | `system` CLI verbs — reached via the CLIs + scripts |
-| `shared-cloud` | 91 | 54% | S3 / GCS / Azure / Local backends, retry, compression |
-| `shared-cloud-bench` | 0 | 0% | cloud benchmark engine — reached via `system cloud benchmark` |
-| `shared-crypto` | 9 | 95% | AES-256-GCM encrypt / decrypt, IV derivation |
-| `shared-dedup-stats` | 3 | 100% | dedup exclusive / shared byte split |
-| `shared-health` | 2 | 100% | `/health` liveness handler |
-| `shared-iscsi` | 45 | 46% | iSCSI transport, CHAP auth, session + unit-attention |
-| `shared-keystore` | 94 | 69% | six DEK keystore backends, wrap / unwrap round-trips |
-| `shared-naming` | 15 | 94% | per-product identity strings |
-| `shared-pool` | 45 | 90% | content-addressed chunk pool, insertion, GC iteration, budget |
-| `shared-telemetry` | 3 | 67% | OpenTelemetry instrument plumbing |
-| `shared-upload-worker` | 4 | 73% | cloud-upload pipeline primitives |
-| `shared-verify-core` | 0 | 85% | pool + cloud verify sweeps — exercised via the `core-*` verify tests |
+| Crate | Line cov | Coverage focus |
+|---|---:|---|
+| `shared-admin-audit` | 64% | `system.audit.*` job handlers — reached via the daemon audit verbs |
+| `shared-admin-client` | 70% | admin Unix-socket dialer, NDJSON job-stream consumer |
+| `shared-admin-http` | 80% | admin HTTP listener, TLS config, self-signed cert gen / regen |
+| `shared-admin-iscsi` | 76% | cross-product iSCSI admin handlers — reached via both daemons |
+| `shared-admin-proto` | 95% | admin-socket wire types (`JobEvent`, `JobAccepted`) round-trips |
+| `shared-admin-server` | 53% | job registry / emitter / NDJSON event streaming |
+| `shared-alerting` | 54% | email + webhook sinks, Tera templating, per-class dedup |
+| `shared-audit` | 88% | BLAKE3 hash chain, append / verify / rotate, tail cursor |
+| `shared-cli` | 74% | CLI UX helpers — reached via the shipped CLIs |
+| `shared-cli-alerting` | 57% | `system alerting` CLI — reached via the CLIs + scripts |
+| `shared-cli-iscsi` | 56% | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
+| `shared-cli-system` | 55% | `system` CLI verbs — reached via the CLIs + scripts |
+| `shared-cloud` | 80% | S3 / GCS / Azure / Local backends, retry, compression |
+| `shared-cloud-bench` | 36% | cloud benchmark engine — reached via `system cloud benchmark` |
+| `shared-crypto` | 95% | AES-256-GCM encrypt / decrypt, IV derivation |
+| `shared-dedup-stats` | 100% | dedup exclusive / shared byte split |
+| `shared-health` | 100% | `/health` liveness handler |
+| `shared-iscsi` | 87% | iSCSI transport, CHAP auth, session + unit-attention |
+| `shared-keystore` | 81% | six DEK keystore backends, wrap / unwrap round-trips |
+| `shared-naming` | 94% | per-product identity strings |
+| `shared-pool` | 91% | content-addressed chunk pool, insertion, GC iteration, budget |
+| `shared-telemetry` | 66% | OpenTelemetry instrument plumbing |
+| `shared-upload-worker` | 74% | cloud-upload pipeline primitives |
+| `shared-verify-core` | 85% | pool + cloud verify sweeps — exercised via the `core-*` verify tests |
 
 ### `scsi/` — SCSI command sets
 
-| Crate | Tests | Line cov | Coverage focus |
-|---|---:|---:|---|
-| `scsi-sbc` | 166 | 92% | SBC-3 block dispatch: data-path opcodes, reservations, VPD, sizing |
-| `scsi-smc` | 14 | 49% | SMC-3 changer dispatch, element-address topology |
-| `scsi-spc` | 51 | 91% | SPC-4 baseline: sense, INQUIRY / VPD, mode pages, REPORT LUNS, PR |
-| `scsi-ssc` | 94 | 48% | SSC-4 tape dispatch, log / MAM / encryption pages |
+| Crate | Line cov | Coverage focus |
+|---|---:|---|
+| `scsi-sbc` | 92% | SBC-3 block dispatch: data-path opcodes, reservations, VPD, sizing |
+| `scsi-smc` | 83% | SMC-3 changer dispatch, element-address topology |
+| `scsi-spc` | 94% | SPC-4 baseline: sense, INQUIRY / VPD, mode pages, REPORT LUNS, PR |
+| `scsi-ssc` | 83% | SSC-4 tape dispatch, log / MAM / encryption pages |
 
 ### `nvme/` — NVMe stack
 
-| Crate | Tests | Line cov | Coverage focus |
-|---|---:|---:|---|
-| `nvme-base` | 27 | 90% | wire-format primitives: SQE / CQE, Identify, Fabrics, registers |
-| `nvme-nvm` | 10 | 71% | NVM Command Set dispatch, fused compare-and-write |
-| `nvme-tcp` | 61 | 87% | NVMe/TCP transport state machine, PDU codec, R2T flow |
+| Crate | Line cov | Coverage focus |
+|---|---:|---|
+| `nvme-base` | 92% | wire-format primitives: SQE / CQE, Identify, Fabrics, registers |
+| `nvme-nvm` | 92% | NVM Command Set dispatch, fused compare-and-write |
+| `nvme-tcp` | 87% | NVMe/TCP transport state machine, PDU codec, R2T flow |
 
 ### `core/` — product cores
 
-| Crate | Tests | Line cov | Coverage focus |
-|---|---:|---:|---|
-| `core-block` | 116 | 88% | SBC-3 block core: page table, write-back cache, volume manifests |
-| `core-mediachanger` | 209 | 80% | SMC-3 medium changer + library inventory + library-wide verify |
-| `core-stream` | 95 | 76% | LTO cartridge primitives: indexes, FastCDC, AES-GCM, prefetch |
+| Crate | Line cov | Coverage focus |
+|---|---:|---|
+| `core-block` | 88% | SBC-3 block core: page table, write-back cache, volume manifests |
+| `core-mediachanger` | 83% | SMC-3 medium changer + library inventory + library-wide verify |
+| `core-stream` | 80% | LTO cartridge primitives: indexes, FastCDC, AES-GCM, prefetch |
 
 ### Product daemons + CLIs
 
-Low here by construction — these crates are the integration surface
-covered by the **end-to-end suites** below, which `cargo llvm-cov` does
-not instrument. The number is a measurement artifact, not a gap.
+These crates are the integration surface covered by the **end-to-end
+suites** below, which `cargo llvm-cov` does not instrument. The
+numbers below reflect only what the unit-test layer can see — the
+real exercise lives in the shell suites.
 
-| Crate | Tests | Line cov | Coverage focus |
-|---|---:|---:|---|
-| `vsa-cli` | 5 | 2% | VSA CLI command modules — see `vsa/scripts/` |
-| `vsa-daemon` | 26 | 29% | VSA daemon wiring, admin handlers — see `vsa/scripts/` |
-| `vtl-cli` | 3 | 1% | VTL CLI command modules — see `vtl/scripts/` |
-| `vtl-daemon` | 11 | 6% | VTL daemon wiring, iSCSI / admin paths — see `vtl/scripts/` |
+| Crate | Line cov | Coverage focus |
+|---|---:|---|
+| `vsa-cli` | 36% | VSA CLI command modules — see `vsa/scripts/` |
+| `vsa-daemon` | 32% | VSA daemon wiring, admin handlers — see `vsa/scripts/` |
+| `vtl-cli` | 39% | VTL CLI command modules — see `vtl/scripts/` |
+| `vtl-daemon` | 31% | VTL daemon wiring, iSCSI / admin paths — see `vtl/scripts/` |
 
-A crate can show coverage without owning tests: `shared-verify-core`
-has no tests of its own yet is 85% covered, because `core-mediachanger`
-and `core-block`'s verify tests exercise it. The 0% crates — the CLI
-helper crates, `shared-admin-audit`, `shared-admin-iscsi`,
-`shared-cloud-bench` — are thin cross-product glue reached only through
-their consumers and the end-to-end suites.
+A crate can show coverage without owning many tests of its own:
+`shared-verify-core` has no inline tests yet is 85% covered, because
+`core-mediachanger` and `core-block`'s verify tests exercise it.
+Several thin cross-product crates (`shared-admin-audit`,
+`shared-admin-iscsi`, the `shared-cli-*` family) clear their 50%
+floor entirely on the strength of their consumers' tests — what they
+add directly to the workspace is structural glue.
 
 ## Coverage floors
 
@@ -137,9 +139,6 @@ their pure logic (config parsing, registries, job-argument handling).
 
 ### Structural sub-floor exceptions
 
-Two crates sit under their floor for reasons the unit-test layer can't
-fix; both are exercised by the end-to-end suites.
-
 - **`shared/cloud-bench` (36% < 50%)** — the bench engine
   (`bench_cell` / `parallel_delete` / the print helpers) is a
   throughput probe whose minimum useful transfer is **1 GiB per
@@ -147,25 +146,15 @@ fix; both are exercised by the end-to-end suites.
   Validation, options, config loading, PRNG, error variants are unit-
   tested; the bench loop is reached via the `system cloud benchmark`
   integration path.
-- **`shared/cloud` (77% < 80%)** — `gcs.rs` (307 lines) is bound to
-  the `google-cloud-storage` SDK, which has no endpoint override that
-  the in-crate `wiremock` rig can drive (s3.rs and azure.rs both use
-  reqwest-based clients that accept a custom endpoint URL). The GCS
-  backend is exercised by `vsa/scripts/test-iscsi-fs-cloud.sh` against
-  a real GCS bucket; the rest of `shared/cloud` (s3 / azure / local /
-  caching / config / compression / dedup / helpers / cloud_backend /
-  error) is at 80%+ per-file.
-
-## Known gaps
-
-Not every low number is an instrumentation artifact. These crates have
-real unit tests but meaningful untested branches — the first place more
-unit tests would pay off:
-
-- `scsi-ssc` (48%) — SSC-4 tape command dispatch
-- `scsi-smc` (49%) — SMC-3 changer command dispatch
-- `shared-iscsi` (46%) — iSCSI transport / session management
-- `shared-cloud` (54%) — cloud-backend error + retry paths
+- **`shared/cloud` gcs.rs (5%)** — pulls `shared/cloud` close to its
+  80% floor: `gcs.rs` (307 lines) is bound to the
+  `google-cloud-storage` SDK, which has no endpoint override that
+  the in-crate `wiremock` rig can drive (s3.rs and azure.rs both
+  use reqwest-based clients that accept a custom endpoint URL).
+  The GCS backend is exercised by `vsa/scripts/test-iscsi-fs-cloud.sh`
+  against a real GCS bucket; every other file in `shared/cloud` is
+  at 80%+ per-file and the crate as a whole sits at 80% — just on
+  the line.
 
 ## End-to-end suites
 
