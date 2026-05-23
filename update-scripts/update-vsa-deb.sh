@@ -13,7 +13,8 @@
 # Default behavior: unmount the loopback iSCSI / NVMe-TCP volumes,
 # log the sessions out, stop thurvsad, install the newest
 # thurvsa_*.deb in package-dir (default: the current directory),
-# start thurvsad, log back in, and remount (by filesystem UUID).
+# then (only if the daemon was active before the run) start
+# thurvsad, log back in, and remount (by filesystem UUID).
 # --dont-restart stops after the package swap so the operator can
 # review the conffile before starting the daemon back up.
 # --disconnect-only quiesces the host (unmount + logout) without

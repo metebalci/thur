@@ -13,8 +13,9 @@
 # Default behavior: discover any LTFS mounts (from the running
 # `ltfs` processes) and loopback iSCSI sessions, unmount LTFS, log
 # the sessions out, stop thurvtld, install the newest thurvtl_*.deb
-# in package-dir (default: the current directory), start thurvtld,
-# log back in, and replay each `ltfs` mount. With no LTFS mounts it
+# in package-dir (default: the current directory), then (only if
+# the daemon was active before the run) start thurvtld, log back
+# in, and replay each `ltfs` mount. With no LTFS mounts it
 # is just stop/install/start. --dont-restart stops after the
 # package swap so the operator can review the conffile before
 # starting the daemon back up. --disconnect-only quiesces the host

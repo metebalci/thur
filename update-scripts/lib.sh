@@ -29,7 +29,12 @@
 #   default            unmount + logout + stop + install + start +
 #                      login + remount.  Session-continuity for a
 #                      routine upgrade.  State file removed on
-#                      success.
+#                      success.  Daemon state is *preserved*: if the
+#                      daemon was already stopped (`inactive` /
+#                      `failed`) when the run started, it stays
+#                      stopped after the install — no surprise
+#                      side-effect start.  Only an `active` daemon
+#                      gets restarted.
 #
 #   --dont-restart     unmount + logout + stop + install.  Stops
 #                      short of `systemctl start`, leaving the daemon
@@ -79,7 +84,9 @@ usage: $(basename "${0:-update script}") [--dry-run] [--force]
               [--dont-restart | --disconnect-only] [package-dir]
 
   --dry-run          show the commands that would run; change nothing
-  --force            VTL only: proceed even if backup sessions are connected
+  --force            proceed past the activating/reloading/deactivating
+                     gate, and (VTL) proceed even if backup sessions are
+                     connected without an LTFS mount
   --dont-restart     unmount + logout + stop + install, then exit;
                      leaves the daemon stopped so the operator can
                      review the conffile before starting it back up
@@ -165,6 +172,45 @@ install_pkg() {
       run "${cmd[@]}"
       ;;
   esac
+}
+
+# sample_service_state SERVICE — read `systemctl is-active` once,
+# before any teardown begins, and store a normalized result in the
+# global WAS_ACTIVE: one of `active` / `inactive` / `failed`. The
+# default mode preserves whichever state the daemon was in before
+# the upgrade: an already-stopped daemon stays stopped after the
+# package swap (no surprise side effects), an active daemon gets
+# restarted as today, a failed daemon is treated like inactive
+# (operator presumably ran the upgrade *because* it was failing).
+#
+# Transient values (`activating` / `reloading` / `deactivating`)
+# refuse without `--force` — the active/inactive heuristic isn't
+# reliable mid-transition. `--force` is the same flag VTL already
+# uses to mean "I know what I'm doing"; on either product it now
+# also overrides this gate.
+sample_service_state() {
+  local svc=$1 state
+  state=$(systemctl is-active "$svc" 2>/dev/null || true)
+  case "$state" in
+    active|inactive|failed) ;;
+    activating|reloading|deactivating)
+      if [[ $force -eq 0 ]]; then
+        die "$svc is currently $state — state in flux, retry once it settles or pass --force"
+      fi
+      log "WARNING: $svc is $state, --force in effect — treating as active"
+      state=active
+      ;;
+    *)
+      # `unknown`, an empty string from a parse failure, or some
+      # future is-active output. Be conservative: treat as inactive
+      # (skip stop, skip restart) rather than try to act on a state
+      # we don't recognize.
+      log "WARNING: \`systemctl is-active $svc\` returned '${state:-<empty>}' — treating as inactive"
+      state=inactive
+      ;;
+  esac
+  WAS_ACTIVE=$state
+  log "$svc pre-upgrade state: $WAS_ACTIVE"
 }
 
 # require_installed SERVICE — refuse to run on a host where the
@@ -302,6 +348,8 @@ update_vsa() {
   local pkg; pkg=$(pick_pkg thurvsa)
   log "package: $pkg"
   require_installed "$SERVICE"      # upgrade-only gate (bails clean)
+  local WAS_ACTIVE
+  sample_service_state "$SERVICE"   # default mode preserves this state
 
   DONE=0
   trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vsa-update] INTERRUPTED — teardown state is in %s\n" "'"$STATE"'" >&2' EXIT
@@ -386,13 +434,30 @@ update_vsa() {
   fi
 
   # ---- swap the package ---------------------------------------------
-  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  # Stop only if the daemon was actually running. Skipping the stop
+  # when it was already inactive/failed avoids a confusing "stopping
+  # $SERVICE" log line when there was nothing to stop.
+  if [[ "$WAS_ACTIVE" == active ]]; then
+    log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  else
+    log "$SERVICE was $WAS_ACTIVE before this run — skipping stop"
+  fi
   install_pkg "$pkg"
 
   # ---- mode: --dont-restart -----------------------------------------
   if [[ $DONT_RESTART -eq 1 ]]; then
     DONE=1
     log "dont-restart: package swapped — daemon left stopped"
+    print_vsa_next_steps "$SERVICE" "$STATE" 0
+    return 0
+  fi
+
+  # ---- preserve pre-upgrade stopped/failed state --------------------
+  # If the daemon wasn't running when the operator started this run,
+  # don't surprise them by starting the new binary as a side effect.
+  if [[ "$WAS_ACTIVE" != active ]]; then
+    DONE=1
+    log "$SERVICE was $WAS_ACTIVE before upgrade — leaving it stopped (start manually when ready)"
     print_vsa_next_steps "$SERVICE" "$STATE" 0
     return 0
   fi
@@ -446,6 +511,8 @@ update_vtl() {
   local pkg; pkg=$(pick_pkg thurvtl)
   log "package: $pkg"
   require_installed "$SERVICE"      # upgrade-only gate (bails clean)
+  local WAS_ACTIVE
+  sample_service_state "$SERVICE"   # default mode preserves this state
 
   DONE=0
   trap '[[ $DONE -eq 1 || $DRYRUN -eq 1 ]] || printf "[vtl-update] INTERRUPTED — teardown state is in %s\n" "'"$STATED"'" >&2' EXIT
@@ -516,13 +583,30 @@ update_vtl() {
   fi
 
   # ---- swap the package ---------------------------------------------
-  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  # Stop only if the daemon was actually running. Skipping the stop
+  # when it was already inactive/failed avoids a confusing "stopping
+  # $SERVICE" log line when there was nothing to stop.
+  if [[ "$WAS_ACTIVE" == active ]]; then
+    log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  else
+    log "$SERVICE was $WAS_ACTIVE before this run — skipping stop"
+  fi
   install_pkg "$pkg"
 
   # ---- mode: --dont-restart -----------------------------------------
   if [[ $DONT_RESTART -eq 1 ]]; then
     DONE=1
     log "dont-restart: package swapped — daemon left stopped"
+    print_vtl_next_steps "$SERVICE" "$STATED" 0
+    return 0
+  fi
+
+  # ---- preserve pre-upgrade stopped/failed state --------------------
+  # If the daemon wasn't running when the operator started this run,
+  # don't surprise them by starting the new binary as a side effect.
+  if [[ "$WAS_ACTIVE" != active ]]; then
+    DONE=1
+    log "$SERVICE was $WAS_ACTIVE before upgrade — leaving it stopped (start manually when ready)"
     print_vtl_next_steps "$SERVICE" "$STATED" 0
     return 0
   fi
