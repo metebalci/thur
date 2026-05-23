@@ -241,7 +241,8 @@ pub async fn cmd_info(name: &str, json: bool) -> Result<()> {
         .get("runtime")
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok());
-    print_manifest(path, &manifest, runtime.as_ref(), lun);
+    let allocated_pages = value.get("allocated_pages").and_then(|v| v.as_u64());
+    print_manifest(path, &manifest, runtime.as_ref(), lun, allocated_pages);
     Ok(())
 }
 
@@ -777,7 +778,13 @@ pub async fn cmd_key_import(
     Ok(())
 }
 
-fn print_manifest(path: &str, m: &VolumeManifest, r: Option<&VolumeRuntime>, lun: Option<u64>) {
+fn print_manifest(
+    path: &str,
+    m: &VolumeManifest,
+    r: Option<&VolumeRuntime>,
+    lun: Option<u64>,
+    allocated_pages: Option<u64>,
+) {
     println!("Volume: {}", m.name);
     if let Some(lun) = lun {
         println!("  LUN:               {lun}");
@@ -789,6 +796,20 @@ fn print_manifest(path: &str, m: &VolumeManifest, r: Option<&VolumeRuntime>, lun
         format_bytes(m.size_bytes),
         m.size_bytes
     );
+    if let Some(pages) = allocated_pages {
+        let used = pages.saturating_mul(u64::from(m.page_size_bytes));
+        let pct = if m.size_bytes > 0 {
+            (used as f64 / m.size_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  Used:              {} ({:.1}% of size, {} pages)",
+            format_bytes(used),
+            pct,
+            pages
+        );
+    }
     println!("  Sector size:       {} B", m.sector_bytes);
     println!(
         "  Page size:         {} ({} bytes)",

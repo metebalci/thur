@@ -36,7 +36,7 @@ use axum::{
     Json, extract::Path as AxumPath, extract::State, http::StatusCode, response::IntoResponse,
 };
 use core_block::{
-    self, PageCache, UploadTask, VolumeManifest, VolumeRuntime, VolumeWriter,
+    self, PageCache, PageIndex, UploadTask, VolumeManifest, VolumeRuntime, VolumeWriter,
     volume::{VolumeEncryptionAlgorithm, parse_dedup_scope},
 };
 use serde::{Deserialize, Serialize};
@@ -250,10 +250,24 @@ pub async fn info(
             )
         })?,
     };
+    // Walk pages.idx for the "used" figure — the same pattern
+    // `system stats` uses. On open failure, fall back to 0 so a
+    // corrupted index doesn't block the info verb; the operator's
+    // response (investigate) is the same either way.
+    let allocated_pages: u64 = PageIndex::open(
+        &PageIndex::path_for(&vol_dir),
+        manifest.uuid,
+        u64::from(manifest.page_size_bytes),
+    )
+    .ok()
+    .map(|p| p.iter().filter(Result::is_ok).count() as u64)
+    .unwrap_or(0);
+
     let mut out = serde_json::to_value(&manifest).unwrap_or_else(|_| json!({}));
     if let Some(map) = out.as_object_mut() {
         map.insert("lun".into(), json!(lun));
         map.insert("path".into(), json!(vol_dir.display().to_string()));
+        map.insert("allocated_pages".into(), json!(allocated_pages));
         map.insert(
             "runtime".into(),
             serde_json::to_value(&runtime).unwrap_or(json!({})),
