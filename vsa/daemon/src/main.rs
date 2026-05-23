@@ -29,7 +29,7 @@ use crate::http::HttpState;
 use scsi_sbc::SbcScsiDispatcher;
 
 // `THURVSA_VERSION` is set by build.rs to "<crate-ver> (<sha>[-dirty])".
-const THURVSA_VERSION_STR: &str = match option_env!("THURVSA_VERSION") {
+pub(crate) const THURVSA_VERSION_STR: &str = match option_env!("THURVSA_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -588,6 +588,10 @@ async fn main() -> Result<()> {
 
     // Admin Unix socket — live volume create / destroy + read APIs +
     // long-running jobs.
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
         cloud: Arc::new(cfg.cloud.clone()),
@@ -598,6 +602,9 @@ async fn main() -> Result<()> {
         jobs: Arc::new(shared_admin_server::JobRegistry::new()),
         keystore_config: Arc::new(cfg.keystore.clone()),
         keystore_cache: Arc::new(tokio::sync::RwLock::new(keystores)),
+        started_at_unix,
+        pool_budgets: pool_budgets.clone(),
+        sessions: Arc::clone(&session_manager),
     };
     let admin_socket = admin::admin_socket_path();
 

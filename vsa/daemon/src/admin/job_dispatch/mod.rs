@@ -81,6 +81,11 @@ pub fn dispatch(
             ));
             Ok(())
         }
+        "system.monitor" => {
+            // AdminState already impls `MonitorState`; spawn directly.
+            tokio::spawn(shared_admin_monitor::run_monitor(emitter, body, state));
+            Ok(())
+        }
         other => Err(format!("unknown job kind: {}", other)),
     }
 }

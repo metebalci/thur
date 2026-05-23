@@ -5569,6 +5569,7 @@ dependencies = [
  "shared-admin-audit",
  "shared-admin-http",
  "shared-admin-iscsi",
+ "shared-admin-monitor",
  "shared-admin-server",
  "shared-alerting",
  "shared-audit",

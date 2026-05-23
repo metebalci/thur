@@ -74,6 +74,50 @@ pub struct AdminState {
     /// by handlers thereafter so KMS / Vault clients are reused for
     /// the daemon's lifetime.
     pub keystore_cache: Arc<RwLock<BTreeMap<String, Arc<dyn KeyStoreBackend>>>>,
+    /// Unix epoch seconds the daemon started at. Captured once at
+    /// boot — surfaces in the `system monitor` header (uptime = now
+    /// - started_at).
+    pub started_at_unix: i64,
+    /// Per-backend disk-cache budgets. Same `Arc<PoolBudget>` map the
+    /// eviction worker holds; cloned in once at boot so the monitor
+    /// handler can read used / cap / waiters_now coherently.
+    pub pool_budgets: std::collections::HashMap<String, Arc<shared_pool::PoolBudget>>,
+    /// iSCSI / NVMe-TCP session manager. Cloned from the transport's
+    /// `Arc<SessionManager>` so the monitor handler can read
+    /// `session_count` without going through the HTTP listener state.
+    pub sessions: Arc<shared_iscsi::session::SessionManager>,
+}
+
+// `system.monitor` per-tick view. The handler in `shared-admin-monitor`
+// calls these accessors once per second to compose the JSON payload.
+impl shared_admin_monitor::MonitorState for AdminState {
+    fn daemon_name(&self) -> &str {
+        "thurvsad"
+    }
+    fn version(&self) -> &str {
+        crate::THURVSA_VERSION_STR
+    }
+    fn started_at_unix(&self) -> i64 {
+        self.started_at_unix
+    }
+    fn live_stats(&self) -> Arc<shared_telemetry::LiveStats> {
+        // The global is always set on the daemon side (see main.rs
+        // boot); fallback keeps the `--test` smoke path harmless.
+        shared_telemetry::global()
+            .map(|t| t.live_stats())
+            .unwrap_or_else(|| Arc::new(shared_telemetry::LiveStats::default()))
+    }
+    fn pool_budgets(
+        &self,
+    ) -> std::collections::HashMap<String, Arc<shared_pool::PoolBudget>> {
+        self.pool_budgets.clone()
+    }
+    fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
+        shared_admin_monitor::ProductSnapshot::Vsa {
+            volumes_online: self.registry.len() as u64,
+            sessions_active: self.sessions.session_count() as u64,
+        }
+    }
 }
 
 impl AdminState {
