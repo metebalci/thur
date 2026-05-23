@@ -77,9 +77,9 @@ fn build_declared_topology(
         ));
     }
     Ok(core_mediachanger::library::DeclaredTopology {
-        num_storage_slots: block.num_slots.unwrap(),
-        num_drives: block.num_drives.unwrap(),
-        lto_generation: block.lto_generation.unwrap(),
+        num_storage_slots: block.num_slots.expect("checked Some above"),
+        num_drives: block.num_drives.expect("checked Some above"),
+        lto_generation: block.lto_generation.expect("checked Some above"),
         firmware: block.firmware.clone(),
     })
 }
