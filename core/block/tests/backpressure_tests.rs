@@ -112,7 +112,7 @@ async fn seal_blocks_then_succeeds_after_release() {
     let bg = budget.clone();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
-        bg.release(PAGE as u64);
+        bg.release(PAGE as u64, None);
     });
 
     let started = std::time::Instant::now();

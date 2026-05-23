@@ -143,6 +143,16 @@ cloud HEAD-skip rate, by contrast, is exposed *only* through these
 counters — it is a runtime signal, not state that exists anywhere on
 disk to be walked.
 
+`pool_used_bytes` and `pool_cap_bytes` carry the `backend` attribute
+only — the cap and the backpressure semaphore are backend-wide, so a
+single Prometheus series per backend matches how the gate actually
+works. Operators who want to see *which* volume / cartridge is
+consuming the pool drop into `thurvsa system monitor` (or
+`thurvtl system monitor`) — that screen renders one row per (backend,
+namespace) by reading the daemon's in-memory `PoolBudget`
+breakdown. The Prometheus shape is deliberately kept the way it was
+so existing dashboards keep working unchanged.
+
 ## Alerts worth setting (PromQL)
 
 The point of the examples below is that each one maps to a concrete

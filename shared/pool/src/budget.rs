@@ -17,6 +17,18 @@
 //! gate via [`PoolBudget::force_reserve`] — bounded overshoot is
 //! preferred over losing data.
 //!
+//! ## Per-namespace usage tracking
+//!
+//! The cap stays per-backend (matches the YAML `disk_cache.size_gb`
+//! knob, which is per-`cloud.backends` entry), but the budget tracks
+//! reserved bytes broken down by namespace alongside the backend total.
+//! Every reserve / release call carries an `Option<&str>` namespace
+//! tag: `None` for the global-dedup pool, `Some(uuid_hex)` for each
+//! local-dedup volume / cartridge. [`PoolBudget::per_namespace_used`]
+//! exposes the breakdown for the `system monitor` view; the
+//! backpressure semaphore itself does not partition by namespace
+//! (every reserver blocks on the same backend-wide cap).
+//!
 //! ## Where this used to live
 //!
 //! Originally lived at `core/ssc/src/disk_cache.rs:589-857` (tape
@@ -26,9 +38,10 @@
 //! variant via `#[from]`. The tape-aware `refresh_from_disk` helper
 //! that used to live alongside `PoolBudget` stays in the tape side
 //! (`core/ssc/src/disk_cache.rs`) and now calls
-//! [`PoolBudget::set_current_bytes`]. The block side has its own
+//! [`PoolBudget::set_pool_buckets`]. The block side has its own
 //! parallel walker.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -55,6 +68,40 @@ pub struct BackpressureError {
     pub waited_secs: u64,
 }
 
+/// Backend total + per-namespace breakdown, kept in one mutex so
+/// every reserve / release atomically updates both.
+struct PoolState {
+    total: u64,
+    per_namespace: HashMap<Option<String>, u64>,
+}
+
+impl PoolState {
+    fn new() -> Self {
+        Self {
+            total: 0,
+            per_namespace: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, namespace: Option<&str>, bytes: u64) {
+        self.total = self.total.saturating_add(bytes);
+        let key = namespace.map(|s| s.to_string());
+        let slot = self.per_namespace.entry(key).or_insert(0);
+        *slot = slot.saturating_add(bytes);
+    }
+
+    fn sub(&mut self, namespace: Option<&str>, bytes: u64) {
+        self.total = self.total.saturating_sub(bytes);
+        let key = namespace.map(|s| s.to_string());
+        if let Some(slot) = self.per_namespace.get_mut(&key) {
+            *slot = slot.saturating_sub(bytes);
+            if *slot == 0 {
+                self.per_namespace.remove(&key);
+            }
+        }
+    }
+}
+
 /// Per-backend hard cap on local pool occupancy, with sync
 /// `Mutex`+`Condvar` semantics so the chunk-seal path can block
 /// without forcing the whole write path async. One `PoolBudget` is
@@ -64,15 +111,18 @@ pub struct BackpressureError {
 /// its condvar wait).
 ///
 /// Semantics:
-///   * `try_reserve(chunk_size, deadline)` blocks if reserving would
-///     push us past the cap or take filesystem free space below
-///     `disk_free_min_bytes`. Wakes on `release` calls; returns
-///     [`BackpressureError`] after `deadline`.
-///   * `release(bytes)` is called from the eviction path after a pool
-///     file is unlinked. Decrements `current_bytes` and signals all
-///     waiters.
-///   * `force_reserve(bytes)` bypasses both gates — reserved for
-///     `Cartridge::Drop` / `PageCache::flush_all` flushes where
+///   * `try_reserve(chunk_size, namespace, deadline)` blocks if
+///     reserving would push us past the cap or take filesystem free
+///     space below `disk_free_min_bytes`. Wakes on `release` calls;
+///     returns [`BackpressureError`] after `deadline`. The `namespace`
+///     tag is recorded against the per-namespace breakdown but does
+///     not partition the cap — every reserver blocks on the same
+///     backend-wide semaphore.
+///   * `release(bytes, namespace)` is called from the eviction path
+///     after a pool file is unlinked. Decrements both the backend
+///     total and the namespace's bucket; signals all waiters.
+///   * `force_reserve(bytes, namespace)` bypasses both gates — reserved
+///     for `Cartridge::Drop` / `PageCache::flush_all` flushes where
 ///     surfacing `Backpressured` would mean dropping data on the floor.
 ///     Bounded overshoot ≤ chunk_max per concurrent unload.
 ///
@@ -107,10 +157,11 @@ pub struct PoolBudget {
     /// `data_dir`.
     data_dir: PathBuf,
     /// Bytes currently reserved in the pool (sealed chunks the daemon
-    /// believes are on disk under this backend). Mutex-protected so
+    /// believes are on disk under this backend), plus a per-namespace
+    /// breakdown summing to the same total. Mutex-protected so
     /// reservation and release can race safely; condvar is paired
     /// with this mutex for waiters.
-    state: Mutex<u64>,
+    state: Mutex<PoolState>,
     cv: Condvar,
 }
 
@@ -154,7 +205,7 @@ impl PoolBudget {
             disk_free_min_bytes,
             soft_watermark_frac: pct,
             data_dir,
-            state: Mutex::new(0),
+            state: Mutex::new(PoolState::new()),
             cv: Condvar::new(),
         }
     }
@@ -193,7 +244,7 @@ impl PoolBudget {
     }
 
     pub fn current_bytes(&self) -> u64 {
-        *self.state.lock().expect("PoolBudget mutex poisoned")
+        self.state.lock().expect("PoolBudget mutex poisoned").total
     }
 
     /// Backend name this budget was tagged with at construction.
@@ -216,27 +267,53 @@ impl PoolBudget {
         used / cap as f64 >= self.soft_watermark_frac
     }
 
+    /// Snapshot the per-namespace usage breakdown. Returns
+    /// `(namespace, used_bytes)` pairs that sum to
+    /// [`Self::current_bytes`]. `namespace = None` means the
+    /// global-dedup pool; `Some(uuid_hex)` is a local-dedup
+    /// volume / cartridge. Sorted by namespace for deterministic
+    /// rendering.
+    pub fn per_namespace_used(&self) -> Vec<(Option<String>, u64)> {
+        let state = self.state.lock().expect("PoolBudget mutex poisoned");
+        let mut out: Vec<(Option<String>, u64)> = state
+            .per_namespace
+            .iter()
+            .map(|(ns, &bytes)| (ns.clone(), bytes))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Try to reserve `bytes` for a soon-to-seal chunk, blocking up to
     /// `deadline` while waiting for upload-completion to free
     /// headroom. Returns `Ok(())` once the reservation lands; returns
     /// [`BackpressureError`] on timeout. Idempotent vs. `release` —
-    /// the seal path must call `release(bytes)` if the chunk is
-    /// deduped against an existing pool file (and therefore doesn't
-    /// actually consume new disk).
+    /// the seal path must call `release(bytes, namespace)` if the
+    /// chunk is deduped against an existing pool file (and therefore
+    /// doesn't actually consume new disk). The `namespace` tag is
+    /// recorded against the per-namespace breakdown; cap enforcement
+    /// stays backend-wide.
     //
     // `expect` on the mutex/condvar is acceptable here: a poisoned
     // budget mutex is non-recoverable (some other holder panicked
     // mid-update), and the rest of this impl panics the same way.
     #[allow(clippy::unwrap_in_result)]
-    pub fn try_reserve(&self, bytes: u64, deadline: Duration) -> Result<(), BackpressureError> {
+    pub fn try_reserve(
+        &self,
+        bytes: u64,
+        namespace: Option<&str>,
+        deadline: Duration,
+    ) -> Result<(), BackpressureError> {
         // No-gate fast path — used by the unbounded budget tests/CLI
         // construct. Re-read the atomic each time because the eviction
         // worker may rewrite cap when running in `size_gb: auto` mode.
         let cap = self.cap_bytes();
         if cap == 0 && self.disk_free_min_bytes == 0 {
-            let mut g = self.state.lock().expect("PoolBudget mutex poisoned");
-            *g += bytes;
-            self.report_used(*g);
+            let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
+            state.add(namespace, bytes);
+            let used = state.total;
+            drop(state);
+            self.report_used(used);
             return Ok(());
         }
 
@@ -249,12 +326,12 @@ impl PoolBudget {
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
         loop {
             let cap = self.cap_bytes();
-            let pool_room_ok = cap == 0 || *state + bytes <= cap;
+            let pool_room_ok = cap == 0 || state.total + bytes <= cap;
             let disk_room_ok = self.disk_free_min_bytes == 0
                 || disk_free_bytes(&self.data_dir).unwrap_or(u64::MAX) >= self.disk_free_min_bytes;
             if pool_room_ok && disk_room_ok {
-                *state += bytes;
-                let used = *state;
+                state.add(namespace, bytes);
+                let used = state.total;
                 let waited = started.elapsed();
                 if waited > Duration::from_millis(0) && !self.backend.is_empty() {
                     shared_telemetry::record::pool_backpressure_wait(
@@ -270,7 +347,7 @@ impl PoolBudget {
             // a release (cv signal) or the deadline.
             warn!(
                 "Upload backpressure waiting: pool {}/{} bytes, requesting {} more (disk-room {})",
-                *state, cap, bytes, disk_room_ok
+                state.total, cap, bytes, disk_room_ok
             );
             let elapsed = started.elapsed();
             if elapsed >= deadline {
@@ -288,7 +365,7 @@ impl PoolBudget {
                     );
                 }
                 return Err(BackpressureError {
-                    pool_used_bytes: *state,
+                    pool_used_bytes: state.total,
                     pool_cap_bytes: cap,
                     waited_secs,
                 });
@@ -300,7 +377,7 @@ impl PoolBudget {
                 .expect("PoolBudget mutex poisoned");
             state = next_state;
             if wait_outcome.timed_out() {
-                let pool_used_bytes = *state;
+                let pool_used_bytes = state.total;
                 if !self.backend.is_empty() {
                     shared_telemetry::record::pool_backpressure_wait(
                         &self.backend,
@@ -327,10 +404,10 @@ impl PoolBudget {
     /// flushes where returning `Backpressured` would mean dropping
     /// data on the floor. Bounded overshoot: ≤ chunk_max per
     /// concurrent unload.
-    pub fn force_reserve(&self, bytes: u64) {
+    pub fn force_reserve(&self, bytes: u64, namespace: Option<&str>) {
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
-        *state += bytes;
-        let used = *state;
+        state.add(namespace, bytes);
+        let used = state.total;
         drop(state);
         self.report_used(used);
     }
@@ -339,24 +416,28 @@ impl PoolBudget {
     /// after the seal path discovered a dedup hit and the staging
     /// reservation never materialized into a new file). Wakes all
     /// `try_reserve` waiters so the next reservation can proceed.
-    pub fn release(&self, bytes: u64) {
+    pub fn release(&self, bytes: u64, namespace: Option<&str>) {
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
-        *state = state.saturating_sub(bytes);
-        let used = *state;
+        state.sub(namespace, bytes);
+        let used = state.total;
         self.cv.notify_all();
         drop(state);
         self.report_used(used);
     }
 
-    /// Overwrite `current_bytes` with the supplied total. Called by
-    /// the per-product startup walker once it's added up all on-disk
-    /// pool bytes (sealed chunks under `<data_dir>/chunks/<backend>/`
-    /// plus any `DedupScope::Local` namespaces this backend hosts).
-    /// Wakes all `try_reserve` waiters so a startup recount that
-    /// drops `current_bytes` immediately frees backpressure quota.
-    pub fn set_current_bytes(&self, total: u64) {
+    /// Overwrite the budget's accounting with a per-namespace breakdown
+    /// discovered by the startup walker. The walker sums on-disk pool
+    /// bytes per namespace (Global → `None`; each Local volume /
+    /// cartridge → its own UUID-keyed entry under
+    /// `<data_dir>/chunks/<backend>/<namespace>/`) and hands the whole
+    /// map over atomically. Total = sum of bucket values. Wakes all
+    /// `try_reserve` waiters so a startup recount that drops
+    /// `current_bytes` immediately frees backpressure quota.
+    pub fn set_pool_buckets(&self, buckets: HashMap<Option<String>, u64>) {
+        let total: u64 = buckets.values().sum();
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
-        *state = total;
+        state.total = total;
+        state.per_namespace = buckets;
         self.cv.notify_all();
         drop(state);
         self.report_used(total);
@@ -419,10 +500,10 @@ mod tests {
     fn pool_budget_unbounded_admits_every_reservation() {
         let tmp = tempfile::tempdir().unwrap();
         let b = PoolBudget::unbounded(tmp.path().to_path_buf());
-        b.try_reserve(10 * 1024 * 1024 * 1024, Duration::from_secs(1))
+        b.try_reserve(10 * 1024 * 1024 * 1024, None, Duration::from_secs(1))
             .expect("unbounded budget should always admit");
         assert_eq!(b.current_bytes(), 10 * 1024 * 1024 * 1024);
-        b.release(10 * 1024 * 1024 * 1024);
+        b.release(10 * 1024 * 1024 * 1024, None);
         assert_eq!(b.current_bytes(), 0);
     }
 
@@ -431,19 +512,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
         // Fill the budget.
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         assert_eq!(b.current_bytes(), 1024);
 
         // Background thread will release after a short delay.
         let b_bg = b.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            b_bg.release(512);
+            b_bg.release(512, None);
         });
 
         // Foreground reserves must block until the release lands.
         let started = std::time::Instant::now();
-        b.try_reserve(512, Duration::from_secs(2))
+        b.try_reserve(512, None, Duration::from_secs(2))
             .expect("should admit after background release");
         let waited = started.elapsed();
         assert!(
@@ -459,11 +540,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80);
         // Fill the budget.
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         // No background release; second reserve must time out.
         let started = std::time::Instant::now();
         let err = b
-            .try_reserve(1, Duration::from_millis(150))
+            .try_reserve(1, None, Duration::from_millis(150))
             .expect_err("should have timed out");
         let waited = started.elapsed();
         assert!(
@@ -480,9 +561,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80);
         // Already full.
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         // force_reserve must succeed and push us over.
-        b.force_reserve(2048);
+        b.force_reserve(2048, None);
         assert_eq!(b.current_bytes(), 3072);
     }
 
@@ -491,31 +572,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = PoolBudget::new(tmp.path().to_path_buf(), 1000, 0, 80);
         assert!(!b.over_soft_watermark());
-        b.try_reserve(800, Duration::from_secs(1)).unwrap();
+        b.try_reserve(800, None, Duration::from_secs(1)).unwrap();
         assert!(b.over_soft_watermark());
-        b.release(50);
+        b.release(50, None);
         assert!(!b.over_soft_watermark());
     }
 
     #[test]
-    fn set_current_bytes_overwrites_and_wakes_waiters() {
+    fn set_pool_buckets_overwrites_and_wakes_waiters() {
         let tmp = tempfile::tempdir().unwrap();
         let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         assert_eq!(b.current_bytes(), 1024);
 
         // A waiter parked at the cap.
         let b_w = b.clone();
         let handle = std::thread::spawn(move || {
-            b_w.try_reserve(256, Duration::from_secs(2))
+            b_w.try_reserve(256, None, Duration::from_secs(2))
                 .expect("should admit after startup recount")
         });
 
-        // Background thread overwrites current_bytes to a smaller
-        // value (simulating a startup walk that discovered fewer
-        // bytes than the in-memory state).
+        // Background thread overwrites buckets to empty (simulating a
+        // startup walk that discovered fewer bytes than the in-memory
+        // state).
         std::thread::sleep(Duration::from_millis(50));
-        b.set_current_bytes(0);
+        b.set_pool_buckets(HashMap::new());
         handle.join().unwrap();
         assert_eq!(b.current_bytes(), 256);
     }
@@ -524,14 +605,14 @@ mod tests {
     fn set_cap_bytes_grows_and_wakes_waiters() {
         let tmp = tempfile::tempdir().unwrap();
         let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         assert_eq!(b.current_bytes(), 1024);
         assert_eq!(b.cap_bytes(), 1024);
 
         // Waiter blocked at the cap.
         let b_w = b.clone();
         let handle = std::thread::spawn(move || {
-            b_w.try_reserve(256, Duration::from_secs(2))
+            b_w.try_reserve(256, None, Duration::from_secs(2))
                 .expect("should admit after cap grows")
         });
         std::thread::sleep(Duration::from_millis(50));
@@ -547,13 +628,13 @@ mod tests {
     fn set_cap_bytes_shrink_takes_effect_on_next_reserve() {
         let tmp = tempfile::tempdir().unwrap();
         let b = PoolBudget::new(tmp.path().to_path_buf(), 4096, 0, 80);
-        b.try_reserve(1024, Duration::from_secs(1)).unwrap();
+        b.try_reserve(1024, None, Duration::from_secs(1)).unwrap();
         // Shrink below current usage; next reservation must block until
         // a release happens.
         b.set_cap_bytes(512);
         assert_eq!(b.cap_bytes(), 512);
         let err = b
-            .try_reserve(1, Duration::from_millis(50))
+            .try_reserve(1, None, Duration::from_millis(50))
             .expect_err("over-cap reservation must time out");
         assert_eq!(err.pool_cap_bytes, 512);
     }
@@ -568,5 +649,84 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("100/80"));
         assert!(s.contains("7s"));
+    }
+
+    /// Reservations against distinct namespaces share the backend cap
+    /// — a release against one namespace wakes a waiter parked
+    /// against another.
+    #[test]
+    fn release_on_one_namespace_wakes_waiter_on_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
+        b.try_reserve(1024, Some("vol-a"), Duration::from_secs(1))
+            .unwrap();
+
+        let b_bg = b.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            b_bg.release(512, Some("vol-a"));
+        });
+
+        let started = std::time::Instant::now();
+        b.try_reserve(512, Some("vol-b"), Duration::from_secs(2))
+            .expect("vol-b reserver must wake when vol-a releases");
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        let snap = b.per_namespace_used();
+        let map: HashMap<Option<String>, u64> = snap.into_iter().collect();
+        assert_eq!(map.get(&Some("vol-a".to_string())).copied(), Some(512));
+        assert_eq!(map.get(&Some("vol-b".to_string())).copied(), Some(512));
+        assert_eq!(b.current_bytes(), 1024);
+    }
+
+    /// `per_namespace_used` returns a deterministic sorted snapshot
+    /// whose bucket values sum to `current_bytes`. Empty buckets are
+    /// pruned (a namespace that was reserved-then-fully-released
+    /// disappears from the breakdown).
+    #[test]
+    fn per_namespace_used_sums_to_total_and_prunes_empties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = PoolBudget::unbounded(tmp.path().to_path_buf());
+        b.try_reserve(100, None, Duration::from_secs(1)).unwrap();
+        b.try_reserve(200, Some("vol-a"), Duration::from_secs(1))
+            .unwrap();
+        b.try_reserve(300, Some("vol-b"), Duration::from_secs(1))
+            .unwrap();
+
+        let snap = b.per_namespace_used();
+        let sum: u64 = snap.iter().map(|(_, v)| v).sum();
+        assert_eq!(sum, b.current_bytes());
+        assert_eq!(snap.len(), 3);
+        // Sort order: None first, then alphabetical.
+        assert_eq!(snap[0].0, None);
+        assert_eq!(snap[1].0, Some("vol-a".to_string()));
+        assert_eq!(snap[2].0, Some("vol-b".to_string()));
+
+        // Fully drain vol-a; it should drop out of the breakdown.
+        b.release(200, Some("vol-a"));
+        let snap = b.per_namespace_used();
+        assert_eq!(snap.len(), 2);
+        assert!(!snap.iter().any(|(ns, _)| ns.as_deref() == Some("vol-a")));
+    }
+
+    /// `set_pool_buckets` atomically replaces the breakdown — the
+    /// total tracks the sum of bucket values and any prior
+    /// reservations are wiped.
+    #[test]
+    fn set_pool_buckets_replaces_breakdown_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = PoolBudget::unbounded(tmp.path().to_path_buf());
+        b.try_reserve(999, Some("stale-vol"), Duration::from_secs(1))
+            .unwrap();
+
+        let mut fresh = HashMap::new();
+        fresh.insert(None, 100);
+        fresh.insert(Some("vol-a".to_string()), 200);
+        fresh.insert(Some("vol-b".to_string()), 300);
+        b.set_pool_buckets(fresh);
+
+        assert_eq!(b.current_bytes(), 600);
+        let snap = b.per_namespace_used();
+        assert_eq!(snap.len(), 3);
+        assert!(!snap.iter().any(|(ns, _)| ns.as_deref() == Some("stale-vol")));
     }
 }

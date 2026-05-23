@@ -63,6 +63,12 @@ impl shared_admin_monitor::MonitorState for AdminState {
     ) -> std::collections::HashMap<String, Arc<core_mediachanger::PoolBudget>> {
         self.daemon.pool_budgets.clone()
     }
+    fn pool_namespace_label(&self, _backend: &str, namespace: &str) -> Option<String> {
+        // VTL namespace = the cartridge's `Manifest.label` (the
+        // barcode); operators already recognise the label, no lookup
+        // needed.
+        Some(namespace.to_string())
+    }
     fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
         let (cartridges_loaded, cartridges_total, drives_busy, drives_total) = {
             let lib = self.daemon.library.lock().expect("library mutex poisoned");

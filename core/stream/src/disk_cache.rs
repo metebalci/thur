@@ -528,7 +528,7 @@ impl DiskCacheManager {
         };
         store.remove(&candidate.hash)?;
         if let Some(budget) = self.pool_budget.as_ref() {
-            budget.release(candidate.size);
+            budget.release(candidate.size, candidate.namespace.as_deref());
         }
         debug!(
             "Deleted pool file for hash {}.. ({} bytes, namespace {:?})",
@@ -621,22 +621,26 @@ fn manifest_routing_for_backend(
 // at `core/sbc/src/disk_cache.rs`.
 
 /// Walk every chunk on disk under `backend_name` and seed
-/// `budget.set_current_bytes(total)`. Counts the shared per-backend
-/// pool plus each `DedupScope::Local` cartridge's per-cartridge
-/// namespace — both consume the same disk-cache budget and therefore
-/// both must show up in the reservation count.
+/// `budget.set_pool_buckets(per_namespace)`. Counts the shared
+/// per-backend pool (bucketed under `None`) plus each
+/// `DedupScope::Local` cartridge's per-cartridge namespace
+/// (bucketed under `Some(label)`) — both consume the same
+/// disk-cache budget.
 pub fn refresh_pool_budget_from_tapes(
     budget: &PoolBudget,
     data_dir: &Path,
     backend_name: &str,
 ) -> Result<()> {
-    let mut total: u64 = 0;
+    let mut buckets: HashMap<Option<String>, u64> = HashMap::new();
     let store = ChunkStore::new(data_dir, backend_name)?;
-    total += store
+    let global_sum: u64 = store
         .iter_chunks()?
         .into_iter()
         .map(|(_, sz)| sz)
         .sum::<u64>();
+    if global_sum > 0 {
+        buckets.insert(None, global_sum);
+    }
 
     let tapes_dir = data_dir.join("tapes");
     if tapes_dir.is_dir() {
@@ -654,15 +658,18 @@ pub fn refresh_pool_budget_from_tapes(
                 None => continue,
             };
             let ns_store = ChunkStore::new_namespaced(data_dir, backend_name, &label)?;
-            total += ns_store
+            let ns_sum: u64 = ns_store
                 .iter_chunks()?
                 .into_iter()
                 .map(|(_, sz)| sz)
                 .sum::<u64>();
+            if ns_sum > 0 {
+                buckets.insert(Some(label), ns_sum);
+            }
         }
     }
 
-    budget.set_current_bytes(total);
+    budget.set_pool_buckets(buckets);
     Ok(())
 }
 

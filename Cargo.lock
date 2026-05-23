@@ -4479,6 +4479,7 @@ dependencies = [
  "shared-admin-server",
  "shared-pool",
  "shared-telemetry",
+ "tempfile",
  "tokio",
 ]
 

@@ -118,13 +118,22 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
         }
     }
 
-    // Pool block — one row per backend.
-    out.push_str("Pool          used / cap               waiters / waits-since-boot\n");
+    // Pool block — one row per (backend, namespace). Backend-wide
+    // columns (cap, waiters, waits-since-boot) are repeated across
+    // rows sharing a backend; the renderer prints them only on the
+    // first row of each backend group and leaves blanks on the
+    // continuations so the columns stay readable.
+    out.push_str(
+        "Pool                          used / cap                waiters / waits-since-boot\n",
+    );
     if current.pool.is_empty() {
         out.push_str("  (no backends configured)\n");
     } else {
+        let mut prev_backend: Option<&str> = None;
         for p in &current.pool {
-            out.push_str(&format!("  {}\n", render_pool_row(p)));
+            let first_in_group = prev_backend != Some(p.backend.as_str());
+            out.push_str(&format!("  {}\n", render_pool_row(p, first_in_group)));
+            prev_backend = Some(p.backend.as_str());
         }
     }
     out.push('\n');
@@ -175,18 +184,30 @@ fn baseline_at_least(
         .find(|s| latest_ts - s.ts_unix >= secs as i64)
 }
 
-fn render_pool_row(p: &PoolEntry) -> String {
+fn render_pool_row(p: &PoolEntry, first_in_group: bool) -> String {
     let used = shared_cli::fmt::format_bytes(p.used_bytes);
-    let cap = shared_cli::fmt::format_bytes(p.cap_bytes);
-    let pct = if p.cap_bytes > 0 {
-        (p.used_bytes as f64 / p.cap_bytes as f64 * 100.0).round() as u64
+    let label = p
+        .label
+        .clone()
+        .or_else(|| p.namespace.clone())
+        .unwrap_or_else(|| "global".to_string());
+    let row_label = format!("{}/{}", p.backend, label);
+    if first_in_group {
+        let cap = shared_cli::fmt::format_bytes(p.cap_bytes);
+        let pct = if p.cap_bytes > 0 {
+            (p.used_bytes as f64 / p.cap_bytes as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+        format!(
+            "{:<26}  {:>9} / {:>9} {:>3}%   waiters: {}  waits: {}",
+            row_label, used, cap, pct, p.waiters_now, p.backpressure_waits_total,
+        )
     } else {
-        0
-    };
-    format!(
-        "{:<12}  {:>9} / {:>9} {:>3}%   waiters: {}  waits: {}",
-        p.backend, used, cap, pct, p.waiters_now, p.backpressure_waits_total,
-    )
+        // Continuation row: same backend → same cap + backpressure
+        // counters; show only used.
+        format!("{:<26}  {:>9}", row_label, used)
+    }
 }
 
 fn render_cloud_row(c: &CloudEntry, baseline: Option<&MonitorSnapshot>) -> String {
@@ -302,5 +323,47 @@ mod tests {
         assert_eq!(format_uptime(125), "2m 5s");
         assert_eq!(format_uptime(3700), "1h 1m");
         assert_eq!(format_uptime(90_000), "1d 1h 0m");
+    }
+
+    fn pool_entry(backend: &str, ns: Option<&str>, label: Option<&str>, used: u64) -> PoolEntry {
+        PoolEntry {
+            backend: backend.into(),
+            namespace: ns.map(String::from),
+            label: label.map(String::from),
+            used_bytes: used,
+            cap_bytes: 1024 * 1024 * 1024,
+            waiters_now: 0,
+            backpressure_waits_total: 7,
+        }
+    }
+
+    /// Multi-namespace render: backend header row carries cap +
+    /// backpressure counters; continuation rows show only the
+    /// per-namespace used bytes.
+    #[test]
+    fn render_pool_row_suppresses_cap_on_continuation_rows() {
+        let head = render_pool_row(&pool_entry("primary", None, None, 100), true);
+        let cont = render_pool_row(
+            &pool_entry("primary", Some("uuid-a"), Some("vol-a"), 200),
+            false,
+        );
+        assert!(head.contains("primary/global"));
+        assert!(head.contains("waits: 7"));
+        assert!(cont.contains("primary/vol-a"));
+        assert!(!cont.contains("waits:"));
+        assert!(!cont.contains('%'));
+    }
+
+    /// Namespace without a resolved label falls back to the raw
+    /// namespace string ("primary/<ns>"). This is the VSA path when
+    /// a volume has been destroyed mid-tick or the registry hasn't
+    /// caught up.
+    #[test]
+    fn render_pool_row_falls_back_to_namespace_when_label_missing() {
+        let row = render_pool_row(
+            &pool_entry("primary", Some("uuid-orphan"), None, 50),
+            true,
+        );
+        assert!(row.contains("primary/uuid-orphan"));
     }
 }

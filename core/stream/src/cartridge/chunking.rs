@@ -117,18 +117,19 @@ impl Cartridge {
         // SCSI NOT READY at the iSCSI layer; backup software retries).
         // Drop-time flushes pass `force=true` and bypass the gate.
         let staged_bytes = self.cur_chunk.size;
+        let namespace = self.manifest.dedup.namespace(&self.manifest.label);
         if force {
-            self.pool_budget.force_reserve(staged_bytes);
+            self.pool_budget.force_reserve(staged_bytes, namespace);
         } else {
             self.pool_budget
-                .try_reserve(staged_bytes, self.backpressure_deadline)?;
+                .try_reserve(staged_bytes, namespace, self.backpressure_deadline)?;
         }
 
         // Make sure all bytes hit disk before the rename. The hash
         // itself comes from the streaming hasher we updated per-block
         // in `write_data` — we do not re-read the chunk to hash it.
         if let Err(e) = self.cur_file.flush() {
-            self.pool_budget.release(staged_bytes);
+            self.pool_budget.release(staged_bytes, namespace);
             return Err(e.into());
         }
 
@@ -158,12 +159,12 @@ impl Cartridge {
         // multi-MiB chunk, well below pool-budget granularity.
         let hash = if let Some(dek) = self.at_rest_dek {
             let plaintext = std::fs::read(&staging).map_err(|e| {
-                self.pool_budget.release(staged_bytes);
+                self.pool_budget.release(staged_bytes, namespace);
                 SmcError::from(e)
             })?;
             let iv = derive_iv(&self.manifest.uuid, self.cur_chunk_id, 0);
             let ciphertext = shared_crypto::encrypt_block(&dek, &iv, &plaintext).map_err(|e| {
-                self.pool_budget.release(staged_bytes);
+                self.pool_budget.release(staged_bytes, namespace);
                 SmcError::EncryptionError(e.to_string())
             })?;
             // Drop the now-stale streaming plaintext hasher; the
@@ -174,7 +175,7 @@ impl Cartridge {
             // under the ciphertext hash. The pool's atomic rename
             // moves bytes regardless of content.
             std::fs::write(&staging, &ciphertext).map_err(|e| {
-                self.pool_budget.release(staged_bytes);
+                self.pool_budget.release(staged_bytes, namespace);
                 SmcError::from(e)
             })?;
             ct_hash
@@ -191,11 +192,11 @@ impl Cartridge {
         // don't leak quota.
         let dedup_hit = self.chunk_store.exists(&hash);
         if let Err(e) = self.chunk_store.insert_from_path(&staging, &hash) {
-            self.pool_budget.release(staged_bytes);
+            self.pool_budget.release(staged_bytes, namespace);
             return Err(e.into());
         }
         if dedup_hit {
-            self.pool_budget.release(staged_bytes);
+            self.pool_budget.release(staged_bytes, namespace);
         }
 
         // Update the chunk_index entry in place.

@@ -2095,6 +2095,14 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | recovery | `orphan_scan_duration` | Histogram<f64> | s | — |
 | daemon | `daemon_start_time` | Gauge<i64> | s | — |
 
+`pool_*` instruments carry the `backend` attribute only — the cap, the
+backpressure semaphore, and the eviction worker all operate
+backend-wide. Per-namespace pool usage (one row per
+local-dedup volume / cartridge, plus one row for the shared
+global-dedup pool) is surfaced via the `system monitor` job stream's
+`PoolEntry` payload, not via Prometheus, so existing dashboards that
+sum or filter on `backend` keep working unchanged.
+
 ### Process-global handle
 
 The core call sites — cartridge, audit, cloud, iSCSI, pool budget —

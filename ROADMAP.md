@@ -26,6 +26,22 @@ drops back to Parked. Explicit rejections go to Declined.
 
 ## FIXES
 
+### `thurvsa volume info` reports size but not used bytes
+The output today shows `Size:` (creation-frozen) and the runtime byte
+counters (`Host bytes written / read`, `Backend bytes written / read`)
+but no "used" figure — the operator has to run `system stats` and dig a
+volume row out to learn how many pages are actually allocated. `system
+stats` already walks `pages.idx` on the daemon side, so the same walk
+in the `info` handler is cheap (a 100 GiB / 64 KiB volume = ~1.6M page
+index entries, milliseconds).
+
+Sketch: add a pages.idx walk in `vsa/daemon/src/admin/handlers.rs:info`,
+emit `allocated_pages` in the response JSON next to the `runtime`
+block, render `Used: <bytes> (<pct>% of size)` in `print_manifest`
+(`vsa/cli/src/volume.rs:780`). Attached volumes use the on-disk
+pages.idx (in-flight pages not yet committed there are an acceptable
+approximation for an operator-facing field).
+
 ### Raise unit-test coverage on the low-coverage crates
 `docs/TESTCOVERAGE.md` (2026-05-22 `cargo llvm-cov` snapshot) flags four
 crates with real unit-test gaps — meaningful untested branches, not an

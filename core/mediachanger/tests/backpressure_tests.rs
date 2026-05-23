@@ -98,7 +98,7 @@ fn seal_blocks_then_succeeds_after_release() {
     let bg = budget.clone();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
-        bg.release(128 * 1024);
+        bg.release(128 * 1024, None);
     });
 
     // The third write rolls → seal of chunk 2 → reserves 128 KiB →

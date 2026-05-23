@@ -18,6 +18,18 @@
 //! and dispatch `"system.monitor"` here. The product-specific bits
 //! (volumes vs cartridges, drives, sessions) flow through the
 //! [`MonitorState::snapshot_product`] hook.
+//!
+//! ## Pool rows
+//!
+//! One [`PoolEntry`] is emitted per (backend, namespace) pair. The
+//! cap, waiters_now, and backpressure_waits_total counters are
+//! backend-wide; they are repeated verbatim across every row that
+//! shares a backend. The CLI renderer groups by backend and prints
+//! those columns once per group. `namespace = None` is the
+//! global-dedup bucket (shared per-backend pool); a `Some(ns)` row is
+//! a `DedupScope::Local` volume / cartridge. Every backend always
+//! emits at least its `None` row even when the global bucket is empty
+//! so the cap and backpressure counters stay visible.
 
 #![forbid(unsafe_code)]
 
@@ -44,9 +56,20 @@ pub trait MonitorState: Clone + Send + Sync + 'static {
     /// In-process counter sidecar from `shared-telemetry`. Cloned per
     /// tick; the underlying counters are shared.
     fn live_stats(&self) -> Arc<LiveStats>;
-    /// All cloud-backend pool budgets, keyed by backend name. Used
-    /// for the pool used/cap rows.
+    /// All cloud-backend pool budgets, keyed by backend name. The
+    /// monitor renderer flattens each budget's per-namespace
+    /// breakdown into one [`PoolEntry`] per (backend, namespace).
     fn pool_budgets(&self) -> HashMap<String, Arc<PoolBudget>>;
+    /// Human-readable label for a pool namespace, if any. Called once
+    /// per (backend, namespace) at build time; the renderer falls
+    /// back to the raw namespace string when this returns `None`.
+    ///
+    /// VSA: namespace is `hex(volume_uuid)`; resolver looks the
+    /// volume name up in the registry.
+    ///
+    /// VTL: namespace is already the cartridge label, so the
+    /// resolver just echoes it back.
+    fn pool_namespace_label(&self, backend: &str, namespace: &str) -> Option<String>;
     /// Per-product fields. VSA returns `Vsa { volumes_online,
     /// sessions_active }`; VTL returns `Vtl { … }`.
     fn snapshot_product(&self) -> ProductSnapshot;
@@ -87,9 +110,21 @@ pub struct MonitorSnapshot {
     pub audit: AuditEntry,
 }
 
+/// One row of the Pool table — keyed on (backend, namespace).
+///
+/// `namespace = None` is the global-dedup bucket; `Some(ns)` is a
+/// local-dedup volume / cartridge. `label` is the human-readable
+/// name resolved via [`MonitorState::pool_namespace_label`] (volume
+/// name on VSA, cartridge label on VTL); `None` for the global row.
+///
+/// `cap_bytes`, `waiters_now`, and `backpressure_waits_total` are
+/// backend-wide and repeated identically across every row sharing a
+/// backend — the CLI renderer prints them once per backend group.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PoolEntry {
     pub backend: String,
+    pub namespace: Option<String>,
+    pub label: Option<String>,
     pub used_bytes: u64,
     pub cap_bytes: u64,
     pub waiters_now: i64,
@@ -148,21 +183,44 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mut pool: Vec<PoolEntry> = state
-        .pool_budgets()
-        .into_iter()
-        .map(|(name, b)| {
-            let pool_snap = snap.pool.get(&name).copied().unwrap_or_default();
-            PoolEntry {
-                backend: name,
-                used_bytes: b.current_bytes(),
-                cap_bytes: b.cap_bytes(),
-                waiters_now: pool_snap.waiters_now,
-                backpressure_waits_total: pool_snap.waits_total,
-            }
-        })
-        .collect();
-    pool.sort_by(|a, b| a.backend.cmp(&b.backend));
+    let mut pool: Vec<PoolEntry> = Vec::new();
+    for (backend_name, budget) in state.pool_budgets() {
+        let backend_snap = snap.pool.get(&backend_name).copied().unwrap_or_default();
+        let cap = budget.cap_bytes();
+        let breakdown = budget.per_namespace_used();
+        let has_global = breakdown.iter().any(|(ns, _)| ns.is_none());
+        // Always emit at least the (backend, None) row so cap +
+        // backpressure counters are visible even when the global
+        // bucket is empty.
+        if !has_global {
+            pool.push(PoolEntry {
+                backend: backend_name.clone(),
+                namespace: None,
+                label: None,
+                used_bytes: 0,
+                cap_bytes: cap,
+                waiters_now: backend_snap.waiters_now,
+                backpressure_waits_total: backend_snap.waits_total,
+            });
+        }
+        for (ns, used) in breakdown {
+            let label = ns
+                .as_deref()
+                .and_then(|n| state.pool_namespace_label(&backend_name, n));
+            pool.push(PoolEntry {
+                backend: backend_name.clone(),
+                namespace: ns,
+                label,
+                used_bytes: used,
+                cap_bytes: cap,
+                waiters_now: backend_snap.waiters_now,
+                backpressure_waits_total: backend_snap.waits_total,
+            });
+        }
+    }
+    // Sort by (backend, namespace). `None` (global) ahead of any
+    // `Some(_)` so the backend's global row prints first.
+    pool.sort_by(|a, b| a.backend.cmp(&b.backend).then_with(|| a.namespace.cmp(&b.namespace)));
 
     let mut cloud: Vec<CloudEntry> = snap
         .cloud
@@ -195,12 +253,14 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct FakeState {
         started_at: i64,
         live: Arc<LiveStats>,
         budgets: HashMap<String, Arc<PoolBudget>>,
+        labels: HashMap<(String, String), String>,
     }
 
     impl MonitorState for FakeState {
@@ -218,6 +278,11 @@ mod tests {
         }
         fn pool_budgets(&self) -> HashMap<String, Arc<PoolBudget>> {
             self.budgets.clone()
+        }
+        fn pool_namespace_label(&self, backend: &str, namespace: &str) -> Option<String> {
+            self.labels
+                .get(&(backend.to_string(), namespace.to_string()))
+                .cloned()
         }
         fn snapshot_product(&self) -> ProductSnapshot {
             ProductSnapshot::Vsa {
@@ -240,6 +305,7 @@ mod tests {
             started_at: 1_000_000,
             live,
             budgets: HashMap::new(),
+            labels: HashMap::new(),
         };
         let snap = build_payload(&state);
 
@@ -271,11 +337,127 @@ mod tests {
             started_at: 42,
             live,
             budgets: HashMap::new(),
+            labels: HashMap::new(),
         };
         let snap = build_payload(&state);
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: MonitorSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.started_at_unix, 42);
         assert_eq!(parsed.daemon, "fake");
+    }
+
+    /// Two namespaces under one backend → two rows, sorted with the
+    /// global (`None`) row first, then alphabetical. Each row carries
+    /// the same cap and backpressure counters; the per-namespace
+    /// `used_bytes` differs.
+    #[test]
+    fn build_payload_emits_one_row_per_backend_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 4096, 0, 80));
+        budget
+            .try_reserve(100, None, Duration::from_secs(1))
+            .unwrap();
+        budget
+            .try_reserve(200, Some("0011aabb"), Duration::from_secs(1))
+            .unwrap();
+        budget
+            .try_reserve(300, Some("0099ccdd"), Duration::from_secs(1))
+            .unwrap();
+
+        let mut labels = HashMap::new();
+        labels.insert(
+            ("primary".to_string(), "0011aabb".to_string()),
+            "vol-a".to_string(),
+        );
+        labels.insert(
+            ("primary".to_string(), "0099ccdd".to_string()),
+            "vol-b".to_string(),
+        );
+
+        let state = FakeState {
+            started_at: 0,
+            live: Arc::new(LiveStats::default()),
+            budgets: HashMap::from([("primary".to_string(), budget)]),
+            labels,
+        };
+        let snap = build_payload(&state);
+
+        assert_eq!(snap.pool.len(), 3);
+        assert_eq!(snap.pool[0].namespace, None);
+        assert_eq!(snap.pool[0].label, None);
+        assert_eq!(snap.pool[0].used_bytes, 100);
+        assert_eq!(snap.pool[1].namespace.as_deref(), Some("0011aabb"));
+        assert_eq!(snap.pool[1].label.as_deref(), Some("vol-a"));
+        assert_eq!(snap.pool[1].used_bytes, 200);
+        assert_eq!(snap.pool[2].namespace.as_deref(), Some("0099ccdd"));
+        assert_eq!(snap.pool[2].label.as_deref(), Some("vol-b"));
+        assert_eq!(snap.pool[2].used_bytes, 300);
+        // Cap is repeated.
+        assert!(snap.pool.iter().all(|p| p.cap_bytes == 4096));
+        // Backend is repeated.
+        assert!(snap.pool.iter().all(|p| p.backend == "primary"));
+    }
+
+    /// A backend with no reservations still emits one synthetic
+    /// (backend, None) row so the cap and backpressure counters are
+    /// visible on an empty pool.
+    #[test]
+    fn build_payload_emits_synthetic_global_row_on_empty_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 8192, 0, 80));
+
+        let state = FakeState {
+            started_at: 0,
+            live: Arc::new(LiveStats::default()),
+            budgets: HashMap::from([("primary".to_string(), budget)]),
+            labels: HashMap::new(),
+        };
+        let snap = build_payload(&state);
+
+        assert_eq!(snap.pool.len(), 1);
+        assert_eq!(snap.pool[0].backend, "primary");
+        assert_eq!(snap.pool[0].namespace, None);
+        assert_eq!(snap.pool[0].used_bytes, 0);
+        assert_eq!(snap.pool[0].cap_bytes, 8192);
+    }
+
+    /// Two backends side by side, each with its own per-namespace
+    /// breakdown — rows are sorted (backend, namespace) globally.
+    #[test]
+    fn build_payload_sorts_two_backends_with_breakdowns_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b_primary = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 4096, 0, 80));
+        b_primary
+            .try_reserve(100, None, Duration::from_secs(1))
+            .unwrap();
+        b_primary
+            .try_reserve(200, Some("vol-a"), Duration::from_secs(1))
+            .unwrap();
+        let b_secondary = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 4096, 0, 80));
+        b_secondary
+            .try_reserve(50, Some("vol-z"), Duration::from_secs(1))
+            .unwrap();
+
+        let state = FakeState {
+            started_at: 0,
+            live: Arc::new(LiveStats::default()),
+            budgets: HashMap::from([
+                ("primary".to_string(), b_primary),
+                ("secondary".to_string(), b_secondary),
+            ]),
+            labels: HashMap::new(),
+        };
+        let snap = build_payload(&state);
+
+        // primary/None, primary/vol-a, secondary/None (synthetic), secondary/vol-z
+        assert_eq!(snap.pool.len(), 4);
+        assert_eq!(snap.pool[0].backend, "primary");
+        assert_eq!(snap.pool[0].namespace, None);
+        assert_eq!(snap.pool[1].backend, "primary");
+        assert_eq!(snap.pool[1].namespace.as_deref(), Some("vol-a"));
+        assert_eq!(snap.pool[2].backend, "secondary");
+        assert_eq!(snap.pool[2].namespace, None);
+        assert_eq!(snap.pool[3].backend, "secondary");
+        assert_eq!(snap.pool[3].namespace.as_deref(), Some("vol-z"));
     }
 }

@@ -65,6 +65,21 @@ end-to-end between both products:
   At startup the budget is seeded from the actual on-disk pool state so that
   a restart does not silently re-grant bytes that survived on disk (VTL's
   `refresh_from_disk`; VSA's `core_block::refresh_pool_budget_from_volumes`).
+  The seed is a per-namespace breakdown — global-dedup bytes under the
+  `None` bucket, each local-dedup volume / cartridge under
+  `Some(uuid_hex)` / `Some(label)` — so a restart that picks up two
+  namespaces' on-disk bytes can attribute them correctly in the
+  monitor view.
+
+- **Backend-wide cap, per-namespace tracking.** The hard cap and the
+  backpressure semaphore are backend-wide — every reserver (no matter
+  which namespace it carries) blocks on the same gate, and a release
+  against one namespace wakes a waiter parked against another. The
+  per-namespace counter exists for reporting only, surfaced via the
+  `system monitor` job stream's `PoolEntry` payload as one row per
+  (backend, namespace). Prometheus instruments stay backend-only so
+  existing operator dashboards don't break (see `docs/SPEC.md` §
+  Telemetry).
 
 - **Two trigger conditions.** A reservation blocks if **either** is true:
 

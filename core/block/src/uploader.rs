@@ -696,8 +696,12 @@ impl VolumeWriter {
         // at the data-path layer; host backup software retries).
         // Mirrors `core_stream::cartridge::chunking::seal_current_chunk`.
         let reserved_bytes = payload.len() as u64;
-        self.pool_budget
-            .try_reserve(reserved_bytes, self.backpressure_deadline)?;
+        let namespace = self.manifest.pool_namespace();
+        self.pool_budget.try_reserve(
+            reserved_bytes,
+            namespace.as_deref(),
+            self.backpressure_deadline,
+        )?;
 
         let insert_result = self.pool.insert_bytes(payload);
         let (hash_hex, was_new) = match insert_result {
@@ -705,7 +709,8 @@ impl VolumeWriter {
             Err(e) => {
                 // Pool insert failed before any bytes hit disk —
                 // release the quota we reserved.
-                self.pool_budget.release(reserved_bytes);
+                self.pool_budget
+                    .release(reserved_bytes, namespace.as_deref());
                 return Err(e.into());
             }
         };
@@ -713,7 +718,8 @@ impl VolumeWriter {
             // Local dedup hit: the chunk was already in the pool, so
             // our reservation never consumed new disk — release it
             // before continuing so the budget reflects reality.
-            self.pool_budget.release(reserved_bytes);
+            self.pool_budget
+                .release(reserved_bytes, namespace.as_deref());
         }
         let hash_bytes = decode_hash(&hash_hex)?;
 

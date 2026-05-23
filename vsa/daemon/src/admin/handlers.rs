@@ -130,6 +130,17 @@ impl shared_admin_monitor::MonitorState for AdminState {
     ) -> std::collections::HashMap<String, Arc<shared_pool::PoolBudget>> {
         self.pool_budgets.clone()
     }
+    fn pool_namespace_label(&self, _backend: &str, namespace: &str) -> Option<String> {
+        // VSA namespace = hex(volume_uuid). Walk the registry; backend
+        // ignored because a UUID is unique across backends.
+        for (_lun, cache) in self.registry.entries() {
+            let m = cache.manifest();
+            if hex::encode(m.uuid) == namespace {
+                return Some(m.name.clone());
+            }
+        }
+        None
+    }
     fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
         shared_admin_monitor::ProductSnapshot::Vsa {
             volumes_online: self.registry.len() as u64,

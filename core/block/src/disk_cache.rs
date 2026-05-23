@@ -34,10 +34,12 @@ use crate::upload_index::{UploadIndexFile, UploadState};
 use crate::volume::{DedupScope, VolumeManifest, namespace_from_uuid};
 
 /// Walk every chunk on disk under `backend_name` and seed
-/// `budget.set_current_bytes(total)`. Counts the shared per-backend
-/// pool plus each `DedupScope::Local` volume's per-volume namespace —
-/// both consume the same disk-cache budget and therefore both must
-/// show up in the reservation count.
+/// `budget.set_pool_buckets(per_namespace)`. Counts the shared
+/// per-backend pool (bucketed under `None`) plus each
+/// `DedupScope::Local` volume's per-volume namespace (bucketed under
+/// `Some(uuid_hex)`) — both consume the same disk-cache budget. The
+/// returned value is the backend total, summed across buckets, for
+/// the caller's log line.
 ///
 /// Mirrors `core_stream::disk_cache::refresh_pool_budget_from_tapes`
 /// modulo terminology: VSA walks `<data_dir>/volumes/<name>/manifest.json`
@@ -50,14 +52,17 @@ pub fn refresh_pool_budget_from_volumes(
     data_dir: &Path,
     backend_name: &str,
 ) -> Result<u64, ChunkPoolError> {
-    let mut total: u64 = 0;
+    let mut buckets: HashMap<Option<String>, u64> = HashMap::new();
 
     let pool = ChunkPool::new(data_dir, backend_name)?;
-    total += pool
+    let global_sum: u64 = pool
         .iter_chunks()?
         .into_iter()
         .map(|(_, sz)| sz)
         .sum::<u64>();
+    if global_sum > 0 {
+        buckets.insert(None, global_sum);
+    }
 
     let volumes_dir = data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
     if volumes_dir.is_dir() {
@@ -72,15 +77,19 @@ pub fn refresh_pool_budget_from_volumes(
             }
             let ns = namespace_from_uuid(&routing.uuid);
             let ns_pool = ChunkPool::new_namespaced(data_dir, backend_name, &ns)?;
-            total += ns_pool
+            let ns_sum: u64 = ns_pool
                 .iter_chunks()?
                 .into_iter()
                 .map(|(_, sz)| sz)
                 .sum::<u64>();
+            if ns_sum > 0 {
+                buckets.insert(Some(ns), ns_sum);
+            }
         }
     }
 
-    budget.set_current_bytes(total);
+    let total: u64 = buckets.values().sum();
+    budget.set_pool_buckets(buckets);
     Ok(total)
 }
 
@@ -317,7 +326,7 @@ impl DiskCacheManager {
                 Ok(()) => {
                     freed += c.size;
                     if let Some(budget) = self.pool_budget.as_ref() {
-                        budget.release(c.size);
+                        budget.release(c.size, c.namespace.as_deref());
                     }
                     debug!(
                         "Evicted chunk {}.. ({} B, ns {:?}) from backend '{}'",
