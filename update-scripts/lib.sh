@@ -129,6 +129,23 @@ install_pkg() {
   esac
 }
 
+# stop_if_loaded SERVICE — `systemctl stop` only when systemd has
+# the unit loaded. On a fresh host where the .deb / .rpm has never
+# been installed, the unit file does not exist and `systemctl stop`
+# would fail the `set -e` check and trigger the EXIT trap's
+# "INTERRUPTED" notice for what is really a clean first-install run.
+# `systemctl cat <svc>` returns non-zero when the unit isn't on disk
+# and is the canonical existence probe.
+stop_if_loaded() {
+  local svc=$1
+  if systemctl cat "$svc" >/dev/null 2>&1; then
+    log "stopping $svc"
+    run systemctl stop "$svc"
+  else
+    log "$svc not installed yet — skipping stop (first-install run)"
+  fi
+}
+
 # wait_active SERVICE — block until systemd reports it active.
 wait_active() {
   local svc=$1 i s
@@ -244,7 +261,7 @@ update_vsa() {
   done < <(grep '^NVME|' "$STATE" || true)
 
   # ---- swap the package ---------------------------------------------
-  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  stop_if_loaded "$SERVICE"
   install_pkg "$pkg"
   log "starting $SERVICE"; run systemctl start "$SERVICE"
   wait_active "$SERVICE"
@@ -345,7 +362,7 @@ update_vtl() {
   done
 
   # ---- swap the package ---------------------------------------------
-  log "stopping $SERVICE"; run systemctl stop "$SERVICE"
+  stop_if_loaded "$SERVICE"
   install_pkg "$pkg"
   log "starting $SERVICE"; run systemctl start "$SERVICE"
   wait_active "$SERVICE"

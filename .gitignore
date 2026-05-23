@@ -17,6 +17,9 @@ target/
 .claude/
 .*.swp
 
+# Python bytecode caches (scripts/coverage-report.py and friends).
+__pycache__/
+
 # Maintainer-private state (cloud credentials for integration tests,
 # vendor reference PDFs, GPG signing-key backup notes). Local-only —
 # never check anything under here into the repo.
