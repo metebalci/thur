@@ -366,12 +366,16 @@ async fn main() -> Result<()> {
     // discovery so registry lookups always resolve. Concurrency cap
     // matches the per-volume flush concurrency — both are sized off
     // the same `cloud.upload.max_concurrent` knob.
+    // Wrap discovery's backends map in the same Arc<Mutex> AdminState
+    // will hold so runtime adds via `get_or_init_backend` are visible
+    // to the worker. Pre-fix the worker held a snapshot taken here;
+    // any post-boot `volume create` would never see the new backend
+    // in the worker, and every page dispatched against it silently
+    // hit "backend unknown" (warned-once-and-drop).
+    let admin_backends = Arc::new(Mutex::new(backends));
     let upload_worker_handle = {
         let registry = Arc::clone(&registry);
-        let backends = backends
-            .iter()
-            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-            .collect();
+        let backends = Arc::clone(&admin_backends);
         let max_concurrent = max_concurrent_flushes;
         Some(tokio::spawn(async move {
             if let Err(e) =
@@ -596,7 +600,7 @@ async fn main() -> Result<()> {
         data_dir: data_dir.clone(),
         cloud: Arc::new(cfg.cloud.clone()),
         registry: Arc::clone(&registry),
-        backends: Arc::new(Mutex::new(backends)),
+        backends: admin_backends,
         audit: audit_channel_for_admin,
         audit_dir: audit_dir(&cfg.audit, &data_dir),
         jobs: Arc::new(shared_admin_server::JobRegistry::new()),

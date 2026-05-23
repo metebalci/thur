@@ -1464,7 +1464,10 @@ mod tests {
         // sender is wired (tests, CLI tools).
         let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
         cache.write_bytes(0, &pattern(0x11, PAGE)).await.unwrap();
-        cache.write_bytes(PAGE as u64, &pattern(0x22, PAGE)).await.unwrap();
+        cache
+            .write_bytes(PAGE as u64, &pattern(0x22, PAGE))
+            .await
+            .unwrap();
         cache.flush_all().await.unwrap();
         let snap = cache.runtime_snapshot();
         // Two pages flushed, no compression / encryption — each PUT

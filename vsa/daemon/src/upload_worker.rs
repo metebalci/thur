@@ -46,7 +46,7 @@ use anyhow::Result;
 use core_block::{PageCache, UploadState, UploadTask};
 use shared_cloud::CloudBackend;
 use shared_upload_worker::upload_chunk_inert;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::registry::VolumeRegistry;
@@ -78,12 +78,11 @@ pub fn upload_channel() -> (mpsc::Sender<UploadTask>, mpsc::Receiver<UploadTask>
 pub async fn run_upload_worker(
     mut rx: mpsc::Receiver<UploadTask>,
     registry: Arc<VolumeRegistry>,
-    backends: BTreeMap<String, Arc<dyn CloudBackend>>,
+    backends: Arc<Mutex<BTreeMap<String, Arc<dyn CloudBackend>>>>,
     max_concurrent: usize,
 ) -> Result<()> {
     let concurrency = max_concurrent.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let backends = Arc::new(backends);
     info!(
         "thurvsa upload worker started (max_concurrent={}, channel_depth={})",
         concurrency, UPLOAD_CHANNEL_DEPTH
@@ -117,17 +116,27 @@ pub async fn run_upload_worker(
 /// next write or boot-time scan re-enqueues.
 async fn run_one_task(
     task: UploadTask,
-    backends: &BTreeMap<String, Arc<dyn CloudBackend>>,
+    backends: &Arc<Mutex<BTreeMap<String, Arc<dyn CloudBackend>>>>,
     registry: &VolumeRegistry,
 ) {
-    let backend = match backends.get(&task.payload.backend_name) {
-        Some(b) => Arc::clone(b),
-        None => {
-            warn!(
-                "upload worker: backend '{}' unknown (volume='{}' page={}); leaving LocalOnly",
-                task.payload.backend_name, task.volume_name, task.payload.item_id
-            );
-            return;
+    // Share the same map AdminState holds so backends instantiated by
+    // a runtime `volume create` (via admin/handlers.rs's
+    // `get_or_init_backend`) are visible here. Pre-fix this was a
+    // snapshot taken at boot, which meant any post-boot create's
+    // pages dispatched into the worker hit "backend unknown" and the
+    // upload silently no-op'd into LocalOnly forever — invisible to
+    // operators because daemon restart re-populates discovery's map.
+    let backend = {
+        let guard = backends.lock().await;
+        match guard.get(&task.payload.backend_name) {
+            Some(b) => Arc::clone(b),
+            None => {
+                warn!(
+                    "upload worker: backend '{}' unknown (volume='{}' page={}); leaving LocalOnly",
+                    task.payload.backend_name, task.volume_name, task.payload.item_id
+                );
+                return;
+            }
         }
     };
     let cache = match registry.get_by_name(&task.volume_name) {
