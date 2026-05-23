@@ -54,8 +54,8 @@ A cartridge is a directory under `<data_dir>/tapes/<barcode>/`:
 - **`runtime.json`** — daemon-mutated sidecar: `partitions`,
   `active_partition`, `pending_partition_layout`,
   `set_capacity_proportion`, `index_epoch`, and four lifetime byte
-  counters. `host_bytes_written` (the FETB counter) and
-  `host_bytes_read` are logical, pre-dedup totals of what the host
+  counters. `host_bytes_written` and `host_bytes_read` are logical,
+  pre-dedup totals of what the host
   wrote and read; `backend_bytes_written` and `backend_bytes_read`
   are the post-dedup, post-compression bytes actually PUT to /
   fetched from cloud, so the gap between a host counter and its
@@ -230,8 +230,8 @@ A volume is a directory under `<data_dir>/volumes/<name>/`:
   fsync + rename.
 - **`runtime.json`** — daemon-mutated sidecar carrying the four
   per-volume byte counters plus `modified_at` and `sync_after`.
-  `host_bytes_written` (the FETB capacity counter) and
-  `host_bytes_read` are logical, pre-dedup totals of what the
+  `host_bytes_written` and `host_bytes_read` are logical,
+  pre-dedup totals of what the
   initiator wrote and read; `backend_bytes_written` and
   `backend_bytes_read` are the post-dedup, post-compression bytes
   actually PUT to / fetched from cloud, so the gap between a host

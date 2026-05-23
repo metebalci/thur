@@ -1035,10 +1035,11 @@ ciphertext, and the IV is derived at read time as `derive_iv(uuid,
 chunk_id, 0)`. The keystore lifecycle and the AME composition rules
 are in [`AUTH.md`](AUTH.md) § *VTL keystore backends*.
 
-Everything that mutates at runtime — the partition layout, the FETB
-counter, the index-backup epoch, the host-set capacity proportion, the
-pending partition layout — is kept out of the manifest and lives in a
-sibling `runtime.json` sidecar (described in the next section).
+Everything that mutates at runtime — the partition layout, the
+lifetime host-byte counters, the index-backup epoch, the host-set
+capacity proportion, the pending partition layout — is kept out of
+the manifest and lives in a sibling `runtime.json` sidecar (described
+in the next section).
 Neither the per-block nor the per-chunk index is stored in either file
 either (see "Block Index Files" and "Chunk Index File" below).
 Keeping all of that out is what makes the manifest **O(1) in size** no
@@ -1059,7 +1060,7 @@ per-write.
     "chunks":    { "pages": 1,  "page_size": 1048576, "epoch": 7,  "file_size": 4128 },
     "blocks-p0": { "pages": 4,  "page_size": 1048576, "epoch": 7,  "file_size": 3145760 }
   },
-  "host_bytes_written":   5368709120, // lifetime FETB; pre-dedup, pre-compression; reset on ERASE
+  "host_bytes_written":   5368709120, // lifetime host writes; pre-dedup, pre-compression; reset on ERASE
   "host_bytes_read":      4294967296, // lifetime plaintext bytes served to the host on READ
   "backend_bytes_written": 2147483648, // lifetime on-wire bytes PUT to cloud; post-dedup, post-compression
   "backend_bytes_read":    1073741824  // lifetime bytes fetched from cloud on a chunk cache miss
@@ -1080,9 +1081,9 @@ creation, so an out-of-band identity mutation like `cartridge
 migrate` cannot race against a hot-path persist.
 
 `runtime.json` carries four lifetime byte counters. `host_bytes_written`
-is the cartridge's FETB counter: incremented in `Cartridge::write_data`
-by the **plaintext** byte length — counted before drive-side
-compression and before chunk dedup. `host_bytes_read` is its read-side
+is incremented in `Cartridge::write_data` by the **plaintext** byte
+length — counted before drive-side compression and before chunk dedup.
+`host_bytes_read` is its read-side
 mirror, incremented by the plaintext length handed back to the host on
 each READ (post-decrypt, post-decompress; filemark reads do not count).
 `backend_bytes_written` is the on-wire bytes PUT to cloud — post-dedup,
@@ -1096,9 +1097,7 @@ on the write side and the cache hit rate on the read side. All four
 are monotonic — never decremented on an overwrite, a rewind, or ALLOW
 OVERWRITE. ERASE and FORMAT MEDIUM reset all four to 0, because the
 medium is now logically blank. Restore-archive preserves the source
-cartridge's values. The FETB telemetry sampler walks every
-`tapes/<barcode>/runtime.json` every 6 hours and emits the
-`host_bytes_written` sum as a `fetb.sample` audit event.
+cartridge's values.
 
 `uuid` is sticky: 16 random bytes drawn from the OS CSPRNG at create
 time and never modified afterward. It is mixed into the per-block
@@ -2069,8 +2068,6 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | alerting | `alerts_fired_total` | Counter<u64> | — | `class`, `severity`, `sink`, `outcome` |
 | recovery | `orphan_scan_chunks_found_total` | Counter<u64> | — | — |
 | recovery | `orphan_scan_duration` | Histogram<f64> | s | — |
-| fetb | `fetb_latest_bytes` | Gauge<u64> | By | — |
-| fetb | `fetb_sample_count` | Gauge<u64> | — | — |
 | daemon | `daemon_start_time` | Gauge<i64> | s | — |
 
 ### Process-global handle
@@ -2142,43 +2139,10 @@ rather than this open HTTP endpoint.
 
 ---
 
-## FETB Telemetry
-
-The daemon samples front-end TiB — FETB, the count of bytes the host
-writes into the VTL measured before dedup and before compression —
-purely as an operational telemetry signal. There is no cap, no gate,
-and no enforcement built on the figure.
-
-### FETB sampler
-
-The sampler runs every 6 hours; the interval is hardcoded. Each sample
-sums `runtime.json::host_bytes_written` across every cartridge under
-`<data_dir>/tapes/` — that is one `fs::read` per `runtime.json`
-sidecar, with no `chunks.idx` opened. The sum is emitted as a single
-`fetb.sample` audit event carrying `{ts, fetb_bytes,
-cartridge_count}`. The audit log is the *only* place this is
-persisted; there is no separate JSON cache. The sampler itself lives
-in `shared_audit::fetb` (`take_sample`, `count_samples_in_window`,
-`record_fetb_sample`, `run_fetb_sampler`).
-
-The telemetry meter reads back the trailing 4-week (28-day) window of
-`fetb.sample` audit entries. That is what sets the audit retention
-floor: `audit.retention_days` must be `>= 40` (the default is 90), and
-below 40 the daemon refuses to start, because the meter needs at least
-4 weeks of history plus some margin.
-
-### Telemetry metrics
-
-| Metric | Description |
-|---|---|
-| `thurvtl_fetb_latest_bytes` | Latest raw FETB sample (bytes). |
-| `thurvtl_fetb_sample_count` | Samples in the trailing 4-week window. |
-
-### Audit events
+## Boot-Time Recovery Audit Events
 
 | Event | When | Body |
 |---|---|---|
-| `fetb.sample` | Every sampler tick (every 6 h) and once at startup if the audit log carried no FETB history (bootstrap). | `ts: RFC3339`, `fetb_bytes: u64`, `cartridge_count: u64`, optional `reason: "startup-bootstrap"`. |
 | `cloud.orphan_scan_started` | Boot-time scan begins walking `<data_dir>/tapes/` for sealed-but-not-uploaded chunks. One entry per daemon start. | `cartridges_scanned: u64`. |
 | `cloud.orphan_scan_completed` | Same scan ends. `orphans_requeued < orphans_found` indicates one or more upload-worker dispatches failed (channel closed). | `orphans_found: u64`, `orphans_requeued: u64`, `duration_seconds: f64`. |
 

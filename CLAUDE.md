@@ -126,10 +126,7 @@ on-disk paths group by purpose.
   VSA keystore backends. Operators move a volume's wrap-target with
   `thurvsa volume key migrate NAME --to NAME` (daemon-down).
 - `shared/audit` (`shared-audit`) — append-only BLAKE3-chained log +
-  cloneable `AuditChannel` producer + rate limiter. Also carries the
-  `fetb` module (`take_sample`, `count_samples_in_window`,
-  `record_fetb_sample`, `run_fetb_sampler`) — FETB sampling as pure
-  operational telemetry, no cap or gate.
+  cloneable `AuditChannel` producer + rate limiter.
 - `shared/telemetry` (`shared-telemetry`) — OpenTelemetry SDK
   plumbing, Prometheus pull + OTLP push. Per-product instrument
   prefix (`thurvtl_*` / `thurvsa_*`) sourced from
@@ -267,8 +264,7 @@ adapter layers between products are in
   task drains a cloneable `AuditChannel` mpsc; daemon-down CLI flows queue
   to `<audit_dir>/pending/` for replay on next start. Host-driven failure
   paths are rate-limited via `AuditRateLimiter` (60 s window).
-  `audit.retention_days` defaults to 90 and must be ≥ 40 (the FETB
-  telemetry meter walks the trailing 4 weeks). Full design in
+  `audit.retention_days` defaults to 90. Full design in
   [`docs/AUDIT.md`](docs/AUDIT.md); schema +
   rate-limited-rollup shape in
   [`docs/SPEC.md`](docs/SPEC.md) § Audit Log.

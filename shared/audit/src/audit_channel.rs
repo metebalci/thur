@@ -19,8 +19,8 @@
 //! once per occurrence.
 //!
 //! Lifecycle. Build an `AuditLog` synchronously, run any startup-time
-//! sync work (`replay_pending`, the bootstrap `daemon.start` and
-//! `license.fetb_sample` entries), then call [`spawn_writer`]. The
+//! sync work (`replay_pending`, the bootstrap `daemon.start` entry),
+//! then call [`spawn_writer`]. The
 //! returned [`AuditChannel`] is the runtime producer handle (Clone,
 //! cheap); [`AuditWriterHandle`] is held by the daemon for shutdown.
 //! On shutdown the daemon calls [`AuditWriterHandle::shutdown`] which

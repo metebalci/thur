@@ -114,7 +114,6 @@ coherent area of the daemon and the files that instrument it:
 | `prefetch` | Queue depth, hit/miss counts | `prefetch.rs` |
 | `audit` | Append rate by entry kind, chain resets, queue drops | `audit.rs` |
 | `recovery` | Orphan-upload scan: chunks found by boot-time sweep + scan duration | `vtl/daemon/src/upload_recovery.rs` (thurvtl only) |
-| `fetb` | Latest FETB sample (bytes) + sample count in the trailing 4-week window | `shared/audit/src/fetb.rs` |
 | `daemon` | Process start time | `vtl/daemon/src/main.rs` |
 
 ## Metrics meant to be combined
@@ -137,10 +136,6 @@ operator actually cares about. Substitute the product prefix as needed
 - **Pool fill** = `thurvtl_pool_used_bytes / thurvtl_pool_cap_bytes`.
   This is the primary backpressure trigger. The closer it sits to
   `1.0`, the more often a chunk-seal has to block waiting for room.
-- **FETB** = `thurvtl_fetb_latest_bytes`. The most recent front-end
-  TiB sample — bytes the host wrote, measured before dedup and before
-  compression. It is operational telemetry only: no cap, no gate. Both
-  products emit the `*_fetb_*` series.
 
 The dedup analytics CLI (`thurvtl system stats`) walks
 `chunks.idx` directly when you want per-cartridge breakdowns. The

@@ -17,9 +17,6 @@
 //! - [`audit_ratelimit`] — host-driven failure rollups
 //!   (`iscsi.chap.failure`, `iscsi.move_medium`, …) over a 60 s
 //!   window with a 10 s flush sweep.
-//! - [`fetb`] — front-end-TB telemetry sampler. Emits `fetb.sample`
-//!   rows into this chain and rebuilds the rolling-window count from
-//!   them; pure telemetry, no enforcement.
 //!
 //! Internal `record::*` calls forward into `shared-telemetry` for the
 //! `audit_entries_total`, `audit_chain_resets_total`, and
@@ -30,7 +27,6 @@
 pub mod audit;
 pub mod audit_channel;
 pub mod audit_ratelimit;
-pub mod fetb;
 
 pub use audit::{
     AuditActor, AuditConfig, AuditEntry, AuditError, AuditLog, AuditMode, AuditResult,

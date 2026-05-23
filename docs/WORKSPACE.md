@@ -203,9 +203,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   producer + bounded mpsc + single-writer drainer `spawn_writer`,
   `Shutdown` sentinel draining FIFO before exit), `audit_ratelimit.rs`
   (`AuditRateLimiter` — host-driven failure rollups over a 60 s window
-  with a 10 s flush sweep), `fetb.rs` (`take_sample`,
-  `count_samples_in_window`, `record_fetb_sample`, `run_fetb_sampler`
-  — FETB sampling as pure operational telemetry, no cap or gate).
+  with a 10 s flush sweep).
   Internal metric calls forward to `shared-telemetry` for the
   `audit_entries_total` / `audit_chain_resets_total` /
   `audit_queue_drops_total` counters. core-mediachanger re-exports the
@@ -214,8 +212,8 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-telemetry** — OpenTelemetry SDK plumbing. One
   `SdkMeterProvider` with two readers: Prometheus pull (always wired) +
   OTLP push (opt-in). The `Telemetry` struct carries every instrument
-  handle (pool, cloud, chunk, iscsi, tape, prefetch, audit, fetb,
-  daemon). Per-product instrument prefix (`thurvtl_*` / `thurvsa_*`)
+  handle (pool, cloud, chunk, iscsi, tape, prefetch, audit, daemon).
+  Per-product instrument prefix (`thurvtl_*` / `thurvsa_*`)
   sourced from `shared_naming::PRODUCT.metric_prefix`; the
   `service.name` OTel resource attribute (`thurvtl` / `thurvsa`)
   carries the distinction redundantly. A process-global
@@ -410,7 +408,8 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   — a volume directory always has all three files or none.
 - `core-block::runtime_state::VolumeRuntime` — daemon-mutated sidecar
   at `<data_dir>/volumes/<name>/runtime.json` (atomic tmp+rename).
-  Carries `host_bytes_written` (FETB counter) and `modified_at`. Split
+  Carries `host_bytes_written` (lifetime host write counter,
+  pre-dedup/compression) and `modified_at`. Split
   out of the manifest so the identity file stays byte-stable
   post-create and `volume key migrate` can rewrite `encryption.*`
   daemon-up without racing the writer's flush.

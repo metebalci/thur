@@ -75,9 +75,7 @@ struct Config {
     drive: Option<DriveConfig>,
     /// Audit log configuration. Always-on (writes to
     /// `<data_dir>/audit/` by default), tamper-evident BLAKE3 chain.
-    /// No `enabled` knob — the FETB telemetry meter and the audit
-    /// chain are co-engineered, and disabling either silently
-    /// breaks the other.
+    /// No `enabled` knob — audit is unconditional.
     #[serde(default)]
     audit: AuditConfig,
     /// Telemetry / observability. The Prometheus `/metrics` endpoint
@@ -102,14 +100,6 @@ struct Config {
     alerting: shared_alerting::AlertingConfig,
 }
 
-/// Hard floor on the operator-configured audit retention. The FETB
-/// telemetry meter counts the trailing 28-day (4-week) window of
-/// `fetb.sample` audit rows on every daemon startup; below 40 days
-/// of retention there isn't enough margin between that window and
-/// the audit-rotation cliff. Drop below 40 → daemon refuses to
-/// start. No silent bump.
-const MIN_AUDIT_RETENTION_DAYS: u32 = 40;
-
 #[derive(Debug, Deserialize, Clone)]
 struct AuditConfig {
     /// Directory for audit files. Default: `<data_dir>/audit`. Override
@@ -122,10 +112,7 @@ struct AuditConfig {
     #[serde(default = "default_audit_compress_rotated")]
     compress_rotated: bool,
     /// How many days of audit history the daemon keeps locally before
-    /// pruning rotated files. The FETB telemetry meter counts the
-    /// trailing 28-day (4-week) window on startup; the floor
-    /// enforces ~12 days of margin over that window. Default 90;
-    /// minimum 40 (refuse-to-start below).
+    /// pruning rotated files. Default 90.
     #[serde(default = "default_audit_retention_days")]
     retention_days: u32,
 }
@@ -695,35 +682,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 🔸 Audit retention floor. The FETB telemetry meter counts the
-    // trailing 28-day window on every startup; below
-    // `MIN_AUDIT_RETENTION_DAYS` we lose the margin we need.
-    if cfg.audit.retention_days < MIN_AUDIT_RETENTION_DAYS {
-        return Err(anyhow::anyhow!(
-            "audit.retention_days = {} is below the {}-day floor. The FETB telemetry \
-             meter requires at least {} days of audit history. Raise audit.retention_days \
-             in thurvtl.yaml.",
-            cfg.audit.retention_days,
-            MIN_AUDIT_RETENTION_DAYS,
-            MIN_AUDIT_RETENTION_DAYS,
-        ));
-    }
-
     // 🔸 Open the audit log. Always on — there is no enabled knob.
     // The daemon is the sole writer once started; daemon-down CLI
     // flows (`library init` / `library modify`) drop their entries
     // into `<audit_dir>/pending/` and we drain that queue right after
-    // open. A broken chain refuses to start (both tiers) — the
-    // FETB telemetry meter counts the chain on every startup.
+    // open. A broken chain refuses to start (both tiers).
     let audit_log_dir = cfg.audit.dir.as_ref().map_or_else(
         || std::path::PathBuf::from(&cfg.data_dir).join("audit"),
         std::path::PathBuf::from,
     );
 
     // Open the audit log synchronously and run all startup-time sync
-    // writes (replay queue drain, daemon.start, bootstrap FETB sample)
-    // through the underlying `Arc<AuditLog>` directly. Once those are
-    // done, [`spawn_audit_writer`] takes over: every subsequent runtime
+    // writes (replay queue drain, daemon.start) through the underlying
+    // `Arc<AuditLog>` directly. Once those are done,
+    // [`spawn_audit_writer`] takes over: every subsequent runtime
     // append goes through the channel-backed writer task so iSCSI and
     // admin handlers never sit on the chain mutex.
     let audit_log_arc: Option<std::sync::Arc<core_mediachanger::AuditLog>> = {
@@ -772,18 +744,17 @@ async fn main() -> Result<()> {
                 }
                 // Stays on the sync `Arc<AuditLog>` path because the
                 // channel writer task hasn't been spawned yet — this
-                // entry, plus the bootstrap fetb sample below, are the
-                // only writes that hit the chain mutex directly.
+                // entry is the only write that hits the chain mutex
+                // directly before [`spawn_audit_writer`] takes over.
                 Some(log)
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
-                    "audit log: failed to open at {}: {}. The FETB telemetry meter \
-                     depends on the audit chain; the daemon refuses to start until the \
-                     chain is healthy. Investigate with `thurvtl system audit verify`, \
-                     then either fix the underlying issue or run \
-                     `thurvtl system audit rotate --accept-break` to acknowledge the \
-                     break and start a fresh chain.",
+                    "audit log: failed to open at {}: {}. The daemon refuses to start \
+                     until the chain is healthy. Investigate with \
+                     `thurvtl system audit verify`, then either fix the underlying \
+                     issue or run `thurvtl system audit rotate --accept-break` to \
+                     acknowledge the break and start a fresh chain.",
                     audit_log_dir.display(),
                     e
                 ));
@@ -1010,8 +981,8 @@ async fn main() -> Result<()> {
     info!("Starting daemon mode (use --test to run smoke tests)");
 
     // 🔸 Spawn the audit writer task. Every runtime audit emission from
-    // here on (iSCSI handlers, admin endpoints, the FETB sampler,
-    // gc) goes through the bounded mpsc and the dedicated
+    // here on (iSCSI handlers, admin endpoints, gc) goes through the
+    // bounded mpsc and the dedicated
     // task drains it FIFO into the chain. Producers never sit on the
     // chain mutex; channel-full drops surface in
     // `thurvtl_audit_queue_drops_total`. The shutdown handle is
@@ -1164,33 +1135,6 @@ async fn main() -> Result<()> {
         )
         .await;
     });
-
-    // 🔸 Start the FETB telemetry sampler. Take a bootstrap sample
-    // now so the gauges carry a real number before the first
-    // periodic tick, then loop every 6 h: sum each cartridge's
-    // host_bytes_written, emit one `fetb.sample` audit row, recount
-    // the rolling window, publish the two Prometheus gauges.
-    let fetb_sampler_handle = {
-        let data_dir = std::path::PathBuf::from(&cfg.data_dir);
-        let audit_dir_for_fetb = audit_log_dir.clone();
-        let audit_log_for_fetb = audit_log.clone();
-        shared_audit::fetb::record_fetb_sample(
-            &data_dir,
-            &audit_dir_for_fetb,
-            "tapes",
-            audit_log_for_fetb.as_ref(),
-        )
-        .await;
-        Some(tokio::spawn(async move {
-            shared_audit::fetb::run_fetb_sampler(
-                data_dir,
-                audit_dir_for_fetb,
-                "tapes",
-                audit_log_for_fetb,
-            )
-            .await;
-        }))
-    };
 
     // 🔸 Construct the audit rate-limiter. Bounds host-driven failure
     // floods (CHAP failures, MOVE MEDIUM refusals) on the audit chain.
@@ -1563,9 +1507,6 @@ async fn main() -> Result<()> {
     prefetch_worker_handle.abort();
     disk_cache_worker_handle.abort();
     if let Some(handle) = audit_ratelimit_flush_handle {
-        handle.abort();
-    }
-    if let Some(handle) = fetb_sampler_handle {
         handle.abort();
     }
     if let Some(handle) = iscsi_server_handle {

@@ -368,7 +368,7 @@ fn rewrite_manifest_for_local(
 /// - `pending_partition_layout` → removed (stale stage from pre-archive)
 ///
 /// Everything else carries over: partition layout, active partition,
-/// host-set capacity proportion, FETB counter.
+/// host-set capacity proportion, lifetime host write counter.
 fn rewrite_runtime_for_local(archive_runtime: &str) -> Result<String> {
     let mut v: serde_json::Value = serde_json::from_str(archive_runtime)?;
     let obj = v

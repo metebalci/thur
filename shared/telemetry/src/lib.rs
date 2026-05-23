@@ -176,12 +176,7 @@ struct TelemetryInner {
     /// only successful emits show up downstream.
     alerts_fired_total: Counter<u64>,
 
-    // ── fetb / daemon info ──
-    /// Latest raw FETB sample — front-end bytes (`host_bytes_written`
-    /// summed across cartridges / volumes), pre-dedup, pre-compression.
-    fetb_latest_bytes: Gauge<u64>,
-    /// Number of FETB samples in the rolling window (4 weeks).
-    fetb_sample_count: Gauge<u64>,
+    // ── daemon info ──
     daemon_start_time_seconds: Gauge<i64>,
 }
 
@@ -537,13 +532,6 @@ impl Telemetry {
             .daemon_start_time_seconds
             .record(unix_seconds, &[]);
     }
-
-    /// Publish FETB telemetry: the latest raw sample value (in bytes)
-    /// and the number of samples currently in the rolling window.
-    pub fn fetb_set_sample(&self, latest_bytes: u64, sample_count: u64) {
-        self.inner.fetb_latest_bytes.record(latest_bytes, &[]);
-        self.inner.fetb_sample_count.record(sample_count, &[]);
-    }
 }
 
 impl TelemetryInner {
@@ -752,16 +740,7 @@ impl TelemetryInner {
                 )
                 .build(),
 
-            // fetb / daemon info
-            fetb_latest_bytes: meter
-                .u64_gauge(name("fetb_latest_bytes"))
-                .with_description("Latest raw FETB sample (front-end bytes, pre-dedup)")
-                .with_unit("By")
-                .build(),
-            fetb_sample_count: meter
-                .u64_gauge(name("fetb_sample_count"))
-                .with_description("FETB samples in the rolling window (4 weeks)")
-                .build(),
+            // daemon info
             daemon_start_time_seconds: meter
                 .i64_gauge(name("daemon_start_time"))
                 .with_description("Daemon start time as Unix epoch seconds")
@@ -1007,11 +986,6 @@ pub mod record {
             t.orphan_scan_record(chunks_found, duration_seconds);
         }
     }
-    pub fn fetb(latest_bytes: u64, sample_count: u64) {
-        if let Some(t) = global() {
-            t.fetb_set_sample(latest_bytes, sample_count);
-        }
-    }
 }
 
 /// Backwards-compat alias so existing call sites that say
@@ -1056,7 +1030,6 @@ mod tests {
         t.chunk_add_cloud_cache_warmup_seeded("primary", 42);
         t.iscsi_set_sessions_active(0);
         t.audit_inc_entry("daemon.start");
-        t.fetb_set_sample(0, 0);
         t.cache_inc_eviction("vol1", "dirty");
         let dump = t.export_prometheus();
         for needle in [
@@ -1074,7 +1047,6 @@ mod tests {
             "thur_cache_evictions_total",
             "thur_iscsi_sessions_active",
             "thur_audit_entries_total",
-            "thur_fetb_latest_bytes",
         ] {
             assert!(
                 dump.contains(needle),

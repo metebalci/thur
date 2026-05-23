@@ -122,8 +122,7 @@ unused until the LDAP work lands).
 
 Scope of v1:
 - Read-only dashboards: library + cartridge inventory (VTL), volume
-  list + per-volume status (VSA), FETB usage, audit log tail, recent
-  jobs.
+  list + per-volume status (VSA), audit log tail, recent jobs.
 - Mutating forms for the highest-friction operator paths:
   add/remove CHAP user, add/remove volume (VSA) or cartridge (VTL),
   set legal hold, trigger `cloud check`.

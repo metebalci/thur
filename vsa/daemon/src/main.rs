@@ -610,32 +610,6 @@ async fn main() -> Result<()> {
         target_iqn,
     };
 
-    // FETB telemetry sampler. Opt-in on the presence of the audit
-    // channel (off → no audit log to write samples to → skip
-    // sampling). The sampler takes an initial reading synchronously
-    // before its first sleep so the gauges carry a real number on
-    // boot.
-    let audit_dir_path = audit_dir(&cfg.audit, &data_dir);
-    let fetb_audit_channel = audit_lifecycle.as_ref().map(|(c, _)| c.clone());
-    let fetb_sampler_handle = if fetb_audit_channel.is_some() {
-        let data_dir = data_dir.clone();
-        let audit_dir_path = audit_dir_path.clone();
-        let channel = fetb_audit_channel;
-        Some(tokio::spawn(async move {
-            shared_audit::fetb::record_fetb_sample(
-                &data_dir,
-                &audit_dir_path,
-                "volumes",
-                channel.as_ref(),
-            )
-            .await;
-            shared_audit::fetb::run_fetb_sampler(data_dir, audit_dir_path, "volumes", channel)
-                .await;
-        }))
-    } else {
-        None
-    };
-
     // Disk-cache eviction worker. Periodically re-scans every
     // backend's pool slice and evicts oldest chunks (per-volume
     // `lru.idx` sidecar drives the sort) until each backend is
@@ -764,11 +738,6 @@ async fn main() -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
     }
 
-    // FETB sampler — abort on shutdown. It sleeps for hours between
-    // work, so a graceful drain isn't meaningful.
-    if let Some(h) = fetb_sampler_handle {
-        h.abort();
-    }
     if let Some(h) = eviction_worker_handle {
         h.abort();
     }

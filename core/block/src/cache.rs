@@ -174,8 +174,8 @@ pub struct PageCache {
     /// Monotonic count of host-visible bytes written into this volume,
     /// pre-dedup, pre-compression. Seeded from
     /// `runtime.host_bytes_written` at construction; bumped on every
-    /// WRITE / committed CAW / UNMAP (UNMAP zeros count as host bytes
-    /// per the FETB definition).
+    /// WRITE / committed CAW / UNMAP (UNMAP zeros count as host
+    /// writes).
     host_bytes_written: AtomicU64,
     /// Monotonic count of host-visible bytes served for READs. Bumped
     /// per `read_bytes`, cache hits and cloud misses alike.
@@ -263,9 +263,9 @@ impl PageCache {
         })
     }
 
-    /// Current in-memory FETB counter. Reflects every WRITE / committed
-    /// CAW / UNMAP since boot; may lead the on-disk manifest until the
-    /// next persist boundary.
+    /// Current in-memory host write counter. Reflects every WRITE /
+    /// committed CAW / UNMAP since boot; may lead the on-disk manifest
+    /// until the next persist boundary.
     pub fn host_bytes_written(&self) -> u64 {
         self.host_bytes_written.load(Ordering::Relaxed)
     }
@@ -473,8 +473,8 @@ impl PageCache {
         // Phase 2: commit. Reuse `write_bytes` for the splice; the
         // cache remains mutex-serialized so a concurrent third
         // mutation is a host-side bug we don't fence. `write_bytes`
-        // already bumps the FETB counter, so CAW counts host bytes
-        // only on successful commit — matching SBC-3 semantics.
+        // already bumps the host write counter, so CAW counts host
+        // bytes only on successful commit — matching SBC-3 semantics.
         self.write_bytes(byte_offset, new).await?;
         Ok(true)
     }
@@ -506,9 +506,9 @@ impl PageCache {
             cursor += chunk_u64;
             remaining -= chunk_u64;
         }
-        // UNMAP zeros count as host-written bytes for FETB. The host
-        // told us "these LBAs are now zero" — that's a write the
-        // operator's backup software is going to bill them for.
+        // UNMAP zeros count as host-written bytes. The host told us
+        // "these LBAs are now zero" — that's still a write from the
+        // host's perspective.
         self.bump_host_bytes(len);
         Ok(())
     }
@@ -561,10 +561,10 @@ impl PageCache {
     }
 
     /// Flush every dirty page in the cache. Called at shutdown so
-    /// in-memory writes don't get silently lost. Persists the FETB
-    /// counter to `runtime.json` once all dirty pages are committed
-    /// so a restart picks up roughly the same number the audit
-    /// sampler last saw.
+    /// in-memory writes don't get silently lost. Persists the host
+    /// write counter to `runtime.json` once all dirty pages are
+    /// committed so a restart picks up the counter close to where the
+    /// running daemon left it.
     ///
     /// Drains in batches of up to `max_concurrent_flushes` parallel
     /// `flush_one` calls via `buffer_unordered`. Pages re-dirtied

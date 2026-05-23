@@ -34,11 +34,10 @@ needed.
 
 Only **one** task calls `AuditLog::append` directly: a dedicated
 writer launched via `thur_core::spawn_audit_writer` after
-startup-time sync writes (`replay_pending`, `daemon.start`, the
-bootstrap `fetb.sample`) complete. Every other emitter — iSCSI
-handlers, admin endpoints, the FETB sampler, the rate-limit flush,
-gc — holds a cheaply-cloned `AuditChannel` and pushes via
-non-blocking `try_append`.
+startup-time sync writes (`replay_pending`, `daemon.start`) complete.
+Every other emitter — iSCSI handlers, admin endpoints, the
+rate-limit flush, gc — holds a cheaply-cloned `AuditChannel` and
+pushes via non-blocking `try_append`.
 
 The writer drains a bounded mpsc (1024 entries; `AUDIT_CHANNEL_CAPACITY`)
 FIFO into the chain, so producers never contend on the chain mutex. From
@@ -84,18 +83,10 @@ The `AuditMode` enum slot is preserved (single variant `TamperEvident`).
 The log rotates daily at UTC midnight. Compression of rotated files is
 available via `audit.compress_rotated: true` (default).
 
-## Retention floor (hard)
+## Retention
 
-`audit.retention_days` defaults to **90**. The daemon refuses to
-start if it drops below **40** (`MIN_AUDIT_RETENTION_DAYS`) — no
-silent bump. The FETB telemetry meter walks the trailing 4 weeks
-(`WINDOW_DAYS` = 28) of the audit chain on every startup; below 40
-days there isn't enough margin between the rolling window and the
-prune cliff. The audit log is the FETB meter's persistence layer.
-
-There is no `enabled` knob. Audit is unconditionally on — the FETB
-meter and the audit chain are co-engineered, and disabling either
-silently breaks the other.
+`audit.retention_days` defaults to **90**. There is no `enabled`
+knob — audit is unconditionally on.
 
 ## CLI surfaces
 
@@ -116,7 +107,7 @@ crates, so the two products cannot drift.
 ## What gets logged
 
 Cartridge create/import/export, library init/modify,
-load/unload/move, gc, daemon start/stop, FETB telemetry samples,
+load/unload/move, gc, daemon start/stop,
 boot-time orphan-upload recovery
 (`cloud.orphan_scan_started` / `cloud.orphan_scan_completed`).
 **Read paths are NOT logged.**
@@ -162,7 +153,7 @@ written. When the window expires, a single rollup entry — same op,
 shutdown drains all in-flight windows before writing `daemon.stop`.
 
 Lifecycle and one-shot events (`cartridge.create`, `daemon.start`,
-`fetb.sample`, `gc.run`, drive load/unload Ok paths, CHAP success,
+`gc.run`, drive load/unload Ok paths, CHAP success,
 encryption set/clear, drive-compression toggle) bypass the limiter.
 The policy lives in `ratelimit_key_for(op, actor, params)` — the
 single source of truth for which operations opt in; adding a new

@@ -12,9 +12,9 @@
 //! suppressed count.
 //!
 //! Opt-in: applied per-site at audit emission time. Lifecycle /
-//! one-shot events (`cartridge.create`, `daemon.start`,
-//! `license.fetb_sample`) bypass it entirely — they carry no flood
-//! risk and the chain narrative needs every one.
+//! one-shot events (`cartridge.create`, `daemon.start`) bypass it
+//! entirely — they carry no flood risk and the chain narrative needs
+//! every one.
 //!
 //! Failure mode is **fail-open**: if the in-memory mutex is
 //! poisoned, [`decide`](AuditRateLimiter::decide) returns

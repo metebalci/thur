@@ -26,9 +26,9 @@ use crate::volume::{SyncAfter, VolumeError};
 /// `thurvsa volume modify --sync-after` flips.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VolumeRuntime {
-    /// FETB capacity counter — bytes the host has written into this
-    /// volume, pre-dedup, pre-compression. Bumped on every WRITE /
-    /// committed CAW / UNMAP; reset to 0 at create.
+    /// Lifetime host bytes written into this volume — pre-dedup,
+    /// pre-compression. Bumped on every WRITE / committed CAW /
+    /// UNMAP; reset to 0 at create.
     pub host_bytes_written: u64,
     /// Bytes served to the host for READs — logical, pre-dedup. Counts
     /// reads satisfied from cache and from cloud alike.

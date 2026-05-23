@@ -68,10 +68,9 @@ pub(super) struct Runtime {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub index_epoch: BTreeMap<String, IndexEpoch>,
 
-    /// Lifetime front-end bytes the host has written into this
-    /// cartridge — pre-dedup, pre-compression, pre-encryption. Drives
-    /// the FETB telemetry meter (`shared_audit::fetb`). Monotonic
-    /// for the cartridge's life; reset to 0 on ERASE / FORMAT MEDIUM.
+    /// Lifetime host bytes written into this cartridge — pre-dedup,
+    /// pre-compression, pre-encryption. Monotonic for the cartridge's
+    /// life; reset to 0 on ERASE / FORMAT MEDIUM.
     #[serde(default)]
     pub host_bytes_written: u64,
 

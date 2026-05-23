@@ -22,8 +22,8 @@ mod chunking;
 mod indexing;
 
 // Per-cartridge runtime sidecar (`<root>/runtime.json`): partition
-// layout, FETB counter, index-backup epoch map. Split out of the
-// manifest in Commit 2 of plan-for-the-change-compiled-sutherland.md
+// layout, lifetime byte counters, index-backup epoch map. Split out of
+// the manifest in Commit 2 of plan-for-the-change-compiled-sutherland.md
 // so manifest.json is creation-frozen.
 mod runtime;
 use runtime::Runtime;
@@ -220,7 +220,7 @@ pub use shared_cloud::DedupScope;
 /// identity mutations (today: `cartridge_migrate::rewrite_manifest_backend`,
 /// archive provenance stamping) are the only writers post-create.
 ///
-/// Runtime-mutated state — partition layout, FETB counter,
+/// Runtime-mutated state — partition layout, lifetime byte counters,
 /// index-backup epoch, host-set capacity proportion — lives in the
 /// sibling [`Runtime`] sidecar at `<root>/runtime.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -559,8 +559,9 @@ pub struct Cartridge {
     /// Per-cartridge runtime sidecar (`runtime.json`). Holds the
     /// fields the daemon mutates on the hot path: partition layout,
     /// active partition, pending format, set-capacity proportion,
-    /// index-backup epoch, FETB counter. `manifest` is creation-
-    /// frozen; every runtime-mutating opcode writes here instead.
+    /// index-backup epoch, lifetime byte counters. `manifest` is
+    /// creation-frozen; every runtime-mutating opcode writes here
+    /// instead.
     runtime: Runtime,
     /// Shared content-addressed pool used for sealed chunks. All cartridges
     /// in the same data_dir share this pool; the cartridge keeps its own
@@ -1593,11 +1594,10 @@ impl Cartridge {
         self.cur_chunk_hasher.update(write_bytes);
         self.cur_chunk.size += on_disk_len;
 
-        // FETB meter: front-end bytes the host shoved at the VTL,
-        // counted before any drive-side compression / encryption.
-        // Monotonic for the cartridge's life so the rolling-window
-        // sampler can sum across all cartridges without per-call
-        // bookkeeping. Persisted with the next manifest fsync.
+        // Lifetime host-byte counter: front-end bytes the host
+        // shoved at the VTL, counted before any drive-side compression
+        // / encryption. Monotonic for the cartridge's life; persisted
+        // with the next manifest fsync.
         self.runtime.host_bytes_written = self
             .runtime
             .host_bytes_written
@@ -2177,10 +2177,9 @@ impl Cartridge {
         self.sealed_bytes.saturating_add(self.cur_chunk.size)
     }
 
-    /// Lifetime front-end bytes the host has written into this
-    /// cartridge — pre-dedup, pre-compression, pre-encryption.
-    /// Drives the FETB capacity-license meter. Monotonic for the
-    /// cartridge's life; reset to 0 on ERASE.
+    /// Lifetime host bytes written into this cartridge — pre-dedup,
+    /// pre-compression, pre-encryption. Monotonic for the cartridge's
+    /// life; reset to 0 on ERASE.
     pub fn host_bytes_written(&self) -> u64 {
         self.runtime.host_bytes_written
     }
@@ -2373,9 +2372,8 @@ impl Cartridge {
         self.head_lba = 0;
         // Erase clears the EW latch — the medium is empty again.
         self.early_warning_reported = false;
-        // FETB meter: erase blanks the medium, so the host's lifetime
-        // FETB on this cartridge resets to 0. The rolling mean
-        // catches up over the next sampler ticks.
+        // Erase blanks the medium, so the host's lifetime write
+        // counter on this cartridge resets to 0.
         self.runtime.host_bytes_written = 0;
         self.persist_runtime()?;
         Ok(())
@@ -2770,7 +2768,8 @@ impl Cartridge {
                 self.runtime.active_partition = 0;
                 self.head_lba = 0;
                 self.runtime.pending_partition_layout = None;
-                // FETB meter: format wipes the medium.
+                // Format wipes the medium, so the host write counter
+                // resets to 0.
                 self.runtime.host_bytes_written = 0;
                 self.persist_runtime()?;
                 Ok(())
@@ -2839,7 +2838,8 @@ impl Cartridge {
                 self.runtime.active_partition = 0;
                 self.head_lba = 0;
                 self.runtime.pending_partition_layout = None;
-                // FETB meter: format wipes the medium.
+                // Format wipes the medium, so the host write counter
+                // resets to 0.
                 self.runtime.host_bytes_written = 0;
                 self.persist_runtime()?;
                 Ok(())
