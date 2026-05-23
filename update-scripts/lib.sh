@@ -426,7 +426,12 @@ update_vsa() {
   DONE=1
   [[ $rc -eq 0 ]] || die "some volumes did not remount — see $STATE and mount them by hand"
   rm -f "$STATE"
-  log "done — $SERVICE upgrade ${DRYRUN:+(dry-run) }complete"
+  # `${DRYRUN:+...}` would always fire here — DRYRUN is set to "0" or
+  # "1", both non-empty, so the `:+` triggers regardless. Test the
+  # actual value instead.
+  local dry_tag=''
+  [[ $DRYRUN -eq 1 ]] && dry_tag='(dry-run) '
+  log "done — $SERVICE upgrade ${dry_tag}complete"
 }
 
 # =====================================================================
@@ -552,5 +557,10 @@ update_vtl() {
   DONE=1
   [[ $rc -eq 0 ]] || die "some LTFS mounts did not come back — see messages above"
   rm -rf "$STATED"
-  log "done — $SERVICE upgrade ${DRYRUN:+(dry-run) }complete"
+  # `${DRYRUN:+...}` would always fire here — DRYRUN is set to "0" or
+  # "1", both non-empty, so the `:+` triggers regardless. Test the
+  # actual value instead.
+  local dry_tag=''
+  [[ $DRYRUN -eq 1 ]] && dry_tag='(dry-run) '
+  log "done — $SERVICE upgrade ${dry_tag}complete"
 }
