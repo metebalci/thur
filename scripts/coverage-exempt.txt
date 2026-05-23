@@ -41,15 +41,66 @@
 ./core/stream/src/drive_topology.rs
 ./core/stream/src/tape.rs
 ./nvme/base/src/error.rs
+./scsi/spc/src/naa.rs
 ./scsi/smc/src/dispatch/types.rs
 ./shared/alerting/src/sinks/mod.rs
 ./shared/cloud/src/error.rs
 ./shared/iscsi/src/error.rs
+./shared/keystore/src/error.rs
+./shared/upload-worker/src/payload.rs
 
 # --- process-global / framework glue (no unit-testable surface;
 #     exercised by the end-to-end suites) ---
 ./shared/admin-http/src/lib.rs
+./shared/admin-http/src/tls.rs
+./shared/admin-server/src/server.rs
+./shared/alerting/src/dispatcher.rs
+./shared/alerting/src/http.rs
+./shared/alerting/src/lib.rs
+./shared/telemetry/src/http.rs
 ./vtl/daemon/src/http/mod.rs
+
+# --- daemon I/O orchestration covered by the in-process `--test`
+#     smoke harness + the vtl/scripts/, vsa/scripts/ shell suites ---
+./vtl/daemon/src/iscsi/handler.rs
+./vtl/daemon/src/iscsi/server.rs
+./vtl/daemon/src/smoke.rs
+./vtl/daemon/src/upload_worker.rs
+./vtl/daemon/src/admin/iscsi_users.rs
+./vtl/daemon/src/admin/mod.rs
+./vtl/daemon/src/admin/job_dispatch/alerting.rs
+./vsa/daemon/src/smoke.rs
+./vsa/daemon/src/upload_worker.rs
+./vsa/daemon/src/http.rs
+./vsa/daemon/src/main.rs
+./vsa/daemon/src/admin/handlers.rs
+./vsa/daemon/src/admin/iscsi_target.rs
+./vsa/daemon/src/admin/iscsi_users.rs
+./vsa/daemon/src/admin/nvmetcp_psks.rs
+./vsa/daemon/src/admin/mod.rs
+./vsa/daemon/src/admin/job_dispatch/mod.rs
+./vsa/daemon/src/admin/job_dispatch/alerting.rs
+
+# --- CLI daemon-call adapters covered by the vtl/scripts/, vsa/scripts/
+#     integration suites (build a request, call the admin socket, print) ---
+./vsa/cli/src/cloud.rs
+./vsa/cli/src/gc.rs
+./vsa/cli/src/main.rs
+./vsa/cli/src/volume.rs
+./vsa/cli/src/commands/generate_config.rs
+./vtl/cli/src/commands/cartridge_key.rs
+./vtl/cli/src/commands/cloud.rs
+./vtl/cli/src/commands/credentials.rs
+./vtl/cli/src/commands/drive.rs
+./vtl/cli/src/commands/gc.rs
+./vtl/cli/src/commands/generate_config.rs
+./vtl/cli/src/commands/self_test.rs
+./shared/cli-system/src/daemon_health.rs
+./shared/cli-system/src/regenerate_cert.rs
+
+# --- include!d into main.rs (the clap tests live in main.rs, not the
+#     included file; the --zero grep can't see across include!) ---
+./vtl/cli/src/cli.rs
 
 # --- covered by a crate integration-test suite (tests/), not an
 #     inline #[cfg(test)] block ---
@@ -58,3 +109,13 @@
 ./scsi/ssc/src/dispatch/handlers.rs
 ./scsi/ssc/src/dispatch/inquiry.rs
 ./scsi/ssc/src/dispatch/mod.rs
+./core/mediachanger/src/events.rs
+./core/mediachanger/src/legal_hold.rs
+./core/mediachanger/src/library/inventory.rs
+./core/mediachanger/src/library/partitions.rs
+./core/mediachanger/src/library/restore_archive.rs
+./core/stream/src/cartridge_archive.rs
+./core/stream/src/cartridge_migrate.rs
+./core/stream/src/cartridge/cloud.rs
+./core/stream/src/cartridge/indexing.rs
+./shared/verify-core/src/lib.rs
