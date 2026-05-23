@@ -329,6 +329,14 @@ enum SystemAction {
         json: bool,
     },
 
+    /// Live activity screen — holds and redraws ~1s, Ctrl-C to exit.
+    ///
+    /// Daemon-routed. Streams a per-second snapshot over the admin
+    /// socket: uptime, cartridges loaded, drives busy, iSCSI sessions,
+    /// per-backend pool used/cap + backpressure, per-backend cloud
+    /// PUT/GET rate over the last 60s, audit events over the last 5m.
+    Monitor,
+
     /// Library-wide consistency check.
     Verify {
         /// Skip the cloud sweep (local-only audit).

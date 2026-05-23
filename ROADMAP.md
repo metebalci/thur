@@ -111,60 +111,6 @@ duty, HSM-backed admin tokens.
 
 ### Management UX
 
-#### `system monitor` — live activity screen
-There is no at-a-glance answer to "what is the daemon doing right
-now?" today. Operators must hand-correlate `system daemon-health`,
-`volume list` / `library show`, a `curl /metrics | grep`, and an
-`audit tail -f` to infer whether cloud uploads are flowing, whether
-the pool is backpressured, and whether sessions are alive. The
-implicit surface is fine for scripted scraping but bad for sitting
-in front of a terminal during a deploy or an incident.
-
-Add `thurvsa system monitor` + `thurvtl system monitor` — an
-interactive, holding screen that redraws every ~1s and exits on
-Ctrl-C. One-shot output is not the goal (scriptable scraping
-already has `/metrics`); the verb's job is to be the live screen.
-
-Compact grouped layout (per-product specifics in the first two rows;
-pool / cloud / audit blocks are shared across products):
-
-```
-thurvsad  up 2d 4h   v0.1.0-dev.4
-
-Volumes:   4 online              (VTL: Cartridges: 38 loaded / 240)
-Sessions:  3 active              (VTL: Drives:     2 busy / 3)
-
-Pool          used / cap         backpressure (1h)
-  s3-primary  487 / 512 GiB 95%   12 waits  HIGH
-  local         8 /  32 GiB 25%    0 waits
-
-Cloud (last 60s)
-  s3-primary  PUT 142 ops  1.8 GiB  0 errors
-
-Audit (last 5m): 3 events
-```
-
-Implementation: a thin TUI loop in `shared-cli` (crossterm for the
-clear+cursor-home redraw, SIGINT → cooperative shutdown), driven by
-periodic GETs against `/api/v1/health` + a new `/api/v1/monitor`
-JSON endpoint that pre-aggregates the pool / cloud / audit windows
-daemon-side (so the CLI isn't parsing `/metrics` text and rolling
-its own 60s / 1h / 5m windows). Per-product extras (volumes /
-sessions for VSA, cartridges / drives for VTL) come from the
-already-routed admin handlers (`/api/v1/volumes`, `/api/v1/library`
-etc.).
-
-Touches: new `shared-cli` TUI loop, new `shared-admin-server`
-`/api/v1/monitor` handler with per-product state-fetch closures
-(mirror `shared-admin-iscsi` pattern), per-product CLI subcommand
-plumbing in `vtl/cli` and `vsa/cli`.
-
-Out of scope: full-screen `top`-style sortable panes, mouse
-interaction, per-volume / per-cartridge drill-down (those belong in
-the Web UI), historical replay. A future `system status` (one-shot
-snapshot, scriptable) could share the same `/api/v1/monitor`
-endpoint if a demand surfaces.
-
 #### Web UI v1
 Browser frontend on top of `/api/v1/*`: library inventory, cartridge
 browser, op history, configuration panel. Hosted on the existing TCP

@@ -403,6 +403,9 @@ _thurvtl() {
             thurvtl__subcmd__help__subcmd__system,gc)
                 cmd="thurvtl__subcmd__help__subcmd__system__subcmd__gc"
                 ;;
+            thurvtl__subcmd__help__subcmd__system,monitor)
+                cmd="thurvtl__subcmd__help__subcmd__system__subcmd__monitor"
+                ;;
             thurvtl__subcmd__help__subcmd__system,regenerate-cert)
                 cmd="thurvtl__subcmd__help__subcmd__system__subcmd__regenerate__subcmd__cert"
                 ;;
@@ -658,6 +661,9 @@ _thurvtl() {
             thurvtl__subcmd__system,help)
                 cmd="thurvtl__subcmd__system__subcmd__help"
                 ;;
+            thurvtl__subcmd__system,monitor)
+                cmd="thurvtl__subcmd__system__subcmd__monitor"
+                ;;
             thurvtl__subcmd__system,regenerate-cert)
                 cmd="thurvtl__subcmd__system__subcmd__regenerate__subcmd__cert"
                 ;;
@@ -756,6 +762,9 @@ _thurvtl() {
                 ;;
             thurvtl__subcmd__system__subcmd__help,help)
                 cmd="thurvtl__subcmd__system__subcmd__help__subcmd__help"
+                ;;
+            thurvtl__subcmd__system__subcmd__help,monitor)
+                cmd="thurvtl__subcmd__system__subcmd__help__subcmd__monitor"
                 ;;
             thurvtl__subcmd__system__subcmd__help,regenerate-cert)
                 cmd="thurvtl__subcmd__system__subcmd__help__subcmd__regenerate__subcmd__cert"
@@ -2906,7 +2915,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__help__subcmd__system)
-            opts="gc audit cloud stats daemon-health verify regenerate-cert alerting"
+            opts="gc audit cloud stats daemon-health monitor verify regenerate-cert alerting"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3102,6 +3111,20 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__help__subcmd__system__subcmd__gc)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvtl__subcmd__help__subcmd__system__subcmd__monitor)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -4492,7 +4515,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system)
-            opts="-c -h --config --user --copyright --help gc audit cloud stats daemon-health verify regenerate-cert alerting help"
+            opts="-c -h --config --user --copyright --help gc audit cloud stats daemon-health monitor verify regenerate-cert alerting help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5144,7 +5167,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__help)
-            opts="gc audit cloud stats daemon-health verify regenerate-cert alerting help"
+            opts="gc audit cloud stats daemon-health monitor verify regenerate-cert alerting help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5367,6 +5390,20 @@ _thurvtl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        thurvtl__subcmd__system__subcmd__help__subcmd__monitor)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         thurvtl__subcmd__system__subcmd__help__subcmd__regenerate__subcmd__cert)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -5402,6 +5439,32 @@ _thurvtl() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvtl__subcmd__system__subcmd__monitor)
+            opts="-c -h --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

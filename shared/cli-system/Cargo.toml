@@ -17,10 +17,16 @@ workspace = true
 [dependencies]
 shared-admin-client = { path = "../admin-client" }
 shared-admin-http = { path = "../admin-http" }
+# `system monitor` parses the per-tick payload (`MonitorSnapshot`)
+# emitted by the daemon-side handler.
+shared-admin-monitor = { path = "../admin-monitor" }
 # `system audit` consumes the job-event stream (`JobEvent`) and
 # offline-verifies a copied audit directory (`verify_chain`).
 shared-admin-proto = { path = "../admin-proto" }
 shared-audit = { path = "../audit" }
+# `system monitor` reuses `fmt::format_bytes` for the pool / cloud
+# byte columns.
+shared-cli = { path = "../cli" }
 shared-naming = { path = "../naming" }
 
 anyhow = "1"

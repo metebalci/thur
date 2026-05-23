@@ -472,6 +472,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(monitor)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (audit)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -684,6 +694,10 @@ _arguments "${_arguments_options[@]}" : \
 esac
 ;;
 (daemon-health)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(monitor)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1528,6 +1542,10 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(monitor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (audit)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvsa__subcmd__help__subcmd__system__subcmd__audit_commands" \
@@ -1996,6 +2014,7 @@ _thurvsa__subcmd__help__subcmd__system_commands() {
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'audit:Audit-chain operations' \
 'stats:Dedup ratio and per-volume contribution' \
 'verify:Volume-wide consistency check' \
@@ -2077,6 +2096,11 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__daemon-health_commands() {
 _thurvsa__subcmd__help__subcmd__system__subcmd__gc_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help system gc commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__monitor_commands] )) ||
+_thurvsa__subcmd__help__subcmd__system__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help system monitor commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
@@ -2551,6 +2575,7 @@ _thurvsa__subcmd__system_commands() {
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'audit:Audit-chain operations' \
 'stats:Dedup ratio and per-volume contribution' \
 'verify:Volume-wide consistency check' \
@@ -2729,6 +2754,7 @@ _thurvsa__subcmd__system__subcmd__help_commands() {
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'audit:Audit-chain operations' \
 'stats:Dedup ratio and per-volume contribution' \
 'verify:Volume-wide consistency check' \
@@ -2817,6 +2843,11 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system help help commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__monitor_commands] )) ||
+_thurvsa__subcmd__system__subcmd__help__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system help monitor commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands() {
     local commands; commands=()
@@ -2831,6 +2862,11 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__stats_commands() {
 _thurvsa__subcmd__system__subcmd__help__subcmd__verify_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system help verify commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__monitor_commands] )) ||
+_thurvsa__subcmd__system__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system monitor commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__system__subcmd__regenerate-cert_commands] )) ||
 _thurvsa__subcmd__system__subcmd__regenerate-cert_commands() {

@@ -9,8 +9,10 @@
 
 pub mod audit;
 pub mod daemon_health;
+pub mod monitor;
 pub mod regenerate_cert;
 pub mod secrets_io;
 
 pub use daemon_health::cmd_daemon_health;
+pub use monitor::cmd_monitor;
 pub use regenerate_cert::cmd_regenerate_cert;

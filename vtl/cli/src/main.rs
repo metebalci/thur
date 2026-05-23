@@ -504,6 +504,10 @@ async fn main() -> Result<()> {
             SystemAction::DaemonHealth { json } => {
                 shared_cli_system::cmd_daemon_health(&shared_naming::TAPE_LIBRARY, json).await?;
             }
+            SystemAction::Monitor => {
+                let code = shared_cli_system::cmd_monitor(&shared_naming::TAPE_LIBRARY).await?;
+                std::process::exit(i32::from(code));
+            }
             SystemAction::Verify {
                 skip_cloud,
                 verbose,

@@ -1136,6 +1136,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(monitor)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -1314,6 +1324,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (daemon-health)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(monitor)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2101,6 +2115,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (daemon-health)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(monitor)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3029,6 +3047,7 @@ _thurvtl__subcmd__help__subcmd__system_commands() {
 'cloud:Cloud-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -3116,6 +3135,11 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__daemon-health_commands() {
 _thurvtl__subcmd__help__subcmd__system__subcmd__gc_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system gc commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__monitor_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system monitor commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
@@ -3565,6 +3589,7 @@ _thurvtl__subcmd__system_commands() {
 'cloud:Cloud-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -3755,6 +3780,7 @@ _thurvtl__subcmd__system__subcmd__help_commands() {
 'cloud:Cloud-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
+'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -3849,6 +3875,11 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help help commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__monitor_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help monitor commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands() {
     local commands; commands=()
@@ -3863,6 +3894,11 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands() {
 _thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help verify commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__monitor_commands] )) ||
+_thurvtl__subcmd__system__subcmd__monitor_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system monitor commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__regenerate-cert_commands] )) ||
 _thurvtl__subcmd__system__subcmd__regenerate-cert_commands() {

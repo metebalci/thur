@@ -257,6 +257,10 @@ async fn run(cli: Cli) -> Result<()> {
             SystemAction::DaemonHealth { json } => {
                 shared_cli_system::cmd_daemon_health(&shared_naming::DISK, json).await
             }
+            SystemAction::Monitor => {
+                let code = shared_cli_system::cmd_monitor(&shared_naming::DISK).await?;
+                std::process::exit(i32::from(code));
+            }
             SystemAction::Audit { action } => {
                 use shared_cli_system::audit;
                 let p = &shared_naming::DISK;
