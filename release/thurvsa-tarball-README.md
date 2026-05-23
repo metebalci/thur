@@ -18,6 +18,8 @@ thurvsa.env                     Daemon env file: cloud creds, ${ENV_VAR} secrets
 thurvsa.defaults.yaml            Full reference: every key documented (read-only docs)
 thurvsa-completion.bash      Bash completion for the CLI
 thurvsa-completion.zsh       Zsh completion for the CLI
+thurvsa.1                       Man page: thurvsa(1) — CLI
+thurvsad.8                      Man page: thurvsad(8) — daemon
 LICENSE                         Apache License 2.0 — full text
 README.md                       This file
 ```
@@ -79,7 +81,13 @@ install -m 644 thurvsa-completion.bash \
 install -m 644 thurvsa-completion.zsh \
         /usr/share/zsh/site-functions/_thurvsa
 
-# 6. Register the unit (does NOT enable / start)
+# 6. Man pages (optional). `mandb` indexes them on next run; force-rebuild
+#    with `sudo mandb` if you want `man thurvsa` immediately.
+install -d -m 755 /usr/share/man/man1 /usr/share/man/man8
+install -m 644 thurvsa.1  /usr/share/man/man1/thurvsa.1
+install -m 644 thurvsad.8 /usr/share/man/man8/thurvsad.8
+
+# 7. Register the unit (does NOT enable / start)
 systemctl daemon-reload
 ```
 
@@ -137,6 +145,7 @@ rm -f /usr/bin/thurvsad /usr/bin/thurvsa
 rm -f /etc/systemd/system/thurvsad.service
 rm -f /usr/share/bash-completion/completions/thurvsa
 rm -f /usr/share/zsh/site-functions/_thurvsa
+rm -f /usr/share/man/man1/thurvsa.1 /usr/share/man/man8/thurvsad.8
 systemctl daemon-reload
 
 # Operator decides whether to keep these — they hold volume data

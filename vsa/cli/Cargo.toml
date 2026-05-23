@@ -59,6 +59,12 @@ assets = [
     ["../../README.md", "usr/share/doc/thurvsa/README.md", "644"],
     ["../../dist/thurvsa-completion.bash", "usr/share/bash-completion/completions/thurvsa", "644"],
     ["../../dist/thurvsa-completion.zsh", "usr/share/zsh/site-functions/_thurvsa", "644"],
+    # Man pages. cargo-deb auto-gzips files under `usr/share/man/` to
+    # satisfy Debian Policy 12.1 (`man-page-not-compressed` lintian
+    # check), so we ship the .1 / .8 sources here and let the tooling
+    # handle compression at packaging time.
+    ["../../dist/thurvsa.1", "usr/share/man/man1/thurvsa.1", "644"],
+    ["../../release/thurvsad.8", "usr/share/man/man8/thurvsad.8", "644"],
 ]
 conf-files = ["/etc/thurvsa/thurvsa.yaml", "/etc/thurvsa/thurvsa.env"]
 maintainer-scripts = "../../release/thurvsa/"
@@ -94,6 +100,10 @@ assets = [
     { source = "../../README.md", dest = "/usr/share/doc/thurvsa/README.md", mode = "644", doc = true },
     { source = "../../dist/thurvsa-completion.bash", dest = "/usr/share/bash-completion/completions/thurvsa", mode = "644" },
     { source = "../../dist/thurvsa-completion.zsh", dest = "/usr/share/zsh/site-functions/_thurvsa", mode = "644" },
+    # Man pages — RPM's brp-compress macro auto-gzips files installed
+    # under /usr/share/man/ at build time.
+    { source = "../../dist/thurvsa.1", dest = "/usr/share/man/man1/thurvsa.1", mode = "644", doc = true },
+    { source = "../../release/thurvsad.8", dest = "/usr/share/man/man8/thurvsad.8", mode = "644", doc = true },
     { source = "../../LICENSE", dest = "/usr/share/licenses/thurvsa/LICENSE", mode = "644", doc = true },
 ]
 # Inline scriptlets. cargo-generate-rpm reads these as literal strings
@@ -260,6 +270,11 @@ tokio = { version = "1", features = ["rt", "macros", "net"] }
 [build-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+# Same clap_mangen drives `dist/thurvsa.1`; ships in lockstep with the
+# clap 4.x ecosystem. The build script appends a FILES + SEE ALSO
+# trailer (pointing at thurvsad(8) + the shipped defaults.yaml) after
+# clap_mangen renders the auto-generated sections.
+clap_mangen = "0.2"
 shared-cli = { path = "../../shared/cli" }
 
 [[bin]]

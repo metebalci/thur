@@ -1,0 +1,116 @@
+.\" Copyright (c) 2026 Mete Balci
+.\" SPDX-License-Identifier: Apache-2.0
+.\"
+.\" Hand-written man page for thurvtld. The .deb / .rpm install it at
+.\" /usr/share/man/man8/thurvtld.8 (tooling gzips on the way in).
+.\"
+.TH THURVTLD 8 "" "Thur VTL" "System Manager's Manual"
+.SH NAME
+thurvtld \- Thur VTL daemon
+.SH SYNOPSIS
+.B thurvtld
+[\fB\-c\fR \fIPATH\fR | \fB\-\-config\fR \fIPATH\fR]
+[\fB\-\-test\fR]
+[\fB\-\-help\fR]
+[\fB\-\-version\fR]
+.SH DESCRIPTION
+.B thurvtld
+is the Thur VTL daemon: a spec-conformant SMC-3 medium changer plus
+SSC-4 LTO drive emulation exposed as an iSCSI target. Cartridge data
+is content-addressed and deduplicated, with chunks tiered out to S3,
+GCS, Azure, or a local filesystem.
+
+The daemon owns one library / chassis instance (initialized once via
+.BR thurvtl (1)
+.BR "library init" ),
+listens for iSCSI sessions on the configured port (3260 by default),
+serves the admin Unix socket at
+.I /run/thurvtl/admin.sock
+for the CLI, and exposes Prometheus metrics + health endpoints on
+the HTTP listener (9090 by default).
+
+It is not started automatically by the package postinst \(em the
+operator edits the conffile, runs
+.BR "thurvtl library init" ,
+then
+.BR "systemctl enable --now thurvtld" .
+.SH OPTIONS
+.TP
+\fB\-c\fR \fIPATH\fR, \fB\-\-config\fR=\fIPATH\fR
+Path to the YAML configuration file. Defaults to
+.IR /etc/thurvtl/thurvtl.yaml .
+.TP
+\fB\-\-test\fR
+Run an in-process smoke test (cartridge / library / S3 / prefetch /
+\(cqstop) and exit. Does not start the daemon, does not bind ports.
+Useful for packaging CI.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print short usage and exit.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version (crate version plus the git SHA the binary was built
+from) and exit.
+.SH SIGNALS
+.TP
+.B SIGTERM
+Graceful shutdown: drain in-flight SCSI commands, flush dirty chunks
+to the configured pool, release the admin socket, exit zero.
+.TP
+.B SIGINT
+Same as
+.BR SIGTERM .
+.SH FILES
+.TP
+.I /etc/thurvtl/thurvtl.yaml
+Daemon configuration (mode 0640, root:thurvtl). Minimal starter
+shipped at install. The
+.B full annotated reference for every key
+is at
+.IR /usr/share/doc/thurvtl/thurvtl.defaults.yaml ;
+.B "thurvtl config defaults"
+prints the same content to stdout.
+.TP
+.I /etc/thurvtl/thurvtl.env
+Optional daemon environment file (cloud credentials,
+.RI ${ ENV_VAR }
+references from thurvtl.yaml). 0640 root:thurvtl. Read by
+.B thurvtld.service
+via
+.BR EnvironmentFile= .
+.TP
+.I /var/lib/thurvtl/
+Default data directory: library + inventory (\fIlibrary/\fR),
+cartridge manifests (\fItapes/\fR), the local chunk pool
+(\fIchunks/\fR), and the audit log (\fIaudit/\fR). Overridable via
+.B data_dir
+in the conffile.
+.TP
+.I /run/thurvtl/admin.sock
+Admin Unix socket (mode 0660, peer-cred authed). CLI commands that
+require a live daemon route through it; the
+.B thurvtl
+group has connect access.
+.TP
+.I /var/lib/thurvtl/.daemon.lock
+PID lockfile. CLI mutating commands refuse if a daemon is alive on
+the same data directory. Stale locks auto-clear.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Standard
+.BR tracing-subscriber
+filter directive (e.g.
+.BR RUST_LOG=info,thurvtl=debug ).
+Defaults to
+.B info
+when unset. Read at startup; restart the daemon to apply a change.
+.SH SEE ALSO
+.BR thurvtl (1),
+.BR systemctl (1)
+
+The shipped reference YAML at
+.I /usr/share/doc/thurvtl/thurvtl.defaults.yaml
+documents every configuration key.
+.SH AUTHORS
+Mete Balci <info@metebalci.com>

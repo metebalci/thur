@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Auto-regenerate `thurvsa-completion.{bash,zsh}` from the clap
-//! `Cli` enum on every relevant build, and mirror
+//! Auto-regenerate `thurvsa-completion.{bash,zsh}` and `thurvsa.1`
+//! from the clap `Cli` enum on every relevant build, and mirror
 //! `defaults_reference.yaml` to `dist/thurvsa.defaults.yaml`. The same
 //! `cli.rs` file is `include!`d by both `main.rs` and this build
-//! script, so the binary and the completion script can never disagree
-//! about what flags exist.
+//! script, so the binary, the completion scripts, and the man page
+//! can never disagree about what flags exist.
 //!
 //! Two layers of don't-redo-work:
 //!
@@ -19,11 +19,13 @@
 //!    entry, no rebuild cascade in tools that watch mtimes.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+use clap_mangen::Man;
 
 include!("src/cli.rs");
 
@@ -66,6 +68,35 @@ fn main() {
     // > thurvsa.defaults.yaml` after touching the template.
     let defaults_src = include_bytes!("src/commands/defaults_reference.yaml");
     write_if_changed(&dist_dir.join("thurvsa.defaults.yaml"), defaults_src);
+
+    // Render a section-1 man page from the same Cli tree. clap_mangen's
+    // `Man::render` covers NAME / SYNOPSIS / DESCRIPTION / OPTIONS
+    // / SUBCOMMANDS / VERSION / AUTHORS; we append a hand-rolled FILES
+    // + SEE ALSO trailer pointing operators at the daemon page and the
+    // shipped defaults reference (the .yaml file is the YAML-format
+    // documentation, no separate section-5 page).
+    let cmd = Cli::command().name("thurvsa");
+    let mut man_buf: Vec<u8> = Vec::new();
+    if let Err(e) = Man::new(cmd).render(&mut man_buf) {
+        println!("cargo:warning=could not render thurvsa.1: {e}");
+    } else {
+        let _ = writeln!(
+            &mut man_buf,
+            ".SH FILES\n\
+             .TP\n\
+             .I /etc/thurvsa/thurvsa.yaml\n\
+             Daemon configuration. Minimal starter shipped at install; the\n\
+             full annotated reference for every key is at\n\
+             .IR /usr/share/doc/thurvsa/thurvsa.defaults.yaml .\n\
+             .TP\n\
+             .I /run/thurvsa/admin.sock\n\
+             Admin Unix socket the CLI dials for daemon-routed verbs (mode\n\
+             0660, peer-cred authed).\n\
+             .SH SEE ALSO\n\
+             .BR thurvsad (8)"
+        );
+        write_if_changed(&dist_dir.join("thurvsa.1"), &man_buf);
+    }
 }
 
 /// Emit `THURVSA_VERSION=<crate-ver> (<sha>[-dirty])` for clap's

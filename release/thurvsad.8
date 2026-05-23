@@ -1,0 +1,115 @@
+.\" Copyright (c) 2026 Mete Balci
+.\" SPDX-License-Identifier: Apache-2.0
+.\"
+.\" Hand-written man page for thurvsad. The .deb / .rpm install it at
+.\" /usr/share/man/man8/thurvsad.8 (tooling gzips on the way in).
+.\"
+.TH THURVSAD 8 "" "Thur VSA" "System Manager's Manual"
+.SH NAME
+thurvsad \- Thur VSA daemon
+.SH SYNOPSIS
+.B thurvsad
+[\fB\-c\fR \fIPATH\fR | \fB\-\-config\fR \fIPATH\fR]
+[\fB\-\-test\fR]
+[\fB\-\-help\fR]
+[\fB\-\-version\fR]
+.SH DESCRIPTION
+.B thurvsad
+is the Thur VSA daemon: a block-storage target presenting SBC-3
+direct-access LUNs over iSCSI (or NVMe-TCP, when configured). Per
+volume the daemon maintains a sparse page table backed by a dedup-
+capable chunk pool, with chunks tiered to S3, GCS, Azure, or a local
+filesystem. Sectors are 4 KiB; the default page is 64 KiB; volumes
+are thin-provisioned.
+
+The daemon serves iSCSI / NVMe-TCP on the configured port (3260 by
+default), the admin Unix socket at
+.I /run/thurvsa/admin.sock
+for the CLI, and Prometheus metrics + health endpoints on the HTTP
+listener (9090 by default).
+
+It is not started automatically by the package postinst \(em the
+operator edits the conffile, then runs
+.BR "systemctl enable --now thurvsad" .
+.SH OPTIONS
+.TP
+\fB\-c\fR \fIPATH\fR, \fB\-\-config\fR=\fIPATH\fR
+Path to the YAML configuration file. Defaults to
+.IR /etc/thurvsa/thurvsa.yaml .
+.TP
+\fB\-\-test\fR
+Run an in-process smoke test and exit. Does not start the daemon,
+does not bind ports.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print short usage and exit.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version (crate version plus the git SHA the binary was built
+from) and exit.
+.SH SIGNALS
+.TP
+.B SIGTERM
+Graceful shutdown: drain in-flight SCSI / NVMe commands, flush dirty
+pages to the configured pool, release the admin socket, exit zero.
+SYNCHRONIZE CACHE is a real fence on VSA, so dirty pages are
+persisted before the daemon returns.
+.TP
+.B SIGINT
+Same as
+.BR SIGTERM .
+.SH FILES
+.TP
+.I /etc/thurvsa/thurvsa.yaml
+Daemon configuration (mode 0640, root:thurvsa). Minimal starter
+shipped at install. The
+.B full annotated reference for every key
+is at
+.IR /usr/share/doc/thurvsa/thurvsa.defaults.yaml ;
+.B "thurvsa config defaults"
+prints the same content to stdout.
+.TP
+.I /etc/thurvsa/thurvsa.env
+Optional daemon environment file (cloud credentials,
+.RI ${ ENV_VAR }
+references from thurvsa.yaml). 0640 root:thurvsa. Read by
+.B thurvsad.service
+via
+.BR EnvironmentFile= .
+.TP
+.I /var/lib/thurvsa/
+Default data directory: volume manifests (\fIvolumes/\fR), the local
+chunk pool (\fIchunks/\fR), the audit log (\fIaudit/\fR), and \(em for
+\fBlocal\fR keystore volumes \(em DEK sidecars (\fIkeys/\fR).
+Overridable via
+.B data_dir
+in the conffile.
+.TP
+.I /run/thurvsa/admin.sock
+Admin Unix socket (mode 0660, peer-cred authed). CLI commands that
+require a live daemon route through it; the
+.B thurvsa
+group has connect access.
+.TP
+.I /var/lib/thurvsa/.daemon.lock
+PID lockfile. CLI mutating commands refuse if a daemon is alive on
+the same data directory. Stale locks auto-clear.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Standard
+.BR tracing-subscriber
+filter directive (e.g.
+.BR RUST_LOG=info,thurvsa=debug ).
+Defaults to
+.B info
+when unset. Read at startup; restart the daemon to apply a change.
+.SH SEE ALSO
+.BR thurvsa (1),
+.BR systemctl (1)
+
+The shipped reference YAML at
+.I /usr/share/doc/thurvsa/thurvsa.defaults.yaml
+documents every configuration key.
+.SH AUTHORS
+Mete Balci <info@metebalci.com>

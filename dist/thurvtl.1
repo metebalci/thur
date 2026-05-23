@@ -1,0 +1,70 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH thurvtl 1  "thurvtl 0.1.0-dev.4" 
+.SH NAME
+thurvtl \- ThurVTL Management CLI
+.SH SYNOPSIS
+\fBthurvtl\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-\-user\fR] [\fB\-\-copyright\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+ThurVTL Management CLI
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR
+Path to configuration file.
+
+Defaults to `/etc/thurvtl/thurvtl.yaml` (thurvtl) or `/etc/thurvsa/thurvsa.yaml` (thurvsa).
+.TP
+\fB\-\-user\fR \fI<USER>\fR
+User to drop privileges to under sudo.
+
+Only applied by daemon\-down commands that write under `data_dir`. Under plain `sudo` those files would otherwise be owned by root and unreadable by the daemon. No effect when the CLI is already running as a non\-root user. Defaults to `thurvtl` (thurvtl) or `thurvsa` (thurvsa).
+.TP
+\fB\-\-copyright\fR
+Print the copyright + license notice and exit.
+
+Handled by [`handle_copyright_flag`] before `Cli::parse()`, so the flag works without a subcommand. Declared here too so it shows up in `\-\-help`.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+thurvtl\-library(1)
+Library management (init, info, modify, monitor)
+.TP
+thurvtl\-cartridge(1)
+Cartridge management operations
+.TP
+thurvtl\-changer(1)
+Changer / SMC operations (inventory, move, load, unload)
+.TP
+thurvtl\-drive(1)
+Drive operations and status
+.TP
+thurvtl\-system(1)
+System operations
+.TP
+thurvtl\-iscsi(1)
+iSCSI CHAP credentials
+.TP
+thurvtl\-config(1)
+Configuration helpers (defaults yaml, systemd unit, shell completion)
+.TP
+thurvtl\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0\-dev.4
+.SH FILES
+.TP
+.I /etc/thurvtl/thurvtl.yaml
+Daemon configuration. Minimal starter shipped at install; the
+full annotated reference for every key is at
+.IR /usr/share/doc/thurvtl/thurvtl.defaults.yaml .
+.TP
+.I /run/thurvtl/admin.sock
+Admin Unix socket the CLI dials for daemon-routed verbs (mode
+0660, peer-cred authed).
+.SH SEE ALSO
+.BR thurvtld (8)

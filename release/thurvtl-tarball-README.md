@@ -18,6 +18,8 @@ thurvtl.env                        Daemon env file: cloud creds, ${ENV_VAR} secr
 thurvtl.defaults.yaml            Full reference: every key documented (read-only docs)
 thurvtl-completion.bash      Bash completion for the CLI
 thurvtl-completion.zsh       Zsh completion for the CLI
+thurvtl.1                          Man page: thurvtl(1) — CLI
+thurvtld.8                         Man page: thurvtld(8) — daemon
 LICENSE                            Apache License 2.0 — full text
 README.md                          This file
 ```
@@ -68,7 +70,13 @@ install -m 644 thurvtl-completion.bash \
 install -m 644 thurvtl-completion.zsh \
         /usr/share/zsh/site-functions/_thurvtl
 
-# 6. Register the unit (does NOT enable / start)
+# 6. Man pages (optional). `mandb` indexes them on next run; force-rebuild
+#    with `sudo mandb` if you want `man thurvtl` immediately.
+install -d -m 755 /usr/share/man/man1 /usr/share/man/man8
+install -m 644 thurvtl.1  /usr/share/man/man1/thurvtl.1
+install -m 644 thurvtld.8 /usr/share/man/man8/thurvtld.8
+
+# 7. Register the unit (does NOT enable / start)
 systemctl daemon-reload
 ```
 
@@ -124,6 +132,7 @@ rm -f /usr/bin/thurvtld /usr/bin/thurvtl
 rm -f /etc/systemd/system/thurvtld.service
 rm -f /usr/share/bash-completion/completions/thurvtl
 rm -f /usr/share/zsh/site-functions/_thurvtl
+rm -f /usr/share/man/man1/thurvtl.1 /usr/share/man/man8/thurvtld.8
 systemctl daemon-reload
 
 # Operator decides whether to keep these — they hold tape data
