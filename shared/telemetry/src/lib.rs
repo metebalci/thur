@@ -24,7 +24,10 @@
 #[cfg(feature = "http")]
 pub mod http;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
@@ -88,6 +91,191 @@ pub struct TelemetryConfig {
     pub instrument_prefix: Option<String>,
     /// OTLP push reader. `None` ⇒ only the Prometheus reader is wired.
     pub otlp: Option<OtlpExporterConfig>,
+}
+
+/// In-process counters mirrored alongside the OTel instruments so the
+/// `system monitor` job handler can read them back without scraping
+/// `/metrics`. OTel's SDK is write-only from the producer side, so for
+/// the windowed views the monitor verb computes (cloud ops/bytes/errors
+/// per backend, pool backpressure waits/waiters, audit entries) we keep
+/// a parallel set of atomics here.
+///
+/// Updated alongside the OTel calls in the [`Telemetry`] recorder
+/// methods — one extra `fetch_add` per call site, paid only on the
+/// recorder hot path (no contention because each backend gets its own
+/// counter struct under an `Arc`).
+#[derive(Default)]
+pub struct LiveStats {
+    /// Per-cloud-backend cumulative counters.
+    cloud: Mutex<HashMap<String, Arc<CloudCounters>>>,
+    /// Per-pool-backend cumulative counters + an instantaneous waiter
+    /// gauge.
+    pool: Mutex<HashMap<String, Arc<PoolCounters>>>,
+    /// Audit entries appended since daemon start.
+    pub audit_entries_total: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct CloudCounters {
+    pub put_ops: AtomicU64,
+    pub get_ops: AtomicU64,
+    pub put_bytes: AtomicU64,
+    pub get_bytes: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct PoolCounters {
+    pub waits_total: AtomicU64,
+    /// Signed because the inc/dec around the backpressure wait happens
+    /// across multiple threads; a transient drop below zero from a
+    /// reorder would be benign but i64 makes the invariant explicit.
+    pub waiters_now: AtomicI64,
+}
+
+/// Plain-data snapshot of [`LiveStats`] for emission in the monitor
+/// JSON payload. All numeric; no atomics.
+#[derive(Default, Clone, Debug)]
+pub struct LiveStatsSnapshot {
+    pub cloud: HashMap<String, CloudSnapshot>,
+    pub pool: HashMap<String, PoolSnapshot>,
+    pub audit_entries_total: u64,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct CloudSnapshot {
+    pub put_ops: u64,
+    pub get_ops: u64,
+    pub put_bytes: u64,
+    pub get_bytes: u64,
+    pub errors: u64,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PoolSnapshot {
+    pub waits_total: u64,
+    pub waiters_now: i64,
+}
+
+impl LiveStats {
+    fn cloud_for(&self, backend: &str) -> Arc<CloudCounters> {
+        let mut map = self
+            .cloud
+            .lock()
+            .expect("LiveStats cloud mutex poisoned");
+        Arc::clone(map.entry(backend.to_string()).or_default())
+    }
+
+    fn pool_for(&self, backend: &str) -> Arc<PoolCounters> {
+        let mut map = self.pool.lock().expect("LiveStats pool mutex poisoned");
+        Arc::clone(map.entry(backend.to_string()).or_default())
+    }
+
+    /// Mirror of [`Telemetry::cloud_record_request`]. `op` is one of
+    /// `put`/`get`/`head`/`delete`; bytes are credited only on the
+    /// successful put/get paths so `put_bytes` + `get_bytes` track the
+    /// `outcome="ok"` slice of `cloud_bytes_total`.
+    pub fn record_cloud_op(&self, backend: &str, op: &str, outcome: &str, bytes: u64) {
+        let c = self.cloud_for(backend);
+        if outcome == "error" {
+            c.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        match op {
+            "put" => {
+                c.put_ops.fetch_add(1, Ordering::Relaxed);
+                if outcome == "ok" {
+                    c.put_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+            }
+            "get" => {
+                c.get_ops.fetch_add(1, Ordering::Relaxed);
+                if outcome == "ok" {
+                    c.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mirror of [`Telemetry::pool_record_backpressure_wait`] — one
+    /// increment per completed wait, success or timeout.
+    pub fn record_pool_wait(&self, backend: &str) {
+        self.pool_for(backend)
+            .waits_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Called by `PoolBudget::try_reserve` when it enters the slow
+    /// path. Matched by exactly one [`LiveStats::dec_waiters`] on
+    /// every exit (success, timeout, error).
+    pub fn inc_waiters(&self, backend: &str) {
+        self.pool_for(backend)
+            .waiters_now
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_waiters(&self, backend: &str) {
+        self.pool_for(backend)
+            .waiters_now
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Mirror of [`Telemetry::audit_inc_entry`].
+    pub fn record_audit_entry(&self) {
+        self.audit_entries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot all counters for the monitor JSON payload. Holds the
+    /// two backend-keyed mutexes briefly to clone the per-backend
+    /// `Arc`s, then drops the locks and reads atomics outside.
+    pub fn snapshot(&self) -> LiveStatsSnapshot {
+        let cloud_pairs: Vec<(String, Arc<CloudCounters>)> = self
+            .cloud
+            .lock()
+            .expect("LiveStats cloud mutex poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        let pool_pairs: Vec<(String, Arc<PoolCounters>)> = self
+            .pool
+            .lock()
+            .expect("LiveStats pool mutex poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        LiveStatsSnapshot {
+            cloud: cloud_pairs
+                .into_iter()
+                .map(|(k, v)| (k, v.snapshot()))
+                .collect(),
+            pool: pool_pairs
+                .into_iter()
+                .map(|(k, v)| (k, v.snapshot()))
+                .collect(),
+            audit_entries_total: self.audit_entries_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl CloudCounters {
+    fn snapshot(&self) -> CloudSnapshot {
+        CloudSnapshot {
+            put_ops: self.put_ops.load(Ordering::Relaxed),
+            get_ops: self.get_ops.load(Ordering::Relaxed),
+            put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            get_bytes: self.get_bytes.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl PoolCounters {
+    fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            waits_total: self.waits_total.load(Ordering::Relaxed),
+            waiters_now: self.waiters_now.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// All Thur instruments, grouped by subsystem. Held in an `Arc` so
@@ -178,6 +366,9 @@ struct TelemetryInner {
 
     // ── daemon info ──
     daemon_start_time_seconds: Gauge<i64>,
+
+    // ── monitor live-stats sidecar (in-process readable) ──
+    live_stats: Arc<LiveStats>,
 }
 
 impl Telemetry {
@@ -276,6 +467,7 @@ impl Telemetry {
         self.inner
             .pool_backpressure_wait_seconds
             .record(seconds, &kv);
+        self.inner.live_stats.record_pool_wait(backend);
     }
 
     /// VSA per-volume page-cache eviction. `outcome` is `clean` (LRU
@@ -313,6 +505,9 @@ impl Telemetry {
         if bytes > 0 {
             self.inner.cloud_bytes_total.add(bytes, &kv);
         }
+        self.inner
+            .live_stats
+            .record_cloud_op(backend, op, outcome, bytes);
     }
 
     pub fn cloud_inc_retry(&self, backend: &str, class: &str) {
@@ -488,6 +683,14 @@ impl Telemetry {
         self.inner
             .audit_entries_total
             .add(1, &[KeyValue::new("kind", kind.to_string())]);
+        self.inner.live_stats.record_audit_entry();
+    }
+
+    /// Borrow the in-process [`LiveStats`] sidecar. Cloned into the
+    /// `system monitor` job handler at daemon boot so the handler can
+    /// snapshot counters per tick without going through `/metrics`.
+    pub fn live_stats(&self) -> Arc<LiveStats> {
+        Arc::clone(&self.inner.live_stats)
     }
 
     pub fn audit_inc_chain_reset(&self) {
@@ -747,6 +950,8 @@ impl TelemetryInner {
                 .with_unit("s")
                 .build(),
 
+            live_stats: Arc::new(LiveStats::default()),
+
             provider,
             prom_registry,
         }
@@ -869,6 +1074,20 @@ pub mod record {
     pub fn pool_backpressure_wait(backend: &str, seconds: f64) {
         if let Some(t) = global() {
             t.pool_record_backpressure_wait(backend, seconds);
+        }
+    }
+    /// `system monitor`'s "waiters now" gauge: increment when
+    /// `PoolBudget::try_reserve` enters its wait loop, paired with one
+    /// `pool_waiters_dec` on every exit path. No-op when the global is
+    /// unset (unit tests, CLI).
+    pub fn pool_waiters_inc(backend: &str) {
+        if let Some(t) = global() {
+            t.live_stats().inc_waiters(backend);
+        }
+    }
+    pub fn pool_waiters_dec(backend: &str) {
+        if let Some(t) = global() {
+            t.live_stats().dec_waiters(backend);
         }
     }
     pub fn cache_eviction(volume: &str, outcome: &str) {

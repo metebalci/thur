@@ -241,6 +241,11 @@ impl PoolBudget {
         }
 
         let started = Instant::now();
+        // `system monitor`'s instantaneous waiters_now gauge. Activated
+        // on the first no-room iteration (so the fast-path / single-
+        // iteration case doesn't touch the counter) and decremented on
+        // every exit via Drop.
+        let mut waiter = WaiterGauge::new(&self.backend);
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
         loop {
             let cap = self.cap_bytes();
@@ -260,6 +265,7 @@ impl PoolBudget {
                 self.report_used(used);
                 return Ok(());
             }
+            waiter.activate();
             // No room — log once at warn level, then wait for either
             // a release (cv signal) or the deadline.
             warn!(
@@ -369,6 +375,39 @@ impl PoolBudget {
 /// pool-only cap).
 fn disk_free_bytes(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
+}
+
+/// Drop-guard for the in-process `pool.<backend>.waiters_now` gauge
+/// that the `system monitor` job handler surfaces. `activate()` flips
+/// the flag and increments the gauge once; Drop decrements iff
+/// activated. Every exit path of [`PoolBudget::try_reserve`] (success,
+/// timeout, error) covered by Drop with no extra bookkeeping.
+struct WaiterGauge<'a> {
+    backend: &'a str,
+    active: bool,
+}
+
+impl<'a> WaiterGauge<'a> {
+    fn new(backend: &'a str) -> Self {
+        Self {
+            backend,
+            active: false,
+        }
+    }
+    fn activate(&mut self) {
+        if !self.active && !self.backend.is_empty() {
+            shared_telemetry::record::pool_waiters_inc(self.backend);
+            self.active = true;
+        }
+    }
+}
+
+impl Drop for WaiterGauge<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            shared_telemetry::record::pool_waiters_dec(self.backend);
+        }
+    }
 }
 
 #[cfg(test)]
