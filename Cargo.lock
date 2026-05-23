@@ -4410,6 +4410,7 @@ dependencies = [
  "serde_json",
  "shared-admin-proto",
  "shared-naming",
+ "tempfile",
  "tokio",
 ]
 

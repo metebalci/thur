@@ -540,4 +540,142 @@ mod tests {
         assert!(results.is_empty(), "no newline -> nothing to drain");
         assert!(!buf.is_empty(), "incomplete line stays buffered");
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Async I/O tests against a fake Unix-socket HTTP server.
+    // ─────────────────────────────────────────────────────────────────
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    fn socket_path() -> PathBuf {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("admin.sock");
+        // Leak the TempDir so the path stays valid for the lifetime of
+        // the test; the OS cleans /tmp on reboot regardless.
+        std::mem::forget(dir);
+        path
+    }
+
+    /// Spawn a one-shot fake server that accepts a single connection,
+    /// drains the request bytes, and writes `response` back.
+    fn fake_server(socket: PathBuf, response: Vec<u8>) {
+        let listener = UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+    }
+
+    fn http_response(status_line: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status_line}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len(),
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn ping_returns_true_when_a_socket_is_accepting() {
+        let path = socket_path();
+        let _l = UnixListener::bind(&path).expect("bind");
+        let client = AdminClient::new(path, "thurvtl");
+        assert!(client.ping().await);
+    }
+
+    #[tokio::test]
+    async fn ping_returns_false_when_no_socket_is_bound() {
+        let mut path = socket_path();
+        path.pop();
+        path.push("does-not-exist.sock");
+        let client = AdminClient::new(path, "thurvtl");
+        assert!(!client.ping().await);
+    }
+
+    #[tokio::test]
+    async fn socket_path_returns_the_constructor_value() {
+        let path = socket_path();
+        let client = AdminClient::new(path.clone(), "thurvtl");
+        assert_eq!(client.socket_path(), path.as_path());
+    }
+
+    #[tokio::test]
+    async fn get_json_parses_a_2xx_response() {
+        let path = socket_path();
+        fake_server(
+            path.clone(),
+            http_response("200 OK", r#"{"name":"primary","ok":true}"#),
+        );
+        // Give the listener a beat to be ready.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = AdminClient::new(path, "thurvtl");
+        #[derive(serde::Deserialize, PartialEq, Eq, Debug)]
+        struct Resp {
+            name: String,
+            ok: bool,
+        }
+        let got: Resp = client.get_json("/api/v1/x").await.expect("ok");
+        assert_eq!(
+            got,
+            Resp {
+                name: "primary".to_string(),
+                ok: true,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_surfaces_the_error_body_on_4xx() {
+        let path = socket_path();
+        fake_server(
+            path.clone(),
+            http_response("400 Bad Request", r#"{"error":"missing field 'name'"}"#),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = AdminClient::new(path, "thurvtl");
+        let err = client
+            .get_json::<serde_json::Value>("/api/v1/x")
+            .await
+            .expect_err("4xx must error");
+        assert!(
+            err.to_string().contains("missing field 'name'"),
+            "got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn post_unit_accepts_a_204_response() {
+        let path = socket_path();
+        fake_server(path.clone(), http_response("204 No Content", ""));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = AdminClient::new(path, "thurvtl");
+        client
+            .post_unit("/api/v1/x", &serde_json::json!({"k":"v"}))
+            .await
+            .expect("204 accepted");
+    }
+
+    #[tokio::test]
+    async fn get_json_errors_when_the_socket_is_missing() {
+        let mut path = socket_path();
+        path.pop();
+        path.push("absent.sock");
+        let client = AdminClient::new(path, "thurvtl");
+        let err = client
+            .get_json::<serde_json::Value>("/api/v1/x")
+            .await
+            .expect_err("must error");
+        // Error should mention the path so operators with multiple
+        // data_dirs can tell which daemon failed.
+        assert!(err.to_string().contains("absent.sock"), "got: {err}");
+    }
 }
