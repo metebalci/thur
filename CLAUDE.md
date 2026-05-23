@@ -78,6 +78,14 @@ on-disk paths group by purpose.
   passed as a plain `PathBuf`. Kept out of `shared-audit` itself so
   that low-level crate stays free of the `JobEmitter` / job-protocol
   deps.
+- `shared/admin-monitor` (`shared-admin-monitor`) — cross-product
+  `system.monitor` job handler. Tick loop that emits one
+  `MonitorSnapshot` (JSON-encoded in the `JobEvent::Log.message`)
+  per second until the CLI subscriber drops the stream; CLI side
+  keeps a ring buffer and computes 60 s / 5 m rate windows. Both
+  daemons impl `MonitorState` for their AdminState (daemon name /
+  version / started_at / `LiveStats` from `shared-telemetry` / pool
+  budgets / per-product VSA-or-VTL snapshot).
 - `shared/cli` (`shared-cli`) — CLI UX helpers: `emit_completion`
   ($SHELL detection + `clap_complete::generate`),
   `emit_defaults` / `emit_systemd_unit` print wrappers. Separate

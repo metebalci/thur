@@ -1,0 +1,28 @@
+[package]
+name = "shared-admin-monitor"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-product `system.monitor` job handler. Both daemons (thurvtl,
+# thurvsa) route the kind here; the per-product variation (volumes /
+# sessions for VSA; cartridges / drives for VTL) is supplied via the
+# `MonitorState` trait the daemon implements on its AdminState.
+
+[dependencies]
+shared-admin-server = { path = "../admin-server" }
+shared-pool = { path = "../pool" }
+shared-telemetry = { path = "../telemetry" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `run_monitor` ticks once per second.
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

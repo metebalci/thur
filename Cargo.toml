@@ -4,6 +4,7 @@ members = [
     "shared/admin-client",
     "shared/admin-http",
     "shared/admin-iscsi",
+    "shared/admin-monitor",
     "shared/admin-proto",
     "shared/admin-server",
     "shared/alerting",
