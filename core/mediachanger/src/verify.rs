@@ -398,8 +398,10 @@ fn verify_library(data_dir: &Path, out: &mut LibraryReport) -> Result<HashSet<St
             Err(e) => out.errors.push(format!("library.json parse failed: {}", e)),
         }
     } else {
-        out.errors
-            .push("library.json missing — run `library init`".to_string());
+        out.errors.push(
+            "library.json missing — configure `library:` in /etc/thurvtl/thurvtl.yaml and start the daemon"
+                .to_string(),
+        );
     }
 
     if out.inventory_json_present {

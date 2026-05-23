@@ -20,7 +20,7 @@ the same commit whenever a YAML key is added or changed.**
 | `thurvtl.yaml` | `/etc/thurvtl/` (override: `--config PATH`) | VTL | YAML | operator (hand-edited) |
 | `thurvsa.yaml` | `/etc/thurvsa/` (override: `--config PATH`) | VSA | YAML | operator (hand-edited) |
 | `thurvtl.env` / `thurvsa.env` | `/etc/thurvtl/` / `/etc/thurvsa/` | both | `KEY=VALUE` | operator; loaded by systemd `EnvironmentFile` |
-| `library.json` | `<data_dir>/library/` | VTL | JSON | `thurvtl library init` / `library modify` / `library partition` |
+| `library.json` | `<data_dir>/library/` | VTL | JSON | daemon (materialized from YAML `library:` block on first start, reconciled on subsequent starts) + `thurvtl library partition` for partition layout |
 | `inventory.json` | `<data_dir>/library/` | VTL | JSON | daemon + `thurvtl changer` ops |
 | `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
@@ -239,12 +239,19 @@ takes effect immediately without a restart.
 
 ### `library.json` — VTL
 
-`library.json` holds the chassis topology: slot, drive, and mail-slot
-counts; LTO generation; the four SMC element-address bases; firmware
-string; chassis serial; and logical partitions. It is written by
-`thurvtl library init` and mutated by `library modify` and
-`library partition {create,modify,…}`, all of which are daemon-down
-operations. Full schema: [`SPEC.md`](SPEC.md) § Library Topology.
+`library.json` holds the chassis topology in two stanzas: `declared`
+mirrors the YAML `library:` block at the last successful reconcile
+(`num_storage_slots`, `num_drives`, `lto_generation`, optional
+`firmware`); `minted` is daemon-owned and set once at first
+materialization (`chassis_serial`, the four SMC element-address
+bases) — immutable for the life of the library. Plus the partition
+layout. The daemon materializes the file on first start from the
+YAML, and on every subsequent start diffs the YAML against
+`declared` and reconciles (grow always succeeds; shrink refuses if
+any cartridge would be orphaned). Partition layout is the only piece
+operators still mutate imperatively, via
+`thurvtl library partition {create,modify,…}` (daemon-down). Full
+schema: [`SPEC.md`](SPEC.md) § Library Topology.
 
 ### `inventory.json` — VTL
 

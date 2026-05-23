@@ -13,6 +13,14 @@ mod inventory;
 // `pour_into_storage` it owns) live in library/partitions.rs.
 mod partitions;
 
+// Declared-vs-persisted topology reconciliation. `open_or_materialize`
+// is the daemon's single library bring-up entry point under the
+// chassis-into-YAML refactor; `compute_bounds` powers
+// `thurvtl library bounds`. The four SMC element bases + the
+// `MAIL_SLOT_COUNT = 1` constant live here as private constants —
+// no operator surface for those values anywhere.
+pub mod reconcile;
+
 // Cross-region DR restore driver — discover cartridges in a cloud
 // bucket and reconstruct the local cartridge directories via the
 // existing single-cartridge cold-bucket path. The CLI's
@@ -145,6 +153,27 @@ struct OldLibraryManifest {
 }
 
 // New two-file architecture
+
+/// Operator-declared chassis intent, deserialized from the
+/// `library:` block of `thurvtl.yaml`. Mirror of the YAML schema; the
+/// daemon stores this verbatim in `library.json`'s `declared` stanza
+/// at successful reconcile and diffs YAML against it on subsequent
+/// starts.
+///
+/// Independent from `LibraryTopology` (which also carries the minted
+/// chassis_serial + four element bases that the operator never sees).
+/// Phase 1 of the chassis-into-YAML refactor moves this struct into
+/// `library/reconcile.rs` along with the diff / materialize entry
+/// points; Phase 0 leaves it here so the type is in tree without yet
+/// being wired to any caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredTopology {
+    pub num_storage_slots: u32,
+    pub num_drives: u32,
+    pub lto_generation: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
+}
 
 /// library.json - Static topology (immutable at runtime)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,7 +588,7 @@ impl Library {
 
         if !lib_path.exists() {
             return Err(SmcError::InvalidOp(
-                "Library not initialized. Run: thurvtl library init --slots N --drives M --lto-generation G",
+                "library not materialized: configure `library:` in /etc/thurvtl/thurvtl.yaml and start the daemon (the daemon materializes library.json on first start from the YAML block)",
             ));
         }
 
@@ -570,8 +599,20 @@ impl Library {
             tracing::info!("Migration complete");
         }
 
-        // Load two-file format
-        let topology: LibraryTopology = serde_json::from_str(&fs::read_to_string(&lib_path)?)?;
+        // Load two-file format. Schema versioning: v1 is the
+        // pre-refactor flat shape (matches `LibraryTopology` directly);
+        // v2 is the `declared`/`minted` split written by
+        // `reconcile::open_or_materialize`. Daemon-down callers stay
+        // working under v2 by flattening through `topology_from_disk`.
+        let raw_topology = fs::read_to_string(&lib_path)?;
+        let probe: serde_json::Value = serde_json::from_str(&raw_topology)?;
+        let version = probe.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+        let topology: LibraryTopology = if version == reconcile::DISK_SCHEMA_VERSION as u64 {
+            let disk: reconcile::DiskV2 = serde_json::from_str(&raw_topology)?;
+            reconcile::topology_from_disk(disk)
+        } else {
+            serde_json::from_str(&raw_topology)?
+        };
         let inventory: LibraryInventory = serde_json::from_str(&fs::read_to_string(&inv_path)?)?;
 
         Ok(Self {
@@ -1153,165 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_unload_slots_success() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        // Create library with 10 slots
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 10, 0, 1, 8, None, 0, 1001, 101, 1)
-                .unwrap();
-
-        // Add tapes to slots 5-9
-        for i in 5..10 {
-            let barcode = format!("TAPE{:03}L8", i);
-            library.add_or_create_tape(&barcode, "primary").unwrap();
-        }
-
-        // Verify 5 tapes in slots
-        assert_eq!(
-            library
-                .storage_slots()
-                .iter()
-                .filter(|s| s.occupied)
-                .count(),
-            5
-        );
-
-        // Shrink to 7 slots - should move 3 tapes from slots 7-9 to slots 0-2
-        let (new_slots, _, _, _) = library.resize(Some(7), None, None, None, None).unwrap();
-        assert_eq!(new_slots, 7);
-        assert_eq!(library.storage_slots().len(), 7);
-
-        // All 5 tapes should still be present (moved to slots 0-4)
-        assert_eq!(
-            library
-                .storage_slots()
-                .iter()
-                .filter(|s| s.occupied)
-                .count(),
-            5
-        );
-    }
-
-    #[test]
-    fn test_auto_unload_slots_no_space() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        // Create library with 10 slots, all full
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 10, 0, 1, 8, None, 0, 1001, 101, 1)
-                .unwrap();
-        for i in 0..10 {
-            let barcode = format!("TAPE{:03}L8", i);
-            library.add_or_create_tape(&barcode, "primary").unwrap();
-        }
-
-        // Try to shrink to 5 slots - should fail (5 tapes need to move but only 0 empty slots)
-        let result = library.resize(Some(5), None, None, None, None);
-        assert!(result.is_err());
-        assert!(format!("{:?}", result.unwrap_err()).contains("Cannot shrink to 5 slots"));
-    }
-
-    #[test]
-    fn test_auto_unload_drives_to_slots() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        // Create library with 10 slots, 3 drives
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 10, 0, 3, 8, None, 0, 1001, 101, 1)
-                .unwrap();
-
-        // Load all 3 drives
-        for i in 0..3 {
-            let slot_id = library
-                .add_or_create_tape(&format!("TAPE{:03}", i), "primary")
-                .unwrap();
-            library.load_to_drive(slot_id, i as u32).unwrap();
-        }
-
-        // Shrink to 1 drive - should move tapes from drives 1 and 2 to slots
-        let (_, _, new_drives, _) = library.resize(None, None, Some(1), None, None).unwrap();
-        assert_eq!(new_drives, 1);
-        assert_eq!(library.drives().len(), 1);
-
-        // Drive 0 should still have TAPE000
-        let drive0 = library.get_drive(0).unwrap();
-        assert!(drive0.occupied);
-        assert_eq!(drive0.barcode, Some("TAPE000".to_string()));
-
-        // TAPE001 and TAPE002 should be in slots
-        let tape001_in_slot = library
-            .storage_slots()
-            .iter()
-            .any(|s| s.occupied && s.barcode == Some("TAPE001".to_string()));
-        let tape002_in_slot = library
-            .storage_slots()
-            .iter()
-            .any(|s| s.occupied && s.barcode == Some("TAPE002".to_string()));
-        assert!(
-            tape001_in_slot,
-            "TAPE001 should be in a slot after drive shrink"
-        );
-        assert!(
-            tape002_in_slot,
-            "TAPE002 should be in a slot after drive shrink"
-        );
-
-        // Drives 1 and 2 should no longer exist
-        assert!(library.get_drive(1).is_none());
-        assert!(library.get_drive(2).is_none());
-    }
-
-    #[test]
-    fn test_expand_slots() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        // Create library with 10 slots
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 10, 0, 2, 8, None, 0, 1001, 101, 1)
-                .unwrap();
-
-        // Expand to 20 slots
-        let (new_slots, _, _, _) = library.resize(Some(20), None, None, None, None).unwrap();
-        assert_eq!(new_slots, 20);
-        assert_eq!(library.storage_slots().len(), 20);
-
-        // New slots should be empty
-        for i in 10..20 {
-            assert!(!library.storage_slots()[i as usize].occupied);
-        }
-    }
-
-    #[test]
-    fn test_lto_generation_change() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        // Create library with LTO-8
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 5, 0, 1, 8, None, 0, 1001, 101, 1).unwrap();
-        assert_eq!(library.lto_generation(), 8);
-
-        // Change to LTO-7 (e.g., drive replacement)
-        let (_, _, _, new_lto) = library.resize(None, None, None, Some(7), None).unwrap();
-        assert_eq!(new_lto, 7);
-        assert_eq!(library.lto_generation(), 7);
-
-        // Verify persisted
-        let library = Library::open(&lib_root, &tapes_root).unwrap();
-        assert_eq!(library.lto_generation(), 7);
-    }
-
-    #[test]
     fn test_reload_inventory() {
         let temp_dir = TempDir::new().unwrap();
         let lib_root = temp_dir.path().join("library");
@@ -1683,48 +1565,4 @@ mod tests {
         assert_eq!(library.drive_mfg_serial(0).as_deref(), Some("THUR-MFG-001"));
     }
 
-    #[test]
-    fn library_resize_grow_drives_assigns_random_mfg_serials() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 5, 0, 1, 8, None, 0, 1001, 101, 1).unwrap();
-        let original = library.drive_mfg_serial(0).unwrap();
-        library.resize(None, None, Some(3), None, None).unwrap();
-        // Existing drive's serial unchanged; new drives got fresh ones.
-        assert_eq!(
-            library.drive_mfg_serial(0).as_deref(),
-            Some(original.as_str())
-        );
-        let new1 = library.drive_mfg_serial(1).unwrap();
-        let new2 = library.drive_mfg_serial(2).unwrap();
-        assert!(new1.starts_with("TVL") && new2.starts_with("TVL"));
-        assert_ne!(new1, new2);
-        assert_ne!(new1, original);
-    }
-
-    #[test]
-    fn library_resize_validates_partitions() {
-        let temp_dir = TempDir::new().unwrap();
-        let lib_root = temp_dir.path().join("library");
-        let tapes_root = temp_dir.path().join("tapes");
-
-        let mut library =
-            Library::initialize(&lib_root, &tapes_root, 40, 5, 3, 8, None, 0, 1001, 101, 1)
-                .unwrap();
-        let parts = vec![
-            part("alpha", (0, 20), (0, 2), &[0, 1]),
-            part("bravo", (20, 40), (2, 5), &[2]),
-        ];
-        library.set_partitions(parts).unwrap();
-
-        // Shrink to 30 slots — bravo's range [20, 40) now exceeds the
-        // chassis size; resize must refuse.
-        let err = library
-            .resize(Some(30), None, None, None, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("exceeds 30 storage slots"));
-    }
 }

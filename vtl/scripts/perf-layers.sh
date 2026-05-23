@@ -252,6 +252,10 @@ row_dir_cleanup() {
 make_config() {
     cat > "$TEST_CONFIG" <<EOFCFG
 data_dir: "$TEST_DIR/data"
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 iscsi:
@@ -265,13 +269,6 @@ cloud:
   backends:
     $PERF_BACKEND_NAME: $(jq -c --arg name "$PERF_BACKEND_NAME" --arg prefix "$TEST_PREFIX" '.backends[$name] + { prefix: $prefix }' "$PERF_BACKENDS_FILE")
 EOFCFG
-}
-
-init_library() {
-    "$CLI_PATH" --config "$TEST_CONFIG" \
-        --user "${SUDO_USER:-root}" \
-        library init --slots 4 --drives 1 --lto-generation 8 >/dev/null \
-        || { log_error "library init failed"; return 1; }
 }
 
 start_daemon() {
@@ -434,7 +431,6 @@ run_l3() {
         if [[ "$fixture" == "random" ]]; then src="$FIXTURE_RANDOM"; else src="$FIXTURE_COMPRESSIBLE"; fi
         row_dir_setup 3 "$fixture"
         make_config
-        if ! init_library; then row_dir_cleanup; continue; fi
         if ! start_daemon; then row_dir_cleanup; continue; fi
         if ! create_cartridge "TAPE01L8"; then row_dir_cleanup; continue; fi
         if ! connect_iscsi; then row_dir_cleanup; continue; fi

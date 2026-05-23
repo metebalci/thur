@@ -101,7 +101,8 @@ check_prerequisites() {
     fi
 }
 
-# Fresh data dir + YAML conffile (with cloud.backends:) + library init for each sub-test.
+# Fresh data dir + YAML conffile (with cloud.backends: + library:) for each sub-test.
+# Daemon materializes library.json from the library: block on first start.
 prepare_fixture() {
     local sub="$1"
     local fixture="${TEST_DIR}/${sub}"
@@ -113,6 +114,10 @@ prepare_fixture() {
 
     cat > "$config" <<EOFCONFIG
 data_dir: "$data_dir"
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
 license:
   file: "${fixture}/no-such.lic"
 cloud:
@@ -123,7 +128,6 @@ cloud:
 
 EOFCONFIG
 
-    "$CLI_PATH" --config "$config" library init --slots 4 --drives 1 --lto-generation 8 > /dev/null
     echo "$fixture"
 }
 

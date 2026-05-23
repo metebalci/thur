@@ -42,6 +42,98 @@ struct Args {
     test: bool,
 }
 
+/// Build a `DeclaredTopology` from the YAML `library:` block.
+/// Surfaces every missing required field at once (one error line per
+/// missing field) so the operator doesn't fix them one at a time.
+fn build_declared_topology(
+    block: Option<&LibraryConfig>,
+    config_path: &str,
+) -> Result<core_mediachanger::library::DeclaredTopology> {
+    let block = block.ok_or_else(|| {
+        anyhow::anyhow!(
+            "library: block missing from {}. Required fields: num_slots, num_drives, lto_generation.",
+            config_path,
+        )
+    })?;
+    let mut missing: Vec<&'static str> = Vec::new();
+    if block.num_slots.is_none() {
+        missing.push("num_slots");
+    }
+    if block.num_drives.is_none() {
+        missing.push("num_drives");
+    }
+    if block.lto_generation.is_none() {
+        missing.push("lto_generation");
+    }
+    if !missing.is_empty() {
+        let lines: Vec<String> = missing
+            .iter()
+            .map(|f| format!("library.{}", f))
+            .collect();
+        return Err(anyhow::anyhow!(
+            "{}: required field(s) missing from library: block: {}",
+            config_path,
+            lines.join(", "),
+        ));
+    }
+    Ok(core_mediachanger::library::DeclaredTopology {
+        num_storage_slots: block.num_slots.unwrap(),
+        num_drives: block.num_drives.unwrap(),
+        lto_generation: block.lto_generation.unwrap(),
+        firmware: block.firmware.clone(),
+    })
+}
+
+/// Walk the reconcile-event vector from `open_or_materialize` and
+/// emit the matching audit rows. Ordering matches the vector: every
+/// `DriveEvacuated` precedes the summary row.
+fn emit_reconcile_audit(
+    log: &std::sync::Arc<core_mediachanger::AuditLog>,
+    events: &[core_mediachanger::library::reconcile::ReconcileEvent],
+) {
+    use core_mediachanger::library::reconcile::ReconcileEvent;
+    for ev in events {
+        match ev {
+            ReconcileEvent::DriveEvacuated(d) => {
+                let params = serde_json::json!({
+                    "drive_id": d.drive_id,
+                    "barcode": d.barcode,
+                    "origin_slot": d.origin_slot,
+                    "trigger": "library.reconcile",
+                });
+                if let Err(e) = log.append(
+                    "inventory.move_medium",
+                    core_mediachanger::AuditActor::daemon(),
+                    params,
+                    core_mediachanger::AuditResult::Ok,
+                ) {
+                    warn!("audit: failed to record inventory.move_medium: {}", e);
+                }
+            }
+            ReconcileEvent::Materialized => {
+                if let Err(e) = log.append(
+                    "library.materialize",
+                    core_mediachanger::AuditActor::daemon(),
+                    serde_json::json!({}),
+                    core_mediachanger::AuditResult::Ok,
+                ) {
+                    warn!("audit: failed to record library.materialize: {}", e);
+                }
+            }
+            ReconcileEvent::Reconciled => {
+                if let Err(e) = log.append(
+                    "library.reconcile",
+                    core_mediachanger::AuditActor::daemon(),
+                    serde_json::json!({}),
+                    core_mediachanger::AuditResult::Ok,
+                ) {
+                    warn!("audit: failed to record library.reconcile: {}", e);
+                }
+            }
+        }
+    }
+}
+
 impl Args {
     /// Resolve the config path. `--config PATH` wins; otherwise the
     /// production location at `/etc/thurvtl/thurvtl.yaml`. We
@@ -98,6 +190,33 @@ struct Config {
     /// listing at least one sink. Full schema in `shared-alerting`.
     #[serde(default)]
     alerting: shared_alerting::AlertingConfig,
+    /// Chassis topology declaration. The three counts
+    /// (`num_slots`, `num_drives`, `lto_generation`) are compulsory
+    /// with no defaults — the daemon refuses to start naming each
+    /// missing field. Fields are modeled as `Option<...>` here so
+    /// the daemon produces its own missing-field error instead of
+    /// serde's generic message. The optional `firmware` overrides
+    /// the per-LTO default (`TVL7`/`TVL8`/`TVL0`).
+    ///
+    /// Phase 0 adds the block to the schema but does not yet read
+    /// it at startup; Phase 2 wires
+    /// `reconcile::open_or_materialize` to consume it.
+    #[serde(default)]
+    library: Option<LibraryConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct LibraryConfig {
+    /// Number of storage slots. REQUIRED.
+    num_slots: Option<u32>,
+    /// Number of tape drives. REQUIRED.
+    num_drives: Option<u32>,
+    /// LTO generation: 7 or 8. REQUIRED.
+    lto_generation: Option<u8>,
+    /// 1-4 ASCII chars; INQUIRY revision override. Defaults
+    /// to `TVL<gen>` per `default_firmware_for_lto`.
+    #[serde(default)]
+    firmware: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -600,23 +719,35 @@ async fn main() -> Result<()> {
         iscsi_users_file.users.len()
     );
 
-    // Load library manifest (must be initialized via CLI). Done
-    // before cloud validation so the cartridge ↔ backend referential
-    // check below has the manifest list available.
-    info!("Loading library manifest...");
+    // Bring up the library: materialize from the YAML `library:`
+    // block on first start, diff-and-reconcile on every subsequent
+    // start. Done before cloud validation so the cartridge ↔ backend
+    // referential check below has the manifest list available.
+    info!("Bringing up library from YAML library: block...");
     let lib_root = std::path::PathBuf::from(&cfg.data_dir).join("library");
     let tapes_root = std::path::PathBuf::from(&cfg.data_dir).join("tapes");
 
-    let library = core_mediachanger::Library::open(&lib_root, &tapes_root)
-        .map_err(|e| anyhow::anyhow!(
-            "Failed to load library: {}. Initialize with: thurvtl library init --slots N --drives M --lto-generation G",
-            e
-        ))?;
+    let declared = build_declared_topology(cfg.library.as_ref(), &config_path)?;
+    let (library, reconcile_events) =
+        core_mediachanger::library::reconcile::open_or_materialize(
+            &lib_root,
+            &tapes_root,
+            &declared,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to bring up library: {}", e))?;
+
+    for ev in &reconcile_events {
+        if let core_mediachanger::library::reconcile::ReconcileEvent::DriveEvacuated(d) = ev {
+            info!(
+                "Reconcile: evacuated drive {} ({}) to origin slot {}",
+                d.drive_id, d.barcode, d.origin_slot,
+            );
+        }
+    }
 
     info!(
-        "Library loaded: {} slots, {} mail slots, {} drives, LTO-{}",
+        "Library ready: {} slots, {} drives, LTO-{}",
         library.storage_slots().len(),
-        library.mail_slots().len(),
         library.drives().len(),
         library.lto_generation()
     );
@@ -683,10 +814,11 @@ async fn main() -> Result<()> {
     }
 
     // 🔸 Open the audit log. Always on — there is no enabled knob.
-    // The daemon is the sole writer once started; daemon-down CLI
-    // flows (`library init` / `library modify`) drop their entries
-    // into `<audit_dir>/pending/` and we drain that queue right after
-    // open. A broken chain refuses to start (both tiers).
+    // The daemon is the sole writer once started; remaining daemon-
+    // down CLI flows (`library partition`, `library restore`) drop
+    // their entries into `<audit_dir>/pending/` and we drain that
+    // queue right after open. A broken chain refuses to start (both
+    // tiers).
     let audit_log_dir = cfg.audit.dir.as_ref().map_or_else(
         || std::path::PathBuf::from(&cfg.data_dir).join("audit"),
         std::path::PathBuf::from,
@@ -730,7 +862,6 @@ async fn main() -> Result<()> {
                     "library": {
                         "drives": library.drives().len(),
                         "storage_slots": library.storage_slots().len(),
-                        "mail_slots": library.mail_slots().len(),
                         "lto_generation": library.lto_generation(),
                     },
                 });
@@ -742,6 +873,11 @@ async fn main() -> Result<()> {
                 ) {
                     warn!("audit: failed to record daemon.start: {}", e);
                 }
+                // Emit reconcile audit trail: per-evacuation
+                // `inventory.move_medium` rows precede a single
+                // summary row (`library.materialize` on first start,
+                // `library.reconcile` on subsequent diffs).
+                emit_reconcile_audit(&log, &reconcile_events);
                 // Stays on the sync `Arc<AuditLog>` path because the
                 // channel writer task hasn't been spawned yet — this
                 // entry is the only write that hits the chain mutex

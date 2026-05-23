@@ -113,6 +113,11 @@ write_config() {
     cat > "$config_path" <<EOFCONFIG
 data_dir: "$data_dir"
 
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
+
 license:
   file: "$TEST_DIR/no-such.lic"
 
@@ -171,12 +176,6 @@ seed_fixture() {
     local barcode="$5"
 
     write_config "$data_dir" "$config" "$src_bucket" "$dst_bucket"
-
-    if ! "$CLI_PATH" --config "$config" library init \
-            --slots 4 --drives 1 --lto-generation 8 > /dev/null; then
-        log_error "library init failed"
-        return 1
-    fi
 
     if ! start_daemon "$config" "$data_dir"; then
         return 1

@@ -45,7 +45,7 @@ above.
 | Product ID (LUN 0) | `THUR VTL        ` (16 bytes, from `shared_naming::TAPE_LIBRARY_PRODUCT`) |
 | Device type (LUN 0) | `0x08` (Medium Changer) |
 | Serial (LUN 0, VPD 0x80) | `<chassis_serial>_LL<NN>` where `chassis_serial` is the persisted 14-byte string in `library.json` (default `TVLxxxxxxxxxxx` minted at init) and `NN` is the 1-based partition index — `_LL01` on unpartitioned libraries, `_LL02` for the second partition, etc. Sessions bound to different partitions see distinct serials. |
-| Firmware revision | from `LibraryTopology.firmware`; default `TVL<gen>` (`TVL8`). Override via `library init --firmware <CODE>` for backup-software compatibility matrices that gate on a specific vendor firmware string. |
+| Firmware revision | from `LibraryTopology.firmware`; default `TVL<gen>` (`TVL8`). Override via `library.firmware: <CODE>` in the YAML for backup-software compatibility matrices that gate on a specific vendor firmware string. |
 
 ### Drives
 
@@ -63,8 +63,8 @@ above.
 |---------|--------|
 | LTO-8  | 12 TB  |
 
-VTL ships as a clean LTO-8 drive: both `library init --lto-generation`
-and `cartridge create --lto-generation` accept `8` only. The flag
+VTL ships as a clean LTO-8 drive: both `library.lto_generation` in
+the YAML and `cartridge create --lto-generation` accept `8` only. The flag
 exists at all only for forward-compatibility with LTO-9/10 (see
 [`docs/LTO-9.md`](LTO-9.md)). REPORT DENSITY SUPPORT still
 advertises the LTO-8 plus LTO-7-RO descriptor pair, which matches the
@@ -88,16 +88,23 @@ clears the Early Warning latch.
 
 | Element | Min | Max | Default |
 |---------|----:|----:|--------:|
-| Cartridge storage slots | 1 | 65535 | 40 |
-| Mail slots (import/export) | 0 | 65535 | 0 |
-| Tape drives | 1 | 255 | 3 |
-| LTO generation | 7 | 8 | (no default — required at `library init`) |
+| Cartridge storage slots | 1 | 65535 | (none — required in YAML) |
+| Mail slots (import/export) | 1 | 1 | 1 (hardwired) |
+| Tape drives | 1 | 255 | (none — required in YAML) |
+| LTO generation | 7 | 8 | (none — required in YAML) |
 
-The chassis topology lives in `<data_dir>/library/library.json`. That
-file is created by `thurvtl library init` and can only be mutated
-by `library modify` while the daemon is stopped. The contents of the
-slots and drives — what cartridge sits where — live separately in
-`<data_dir>/library/inventory.json`.
+The chassis topology is declared in `thurvtl.yaml`'s `library:`
+block (`num_slots`, `num_drives`, `lto_generation`, optional
+`firmware`); the daemon materializes
+`<data_dir>/library/library.json` from that block on first start
+(minting a stable chassis serial + four SMC element-address bases
+into the `minted` stanza) and reconciles YAML against persisted
+`declared` state on every subsequent start. Mail slots no longer
+have an operator surface — exactly one IE element is reported for
+backup-software compatibility, and `cartridge import` /
+`cartridge export` operate on storage slots directly. The contents
+of the slots and drives — what cartridge sits where — live
+separately in `<data_dir>/library/inventory.json`.
 
 ---
 
@@ -160,24 +167,26 @@ this:
 
 ### SMC Element Addressing
 
-The element addresses are fixed at `thurvtl library init` and
-persisted in `library.json` alongside the slot and drive counts. They
-are immutable after init, and for a good reason: barcoded inventory
-entries reference these addresses directly, so changing them would
-orphan every element currently loaded. The defaults below follow the
-conventional element-address layout.
+The four element-address bases are minted by the daemon when it
+materializes `library.json` from the YAML `library:` block on first
+start, and persisted in the `minted` stanza of `library.json`
+alongside the chassis serial. They are immutable forever after, and
+for a good reason: barcoded inventory entries reference these
+addresses directly, so changing them would orphan every element
+currently loaded. The values below follow the conventional
+element-address layout and are not operator-tunable.
 
-| Element type | Default first address | Count | `library init` flag |
-|--------------|----------------------:|------:|---------------------|
-| Medium Transport (robot) | `0`    | 1 | `--transport-base` |
-| Data Transfer (drives)   | `1`    | `num_drives` | `--data-transfer-base` |
-| Import/Export (mail)     | `101`  | `num_mail_slots` | `--import-export-base` |
-| Storage (slots)          | `1001` | `num_storage_slots` | `--storage-base` |
+| Element type | First address | Count |
+|--------------|--------------:|------:|
+| Medium Transport (robot) | `0`    | 1 |
+| Data Transfer (drives)   | `1`    | `num_drives` |
+| Import/Export (mail)     | `101`  | 1 (hardwired) |
+| Storage (slots)          | `1001` | `num_storage_slots` |
 
-Before it writes `library.json`, `library init` validates that the
-four `[base, base+count)` ranges neither overlap each other nor run
-past the end of the u16 SMC address space. If either check fails, it
-returns `LibraryConfig` and writes nothing.
+Before it writes `library.json`, the daemon validates that the four
+`[base, base+count)` ranges neither overlap each other nor run past
+the end of the u16 SMC address space. If either check fails it
+refuses to start with a `LibraryConfig` error and writes nothing.
 
 ---
 
@@ -418,7 +427,7 @@ to re-register on reconnect.
 | 0x83 | Device Identification | Three descriptors: (1) NAA-3 (Locally Assigned, 8-byte binary) — top nibble `0x3`, remaining 60 bits = BLAKE3(`chassis_serial \| lun \| partition_name`) so identity is globally distinct and stable across daemon restarts; (2) T10 vendor-ID-based identifier (ASCII); (3) Logical Unit Group (codeset 1, association 10, designator type 6) — 4-byte group ID = first 4 bytes of BLAKE3(`chassis_serial \| partition_name`). Drives in the same partition share the same group ID; backup software uses it to auto-correlate "these LUNs belong to one logical library." Multipath stacks bind to NAA. |
 | 0x85 | Management Network Address (changer only) | ASCII URL pointing at the daemon's HTTP listener. |
 | 0xB0 | Sequential-Access Device Characteristics (SSC-5 §8.5.4) | Tape-drive LUNs only. Byte 4 bit 7 = WORMM, set when the loaded cartridge is WORM (`manifest.worm == true`). |
-| 0xB1 | Manufacturer-Assigned Serial Number | Tape-drive LUNs only. 32-byte ASCII serial padded with spaces, conceptually fixed at production. Reads from `DriveInfo::mfg_serial` in `inventory.json` (10-byte `TVL` + 7 hex chars, minted once per drive at library init / `library modify --drives N`). Pre-field libraries fall back to the deterministic literal `THUR-MFG-NNN`. The same string is reported by LOG SENSE page 0x14 parameter 0x0040 so hosts correlating the two sources see one identity per drive LUN. |
+| 0xB1 | Manufacturer-Assigned Serial Number | Tape-drive LUNs only. 32-byte ASCII serial padded with spaces, conceptually fixed at production. Reads from `DriveInfo::mfg_serial` in `inventory.json` (10-byte `TVL` + 7 hex chars, minted once per drive when the daemon first materializes the library or grows `num_drives`). Pre-field libraries fall back to the deterministic literal `THUR-MFG-NNN`. The same string is reported by LOG SENSE page 0x14 parameter 0x0040 so hosts correlating the two sources see one identity per drive LUN. |
 | 0xB2 | TapeAlert Supported Flags (SSC-3 TapeAlert supplement) | Tape-drive LUNs only. 8-byte bitmap covering TapeAlert flags 1..=64 — bit 7 of byte 4 = flag 1, bit 0 of byte 11 = flag 64. Thur VTL advertises all 64 flags (`0xFF` ×8), matching what LOG SENSE 0x2E already exposes. A healthy virtual drive reports flag value 0 for each parameter; the bitmap tells hosts every standard SSC-3 alert flag is interpretable if anything were ever raised. |
 | 0xB3 | Automation Device Serial Number (SSC-5 §8.5.6 companion to 0xB4) | Tape-drive LUNs only. 32-byte ASCII serial padded with spaces, identifying the *automation device* (chassis / library) this drive is housed in. Reads from `LibraryTopology::chassis_serial` (14-byte string, persisted in `library.json`). Distinct from VPD 0xB1 (per-drive serial) and from the changer LUN's VPD 0x80 (which carries the `_LL<NN>` partition suffix on top of the same chassis serial). Pre-field libraries fall back to the legacy literal `THUR-CHG-001`. Backup software pairs 0xB3 + 0xB4 to identify "which library does this drive belong to and at which element". |
 | 0xB4 | Data Transfer Device Element Address (SPC-4 §7.8.7 / SSC-5 §8.5.7) | Tape-drive LUNs only. One designation descriptor (codeset=binary, association=target device, designator type=vendor specific) carrying a 4-byte big-endian element address — high two bytes zero, low two bytes = `data_transfer_start + (lun - 1)`. Lets the host correlate a drive's INQUIRY identity with its slot in the changer's element table. |
@@ -929,7 +938,8 @@ chunking-mode interactions, encryption / compression trade-offs).
 `firmware` is optional; leaving it `null` selects the per-LTO default
 (`TVL7` or `TVL8`). `chassis_serial` is a 14-byte uppercase string —
 a 3-character `TVL` prefix followed by 11 hex chars, so 44 bits of
-entropy — minted at `library init` and persisted across restarts. It
+entropy — minted by the daemon when it first materializes the
+library from the YAML, and persisted across restarts. It
 shows up in two places: as INQUIRY VPD `0xB3` (Automation Device
 Serial) on every drive LUN, and as the prefix of VPD `0x80` (Unit
 Serial) on the changer LUN, where the full value is
@@ -982,8 +992,9 @@ secrets stay in the same config file the operator already manages.
 
 `mfg_serial` is a 10-byte string — a 3-character `TVL` prefix plus 7
 hex chars, so 28 bits of entropy — minted once when the drive is added
-(at `library init` or `library modify --drives N`) and persisted
-across restarts. The same value is surfaced through INQUIRY VPD `0xB1`
+(when the daemon first materializes the library, or when reconcile
+grows `num_drives`) and persisted across restarts. The same value is
+surfaced through INQUIRY VPD `0xB1`
 (Manufacturer-Assigned Serial), through LOG SENSE page `0x14`
 parameter `0x0040`, and as the drive LUN's VPD `0x80` Unit Serial —
 all three must report the same string. A pre-field inventory with no
@@ -991,9 +1002,9 @@ all three must report the same string. A pre-field inventory with no
 LUN.
 
 Write paths to `library.json` and `inventory.json` are guarded by an
-in-process write-lock plus atomic-rename, so the daemon and the
-chassis-assembly CLI commands (`library init`, `library modify`,
-`library partition …`) cannot tear either file. The older
+in-process write-lock plus atomic-rename, so the daemon's reconcile
+engine and the daemon-down `library partition …` commands cannot
+tear either file. The older
 cross-process `fs2` lock was retired in 2026-05, because the daemon is
 now the sole live writer and a cross-process lock is no longer needed.
 
@@ -1305,7 +1316,7 @@ it.
 | `audit-YYYY-MM-DD.jsonl` | One entry per line, today's file (or any non-rotated file). |
 | `audit-YYYY-MM-DD.jsonl.zst` | Rotated file, zstd-compressed level 3 (default; `audit.compress_rotated: false` keeps plain). |
 | `chain.state` | `{last_seq, last_hash, last_file}` JSON; rewritten after every append. |
-| `pending/<RFC3339>-<rand>.json` | Daemon-down CLI audit queue (`library init` / `library modify`); drained at next daemon start. |
+| `pending/<RFC3339>-<rand>.json` | Daemon-down CLI audit queue (`library partition *`, `library restore`); drained at next daemon start. |
 | `pending/failed/` | Quarantine for queued entries the daemon couldn't append (chain broken, malformed JSON). Investigated out-of-band. |
 
 Rollover is daily, at UTC midnight: it happens on the first append
@@ -1372,8 +1383,9 @@ Daemon-side: `daemon.start`, `daemon.stop`.
 
 CLI-side: `cartridge.create`, `cartridge.import`,
 `cartridge.export`, `cartridge.legal_hold.set`,
-`cartridge.legal_hold.clear`, `library.init`, `library.modify`,
-`library.load`, `library.unload`, `library.move`, `gc.run`.
+`cartridge.legal_hold.clear`, `library.materialize`,
+`library.reconcile`, `library.load`, `library.unload`,
+`library.move`, `inventory.move_medium`, `gc.run`.
 
 iSCSI / SCSI-side (actor `kind:"iscsi"`, `user` = initiator IQN if
 the initiator advertised one, `addr` = peer ip:port):
@@ -1558,7 +1570,8 @@ This verb brings a fresh host up from a cold mirror bucket. It can
 only replicate what the bucket actually holds, which is the cartridge
 state — manifests, index pages, and chunks. The chassis topology in
 `library.json` is **not** cloud-replicated, so the operator has to
-declare it themselves with `library init` on the new host. Restored
+declare it themselves in the new host's `thurvtl.yaml` `library:`
+block (and start the daemon once to materialize it). Restored
 cartridges are seated into storage slots sequentially in barcode-sort
 order; if a specific layout matters, run `changer move` afterward.
 
@@ -1617,16 +1630,25 @@ The restore runs in four phases:
 
 ### Operator runbook (cold-bucket DR)
 
-On a fresh host, a cold-bucket recovery is three commands:
+On a fresh host, a cold-bucket recovery is three steps:
 
 ```
-# 1. Bring up chassis topology (operator's call, not cloud-replicated).
-thurvtl library init --slots N --drives M --lto-generation 7|8
+# 1. Declare chassis topology in thurvtl.yaml (operator's call,
+#    not cloud-replicated):
+#    library:
+#      num_slots: N
+#      num_drives: M
+#      lto_generation: 7|8
 
-# 2. Restore cartridges from the mirror.
+# 2. Bring the daemon up briefly so it materializes library.json
+#    from the YAML, then stop so the daemon-down restore can run.
+systemctl start thurvtld
+systemctl stop thurvtld
+
+# 3. Restore cartridges from the mirror.
 thurvtl library restore --backend mirror
 
-# 3. Start serving.
+# 4. Start serving.
 systemctl start thurvtld
 ```
 
@@ -1645,9 +1667,9 @@ replication", see `ROADMAP.md`).
 
 ### What this verb does NOT cover
 
-- **Chassis topology.** The operator runs `library init` first; the
-  topology knobs (`--slots / --drives / --lto-generation`) are never
-  pulled from cloud state.
+- **Chassis topology.** The operator declares the chassis in the
+  YAML `library:` block first; the topology fields (`num_slots`,
+  `num_drives`, `lto_generation`) are never pulled from cloud state.
 - **Daemon-routed warm-host restore.** `library restore` refuses to
   run if a daemon is alive on the data dir. Refreshing a single
   cartridge's metadata against a live daemon is a different operation
@@ -1977,9 +1999,12 @@ create time. That flag is optional and inferred when only one backend
 is configured, and required once there are two or more; any number of
 backends may be configured.
 
-The library topology is **not** part of `thurvtl.yaml`. It is
-initialized once with `thurvtl library init` and lives at
-`<data_dir>/library/library.json`.
+The library topology is declared in the `library:` block of
+`thurvtl.yaml` (required fields: `num_slots`, `num_drives`,
+`lto_generation`); the daemon materializes
+`<data_dir>/library/library.json` from that block on first start
+and reconciles YAML against persisted state on every subsequent
+start.
 
 ---
 

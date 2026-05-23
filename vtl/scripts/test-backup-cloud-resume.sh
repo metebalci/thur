@@ -104,6 +104,10 @@ prepare_fixture() {
 
     cat > "$config" <<EOFCONFIG
 data_dir: "$data_dir"
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
 iscsi:
   listen: "127.0.0.1:$iscsi_port"
   target_iqn: "iqn.2025-10.com.metebalci:thurvtl"
@@ -119,7 +123,6 @@ cloud:
 
 EOFCONFIG
 
-    "$CLI_PATH" --config "$config" library init --slots 4 --drives 1 --lto-generation 8 > /dev/null
     echo "$fixture"
 }
 

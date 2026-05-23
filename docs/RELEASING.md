@@ -114,13 +114,15 @@ Debian convention; the `.rpm` places it at
 ## Daemon is not auto-enabled
 
 The postinst deliberately does NOT enable or start the daemon. Both
-products require an edited conffile before the daemon can start usefully,
-and `thurvtl` additionally requires a `library init` run to lay down
-`library.json` and `inventory.json`. Auto-enabling on install would simply
-produce failed-unit logs on every fresh installation.
+products require an edited conffile before the daemon can start usefully.
+Auto-enabling on install would simply produce failed-unit logs on every
+fresh installation.
 
-- `thurvtl`: edit `/etc/thurvtl/thurvtl.yaml`, run
-  `thurvtl library init`, then `systemctl enable --now thurvtld`.
+- `thurvtl`: edit `/etc/thurvtl/thurvtl.yaml` — `data_dir` plus the
+  required `library:` block (`num_slots` / `num_drives` /
+  `lto_generation`) — then `systemctl enable --now thurvtld`. The
+  daemon materializes `library.json` / `inventory.json` on first
+  start from the YAML.
 - `thurvsa`: edit `/etc/thurvsa/thurvsa.yaml`, then
   `systemctl enable --now thurvsad`. Volumes are created at
   runtime via `thurvsa volume create` (admin-socket-routed).

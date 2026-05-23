@@ -1,12 +1,15 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! CLI-side audit log helper for the two daemon-down commands —
-//! `library init` and `library modify`. Each writes a
+//! CLI-side audit log helper for the remaining daemon-down commands
+//! — `library partition *` and `library restore`. Each writes a
 //! `PendingAuditEntry` JSON file under `<audit_dir>/pending/` via
 //! [`core_mediachanger::queue_pending`]; the daemon picks them up at
 //! next startup, replays them through the live chain, and removes
-//! the source files.
+//! the source files. (Chassis topology changes — formerly
+//! `library init` / `library modify` — are now daemon-side reconcile
+//! events emitted directly by [`core_mediachanger::library::reconcile`]
+//! and don't pass through this queue.)
 //!
 //! Routing CLI audit writes through the queue keeps the daemon as
 //! the single chain writer — no cross-process file lock required.
@@ -219,8 +222,8 @@ mod tests {
         record_ok(
             dir.path().to_str().expect("utf8"),
             cfg.to_str().expect("utf8"),
-            "library.init",
-            serde_json::json!({"slots": 10}),
+            "library.partition.create",
+            serde_json::json!({"name": "p0"}),
         );
         assert!(!dir.path().join("audit").join("pending").exists());
     }
@@ -235,8 +238,8 @@ mod tests {
         record_ok(
             data_dir.to_str().expect("utf8"),
             cfg.to_str().expect("utf8"),
-            "library.init",
-            serde_json::json!({"slots": 10}),
+            "library.partition.create",
+            serde_json::json!({"name": "p0"}),
         );
         let pending = data_dir.join("audit").join("pending");
         assert!(pending.is_dir());
@@ -252,7 +255,7 @@ mod tests {
         let r: Result<i32> = record_result(
             dir.path().to_str().expect("utf8"),
             cfg.to_str().expect("utf8"),
-            "library.modify",
+            "library.restore",
             serde_json::json!({}),
             Ok(42),
         );
@@ -267,7 +270,7 @@ mod tests {
         let r: Result<i32> = record_result(
             dir.path().to_str().expect("utf8"),
             cfg.to_str().expect("utf8"),
-            "library.modify",
+            "library.restore",
             serde_json::json!({}),
             Err(anyhow::anyhow!("boom")),
         );

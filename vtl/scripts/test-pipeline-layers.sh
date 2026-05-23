@@ -241,6 +241,10 @@ make_config() {
         "$SOURCE_BACKENDS")
     cat > "$TEST_CONFIG" <<EOFCFG
 data_dir: "$TEST_DIR/data"
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 iscsi:
@@ -456,7 +460,6 @@ download_first_chunk() {
 row_bring_up() {
     local cloud_compress="$1"
     make_config "$cloud_compress" || return 1
-    init_library || return 1
     start_daemon || return 1
     connect_iscsi || return 1
     make_fixture || return 1

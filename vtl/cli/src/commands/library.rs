@@ -8,111 +8,6 @@ use std::path::{Path, PathBuf};
 
 use crate::output::{create_table, format_bytes, with_host_ratio};
 
-/// Initialize a new library
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_init(
-    data_dir: &str,
-    num_storage_slots: u32,
-    num_mail_slots: u32,
-    num_drives: u32,
-    lto_generation: u8,
-    firmware: Option<String>,
-    transport_base: u16,
-    storage_base: u16,
-    import_export_base: u16,
-    data_transfer_base: u16,
-    config_path: &str,
-) -> Result<()> {
-    // Operator's responsibility to pre-create data_dir with the right
-    // ownership — the .deb / .rpm postinst handles /var/lib/thurvtl,
-    // dev setups need a manual `mkdir + chown` first. After the
-    // pre-init privilege drop the CLI is no longer root, so silently
-    // creating data_dir would either succeed with the wrong owner or
-    // EACCES with a confusing error. Bail early instead.
-    if !std::path::Path::new(data_dir).is_dir() {
-        anyhow::bail!(
-            "data_dir '{data_dir}' does not exist or is not a directory; \
-             create it (chowned to the daemon user) before `library init`",
-        );
-    }
-
-    // Safety check: refuse if daemon is running
-    check_daemon_not_running(data_dir)?;
-
-    let library_root = PathBuf::from(data_dir).join("library");
-    let tapes_dir = PathBuf::from(data_dir).join("tapes");
-
-    let resolved_firmware = firmware
-        .clone()
-        .unwrap_or_else(|| core_mediachanger::default_firmware_for_lto(lto_generation).to_string());
-
-    let init_result = Library::initialize(
-        &library_root,
-        &tapes_dir,
-        num_storage_slots,
-        num_mail_slots,
-        num_drives,
-        lto_generation,
-        firmware,
-        transport_base,
-        storage_base,
-        import_export_base,
-        data_transfer_base,
-    )
-    .context("Failed to initialize library");
-
-    let audit_params = serde_json::json!({
-        "storage_slots": num_storage_slots,
-        "mail_slots": num_mail_slots,
-        "drives": num_drives,
-        "lto_generation": lto_generation,
-        "firmware": resolved_firmware,
-        "transport_base": transport_base,
-        "storage_base": storage_base,
-        "import_export_base": import_export_base,
-        "data_transfer_base": data_transfer_base,
-    });
-    crate::audit_helper::record_result(
-        data_dir,
-        config_path,
-        "library.init",
-        audit_params,
-        init_result.map(|_| ()),
-    )?;
-
-    println!("OK: Library initialized successfully");
-    println!("  Storage slots: {}", num_storage_slots);
-    println!("  Mail slots: {}", num_mail_slots);
-    println!("  Drives: {}", num_drives);
-    println!("  LTO generation: LTO-{}", lto_generation);
-    println!("  Firmware revision: {}", resolved_firmware);
-    let mail_range = if num_mail_slots == 0 {
-        "none".to_string()
-    } else {
-        format!(
-            "{}-{}",
-            import_export_base,
-            import_export_base as u32 + num_mail_slots - 1
-        )
-    };
-    println!(
-        "  Element addressing: transport {}, storage {}-{}, mail {}, drives {}-{}",
-        transport_base,
-        storage_base,
-        storage_base as u32 + num_storage_slots - 1,
-        mail_range,
-        data_transfer_base,
-        data_transfer_base as u32 + num_drives - 1,
-    );
-    println!();
-    println!(
-        "Library manifest created at: {}/library.json",
-        library_root.display()
-    );
-
-    Ok(())
-}
-
 /// Restore cartridges from a cloud backend (cross-region DR).
 ///
 /// Daemon-down. Discovers every cartridge with a `manifest-latest.json`
@@ -120,8 +15,9 @@ pub async fn cmd_init(
 /// cartridge's manifest + index pages, and seats the restored
 /// cartridges into storage slots in barcode-sort order. Chunks
 /// lazy-load on first host read once the daemon starts. Requires
-/// `library init` to have been run first — chassis topology is not
-/// cloud-replicated.
+/// the `library:` block to be configured in thurvtl.yaml and the
+/// daemon to have started at least once so `library.json` is
+/// materialized — chassis topology is not cloud-replicated.
 pub async fn cmd_restore(
     data_dir: &str,
     config_path: &str,
@@ -139,8 +35,8 @@ pub async fn cmd_restore(
 
     if !library_root.join("library.json").exists() {
         anyhow::bail!(
-            "library not initialized at {}; run `thurvtl library init --slots N --drives M --lto-generation 8` first \
-             (chassis topology is not cloud-replicated and must be operator-supplied)",
+            "library not initialized at {}; configure `library:` in /etc/thurvtl/thurvtl.yaml and start the daemon once \
+             so it materializes library.json (chassis topology is not cloud-replicated and must be operator-declared)",
             library_root.display()
         );
     }
@@ -277,7 +173,7 @@ fn rebuild_inventory(
     if restored_barcodes.len() > free_slots {
         anyhow::bail!(
             "restored {} cartridge(s) but library has {} free storage slot(s) ({} total, {} already occupied); \
-             re-run `library init` with --slots >= {} or free occupied slots first",
+             raise `library.num_slots` in thurvtl.yaml to at least {} (and restart the daemon) or free occupied slots first",
             restored_barcodes.len(),
             free_slots,
             total_slots,
@@ -407,194 +303,49 @@ pub async fn cmd_info(json: bool, with_cartridges: bool) -> Result<()> {
     Ok(())
 }
 
-/// Modify library topology (resize slots/drives, change LTO generation,
-/// override firmware revision).
-///
-/// `firmware` semantics: `None` = unchanged; `Some("")` = revert to the
-/// per-LTO default; `Some(s)` = set custom revision (1-4 ASCII chars).
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_modify(
-    data_dir: &str,
-    num_storage_slots: Option<u32>,
-    num_mail_slots: Option<u32>,
-    num_drives: Option<u32>,
-    lto_generation: Option<u8>,
-    firmware: Option<String>,
-    config_path: &str,
-) -> Result<()> {
-    // Safety check: refuse if daemon is running
-    check_daemon_not_running(data_dir)?;
-
-    let library_root = PathBuf::from(data_dir).join("library");
-    let tapes_dir = PathBuf::from(data_dir).join("tapes");
-
-    let mut library = Library::open(&library_root, &tapes_dir).context("Failed to open library")?;
-
-    // Check if any parameters were provided
-    if num_storage_slots.is_none()
-        && num_mail_slots.is_none()
-        && num_drives.is_none()
-        && lto_generation.is_none()
-        && firmware.is_none()
-    {
-        anyhow::bail!(
-            "No modifications specified. Provide at least one of: --slots, --mail-slots, --drives, --lto-generation, --firmware"
-        );
+/// `library bounds` — show min / current / max for num_slots and
+/// num_drives, with the per-field "why" line that pins each minimum.
+/// Daemon-routed read; mirrors the refuse-to-start algorithm so the
+/// operator can predict whether a YAML shrink will be accepted.
+pub async fn cmd_bounds(json: bool) -> Result<()> {
+    let client = shared_admin_client::AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
+    let bounds: core_mediachanger::library::reconcile::BoundsReport =
+        client.get_json("/api/v1/library/bounds").await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&bounds)?);
+        return Ok(());
     }
 
-    // Convert CLI firmware: empty string = revert to default, non-empty
-    // = override. None = leave the existing setting alone.
-    let new_firmware: Option<Option<String>> =
-        firmware.map(|s| if s.is_empty() { None } else { Some(s) });
-
-    // Show current configuration
-    let old_slots = library.storage_slots().len();
-    let old_mail = library.mail_slots().len();
-    let old_drives = library.drives().len();
-    let old_lto = library.lto_generation();
-
-    println!("Current library configuration:");
-    println!("  Storage slots: {}", old_slots);
-    println!("  Mail slots: {}", old_mail);
-    println!("  Drives: {}", old_drives);
-    println!("  LTO generation: LTO-{}", old_lto);
-    println!();
-
-    // Show what will change
-    println!("Requested changes:");
-
-    // Check for shrinking operations and warn about auto-unload
-    let mut has_shrink_warning = false;
-
-    if let Some(slots) = num_storage_slots {
-        let diff = slots as i32 - old_slots as i32;
-        let op = if diff > 0 { "+" } else { "" };
-        println!(
-            "  Storage slots: {} → {} ({}{})",
-            old_slots, slots, op, diff
-        );
-
-        if diff < 0 {
-            let occupied = library.storage_slots()[(slots as usize)..]
-                .iter()
-                .filter(|s| s.occupied)
-                .count();
-            if occupied > 0 {
-                println!(
-                    "    WARNING: {} occupied slot(s) will be unloaded (cartridge data preserved)",
-                    occupied
-                );
-                has_shrink_warning = true;
-            }
-        }
-    }
-
-    if let Some(mail) = num_mail_slots {
-        let diff = mail as i32 - old_mail as i32;
-        let op = if diff > 0 { "+" } else { "" };
-        println!("  Mail slots: {} → {} ({}{})", old_mail, mail, op, diff);
-
-        if diff < 0 {
-            let occupied = library.mail_slots()[(mail as usize)..]
-                .iter()
-                .filter(|s| s.occupied)
-                .count();
-            if occupied > 0 {
-                println!(
-                    "    WARNING: {} occupied mail slot(s) will be cleared (cartridge data preserved)",
-                    occupied
-                );
-                has_shrink_warning = true;
-            }
-        }
-    }
-
-    if let Some(drives) = num_drives {
-        let diff = drives as i32 - old_drives as i32;
-        let op = if diff > 0 { "+" } else { "" };
-        println!("  Drives: {} → {} ({}{})", old_drives, drives, op, diff);
-
-        if diff < 0 {
-            let occupied = library.drives()[(drives as usize)..]
-                .iter()
-                .filter(|d| d.occupied)
-                .count();
-            if occupied > 0 {
-                println!(
-                    "    WARNING: {} loaded drive(s) will be unloaded (cartridge data preserved)",
-                    occupied
-                );
-                has_shrink_warning = true;
-            }
-        }
-    }
-
-    if let Some(lto) = lto_generation {
-        println!("  LTO generation: LTO-{} → LTO-{}", old_lto, lto);
-    }
-    println!();
-
-    if has_shrink_warning {
-        println!("Note: Cartridge data remains safe in the tapes directory.");
-        println!("      You can re-add cartridges to slots after resizing.");
-        println!();
-    }
-
-    // Apply changes
-    let resize_result = library.resize(
-        num_storage_slots,
-        num_mail_slots,
-        num_drives,
-        lto_generation,
-        new_firmware,
+    println!("Field     Current   Min       Max");
+    println!(
+        "slots     {:<9} {:<9} {}",
+        bounds.current.num_slots, bounds.min.num_slots, bounds.max.num_slots,
     );
-    let audit_params = serde_json::json!({
-        "before": {"storage_slots": old_slots, "mail_slots": old_mail, "drives": old_drives, "lto_generation": old_lto},
-        "requested": {"storage_slots": num_storage_slots, "mail_slots": num_mail_slots, "drives": num_drives, "lto_generation": lto_generation},
-    });
-    match resize_result {
-        Ok((new_slots, new_mail, new_drives, new_lto)) => {
-            crate::audit_helper::record_ok(
-                data_dir,
-                config_path,
-                "library.modify",
-                serde_json::json!({
-                    "before": {"storage_slots": old_slots, "mail_slots": old_mail, "drives": old_drives, "lto_generation": old_lto},
-                    "after": {"storage_slots": new_slots, "mail_slots": new_mail, "drives": new_drives, "lto_generation": new_lto},
-                }),
-            );
-            println!("OK: Library modified successfully");
-            println!();
-            println!("New configuration:");
-            println!("  Storage slots: {}", new_slots);
-            println!("  Mail slots: {}", new_mail);
-            println!("  Drives: {}", new_drives);
-            println!("  LTO generation: LTO-{}", new_lto);
-            println!();
-            println!(
-                "Changes persisted to: {}/library.json",
-                library_root.display()
-            );
-            println!();
-            println!(
-                "NOTE: Stop the daemon before modifying, then restart for changes to take effect"
-            );
-        }
-        Err(e) => {
-            crate::audit_helper::record_err(
-                data_dir,
-                config_path,
-                "library.modify",
-                audit_params,
-                &e.to_string(),
-            );
-            anyhow::bail!("Failed to modify library: {}", e);
+    println!(
+        "drives    {:<9} {:<9} {}",
+        bounds.current.num_drives, bounds.min.num_drives, bounds.max.num_drives,
+    );
+    if !bounds.explanations.is_empty() {
+        println!();
+        for e in &bounds.explanations {
+            println!("Min {} = {}: {}", e.field, count_for(&bounds, &e.field), e.reason);
         }
     }
-
     Ok(())
 }
 
+fn count_for(b: &core_mediachanger::library::reconcile::BoundsReport, field: &str) -> u32 {
+    match field {
+        "num_slots" => b.min.num_slots,
+        "num_drives" => b.min.num_drives,
+        _ => 0,
+    }
+}
+
+// `cmd_modify` (the imperative chassis-resize verb) was removed
+// alongside `cmd_init`. Chassis topology now lives in
+// `thurvtl.yaml`'s `library:` block; the daemon diffs and reconciles
+// on every start. See `core_mediachanger::library::reconcile`.
 #[derive(serde::Deserialize, serde::Serialize)]
 struct ChangerInventoryResponseItem {
     slot_id: u32,
@@ -823,15 +574,12 @@ pub async fn cmd_partition_list(data_dir: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn cmd_partition_create(
     data_dir: &str,
     config_path: &str,
     name: String,
     storage_start: u32,
     storage_end: u32,
-    mail_start: u32,
-    mail_end: u32,
     drives: Vec<u32>,
 ) -> Result<()> {
     check_daemon_not_running(data_dir)?;
@@ -848,17 +596,16 @@ pub async fn cmd_partition_create(
             start: storage_start,
             end: storage_end,
         },
-        mail_slots: SlotRange {
-            start: mail_start,
-            end: mail_end,
-        },
+        // Mail slot is hardwired to a single global IE element in this
+        // build (no operator surface). Partitions don't own any
+        // portion of it; this field stays for v2 schema stability.
+        mail_slots: SlotRange::default(),
         drives: drives.clone(),
     });
 
     let audit_params = serde_json::json!({
         "name": name,
         "storage": [storage_start, storage_end],
-        "mail": [mail_start, mail_end],
         "drives": drives,
     });
     let result = library
@@ -877,15 +624,12 @@ pub async fn cmd_partition_create(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn cmd_partition_modify(
     data_dir: &str,
     config_path: &str,
     name: String,
     storage_start: Option<u32>,
     storage_end: Option<u32>,
-    mail_start: Option<u32>,
-    mail_end: Option<u32>,
     drives: Option<Vec<u32>>,
 ) -> Result<()> {
     check_daemon_not_running(data_dir)?;
@@ -893,12 +637,10 @@ pub async fn cmd_partition_modify(
 
     if storage_start.is_none()
         && storage_end.is_none()
-        && mail_start.is_none()
-        && mail_end.is_none()
         && drives.is_none()
     {
         anyhow::bail!(
-            "no modifications specified. Provide at least one of: --storage-start, --storage-end, --mail-start, --mail-end, --drives"
+            "no modifications specified. Provide at least one of: --storage-start, --storage-end, --drives"
         );
     }
 
@@ -914,12 +656,6 @@ pub async fn cmd_partition_modify(
     if let Some(v) = storage_end {
         target.storage_slots.end = v;
     }
-    if let Some(v) = mail_start {
-        target.mail_slots.start = v;
-    }
-    if let Some(v) = mail_end {
-        target.mail_slots.end = v;
-    }
     if let Some(d) = drives.clone() {
         target.drives = d;
     }
@@ -928,8 +664,6 @@ pub async fn cmd_partition_modify(
         "name": name,
         "storage_start": storage_start,
         "storage_end": storage_end,
-        "mail_start": mail_start,
-        "mail_end": mail_end,
         "drives": drives,
     });
     let result = library

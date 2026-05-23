@@ -15,10 +15,13 @@ administrators.
 - `<data_dir>/audit/chain.state` — caches `(last_seq, last_hash,
   last_file)` for O(1) startup tail-verify.
 - `<data_dir>/audit/pending/<sortable>.json` — CLI daemon-down
-  queue. `library init` / `library modify` write a
+  queue. `library partition *` and `library restore` write a
   `PendingAuditEntry` here; the daemon drains it on startup via
   `AuditLog::replay_pending()`, appending each into the live chain
-  in filename (≈ submission timestamp) order.
+  in filename (≈ submission timestamp) order. (Chassis topology
+  changes are no longer queued — the daemon's reconcile engine
+  emits `library.materialize` / `library.reconcile` /
+  `inventory.move_medium` rows directly during start-up.)
 - `<data_dir>/audit/pending/failed/` — quarantine for queued
   entries the daemon couldn't append (malformed JSON, chain broken).
   Replay continues with the rest; operator inspects out of band.
@@ -56,8 +59,8 @@ Code: `shared/audit/src/audit.rs` (chain core),
 Daemon hookup in each daemon's `main.rs`. The `system.audit.*` job
 handlers are cross-product in `shared/admin-audit`; the `system audit`
 CLI subcommand is cross-product in `shared/cli-system/src/audit.rs`.
-The daemon-down `library init/modify` audit-queue helper stays
-VTL-only in `vtl/cli/src/audit_helper.rs`.
+The daemon-down audit-queue helper (used by `library partition *` and
+`library restore`) stays VTL-only in `vtl/cli/src/audit_helper.rs`.
 
 ## Tamper-evidence
 
@@ -106,11 +109,12 @@ crates, so the two products cannot drift.
 
 ## What gets logged
 
-Cartridge create/import/export, library init/modify,
-load/unload/move, gc, daemon start/stop,
-boot-time orphan-upload recovery
-(`cloud.orphan_scan_started` / `cloud.orphan_scan_completed`).
-**Read paths are NOT logged.**
+Cartridge create/import/export, daemon-side chassis bring-up
+(`library.materialize` on first start, `library.reconcile` on
+subsequent YAML diffs, `inventory.move_medium` per auto-evacuated
+drive), load/unload/move, gc, daemon start/stop, boot-time
+orphan-upload recovery (`cloud.orphan_scan_started` /
+`cloud.orphan_scan_completed`). **Read paths are NOT logged.**
 
 ### SCSI-layer events
 

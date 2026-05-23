@@ -157,6 +157,11 @@ create_test_config() {
     cat > "$TEST_CONFIG" << EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
+library:
+  num_slots: 40
+  num_drives: 2
+  lto_generation: 8
+
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 
@@ -177,20 +182,6 @@ EOFCONFIG
 
     mkdir -p "$TEST_DIR/data"
     log_info "Test config created at: $TEST_CONFIG"
-}
-
-# Initialize the library before the daemon starts (chassis-assembly
-# operation in the hardware-analogy model — cannot run while daemon
-# alive). Cartridge creation runs AFTER the daemon is up because it's
-# now a daemon-routed live op (post-Step 7 of the CLI/daemon
-# migration; see ROADMAP.md § Management surfaces).
-init_library() {
-    log_info "Initializing library..."
-    # `library init` refuses to create data_dir itself (operator
-    # responsibility on a packaged install — chowned to the daemon
-    # user). For the smoke test we just pre-create it.
-    mkdir -p "$TEST_DIR/data"
-    "$CLI_PATH" --config "$TEST_CONFIG" library init --slots 40 --drives 2 --lto-generation 8 > /dev/null 2>&1
 }
 
 # Create test cartridges via the daemon's admin socket. Runs AFTER
@@ -780,7 +771,6 @@ main() {
     check_prerequisites
     assign_ports
     create_test_config
-    init_library
     start_daemon
     create_test_cartridges
     

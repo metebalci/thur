@@ -205,7 +205,7 @@ apply only to the tape side; their full coverage is in
 
 | Feature | Status | Spec | Notes |
 |---------|--------|:----:|-------|
-| LU model | 🟩 Yes | M | thurvtl tape: one changer + N drives behind one target (per `library init`). thurvsa: N volumes as flat LUNs behind one target (per `volume create`). |
+| LU model | 🟩 Yes | M | thurvtl tape: one changer + N drives behind one target (per the YAML `library:` block). thurvsa: N volumes as flat LUNs behind one target (per `volume create`). |
 | Task management — ABORT TASK | 🟩 Yes | M | Always returns "Function complete." |
 | Task management — ABORT TASK SET | 🟩 Yes | M | |
 | Task management — CLEAR TASK SET | 🟩 Yes | M | |
@@ -499,7 +499,7 @@ this file; SSC-4 / SMC-3 in Part 2; SBC-3 in Part 3; NVMe in
 | 0x13 | VERIFY(6) | 🟩 No-op | O | All blocks valid on virtual media. |
 | 0x19 | ERASE | 🟩 Yes | M | Wipes data, rewinds; refused on WORM. |
 | 0x34 | READ POSITION | 🟩 Partial | M | SAs 0x00 / 0x01 (Short Form, 20 B), 0x06 (Long Form, 32 B), 0x08 (Extended Form, 32 B). SAs 0x02–0x05, 0x07, 0x09–0x1F return INVALID FIELD IN CDB. Long Form sets MPU (file/set numbers not tracked); Extended Form sets LOCU + BYCU (buffer counts not tracked); Short Form sets BPU when position > 2³². |
-| 0x44 | REPORT DENSITY SUPPORT | 🟩 Yes | CC | LTO-7 / LTO-8 descriptors per `library init --lto-generation`. Mandatory on devices advertising multiple density codes. |
+| 0x44 | REPORT DENSITY SUPPORT | 🟩 Yes | CC | LTO-7 / LTO-8 descriptors per `library.lto_generation` in the YAML. Mandatory on devices advertising multiple density codes. |
 | 0x80 | WRITE FILEMARKS(16) | 🟩 Yes | O | 32-bit count at CDB[12..16]. |
 | 0x82 | ALLOW OVERWRITE | 🟩 Yes | O | Volatile flag, cleared on UNLOAD. |
 | 0x8F | VERIFY(16) | 🟩 No-op | O | 64-bit LBA range. |
@@ -571,7 +571,7 @@ LTO-8) rather than by SSC-4.
 
 | Feature | Status | Spec | Notes |
 |---------|--------|:----:|-------|
-| LTO-7 emulation | 🟩 Yes | M | 6 TB native; `library init --lto-generation 7`. |
+| LTO-7 emulation | 🟩 Yes | M | 6 TB native; `library.lto_generation: 7` in the YAML. |
 | LTO-8 emulation | 🟩 Yes | M | 12 TB native; default. |
 | LTO-9 emulation | 🟨 No | — | Targets SPC-5 / SSC-5 + RAO; out of scope. |
 | Append-only mode | 🟩 Yes | O | LTO-7+ feature. Mode Page 0x10/0x01 WRITE MODE = 1 → drive refuses WRITE / WRITE FILEMARKS at any LBA other than active-partition EOD with DATA PROTECT + 0x27/0x06 (CONDITIONAL WRITE PROTECT). State persists in `<data_dir>/library/drive_state.json` across cartridge swaps when SP=1. |
@@ -770,9 +770,10 @@ in [Part 1](#part-1-spc-4-sam-5-and-iscsi)
 When an operator reconfigures a physical library, the library raises
 a `06/2A/00 MODE PARAMETERS CHANGED` Unit Attention to every host
 currently connected. VTL cannot reproduce that exactly, and for a
-benign reason: `thurvtl library modify` only runs with the daemon
-stopped, so by the time the topology actually changes there is no
-host connected to notify. What the hosts see instead is the next
+benign reason: chassis topology lives in the YAML `library:` block,
+the daemon reconciles it at start-up, and changes only take effect
+on restart — so by the time the topology actually changes there is
+no host connected to notify. What the hosts see instead is the next
 thing that happens — on daemon restart they get a `06/29/00 POWER ON
 RESET`. That carries broader semantics ("something changed,
 re-discover everything") rather than the narrower "the topology
@@ -893,8 +894,9 @@ the absolute ceiling for storage and mail slots at 65535 each. But
 that 0..=65535 space is shared: all four element ranges — transport,
 storage, mail, drives — have to fit inside it without overlapping.
 `validate_element_address_layout` in
-`core/mediachanger/src/library/mod.rs` checks exactly that at
-`library init` time. The practical consequence is that the ceilings
+`core/mediachanger/src/library/mod.rs` checks exactly that when the
+daemon materializes `library.json` on first start. The practical
+consequence is that the ceilings
 are not simultaneously reachable — configuring 65535 storage slots
 leaves no addresses for the other three element types.
 
@@ -921,10 +923,11 @@ that belongs to actual hardware would, in effect, inherit that
 revision's published CVEs and the known-bug workarounds initiators
 apply against it. When a backup-software compatibility matrix
 genuinely insists on a specific code, the operator can set it
-explicitly with `library init --firmware <CODE>` or `library modify
---firmware <CODE>` rather than have it faked by default. Whichever
-string is in effect is reported identically on the changer LUN and on
-every tape-drive LUN, since they all read it from the same
+explicitly via `library.firmware: <CODE>` in `thurvtl.yaml` (and
+restart the daemon — the reconcile engine applies firmware changes
+freely) rather than have it faked by default. Whichever string is in
+effect is reported identically on the changer LUN and on every
+tape-drive LUN, since they all read it from the same
 `LibraryTopology.firmware`.
 
 ---

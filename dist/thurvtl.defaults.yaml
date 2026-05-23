@@ -18,6 +18,24 @@
 # state, and the shared chunk pool. No default — must be set.
 # data_dir: "./.thurvtl"
 
+# Chassis topology declaration. REQUIRED — daemon refuses to start
+# if any of `num_slots` / `num_drives` / `lto_generation` is missing,
+# naming each one. `firmware` is optional (defaults to `TVL<gen>`).
+#
+# On first daemon start the values here are written into
+# <data_dir>/library/library.json's `declared` stanza along with the
+# minted chassis_serial + four SMC element bases. On subsequent
+# starts the daemon diffs YAML against the persisted `declared`
+# values and reconciles: grow operations apply; shrink operations
+# refuse if any cartridge or loaded drive would be orphaned. Use
+# `thurvtl library bounds` against a running daemon to see the
+# safe-shrink minima for the current inventory.
+# library:
+#   num_slots: 40              # REQUIRED — no default
+#   num_drives: 3              # REQUIRED — no default
+#   lto_generation: 8          # REQUIRED — 7 or 8, no default
+#   firmware: TVL8             # optional override; 1-4 ASCII chars
+
 # Per-tape RAM-staged memory buffers. Distinct from `disk_cache`
 # below — these are scratch the daemon keeps alive between iSCSI ops,
 # not the on-disk chunk pool.

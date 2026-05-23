@@ -137,6 +137,11 @@ create_test_config() {
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
+library:
+  num_slots: 40
+  num_drives: 2
+  lto_generation: 8
+
 # Force Community mode so a host-installed license at /etc/thurvtl/license.lic
 # can't influence test behavior. Pointing license.file at a nonexistent path
 # disables the default search paths and triggers the Missing-license fallback
@@ -156,18 +161,8 @@ cloud:
       type: local
       root_dir: "$TEST_DIR/local-backend"
 
-EOFCONFIG}
-
-initialize_library() {
-    log_info "Initializing library..."
-    # `library init` refuses to create data_dir itself (operator responsibility
-    # on a packaged install — chowned to the daemon user). Pre-create it for
-    # the test fixture. The protocol-layer assertions (login + CmdSN/StatSN +
-    # INQUIRY routing for changer vs sequential-access) only exercise drive 0;
-    # the second drive is provisioned to match a more realistic deployment
-    # topology.
+EOFCONFIG
     mkdir -p "$TEST_DIR/data"
-    "$CLI_PATH" --config "$TEST_CONFIG" library init --slots 40 --drives 2 --lto-generation 8 >/dev/null
 }
 
 start_daemon() {
@@ -238,7 +233,6 @@ main() {
     check_prerequisites
     assign_ports
     create_test_config
-    initialize_library
     start_daemon
 
     echo ""

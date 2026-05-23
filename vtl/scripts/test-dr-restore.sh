@@ -111,6 +111,11 @@ write_config() {
     cat > "$config_path" <<EOFCONFIG
 data_dir: "$data_dir"
 
+library:
+  num_slots: 4
+  num_drives: 1
+  lto_generation: 8
+
 license:
   file: "$TEST_DIR/no-such.lic"
 
@@ -158,7 +163,8 @@ stop_daemon() {
 
 # library restore refuses with a clear error when library.json is
 # absent. We must not blow past this gate — the operator's mental
-# model is "init first, then restore."
+# model is "configure library: in YAML, start daemon once to
+# materialize, then restore."
 test_refuses_when_uninitialized() {
     log_test "library restore refuses when library is not initialized..."
     local data_dir="$TEST_DIR/uninit"
@@ -178,8 +184,8 @@ test_refuses_when_uninitialized() {
         echo "$out" >&2
         return 1
     fi
-    if ! echo "$out" | grep -q "library init"; then
-        log_error "error message does not point operator at library init:"
+    if ! echo "$out" | grep -q "thurvtl.yaml"; then
+        log_error "error message does not point operator at thurvtl.yaml:"
         echo "$out" >&2
         return 1
     fi
@@ -195,11 +201,13 @@ test_refuses_unknown_backend() {
     local config="$TEST_DIR/unknown-backend.yaml"
     write_config "$data_dir" "$config" "$TEST_DIR/mirror-empty"
 
-    if ! "$CLI_PATH" --config "$config" library init \
-            --slots 4 --drives 1 --lto-generation 8 > /dev/null; then
-        log_error "library init failed"
+    # Materialize library.json by starting the daemon briefly. The
+    # daemon writes library.json from the YAML `library:` block on
+    # first start; we then stop so cmd_restore (daemon-down) can run.
+    if ! start_daemon "$config" "$data_dir"; then
         return 1
     fi
+    stop_daemon
 
     local out
     out=$("$CLI_PATH" --config "$config" library restore --backend nope 2>&1)
@@ -227,11 +235,13 @@ test_empty_bucket_dry_run_then_real() {
     write_config "$data_dir" "$config" "$mirror"
     mkdir -p "$mirror"
 
-    if ! "$CLI_PATH" --config "$config" library init \
-            --slots 4 --drives 1 --lto-generation 8 > /dev/null; then
-        log_error "library init failed"
+    # Materialize library.json by starting the daemon briefly. The
+    # daemon writes library.json from the YAML `library:` block on
+    # first start; we then stop so cmd_restore (daemon-down) can run.
+    if ! start_daemon "$config" "$data_dir"; then
         return 1
     fi
+    stop_daemon
 
     # Dry-run first.
     local dry_out
@@ -283,11 +293,13 @@ test_barcode_filter_with_no_matches() {
     echo '{"label":"TAPE_HIDDEN","backend":"mirror","dedup":"global","uuid":"00000000000000000000000000000000","index_epoch":{}}' \
         > "$mirror/manifests/TAPE_HIDDEN/manifest-latest.json"
 
-    if ! "$CLI_PATH" --config "$config" library init \
-            --slots 4 --drives 1 --lto-generation 8 > /dev/null; then
-        log_error "library init failed"
+    # Materialize library.json by starting the daemon briefly. The
+    # daemon writes library.json from the YAML `library:` block on
+    # first start; we then stop so cmd_restore (daemon-down) can run.
+    if ! start_daemon "$config" "$data_dir"; then
         return 1
     fi
+    stop_daemon
 
     # Filter selects nothing — exit 0, no restore attempted.
     local out
@@ -323,11 +335,13 @@ test_audit_footprint_replays() {
     write_config "$data_dir" "$config" "$mirror"
     mkdir -p "$mirror"
 
-    if ! "$CLI_PATH" --config "$config" library init \
-            --slots 4 --drives 1 --lto-generation 8 > /dev/null; then
-        log_error "library init failed"
+    # Bring the daemon up briefly so it materializes library.json v2
+    # from the YAML `library:` block, then stop so library restore
+    # (daemon-down) can run.
+    if ! start_daemon "$config" "$data_dir"; then
         return 1
     fi
+    stop_daemon
 
     if ! "$CLI_PATH" --config "$config" library restore \
             --backend mirror > /dev/null 2>&1; then

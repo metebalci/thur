@@ -223,6 +223,11 @@ create_test_config() {
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
+library:
+  num_slots: 10
+  num_drives: 2
+  lto_generation: 8
+
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 
@@ -235,21 +240,7 @@ cloud:
       type: local
       root_dir: "$TEST_DIR/local-backend"
 
-EOFCONFIG}
-
-# `library init` is daemon-down: must run BEFORE start_daemon.
-# `--user "${SUDO_USER:-root}"`: the script self-elevates via sudo,
-# so euid=0 here and the CLI's privdrop tries to setuid to the daemon
-# service user (default `thurvtl`). On a dev box that user typically
-# isn't provisioned; pass the invoking user (or root if invoked
-# directly as root) so privdrop has a real target.
-init_library() {
-    log_info "Initializing library (10 slots, 2 drives, LTO-8)..."
-    if ! "$CLI_PATH" --config "$TEST_CONFIG" --user "${SUDO_USER:-root}" \
-            library init --slots 10 --drives 2 --lto-generation 8 >/dev/null; then
-        log_error "library init failed"
-        exit 1
-    fi
+EOFCONFIG
 }
 
 # `cartridge create` is daemon-routed (admin socket): must run AFTER
@@ -1130,7 +1121,6 @@ main() {
     check_prerequisites
     assign_ports
     create_test_config
-    init_library               # daemon-down: library init writes library.json/inventory.json
     start_daemon               # exports THURVTL_ADMIN_SOCKET; required before any cartridge op
     create_cartridges          # daemon-routed: cartridge create auto-places in slots 1..N
     connect_iscsi

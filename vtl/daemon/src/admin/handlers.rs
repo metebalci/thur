@@ -153,6 +153,24 @@ pub async fn library_info(
 }
 
 // ---------------------------------------------------------------------------
+// /api/v1/library/bounds
+// ---------------------------------------------------------------------------
+
+/// Read-only view of the slot/drive sizing envelope: current YAML
+/// counts, minimum the operator can shrink to without losing
+/// cartridges (computed against live inventory), and the absolute
+/// ceiling the SCSI / iSCSI wire formats allow. Powers
+/// `thurvtl library bounds` — the operator's check before editing
+/// the YAML `library:` block.
+pub async fn library_bounds(State(state): State<AdminState>) -> impl IntoResponse {
+    let bounds = {
+        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        core_mediachanger::library::reconcile::compute_bounds(&lib)
+    };
+    Json(bounds)
+}
+
+// ---------------------------------------------------------------------------
 // /api/v1/cartridges  (list)
 // ---------------------------------------------------------------------------
 

@@ -15,12 +15,16 @@ and co-resident on the same host:
   iSCSI on port 3260 (IQN `iqn.2025-10.com.metebalci:thurvtl`). INQUIRY
   identity vendor `MB` / product `THUR VTL`; not modeled after any
   specific physical chassis. Sequential-access cartridges,
-  library/changer (caps 65535 / 65535 / 255 for slots / mail / drives —
-  16-bit SMC element address; drive ceiling is the iSCSI single-byte
-  LUN encoding, see [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) §
-  Topology bounds), cloud tiering (S3 / GCS / Azure / Local).
-  Single-tape-drive
-  deployments use VTL with `--slots 1 --drives 1 --mail-slots 0`.
+  library/changer (caps 65535 storage slots and 255 drives — 16-bit
+  SMC element address for slots, iSCSI single-byte LUN encoding for
+  drives, see [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) §
+  Topology bounds; one Import/Export element is reported, hardwired,
+  for backup-software compat — the operator-visible
+  `cartridge import` / `cartridge export` CLI works against storage
+  slots directly), cloud tiering (S3 / GCS / Azure / Local).
+  Single-tape-drive deployments declare
+  `library: { num_slots: 1, num_drives: 1, lto_generation: 8 }` in
+  the YAML conffile.
 - **Thur VSA** (working name `thurvsa`) — Virtual Storage Appliance, a
   block-storage target serving SBC-3
   direct-access LUNs. Sparse per-volume page table backed by the same
@@ -171,8 +175,9 @@ on-disk paths group by purpose.
   SEND VOLUME TAG, INITIALIZE WITH RANGE) plus element-address
   topology helpers (`ElementType`, `ElementAddressConfig`).
   `ElementAddressConfig` is constructed from the four element bases
-  persisted in `library.json` (set at `library init`, immutable
-  post-init) plus the chassis counts. The per-command context
+  persisted in `library.json`'s `minted` stanza (minted once at first
+  daemon start, immutable thereafter) plus the chassis counts. The
+  per-command context
   `SmcScsiCtx` wraps `scsi-ssc`'s `ScsiCtx` and adds the `Library`
   lock + `ElementAddressConfig` borrows. Consumed by `thurvtld`.
 - `scsi/sbc` (`scsi-sbc`) — SBC-3 block-target SCSI dispatch (every
@@ -305,8 +310,15 @@ cargo build [--release]
 thurvtl config defaults > thurvtl.yaml
 thurvsa config defaults > thurvsa.yaml
 
-# Initialize the tape library (required once before first daemon start)
-thurvtl library init --slots 40 --drives 3 --lto-generation 8
+# Declare the chassis topology in thurvtl.yaml's `library:` block:
+#   library:
+#     num_slots: 40       # REQUIRED
+#     num_drives: 3       # REQUIRED
+#     lto_generation: 8   # REQUIRED
+# The daemon materializes <data_dir>/library/library.json from this
+# block on first start, then diffs and reconciles on every subsequent
+# start. `thurvtl library bounds` (after the daemon is up) shows the
+# safe-shrink envelope.
 
 # Run daemons (--config wins, otherwise /etc/{thurvtl,thurvsa}/...)
 cargo run --bin thurvtld  [-- --config PATH]   # iSCSI :3260, HTTP :9090
@@ -379,14 +391,20 @@ catalogued in
 is one component (`<data_dir>/library/`) alongside other daemon-managed
 state (`<data_dir>/tapes/`, `<data_dir>/chunks/`, `<data_dir>/audit/`,
 plus the JSON files below). Blowing away `<data_dir>/library/` and
-re-running `library init` leaves everything else intact.
+restarting the daemon leaves everything else intact — the daemon
+re-materializes `library.json` from the YAML `library:` block.
 
 **Daemon-managed JSON files under `<data_dir>/`** (operationally mutated
 + credential-bearing state):
 
 - `library.json` + `inventory.json` (under `library/`) — chassis topology
-  and inventory. Managed via `thurvtl library {init,modify}` and
-  `library partition {create,modify,…}`. Logical-partition design in
+  and inventory. The chassis is *declared* in `thurvtl.yaml`'s
+  `library:` block; the daemon materializes `library.json` on first
+  start (minting `chassis_serial` and four SMC element bases) and
+  reconciles YAML against persisted state on every subsequent start.
+  Partition layout managed via `thurvtl library partition
+  {create,modify,…}` (still imperative — partitions are deliberate,
+  not declarative). Logical-partition design in
   [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) § Multi-partition
   libraries; schema in
   [`docs/SPEC.md`](docs/SPEC.md) § Library Topology.
@@ -419,8 +437,11 @@ drives both `--help` and the shipped completion scripts).
 
 Most CLI commands are **daemon-routed** (live; talk to the admin socket at
 `/run/{thurvtl,thurvsa}/admin.sock`, mode 0660, peer-cred-authed). Only
-chassis-assembly ops (`library init` / `modify` / `partition *` on
-Thur VTL) and pure-local config commands are **daemon-down**. Long-running
+partition-layout ops (`library partition *`), DR-restore (`library
+restore` / `library restore-archive`), and pure-local config commands
+are **daemon-down**. Chassis topology (`num_slots`, `num_drives`,
+`lto_generation`) is YAML-declared and reconciled by the daemon at
+start; there's no imperative chassis-mutation verb. Long-running
 ops (`gc` / `verify` / `stats` / `cloud check` / self-tests) ride a two-step
 job protocol on the same socket. Full split, admin socket discovery, sudo
 / privdrop behavior, and the job protocol in

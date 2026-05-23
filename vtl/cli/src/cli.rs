@@ -853,61 +853,6 @@ enum DriveAction {
 
 #[derive(Subcommand)]
 enum LibraryAction {
-    /// Initialize a new library
-    Init {
-        /// Number of cartridge storage slots
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=65535))]
-        slots: u32,
-
-        /// Number of mail slots for import/export
-        #[arg(long, default_value = "0", value_parser = clap::value_parser!(u32).range(0..=65535))]
-        mail_slots: u32,
-
-        /// Number of tape drives
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=255))]
-        drives: u32,
-
-        /// LTO generation for drives (currently 8 only).
-        ///
-        /// The VTL ships as a clean LTO-8 drive — only `8` is
-        /// accepted today. The flag is kept for forward-compat
-        /// with future LTO-9 support (see docs/LTO-9.md).
-        #[arg(long, value_parser = clap::value_parser!(u8).range(8..=8))]
-        lto_generation: u8,
-
-        /// Override the INQUIRY firmware revision (1-4 ASCII chars).
-        ///
-        /// Defaults to the LTO-8 firmware signature (NVL8). Override
-        /// only when a backup product's compatibility matrix requires
-        /// a specific vendor firmware string.
-        #[arg(long)]
-        firmware: Option<String>,
-
-        /// SMC element address for the medium-transport (robot).
-        ///
-        /// Immutable post-init. Defaults to the conventional layout.
-        #[arg(long, default_value = "0")]
-        transport_base: u16,
-
-        /// First SMC element address for storage slots.
-        ///
-        /// Immutable post-init. Defaults to the conventional layout.
-        #[arg(long, default_value = "1001")]
-        storage_base: u16,
-
-        /// First SMC element address for import/export (mail) slots.
-        ///
-        /// Immutable post-init. Defaults to the conventional layout.
-        #[arg(long, default_value = "101")]
-        import_export_base: u16,
-
-        /// First SMC element address for data-transfer (drive) elements.
-        ///
-        /// Immutable post-init. Defaults to the conventional layout.
-        #[arg(long, default_value = "1")]
-        data_transfer_base: u16,
-    },
-
     /// Show library information
     Info {
         /// Emit the response as JSON for automation.
@@ -923,13 +868,28 @@ enum LibraryAction {
         with_cartridges: bool,
     },
 
+    /// Show min / current / max for num_slots and num_drives.
+    ///
+    /// Current values reflect the persisted YAML declaration; min
+    /// values are computed against live inventory so the operator
+    /// can see exactly which cartridge or loaded drive would block a
+    /// proposed shrink. Max values are the SMC-3 / iSCSI ceilings.
+    /// Daemon-routed (live read).
+    Bounds {
+        /// Emit the response as JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Restore cartridges from a cloud backend after disaster recovery.
     ///
     /// Walks `manifests/` under the named backend, downloads each
     /// cartridge's manifest + index pages, and populates storage
-    /// slots in barcode-sort order. Requires `library init` first
-    /// (chassis topology is not cloud-replicated). Chunks lazy-load
-    /// on first host read.
+    /// slots in barcode-sort order. Requires the `library:` block in
+    /// thurvtl.yaml to be set and the daemon to have started at
+    /// least once (so `library.json` is materialized — chassis
+    /// topology is not cloud-replicated). Chunks lazy-load on first
+    /// host read.
     Restore {
         /// Cloud backend name to restore from.
         ///
@@ -987,37 +947,6 @@ enum LibraryAction {
         dry_run: bool,
     },
 
-    /// Modify library configuration (add/remove slots/drives, change LTO generation)
-    Modify {
-        /// New number of cartridge slots (optional)
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=65535))]
-        slots: Option<u32>,
-
-        /// New number of mail slots (optional)
-        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=65535))]
-        mail_slots: Option<u32>,
-
-        /// New number of drives (optional)
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=255))]
-        drives: Option<u32>,
-
-        /// New LTO generation (currently 8 only, optional).
-        ///
-        /// The VTL ships as a clean LTO-8 drive — only `8` is
-        /// accepted today. The flag is kept for forward-compat
-        /// with future LTO-9 support (see docs/LTO-9.md).
-        #[arg(long, value_parser = clap::value_parser!(u8).range(8..=8))]
-        lto_generation: Option<u8>,
-
-        /// Override the INQUIRY firmware revision (1-4 ASCII chars).
-        ///
-        /// Pass an empty string to revert to the LTO-8 default
-        /// firmware (NVL8). See `library init --help` for the
-        /// default.
-        #[arg(long)]
-        firmware: Option<String>,
-    },
-
     /// Monitor library activity in real-time
     Monitor {
         /// Update interval in seconds
@@ -1062,11 +991,12 @@ enum PartitionAction {
 
     /// Create a new partition.
     ///
-    /// Storage and mail ranges are half-open `[start, end)`. Drives
-    /// is a comma-separated list of drive ids. The partition layout
-    /// must cover every storage slot, mail slot, and drive exactly
-    /// once across all defined partitions; this command fails if the
-    /// resulting layout doesn't.
+    /// Storage range is half-open `[start, end)`. Drives is a
+    /// comma-separated list of drive ids. The partition layout must
+    /// cover every storage slot and drive exactly once across all
+    /// defined partitions; this command fails if the resulting
+    /// layout doesn't. (Mail slots are global in this build — the
+    /// single IE element is partition-agnostic.)
     Create {
         /// Partition name (1-64 chars, unique).
         name: String,
@@ -1078,14 +1008,6 @@ enum PartitionAction {
         /// Storage-slot range end (exclusive).
         #[arg(long)]
         storage_end: u32,
-
-        /// Mail-slot range start (inclusive). Default 0.
-        #[arg(long, default_value = "0")]
-        mail_start: u32,
-
-        /// Mail-slot range end (exclusive). Default 0 (no mail slots).
-        #[arg(long, default_value = "0")]
-        mail_end: u32,
 
         /// Drive ids assigned to this partition (comma-separated).
         #[arg(long, value_delimiter = ',')]
@@ -1105,12 +1027,6 @@ enum PartitionAction {
 
         #[arg(long)]
         storage_end: Option<u32>,
-
-        #[arg(long)]
-        mail_start: Option<u32>,
-
-        #[arg(long)]
-        mail_end: Option<u32>,
 
         /// Replace the drive set (comma-separated). Pass `--drives ""`
         /// to clear it.

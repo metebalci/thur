@@ -81,13 +81,18 @@ env var. The canonical path is binding for both the daemon
 `<data_dir>/admin.sock`, so daemon-routed commands work without reading
 the 0640 conffile.
 
-- **Daemon-down (chassis assembly + DR + cloud benchmark + offline
-  key/cert ops):** `library {init, modify, restore}`, `library partition
-  {list,create,modify,delete}`, `cartridge key {migrate,show}`, `system
-  cloud benchmark`, `system regenerate-cert`.
+- **Daemon-down (partition layout + DR + cloud benchmark + offline
+  key/cert ops):** `library restore`, `library restore-archive`,
+  `library partition {list,create,modify,delete}`,
+  `cartridge key {migrate,show}`, `system cloud benchmark`,
+  `system regenerate-cert`.
   Each of these has a specific reason to require the daemon to be
-  stopped. `library init` seeds chassis topology and must not race with
-  the daemon's library lock. `library restore` discovers cartridges in a
+  stopped. (Chassis topology — `num_slots` / `num_drives` /
+  `lto_generation` — is YAML-declared and reconciled by the daemon at
+  start; no imperative `library init` / `library modify` verb exists.
+  `library bounds` is a daemon-routed read that surfaces the
+  safe-shrink envelope before editing the YAML.)
+  `library restore` discovers cartridges in a
   cloud backend's `manifests/` prefix and seeds the local data directory
   for cross-region DR. `system cloud benchmark` validates a bucket
   before the daemon starts. `system regenerate-cert` rewrites the admin

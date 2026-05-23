@@ -71,6 +71,7 @@ pub async fn run_admin_server(socket_path: PathBuf, daemon_state: Arc<DaemonStat
     let product_routes = Router::new()
         .route("/api/v1/health", get(health_handler))
         .route("/api/v1/library/info", get(handlers::library_info))
+        .route("/api/v1/library/bounds", get(handlers::library_bounds))
         .route(
             "/api/v1/cartridges",
             get(handlers::cartridges_list).post(handlers::cartridge_create),

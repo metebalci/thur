@@ -71,9 +71,7 @@ impl Cli {
         if matches!(
             self.command,
             Commands::Library {
-                action: LibraryAction::Init { .. }
-                    | LibraryAction::Modify { .. }
-                    | LibraryAction::Partition { .. }
+                action: LibraryAction::Partition { .. }
                     | LibraryAction::Restore { .. }
             }
         ) {
@@ -178,12 +176,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Strict split: daemon-down commands (`library init`,
-    // `library modify`, `library partition *`) read the yaml — they
-    // need `data_dir` to write under and run with `sudo` on a
-    // packaged install so the 0640 conffile is readable. Every
-    // other command is daemon-routed and only talks to the admin
-    // Unix socket; it must not touch the yaml at all.
+    // Strict split: daemon-down commands (`library partition *`,
+    // `library restore`) read the yaml — they need `data_dir` to
+    // write under and run with `sudo` on a packaged install so the
+    // 0640 conffile is readable. Every other command is daemon-routed
+    // and only talks to the admin Unix socket; it must not touch the
+    // yaml at all.
     let data_dir = if cli.is_daemon_down() {
         Cli::read_minimal(&config_path)?.data_dir
     } else {
@@ -367,57 +365,14 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Library { action } => match action {
-            LibraryAction::Init {
-                slots,
-                mail_slots,
-                drives,
-                lto_generation,
-                firmware,
-                transport_base,
-                storage_base,
-                import_export_base,
-                data_transfer_base,
-            } => {
-                shared_cli::privdrop::drop_to_user_if_root(&target_user)?;
-                commands::library::cmd_init(
-                    &data_dir,
-                    slots,
-                    mail_slots,
-                    drives,
-                    lto_generation,
-                    firmware,
-                    transport_base,
-                    storage_base,
-                    import_export_base,
-                    data_transfer_base,
-                    &config_path,
-                )
-                .await?;
-            }
             LibraryAction::Info {
                 json,
                 with_cartridges,
             } => {
                 commands::library::cmd_info(json, with_cartridges).await?;
             }
-            LibraryAction::Modify {
-                slots,
-                mail_slots,
-                drives,
-                lto_generation,
-                firmware,
-            } => {
-                shared_cli::privdrop::drop_to_user_if_root(&target_user)?;
-                commands::library::cmd_modify(
-                    &data_dir,
-                    slots,
-                    mail_slots,
-                    drives,
-                    lto_generation,
-                    firmware,
-                    &config_path,
-                )
-                .await?;
+            LibraryAction::Bounds { json } => {
+                commands::library::cmd_bounds(json).await?;
             }
             LibraryAction::Restore {
                 backend,
@@ -471,8 +426,6 @@ async fn main() -> Result<()> {
                     name,
                     storage_start,
                     storage_end,
-                    mail_start,
-                    mail_end,
                     drives,
                 } => {
                     commands::library::cmd_partition_create(
@@ -481,8 +434,6 @@ async fn main() -> Result<()> {
                         name,
                         storage_start,
                         storage_end,
-                        mail_start,
-                        mail_end,
                         drives,
                     )
                     .await?;
@@ -491,8 +442,6 @@ async fn main() -> Result<()> {
                     name,
                     storage_start,
                     storage_end,
-                    mail_start,
-                    mail_end,
                     drives,
                 } => {
                     commands::library::cmd_partition_modify(
@@ -501,8 +450,6 @@ async fn main() -> Result<()> {
                         name,
                         storage_start,
                         storage_end,
-                        mail_start,
-                        mail_end,
                         drives,
                     )
                     .await?;
@@ -780,28 +727,6 @@ mod cli_parse_tests {
     // ---- daemon-down classification ----
 
     #[test]
-    fn library_init_is_daemon_down() {
-        let cli = parse([
-            "thurvtl",
-            "library",
-            "init",
-            "--slots",
-            "10",
-            "--drives",
-            "2",
-            "--lto-generation",
-            "8",
-        ]);
-        assert!(cli.is_daemon_down());
-    }
-
-    #[test]
-    fn library_modify_is_daemon_down() {
-        let cli = parse(["thurvtl", "library", "modify", "--slots", "20"]);
-        assert!(cli.is_daemon_down());
-    }
-
-    #[test]
     fn library_partition_is_daemon_down() {
         let cli = parse(["thurvtl", "library", "partition", "list"]);
         assert!(cli.is_daemon_down());
@@ -849,99 +774,23 @@ mod cli_parse_tests {
         assert!(!cli.is_daemon_down());
     }
 
-    // ---- library init flag validation ----
+    // ---- library bounds is daemon-routed (chassis topology lives in YAML;
+    // CLI verbs to mutate the chassis no longer exist).
 
     #[test]
-    fn library_init_requires_slots_and_drives() {
-        assert!(
-            Cli::try_parse_from(["thurvtl", "library", "init", "--lto-generation", "8"]).is_err()
-        );
+    fn library_init_and_modify_are_no_longer_subcommands() {
+        // Chassis topology now lives in thurvtl.yaml's `library:`
+        // block; the daemon materializes library.json on first start
+        // and reconciles on every subsequent start. The imperative
+        // `library init` / `library modify` verbs were removed.
+        assert!(Cli::try_parse_from(["thurvtl", "library", "init"]).is_err());
+        assert!(Cli::try_parse_from(["thurvtl", "library", "modify"]).is_err());
     }
 
     #[test]
-    fn library_init_rejects_zero_slots() {
-        assert!(
-            Cli::try_parse_from([
-                "thurvtl",
-                "library",
-                "init",
-                "--slots",
-                "0",
-                "--drives",
-                "1",
-                "--lto-generation",
-                "8",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn library_init_rejects_too_many_drives() {
-        assert!(
-            Cli::try_parse_from([
-                "thurvtl",
-                "library",
-                "init",
-                "--slots",
-                "1",
-                "--drives",
-                "256",
-                "--lto-generation",
-                "8",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn library_init_rejects_lto_generation_other_than_8() {
-        assert!(
-            Cli::try_parse_from([
-                "thurvtl",
-                "library",
-                "init",
-                "--slots",
-                "1",
-                "--drives",
-                "1",
-                "--lto-generation",
-                "9",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn library_init_parses_element_bases() {
-        let cli = parse([
-            "thurvtl",
-            "library",
-            "init",
-            "--slots",
-            "40",
-            "--mail-slots",
-            "5",
-            "--drives",
-            "3",
-            "--lto-generation",
-            "8",
-            "--storage-base",
-            "2000",
-        ]);
-        assert!(matches!(
-            cli.command,
-            Commands::Library {
-                action: LibraryAction::Init {
-                    slots: 40,
-                    mail_slots: 5,
-                    drives: 3,
-                    storage_base: 2000,
-                    transport_base: 0,
-                    ..
-                },
-            }
-        ));
+    fn library_bounds_is_daemon_routed() {
+        let cli = parse(["thurvtl", "library", "bounds"]);
+        assert!(!cli.is_daemon_down());
     }
 
     // ---- cartridge create flag validation ----

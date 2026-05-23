@@ -121,8 +121,8 @@ sudo usermod -aG thurvsa $USER     # ...and thurvsa, on a co-resident host
 ```
 
 Alternatively, invoke the CLI as the daemon user per command —
-`sudo -u thurvtl thurvtl ...`. Pure-local commands (`config defaults`,
-`thurvtl library init`) use no socket and need neither.
+`sudo -u thurvtl thurvtl ...`. Pure-local commands (`config defaults`)
+use no socket and need neither.
 
 Every release artifact ships a detached `.asc` GPG signature — verify
 it before installing. Key fingerprint and the build / signing process
@@ -157,18 +157,26 @@ catalogued in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Both
 the daemon and CLI resolve `--config PATH` first, otherwise
 `/etc/<product>/<product>.yaml`.
 
-Thur VTL additionally needs its chassis initialized once, before the
-first daemon start. This step writes the chassis topology — how many
-slots, drives, and mail slots the library presents — into persistent
-state that the daemon reads on every subsequent boot:
+Thur VTL also needs a chassis declaration. Add a `library:` block to
+your `thurvtl.yaml` — every field is required:
 
-```bash
-sudo thurvtl library init --slots 40 --drives 3 --lto-generation 8
+```yaml
+library:
+  num_slots: 40       # storage slots; raise/lower by editing this and restarting
+  num_drives: 3       # tape drives
+  lto_generation: 8   # 7 or 8 (LTO-8 only is supported today)
 ```
 
-`library init` only lays out the chassis topology (slots, drives,
-mail slots) — it does **not** create any cartridges. Add those once
-the daemon is running with `thurvtl cartridge create`.
+The daemon materializes `<data_dir>/library/library.json` from this
+block on first start (minting a stable chassis serial + SMC element
+bases). On subsequent starts it diffs the YAML against the persisted
+declaration and reconciles: grow operations always succeed; shrink
+operations refuse if any cartridge or loaded drive would be orphaned.
+`thurvtl library bounds` (against a running daemon) shows the
+safe-shrink envelope for the current inventory. No imperative chassis
+mutation — edit the YAML and restart the daemon.
+
+Add cartridges via `thurvtl cartridge create` once the daemon is up.
 
 ## Run
 

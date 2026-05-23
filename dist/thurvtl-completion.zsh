@@ -50,32 +50,24 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvtl-library-command-$line[1]:"
         case $line[1] in
-            (init)
-_arguments "${_arguments_options[@]}" : \
-'--slots=[Number of cartridge storage slots]:SLOTS:_default' \
-'--mail-slots=[Number of mail slots for import/export]:MAIL_SLOTS:_default' \
-'--drives=[Number of tape drives]:DRIVES:_default' \
-'--lto-generation=[LTO generation for drives (currently 8 only)]:LTO_GENERATION:_default' \
-'--firmware=[Override the INQUIRY firmware revision (1-4 ASCII chars)]:FIRMWARE:_default' \
-'--transport-base=[SMC element address for the medium-transport (robot)]:TRANSPORT_BASE:_default' \
-'--storage-base=[First SMC element address for storage slots]:STORAGE_BASE:_default' \
-'--import-export-base=[First SMC element address for import/export (mail) slots]:IMPORT_EXPORT_BASE:_default' \
-'--data-transfer-base=[First SMC element address for data-transfer (drive) elements]:DATA_TRANSFER_BASE:_default' \
-'-c+[Path to configuration file]:CONFIG:_default' \
-'--config=[Path to configuration file]:CONFIG:_default' \
-'--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(info)
+            (info)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the response as JSON for automation]' \
 '--with-cartridges[Also show summed per-cartridge byte counters]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(bounds)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit the response as JSON for automation]' \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -106,21 +98,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--allow-existing[Skip silently if the destination barcode already exists locally. Without this flag, an existing local dir is an error]' \
 '--dry-run[Plan only — no downloads, no inventory mutation]' \
-'--copyright[Print the copyright + license notice and exit]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(modify)
-_arguments "${_arguments_options[@]}" : \
-'--slots=[New number of cartridge slots (optional)]:SLOTS:_default' \
-'--mail-slots=[New number of mail slots (optional)]:MAIL_SLOTS:_default' \
-'--drives=[New number of drives (optional)]:DRIVES:_default' \
-'--lto-generation=[New LTO generation (currently 8 only, optional)]:LTO_GENERATION:_default' \
-'--firmware=[Override the INQUIRY firmware revision (1-4 ASCII chars)]:FIRMWARE:_default' \
-'-c+[Path to configuration file]:CONFIG:_default' \
-'--config=[Path to configuration file]:CONFIG:_default' \
-'--user=[User to drop privileges to under sudo]:USER:_default' \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -181,8 +158,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--storage-start=[Storage-slot range start (inclusive)]:STORAGE_START:_default' \
 '--storage-end=[Storage-slot range end (exclusive)]:STORAGE_END:_default' \
-'--mail-start=[Mail-slot range start (inclusive). Default 0]:MAIL_START:_default' \
-'--mail-end=[Mail-slot range end (exclusive). Default 0 (no mail slots)]:MAIL_END:_default' \
 '*--drives=[Drive ids assigned to this partition (comma-separated)]:DRIVES:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -197,8 +172,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--storage-start=[]:STORAGE_START:_default' \
 '--storage-end=[]:STORAGE_END:_default' \
-'--mail-start=[]:MAIL_START:_default' \
-'--mail-end=[]:MAIL_END:_default' \
 '*--drives=[Replace the drive set (comma-separated). Pass \`--drives ""\` to clear it]:DRIVES:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -273,11 +246,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvtl-library-help-command-$line[1]:"
         case $line[1] in
-            (init)
+            (info)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
-(info)
+(bounds)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -286,10 +259,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (restore-archive)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(modify)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1839,11 +1808,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvtl-help-library-command-$line[1]:"
         case $line[1] in
-            (init)
+            (info)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
-(info)
+(bounds)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1852,10 +1821,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (restore-archive)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(modify)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2986,31 +2951,25 @@ _thurvtl__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() 
 (( $+functions[_thurvtl__subcmd__help__subcmd__library_commands] )) ||
 _thurvtl__subcmd__help__subcmd__library_commands() {
     local commands; commands=(
-'init:Initialize a new library' \
 'info:Show library information' \
+'bounds:Show min / current / max for num_slots and num_drives' \
 'restore:Restore cartridges from a cloud backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
-'modify:Modify library configuration (add/remove slots/drives, change LTO generation)' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \
 'partition:Manage logical partitions (chassis-assembly, daemon-down)' \
     )
     _describe -t commands 'thurvtl help library commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__help__subcmd__library__subcmd__bounds_commands] )) ||
+_thurvtl__subcmd__help__subcmd__library__subcmd__bounds_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help library bounds commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__help__subcmd__library__subcmd__info_commands] )) ||
 _thurvtl__subcmd__help__subcmd__library__subcmd__info_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help library info commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__help__subcmd__library__subcmd__init_commands] )) ||
-_thurvtl__subcmd__help__subcmd__library__subcmd__init_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl help library init commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__help__subcmd__library__subcmd__modify_commands] )) ||
-_thurvtl__subcmd__help__subcmd__library__subcmd__modify_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl help library modify commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__library__subcmd__monitor_commands] )) ||
 _thurvtl__subcmd__help__subcmd__library__subcmd__monitor_commands() {
@@ -3411,11 +3370,10 @@ _thurvtl__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() {
 (( $+functions[_thurvtl__subcmd__library_commands] )) ||
 _thurvtl__subcmd__library_commands() {
     local commands; commands=(
-'init:Initialize a new library' \
 'info:Show library information' \
+'bounds:Show min / current / max for num_slots and num_drives' \
 'restore:Restore cartridges from a cloud backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
-'modify:Modify library configuration (add/remove slots/drives, change LTO generation)' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \
 'partition:Manage logical partitions (chassis-assembly, daemon-down)' \
@@ -3423,20 +3381,29 @@ _thurvtl__subcmd__library_commands() {
     )
     _describe -t commands 'thurvtl library commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__library__subcmd__bounds_commands] )) ||
+_thurvtl__subcmd__library__subcmd__bounds_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl library bounds commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__library__subcmd__help_commands] )) ||
 _thurvtl__subcmd__library__subcmd__help_commands() {
     local commands; commands=(
-'init:Initialize a new library' \
 'info:Show library information' \
+'bounds:Show min / current / max for num_slots and num_drives' \
 'restore:Restore cartridges from a cloud backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
-'modify:Modify library configuration (add/remove slots/drives, change LTO generation)' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \
 'partition:Manage logical partitions (chassis-assembly, daemon-down)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl library help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__library__subcmd__help__subcmd__bounds_commands] )) ||
+_thurvtl__subcmd__library__subcmd__help__subcmd__bounds_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl library help bounds commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__library__subcmd__help__subcmd__help_commands] )) ||
 _thurvtl__subcmd__library__subcmd__help__subcmd__help_commands() {
@@ -3447,16 +3414,6 @@ _thurvtl__subcmd__library__subcmd__help__subcmd__help_commands() {
 _thurvtl__subcmd__library__subcmd__help__subcmd__info_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl library help info commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__library__subcmd__help__subcmd__init_commands] )) ||
-_thurvtl__subcmd__library__subcmd__help__subcmd__init_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl library help init commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__library__subcmd__help__subcmd__modify_commands] )) ||
-_thurvtl__subcmd__library__subcmd__help__subcmd__modify_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl library help modify commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__library__subcmd__help__subcmd__monitor_commands] )) ||
 _thurvtl__subcmd__library__subcmd__help__subcmd__monitor_commands() {
@@ -3512,16 +3469,6 @@ _thurvtl__subcmd__library__subcmd__help__subcmd__self-test_commands() {
 _thurvtl__subcmd__library__subcmd__info_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl library info commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__library__subcmd__init_commands] )) ||
-_thurvtl__subcmd__library__subcmd__init_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl library init commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__library__subcmd__modify_commands] )) ||
-_thurvtl__subcmd__library__subcmd__modify_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl library modify commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__library__subcmd__monitor_commands] )) ||
 _thurvtl__subcmd__library__subcmd__monitor_commands() {
