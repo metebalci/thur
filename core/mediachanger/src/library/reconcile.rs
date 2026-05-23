@@ -976,8 +976,7 @@ mod tests {
             slot.barcode = Some("BC0006L8".into());
         }
         let err = diff_against_declared(&lib, &declared(5, 2, 8))
-            .err()
-            .expect("shrink into occupied slot must refuse");
+            .expect_err("shrink into occupied slot must refuse");
         let msg = format!("{}", err);
         assert!(msg.contains("slot 6"));
         assert!(msg.contains("BC0006L8"));
@@ -1014,8 +1013,7 @@ mod tests {
             slot.barcode = Some("BLOCKER1L8".into());
         }
         let err = diff_against_declared(&lib, &declared(8, 2, 8))
-            .err()
-            .expect("drive shrink into occupied origin must refuse");
+            .expect_err("drive shrink into occupied origin must refuse");
         let msg = format!("{}", err);
         assert!(msg.contains("drive 2"));
         assert!(msg.contains("LOADED1L8"));
@@ -1095,8 +1093,7 @@ mod tests {
             slot.barcode = Some("ONLY1L8".into());
         }
         let err = diff_against_declared(&lib, &declared(8, 2, 7))
-            .err()
-            .expect("downgrade with cartridges must refuse");
+            .expect_err("downgrade with cartridges must refuse");
         let msg = format!("{}", err);
         assert!(msg.contains("lto_generation"));
         // Note: validate_declared rejects gen != 8 first, so this fires
