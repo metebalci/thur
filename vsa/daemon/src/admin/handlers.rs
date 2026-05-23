@@ -27,15 +27,16 @@
 //! audit is enabled. Read endpoints don't audit (would balloon the
 //! chain on every CLI poll).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, extract::Path as AxumPath, extract::State, http::StatusCode, response::IntoResponse,
 };
 use core_block::{
-    self, PageCache, VolumeManifest, VolumeRuntime, VolumeWriter,
+    self, PageCache, UploadTask, VolumeManifest, VolumeRuntime, VolumeWriter,
     volume::{VolumeEncryptionAlgorithm, parse_dedup_scope},
 };
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,8 @@ use shared_admin_server::{JobRegistry, PeerCred};
 use shared_audit::{AuditActor, AuditChannel, AuditResult};
 use shared_cloud::{CloudBackend, CloudConfig};
 use shared_keystore::{DekSource, KeyStoreBackend, KeystoreYamlConfig, SecretBytes};
-use tokio::sync::{Mutex, RwLock};
+use shared_pool::PoolBudget;
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
 use crate::registry::VolumeRegistry;
@@ -80,8 +82,24 @@ pub struct AdminState {
     pub started_at_unix: i64,
     /// Per-backend disk-cache budgets. Same `Arc<PoolBudget>` map the
     /// eviction worker holds; cloned in once at boot so the monitor
-    /// handler can read used / cap / waiters_now coherently.
-    pub pool_budgets: std::collections::HashMap<String, Arc<shared_pool::PoolBudget>>,
+    /// handler can read used / cap / waiters_now coherently AND so
+    /// runtime `volume create` can chain `.with_pool_budget(...)`
+    /// onto the new `VolumeWriter` (matching the boot path in
+    /// `discovery.rs`).
+    pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
+    /// `try_reserve` deadline applied to every `VolumeWriter`'s pool
+    /// budget. Parsed once at boot from
+    /// `cfg.disk_cache.backpressure_max_wait_seconds`; threaded here
+    /// so runtime `volume create` builds writers with the same
+    /// backpressure semantics as boot.
+    pub backpressure_deadline: Duration,
+    /// Sender end of the async upload-worker channel. Cloned into
+    /// each runtime-created `VolumeWriter` so its
+    /// `write_page_unsynced` takes the async dispatch path (vs.
+    /// falling back to the inline upload, which blocks the SCSI
+    /// write on cloud and skips the `backend_bytes_written`
+    /// counter).
+    pub upload_tx: mpsc::Sender<UploadTask>,
     /// iSCSI / NVMe-TCP session manager. Cloned from the transport's
     /// `Arc<SessionManager>` so the monitor handler can read
     /// `session_count` without going through the HTTP listener state.
@@ -287,6 +305,23 @@ pub async fn create(
 
     let backend = resolve_backend(&state, &body.backend)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+
+    // Look up the pool budget for the resolved backend. The boot
+    // path makes the same invariant assumption (every backend in
+    // cloud_config has a budget in pool_budgets, built side-by-side
+    // in main.rs); refuse the create fast if it's somehow missing
+    // rather than carrying half-wired state into VolumeWriter.
+    let pool_budget = state.pool_budgets.get(&backend).cloned().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!(
+                    "no pool budget configured for backend '{}' (internal: boot path should have wired one)",
+                    backend
+                )
+            })),
+        )
+    })?;
 
     // Pin the LUN before we touch the disk so an unavailable
     // explicit `--lun N` refuses cleanly without leaving a
@@ -537,7 +572,19 @@ pub async fn create(
         None => VolumeWriter::open(&state.data_dir, &created.name, cloud_backend),
     };
     let writer = match writer {
-        Ok(w) => Arc::new(w),
+        Ok(w) => {
+            // Mirror discovery.rs:269-282 — both builders are
+            // required for the volume to use the async upload path
+            // (`write_page_unsynced` enqueues to the worker) instead
+            // of the inline path (blocking SCSI WRITE on cloud + no
+            // `backend_bytes_written` bump). Their absence was a
+            // silent runtime-create regression that left every
+            // post-boot volume with a flat counter.
+            let w = w
+                .with_pool_budget(Arc::clone(&pool_budget), state.backpressure_deadline)
+                .with_upload_sender(state.upload_tx.clone());
+            Arc::new(w)
+        }
         Err(e) => {
             let _ =
                 std::fs::remove_dir_all(VolumeManifest::dir_for(&state.data_dir, &created.name));

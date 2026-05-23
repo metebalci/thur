@@ -604,6 +604,8 @@ async fn main() -> Result<()> {
         keystore_cache: Arc::new(tokio::sync::RwLock::new(keystores)),
         started_at_unix,
         pool_budgets: pool_budgets.clone(),
+        backpressure_deadline,
+        upload_tx: upload_tx.clone(),
         sessions: Arc::clone(&session_manager),
     };
     let admin_socket = admin::admin_socket_path();
