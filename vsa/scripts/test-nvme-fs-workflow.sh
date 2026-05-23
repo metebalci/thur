@@ -420,6 +420,30 @@ phase_a_format_mount_extract() {
         return 1
     fi
     log_info "[Phase A] umounted cleanly"
+
+    # Async-upload health gate — same shape as the iSCSI workflow.
+    # See vsa/scripts/test-iscsi-fs-workflow.sh phase_a for rationale.
+    if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
+        log_error "[Phase A] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
+        grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'
+        return 1
+    fi
+    local info_json host_bw backend_bw
+    info_json=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$VOLUME_NAME" --json 2>/dev/null) || {
+        log_error "[Phase A] volume info '$VOLUME_NAME' failed"
+        return 1
+    }
+    host_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("host_bytes_written",0))')
+    backend_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("backend_bytes_written",0))')
+    log_info "[Phase A] runtime counters: host_bytes_written=$host_bw  backend_bytes_written=$backend_bw"
+    if [[ "${host_bw:-0}" -le 0 ]]; then
+        log_error "[Phase A] host_bytes_written=$host_bw — host writes never reached the daemon"
+        return 1
+    fi
+    if [[ "${backend_bw:-0}" -le 0 ]]; then
+        log_error "[Phase A] backend_bytes_written=$backend_bw with host_bytes_written=$host_bw — uploads silently dropped"
+        return 1
+    fi
 }
 
 phase_b_snapshot_pre_restart() {

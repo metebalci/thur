@@ -393,6 +393,39 @@ phase_a_format_mount_extract() {
         return 1
     fi
     log_info "[Phase A] umounted cleanly"
+
+    # Async-upload health gate. The async upload worker has historically
+    # been wired to a *snapshot* of the backend map taken at daemon
+    # boot; any volume whose backend was first instantiated by a
+    # runtime `volume create` (i.e. against an empty initial daemon)
+    # produced "backend 'X' unknown … leaving LocalOnly" warns and
+    # silently dropped every upload until daemon restart. Catch any
+    # regression of that shape here, before the persistence phases
+    # mask it via a restart.
+    if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
+        log_error "[Phase A] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
+        grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'
+        return 1
+    fi
+    # Backend bytes written should track host writes — a flat counter
+    # means uploads no-op'd into LocalOnly. Cheap admin-socket probe.
+    local info_json
+    info_json=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$VOLUME_NAME" --json 2>/dev/null) || {
+        log_error "[Phase A] volume info '$VOLUME_NAME' failed"
+        return 1
+    }
+    local host_bw backend_bw
+    host_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("host_bytes_written",0))')
+    backend_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("backend_bytes_written",0))')
+    log_info "[Phase A] runtime counters: host_bytes_written=$host_bw  backend_bytes_written=$backend_bw"
+    if [[ "${host_bw:-0}" -le 0 ]]; then
+        log_error "[Phase A] host_bytes_written=$host_bw — host writes never reached the daemon"
+        return 1
+    fi
+    if [[ "${backend_bw:-0}" -le 0 ]]; then
+        log_error "[Phase A] backend_bytes_written=$backend_bw with host_bytes_written=$host_bw — uploads silently dropped"
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------

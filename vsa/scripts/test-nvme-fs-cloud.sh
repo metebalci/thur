@@ -507,6 +507,29 @@ phase_a_format_mount_extract() {
 
 phase_b_assert_cloud_objects() {
     log_info "[Phase B] Asserting chunk objects landed in cloud..."
+    # Async-upload health gate — same shape as the iSCSI cloud test.
+    # See vsa/scripts/test-iscsi-fs-cloud.sh phase_b for rationale.
+    if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
+        log_error "[Phase B] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
+        grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'
+        return 1
+    fi
+    local info_json host_bw backend_bw
+    info_json=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$VOLUME_NAME" --json 2>/dev/null) || {
+        log_error "[Phase B] volume info '$VOLUME_NAME' failed"
+        return 1
+    }
+    host_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("host_bytes_written",0))')
+    backend_bw=$(echo "$info_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("runtime",{}).get("backend_bytes_written",0))')
+    log_info "[Phase B] runtime counters: host_bytes_written=$host_bw  backend_bytes_written=$backend_bw"
+    if [[ "${host_bw:-0}" -le 0 ]]; then
+        log_error "[Phase B] host_bytes_written=$host_bw — host writes never reached the daemon"
+        return 1
+    fi
+    if [[ "${backend_bw:-0}" -le 0 ]]; then
+        log_error "[Phase B] backend_bytes_written=$backend_bw with host_bytes_written=$host_bw — uploads silently dropped"
+        return 1
+    fi
     # SYNCHRONIZE CACHE / NVMe Flush on umount drains in-flight
     # uploads, but the cloud bucket may take a beat to be listable.
     # cloud_wait_for_key blocks until at least one object shows up.
