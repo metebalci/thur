@@ -315,6 +315,11 @@ fn read_env(name: &str) -> CloudConfigResult<String> {
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct S3BackendConfig {
     pub bucket: String,
+    /// Object-key prefix prepended to every chunk / manifest under
+    /// this backend. Empty (the default) puts objects at the bucket
+    /// root; set a trailing-slash prefix like `tapes/` to namespace
+    /// the daemon's traffic inside a shared bucket.
+    #[serde(default)]
     pub prefix: String,
     pub region: String,
     #[serde(default)]
@@ -352,6 +357,8 @@ pub struct S3BackendConfig {
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct GcsBackendConfig {
     pub bucket: String,
+    /// Object-key prefix. See `S3BackendConfig::prefix`.
+    #[serde(default)]
     pub prefix: String,
     pub project_id: String,
     /// Path to a service-account JSON key file. `None` falls
@@ -379,6 +386,8 @@ pub struct AzureBackendConfig {
     /// by the explicit `storage_account` name.
     pub storage_account: String,
     pub container: String,
+    /// Object-key prefix. See `S3BackendConfig::prefix`.
+    #[serde(default)]
     pub prefix: String,
     /// Optional custom endpoint URL. Use `http://127.0.0.1:10000/<account>`
     /// for Azurite, or a sovereign-cloud endpoint. When omitted the SDK
@@ -1888,6 +1897,34 @@ backends:
         assert_eq!(cfg.prefix_named("primary"), "tapes/");
         assert_eq!(cfg.target_label_named("cold").unwrap(), "thurvtl/cold");
         assert_eq!(cfg.prefix_named("cold"), "");
+    }
+
+    #[test]
+    fn prefix_defaults_to_empty_when_omitted() {
+        // Omitting `prefix:` on each of S3 / GCS / Azure must
+        // deserialize cleanly and resolve to the empty string —
+        // equivalent to writing `prefix: ""` explicitly.
+        let cfg = parse(
+            r#"
+backends:
+  s3-no-prefix:
+    type: s3
+    bucket: b
+    region: us-east-1
+  gcs-no-prefix:
+    type: gcs
+    bucket: b
+    project_id: p
+  azure-no-prefix:
+    type: azure
+    storage_account: a
+    container: c
+"#,
+        );
+        cfg.validate_backends().unwrap();
+        assert_eq!(cfg.prefix_named("s3-no-prefix"), "");
+        assert_eq!(cfg.prefix_named("gcs-no-prefix"), "");
+        assert_eq!(cfg.prefix_named("azure-no-prefix"), "");
     }
 
     // ===== classify() + is_retryable() coverage =====

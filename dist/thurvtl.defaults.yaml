@@ -196,6 +196,9 @@ cloud:
   #     type: s3
   #     bucket: my-bucket-name
   #     region: us-east-1
+  #     # Optional object-key prefix. Empty (the default) puts
+  #     # objects at the bucket root; set a trailing-slash prefix
+  #     # like `thur/` to namespace traffic inside a shared bucket.
   #     prefix: thur/
   #     auth:
   #       type: env
