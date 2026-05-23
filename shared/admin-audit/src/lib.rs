@@ -356,3 +356,200 @@ fn format_entry(e: &AuditEntry) -> String {
         serde_json::to_string(&e.params).unwrap_or_default(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    // `JobEvent` is re-exported by shared-admin-server (see its
+    // crate-root `pub use`), so admin-audit needs no direct
+    // `shared-admin-proto` dependency.
+    use shared_admin_server::{JobEvent, JobRegistry};
+
+    #[test]
+    fn defaults_match_the_documented_values() {
+        assert_eq!(default_lines(), 20);
+        assert_eq!(default_format(), "jsonl");
+    }
+
+    #[test]
+    fn tail_params_default_to_no_follow_twenty_lines() {
+        let p: TailParams = serde_json::from_value(serde_json::json!({})).expect("parse");
+        assert!(!p.follow);
+        assert_eq!(p.lines, 20);
+    }
+
+    #[test]
+    fn tail_params_override_follow_and_lines() {
+        let p: TailParams =
+            serde_json::from_value(serde_json::json!({"follow": true, "lines": 5})).expect("parse");
+        assert!(p.follow);
+        assert_eq!(p.lines, 5);
+    }
+
+    #[test]
+    fn export_params_default_to_jsonl_and_no_window() {
+        let p: ExportParams = serde_json::from_value(serde_json::json!({})).expect("parse");
+        assert_eq!(p.format, "jsonl");
+        assert!(p.from.is_none());
+        assert!(p.to.is_none());
+    }
+
+    #[test]
+    fn export_params_round_trip_csv_window() {
+        let p: ExportParams = serde_json::from_value(serde_json::json!({
+            "format": "csv",
+            "from": "2026-05-01",
+            "to": "2026-05-23",
+        }))
+        .expect("parse");
+        assert_eq!(p.format, "csv");
+        assert_eq!(p.from.as_deref(), Some("2026-05-01"));
+        assert_eq!(p.to.as_deref(), Some("2026-05-23"));
+    }
+
+    #[test]
+    fn rotate_params_default_and_override() {
+        let d: RotateParams = serde_json::from_value(serde_json::json!({})).expect("parse");
+        assert!(!d.accept_break);
+        let y: RotateParams =
+            serde_json::from_value(serde_json::json!({"accept_break": true})).expect("parse");
+        assert!(y.accept_break);
+    }
+
+    #[test]
+    fn parse_date_accepts_iso_8601_and_rejects_garbage() {
+        let d = parse_date("2026-05-23").expect("ok");
+        assert_eq!(d.to_string(), "2026-05-23");
+        let err = parse_date("23/05/2026").expect_err("bad format");
+        assert!(err.contains("invalid date"));
+        assert!(err.contains("YYYY-MM-DD"));
+    }
+
+    #[test]
+    fn csv_escape_quotes_only_when_needed() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("she said \"hi\""), "\"she said \"\"hi\"\"\"");
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    fn make_entry(seq: u64, op: &str, result: &str) -> AuditEntry {
+        AuditEntry {
+            seq,
+            ts: Utc::now(),
+            actor: AuditActor::system(),
+            op: op.to_string(),
+            params: serde_json::json!({"k": "v"}),
+            result: result.to_string(),
+            error: None,
+            prev_hash: None,
+            entry_hash: None,
+        }
+    }
+
+    #[test]
+    fn format_entry_renders_sequence_op_and_result() {
+        let e = make_entry(7, "drive.load", "ok");
+        let line = format_entry(&e);
+        assert!(line.contains("7"));
+        assert!(line.contains("drive.load"));
+        assert!(line.contains("ok"));
+        // params JSON survives the round trip.
+        assert!(line.contains("\"k\":\"v\""));
+    }
+
+    async fn drain(reg: &JobRegistry, id: &str) -> Vec<JobEvent> {
+        let handle = reg.get(id).await.expect("job exists");
+        let mut cursor = 0;
+        handle.next_events(&mut cursor).await
+    }
+
+    fn is_done(events: &[JobEvent]) -> Option<i32> {
+        events.iter().find_map(|e| match e {
+            JobEvent::Done { exit_code, .. } => Some(*exit_code),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn run_tail_on_an_empty_dir_completes_successfully() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.tail").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        run_tail(emitter, serde_json::json!({}), dir.path().to_path_buf()).await;
+        let events = drain(&reg, &id).await;
+        assert_eq!(is_done(&events), Some(0));
+    }
+
+    #[tokio::test]
+    async fn run_tail_with_bad_params_fails_with_exit_code_two() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.tail").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A string body is not a TailParams object.
+        run_tail(
+            emitter,
+            serde_json::json!("not an object"),
+            dir.path().to_path_buf(),
+        )
+        .await;
+        let events = drain(&reg, &id).await;
+        assert_eq!(is_done(&events), Some(2));
+    }
+
+    #[tokio::test]
+    async fn run_tail_with_missing_dir_fails_with_exit_code_two() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.tail").await;
+        run_tail(
+            emitter,
+            serde_json::json!({}),
+            PathBuf::from("/nonexistent/audit-test-dir"),
+        )
+        .await;
+        let events = drain(&reg, &id).await;
+        assert_eq!(is_done(&events), Some(2));
+    }
+
+    #[tokio::test]
+    async fn run_verify_on_an_empty_dir_completes() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.verify").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        run_verify(emitter, serde_json::json!({}), dir.path().to_path_buf()).await;
+        let events = drain(&reg, &id).await;
+        // An empty audit dir verifies as a healthy (empty) chain.
+        assert!(is_done(&events).is_some());
+    }
+
+    #[tokio::test]
+    async fn run_export_on_an_empty_dir_completes() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.export").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        run_export(
+            emitter,
+            serde_json::json!({"format": "jsonl"}),
+            dir.path().to_path_buf(),
+        )
+        .await;
+        let events = drain(&reg, &id).await;
+        assert!(is_done(&events).is_some());
+    }
+
+    #[tokio::test]
+    async fn run_export_rejects_an_unknown_format() {
+        let reg = JobRegistry::new();
+        let (id, _, emitter) = reg.create("audit.export").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        run_export(
+            emitter,
+            serde_json::json!({"format": "xml"}),
+            dir.path().to_path_buf(),
+        )
+        .await;
+        let events = drain(&reg, &id).await;
+        assert_eq!(is_done(&events), Some(2));
+    }
+}
