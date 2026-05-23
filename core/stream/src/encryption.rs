@@ -268,4 +268,109 @@ mod tests {
             decrypt_block(&[0u8; KEY_LEN], &[0u8; 8], &[0u8; TAG_LEN + 1]).expect_err("must fail");
         assert!(matches!(err, SmcError::DataDecryptionError(_)));
     }
+
+    #[test]
+    fn encryption_mode_from_u8_round_trips_known_values() {
+        assert_eq!(
+            EncryptionMode::from_u8(0x00).expect("disable"),
+            EncryptionMode::Disable,
+        );
+        assert_eq!(
+            EncryptionMode::from_u8(0x02).expect("encrypt"),
+            EncryptionMode::Encrypt,
+        );
+        // EXTERNAL (0x01) is deliberately rejected — see the module doc.
+        assert!(matches!(
+            EncryptionMode::from_u8(0x01),
+            Err(SmcError::InvalidField),
+        ));
+        assert!(matches!(
+            EncryptionMode::from_u8(0xFF),
+            Err(SmcError::InvalidField),
+        ));
+    }
+
+    #[test]
+    fn decryption_mode_from_u8_covers_every_variant() {
+        assert_eq!(
+            DecryptionMode::from_u8(0x00).expect("disable"),
+            DecryptionMode::Disable,
+        );
+        assert_eq!(
+            DecryptionMode::from_u8(0x01).expect("raw"),
+            DecryptionMode::Raw,
+        );
+        assert_eq!(
+            DecryptionMode::from_u8(0x02).expect("decrypt"),
+            DecryptionMode::Decrypt,
+        );
+        assert_eq!(
+            DecryptionMode::from_u8(0x03).expect("mixed"),
+            DecryptionMode::Mixed,
+        );
+        assert!(matches!(
+            DecryptionMode::from_u8(0x04),
+            Err(SmcError::InvalidField),
+        ));
+    }
+
+    #[test]
+    fn key_scope_from_u8_covers_every_variant() {
+        assert_eq!(KeyScope::from_u8(0x00).expect("public"), KeyScope::Public);
+        assert_eq!(KeyScope::from_u8(0x01).expect("local"), KeyScope::Local);
+        assert_eq!(
+            KeyScope::from_u8(0x02).expect("all-it-nexus"),
+            KeyScope::AllItNexus,
+        );
+        assert!(matches!(
+            KeyScope::from_u8(0x03),
+            Err(SmcError::InvalidField),
+        ));
+    }
+
+    fn state(mode: EncryptionMode, dec: DecryptionMode, key_len: usize) -> DriveEncryptionState {
+        DriveEncryptionState {
+            mode,
+            decryption_mode: dec,
+            scope: KeyScope::Public,
+            algorithm_index: ALGORITHM_INDEX_AES_256_GCM,
+            key: vec![0x42; key_len],
+            kad: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn encrypt_on_write_requires_encrypt_mode_and_full_key() {
+        assert!(
+            state(EncryptionMode::Encrypt, DecryptionMode::Disable, KEY_LEN).encrypt_on_write()
+        );
+        // Mode disabled -> false even with a full key.
+        assert!(
+            !state(EncryptionMode::Disable, DecryptionMode::Disable, KEY_LEN).encrypt_on_write()
+        );
+        // Wrong key length -> false even with mode = Encrypt.
+        assert!(!state(EncryptionMode::Encrypt, DecryptionMode::Disable, 16).encrypt_on_write());
+    }
+
+    #[test]
+    fn decrypt_on_read_covers_decrypt_and_mixed() {
+        assert!(state(EncryptionMode::Disable, DecryptionMode::Decrypt, KEY_LEN).decrypt_on_read());
+        assert!(state(EncryptionMode::Disable, DecryptionMode::Mixed, KEY_LEN).decrypt_on_read());
+        assert!(!state(EncryptionMode::Disable, DecryptionMode::Raw, KEY_LEN).decrypt_on_read());
+        assert!(
+            !state(EncryptionMode::Disable, DecryptionMode::Disable, KEY_LEN).decrypt_on_read()
+        );
+        // Short key disables decrypt-on-read even with Decrypt mode.
+        assert!(!state(EncryptionMode::Encrypt, DecryptionMode::Decrypt, 8).decrypt_on_read());
+    }
+
+    #[test]
+    fn drive_encryption_state_debug_does_not_leak_the_key() {
+        let s = state(EncryptionMode::Encrypt, DecryptionMode::Decrypt, KEY_LEN);
+        let rendered = format!("{s:?}");
+        // The Debug impl prints key_len but not the bytes themselves.
+        assert!(rendered.contains("key_len"));
+        assert!(rendered.contains("32"));
+        assert!(!rendered.contains("42")); // key bytes are 0x42 — must not appear
+    }
 }

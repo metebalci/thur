@@ -272,3 +272,80 @@ impl From<shared_upload_worker::UploadInertError> for SmcError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_error_routes_to_the_matching_smc_variant() {
+        let cases: Vec<(shared_cloud::CloudError, SmcError)> = vec![
+            (
+                shared_cloud::CloudError::Other("x".into()),
+                SmcError::CloudError("x".into()),
+            ),
+            (
+                shared_cloud::CloudError::PreconditionFailed("p".into()),
+                SmcError::CloudPreconditionFailed("p".into()),
+            ),
+            (
+                shared_cloud::CloudError::Conflict("c".into()),
+                SmcError::CloudConflict("c".into()),
+            ),
+            (
+                shared_cloud::CloudError::NotSupported("n".into()),
+                SmcError::NotSupported("n".into()),
+            ),
+            (
+                shared_cloud::CloudError::Compression("z".into()),
+                SmcError::CompressionError("z".into()),
+            ),
+        ];
+        for (input, expected) in cases {
+            let got: SmcError = input.into();
+            assert_eq!(got.to_string(), expected.to_string());
+        }
+
+        let io = shared_cloud::CloudError::Io(std::io::Error::other("boom"));
+        assert!(matches!(SmcError::from(io), SmcError::Io(_)));
+    }
+
+    #[test]
+    fn chunk_pool_error_io_maps_to_io_variant() {
+        let e = shared_pool::ChunkPoolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing",
+        ));
+        assert!(matches!(SmcError::from(e), SmcError::Io(_)));
+    }
+
+    #[test]
+    fn chunk_pool_error_hash_mismatch_maps_to_content_hash_mismatch() {
+        let e = shared_pool::ChunkPoolError::HashMismatch {
+            expected: "abc".into(),
+            actual: "def".into(),
+        };
+        let got: SmcError = e.into();
+        match got {
+            SmcError::ContentHashMismatch { expected, actual } => {
+                assert_eq!(expected, "abc");
+                assert_eq!(actual, "def");
+            }
+            other => unreachable!("expected ContentHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_inert_error_routes_cloud_and_io_arms() {
+        let cloud = shared_upload_worker::UploadInertError::Cloud(shared_cloud::CloudError::Other(
+            "svc".into(),
+        ));
+        assert!(matches!(SmcError::from(cloud), SmcError::CloudError(_)));
+
+        let io = shared_upload_worker::UploadInertError::Io {
+            path: "/tmp/chunk.dat".into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert!(matches!(SmcError::from(io), SmcError::Io(_)));
+    }
+}
