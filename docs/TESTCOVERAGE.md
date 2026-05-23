@@ -135,6 +135,27 @@ request paths are exercised by the end-to-end shell suites, which
 `cargo llvm-cov` does not instrument — the unit-test floor covers only
 their pure logic (config parsing, registries, job-argument handling).
 
+### Structural sub-floor exceptions
+
+Two crates sit under their floor for reasons the unit-test layer can't
+fix; both are exercised by the end-to-end suites.
+
+- **`shared/cloud-bench` (36% < 50%)** — the bench engine
+  (`bench_cell` / `parallel_delete` / the print helpers) is a
+  throughput probe whose minimum useful transfer is **1 GiB per
+  cell**, allocated in memory and pushed through a real `CloudBackend`.
+  Validation, options, config loading, PRNG, error variants are unit-
+  tested; the bench loop is reached via the `system cloud benchmark`
+  integration path.
+- **`shared/cloud` (77% < 80%)** — `gcs.rs` (307 lines) is bound to
+  the `google-cloud-storage` SDK, which has no endpoint override that
+  the in-crate `wiremock` rig can drive (s3.rs and azure.rs both use
+  reqwest-based clients that accept a custom endpoint URL). The GCS
+  backend is exercised by `vsa/scripts/test-iscsi-fs-cloud.sh` against
+  a real GCS bucket; the rest of `shared/cloud` (s3 / azure / local /
+  caching / config / compression / dedup / helpers / cloud_backend /
+  error) is at 80%+ per-file.
+
 ## Known gaps
 
 Not every low number is an instrumentation artifact. These crates have
