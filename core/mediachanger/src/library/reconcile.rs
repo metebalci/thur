@@ -197,10 +197,7 @@ pub fn open_or_materialize<P: AsRef<Path>>(
     // Peek at the schema version before committing to a full deserialize.
     let raw = fs::read_to_string(&lib_path)?;
     let probe: serde_json::Value = serde_json::from_str(&raw)?;
-    let version = probe
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
+    let version = probe.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     if version != SCHEMA_VERSION as u64 {
         return Err(SmcError::LibraryConfig(format!(
             "library.json is v{} format; this release requires v{}. Remove {} and re-start the daemon to re-materialize from the YAML library: block.",
@@ -385,9 +382,7 @@ pub fn diff_against_declared(
             // origin slot (occupancy at the time of materialize check,
             // pre-evacuation; home slots are unique across loaded
             // drives so the order of evacuation doesn't matter).
-            let effective_slots = plan
-                .storage_target
-                .unwrap_or(cur.num_storage_slots);
+            let effective_slots = plan.storage_target.unwrap_or(cur.num_storage_slots);
             for drive in library.drives() {
                 if drive.id < declared.num_drives {
                     continue;
@@ -395,10 +390,7 @@ pub fn diff_against_declared(
                 if !drive.occupied {
                     continue;
                 }
-                let barcode = drive
-                    .barcode
-                    .clone()
-                    .unwrap_or_else(|| "<unknown>".into());
+                let barcode = drive.barcode.clone().unwrap_or_else(|| "<unknown>".into());
                 let home = drive.home_slot.map(u32::from).unwrap_or(u32::MAX);
                 if home >= effective_slots {
                     blockers.push(format!(
@@ -411,10 +403,7 @@ pub fn diff_against_declared(
                     ));
                     continue;
                 }
-                let dest = library
-                    .storage_slots()
-                    .iter()
-                    .find(|s| s.id == home);
+                let dest = library.storage_slots().iter().find(|s| s.id == home);
                 let dest_occupied = dest.map(|s| s.occupied).unwrap_or(false);
                 if dest_occupied {
                     let other = dest
@@ -519,7 +508,9 @@ pub fn compute_bounds(library: &Library) -> BoundsReport {
         }
     }
     for drive in library.drives() {
-        if drive.occupied && let Some(home) = drive.home_slot {
+        if drive.occupied
+            && let Some(home) = drive.home_slot
+        {
             let home = u32::from(home);
             let take = match &min_slots_pin {
                 None => true,
@@ -560,10 +551,7 @@ pub fn compute_bounds(library: &Library) -> BoundsReport {
             continue;
         }
         let home = drive.home_slot.map(u32::from).unwrap_or(u32::MAX);
-        let barcode = drive
-            .barcode
-            .clone()
-            .unwrap_or_else(|| "<unknown>".into());
+        let barcode = drive.barcode.clone().unwrap_or_else(|| "<unknown>".into());
         if home >= cur.num_storage_slots {
             min_drives_reason = Some(format!(
                 "drive {} holds {} whose origin slot {} would be out of range",
@@ -835,10 +823,7 @@ impl Library {
             .iter_mut()
             .find(|s| s.id == origin_slot)
             .ok_or_else(|| {
-                SmcError::LibraryConfig(format!(
-                    "evacuate: origin slot {} not found",
-                    origin_slot,
-                ))
+                SmcError::LibraryConfig(format!("evacuate: origin slot {} not found", origin_slot,))
             })?;
         slot.occupied = true;
         slot.barcode = Some(barcode.to_string());
@@ -884,8 +869,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (lib, events) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
+        let (lib, events) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
         assert_eq!(events, vec![ReconcileEvent::Materialized]);
         assert_eq!(lib.storage_slots().len(), 8);
         assert_eq!(lib.drives().len(), 2);
@@ -930,7 +914,11 @@ mod tests {
         let result = open_or_materialize(&lib_root, &tapes_dir, &declared(4, 1, 8));
         let err = result.err().expect("v1 should refuse");
         let msg = format!("{}", err);
-        assert!(msg.contains("v1 format"), "expected v1 refuse message, got: {}", msg);
+        assert!(
+            msg.contains("v1 format"),
+            "expected v1 refuse message, got: {}",
+            msg
+        );
         assert!(msg.contains("requires v2"));
     }
 
@@ -940,8 +928,7 @@ mod tests {
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
         let _ = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
-        let (_, events) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
+        let (_, events) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
         assert_eq!(events, vec![ReconcileEvent::Reconciled]);
     }
 
@@ -962,8 +949,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
         // Occupy slot 6 (in the tail we're about to shrink off).
         {
             let slot = lib
@@ -987,17 +973,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
         // Drive 2 holds a cartridge from slot 3, but slot 3 is now occupied
         // by some other cartridge.
         {
-            let drive = lib
-                .inventory
-                .drives
-                .iter_mut()
-                .find(|d| d.id == 2)
-                .unwrap();
+            let drive = lib.inventory.drives.iter_mut().find(|d| d.id == 2).unwrap();
             drive.occupied = true;
             drive.barcode = Some("LOADED1L8".into());
             drive.home_slot = Some(3);
@@ -1025,15 +1005,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
         {
-            let drive = lib
-                .inventory
-                .drives
-                .iter_mut()
-                .find(|d| d.id == 2)
-                .unwrap();
+            let drive = lib.inventory.drives.iter_mut().find(|d| d.id == 2).unwrap();
             drive.occupied = true;
             drive.barcode = Some("LOADED2L8".into());
             drive.home_slot = Some(4);
@@ -1052,15 +1026,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
         {
-            let drive = lib
-                .inventory
-                .drives
-                .iter_mut()
-                .find(|d| d.id == 2)
-                .unwrap();
+            let drive = lib.inventory.drives.iter_mut().find(|d| d.id == 2).unwrap();
             drive.occupied = true;
             drive.barcode = Some("LOADED3L8".into());
             drive.home_slot = Some(5);
@@ -1080,8 +1048,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
         {
             let slot = lib
                 .inventory
@@ -1136,16 +1103,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib_root = dir.path().join("library");
         let tapes_dir = dir.path().join("tapes");
-        let (mut lib, _) =
-            open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
         // Drive 2 loaded from slot 5, but slot 5 occupied by something else.
         {
-            let drive = lib
-                .inventory
-                .drives
-                .iter_mut()
-                .find(|d| d.id == 2)
-                .unwrap();
+            let drive = lib.inventory.drives.iter_mut().find(|d| d.id == 2).unwrap();
             drive.occupied = true;
             drive.barcode = Some("STUCKL8".into());
             drive.home_slot = Some(5);

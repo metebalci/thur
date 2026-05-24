@@ -1564,5 +1564,4 @@ mod tests {
         // (LUN = drive_id + 1, so drive 0 → "THUR-MFG-001").
         assert_eq!(library.drive_mfg_serial(0).as_deref(), Some("THUR-MFG-001"));
     }
-
 }

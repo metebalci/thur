@@ -159,10 +159,7 @@ pub struct PoolSnapshot {
 
 impl LiveStats {
     fn cloud_for(&self, backend: &str) -> Arc<CloudCounters> {
-        let mut map = self
-            .cloud
-            .lock()
-            .expect("LiveStats cloud mutex poisoned");
+        let mut map = self.cloud.lock().expect("LiveStats cloud mutex poisoned");
         Arc::clone(map.entry(backend.to_string()).or_default())
     }
 

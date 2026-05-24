@@ -148,11 +148,7 @@ pub struct AuditEntry {
 
 /// Tick loop. Runs until the subscriber drops the stream — the
 /// `JobRegistry` reaper handles cancellation; we never emit `Done`.
-pub async fn run_monitor<S: MonitorState>(
-    emitter: JobEmitter,
-    _body: serde_json::Value,
-    state: S,
-) {
+pub async fn run_monitor<S: MonitorState>(emitter: JobEmitter, _body: serde_json::Value, state: S) {
     loop {
         let payload = build_payload(&state);
         let json = match serde_json::to_string(&payload) {
@@ -220,7 +216,11 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
     }
     // Sort by (backend, namespace). `None` (global) ahead of any
     // `Some(_)` so the backend's global row prints first.
-    pool.sort_by(|a, b| a.backend.cmp(&b.backend).then_with(|| a.namespace.cmp(&b.namespace)));
+    pool.sort_by(|a, b| {
+        a.backend
+            .cmp(&b.backend)
+            .then_with(|| a.namespace.cmp(&b.namespace))
+    });
 
     let mut cloud: Vec<CloudEntry> = snap
         .cloud

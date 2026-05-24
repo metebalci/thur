@@ -174,10 +174,7 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
 /// Returns `None` if the ring buffer doesn't yet cover the window —
 /// the caller falls back to a cumulative-since-boot reading and the
 /// header annotates "(N/Ms of history)".
-fn baseline_at_least(
-    history: &VecDeque<MonitorSnapshot>,
-    secs: usize,
-) -> Option<&MonitorSnapshot> {
+fn baseline_at_least(history: &VecDeque<MonitorSnapshot>, secs: usize) -> Option<&MonitorSnapshot> {
     let latest_ts = history.back()?.ts_unix;
     history
         .iter()
@@ -360,10 +357,7 @@ mod tests {
     /// caught up.
     #[test]
     fn render_pool_row_falls_back_to_namespace_when_label_missing() {
-        let row = render_pool_row(
-            &pool_entry("primary", Some("uuid-orphan"), None, 50),
-            true,
-        );
+        let row = render_pool_row(&pool_entry("primary", Some("uuid-orphan"), None, 50), true);
         assert!(row.contains("primary/uuid-orphan"));
     }
 }

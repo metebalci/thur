@@ -89,5 +89,4 @@ impl Library {
         Self::write_locked(&lib_path, &serde_json::to_string_pretty(&self.topology)?)?;
         Ok(())
     }
-
 }

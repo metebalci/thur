@@ -727,6 +727,10 @@ mod tests {
         assert_eq!(b.current_bytes(), 600);
         let snap = b.per_namespace_used();
         assert_eq!(snap.len(), 3);
-        assert!(!snap.iter().any(|(ns, _)| ns.as_deref() == Some("stale-vol")));
+        assert!(
+            !snap
+                .iter()
+                .any(|(ns, _)| ns.as_deref() == Some("stale-vol"))
+        );
     }
 }

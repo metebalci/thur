@@ -880,7 +880,9 @@ fn write_filemarks_16_zero_count_succeeds() {
     let mut p = pdu();
     let mut ctx = fx.ctx(&mut p, cdb(0x80));
     assert_eq!(
-        handlers::handle_write_filemarks_16(&mut ctx).unwrap().status,
+        handlers::handle_write_filemarks_16(&mut ctx)
+            .unwrap()
+            .status,
         ScsiStatus::Good,
     );
 }
@@ -894,7 +896,9 @@ fn write_filemarks_16_one_count_succeeds() {
     let mut p = pdu();
     let mut ctx = fx.ctx(&mut p, c);
     assert_eq!(
-        handlers::handle_write_filemarks_16(&mut ctx).unwrap().status,
+        handlers::handle_write_filemarks_16(&mut ctx)
+            .unwrap()
+            .status,
         ScsiStatus::Good,
     );
 }
@@ -906,7 +910,9 @@ fn write_filemarks_16_on_changer_lun_is_a_noop() {
     let mut p = pdu();
     let mut ctx = fx.ctx_at(&mut p, cdb(0x80), 0, 0, true);
     assert_eq!(
-        handlers::handle_write_filemarks_16(&mut ctx).unwrap().status,
+        handlers::handle_write_filemarks_16(&mut ctx)
+            .unwrap()
+            .status,
         ScsiStatus::Good,
     );
 }
