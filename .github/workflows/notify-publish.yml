@@ -1,0 +1,52 @@
+name: notify thur.metebalci.com on release
+
+# Bridge workflow — on every release.published event in this repo, fire a
+# repository_dispatch at metebalci/thur.metebalci.com so its publish.yml
+# can regenerate the apt/yum tree against the new artifacts.
+#
+# Channel routing is driven entirely by the tag string:
+#   vN.M.P with N >= 1 and no pre-release suffix  -> stable channel (GA)
+#   everything else (0.x, -alpha/-beta/-rc, ...)  -> unstable channel
+#
+# The GitHub Release "prerelease" flag is a UI hint and depends on
+# ghrelease.sh remembering to set --prerelease; the tag is the truth.
+#
+# Manual override path: workflow_dispatch in thur.metebalci.com lets a
+# maintainer publish any tag into any channel, bypassing this bridge.
+#
+# Requires secret PUBLISH_DISPATCH_TOKEN — a fine-grained PAT scoped to
+# metebalci/thur.metebalci.com only, with Contents: read & write.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine channel from tag
+        id: route
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$TAG" =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ]; then
+            CHANNEL=stable
+          else
+            CHANNEL=unstable
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Routing $TAG -> $CHANNEL"
+
+      - name: Dispatch to thur.metebalci.com
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISH_DISPATCH_TOKEN }}
+        run: |
+          gh api -X POST repos/metebalci/thur.metebalci.com/dispatches \
+            -f event_type=thur-artifacts-available \
+            -f "client_payload[channel]=${{ steps.route.outputs.channel }}" \
+            -f "client_payload[tag]=${{ steps.route.outputs.tag }}"
