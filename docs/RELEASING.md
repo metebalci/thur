@@ -256,8 +256,9 @@ THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
 # 6. Tag, push, and publish to GitHub Releases. ghrelease.sh creates
 #    the signed tag v0.2.0 on HEAD, pushes branch + tag to origin, and
 #    uploads release-artifacts/* (.deb / .rpm + .asc) as the
-#    release assets. Release notes are the tag message — it opens
-#    $EDITOR, or pass -m "summary" / -F notes.md.
+#    release assets. Release notes default to the HEAD commit message
+#    (the "release: v0.2.0" bump from step 3); pass -m "summary" /
+#    -F notes.md to override or -e to compose in $EDITOR.
 release/ghrelease.sh
 ```
 

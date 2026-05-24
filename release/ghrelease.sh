@@ -35,10 +35,16 @@ ghrelease.sh — tag the release commit and publish it to GitHub Releases.
 Run after release/release.sh and after smoke-testing the artifacts.
 
 Usage:
-  release/ghrelease.sh                 tag message via $EDITOR
+  release/ghrelease.sh                 tag message = HEAD commit message
   release/ghrelease.sh -m "summary"    tag message inline
   release/ghrelease.sh -F notes.md     tag message from a file
+  release/ghrelease.sh -e              open $EDITOR for the tag message
   release/ghrelease.sh -y              skip the confirmation prompt
+
+Default tag message is the HEAD commit message — the release-cut flow
+(see docs/RELEASING.md) commits "release: vX.Y.Z" right before this
+script runs, so HEAD already IS the release commit. Pass -m / -F to
+override, or -e to compose interactively.
 
 The tag is v<version> (from the root Cargo.toml); the GitHub Release
 body is the tag message; a -alpha/-beta/-rc version is a pre-release.
@@ -48,6 +54,7 @@ EOF
 # ---- flags ----
 TAG_MSG=""
 TAG_MSG_FILE=""
+EDIT_MSG=0
 ASSUME_YES=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,13 +62,18 @@ while [ $# -gt 0 ]; do
                          TAG_MSG="$2"; shift 2 ;;
         -F|--notes-file) [ $# -ge 2 ] || { echo "error: -F needs a value" >&2; exit 1; }
                          TAG_MSG_FILE="$2"; shift 2 ;;
+        -e|--edit)       EDIT_MSG=1; shift ;;
         -y|--yes)        ASSUME_YES=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
-if [ -n "$TAG_MSG" ] && [ -n "$TAG_MSG_FILE" ]; then
-    echo "error: pass only one of -m / -F." >&2
+SOURCES=0
+[ -n "$TAG_MSG" ] && SOURCES=$((SOURCES + 1))
+[ -n "$TAG_MSG_FILE" ] && SOURCES=$((SOURCES + 1))
+[ "$EDIT_MSG" -eq 1 ] && SOURCES=$((SOURCES + 1))
+if [ "$SOURCES" -gt 1 ]; then
+    echo "error: pass at most one of -m / -F / -e." >&2
     exit 1
 fi
 if [ -n "$TAG_MSG_FILE" ] && [ ! -f "$TAG_MSG_FILE" ]; then
@@ -196,8 +208,14 @@ elif [ -n "$TAG_MSG" ]; then
     git tag -s "$TAG" -m "$TAG_MSG"
 elif [ -n "$TAG_MSG_FILE" ]; then
     git tag -s "$TAG" -F "$TAG_MSG_FILE"
-else
+elif [ "$EDIT_MSG" -eq 1 ]; then
     git tag -s "$TAG"            # opens $EDITOR for the release notes
+else
+    # Default: HEAD commit message. The release-cut flow makes the
+    # bump commit ("release: vX.Y.Z") right before this script runs,
+    # so HEAD IS the release commit — no need to retype anything.
+    echo "==> tag message: HEAD commit message ($(git log -1 --format=%s))"
+    git log -1 --format=%B | git tag -s "$TAG" -F -
 fi
 
 # ---- summary + confirmation ----
