@@ -512,19 +512,9 @@ root (CLAUDE.md must, for auto-loading).
   [`docs/CLI.md`](docs/CLI.md).
 - Release:
   [`docs/RELEASING.md`](docs/RELEASING.md).
-- Roadmap:
-  [`ROADMAP.md`](ROADMAP.md) — single roadmap file, split by a
-  `# Not committed` divider. Above it: committed work as **FIXES /
-  FEATURES / BLOCKERS** (in that order; `/next` surfaces them in the
-  same order, and stops at the divider). FIXES = bugs / cleanups,
-  FEATURES = on-deck new work, BLOCKERS = must-land-before-tagging-
-  beta/rc/ga (each tagged with the milestone it blocks); delete
-  entries on ship — don't move to a "Shipped" section. Below the
-  divider: a flat **Ideas** list plus **Parked — awaiting concrete
-  request** and **Considered, declined** sections. Ideas graduate by
-  moving up across the divider into FEATURES; a committed entry that
-  loses its case drops back down to Parked; explicit rejections go to
-  Declined with the assumption that would re-open them.
+- Roadmap: tracked as GitHub issues. Labels: `vtl` / `vsa` for
+  scope (cross-product items carry both); `bug` / `enhancement` /
+  `idea` / `doc` for kind. Release-blocking items use `bug`.
   [`docs/LTO-9.md`](docs/LTO-9.md) — what LTO-9 support would
   need, why a VTL cares less about LTO-9 than physical hardware
   would, and the reasoning for deferring past 1.0.0 GA.

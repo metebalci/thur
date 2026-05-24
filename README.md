@@ -378,8 +378,8 @@ the workspace crate map is in [`docs/WORKSPACE.md`](docs/WORKSPACE.md).
 # Documentation
 
 - [`CLAUDE.md`](CLAUDE.md) — architecture orientation and repo map.
-- [`ROADMAP.md`](ROADMAP.md) — committed work plus forward-looking
-  ideas.
+- Roadmap and open work — tracked as
+  [GitHub issues](https://github.com/metebalci/thur/issues).
 - [`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md) — per-crate line
   coverage and the end-to-end suite catalogue.
 
