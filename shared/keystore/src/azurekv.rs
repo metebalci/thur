@@ -9,6 +9,10 @@
 //! decrypts on `volume open` to produce the plaintext the daemon
 //! hands to `VolumeWriter::open_with_key`.
 //!
+//! All SDK-touching code lives in [`crate::azurekv_api`]; this module
+//! composes the backend on top of the [`AzureKvApi`] seam — envelope
+//! shape, context binding, fingerprint, [`KeyStoreBackend`] wiring.
+//!
 //! **Encryption-context binding.** Azure KV's `wrapKey`/`unwrapKey`
 //! on RSA keys does NOT accept service-side additional authenticated
 //! data (only the symmetric `encrypt`/`decrypt` ops on AES keys do).
@@ -35,29 +39,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use azure_core::credentials::{Secret, TokenCredential};
-use azure_core::error::ErrorKind;
-use azure_core::http::RequestContent;
-use azure_identity::ClientSecretCredential;
-use azure_security_keyvault_keys::clients::KeyClient;
-use azure_security_keyvault_keys::models::{
-    EncryptionAlgorithm, KeyClientGetKeyOptions, KeyClientUnwrapKeyOptions,
-    KeyClientWrapKeyOptions, KeyOperationParameters,
-};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::azurekv_api::{AzureKvApi, RealAzureKvApi};
 use crate::error::KeyStoreError;
 use crate::keystore_backend::{DEK_LEN, DekSource, KeyStoreBackend, SecretBytes};
 use crate::keystore_config::ResolvedAzureKvAuth;
-
-/// Wrapping algorithm we use against an RSA key. RSA-OAEP-256 is the
-/// modern Microsoft-recommended option; older `RSA-OAEP` (SHA-1) is
-/// still accepted by KV but flagged by Microsoft's own security
-/// guidance. RSA-1.5 is refused.
-const RSA_OAEP_256: EncryptionAlgorithm = EncryptionAlgorithm::RsaOaep256;
 
 /// Envelope version. Bump if the envelope shape changes; current
 /// readers refuse anything they don't recognize so a future writer
@@ -76,7 +66,7 @@ struct WrappedEnvelope {
 /// (KV-ciphertext) blob.
 #[derive(Clone)]
 pub struct AzureKvBackend {
-    client: Arc<KeyClient>,
+    api: Arc<dyn AzureKvApi>,
     vault_uri: String,
     key_name: String,
     /// Empty string = "latest" — KV's wrap/unwrap APIs accept the
@@ -87,8 +77,6 @@ pub struct AzureKvBackend {
 
 impl std::fmt::Debug for AzureKvBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // KeyClient doesn't impl Debug; surface the operator-meaningful
-        // fields manually.
         f.debug_struct("AzureKvBackend")
             .field("vault_uri", &self.vault_uri)
             .field("key_name", &self.key_name)
@@ -119,112 +107,30 @@ impl AzureKvBackend {
             "Initializing Azure KV backend: vault_uri={}, key_name={}, key_version={:?}",
             vault_uri, key_name, key_version
         );
-
-        let credential: Arc<dyn TokenCredential> = match auth {
-            ResolvedAzureKvAuth::ServicePrincipal {
-                tenant_id,
-                client_id,
-                client_secret,
-            } => ClientSecretCredential::new(
-                &tenant_id,
-                client_id,
-                Secret::from(client_secret),
-                None,
-            )
-            .map_err(|e| {
-                KeyStoreError::Auth(format!("azurekv: ClientSecretCredential build failed: {e}"))
-            })?,
-        };
-
-        let client = KeyClient::new(&vault_uri, credential, None)
-            .map_err(|e| KeyStoreError::Other(format!("azurekv: KeyClient::new failed: {e}")))?;
-
+        let api = RealAzureKvApi::from_auth(&vault_uri, auth)?;
         Ok(Self {
-            client: Arc::new(client),
+            api: Arc::new(api),
             vault_uri,
             key_name,
             key_version: key_version.unwrap_or_default(),
         })
     }
 
-    /// Build the wrap-side options carrying the pinned version (if
-    /// any). KV reads the version from `KeyClientWrapKeyOptions`; the
-    /// empty default value picks "latest" by virtue of `key_version:
-    /// None`.
-    fn wrap_options(&self) -> Option<KeyClientWrapKeyOptions<'_>> {
-        if self.key_version.is_empty() {
-            None
-        } else {
-            Some(KeyClientWrapKeyOptions {
-                key_version: Some(self.key_version.clone()),
-                ..Default::default()
-            })
+    /// Compose an `AzureKvBackend` from an already-built `AzureKvApi`.
+    /// Test constructor for the mock-injected coverage.
+    #[cfg(test)]
+    pub(crate) fn with_api(
+        api: Arc<dyn AzureKvApi>,
+        vault_uri: String,
+        key_name: String,
+        key_version: Option<String>,
+    ) -> Self {
+        Self {
+            api,
+            vault_uri,
+            key_name,
+            key_version: key_version.unwrap_or_default(),
         }
-    }
-
-    fn get_options(&self) -> Option<KeyClientGetKeyOptions<'_>> {
-        if self.key_version.is_empty() {
-            None
-        } else {
-            Some(KeyClientGetKeyOptions {
-                key_version: Some(self.key_version.clone()),
-                ..Default::default()
-            })
-        }
-    }
-
-    /// Wrap one buffer via Azure KV `wrapKey`. Returns the raw
-    /// KV-side ciphertext; envelope wrapping is handled in
-    /// [`KeyStoreBackend::wrap`] below so this stays a thin API
-    /// adapter.
-    async fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
-        let params = KeyOperationParameters {
-            algorithm: Some(RSA_OAEP_256),
-            value: Some(plaintext.to_vec()),
-            ..Default::default()
-        };
-        let body: RequestContent<KeyOperationParameters> = params
-            .try_into()
-            .map_err(|e| KeyStoreError::Other(format!("azurekv.wrapKey body encode: {e}")))?;
-        let response = self
-            .client
-            .wrap_key(&self.key_name, body, self.wrap_options())
-            .await
-            .map_err(|e| classify_azure_kv_err("azurekv.wrapKey", e))?;
-        let result = response
-            .into_model()
-            .map_err(|e| classify_azure_kv_err("azurekv.wrapKey parse", e))?;
-        result.result.ok_or_else(|| {
-            KeyStoreError::Other("azurekv.wrapKey returned no `result` field".into())
-        })
-    }
-
-    /// Unwrap one buffer via Azure KV `unwrapKey`.
-    async fn decrypt(&self, wrapped: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
-        let params = KeyOperationParameters {
-            algorithm: Some(RSA_OAEP_256),
-            value: Some(wrapped.to_vec()),
-            ..Default::default()
-        };
-        let body: RequestContent<KeyOperationParameters> = params
-            .try_into()
-            .map_err(|e| KeyStoreError::Other(format!("azurekv.unwrapKey body encode: {e}")))?;
-        let response = self
-            .client
-            .unwrap_key(
-                &self.key_name,
-                &self.key_version,
-                body,
-                None::<KeyClientUnwrapKeyOptions<'_>>,
-            )
-            .await
-            .map_err(|e| classify_azure_kv_err("azurekv.unwrapKey", e))?;
-        let result = response
-            .into_model()
-            .map_err(|e| classify_azure_kv_err("azurekv.unwrapKey parse", e))?;
-        result.result.ok_or_else(|| {
-            KeyStoreError::Other("azurekv.unwrapKey returned no `result` field".into())
-        })
     }
 
     /// Build the JSON envelope that binds the wrapped ciphertext to
@@ -315,7 +221,14 @@ impl KeyStoreBackend for AzureKvBackend {
         wrap_context: &[u8; 16],
         plaintext: &SecretBytes,
     ) -> Result<Vec<u8>, KeyStoreError> {
-        let ct = self.encrypt(plaintext.as_bytes()).await?;
+        let ct = self
+            .api
+            .wrap_key(
+                &self.key_name,
+                &self.key_version,
+                plaintext.as_bytes().to_vec(),
+            )
+            .await?;
         Ok(Self::build_envelope(wrap_context, &ct))
     }
 
@@ -325,7 +238,10 @@ impl KeyStoreBackend for AzureKvBackend {
         wrapped: &[u8],
     ) -> Result<SecretBytes, KeyStoreError> {
         let ct = Self::parse_envelope(wrap_context, wrapped)?;
-        let plain = self.decrypt(&ct).await?;
+        let plain = self
+            .api
+            .unwrap_key(&self.key_name, &self.key_version, ct)
+            .await?;
         if plain.len() != DEK_LEN {
             return Err(KeyStoreError::Other(format!(
                 "azurekv.unwrapKey returned {} bytes, expected {}",
@@ -355,11 +271,7 @@ impl KeyStoreBackend for AzureKvBackend {
     }
 
     async fn health_check(&self) -> Result<(), KeyStoreError> {
-        self.client
-            .get_key(&self.key_name, self.get_options())
-            .await
-            .map_err(|e| classify_azure_kv_err("azurekv.getKey", e))?;
-        Ok(())
+        self.api.get_key(&self.key_name, &self.key_version).await
     }
 
     fn clone_box(&self) -> Box<dyn KeyStoreBackend> {
@@ -367,33 +279,12 @@ impl KeyStoreBackend for AzureKvBackend {
     }
 }
 
-/// Classify an azure_core error into the keystore error taxonomy.
-/// `HttpResponse { status, .. }` maps via the same 401/403/404/408/5xx
-/// table the Vault backend uses; `Credential` → `Auth`; `Io` →
-/// `Network`. Everything else goes to `Other`.
-fn classify_azure_kv_err(op: &str, err: azure_core::Error) -> KeyStoreError {
-    let label = format!("{op}: {err}");
-    match err.kind() {
-        ErrorKind::HttpResponse { status, .. } => {
-            let code: u16 = (*status).into();
-            match code {
-                401 => KeyStoreError::Auth(label),
-                403 => KeyStoreError::Authz(label),
-                404 => KeyStoreError::NotFound(label),
-                408 => KeyStoreError::Timeout(label),
-                _ => KeyStoreError::Other(label),
-            }
-        }
-        ErrorKind::Credential => KeyStoreError::Auth(label),
-        ErrorKind::Io => KeyStoreError::Network(label),
-        _ => KeyStoreError::Other(label),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::KeyStoreFailureKind;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn fixture_uuid() -> [u8; 16] {
         [0xABu8; 16]
@@ -448,6 +339,24 @@ mod tests {
     }
 
     #[test]
+    fn envelope_refuses_garbage() {
+        let err = AzureKvBackend::parse_envelope(&fixture_uuid(), b"not-json").expect_err("");
+        assert!(matches!(err, KeyStoreError::Other(_)));
+    }
+
+    #[test]
+    fn envelope_refuses_invalid_base64() {
+        let bad = serde_json::to_vec(&WrappedEnvelope {
+            v: ENVELOPE_VERSION,
+            uuid: hex::encode(fixture_uuid()),
+            ct: "!!!not base64!!!".into(),
+        })
+        .expect("encode");
+        let err = AzureKvBackend::parse_envelope(&fixture_uuid(), &bad).expect_err("must reject");
+        assert!(matches!(err, KeyStoreError::Other(_)));
+    }
+
+    #[test]
     fn fingerprint_latest_marker_when_version_empty() {
         let fp = AzureKvBackend::fingerprint_str(
             "https://kv.example.vault.azure.net",
@@ -481,17 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_refuses_garbage() {
-        let err = AzureKvBackend::parse_envelope(&fixture_uuid(), b"not-json").expect_err("");
-        assert!(matches!(err, KeyStoreError::Other(_)));
-    }
-
-    #[test]
     fn classify_failure_kinds_route_correctly() {
-        // Synthesized KeyStoreError values → expected
-        // KeyStoreFailureKind. The real service-error path is
-        // exercised against a real tenant by the env-gated row in the
-        // integration script.
         let auth = KeyStoreError::Auth("test".into());
         assert_eq!(auth.kind(), KeyStoreFailureKind::Auth);
         assert!(!auth.is_retryable());
@@ -507,5 +406,264 @@ mod tests {
         let net = KeyStoreError::Network("test".into());
         assert_eq!(net.kind(), KeyStoreFailureKind::Network);
         assert!(net.is_retryable());
+    }
+
+    // ---- Mock-injected backend tests ---------------------------------
+
+    #[derive(Default, Debug)]
+    struct MockAzureKvApi {
+        wrap_outcomes: Mutex<Vec<Result<Vec<u8>, KeyStoreError>>>,
+        unwrap_outcomes: Mutex<Vec<Result<Vec<u8>, KeyStoreError>>>,
+        get_outcomes: Mutex<Vec<Result<(), KeyStoreError>>>,
+
+        wrap_calls: AtomicU32,
+        unwrap_calls: AtomicU32,
+        get_calls: AtomicU32,
+
+        captured_wrap: Mutex<Vec<(String, String, Vec<u8>)>>,
+        captured_unwrap: Mutex<Vec<(String, String, Vec<u8>)>>,
+    }
+
+    impl MockAzureKvApi {
+        fn pop_or<T>(
+            q: &Mutex<Vec<Result<T, KeyStoreError>>>,
+            default: impl FnOnce() -> Result<T, KeyStoreError>,
+        ) -> Result<T, KeyStoreError> {
+            let mut g = match q.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.is_empty() { default() } else { g.remove(0) }
+        }
+    }
+
+    #[async_trait]
+    impl AzureKvApi for MockAzureKvApi {
+        async fn wrap_key(
+            &self,
+            key_name: &str,
+            key_version: &str,
+            plaintext: Vec<u8>,
+        ) -> Result<Vec<u8>, KeyStoreError> {
+            self.wrap_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_wrap.lock().expect("cap").push((
+                key_name.to_string(),
+                key_version.to_string(),
+                plaintext,
+            ));
+            Self::pop_or(&self.wrap_outcomes, || Ok(b"kv-ciphertext".to_vec()))
+        }
+        async fn unwrap_key(
+            &self,
+            key_name: &str,
+            key_version: &str,
+            ciphertext: Vec<u8>,
+        ) -> Result<Vec<u8>, KeyStoreError> {
+            self.unwrap_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_unwrap.lock().expect("cap").push((
+                key_name.to_string(),
+                key_version.to_string(),
+                ciphertext,
+            ));
+            Self::pop_or(&self.unwrap_outcomes, || Ok(vec![0u8; DEK_LEN]))
+        }
+        async fn get_key(&self, _key_name: &str, _key_version: &str) -> Result<(), KeyStoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.get_outcomes, || Ok(()))
+        }
+    }
+
+    const FIXTURE_VAULT: &str = "https://kv.example.vault.azure.net";
+    const FIXTURE_KEY: &str = "thurvsa-kek";
+
+    fn backend_latest(api: Arc<dyn AzureKvApi>) -> AzureKvBackend {
+        AzureKvBackend::with_api(
+            api,
+            FIXTURE_VAULT.to_string(),
+            FIXTURE_KEY.to_string(),
+            None,
+        )
+    }
+
+    fn backend_pinned(api: Arc<dyn AzureKvApi>, version: &str) -> AzureKvBackend {
+        AzureKvBackend::with_api(
+            api,
+            FIXTURE_VAULT.to_string(),
+            FIXTURE_KEY.to_string(),
+            Some(version.to_string()),
+        )
+    }
+
+    #[test]
+    fn backend_type_and_fingerprint_latest() {
+        let b = backend_latest(Arc::new(MockAzureKvApi::default()));
+        assert_eq!(b.backend_type(), "azurekv");
+        assert_eq!(
+            b.wrap_target_fingerprint(),
+            format!("azurekv:{FIXTURE_VAULT}/{FIXTURE_KEY}/<latest>")
+        );
+    }
+
+    #[test]
+    fn backend_fingerprint_pinned() {
+        let b = backend_pinned(Arc::new(MockAzureKvApi::default()), "v9");
+        assert_eq!(
+            b.wrap_target_fingerprint(),
+            format!("azurekv:{FIXTURE_VAULT}/{FIXTURE_KEY}/v9")
+        );
+    }
+
+    #[test]
+    fn debug_shows_latest_marker() {
+        let b = backend_latest(Arc::new(MockAzureKvApi::default()));
+        let s = format!("{:?}", b);
+        assert!(s.contains("<latest>"));
+        assert!(s.contains(FIXTURE_VAULT));
+    }
+
+    #[test]
+    fn debug_shows_pinned_version() {
+        let b = backend_pinned(Arc::new(MockAzureKvApi::default()), "v7");
+        let s = format!("{:?}", b);
+        assert!(s.contains("v7"));
+    }
+
+    #[test]
+    fn clone_box_yields_independent_handle() {
+        let b = backend_latest(Arc::new(MockAzureKvApi::default()));
+        let boxed: Box<dyn KeyStoreBackend> = Box::new(b);
+        let cloned = boxed.clone();
+        assert_eq!(cloned.backend_type(), "azurekv");
+    }
+
+    #[tokio::test]
+    async fn wrap_round_trips_envelope_through_mock() {
+        let api = Arc::new(MockAzureKvApi::default());
+        let b = backend_latest(api.clone());
+        let ctx = fixture_uuid();
+        let plain = SecretBytes::new([0x33u8; DEK_LEN]);
+        let envelope = b.wrap(&ctx, &plain).await.expect("wrap");
+        // Envelope decodes back to the canned KV ciphertext.
+        let inner = AzureKvBackend::parse_envelope(&ctx, &envelope).expect("parse");
+        assert_eq!(inner, b"kv-ciphertext");
+        let captured = api.captured_wrap.lock().expect("cap").clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, FIXTURE_KEY);
+        assert_eq!(captured[0].1, "");
+        assert_eq!(captured[0].2, vec![0x33u8; DEK_LEN]);
+    }
+
+    #[tokio::test]
+    async fn unwrap_round_trips_through_envelope_and_mock() {
+        // Seed the wrap path to produce a real envelope, then unwrap it.
+        let api = Arc::new(MockAzureKvApi::default());
+        {
+            let mut g = api.unwrap_outcomes.lock().expect("queue");
+            g.push(Ok(vec![0x55u8; DEK_LEN]));
+        }
+        let b = backend_latest(api.clone());
+        let ctx = fixture_uuid();
+        let envelope = AzureKvBackend::build_envelope(&ctx, b"opaque-kv-ciphertext");
+        let plain = b.unwrap(&ctx, &envelope).await.expect("unwrap");
+        assert_eq!(plain.as_bytes(), &[0x55u8; DEK_LEN][..]);
+        let captured = api.captured_unwrap.lock().expect("cap").clone();
+        assert_eq!(captured[0].0, FIXTURE_KEY);
+        assert_eq!(captured[0].2, b"opaque-kv-ciphertext");
+    }
+
+    #[tokio::test]
+    async fn unwrap_refuses_when_envelope_context_does_not_match() {
+        // No KV call must happen — the envelope's UUID mismatch should
+        // be caught locally.
+        let api = Arc::new(MockAzureKvApi::default());
+        let b = backend_latest(api.clone());
+        let envelope = AzureKvBackend::build_envelope(&[0x01u8; 16], b"ct");
+        let err = b
+            .unwrap(&[0x02u8; 16], &envelope)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, KeyStoreError::Authz(_)));
+        assert_eq!(api.unwrap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unwrap_rejects_wrong_length_plaintext() {
+        let api = Arc::new(MockAzureKvApi::default());
+        {
+            let mut g = api.unwrap_outcomes.lock().expect("queue");
+            g.push(Ok(vec![0u8; DEK_LEN - 1]));
+        }
+        let b = backend_latest(api);
+        let ctx = fixture_uuid();
+        let envelope = AzureKvBackend::build_envelope(&ctx, b"ct");
+        let err = b.unwrap(&ctx, &envelope).await.expect_err("must reject");
+        assert!(matches!(err, KeyStoreError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn wrap_surfaces_authz_failure() {
+        let api = Arc::new(MockAzureKvApi::default());
+        {
+            let mut g = api.wrap_outcomes.lock().expect("queue");
+            g.push(Err(KeyStoreError::Authz("denied".into())));
+        }
+        let b = backend_latest(api);
+        let err = b
+            .wrap(&fixture_uuid(), &SecretBytes::new([0u8; DEK_LEN]))
+            .await
+            .expect_err("must surface");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_returns_matching_envelope() {
+        let api = Arc::new(MockAzureKvApi::default());
+        let b = backend_latest(api.clone());
+        let ctx = fixture_uuid();
+        let (plain, wrapped) = b
+            .generate_and_wrap(&ctx, DekSource::Daemon)
+            .await
+            .expect("gen+wrap");
+        assert_eq!(plain.as_bytes().len(), DEK_LEN);
+        // Wrapped is a JSON envelope; can be parsed back with the same ctx.
+        let inner = AzureKvBackend::parse_envelope(&ctx, &wrapped).expect("parse");
+        assert_eq!(inner, b"kv-ciphertext");
+        assert_eq!(api.wrap_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_collapses_backend_source_to_daemon() {
+        let api = Arc::new(MockAzureKvApi::default());
+        let b = backend_latest(api);
+        let (_, _) = b
+            .generate_and_wrap(&fixture_uuid(), DekSource::Backend)
+            .await
+            .expect("collapses without error");
+    }
+
+    #[tokio::test]
+    async fn forget_is_a_noop() {
+        let b = backend_latest(Arc::new(MockAzureKvApi::default()));
+        b.forget(&fixture_uuid()).await.expect("forget");
+    }
+
+    #[tokio::test]
+    async fn health_check_calls_get_key_with_pinned_version() {
+        let api = Arc::new(MockAzureKvApi::default());
+        let b = backend_pinned(api.clone(), "v3");
+        b.health_check().await.expect("health");
+        assert_eq!(api.get_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn health_check_surfaces_not_found() {
+        let api = Arc::new(MockAzureKvApi::default());
+        {
+            let mut g = api.get_outcomes.lock().expect("queue");
+            g.push(Err(KeyStoreError::NotFound("missing".into())));
+        }
+        let b = backend_latest(api);
+        let err = b.health_check().await.expect_err("must error");
+        assert_eq!(err.kind(), KeyStoreFailureKind::NotFound);
     }
 }

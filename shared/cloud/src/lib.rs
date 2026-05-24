@@ -24,6 +24,7 @@ pub mod compression;
 pub mod dedup;
 pub mod error;
 pub mod gcs;
+mod gcs_api;
 pub mod local;
 pub mod s3;
 

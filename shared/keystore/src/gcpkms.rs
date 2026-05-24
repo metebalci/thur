@@ -5,7 +5,10 @@
 //!
 //! Symmetric `encrypt`/`decrypt` against one CryptoKey in Cloud KMS.
 //! The DEK never appears on the Thur host's disk; the manifest holds
-//! the wrapped (KMS-ciphertext) blob.
+//! the wrapped (KMS-ciphertext) blob. All SDK-touching code lives in
+//! [`crate::gcpkms_api`]; this module composes the backend on top of
+//! the [`GcpKmsApi`] seam — AAD construction, key-name binding,
+//! [`KeyStoreBackend`] trait wiring.
 //!
 //! **Encryption-context binding.** GCP KMS accepts a native
 //! `additional_authenticated_data` field on `EncryptRequest` /
@@ -20,27 +23,33 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use google_cloud_auth::credentials::{Builder as CredsBuilder, Credentials, service_account};
-use google_cloud_gax::error::rpc::Code;
-use google_cloud_kms_v1::Error as KmsError;
-use google_cloud_kms_v1::client::KeyManagementService;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::error::KeyStoreError;
+use crate::gcpkms_api::{GcpKmsApi, RealGcpKmsApi};
 use crate::keystore_backend::{DEK_LEN, DekSource, KeyStoreBackend, SecretBytes};
 use crate::keystore_config::ResolvedGcpKmsAuth;
 
 /// GCP Cloud KMS-backed keystore. The DEK never appears on the Thur
 /// host's disk; the manifest holds the wrapped (KMS-ciphertext)
 /// blob.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GcpKmsBackend {
-    client: KeyManagementService,
+    api: Arc<dyn GcpKmsApi>,
     /// Full resource name:
     /// `projects/P/locations/L/keyRings/R/cryptoKeys/K`. The backend
     /// passes it verbatim to `encrypt().set_name()` /
     /// `decrypt().set_name()` / `get_crypto_key().set_name()`.
     key_name: String,
+}
+
+impl std::fmt::Debug for GcpKmsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcpKmsBackend")
+            .field("key_name", &self.key_name)
+            .finish()
+    }
 }
 
 impl GcpKmsBackend {
@@ -55,54 +64,22 @@ impl GcpKmsBackend {
         auth: Option<ResolvedGcpKmsAuth>,
     ) -> Result<Self, KeyStoreError> {
         debug!("Initializing GCP KMS backend: key_name={}", key_name);
+        let api = RealGcpKmsApi::from_auth(auth).await?;
+        Ok(Self {
+            api: Arc::new(api),
+            key_name,
+        })
+    }
 
-        let creds = build_credentials(auth).await?;
-        let client = KeyManagementService::builder()
-            .with_credentials(creds)
-            .build()
-            .await
-            .map_err(|e| {
-                KeyStoreError::Other(format!(
-                    "gcpkms: KeyManagementService client build failed: {e}"
-                ))
-            })?;
-        Ok(Self { client, key_name })
+    /// Compose a `GcpKmsBackend` from an already-built `GcpKmsApi`. Test
+    /// constructor for the mock-injected coverage.
+    #[cfg(test)]
+    pub(crate) fn with_api(api: Arc<dyn GcpKmsApi>, key_name: String) -> Self {
+        Self { api, key_name }
     }
 
     fn aad(wrap_context: &[u8; 16]) -> Bytes {
         Bytes::from(hex::encode(wrap_context).into_bytes())
-    }
-}
-
-async fn build_credentials(auth: Option<ResolvedGcpKmsAuth>) -> Result<Credentials, KeyStoreError> {
-    match auth {
-        Some(ResolvedGcpKmsAuth::ServiceAccountKey { path }) => {
-            debug!(
-                "gcpkms: using service-account key file {} (ADC bypassed)",
-                path
-            );
-            let json = tokio::fs::read_to_string(&path).await.map_err(|e| {
-                KeyStoreError::Auth(format!(
-                    "gcpkms: service-account key file '{path}' could not be loaded: {e}"
-                ))
-            })?;
-            let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
-                KeyStoreError::Auth(format!(
-                    "gcpkms: service-account key file '{path}' could not be parsed: {e}"
-                ))
-            })?;
-            service_account::Builder::new(value).build().map_err(|e| {
-                KeyStoreError::Auth(format!(
-                    "gcpkms: service-account credential build from '{path}' failed: {e}"
-                ))
-            })
-        }
-        Some(ResolvedGcpKmsAuth::Adc) | None => {
-            debug!("gcpkms: using Application Default Credentials chain");
-            CredsBuilder::default()
-                .build()
-                .map_err(|e| KeyStoreError::Auth(format!("gcpkms: ADC credential build: {e}")))
-        }
     }
 }
 
@@ -135,16 +112,15 @@ impl KeyStoreBackend for GcpKmsBackend {
         wrap_context: &[u8; 16],
         plaintext: &SecretBytes,
     ) -> Result<Vec<u8>, KeyStoreError> {
-        let response = self
-            .client
-            .encrypt()
-            .set_name(self.key_name.clone())
-            .set_plaintext(Bytes::copy_from_slice(plaintext.as_bytes()))
-            .set_additional_authenticated_data(Self::aad(wrap_context))
-            .send()
-            .await
-            .map_err(|e| classify_gcp_kms_err("gcpkms.encrypt", e))?;
-        Ok(response.ciphertext.to_vec())
+        let ct = self
+            .api
+            .encrypt(
+                &self.key_name,
+                Bytes::copy_from_slice(plaintext.as_bytes()),
+                Self::aad(wrap_context),
+            )
+            .await?;
+        Ok(ct.to_vec())
     }
 
     async fn unwrap(
@@ -152,16 +128,14 @@ impl KeyStoreBackend for GcpKmsBackend {
         wrap_context: &[u8; 16],
         wrapped: &[u8],
     ) -> Result<SecretBytes, KeyStoreError> {
-        let response = self
-            .client
-            .decrypt()
-            .set_name(self.key_name.clone())
-            .set_ciphertext(Bytes::copy_from_slice(wrapped))
-            .set_additional_authenticated_data(Self::aad(wrap_context))
-            .send()
-            .await
-            .map_err(|e| classify_gcp_kms_err("gcpkms.decrypt", e))?;
-        let plain = response.plaintext;
+        let plain = self
+            .api
+            .decrypt(
+                &self.key_name,
+                Bytes::copy_from_slice(wrapped),
+                Self::aad(wrap_context),
+            )
+            .await?;
         if plain.len() != DEK_LEN {
             return Err(KeyStoreError::Other(format!(
                 "gcpkms.decrypt returned {} bytes, expected {}",
@@ -194,13 +168,7 @@ impl KeyStoreBackend for GcpKmsBackend {
     }
 
     async fn health_check(&self) -> Result<(), KeyStoreError> {
-        self.client
-            .get_crypto_key()
-            .set_name(self.key_name.clone())
-            .send()
-            .await
-            .map_err(|e| classify_gcp_kms_err("gcpkms.get_crypto_key", e))?;
-        Ok(())
+        self.api.get_crypto_key(&self.key_name).await
     }
 
     fn clone_box(&self) -> Box<dyn KeyStoreBackend> {
@@ -208,59 +176,258 @@ impl KeyStoreBackend for GcpKmsBackend {
     }
 }
 
-/// Classify a google-cloud-rust error into the keystore error
-/// taxonomy. The Status code (gRPC-flavored) drives the mapping; an
-/// error without a Status (transport / serialization) gets a coarser
-/// classification via Error::is_* probes.
-fn classify_gcp_kms_err(op: &str, err: KmsError) -> KeyStoreError {
-    let label = format!("{op}: {err}");
-    if let Some(status) = err.status() {
-        return match status.code {
-            Code::Unauthenticated => KeyStoreError::Auth(label),
-            Code::PermissionDenied => KeyStoreError::Authz(label),
-            Code::NotFound => KeyStoreError::NotFound(label),
-            Code::DeadlineExceeded => KeyStoreError::Timeout(label),
-            Code::Unavailable
-            | Code::ResourceExhausted
-            | Code::Internal
-            | Code::Unknown
-            | Code::Aborted => KeyStoreError::Other(label),
-            _ => KeyStoreError::Other(label),
-        };
-    }
-    if err.is_timeout() {
-        return KeyStoreError::Timeout(label);
-    }
-    if err.is_serialization() || err.is_deserialization() {
-        return KeyStoreError::Other(label);
-    }
-    // Transport / DNS / TLS surfaced through http_* fields; treat
-    // them as network so the retry budget kicks in.
-    if err.http_status_code().is_some() || err.http_headers().is_some() {
-        return KeyStoreError::Other(label);
-    }
-    KeyStoreError::Network(label)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::KeyStoreFailureKind;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    type CapturedCall = (String, Vec<u8>, Vec<u8>);
+
+    #[derive(Default, Debug)]
+    struct MockGcpKmsApi {
+        encrypt_outcomes: Mutex<Vec<Result<Bytes, KeyStoreError>>>,
+        decrypt_outcomes: Mutex<Vec<Result<Bytes, KeyStoreError>>>,
+        get_outcomes: Mutex<Vec<Result<(), KeyStoreError>>>,
+
+        encrypt_calls: AtomicU32,
+        decrypt_calls: AtomicU32,
+        get_calls: AtomicU32,
+
+        captured_encrypt: Mutex<Vec<CapturedCall>>,
+        captured_decrypt: Mutex<Vec<CapturedCall>>,
+    }
+
+    impl MockGcpKmsApi {
+        fn pop_or<T>(
+            q: &Mutex<Vec<Result<T, KeyStoreError>>>,
+            default: impl FnOnce() -> Result<T, KeyStoreError>,
+        ) -> Result<T, KeyStoreError> {
+            let mut g = match q.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.is_empty() { default() } else { g.remove(0) }
+        }
+    }
+
+    #[async_trait]
+    impl GcpKmsApi for MockGcpKmsApi {
+        async fn encrypt(
+            &self,
+            key_name: &str,
+            plaintext: Bytes,
+            aad: Bytes,
+        ) -> Result<Bytes, KeyStoreError> {
+            self.encrypt_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_encrypt.lock().expect("cap").push((
+                key_name.to_string(),
+                plaintext.to_vec(),
+                aad.to_vec(),
+            ));
+            Self::pop_or(&self.encrypt_outcomes, || {
+                Ok(Bytes::from_static(b"canned-ciphertext"))
+            })
+        }
+        async fn decrypt(
+            &self,
+            key_name: &str,
+            ciphertext: Bytes,
+            aad: Bytes,
+        ) -> Result<Bytes, KeyStoreError> {
+            self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_decrypt.lock().expect("cap").push((
+                key_name.to_string(),
+                ciphertext.to_vec(),
+                aad.to_vec(),
+            ));
+            Self::pop_or(&self.decrypt_outcomes, || {
+                Ok(Bytes::from_static(&[0u8; DEK_LEN]))
+            })
+        }
+        async fn get_crypto_key(&self, _key_name: &str) -> Result<(), KeyStoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.get_outcomes, || Ok(()))
+        }
+    }
+
+    const FIXTURE_KEY: &str = "projects/p/locations/global/keyRings/r/cryptoKeys/k";
+
+    fn backend(api: Arc<dyn GcpKmsApi>) -> GcpKmsBackend {
+        GcpKmsBackend::with_api(api, FIXTURE_KEY.to_string())
+    }
+
+    fn fixture_context() -> [u8; 16] {
+        [0xABu8; 16]
+    }
 
     #[test]
-    fn context_carries_volume_uuid_hex() {
-        let uuid = [0xABu8; 16];
-        let aad = GcpKmsBackend::aad(&uuid);
+    fn aad_is_hex_of_context() {
+        let aad = GcpKmsBackend::aad(&fixture_context());
         assert_eq!(aad.as_ref(), b"ab".repeat(16).as_slice());
         assert_eq!(aad.len(), 32);
     }
 
     #[test]
+    fn backend_type_and_fingerprint() {
+        let b = backend(Arc::new(MockGcpKmsApi::default()));
+        assert_eq!(b.backend_type(), "gcpkms");
+        assert_eq!(b.wrap_target_fingerprint(), format!("gcpkms:{FIXTURE_KEY}"));
+    }
+
+    #[test]
+    fn debug_omits_sdk_internals() {
+        let b = backend(Arc::new(MockGcpKmsApi::default()));
+        let s = format!("{:?}", b);
+        assert!(s.contains("key_name"));
+        assert!(s.contains(FIXTURE_KEY));
+    }
+
+    #[test]
+    fn clone_box_yields_independent_handle() {
+        let b = backend(Arc::new(MockGcpKmsApi::default()));
+        let boxed: Box<dyn KeyStoreBackend> = Box::new(b);
+        let cloned = boxed.clone();
+        assert_eq!(cloned.backend_type(), "gcpkms");
+    }
+
+    #[tokio::test]
+    async fn wrap_passes_plaintext_key_name_and_aad() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        let b = backend(api.clone());
+        let ctx = fixture_context();
+        let plain = SecretBytes::new([0x11u8; DEK_LEN]);
+        let wrapped = b.wrap(&ctx, &plain).await.expect("wrap");
+        assert_eq!(wrapped, b"canned-ciphertext");
+        let captured = api.captured_encrypt.lock().expect("cap").clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, FIXTURE_KEY);
+        assert_eq!(captured[0].1, vec![0x11u8; DEK_LEN]);
+        assert_eq!(captured[0].2, b"ab".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn unwrap_round_trips_dek_through_mock() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        {
+            let mut g = api.decrypt_outcomes.lock().expect("queue");
+            g.push(Ok(Bytes::from(vec![0x42u8; DEK_LEN])));
+        }
+        let b = backend(api.clone());
+        let unwrapped = b
+            .unwrap(&fixture_context(), b"canned-ciphertext")
+            .await
+            .expect("unwrap");
+        assert_eq!(unwrapped.as_bytes(), &[0x42u8; DEK_LEN][..]);
+        let captured = api.captured_decrypt.lock().expect("cap").clone();
+        assert_eq!(captured[0].0, FIXTURE_KEY);
+        assert_eq!(captured[0].1, b"canned-ciphertext");
+        assert_eq!(captured[0].2, b"ab".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn unwrap_rejects_wrong_length_plaintext() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        {
+            let mut g = api.decrypt_outcomes.lock().expect("queue");
+            // Too short — must be rejected.
+            g.push(Ok(Bytes::from(vec![0u8; DEK_LEN - 1])));
+        }
+        let b = backend(api);
+        let err = b
+            .unwrap(&fixture_context(), b"ct")
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, KeyStoreError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn unwrap_surfaces_auth_failure() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        {
+            let mut g = api.decrypt_outcomes.lock().expect("queue");
+            g.push(Err(KeyStoreError::Auth("denied".into())));
+        }
+        let b = backend(api);
+        let err = b
+            .unwrap(&fixture_context(), b"ct")
+            .await
+            .expect_err("must surface");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Auth);
+    }
+
+    #[tokio::test]
+    async fn wrap_surfaces_authz_failure() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        {
+            let mut g = api.encrypt_outcomes.lock().expect("queue");
+            g.push(Err(KeyStoreError::Authz("denied".into())));
+        }
+        let b = backend(api);
+        let err = b
+            .wrap(&fixture_context(), &SecretBytes::new([0u8; DEK_LEN]))
+            .await
+            .expect_err("must surface");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_returns_matching_plain_and_ciphertext() {
+        // Mock encrypt returns the AAD as a stand-in for ciphertext so
+        // we can confirm the call site passed the expected context.
+        let api = Arc::new(MockGcpKmsApi::default());
+        let b = backend(api.clone());
+        let ctx = fixture_context();
+        let (plain, wrapped) = b
+            .generate_and_wrap(&ctx, DekSource::Daemon)
+            .await
+            .expect("gen+wrap");
+        assert_eq!(plain.as_bytes().len(), DEK_LEN);
+        assert_eq!(wrapped, b"canned-ciphertext");
+        assert_eq!(api.encrypt_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generate_and_wrap_collapses_backend_source_to_daemon() {
+        // Backend collapses to Daemon-side RNG without erroring — the
+        // log line is the only side effect.
+        let api = Arc::new(MockGcpKmsApi::default());
+        let b = backend(api);
+        let (_, _) = b
+            .generate_and_wrap(&fixture_context(), DekSource::Backend)
+            .await
+            .expect("collapses without error");
+    }
+
+    #[tokio::test]
+    async fn forget_is_a_noop() {
+        let b = backend(Arc::new(MockGcpKmsApi::default()));
+        b.forget(&fixture_context()).await.expect("forget");
+    }
+
+    #[tokio::test]
+    async fn health_check_calls_get_crypto_key() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        let b = backend(api.clone());
+        b.health_check().await.expect("health");
+        assert_eq!(api.get_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn health_check_surfaces_not_found() {
+        let api = Arc::new(MockGcpKmsApi::default());
+        {
+            let mut g = api.get_outcomes.lock().expect("queue");
+            g.push(Err(KeyStoreError::NotFound("missing".into())));
+        }
+        let b = backend(api);
+        let err = b.health_check().await.expect_err("must error");
+        assert_eq!(err.kind(), KeyStoreFailureKind::NotFound);
+    }
+
+    #[test]
     fn classify_failure_kinds_route_correctly() {
-        // Synthesized KeyStoreError values → expected
-        // KeyStoreFailureKind. The real service-error path is
-        // exercised against a real project by the env-gated row in
-        // the integration script.
         let auth = KeyStoreError::Auth("test".into());
         assert_eq!(auth.kind(), KeyStoreFailureKind::Auth);
         assert!(!auth.is_retryable());

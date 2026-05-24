@@ -23,8 +23,10 @@
 
 mod awskms;
 mod azurekv;
+mod azurekv_api;
 mod error;
 mod gcpkms;
+mod gcpkms_api;
 mod keystore_backend;
 mod keystore_config;
 mod kmip;

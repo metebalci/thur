@@ -4,10 +4,11 @@
 //! Google Cloud Storage (GCS) backend for cloud storage tier
 //!
 //! Built on Google's official `google-cloud-storage` crate (the
-//! googleapis/google-cloud-rust line). Two client handles internally:
-//! `Storage` for object I/O (read/write) and `StorageControl` for the
-//! metadata plane (get/list/delete/update + bucket-level ops). Both
-//! are `Arc`-shaped, lazy-channel, and cheap to clone.
+//! googleapis/google-cloud-rust line). All SDK-touching code lives in
+//! [`crate::gcs_api`]; this module composes the backend on top of the
+//! [`GcsApi`] seam — retry policy, compression, prefix joining,
+//! key-name shaping. Tests inject a mock `GcsApi` impl to exercise
+//! every `CloudBackend` method without an HTTP wire.
 //!
 //! Provides upload/download operations for chunks and manifests with:
 //! - Automatic retry with exponential backoff
@@ -17,16 +18,12 @@
 
 use crate::cloud_backend::CloudBackend;
 use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
+use crate::gcs_api::{GcsApi, RealGcsApi, build_credentials};
 use crate::{CloudError, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use google_cloud_auth::credentials::{Builder as CredsBuilder, Credentials, service_account};
-use google_cloud_gax::paginator::ItemPaginator;
-use google_cloud_storage::client::{Storage, StorageControl};
-use google_cloud_storage::model::Object;
-use google_cloud_wkt::FieldMask;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -56,14 +53,10 @@ const MAX_DOWNLOAD_RETRIES: u32 = 3;
 /// Google Cloud Storage backend for storing chunks and manifests
 #[derive(Clone)]
 pub struct GcsBackend {
-    /// Data plane: read_object / write_object.
-    data: Storage,
-    /// Metadata plane: get/list/delete/update objects + get_bucket.
-    control: StorageControl,
+    api: Arc<dyn GcsApi>,
     bucket: String,
     prefix: String,
     project_id: String,
-    /// Compression configuration
     compression_config: CompressionConfig,
 }
 
@@ -111,35 +104,8 @@ impl GcsBackend {
 
         ensure_rustls_provider();
 
-        let creds = match &service_account_key_file {
-            Some(path) => {
-                debug!("Using service-account key file: {} (ADC bypassed)", path);
-                let json = tokio::fs::read_to_string(path).await.map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS service-account key file '{}' could not be loaded: {}",
-                        path, e
-                    ))
-                })?;
-                let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS service-account key file '{}' could not be loaded: {}",
-                        path, e
-                    ))
-                })?;
-                service_account::Builder::new(value).build().map_err(|e| {
-                    CloudError::Other(format!("GCS auth from key file '{}' failed: {}", path, e))
-                })?
-            }
-            None => {
-                debug!("Using Application Default Credentials (ADC)");
-                CredsBuilder::default()
-                    .build()
-                    .map_err(|e| CloudError::Other(format!("GCS auth failed: {}", e)))?
-            }
-        };
-
-        let data = build_storage(&creds).await?;
-        let control = build_storage_control(&creds).await?;
+        let creds = build_credentials(service_account_key_file.as_deref()).await?;
+        let api = RealGcsApi::from_creds(&creds).await?;
 
         debug!(
             "Compression algorithm: {:?}, level: {}",
@@ -147,8 +113,7 @@ impl GcsBackend {
         );
 
         Ok(Self {
-            data,
-            control,
+            api: Arc::new(api),
             bucket,
             prefix,
             project_id,
@@ -156,34 +121,30 @@ impl GcsBackend {
         })
     }
 
+    /// Compose a `GcsBackend` from an already-built `GcsApi`. Test
+    /// constructor for the mock-injected coverage; production code
+    /// uses [`GcsBackend::new`].
+    #[cfg(test)]
+    pub(crate) fn with_api(
+        api: Arc<dyn GcsApi>,
+        bucket: String,
+        prefix: String,
+        project_id: String,
+        compression_config: CompressionConfig,
+    ) -> Self {
+        Self {
+            api,
+            bucket,
+            prefix,
+            project_id,
+            compression_config,
+        }
+    }
+
     /// Construct full GCS object name with prefix.
     fn full_key(&self, key: &str) -> String {
         crate::cloud_helpers::full_key(&self.prefix, key)
     }
-
-    /// Canonical bucket resource name. Every metadata-plane call
-    /// expects `projects/_/buckets/{bucket}`; the data plane wants
-    /// the same shape for the `bucket` parameter to `read_object` /
-    /// `write_object`. Centralized to avoid copy-paste drift.
-    fn bucket_resource(&self) -> String {
-        format!("projects/_/buckets/{}", self.bucket)
-    }
-}
-
-async fn build_storage(creds: &Credentials) -> Result<Storage> {
-    Storage::builder()
-        .with_credentials(creds.clone())
-        .build()
-        .await
-        .map_err(|e| CloudError::Other(format!("GCS Storage client build failed: {}", e)))
-}
-
-async fn build_storage_control(creds: &Credentials) -> Result<StorageControl> {
-    StorageControl::builder()
-        .with_credentials(creds.clone())
-        .build()
-        .await
-        .map_err(|e| CloudError::Other(format!("GCS StorageControl client build failed: {}", e)))
 }
 
 /// CloudBackend trait implementation for GcsBackend
@@ -226,24 +187,12 @@ impl CloudBackend for GcsBackend {
         // Wrap once in `bytes::Bytes` so each retry attempt clones a
         // cheap Arc handle instead of memcpy'ing the full Vec.
         let data_bytes = Bytes::from(data_to_upload);
-        let bucket_resource = self.bucket_resource();
+        let bucket = self.bucket.as_str();
 
         crate::cloud_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
-            self.data
-                .write_object(
-                    bucket_resource.clone(),
-                    full_key.clone(),
-                    data_bytes.clone(),
-                )
-                .send_buffered()
+            self.api
+                .write_object(bucket, &full_key, data_bytes.clone())
                 .await
-                .map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS chunk upload failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    ))
-                })?;
-            Ok(())
         })
         .await?;
 
@@ -269,23 +218,15 @@ impl CloudBackend for GcsBackend {
             );
         }
 
-        let bucket_resource = self.bucket_resource();
+        let bucket = self.bucket.as_str();
 
         crate::cloud_helpers::retry_async("upload_chunk_zerocopy", MAX_UPLOAD_RETRIES, || async {
             let data = tokio::fs::read(file_path)
                 .await
                 .map_err(|e| CloudError::Other(format!("failed to read file: {}", e)))?;
-            self.data
-                .write_object(bucket_resource.clone(), full_key.clone(), Bytes::from(data))
-                .send_buffered()
+            self.api
+                .write_object(bucket, &full_key, Bytes::from(data))
                 .await
-                .map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS chunk upload (zero-copy) failed: {} (bucket: {}, key: {}, file: {:?})",
-                        e, self.bucket, full_key, file_path
-                    ))
-                })?;
-            Ok(())
         })
         .await?;
 
@@ -296,33 +237,13 @@ impl CloudBackend for GcsBackend {
         let full_key = self.full_key(key);
         debug!("Downloading chunk from GCS: {}", full_key);
 
-        let bucket_resource = self.bucket_resource();
+        let bucket = self.bucket.as_str();
 
         crate::cloud_helpers::retry_async("download_chunk", MAX_DOWNLOAD_RETRIES, || async {
             // Drain the streamed body into a single Vec inside the
             // retry closure so a mid-stream error replays the whole
             // RPC instead of returning a half-filled buffer.
-            let mut resp = self
-                .data
-                .read_object(bucket_resource.clone(), full_key.clone())
-                .send()
-                .await
-                .map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS chunk download failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    ))
-                })?;
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = resp.next().await {
-                let chunk = chunk.map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS chunk stream read failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    ))
-                })?;
-                buf.extend_from_slice(&chunk);
-            }
+            let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
             debug!("Downloaded {} bytes from GCS: {}", buf.len(), full_key);
 
             // Mirror upload_chunk's compression logic: if the backend is
@@ -403,24 +324,11 @@ impl CloudBackend for GcsBackend {
             json.len()
         );
 
-        let bucket_resource = self.bucket_resource();
+        let bucket = self.bucket.as_str();
         let body = Bytes::from(json.as_bytes().to_vec());
 
         crate::cloud_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
-            self.data
-                .write_object(bucket_resource.clone(), full_key.clone(), body.clone())
-                .send_buffered()
-                .await
-                .map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS manifest upload failed: {} (bucket: {}, key: {}, size: {} bytes)",
-                        e,
-                        self.bucket,
-                        full_key,
-                        json.len()
-                    ))
-                })?;
-            Ok(())
+            self.api.write_object(bucket, &full_key, body.clone()).await
         })
         .await
     }
@@ -429,30 +337,10 @@ impl CloudBackend for GcsBackend {
         let full_key = self.full_key(key);
         debug!("Downloading manifest from GCS: {}", full_key);
 
-        let bucket_resource = self.bucket_resource();
+        let bucket = self.bucket.as_str();
 
         crate::cloud_helpers::retry_async("download_manifest", MAX_DOWNLOAD_RETRIES, || async {
-            let mut resp = self
-                .data
-                .read_object(bucket_resource.clone(), full_key.clone())
-                .send()
-                .await
-                .map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS manifest download failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    ))
-                })?;
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = resp.next().await {
-                let chunk = chunk.map_err(|e| {
-                    CloudError::Other(format!(
-                        "GCS manifest stream read failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    ))
-                })?;
-                buf.extend_from_slice(&chunk);
-            }
+            let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
             let json = String::from_utf8(buf)
                 .map_err(|e| CloudError::Other(format!("manifest not valid UTF-8: {}", e)))?;
             debug!(
@@ -468,71 +356,29 @@ impl CloudBackend for GcsBackend {
     async fn chunk_exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
         debug!("Checking if chunk exists in GCS: {}", full_key);
-
-        match self
-            .control
-            .get_object()
-            .set_bucket(self.bucket_resource())
-            .set_object(full_key.clone())
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                // Object absent is a normal probe outcome — fold it
-                // into Ok(false). The Google SDK can surface absence
-                // either as HTTP 404 (REST) or as a gRPC `NotFound`
-                // status (`Code = 5`); since the SDK's transport may
-                // hand us either shape, check both. Prior to this
-                // both shapes were checked only via http_status_code,
-                // and gRPC-style NotFound errors would propagate as
-                // hard failures — surfacing on the first
-                // `chunk_exists` of any Global-scope dedup write.
-                let is_absent = e.http_status_code() == Some(404)
-                    || e.status()
-                        .is_some_and(|s| s.code == google_cloud_gax::error::rpc::Code::NotFound);
-                if is_absent {
-                    Ok(false)
-                } else {
-                    Err(CloudError::Other(format!(
-                        "GCS get_object failed: {} (bucket: {}, key: {})",
-                        e, self.bucket, full_key
-                    )))
-                }
-            }
-        }
+        self.api.object_exists(&self.bucket, &full_key).await
     }
 
     async fn list_objects(&self, key_prefix: &str) -> Result<Vec<String>> {
         let full_prefix = self.full_key(key_prefix);
         debug!("Listing objects in GCS with prefix: {}", full_prefix);
 
-        // Drain every page; new SDK is paginated and silently truncates
-        // at the first page if we don't.
-        let mut keys: Vec<String> = Vec::new();
-        let mut items = self
-            .control
-            .list_objects()
-            .set_parent(self.bucket_resource())
-            .set_prefix(&full_prefix)
-            .by_item();
+        let names = self
+            .api
+            .list_object_names(&self.bucket, &full_prefix)
+            .await?;
 
-        while let Some(item) = items.next().await {
-            let obj = item.map_err(|e| {
-                CloudError::Other(format!(
-                    "GCS list_objects failed: {} (bucket: {}, prefix: {})",
-                    e, self.bucket, full_prefix
-                ))
-            })?;
-            let k = obj.name;
-            // Strip the bucket-side prefix so callers get relative keys.
-            let rel = if !self.prefix.is_empty() && k.starts_with(&self.prefix) {
-                k[self.prefix.len()..].to_string()
-            } else {
-                k
-            };
-            keys.push(rel);
-        }
+        // Strip the bucket-side prefix so callers get relative keys.
+        let keys: Vec<String> = names
+            .into_iter()
+            .map(|k| {
+                if !self.prefix.is_empty() && k.starts_with(&self.prefix) {
+                    k[self.prefix.len()..].to_string()
+                } else {
+                    k
+                }
+            })
+            .collect();
 
         debug!("Found {} objects with prefix {}", keys.len(), full_prefix);
         Ok(keys)
@@ -541,20 +387,7 @@ impl CloudBackend for GcsBackend {
     async fn delete_object(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
         debug!("Deleting object from GCS: {}", full_key);
-
-        self.control
-            .delete_object()
-            .set_bucket(self.bucket_resource())
-            .set_object(full_key.clone())
-            .send()
-            .await
-            .map_err(|e| {
-                CloudError::Other(format!(
-                    "GCS delete_object failed: {} (bucket: {}, key: {})",
-                    e, self.bucket, full_key
-                ))
-            })?;
-
+        self.api.delete_object(&self.bucket, &full_key).await?;
         debug!("Deleted object from GCS: {}", full_key);
         Ok(())
     }
@@ -564,46 +397,26 @@ impl CloudBackend for GcsBackend {
     }
 
     async fn lock_state(&self) -> Result<crate::cloud_backend::LockState> {
-        let bucket = self
-            .control
-            .get_bucket()
-            .set_name(self.bucket_resource())
-            .send()
-            .await
-            .map_err(|e| CloudError::Other(format!("GCS get_bucket on {}: {}", self.bucket, e)))?;
-        debug!(
-            "GCS get_bucket on {}: retention_policy={:?}",
-            self.bucket, bucket.retention_policy
-        );
-        let policy = match bucket.retention_policy {
-            Some(p) => p,
-            None => {
-                debug!(
-                    "GCS lock_state: bucket '{}' has no retentionPolicy in API response \
-                     (this is a *bucket-level* retention policy - `gcloud storage buckets update \
-                     --retention-period`. Per-object retention enabled via `--enable-object-retention` \
-                     is a different feature and lives elsewhere). Returning LockState::Off.",
-                    self.bucket
-                );
-                return Ok(crate::cloud_backend::LockState::Off);
-            }
+        let policy = self.api.get_bucket_retention(&self.bucket).await?;
+        let Some(policy) = policy else {
+            debug!(
+                "GCS lock_state: bucket '{}' has no retentionPolicy in API response \
+                 (this is a *bucket-level* retention policy - `gcloud storage buckets update \
+                 --retention-period`. Per-object retention enabled via `--enable-object-retention` \
+                 is a different feature and lives elsewhere). Returning LockState::Off.",
+                self.bucket
+            );
+            return Ok(crate::cloud_backend::LockState::Off);
         };
         // GCS retention duration is a wkt::Duration. A configured
         // policy is in effect as long as seconds > 0 — sub-day
         // periods are allowed for testing (best-effort enforcement),
         // so treat any positive period as "lock is on" and round up
         // to whole days for `default_days`.
-        let secs: u64 = policy
-            .retention_duration
-            .map(|d| d.seconds().max(0) as u64)
-            .unwrap_or(0);
-        if secs == 0 {
-            return Ok(crate::cloud_backend::LockState::Off);
-        }
-        let days: u32 = secs.div_ceil(86_400).min(u32::MAX as u64) as u32;
+        let days: u32 = policy.seconds.div_ceil(86_400).min(u32::MAX as u64) as u32;
         debug!(
             "GCS lock_state: bucket '{}' retention_duration={}s (~{}d, rounded up), is_locked={}",
-            self.bucket, secs, days, policy.is_locked
+            self.bucket, policy.seconds, days, policy.is_locked
         );
         if policy.is_locked {
             Ok(crate::cloud_backend::LockState::Compliance { default_days: days })
@@ -614,48 +427,14 @@ impl CloudBackend for GcsBackend {
 
     async fn set_object_legal_hold(&self, key: &str, held: bool) -> Result<()> {
         let full_key = self.full_key(key);
-        // Patch the object's `eventBasedHold` field. GCS legal-hold-
-        // equivalent primitive; survives bucket lifecycle and prevents
-        // deletion until released.
-        //
-        // **CRITICAL**: the field mask is required. Without it the
-        // update wipes every other field on the object. Only update
-        // exactly `event_based_hold`.
-        let resource = Object::default()
-            .set_name(full_key.clone())
-            .set_event_based_hold(held);
-        let mask = FieldMask::default().set_paths(["event_based_hold"]);
-        self.control
-            .update_object()
-            .set_object(resource)
-            .set_update_mask(mask)
-            .send()
+        self.api
+            .set_event_based_hold(&self.bucket, &full_key, held)
             .await
-            .map_err(|e| {
-                CloudError::Other(format!(
-                    "GCS update_object (event_based_hold={}) failed: {} (bucket: {}, key: {})",
-                    held, e, self.bucket, full_key
-                ))
-            })?;
-        Ok(())
     }
 
     async fn get_object_legal_hold(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
-        let obj = self
-            .control
-            .get_object()
-            .set_bucket(self.bucket_resource())
-            .set_object(full_key.clone())
-            .send()
-            .await
-            .map_err(|e| {
-                CloudError::Other(format!(
-                    "GCS get_object (legal hold) failed: {} (bucket: {}, key: {})",
-                    e, self.bucket, full_key
-                ))
-            })?;
-        Ok(obj.event_based_hold.unwrap_or(false))
+        self.api.get_event_based_hold(&self.bucket, &full_key).await
     }
 
     fn clone_box(&self) -> Box<dyn CloudBackend> {
@@ -665,36 +444,625 @@ impl CloudBackend for GcsBackend {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::cloud_backend::LockState;
+    use crate::compression::CompressionConfig;
+    use crate::gcs_api::RetentionPolicy;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    #[test]
-    fn test_full_key_with_prefix() {
-        // Note: We can't easily create a GcsBackend for unit tests without valid credentials
-        // These tests verify key construction logic only
-        let prefix = "tapes/";
-        let key = "chunks/TAPE001/obj-000001.dat";
-        let expected = "tapes/chunks/TAPE001/obj-000001.dat";
+    /// Mock `GcsApi` impl driven by per-method outcome queues.
+    ///
+    /// Each method pops its next `Outcome` from the matching queue and
+    /// either returns the canned `Ok(...)` or the canned error. When a
+    /// queue is empty, the default behaviour is `Ok(...)` of a benign
+    /// value — that matches the production retry/back-off pattern where
+    /// a successful next attempt ends the loop.
+    #[derive(Default, Debug)]
+    struct MockGcsApi {
+        write_outcomes: Mutex<Vec<Result<()>>>,
+        read_outcomes: Mutex<Vec<Result<Vec<u8>>>>,
+        exists_outcomes: Mutex<Vec<Result<bool>>>,
+        list_outcomes: Mutex<Vec<Result<Vec<String>>>>,
+        delete_outcomes: Mutex<Vec<Result<()>>>,
+        retention_outcomes: Mutex<Vec<Result<Option<RetentionPolicy>>>>,
+        hold_get_outcomes: Mutex<Vec<Result<bool>>>,
+        hold_set_outcomes: Mutex<Vec<Result<()>>>,
 
-        let full_key = if prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{}{}", prefix, key)
-        };
+        write_calls: AtomicU32,
+        read_calls: AtomicU32,
+        exists_calls: AtomicU32,
+        list_calls: AtomicU32,
+        delete_calls: AtomicU32,
+        retention_calls: AtomicU32,
+        hold_get_calls: AtomicU32,
+        hold_set_calls: AtomicU32,
 
-        assert_eq!(full_key, expected);
+        captured_write: Mutex<Vec<(String, String, Vec<u8>)>>,
+        captured_hold_set: Mutex<Vec<(String, String, bool)>>,
+    }
+
+    impl MockGcsApi {
+        fn pop_or<T>(q: &Mutex<Vec<Result<T>>>, default: impl FnOnce() -> Result<T>) -> Result<T> {
+            // Poisoned mutex in test code means an earlier test panicked;
+            // recover and let the current test surface the real issue.
+            let mut g = match q.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.is_empty() { default() } else { g.remove(0) }
+        }
+    }
+
+    #[async_trait]
+    impl GcsApi for MockGcsApi {
+        async fn write_object(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_write.lock().expect("write capture").push((
+                bucket.to_string(),
+                key.to_string(),
+                body.to_vec(),
+            ));
+            Self::pop_or(&self.write_outcomes, || Ok(()))
+        }
+        async fn read_object_to_vec(&self, _bucket: &str, _key: &str) -> Result<Vec<u8>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.read_outcomes, || Ok(Vec::new()))
+        }
+        async fn object_exists(&self, _bucket: &str, _key: &str) -> Result<bool> {
+            self.exists_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.exists_outcomes, || Ok(false))
+        }
+        async fn get_event_based_hold(&self, _bucket: &str, _key: &str) -> Result<bool> {
+            self.hold_get_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.hold_get_outcomes, || Ok(false))
+        }
+        async fn set_event_based_hold(&self, bucket: &str, key: &str, held: bool) -> Result<()> {
+            self.hold_set_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_hold_set
+                .lock()
+                .expect("hold set capture")
+                .push((bucket.to_string(), key.to_string(), held));
+            Self::pop_or(&self.hold_set_outcomes, || Ok(()))
+        }
+        async fn list_object_names(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.list_outcomes, || Ok(Vec::new()))
+        }
+        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<()> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.delete_outcomes, || Ok(()))
+        }
+        async fn get_bucket_retention(&self, _bucket: &str) -> Result<Option<RetentionPolicy>> {
+            self.retention_calls.fetch_add(1, Ordering::SeqCst);
+            Self::pop_or(&self.retention_outcomes, || Ok(None))
+        }
+    }
+
+    fn backend_with(api: Arc<dyn GcsApi>) -> GcsBackend {
+        GcsBackend::with_api(
+            api,
+            "my-bucket".to_string(),
+            "tapes/".to_string(),
+            "my-project".to_string(),
+            CompressionConfig::disabled(),
+        )
+    }
+
+    fn backend_with_compression(api: Arc<dyn GcsApi>, algo: CompressionAlgo) -> GcsBackend {
+        GcsBackend::with_api(
+            api,
+            "my-bucket".to_string(),
+            "tapes/".to_string(),
+            "my-project".to_string(),
+            CompressionConfig::new(Some(algo), 3),
+        )
     }
 
     #[test]
-    fn test_full_key_without_prefix() {
-        let prefix = "";
-        let key = "chunks/TAPE001/obj-000001.dat";
-        let expected = "chunks/TAPE001/obj-000001.dat";
+    fn full_key_with_prefix() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api);
+        assert_eq!(
+            backend.full_key("chunks/TAPE001/obj-000001.dat"),
+            "tapes/chunks/TAPE001/obj-000001.dat"
+        );
+    }
 
-        let full_key = if prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{}{}", prefix, key)
-        };
+    #[test]
+    fn full_key_without_prefix() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = GcsBackend::with_api(
+            api,
+            "my-bucket".to_string(),
+            String::new(),
+            "my-project".to_string(),
+            CompressionConfig::disabled(),
+        );
+        assert_eq!(
+            backend.full_key("chunks/TAPE001/obj-000001.dat"),
+            "chunks/TAPE001/obj-000001.dat"
+        );
+    }
 
-        assert_eq!(full_key, expected);
+    #[test]
+    fn backend_type_is_gcs_and_supports_legal_hold() {
+        let backend = backend_with(Arc::new(MockGcsApi::default()));
+        assert_eq!(backend.backend_type(), "gcs");
+        assert!(backend.supports_legal_hold());
+    }
+
+    #[test]
+    fn debug_omits_sdk_internals() {
+        let backend = backend_with(Arc::new(MockGcsApi::default()));
+        let s = format!("{:?}", backend);
+        assert!(s.contains("bucket"));
+        assert!(s.contains("my-bucket"));
+        assert!(s.contains("my-project"));
+    }
+
+    #[test]
+    fn clone_box_yields_independent_handle() {
+        let backend = backend_with(Arc::new(MockGcsApi::default()));
+        let boxed: Box<dyn CloudBackend> = Box::new(backend);
+        let cloned = boxed.clone();
+        assert_eq!(cloned.backend_type(), "gcs");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_happy_path_no_compression() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        let (uncompressed, compressed, algo) = backend
+            .upload_chunk("chunks/x.dat", b"hello world")
+            .await
+            .expect("upload_chunk");
+        assert_eq!(uncompressed, 11);
+        assert!(compressed.is_none());
+        assert!(algo.is_none());
+        assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);
+        let captured = api.captured_write.lock().expect("captured").clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "my-bucket");
+        assert_eq!(captured[0].1, "tapes/chunks/x.dat");
+        assert_eq!(captured[0].2, b"hello world");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_compresses_when_configured() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with_compression(api.clone(), CompressionAlgo::Zstd);
+        let payload = vec![0u8; 4096]; // highly compressible
+        let (uncompressed, compressed, algo) = backend
+            .upload_chunk("chunks/z.dat", &payload)
+            .await
+            .expect("upload_chunk");
+        assert_eq!(uncompressed, 4096);
+        let csz = compressed.expect("compressed size present");
+        assert!(csz < 4096, "compressed must be smaller, got {}", csz);
+        assert_eq!(algo, Some(CompressionAlgo::Zstd));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_retries_on_transient_error() {
+        let api = Arc::new(MockGcsApi::default());
+        // Fail twice (retryable), succeed on the 3rd attempt.
+        {
+            let mut g = api.write_outcomes.lock().expect("queue");
+            g.push(Err(CloudError::Other("503 service unavailable".into())));
+            g.push(Err(CloudError::Other("502 bad gateway".into())));
+            g.push(Ok(()));
+        }
+        let backend = backend_with(api.clone());
+        backend
+            .upload_chunk("chunks/x.dat", b"payload")
+            .await
+            .expect("eventual success");
+        assert_eq!(api.write_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_fails_fast_on_permanent_auth() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.write_outcomes.lock().expect("queue");
+            g.push(Err(CloudError::Other("AccessDenied: forbidden".into())));
+        }
+        let backend = backend_with(api.clone());
+        let err = backend
+            .upload_chunk("chunks/x.dat", b"payload")
+            .await
+            .expect_err("must fail fast");
+        match err {
+            CloudError::Other(_) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+        // Permanent classification → single attempt, no retry burn.
+        assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_zerocopy_streams_file() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("chunk.dat");
+        tokio::fs::write(&path, b"abcdef").await.expect("seed");
+
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        let n = backend
+            .upload_chunk_zerocopy("chunks/zc.dat", &path)
+            .await
+            .expect("zerocopy upload");
+        assert_eq!(n, 6);
+        assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);
+        let captured = api.captured_write.lock().expect("captured").clone();
+        assert_eq!(captured[0].2, b"abcdef");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_zerocopy_warns_when_compression_enabled() {
+        // The path still uploads — the warn! is informational only.
+        // (We can't easily snoop log output, just confirm behavior.)
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("chunk.dat");
+        tokio::fs::write(&path, b"xyz").await.expect("seed");
+
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with_compression(api.clone(), CompressionAlgo::Zstd);
+        backend
+            .upload_chunk_zerocopy("chunks/zc.dat", &path)
+            .await
+            .expect("zerocopy with compression-enabled config still uploads raw");
+        let captured = api.captured_write.lock().expect("captured").clone();
+        assert_eq!(captured[0].2, b"xyz", "zerocopy uploads raw bytes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_chunk_zerocopy_missing_file_errors() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        let err = backend
+            .upload_chunk_zerocopy("chunks/zc.dat", std::path::Path::new("/no/such/file.dat"))
+            .await
+            .expect_err("missing file must error");
+        assert!(matches!(err, CloudError::Other(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunk_happy_path_no_compression() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            g.push(Ok(b"hello".to_vec()));
+        }
+        let backend = backend_with(api.clone());
+        let got = backend
+            .download_chunk("chunks/x.dat")
+            .await
+            .expect("download");
+        assert_eq!(got, b"hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunk_decompresses_when_algo_configured() {
+        // Pre-compress the payload so the mock returns compressed bytes;
+        // the backend should decompress on download.
+        let payload = vec![0u8; 1024];
+        let compressed = compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            g.push(Ok(compressed));
+        }
+        let backend = backend_with_compression(api.clone(), CompressionAlgo::Zstd);
+        let got = backend
+            .download_chunk("chunks/z.dat")
+            .await
+            .expect("download + decompress");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunk_retries_on_transient_error() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            g.push(Err(CloudError::Other("504 gateway timeout".into())));
+            g.push(Ok(b"ok".to_vec()));
+        }
+        let backend = backend_with(api.clone());
+        let got = backend
+            .download_chunk("chunks/x.dat")
+            .await
+            .expect("recovers");
+        assert_eq!(got, b"ok");
+        assert_eq!(api.read_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunks_parallel_preserves_order() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            // Three downloads — though parallel, the mock pops in order;
+            // assert each result is non-empty rather than positionally
+            // tied. (The per-call body isn't reachable per-key in this
+            // mock; the contract under test is order preservation in
+            // the returned Vec.)
+            g.push(Ok(b"a".to_vec()));
+            g.push(Ok(b"b".to_vec()));
+            g.push(Ok(b"c".to_vec()));
+        }
+        let backend = backend_with(api.clone());
+        let keys = vec![
+            "chunks/1.dat".to_string(),
+            "chunks/2.dat".to_string(),
+            "chunks/3.dat".to_string(),
+        ];
+        let results = backend
+            .download_chunks_parallel(&keys)
+            .await
+            .expect("parallel download");
+        assert_eq!(results.len(), 3);
+        // Each slot must be Some(non-empty).
+        for r in &results {
+            assert!(!r.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunks_parallel_empty_input_returns_empty() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api);
+        let got = backend
+            .download_chunks_parallel(&[])
+            .await
+            .expect("empty input is Ok");
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_and_download_manifest_round_trip() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            g.push(Ok(b"{\"v\":1}".to_vec()));
+        }
+        let backend = backend_with(api.clone());
+        backend
+            .upload_manifest("manifests/m.json", "{\"v\":1}")
+            .await
+            .expect("upload manifest");
+        let got = backend
+            .download_manifest("manifests/m.json")
+            .await
+            .expect("download manifest");
+        assert_eq!(got, "{\"v\":1}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_manifest_rejects_invalid_utf8() {
+        // The UTF-8 decode error classifies as `Other` → retryable, so
+        // the closure retries MAX_DOWNLOAD_RETRIES times. Push enough
+        // bad-byte responses to outlast the budget; the final error
+        // surfacing is what we care about.
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            for _ in 0..8 {
+                g.push(Ok(vec![0xff, 0xfe, 0xfd]));
+            }
+        }
+        let backend = backend_with(api);
+        let err = backend
+            .download_manifest("manifests/bad.json")
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, CloudError::Other(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_exists_true_and_false() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.exists_outcomes.lock().expect("queue");
+            g.push(Ok(true));
+            g.push(Ok(false));
+        }
+        let backend = backend_with(api.clone());
+        assert!(backend.chunk_exists("a").await.expect("exists"));
+        assert!(!backend.chunk_exists("b").await.expect("exists"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_exists_propagates_hard_error() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.exists_outcomes.lock().expect("queue");
+            g.push(Err(CloudError::Other("AccessDenied: forbidden".into())));
+        }
+        let backend = backend_with(api);
+        let err = backend.chunk_exists("a").await.expect_err("must error");
+        assert!(matches!(err, CloudError::Other(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_objects_strips_prefix() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.list_outcomes.lock().expect("queue");
+            g.push(Ok(vec![
+                "tapes/chunks/a.dat".to_string(),
+                "tapes/chunks/b.dat".to_string(),
+            ]));
+        }
+        let backend = backend_with(api);
+        let got = backend.list_objects("chunks/").await.expect("list");
+        assert_eq!(
+            got,
+            vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_objects_without_prefix_pass_through() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.list_outcomes.lock().expect("queue");
+            g.push(Ok(vec!["chunks/a.dat".to_string()]));
+        }
+        let backend = GcsBackend::with_api(
+            api,
+            "my-bucket".to_string(),
+            String::new(),
+            "my-project".to_string(),
+            CompressionConfig::disabled(),
+        );
+        let got = backend.list_objects("chunks/").await.expect("list");
+        assert_eq!(got, vec!["chunks/a.dat".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_object_invokes_api() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        backend.delete_object("chunks/x.dat").await.expect("delete");
+        assert_eq!(api.delete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_state_off_when_policy_absent() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.retention_outcomes.lock().expect("queue");
+            g.push(Ok(None));
+        }
+        let backend = backend_with(api);
+        assert_eq!(backend.lock_state().await.expect("lock"), LockState::Off);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_state_governance_when_unlocked() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.retention_outcomes.lock().expect("queue");
+            g.push(Ok(Some(RetentionPolicy {
+                seconds: 7 * 86_400,
+                is_locked: false,
+            })));
+        }
+        let backend = backend_with(api);
+        assert_eq!(
+            backend.lock_state().await.expect("lock"),
+            LockState::Governance { default_days: 7 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_state_compliance_when_locked() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.retention_outcomes.lock().expect("queue");
+            g.push(Ok(Some(RetentionPolicy {
+                seconds: 30 * 86_400,
+                is_locked: true,
+            })));
+        }
+        let backend = backend_with(api);
+        assert_eq!(
+            backend.lock_state().await.expect("lock"),
+            LockState::Compliance { default_days: 30 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_state_rounds_subday_to_one() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.retention_outcomes.lock().expect("queue");
+            g.push(Ok(Some(RetentionPolicy {
+                seconds: 60,
+                is_locked: false,
+            })));
+        }
+        let backend = backend_with(api);
+        assert_eq!(
+            backend.lock_state().await.expect("lock"),
+            LockState::Governance { default_days: 1 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_state_propagates_retention_error() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.retention_outcomes.lock().expect("queue");
+            g.push(Err(CloudError::Other("AccessDenied".into())));
+        }
+        let backend = backend_with(api);
+        backend.lock_state().await.expect_err("error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_object_legal_hold_passes_flag_through() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        backend
+            .set_object_legal_hold("chunks/x.dat", true)
+            .await
+            .expect("set hold");
+        backend
+            .set_object_legal_hold("chunks/x.dat", false)
+            .await
+            .expect("clear hold");
+        let captured = api.captured_hold_set.lock().expect("captured").clone();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].2);
+        assert!(!captured[1].2);
+        assert_eq!(captured[0].1, "tapes/chunks/x.dat");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_object_legal_hold_returns_api_value() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.hold_get_outcomes.lock().expect("queue");
+            g.push(Ok(true));
+            g.push(Ok(false));
+        }
+        let backend = backend_with(api);
+        assert!(
+            backend
+                .get_object_legal_hold("chunks/x.dat")
+                .await
+                .expect("get hold")
+        );
+        assert!(
+            !backend
+                .get_object_legal_hold("chunks/x.dat")
+                .await
+                .expect("get hold")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warmup_prefix_default_returns_zero() {
+        let backend = backend_with(Arc::new(MockGcsApi::default()));
+        // CloudBackend trait default — GCS doesn't override.
+        let n = backend.warmup_prefix("chunks/").await.expect("warmup");
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_versioned_delegates_to_upload_chunk() {
+        let api = Arc::new(MockGcsApi::default());
+        let backend = backend_with(api.clone());
+        backend
+            .upload_versioned("manifests/m.json", b"{}")
+            .await
+            .expect("upload versioned");
+        assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);
     }
 }

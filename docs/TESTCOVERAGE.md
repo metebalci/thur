@@ -67,13 +67,13 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-cli-alerting` | 57% | shared | `system alerting` CLI — reached via the CLIs + scripts |
 | `shared-cli-iscsi` | 56% | shared | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
 | `shared-cli-system` | 61% | shared | `system` CLI verbs — reached via the CLIs + scripts |
-| `shared-cloud` | 80% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
+| `shared-cloud` | 84% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
 | `shared-cloud-bench` | 36% | shared (exception) | cloud benchmark engine — reached via `system cloud benchmark` |
 | `shared-crypto` | 95% | **critical** | AES-256-GCM encrypt / decrypt, IV derivation |
 | `shared-dedup-stats` | 100% | **control-plane critical** | dedup exclusive / shared byte split |
 | `shared-health` | 100% | shared | `/health` liveness handler |
 | `shared-iscsi` | 87% | **critical** | iSCSI transport, CHAP auth, session + unit-attention |
-| `shared-keystore` | 79% | **critical** | six DEK keystore backends, wrap / unwrap round-trips |
+| `shared-keystore` | 85% | **critical** | six DEK keystore backends, wrap / unwrap round-trips |
 | `shared-naming` | 94% | shared | per-product identity strings |
 | `shared-pool` | 91% | **critical** | content-addressed chunk pool, insertion, GC iteration, budget |
 | `shared-telemetry` | 66% | shared | OpenTelemetry instrument plumbing |
@@ -167,32 +167,24 @@ so it isn't yet the CI gate.
   Validation, options, config loading, PRNG, error variants are unit-
   tested; the bench loop is reached via the `system cloud benchmark`
   integration path.
-- **`shared/cloud` gcs.rs (5%)** — pulls `shared/cloud` close to its
-  80% floor: `gcs.rs` (307 lines) is bound to the
-  `google-cloud-storage` SDK, which has no endpoint override that
-  the in-crate `wiremock` rig can drive (s3.rs and azure.rs both
-  use reqwest-based clients that accept a custom endpoint URL).
-  The GCS backend is exercised by `vsa/scripts/test-iscsi-fs-cloud.sh`
-  against a real GCS bucket; every other file in `shared/cloud` is
-  at 80%+ per-file and the crate as a whole sits at 80% — just on
-  the line. The `googleapis/google-cloud-rust` SDK ships an official
-  client-level mocking pattern that could close this gap with a
-  moderate `GcsBackend::new` refactor; tracked in
-  [`ROADMAP.md`](../ROADMAP.md).
+
+The three SDK-bound files we couldn't reach via `wiremock` —
+`shared/cloud/src/gcs.rs`, `shared/keystore/src/gcpkms.rs`,
+`shared/keystore/src/azurekv.rs` — are now mocked at the
+trait-seam boundary. Each backend struct holds an
+`Arc<dyn *Api>` (`GcsApi` / `GcpKmsApi` / `AzureKvApi`); the only
+SDK-touching code lives in sibling `*_api.rs` files exercised by
+`vsa/scripts/test-iscsi-fs-cloud.sh` (GCS) and
+`vsa/scripts/test-keystore.sh` (KMS / KV). The three target files
+sit at 93-95% per-file; the SDK adapter siblings sit at 36-66%
+without dragging either crate below its 80% floor.
 
 ## Active targets
 
 Crates currently below their integrated-mode floor — listed in priority
 order:
 
-1. **`shared/keystore` (79% integrated, 80.6% `--crates`)** — small
-   measurement drift vs `cargo llvm-cov`'s native number; not
-   actionable until the broader integrated-mode profraw merge bug is
-   resolved (see § Known measurement issues below). The proper close
-   path is the `azurekv.rs` (49%) and `gcpkms.rs` (30%) mocked-client
-   tests once the SDK refactor lands (same path as the gcs.rs note
-   above).
-2. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
+1. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
    action expected.
 
 ### Known measurement issues
