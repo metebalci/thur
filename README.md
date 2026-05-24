@@ -95,13 +95,30 @@ Thur VSA additionally provides:
 
 ## Install
 
-Each tagged release ships separate `.deb` / `.rpm` packages per
-product — `thurvtl` and `thurvsa`. One `.deb` covers Debian 12/13 +
-Ubuntu 24.04/26.04; one `.rpm` covers RHEL 9/10 + Rocky/Alma +
-SLES 15 SP6+/16 + openSUSE Leap. Only the `.deb` on Ubuntu 26.04 is
-regularly tested; other targets are best-effort. Products co-exist on
-one host with disjoint users, data dirs, conffiles, unit names, and
-admin sockets.
+The shortest path is the **https://thur.metebalci.com** apt / yum
+repository — one line on any supported distro:
+
+```bash
+curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
+```
+
+This wires up the `stable` channel; set `CHANNEL=dev` for the rolling
+development channel that tracks `main`. The script writes the right
+`sources.list.d` or `yum.repos.d` entry and installs the signing public
+key alongside it. The fingerprint is documented in
+[`docs/RELEASING.md`](docs/RELEASING.md) — verify it against the key
+the script imports.
+
+For air-gapped installs, offline staging, or anyone who'd rather not
+delegate the install ceremony to a piped shell script, the packages
+can also be downloaded directly from
+[GitHub Releases](https://github.com/metebalci/thur/releases). Each
+tagged release ships separate `.deb` / `.rpm` packages per product —
+`thurvtl` and `thurvsa`. One `.deb` covers Debian 12/13 + Ubuntu
+24.04/26.04; one `.rpm` covers RHEL 9/10 + Rocky/Alma + SLES 15 SP6+/16
++ openSUSE Leap. Only the `.deb` on Ubuntu 26.04 is regularly tested;
+other targets are best-effort. Products co-exist on one host with
+disjoint users, data dirs, conffiles, unit names, and admin sockets.
 
 Packages install to `/usr/bin/`, drop a systemd unit, and lay down a
 minimal starter conffile (`/etc/thurvtl/thurvtl.yaml` /
