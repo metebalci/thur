@@ -102,10 +102,11 @@ repository — one line on any supported distro:
 curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
 ```
 
-This wires up the `stable` channel; set `CHANNEL=dev` for the rolling
-development channel that tracks `main`. The script writes the right
-`sources.list.d` or `yum.repos.d` entry and installs the signing public
-key alongside it. The fingerprint is documented in
+This wires up the `stable` channel (GA only, 1.0.0+); set
+`CHANNEL=unstable` for the pre-GA channel that holds every 0.x and
+release-candidate tag. The script writes the right `sources.list.d` or
+`yum.repos.d` entry and installs the signing public key alongside it.
+The fingerprint is documented in
 [`docs/RELEASING.md`](docs/RELEASING.md) — verify it against the key
 the script imports.
 

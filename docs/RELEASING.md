@@ -288,13 +288,18 @@ operational source of truth for URL layout, Cloudflare wiring, secrets
 inventory, and the rotation procedure for the signing key. Two channels
 are published in parallel:
 
-- **stable** — accumulates over time. Each tagged release publishes its
-  `release-artifacts/*.deb` and `release-artifacts/*.rpm` into the stable
-  pool; apt picks the latest version matching the operator's constraints.
-  This is what production audiences should pin against.
-- **dev** — rolling. Replaced on every publish to track the tip of
-  `main`. For maintainer validation and operators who want to test
-  unreleased changes against staging.
+- **stable** — GA releases only (1.0.0+). Manually triggered via
+  `workflow_dispatch` in `thur.metebalci.com`; rare ceremony. Empty
+  until v1.0.0 ships.
+- **unstable** — every pre-GA tagged release (0.x, RCs, betas).
+  Auto-published on every release event in this repo via a small
+  `notify-publish.yml` bridge that fires `repository_dispatch` at
+  `thur.metebalci.com`. This is where 0.x operators install from
+  today.
+
+Both channels accumulate — every version ever published stays in the
+pool, so operators can pin against a specific tag rather than always
+taking the latest.
 
 The target audience is expected to pin versions, validate in staging, and
 deploy in change windows — not to `apt upgrade` storage software blindly.
