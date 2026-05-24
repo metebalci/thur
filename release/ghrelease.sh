@@ -138,7 +138,10 @@ esac
 #         cargo-generate-rpm stamps <package>-<ver>-<rel>.x86_64.rpm
 # .asc signatures track their parent — match against the name with
 # `.asc` stripped.
-DEB_VERSION="${VERSION//-/~}"
+# Backslash on the `~` is load-bearing: bash performs tilde expansion
+# on the replacement of `${var//pat/repl}`, so a bare `~` would expand
+# to $HOME and `0.1.0-dev.4` would turn into `0.1.0/home/yousilently.4`.
+DEB_VERSION="${VERSION//-/\~}"
 if [[ "$VERSION" == *-* ]]; then
     RPM_VERREL="${VERSION%%-*}-0.${VERSION#*-}"
 else
@@ -254,8 +257,14 @@ if [ "$ASSUME_YES" -ne 1 ]; then
     case "$REPLY" in
         y|Y|yes|YES) ;;
         *) echo "aborted."
-           [ "$TAG_EXISTS" -eq 1 ] || \
-               echo "note: local tag $TAG was created — remove it with: git tag -d $TAG"
+           # If we minted the tag in this run, drop it — the operator
+           # rejected the cut, so the local state should match.
+           # TAG_EXISTS=1 means the tag pre-existed at HEAD (recovered
+           # from a previous run that failed past tagging); leave it.
+           if [ "$TAG_EXISTS" -eq 0 ]; then
+               git tag -d "$TAG" >/dev/null
+               echo "       removed local tag $TAG."
+           fi
            exit 1 ;;
     esac
 fi
