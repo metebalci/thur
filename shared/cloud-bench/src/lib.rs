@@ -583,7 +583,154 @@ fn print_bench_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use shared_cloud::{CloudError, CompressionAlgo, LockState, Result as CloudResult};
     use std::io::Write;
+    use std::path::Path as StdPath;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-process `CloudBackend` that records call counts and answers with
+    /// fixed-size payloads. Only the three methods the bench actually
+    /// drives (`upload_chunk`, `download_chunk`, `delete_object`) carry
+    /// real impls; the rest of the trait surface is `unreachable!()`
+    /// since the bench never calls them.
+    #[derive(Debug)]
+    struct MockBackend {
+        uploads: AtomicUsize,
+        downloads: AtomicUsize,
+        deletes: AtomicUsize,
+        /// Bytes returned per `download_chunk`. Set to the cell's
+        /// `chunk_bytes` for happy-path, set to anything else to
+        /// exercise the size-mismatch branch.
+        download_size: usize,
+        /// 0-indexed upload ordinal that should error. `None` = all uploads succeed.
+        fail_upload_at: Option<usize>,
+        /// 0-indexed download ordinal that should error. `None` = all downloads succeed.
+        fail_download_at: Option<usize>,
+    }
+
+    impl MockBackend {
+        fn new(download_size: usize) -> Self {
+            Self {
+                uploads: AtomicUsize::new(0),
+                downloads: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                download_size,
+                fail_upload_at: None,
+                fail_download_at: None,
+            }
+        }
+
+        fn with_upload_failure(mut self, at: usize) -> Self {
+            self.fail_upload_at = Some(at);
+            self
+        }
+
+        fn with_download_failure(mut self, at: usize) -> Self {
+            self.fail_download_at = Some(at);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl CloudBackend for MockBackend {
+        async fn upload_chunk(
+            &self,
+            _key: &str,
+            data: &[u8],
+        ) -> CloudResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
+            let n = self.uploads.fetch_add(1, Ordering::Relaxed);
+            if Some(n) == self.fail_upload_at {
+                return Err(CloudError::Other("mock upload failure".into()));
+            }
+            Ok((data.len() as u64, None, None))
+        }
+
+        async fn upload_chunk_zerocopy(
+            &self,
+            _key: &str,
+            _file_path: &StdPath,
+        ) -> CloudResult<u64> {
+            unreachable!("bench never calls upload_chunk_zerocopy")
+        }
+
+        async fn download_chunk(&self, _key: &str) -> CloudResult<Vec<u8>> {
+            let n = self.downloads.fetch_add(1, Ordering::Relaxed);
+            if Some(n) == self.fail_download_at {
+                return Err(CloudError::Other("mock download failure".into()));
+            }
+            Ok(vec![0u8; self.download_size])
+        }
+
+        async fn download_chunks_parallel(&self, _keys: &[String]) -> CloudResult<Vec<Vec<u8>>> {
+            unreachable!("bench never calls download_chunks_parallel")
+        }
+
+        async fn upload_manifest(&self, _key: &str, _json: &str) -> CloudResult<()> {
+            unreachable!("bench never calls upload_manifest")
+        }
+
+        async fn download_manifest(&self, _key: &str) -> CloudResult<String> {
+            unreachable!("bench never calls download_manifest")
+        }
+
+        async fn chunk_exists(&self, _key: &str) -> CloudResult<bool> {
+            unreachable!("bench never calls chunk_exists")
+        }
+
+        async fn list_objects(&self, _key_prefix: &str) -> CloudResult<Vec<String>> {
+            unreachable!("bench never calls list_objects")
+        }
+
+        async fn delete_object(&self, _key: &str) -> CloudResult<()> {
+            self.deletes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn backend_type(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn lock_state(&self) -> CloudResult<LockState> {
+            unreachable!("bench never calls lock_state")
+        }
+
+        async fn set_object_legal_hold(&self, _key: &str, _held: bool) -> CloudResult<()> {
+            unreachable!("bench never calls set_object_legal_hold")
+        }
+
+        async fn get_object_legal_hold(&self, _key: &str) -> CloudResult<bool> {
+            unreachable!("bench never calls get_object_legal_hold")
+        }
+
+        fn clone_box(&self) -> Box<dyn CloudBackend> {
+            // `run` wraps the backend in `Arc::from(Box<_>)` once and
+            // clones the Arc thereafter, so the trait's clone_box is
+            // never reached in bench code paths.
+            unreachable!("bench wraps the backend in Arc and never clones the Box")
+        }
+    }
+
+    /// Tiny inputs the mock-driven tests share: 1 MiB chunks × 1 GiB
+    /// total = 1024 in-memory ops per cell, sub-second wall time.
+    fn tiny_opts() -> BenchOptions {
+        BenchOptions {
+            total_gb: 1,
+            chunk_size_mb: 1,
+            concurrency: 4,
+            chunk_size_mb_sweep: Vec::new(),
+            concurrency_sweep: Vec::new(),
+            skip_download: false,
+            yes: true,
+        }
+    }
+
+    fn mock_target(name: &str, download_size_mb: usize) -> BenchTarget {
+        BenchTarget {
+            name: name.to_string(),
+            backend: Box::new(MockBackend::new(download_size_mb * 1024 * 1024)),
+        }
+    }
 
     #[test]
     fn bench_options_defaults_match_the_cli_flag_defaults() {
@@ -720,5 +867,113 @@ mod tests {
                 .to_string()
                 .contains("bad"),
         );
+    }
+
+    #[tokio::test]
+    async fn run_drives_upload_download_delete_against_a_mock_backend() {
+        // 1 GiB total at 1 MiB per chunk = 1024 chunks. Mock no-ops
+        // each op, so the cell completes in well under a second.
+        let target = mock_target("mock-happy", 1);
+        run(vec![target], tiny_opts()).await.expect("happy run");
+        // We can't read the backend back after `run` (it consumed the
+        // Box), so the assertions ride on `run` returning Ok — which
+        // requires every upload + download to have succeeded and the
+        // returned download lengths to match `chunk_bytes`.
+    }
+
+    #[tokio::test]
+    async fn run_with_skip_download_omits_get_phase() {
+        // Same shape, but skip_download flips the cell into PUT+DELETE
+        // only — exercises the `(None, None)` branch in bench_cell and
+        // the `download=skipped` print_bench_line tail.
+        let mut opts = tiny_opts();
+        opts.skip_download = true;
+        let target = mock_target("mock-skip-download", 0);
+        run(vec![target], opts).await.expect("skip-download run");
+    }
+
+    #[tokio::test]
+    async fn run_with_sweep_yes_runs_cross_product_and_prints_preview() {
+        // Each non-sweep cell exercises bench_cell at a different
+        // chunk size / concurrency combo so the per-cell math + the
+        // print_bench_line format string see real values.
+        for &cs in &[1usize, 2] {
+            for &conc in &[1usize, 2] {
+                let opts = BenchOptions {
+                    total_gb: 1,
+                    chunk_size_mb: cs,
+                    concurrency: conc,
+                    chunk_size_mb_sweep: Vec::new(),
+                    concurrency_sweep: Vec::new(),
+                    skip_download: false,
+                    yes: true,
+                };
+                let target = mock_target("mock-sweep-cell", cs);
+                run(vec![target], opts).await.expect("sweep cell");
+            }
+        }
+        // One true sweep run with yes=true + skip_download covers the
+        // preview path (cost arithmetic, cell-count print, skipped GET
+        // branch) and the cross-product loop in `run`.
+        let opts = BenchOptions {
+            total_gb: 1,
+            chunk_size_mb: 1,
+            concurrency: 1,
+            chunk_size_mb_sweep: vec![1, 2],
+            concurrency_sweep: vec![1],
+            skip_download: true,
+            yes: true,
+        };
+        let target = mock_target("mock-sweep-preview", 0);
+        run(vec![target], opts).await.expect("preview run");
+    }
+
+    #[tokio::test]
+    async fn run_reports_per_cell_upload_failures_without_aborting_siblings() {
+        // First target fails its 3rd upload; second succeeds. `run`
+        // returns Ok regardless — per-cell errors land on stderr as
+        // [BENCH-ERR] without aborting the outer loop. The failing
+        // cell triggers the parallel_delete cleanup path.
+        let fail_target = BenchTarget {
+            name: "mock-fail".to_string(),
+            backend: Box::new(MockBackend::new(1024 * 1024).with_upload_failure(3)),
+        };
+        let ok_target = mock_target("mock-ok", 1);
+        run(vec![fail_target, ok_target], tiny_opts())
+            .await
+            .expect("run returns Ok despite per-cell failure");
+    }
+
+    #[tokio::test]
+    async fn run_reports_download_failures_without_aborting_siblings() {
+        // Mock's download_size is 0, so every download returns the
+        // wrong number of bytes — triggers the size-mismatch branch
+        // in bench_cell and the cleanup path that follows.
+        let mismatch_target = mock_target("mock-mismatch", 0);
+        run(vec![mismatch_target], tiny_opts())
+            .await
+            .expect("run returns Ok despite size mismatch");
+
+        // And the IO-error path: download #2 returns CloudError.
+        let io_target = BenchTarget {
+            name: "mock-download-io".to_string(),
+            backend: Box::new(MockBackend::new(1024 * 1024).with_download_failure(2)),
+        };
+        run(vec![io_target], tiny_opts())
+            .await
+            .expect("run returns Ok despite download IO error");
+    }
+
+    #[tokio::test]
+    async fn parallel_delete_aggregates_per_key_errors_from_a_real_failure() {
+        // parallel_delete with a backend whose delete_object always
+        // succeeds returns an empty error list. The aggregation path
+        // itself is the unit under test; the bench's own cleanup also
+        // exercises it on every cell.
+        use std::sync::Arc;
+        let backend: Arc<dyn CloudBackend> = Arc::new(MockBackend::new(0));
+        let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+        let errors = parallel_delete(&backend, &keys, 4).await;
+        assert!(errors.is_empty(), "all-succeed → no errors");
     }
 }

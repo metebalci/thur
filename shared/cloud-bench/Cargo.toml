@@ -26,3 +26,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 [dev-dependencies]
 # Temp config files for the load_cloud_config / run_from_config_path tests.
 tempfile = "3"
+# In-crate MockCloudBackend impl for driving run() / bench_cell() / sweep
+# paths without a real cloud target.
+async-trait = "0.1"

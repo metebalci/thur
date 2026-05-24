@@ -68,7 +68,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-cli-iscsi` | 56% | shared | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
 | `shared-cli-system` | 61% | shared | `system` CLI verbs — reached via the CLIs + scripts |
 | `shared-cloud` | 84% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
-| `shared-cloud-bench` | 36% | shared (exception) | cloud benchmark engine — reached via `system cloud benchmark` |
+| `shared-cloud-bench` | 90% | shared | cloud benchmark engine — driven by a `MockCloudBackend` in-crate |
 | `shared-crypto` | 95% | **critical** | AES-256-GCM encrypt / decrypt, IV derivation |
 | `shared-dedup-stats` | 100% | **control-plane critical** | dedup exclusive / shared byte split |
 | `shared-health` | 100% | shared | `/health` liveness handler |
@@ -159,14 +159,6 @@ needs sudo for the kernel-initiator suites and takes 10-20 minutes.
 
 ### Structural sub-floor exceptions
 
-- **`shared/cloud-bench` (36% < 50%)** — the bench engine
-  (`bench_cell` / `parallel_delete` / the print helpers) is a
-  throughput probe whose minimum useful transfer is **1 GiB per
-  cell**, allocated in memory and pushed through a real `CloudBackend`.
-  Validation, options, config loading, PRNG, error variants are unit-
-  tested; the bench loop is reached via the `system cloud benchmark`
-  integration path.
-
 The three SDK-bound files we couldn't reach via `wiremock` —
 `shared/cloud/src/gcs.rs`, `shared/keystore/src/gcpkms.rs`,
 `shared/keystore/src/azurekv.rs` — are now mocked at the
@@ -180,11 +172,7 @@ without dragging either crate below its 80% floor.
 
 ## Active targets
 
-Crates currently below their integrated-mode floor — listed in priority
-order:
-
-1. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
-   action expected.
+No crates are currently below their integrated-mode floor.
 
 ## End-to-end suites
 

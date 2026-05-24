@@ -4653,6 +4653,7 @@ dependencies = [
 name = "shared-cloud-bench"
 version = "0.1.0-dev.4"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "serde",
