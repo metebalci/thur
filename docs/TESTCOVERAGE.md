@@ -155,8 +155,7 @@ The product daemons and CLIs carry the lower 30% floor because their
 request paths are exercised by the end-to-end shell suites, which the
 **`--crates`** mode does not capture. Running **`--integrated`**
 captures them and lifts the four product crates to 50-60%; that mode
-needs sudo for the kernel-initiator suites and takes 10-20 minutes,
-so it isn't yet the CI gate.
+needs sudo for the kernel-initiator suites and takes 10-20 minutes.
 
 ### Structural sub-floor exceptions
 
@@ -186,17 +185,6 @@ order:
 
 1. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
    action expected.
-
-### Known measurement issues
-
-The `--integrated` runner's `llvm-profdata merge` step globs
-`target/llvm-cov-target/thur-*.profraw`, but the unit-test profraws
-produced by `cargo llvm-cov --no-report --workspace` end up in a
-location that doesn't survive the shell-suite phase by the time the
-merge runs — only the shell-suite-spawned daemon profraws are
-consolidated. This depresses every crate's integrated-mode number,
-not just `shared/keystore`. The `--crates` mode is unaffected and
-remains the authoritative unit-mode gate for CI.
 
 ## End-to-end suites
 

@@ -98,16 +98,29 @@ integrated_report() {
         exit 2
     fi
 
-    local prof_dir="target/llvm-cov-target"
-    local profraw_pattern="${PWD}/${prof_dir}/thur-%p-%8m.profraw"
+    local llvmcov_dir="target/llvm-cov-target"
+    local shell_profraw_pattern="${PWD}/${llvmcov_dir}/thur-shell-%p-%8m.profraw"
 
-    echo "[1/3] Building instrumented binaries + running unit tests ..." >&2
+    echo "[1/4] Unit tests via cargo-llvm-cov ..." >&2
+    # Run cargo-llvm-cov BEFORE eval'ing show-env. The reverse order trips
+    # the documented "cargo-llvm-cov subcommands other than report and
+    # clean may not work correctly in context where environment variables
+    # are set by show-env" warning, which silently produces non-
+    # instrumented test bins for ~85% of workspace crates (and sometimes
+    # SIGKILLs mid-build). Test bins land in target/llvm-cov-target/debug/deps/.
     cargo llvm-cov clean --workspace >&2
-    eval "$(cargo llvm-cov show-env --sh 2>/dev/null)"
-    cargo build --workspace --bins >&2
     cargo llvm-cov --no-report --workspace >&2
 
-    echo "[2/3] Driving shell suites (sudo'd kernel-initiator runs included) ..." >&2
+    echo "[2/4] Instrumented daemon binaries for shell suites ..." >&2
+    # Now safe to eval show-env — we won't invoke cargo-llvm-cov again
+    # under this env. The wrapper instruments `cargo build` outputs at
+    # target/debug/, which is where the shell suites look for thurv{tl,sa}d.
+    eval "$(cargo llvm-cov show-env --sh 2>/dev/null)"
+    mkdir -p "$llvmcov_dir"
+    export LLVM_PROFILE_FILE="$shell_profraw_pattern"
+    cargo build --workspace --bins >&2
+
+    echo "[3/4] Driving shell suites (sudo'd kernel-initiator runs included) ..." >&2
     # `set +e` for the loop: a single failing suite shouldn't abandon
     # the whole capture — we still want partial coverage data merged.
     set +e
@@ -137,34 +150,40 @@ integrated_report() {
     )
     for s in "${no_sudo[@]}"; do
         echo "  - $s" >&2
-        LLVM_PROFILE_FILE="$profraw_pattern" ./"$s" >/dev/null 2>&1 || true
+        LLVM_PROFILE_FILE="$shell_profraw_pattern" ./"$s" >/dev/null 2>&1 || true
     done
     for entry in "${soak[@]}"; do
         echo "  - $entry" >&2
-        env $entry LLVM_PROFILE_FILE="$profraw_pattern" bash -c \
+        env $entry LLVM_PROFILE_FILE="$shell_profraw_pattern" bash -c \
             'eval "$1 ./$2"' _ "${entry%% *}" "${entry##* }" >/dev/null 2>&1 || true
     done
     for s in "${sudo_set[@]}"; do
         echo "  - sudo $s" >&2
-        sudo LLVM_PROFILE_FILE="$profraw_pattern" ./"$s" >/dev/null 2>&1 || true
+        sudo LLVM_PROFILE_FILE="$shell_profraw_pattern" ./"$s" >/dev/null 2>&1 || true
     done
     set -e
 
-    echo "[3/3] Merging + exporting integrated report ..." >&2
-    local count
-    count=$(find "$prof_dir" -name 'thur-*.profraw' 2>/dev/null | wc -l)
-    echo "  collected ${count} profraw file(s)" >&2
+    echo "[4/4] Merging + exporting integrated report ..." >&2
+    # Profraws from step [1/4] land where cargo-llvm-cov puts them
+    # (target/llvm-cov-target/ and sometimes target/), step [3/4]'s
+    # shell suites use $shell_profraw_pattern under target/llvm-cov-target/.
+    # Glob the union.
+    local profraws=()
+    while IFS= read -r -d '' p; do
+        profraws+=("$p")
+    done < <(find target -name '*.profraw' -print0 2>/dev/null)
+    echo "  collected ${#profraws[@]} profraw file(s)" >&2
 
-    "$PROFDATA" merge -sparse "$prof_dir"/thur-*.profraw -o /tmp/thur-integrated.profdata >&2
+    "$PROFDATA" merge -sparse "${profraws[@]}" -o /tmp/thur-integrated.profdata >&2
 
-    # Build -object list: every test binary (cargo llvm-cov discovers
-    # these via --no-report above) plus the four bin targets the shell
-    # suites spawn.
+    # Build -object list: instrumented test bins (cargo-llvm-cov put
+    # them in target/llvm-cov-target/debug/deps/) plus the four daemon
+    # bins the shell suites spawn (target/debug/, built in step [2/4]).
     local obj_args=()
     local b
     while IFS= read -r -d '' b; do
         obj_args+=(-object="$b")
-    done < <(find "${prof_dir}/debug/deps" -maxdepth 1 -type f -executable \
+    done < <(find target/llvm-cov-target/debug/deps -maxdepth 1 -type f -executable \
         -not -name "*.d" -not -name "*.rlib" -not -name "*.so" -print0 2>/dev/null)
     for b in target/debug/thurvtld target/debug/thurvsad \
              target/debug/thurvtl target/debug/thurvsa; do
