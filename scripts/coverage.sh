@@ -6,22 +6,22 @@
 # scripts/coverage.sh — workspace test-coverage report.
 #
 # Modes:
-#   (no args)   cargo llvm-cov --workspace --summary-only (per-file table)
-#   --crates    per-crate line coverage vs. the tier-floor table
-#   --gate      like --crates, but exit 1 if any crate is below its floor
-#   --zero      list non-trivial source files with no #[cfg(test)] block
-#               (reviewed-trivial files are listed in coverage-exempt.txt)
+#   (no args)        cargo llvm-cov --workspace --summary-only (per-file table)
+#   --crates         per-crate line coverage vs. the tier-floor table
+#                    (unit tests only — `cargo test` paths)
+#   --gate           like --crates, but exit 1 if any crate is below its floor
+#   --integrated     end-to-end coverage: unit tests PLUS instrumented daemon
+#                    runs from the shell suites under vtl/scripts/ and
+#                    vsa/scripts/. Self-elevates via sudo for the kernel-
+#                    initiator suites. Takes 10-20 minutes.
+#   --integrated-gate same as --integrated, but exit 1 below floor
+#   --zero           list non-trivial source files with no #[cfg(test)] block
+#                    (reviewed-trivial files are listed in coverage-exempt.txt)
 #
-# Coverage floors (line %):
-#   80  core/*, scsi/*, nvme/*, and the critical shared crates
-#       (crypto, pool, iscsi, audit, keystore, cloud)
-#   50  all other shared/* crates
-#   30  product daemons + CLIs (vtl/*, vsa/*)
-#
-# The CI build-failure gate (--gate) is wired separately; a plain run is
-# advisory. cargo-llvm-cov instruments only the `cargo test` suite — the
-# end-to-end shell suites under vtl/scripts/ and vsa/scripts/ are not
-# captured here, so daemon/CLI numbers read low by construction.
+# Coverage floors (line %) — see scripts/coverage-report.py for the table.
+# Tier-1 critical sits at 80%, tier-2 control-plane critical at 80%,
+# standard shared at 50%, products at 30% (raised once integrated mode
+# becomes the default measurement).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -66,6 +66,120 @@ crate_report() {
     python3 scripts/coverage-report.py "$json" "$@"
 }
 
+# --integrated mode: unit tests + shell-suite daemon runs, one merged
+# report. The shell suites drive the compiled `thurv{tl,sa}d` binaries
+# (which `cargo llvm-cov report` doesn't auto-discover), so we run the
+# underlying `llvm-profdata merge` + `llvm-cov export` pipeline by hand
+# with every binary the daemon-side could fire wired up via `-object`.
+#
+# Three phases:
+#   1. Build the bin-target instrumented binaries + run unit tests
+#      (these populate target/llvm-cov-target/thur-*.profraw).
+#   2. Run the no-sudo shell suites with LLVM_PROFILE_FILE set to the
+#      same profraw pattern, then re-invoke the sudo-required ones via
+#      `sudo LLVM_PROFILE_FILE=... <script>` so the daemon child
+#      process inherits the env var across the sudo boundary.
+#   3. Merge every profraw into one profdata, export JSON via the
+#      LLVM toolchain bundled with rustup, feed coverage-report.py.
+integrated_report() {
+    # Caller passes --gate (or nothing); we always tack on --integrated
+    # so coverage-report.py applies the stricter floor map.
+    local extra_args=("--integrated")
+    if [[ "${1:-}" == "--gate" ]]; then
+        extra_args+=("--gate")
+    fi
+    local llvm_bin
+    llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host:/{print $2}')/bin"
+    local PROFDATA="${llvm_bin}/llvm-profdata"
+    local LLVMCOV="${llvm_bin}/llvm-cov"
+    if [[ ! -x "$PROFDATA" || ! -x "$LLVMCOV" ]]; then
+        echo "rustup llvm-tools not found at ${llvm_bin}" >&2
+        echo "  install with: rustup component add llvm-tools-preview" >&2
+        exit 2
+    fi
+
+    local prof_dir="target/llvm-cov-target"
+    local profraw_pattern="${PWD}/${prof_dir}/thur-%p-%8m.profraw"
+
+    echo "[1/3] Building instrumented binaries + running unit tests ..." >&2
+    cargo llvm-cov clean --workspace >&2
+    eval "$(cargo llvm-cov show-env --sh 2>/dev/null)"
+    cargo build --workspace --bins >&2
+    cargo llvm-cov --no-report --workspace >&2
+
+    echo "[2/3] Driving shell suites (sudo'd kernel-initiator runs included) ..." >&2
+    # `set +e` for the loop: a single failing suite shouldn't abandon
+    # the whole capture — we still want partial coverage data merged.
+    set +e
+    local no_sudo=(
+        "vsa/scripts/test-smoke.sh"
+        "vtl/scripts/test-smoke.sh"
+        "vsa/scripts/test-iscsi-conformance.sh"
+        "vtl/scripts/test-iscsi-conformance.sh"
+        "vsa/scripts/test-crash-audit-append.sh"
+        "vtl/scripts/test-crash-audit-append.sh"
+        "vtl/scripts/test-backup-cloud-resume.sh"
+        "scripts/test-coresident-smoke.sh"
+    )
+    local soak=(
+        "THURVSA_SOAK=1 vsa/scripts/test-multi-volume-dedup.sh"
+        "THURVTL_SOAK=1 vtl/scripts/test-many-cartridge-lifecycle.sh"
+    )
+    local sudo_set=(
+        "vsa/scripts/test-iscsi-fs-workflow.sh"
+        "vsa/scripts/test-scsi-conformance.sh"
+        "vtl/scripts/test-scsi-conformance.sh"
+        "vtl/scripts/test-backup-workflow.sh"
+        "vsa/scripts/test-nvmetcp-conformance.sh"
+        "vsa/scripts/test-nvme-fs-workflow.sh"
+        "vsa/scripts/test-crash-page-flush.sh"
+        "vtl/scripts/test-crash-chunk-seal.sh"
+    )
+    for s in "${no_sudo[@]}"; do
+        echo "  - $s" >&2
+        LLVM_PROFILE_FILE="$profraw_pattern" ./"$s" >/dev/null 2>&1 || true
+    done
+    for entry in "${soak[@]}"; do
+        echo "  - $entry" >&2
+        env $entry LLVM_PROFILE_FILE="$profraw_pattern" bash -c \
+            'eval "$1 ./$2"' _ "${entry%% *}" "${entry##* }" >/dev/null 2>&1 || true
+    done
+    for s in "${sudo_set[@]}"; do
+        echo "  - sudo $s" >&2
+        sudo LLVM_PROFILE_FILE="$profraw_pattern" ./"$s" >/dev/null 2>&1 || true
+    done
+    set -e
+
+    echo "[3/3] Merging + exporting integrated report ..." >&2
+    local count
+    count=$(find "$prof_dir" -name 'thur-*.profraw' 2>/dev/null | wc -l)
+    echo "  collected ${count} profraw file(s)" >&2
+
+    "$PROFDATA" merge -sparse "$prof_dir"/thur-*.profraw -o /tmp/thur-integrated.profdata >&2
+
+    # Build -object list: every test binary (cargo llvm-cov discovers
+    # these via --no-report above) plus the four bin targets the shell
+    # suites spawn.
+    local obj_args=()
+    local b
+    while IFS= read -r -d '' b; do
+        obj_args+=(-object="$b")
+    done < <(find "${prof_dir}/debug/deps" -maxdepth 1 -type f -executable \
+        -not -name "*.d" -not -name "*.rlib" -not -name "*.so" -print0 2>/dev/null)
+    for b in target/debug/thurvtld target/debug/thurvsad \
+             target/debug/thurvtl target/debug/thurvsa; do
+        [[ -x "$b" ]] && obj_args+=(-object="$b")
+    done
+
+    "$LLVMCOV" export \
+        -instr-profile /tmp/thur-integrated.profdata \
+        -format=text \
+        --ignore-filename-regex='(rustc|\.cargo/registry|\.rustup|/target/)' \
+        "${obj_args[@]}" > /tmp/thur-integrated.json 2>/dev/null
+
+    python3 scripts/coverage-report.py /tmp/thur-integrated.json "${extra_args[@]}"
+}
+
 case "$MODE" in
     summary)
         cargo llvm-cov --workspace --summary-only
@@ -76,11 +190,17 @@ case "$MODE" in
     --gate)
         crate_report --gate
         ;;
+    --integrated)
+        integrated_report
+        ;;
+    --integrated-gate)
+        integrated_report --gate
+        ;;
     --zero)
         zero_mode
         ;;
     *)
-        echo "usage: $0 [--crates|--gate|--zero]" >&2
+        echo "usage: $0 [--crates|--gate|--integrated|--integrated-gate|--zero]" >&2
         exit 2
         ;;
 esac

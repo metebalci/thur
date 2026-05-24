@@ -12,32 +12,62 @@ import os
 import sys
 
 # Workspace members, grouped by coverage floor (line %).
-CRITICAL_80 = [
+#
+# Two critical tiers — separated by failure mode, not by criticality
+# level. Tier 1 is data-path: bugs corrupt or lose on-disk / cloud
+# data silently. Tier 2 is control-plane: bugs cause silent
+# operational failures (admin socket down, alert never fires, integrity
+# check skipped) or unrecoverable backups.
+CRITICAL_DATA_PATH_80 = [
     "core/stream", "core/mediachanger", "core/block",
     "scsi/spc", "scsi/ssc", "scsi/smc", "scsi/sbc",
     "nvme/base", "nvme/nvm", "nvme/tcp",
     "shared/crypto", "shared/pool", "shared/iscsi",
     "shared/audit", "shared/keystore", "shared/cloud",
 ]
+CRITICAL_CONTROL_PLANE_80 = [
+    "shared/admin-server",   # admin Unix-socket bind, peer-cred, jobs
+    "shared/verify-core",    # pool / cloud integrity sweep
+    "shared/upload-worker",  # cloud PUT + HEAD-probe primitive
+    "shared/dedup-stats",    # operator-visible dedup math
+]
 PRODUCTS_30 = ["vtl/daemon", "vtl/cli", "vsa/daemon", "vsa/cli"]
 SHARED_50 = [
     "shared/admin-audit", "shared/admin-client", "shared/admin-http",
-    "shared/admin-iscsi", "shared/admin-proto", "shared/admin-server",
+    "shared/admin-iscsi", "shared/admin-proto",
     "shared/alerting", "shared/cli", "shared/cli-alerting",
     "shared/cli-iscsi", "shared/cli-system", "shared/cloud-bench",
-    "shared/dedup-stats", "shared/health", "shared/naming",
-    "shared/telemetry", "shared/upload-worker", "shared/verify-core",
+    "shared/health", "shared/naming",
+    "shared/telemetry",
 ]
 
-FLOOR = {}
-for d in CRITICAL_80:
-    FLOOR[d] = 80
+# Two floor maps: one for `--crates` (unit tests only), one for
+# `--integrated`. Control-plane critical crates carry an integrated-
+# mode floor of 80% but stay at 50% in unit mode — their request
+# paths fire mainly via the shell suites, so demanding the strict
+# bar in unit mode would gate CI on tests that already exist (just
+# in a different runner).
+FLOOR_UNIT = {}
+for d in CRITICAL_DATA_PATH_80:
+    FLOOR_UNIT[d] = 80
+for d in CRITICAL_CONTROL_PLANE_80:
+    FLOOR_UNIT[d] = 50
 for d in PRODUCTS_30:
-    FLOOR[d] = 30
+    FLOOR_UNIT[d] = 30
 for d in SHARED_50:
-    FLOOR[d] = 50
+    FLOOR_UNIT[d] = 50
 
-MEMBERS = sorted(FLOOR, key=len, reverse=True)
+FLOOR_INTEGRATED = {}
+for d in CRITICAL_DATA_PATH_80:
+    FLOOR_INTEGRATED[d] = 80
+for d in CRITICAL_CONTROL_PLANE_80:
+    FLOOR_INTEGRATED[d] = 80
+for d in PRODUCTS_30:
+    FLOOR_INTEGRATED[d] = 30
+for d in SHARED_50:
+    FLOOR_INTEGRATED[d] = 50
+
+MEMBERS = sorted(FLOOR_UNIT, key=len, reverse=True)
 
 
 def crate_for(path, root):
@@ -51,7 +81,11 @@ def crate_for(path, root):
 
 def main():
     json_path = sys.argv[1]
-    gate = "--gate" in sys.argv[2:]
+    extra = sys.argv[2:]
+    gate = "--gate" in extra
+    # `--integrated` picks the stricter floor map; default is unit-mode.
+    integrated = "--integrated" in extra
+    FLOOR = FLOOR_INTEGRATED if integrated else FLOOR_UNIT
     root = os.getcwd()
 
     with open(json_path) as fh:
@@ -68,8 +102,11 @@ def main():
             agg[crate][0] += lines["covered"]
             agg[crate][1] += lines["count"]
 
+    cp_floor = 80 if integrated else 50
     tiers = [
-        ("Critical (floor 80%)", CRITICAL_80, 80),
+        ("Critical data-path (floor 80%)", CRITICAL_DATA_PATH_80, 80),
+        (f"Critical control-plane (floor {cp_floor}%)",
+         CRITICAL_CONTROL_PLANE_80, cp_floor),
         ("Shared (floor 50%)", SHARED_50, 50),
         ("Products (floor 30%)", PRODUCTS_30, 30),
     ]
@@ -83,13 +120,14 @@ def main():
         for c in sorted(crates):
             covered, total = agg[c]
             pct = (100.0 * covered / total) if total else 0.0
-            if pct + 1e-9 >= floor:
+            crate_floor = FLOOR[c]
+            if pct + 1e-9 >= crate_floor:
                 status = "ok"
             else:
-                status = "LOW  (-{:.0f})".format(floor - pct)
-                below.append((c, pct, floor))
+                status = "LOW  (-{:.0f})".format(crate_floor - pct)
+                below.append((c, pct, crate_floor))
             print("  {:<24} {:>6.1f}  {:>6}  {}".format(
-                c, pct, floor, status))
+                c, pct, crate_floor, status))
 
     print()
     if below:
