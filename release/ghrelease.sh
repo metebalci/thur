@@ -35,19 +35,24 @@ ghrelease.sh — tag the release commit and publish it to GitHub Releases.
 Run after release/release.sh and after smoke-testing the artifacts.
 
 Usage:
-  release/ghrelease.sh                 tag message = HEAD commit message
-  release/ghrelease.sh -m "summary"    tag message inline
-  release/ghrelease.sh -F notes.md     tag message from a file
+  release/ghrelease.sh                 tag message = v<version> (stub);
+                                       GitHub release body is empty
+  release/ghrelease.sh -m "summary"    tag message inline (also the body)
+  release/ghrelease.sh -F notes.md     tag message from a file (also the body)
   release/ghrelease.sh -e              open $EDITOR for the tag message
+                                       (also the body)
   release/ghrelease.sh -y              skip the confirmation prompt
 
-Default tag message is the HEAD commit message — the release-cut flow
-(see docs/RELEASING.md) commits "release: vX.Y.Z" right before this
-script runs, so HEAD already IS the release commit. Pass -m / -F to
-override, or -e to compose interactively.
+Default: the tag message is a bare stub (the tag already says
+v<version>) and the GitHub Release body is empty. With stable and
+prerelease tags interleaved there is no single "previous tag" worth
+auto-comparing against — operators who want a commit list pick the
+pair themselves (.../compare/<old-tag>...<new-tag>). Pass -m / -F / -e
+to write real notes; that text becomes both the tag message and the
+release body (via --notes-from-tag).
 
-The tag is v<version> (from the root Cargo.toml); the GitHub Release
-body is the tag message; a -alpha/-beta/-rc version is a pre-release.
+The tag is v<version> (from the root Cargo.toml); a -alpha/-beta/-rc
+version is a pre-release.
 EOF
 }
 
@@ -202,20 +207,29 @@ if EXISTING=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}" 2>/dev/null)
 fi
 
 # ---- create the signed tag ----
+# Track whether the operator wrote a real tag message. If they did, the
+# GitHub Release body uses --notes-from-tag so their text surfaces; if
+# not, the tag message is a bare stub and the body is built from
+# --generate-notes (commits since the last tag).
+CUSTOM_MSG=0
 if [ "$TAG_EXISTS" -eq 1 ]; then
     echo "==> reusing existing tag $TAG (already at HEAD)"
+    # An existing tag's message is whatever it was when first created;
+    # honor it as authoritative.
+    CUSTOM_MSG=1
 elif [ -n "$TAG_MSG" ]; then
     git tag -s "$TAG" -m "$TAG_MSG"
+    CUSTOM_MSG=1
 elif [ -n "$TAG_MSG_FILE" ]; then
     git tag -s "$TAG" -F "$TAG_MSG_FILE"
+    CUSTOM_MSG=1
 elif [ "$EDIT_MSG" -eq 1 ]; then
     git tag -s "$TAG"            # opens $EDITOR for the release notes
+    CUSTOM_MSG=1
 else
-    # Default: HEAD commit message. The release-cut flow makes the
-    # bump commit ("release: vX.Y.Z") right before this script runs,
-    # so HEAD IS the release commit — no need to retype anything.
-    echo "==> tag message: HEAD commit message ($(git log -1 --format=%s))"
-    git log -1 --format=%B | git tag -s "$TAG" -F -
+    # No override: the tag name already says v<version>, so the message
+    # is a stub. The release body comes from --generate-notes below.
+    git tag -s "$TAG" -m "$TAG"
 fi
 
 # ---- summary + confirmation ----
@@ -254,9 +268,22 @@ echo "==> git push origin $TAG"
 git push origin "$TAG"
 
 echo "==> gh release create $TAG"
+if [ "$CUSTOM_MSG" -eq 1 ]; then
+    # Operator wrote real notes via -m / -F / -e — surface them.
+    NOTES_ARG=(--notes-from-tag)
+else
+    # Empty body. With stable + prerelease tags interleaved, there is
+    # no canonical "previous tag" to auto-compare against (GitHub's
+    # --generate-notes picks the chronologically previous tag, which
+    # for a stable cut right after an -rc.N gives the wrong delta).
+    # Operators wanting a changelog pick the pair themselves via
+    # GitHub's compare UI. `--notes ""` is mandatory — omitting all
+    # notes flags makes gh open an editor.
+    NOTES_ARG=(--notes "")
+fi
 gh release create "$TAG" "${ASSETS[@]}" \
     --title "$TAG" \
-    --notes-from-tag \
+    "${NOTES_ARG[@]}" \
     --verify-tag \
     "${PRERELEASE_ARG[@]}"
 
