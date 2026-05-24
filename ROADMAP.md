@@ -117,6 +117,22 @@ flow but fail when run end-to-end against a real kernel initiator:
   First step: instrument the daemon's PR handler to log the
   initiator IQN it sees per WRITE; compare against expectations.
 
+### `test-pipeline-layers.sh` (both products) reads a non-existent backends file
+Both pipeline-layers scripts hard-code `private/cloud-backends.json`
+plus a `.backends.<name>...` shape parsed via `jq` — but the file
+operators actually maintain (and that every other cloud-backed suite
+reads) is `private/cloud-backends.yaml` with a `.cloud.backends.<name>...`
+shape parsed via `yq`. The scripts exit with `Cannot read backends
+file: …/cloud-backends.json` before doing anything, so the dedup /
+compression / encryption layer matrix never runs against a real
+cloud target.
+
+Sketch: lift the `yq`-based backend-fields block from
+`vtl/scripts/test-backup-cloud.sh` (≈ 30 lines starting at the
+`THURVTL_TEST_BACKEND` resolution) into a shared helper in
+`scripts/lib/test-helpers.sh`, and have both `test-pipeline-layers.sh`
+files source it. Removes the divergent JSON parser at the same time.
+
 ---
 
 ## FEATURES
