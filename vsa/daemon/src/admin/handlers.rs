@@ -125,9 +125,7 @@ impl shared_admin_monitor::MonitorState for AdminState {
             .map(|t| t.live_stats())
             .unwrap_or_else(|| Arc::new(shared_telemetry::LiveStats::default()))
     }
-    fn pool_budgets(
-        &self,
-    ) -> std::collections::HashMap<String, Arc<shared_pool::PoolBudget>> {
+    fn pool_budgets(&self) -> std::collections::HashMap<String, Arc<shared_pool::PoolBudget>> {
         self.pool_budgets.clone()
     }
     fn pool_namespace_label(&self, _backend: &str, namespace: &str) -> Option<String> {

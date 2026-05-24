@@ -71,8 +71,7 @@ impl Cli {
         if matches!(
             self.command,
             Commands::Library {
-                action: LibraryAction::Partition { .. }
-                    | LibraryAction::Restore { .. }
+                action: LibraryAction::Partition { .. } | LibraryAction::Restore { .. }
             }
         ) {
             return true;

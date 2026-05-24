@@ -493,6 +493,95 @@ backends:
         }
     }
 
+    /// Build a v4 manifest with an explicit (already-assigned) LUN —
+    /// bypasses the create_volume helper which always stamps the
+    /// pre-v4 sentinel. Used by the collision test to set up two
+    /// manifests claiming the same LUN.
+    fn create_volume_with_lun(data_dir: &Path, name: &str, backend: &str, lun: u64) {
+        VolumeManifest::new(
+            name.to_string(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            backend.to_string(),
+            DedupScope::Local,
+            false,
+            lun,
+        )
+        .expect("manifest new")
+        .create(data_dir)
+        .expect("manifest create");
+    }
+
+    #[tokio::test]
+    async fn explicit_lun_collision_is_rejected_with_both_names() {
+        // Two manifests carrying the same explicit LUN must fail
+        // discovery with both names + the LUN in the error message,
+        // so the operator can pick which one to renumber.
+        let tmp = TempDir::new().expect("tempdir");
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
+        let cfg = local_cloud_config(&cloud_root);
+
+        create_volume_with_lun(tmp.path(), "alpha", "devbox", 5);
+        create_volume_with_lun(tmp.path(), "beta", "devbox", 5);
+
+        match discover_and_register(
+            tmp.path(),
+            &cfg,
+            &local_keystore_backends(),
+            1,
+            &HashMap::new(),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("must reject LUN collision"),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(msg.contains("LUN collision"), "no collision phrase: {msg}");
+                assert!(msg.contains("alpha"), "alpha not named: {msg}");
+                assert!(msg.contains("beta"), "beta not named: {msg}");
+                assert!(msg.contains('5'), "LUN number not named: {msg}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_v4_migration_fills_gap_left_by_explicit_lun() {
+        // Mixed v4-stamped + pre-v4 sentinel manifests: the sentinels
+        // must be auto-assigned to the smallest free LUN, slotting
+        // around the explicit one. Proves the migration path doesn't
+        // collide with already-pinned LUNs.
+        let tmp = TempDir::new().expect("tempdir");
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
+        let cfg = local_cloud_config(&cloud_root);
+
+        create_volume_with_lun(tmp.path(), "pinned", "devbox", 0);
+        create_volume(tmp.path(), "auto_a", "devbox");
+        create_volume(tmp.path(), "auto_b", "devbox");
+
+        let (_reg, vols, _caches, _backends, _keystores) = discover_and_register(
+            tmp.path(),
+            &cfg,
+            &local_keystore_backends(),
+            1,
+            &HashMap::new(),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .expect("discover");
+        let by_name: HashMap<&str, u64> = vols.iter().map(|v| (v.name.as_str(), v.lun)).collect();
+        assert_eq!(by_name.get("pinned").copied(), Some(0));
+        // auto_a precedes auto_b alphabetically; sentinels migrate
+        // to the next free LUNs starting at 1.
+        assert_eq!(by_name.get("auto_a").copied(), Some(1));
+        assert_eq!(by_name.get("auto_b").copied(), Some(2));
+    }
+
     #[tokio::test]
     async fn shares_one_backend_across_multiple_volumes() {
         // Two volumes pointing at the same backend should not blow

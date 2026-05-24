@@ -175,6 +175,9 @@ full backup / filesystem round-trip.
 | `test-backup-cloud.sh` | end-to-end backup + restore (real cloud backend) |
 | `test-backup-cloud-failures.sh` | cloud failure-path handling |
 | `test-backup-cloud-resume.sh` | boot-time orphan-upload recovery |
+| `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
+| `test-crash-chunk-seal.sh` | kill -9 mid tape stream → restart → acked blocks survive |
+| `test-many-cartridge-lifecycle.sh` | soak: create/list/stats N cartridges (THURVTL_SOAK=1) |
 | `test-cartridge-migrate.sh` | cartridge migrate + archive between backends |
 | `test-dr-restore.sh` | cross-region disaster-recovery restore |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
@@ -192,6 +195,10 @@ full backup / filesystem round-trip.
 | `test-nvme-fs-workflow.sh` | filesystem round-trip over NVMe/TCP (local backend) |
 | `test-nvme-fs-cloud.sh` | filesystem round-trip over NVMe/TCP (real cloud backend) |
 | `test-fs-cloud-failures.sh` | cloud failure-path handling |
+| `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
+| `test-crash-page-flush.sh` | kill -9 after host fsync → restart → every byte survives |
+| `test-iscsi-multi-initiator.sh` | two initiators + PR matrix, RESERVATION CONFLICT sense |
+| `test-multi-volume-dedup.sh` | soak: create/list/stats/gc N volumes (THURVSA_SOAK=1) |
 | `test-keystore.sh` | DEK keystore wrap / unwrap / migrate per backend |
 | `test-kmip-pykmip.sh` | `kmip` keystore backend against a local PyKMIP server |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
@@ -210,6 +217,12 @@ thurvsad --test    # volume bring-up / data-path / SYNCHRONIZE CACHE / sparse-pa
 It is a fast confidence check that the core read / write / cloud paths
 work on the host — useful right after install or in a constrained
 environment where the full shell suites can't run.
+
+### Product-agnostic suites — `scripts/`
+
+| Script | Covers |
+|---|---|
+| `test-coresident-smoke.sh` | both daemons co-resident: disjoint ports, admin sockets, audit dirs |
 
 ## Continuous integration
 

@@ -292,4 +292,157 @@ mod tests {
         reg.reap().await;
         assert!(reg.get(&id).await.is_none());
     }
+
+    #[tokio::test]
+    async fn reap_keeps_running_jobs_regardless_of_age() {
+        // Long-running jobs (finished=false) must NOT be reaped no
+        // matter how old they are — otherwise an in-flight verify
+        // would have its transcript yanked out from under the
+        // streamer.
+        let mut reg = JobRegistry::new();
+        reg.retention = Duration::from_millis(0);
+        let (id, _started, _emitter) = reg.create("test.never-finishes").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        reg.reap().await;
+        assert!(reg.get(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn two_subscribers_independently_see_full_transcript() {
+        // Two streamers on the same job both start at cursor 0 and
+        // must each read the complete event log. Notify::notify_waiters
+        // wakes every parked subscriber; the cursor is local to each
+        // streamer so they can't race each other into a partial view.
+        let reg = JobRegistry::new();
+        let (id, _started, emitter) = reg.create("test.fanout").await;
+        let h_a = reg.get(&id).await.unwrap();
+        let h_b = reg.get(&id).await.unwrap();
+
+        let h_a = JobHandle {
+            inner: Arc::clone(&h_a.inner),
+        };
+        let h_b = JobHandle {
+            inner: Arc::clone(&h_b.inner),
+        };
+
+        let stream_a = tokio::spawn(async move {
+            let mut cursor = 0;
+            let mut all = Vec::new();
+            loop {
+                let evs = h_a.next_events(&mut cursor).await;
+                if evs.is_empty() {
+                    break;
+                }
+                let terminal = evs.iter().any(|e| e.is_terminal());
+                all.extend(evs);
+                if terminal {
+                    break;
+                }
+            }
+            all
+        });
+        let stream_b = tokio::spawn(async move {
+            let mut cursor = 0;
+            let mut all = Vec::new();
+            loop {
+                let evs = h_b.next_events(&mut cursor).await;
+                if evs.is_empty() {
+                    break;
+                }
+                let terminal = evs.iter().any(|e| e.is_terminal());
+                all.extend(evs);
+                if terminal {
+                    break;
+                }
+            }
+            all
+        });
+
+        tokio::task::yield_now().await;
+        emitter.info("step 1").await;
+        emitter.info("step 2").await;
+        emitter.info("step 3").await;
+        emitter.emit(JobEvent::done(0)).await;
+
+        let a = stream_a.await.unwrap();
+        let b = stream_b.await.unwrap();
+        assert_eq!(a.len(), 4);
+        assert_eq!(b.len(), 4);
+        assert!(matches!(
+            a.last(),
+            Some(JobEvent::Done { exit_code: 0, .. })
+        ));
+        assert!(matches!(
+            b.last(),
+            Some(JobEvent::Done { exit_code: 0, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_replays_full_history_from_cursor_zero() {
+        // A streamer that connects AFTER the job is already finished
+        // must still get the entire transcript from cursor 0. This
+        // is what the CLI relies on when its first request is racing
+        // with the job's terminal Done.
+        let reg = JobRegistry::new();
+        let (id, _started, emitter) = reg.create("test.fast").await;
+        emitter.info("early").await;
+        emitter.info("middle").await;
+        emitter.emit(JobEvent::done(0)).await;
+
+        let handle = reg.get(&id).await.unwrap();
+        assert!(handle.is_finished());
+        let mut cursor = 0;
+        let history = handle.next_events(&mut cursor).await;
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_subscriber_does_not_block_others() {
+        // Dropping a streamer mid-stream (cancel-safe Notify) must
+        // leave the second subscriber unblocked. Without this guard a
+        // CLI disconnect could wedge a parallel `audit tail -f`.
+        let reg = JobRegistry::new();
+        let (id, _started, emitter) = reg.create("test.cancel").await;
+        let h_a = reg.get(&id).await.unwrap();
+        let h_b = reg.get(&id).await.unwrap();
+
+        // Spawn A, then immediately abort it before any event arrives.
+        let h_a_inner = JobHandle {
+            inner: Arc::clone(&h_a.inner),
+        };
+        let task_a = tokio::spawn(async move {
+            let mut cursor = 0;
+            h_a_inner.next_events(&mut cursor).await
+        });
+        tokio::task::yield_now().await;
+        task_a.abort();
+
+        let h_b_inner = JobHandle {
+            inner: Arc::clone(&h_b.inner),
+        };
+        let task_b = tokio::spawn(async move {
+            let mut cursor = 0;
+            let mut all = Vec::new();
+            loop {
+                let evs = h_b_inner.next_events(&mut cursor).await;
+                if evs.is_empty() {
+                    break;
+                }
+                let terminal = evs.iter().any(|e| e.is_terminal());
+                all.extend(evs);
+                if terminal {
+                    break;
+                }
+            }
+            all
+        });
+
+        tokio::task::yield_now().await;
+        emitter.info("post-cancel").await;
+        emitter.emit(JobEvent::done(0)).await;
+
+        let b_events = task_b.await.unwrap();
+        assert_eq!(b_events.len(), 2);
+    }
 }

@@ -771,6 +771,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_cancel_with_no_rotation_in_progress_returns_conflict() {
+        // Cancelling a rotation that doesn't exist is a no-op from the
+        // operator's POV, but the daemon needs to surface it as 409
+        // CONFLICT so the CLI prints the right "no rotation pending"
+        // message rather than reporting success.
+        let (_t, state) = fresh_state();
+        let _ = add(
+            State(state.clone()),
+            peer(),
+            axum::Json(add_req("alice", "password-1234")),
+        )
+        .await
+        .expect("add ok");
+
+        // alice has no previous_password — rotate_cancel must refuse.
+        let err = rotate_cancel(
+            State(state),
+            peer(),
+            axum::Json(NameOnlyRequest {
+                name: "alice".into(),
+            }),
+        )
+        .await
+        .expect_err("must conflict when no rotation pending");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn rotate_cancel_on_missing_user_returns_404() {
+        let (_t, state) = fresh_state();
+        let err = rotate_cancel(
+            State(state),
+            peer(),
+            axum::Json(NameOnlyRequest {
+                name: "ghost".into(),
+            }),
+        )
+        .await
+        .expect_err("must 404 on missing user");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn sweep_expired_previous_clears_at_exact_now_boundary() {
+        // The state machine uses `expires <= now`; a row whose
+        // expiry has just landed in the current tick must be swept
+        // on this same call, not the next one.
+        let mut file = IscsiUsersFile::default();
+        file.users.push(UserEntry {
+            username: "boundary".into(),
+            password: "current-password-1".into(),
+            mutual_chap: false,
+            partition: None,
+            disabled: false,
+            previous_password: Some("old".into()),
+            // 1 ms in the past — effectively "now" for the sweep.
+            previous_expires_at: Some(Utc::now() - chrono::Duration::milliseconds(1)),
+        });
+        let swept = sweep_expired_previous(&mut file);
+        assert_eq!(swept, vec!["boundary".to_string()]);
+        assert!(file.users[0].previous_password.is_none());
+    }
+
+    #[test]
+    fn load_users_on_malformed_json_surfaces_internal_error() {
+        // A corrupted iscsi-users.json on disk must produce an
+        // INTERNAL_SERVER_ERROR with a clear message, not a panic.
+        let (_t, state) = fresh_state();
+        let path = users_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not valid json").expect("seed corrupted file");
+        let err = load_users(&state).expect_err("must fail on garbage");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn target_set_show_clear_round_trips() {
         let (_t, state) = fresh_state();
         // Nothing set yet -> show returns username=None.

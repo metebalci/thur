@@ -1004,11 +1004,7 @@ mod tests {
         let cache = wrap(mock);
         // download_chunks_parallel
         let _ = cache
-            .download_chunks_parallel(&[
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string(),
-            ])
+            .download_chunks_parallel(&["a".to_string(), "b".to_string(), "c".to_string()])
             .await
             .unwrap();
         assert_eq!(c.gets.load(Ordering::SeqCst), 3);
@@ -1017,7 +1013,10 @@ mod tests {
             .upload_manifest("m", "{\"v\":1}")
             .await
             .expect("manifest upload");
-        let _ = cache.download_manifest("m").await.expect("manifest download");
+        let _ = cache
+            .download_manifest("m")
+            .await
+            .expect("manifest download");
         // list_objects
         let listed = cache.list_objects("").await.expect("list");
         assert!(listed.is_empty());

@@ -2022,6 +2022,48 @@ backends:
         assert!(is_retryable(FailureKind::Other));
     }
 
+    #[test]
+    fn classify_throttling_429_is_retryable_other() {
+        // 429 Too Many Requests / SlowDown / RequestLimitExceeded /
+        // ThrottlingException — providers signal "back off and try
+        // again" via varied strings. None match our explicit Auth /
+        // Authz / NotFound buckets, so they fall through to
+        // `FailureKind::Other`, which `is_retryable` keeps in the
+        // backoff loop. Pinning that fall-through guards against an
+        // accidental future re-classification that would burn
+        // throttle errors against the permanent-error budget.
+        for variant in [
+            "Got HTTP 429 Too Many Requests",
+            "SlowDown: please reduce your request rate",
+            "ThrottlingException: rate exceeded",
+            "RequestLimitExceeded: TPS limit hit",
+        ] {
+            let err = crate::CloudError::Other(variant.to_string());
+            assert_eq!(classify(&err), FailureKind::Other, "variant={variant}");
+            assert!(is_retryable(classify(&err)), "variant={variant}");
+        }
+    }
+
+    #[test]
+    fn classify_5xx_provider_failures_stay_retryable() {
+        // 500 / 502 / 503 / 504 — the provider is having a moment.
+        // Must classify as Other so the backoff loop covers them.
+        for variant in [
+            "InternalError: We encountered an internal error",
+            "503 Service Unavailable",
+            "Bad Gateway (502)",
+            "Gateway Timeout (504)",
+        ] {
+            let err = crate::CloudError::Other(variant.to_string());
+            let kind = classify(&err);
+            assert!(
+                matches!(kind, FailureKind::Other | FailureKind::Timeout),
+                "variant={variant} kind={kind:?}"
+            );
+            assert!(is_retryable(kind), "variant={variant}");
+        }
+    }
+
     // ----- validate_cloud_backend pinning tests --------------------
     //
     // These exercise the externally-observable shape of
@@ -2144,10 +2186,7 @@ backends:
             FailureKind::Other,
         ] {
             assert!(!kind.label().is_empty(), "label empty for {kind:?}");
-            assert!(
-                !kind.diagnosis().is_empty(),
-                "diagnosis empty for {kind:?}"
-            );
+            assert!(!kind.diagnosis().is_empty(), "diagnosis empty for {kind:?}");
             assert!(!kind.hints().is_empty(), "hints empty for {kind:?}");
         }
         assert_eq!(FailureKind::Auth.label(), "AUTH");
@@ -2347,10 +2386,7 @@ backends:
         async fn download_chunk(&self, k: &str) -> crate::Result<Vec<u8>> {
             self.inner.download_chunk(k).await
         }
-        async fn download_chunks_parallel(
-            &self,
-            k: &[String],
-        ) -> crate::Result<Vec<Vec<u8>>> {
+        async fn download_chunks_parallel(&self, k: &[String]) -> crate::Result<Vec<Vec<u8>>> {
             self.inner.download_chunks_parallel(k).await
         }
         async fn upload_manifest(&self, k: &str, j: &str) -> crate::Result<()> {
@@ -2446,9 +2482,15 @@ backends:
         };
         let backend = local_backend(tmp.path()).await;
         let mut details: Vec<String> = Vec::new();
-        check_retention_state(&backend, &cfg, "archive", RetentionMode::Governance, &mut |s| {
-            details.push(s.detail);
-        })
+        check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Governance,
+            &mut |s| {
+                details.push(s.detail);
+            },
+        )
         .await
         .expect("skip flag bypasses the lock_state comparison");
         assert_eq!(details.len(), 1);
@@ -2501,15 +2543,10 @@ backends:
             inner: local_backend(tmp.path()).await,
             fake: LS::Compliance { default_days: 30 },
         };
-        let err = check_retention_state(
-            &backend,
-            &cfg,
-            "archive",
-            RetentionMode::None,
-            &mut |_| {},
-        )
-        .await
-        .expect_err("None vs locked bucket is a mismatch");
+        let err =
+            check_retention_state(&backend, &cfg, "archive", RetentionMode::None, &mut |_| {})
+                .await
+                .expect_err("None vs locked bucket is a mismatch");
         if let CloudConfigError::RetentionMismatch { hint, .. } = err {
             assert!(
                 hint.contains("immutability policy"),
@@ -2573,9 +2610,13 @@ backends:
             fake: LS::Governance { default_days: 7 },
         };
         let mut steps: Vec<String> = Vec::new();
-        check_retention_state(&backend, &cfg, "archive", RetentionMode::Governance, &mut |s| {
-            steps.push(s.detail.clone())
-        })
+        check_retention_state(
+            &backend,
+            &cfg,
+            "archive",
+            RetentionMode::Governance,
+            &mut |s| steps.push(s.detail.clone()),
+        )
         .await
         .expect("Governance matches Governance");
         assert_eq!(steps.len(), 1);

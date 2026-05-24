@@ -316,3 +316,252 @@ impl AlertingDispatcher {
 fn record_telemetry(telemetry: &Telemetry, class: &str, severity: &str, sink: &str, outcome: &str) {
     telemetry.alerts_record(class, severity, sink, outcome);
 }
+
+#[cfg(test)]
+impl AlertingDispatcher {
+    /// Snapshot the current backend-status map for assertions. Test-
+    /// only — production code reaches into the mutex directly through
+    /// `try_emit`.
+    pub(crate) fn backend_status_snapshot(&self) -> HashMap<String, &'static str> {
+        let map = self.backend_status.lock().unwrap();
+        map.iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    match v {
+                        BackendStatus::Healthy => "healthy",
+                        BackendStatus::Failing => "failing",
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Snapshot the CHAP per-user counter for assertions.
+    pub(crate) fn chap_counter_snapshot(&self, user: &str) -> u32 {
+        self.chap_state
+            .lock()
+            .unwrap()
+            .counts
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Force the CHAP window to expire — emulates the passage of
+    /// `dedup_window_seconds + 1` so the next `observe_chap_failure`
+    /// hits the window-reset branch. Cheaper than `tokio::time::sleep`.
+    pub(crate) fn force_chap_window_reset(&self) {
+        let mut state = self.chap_state.lock().unwrap();
+        state.started_at = Instant::now() - state.window - Duration::from_secs(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alert::{AlertClass, Severity};
+    use crate::config::{
+        AlertingConfig, EventsConfig, SinkConfig, SinkSpec, WebhookSinkConfig,
+        default_chap_failures_threshold, default_dedup_window_seconds,
+    };
+    use serde_json::Map;
+    use shared_naming::DISK;
+
+    fn webhook_sink(name: &str) -> SinkSpec {
+        SinkSpec {
+            name: name.into(),
+            config: SinkConfig::Webhook(WebhookSinkConfig {
+                // 127.0.0.1:1 is reserved-low; reqwest fails fast on
+                // ECONNREFUSED. We never observe send outcomes here —
+                // tests assert the *gating* path that runs before
+                // fan_out reaches the sink at all.
+                url: "http://127.0.0.1:1/".into(),
+                method: "POST".into(),
+                headers: HashMap::new(),
+                body_template: String::new(),
+                timeout_seconds: 1,
+            }),
+        }
+    }
+
+    fn build_dispatcher(cfg: AlertingConfig) -> AlertingDispatcher {
+        AlertingDispatcher::build(&cfg, &DISK, "test", Telemetry::noop()).expect("dispatcher build")
+    }
+
+    fn default_cfg(threshold: u32) -> AlertingConfig {
+        AlertingConfig {
+            enabled: true,
+            dedup_window_seconds: default_dedup_window_seconds(),
+            chap_failures_threshold: threshold,
+            events: EventsConfig {
+                // Toggle on every class so try_emit doesn't gate on us.
+                backend_reachability: true,
+                audit_failure: true,
+                disk_cache_backpressure: true,
+                chap_failures: true,
+            },
+            sinks: vec![webhook_sink("primary")],
+        }
+    }
+
+    fn backend_alert(backend: &str, outcome: &str) -> Alert {
+        let mut fields = Map::new();
+        fields.insert("backend".into(), backend.into());
+        fields.insert("outcome".into(), outcome.into());
+        Alert::new(
+            AlertClass::BackendReachability,
+            Severity::Warn,
+            format!("backend {backend} {outcome}"),
+            fields,
+            format!("backend:{backend}:{outcome}"),
+        )
+    }
+
+    #[test]
+    fn build_rejects_empty_sinks_when_enabled() {
+        let mut cfg = AlertingConfig::default();
+        cfg.enabled = true;
+        cfg.sinks.clear();
+        match AlertingDispatcher::build(&cfg, &DISK, "test", Telemetry::noop()) {
+            Ok(_) => panic!("empty sinks must fail"),
+            Err(e) => assert!(matches!(e, DispatcherError::NoSinks)),
+        }
+    }
+
+    #[test]
+    fn build_rejects_duplicate_sink_names() {
+        let mut cfg = default_cfg(default_chap_failures_threshold());
+        cfg.sinks.push(webhook_sink("primary"));
+        match AlertingDispatcher::build(&cfg, &DISK, "test", Telemetry::noop()) {
+            Ok(_) => panic!("duplicate sink name must fail"),
+            Err(e) => assert!(matches!(e, DispatcherError::DuplicateSink(ref n) if n == "primary")),
+        }
+    }
+
+    // try_emit's fan_out path spawns through `tokio::spawn`; the
+    // backend-reachability state machine itself runs synchronously
+    // but the dispatcher still needs an ambient runtime so the
+    // following fan-out doesn't panic.
+    #[tokio::test]
+    async fn backend_reachability_records_first_failing_status() {
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        let snap = d.backend_status_snapshot();
+        assert_eq!(snap.get("s3-a").copied(), Some("failing"));
+    }
+
+    #[tokio::test]
+    async fn backend_reachability_recovery_flips_status() {
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        d.try_emit(backend_alert("s3-a", "recovery"));
+        let snap = d.backend_status_snapshot();
+        assert_eq!(snap.get("s3-a").copied(), Some("healthy"));
+    }
+
+    #[tokio::test]
+    async fn backend_reachability_drops_repeats_in_same_status() {
+        // Two failing-state alerts on the same backend land in the
+        // same status bucket — the map should reflect that without
+        // crashing on the second mutation. We can't directly observe
+        // "alert was suppressed before fan_out" but we can prove the
+        // *state* doesn't oscillate.
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        let snap = d.backend_status_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.get("s3-a").copied(), Some("failing"));
+    }
+
+    #[tokio::test]
+    async fn class_disabled_skips_state_machine_entirely() {
+        let mut cfg = default_cfg(default_chap_failures_threshold());
+        cfg.events.backend_reachability = false;
+        let d = build_dispatcher(cfg);
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        // Class was off → backend_status map untouched.
+        assert!(d.backend_status_snapshot().is_empty());
+    }
+
+    #[test]
+    fn chap_counter_increments_per_user() {
+        let d = build_dispatcher(default_cfg(5));
+        d.observe_chap_failure("alice", "10.0.0.1");
+        d.observe_chap_failure("alice", "10.0.0.1");
+        d.observe_chap_failure("bob", "10.0.0.2");
+        assert_eq!(d.chap_counter_snapshot("alice"), 2);
+        assert_eq!(d.chap_counter_snapshot("bob"), 1);
+    }
+
+    #[test]
+    fn chap_window_reset_clears_per_user_counters() {
+        let d = build_dispatcher(default_cfg(5));
+        d.observe_chap_failure("alice", "10.0.0.1");
+        d.observe_chap_failure("alice", "10.0.0.1");
+        assert_eq!(d.chap_counter_snapshot("alice"), 2);
+
+        d.force_chap_window_reset();
+        // Next observation triggers the window-reset branch — alice's
+        // counter is wiped and starts at 1 for the new window.
+        d.observe_chap_failure("alice", "10.0.0.1");
+        assert_eq!(d.chap_counter_snapshot("alice"), 1);
+    }
+
+    #[test]
+    fn chap_zero_threshold_disables_alert_path() {
+        // threshold=0 means "fire never" — the producer can still
+        // emit per-event, but the dispatcher must not count.
+        let d = build_dispatcher(default_cfg(0));
+        for _ in 0..10 {
+            d.observe_chap_failure("alice", "10.0.0.1");
+        }
+        assert_eq!(d.chap_counter_snapshot("alice"), 0);
+    }
+
+    #[test]
+    fn chap_class_disabled_short_circuits_counter() {
+        let mut cfg = default_cfg(5);
+        cfg.events.chap_failures = false;
+        let d = build_dispatcher(cfg);
+        d.observe_chap_failure("alice", "10.0.0.1");
+        assert_eq!(d.chap_counter_snapshot("alice"), 0);
+    }
+
+    #[tokio::test]
+    async fn send_test_returns_error_for_unknown_sink() {
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        let alert = Alert::new(
+            AlertClass::AuditFailure,
+            Severity::Warn,
+            "test",
+            Map::new(),
+            "k",
+        );
+        let err = d
+            .send_test("does-not-exist", alert)
+            .await
+            .expect_err("unknown sink must error");
+        assert!(
+            matches!(err, DispatcherError::SinkBuild { ref name, .. } if name == "does-not-exist")
+        );
+    }
+
+    #[test]
+    fn sink_names_returns_configured_order() {
+        let mut cfg = default_cfg(default_chap_failures_threshold());
+        cfg.sinks.push(webhook_sink("secondary"));
+        let d = build_dispatcher(cfg);
+        let names = d.sink_names();
+        assert_eq!(names, vec!["primary".to_string(), "secondary".to_string()]);
+    }
+
+    #[test]
+    fn dedup_window_round_trips_through_builder() {
+        let mut cfg = default_cfg(default_chap_failures_threshold());
+        cfg.dedup_window_seconds = 42;
+        let d = build_dispatcher(cfg);
+        assert_eq!(d.dedup_window_seconds(), 42);
+    }
+}

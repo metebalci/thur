@@ -346,3 +346,91 @@ fn validate_interchange_key(s: &str) -> Result<(), ApiError> {
         .map(|_| ())
         .map_err(|e| ApiError::bad_request(format!("invalid interchange_key: {}", e)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn psk(host: &str, prev_key: Option<&str>, prev_expires: Option<DateTime<Utc>>) -> PskEntry {
+        PskEntry {
+            host_nqn: host.into(),
+            interchange_key: "NVMeTLSkey-1:01:00000000000000000000000000000000000000000000000000000000000000000000:".into(),
+            disabled: false,
+            previous_interchange_key: prev_key.map(|s| s.into()),
+            previous_expires_at: prev_expires,
+        }
+    }
+
+    fn file_with(entries: Vec<PskEntry>) -> NvmetcpPsksFile {
+        NvmetcpPsksFile {
+            version: 1,
+            psks: entries,
+        }
+    }
+
+    #[test]
+    fn sweep_clears_expired_previous_and_reports_host() {
+        let past = Utc::now() - ChronoDuration::seconds(60);
+        let mut f = file_with(vec![psk("nqn.host.a", Some("old-key"), Some(past))]);
+        let swept = sweep_expired_previous(&mut f);
+        assert_eq!(swept, vec!["nqn.host.a".to_string()]);
+        let e = &f.psks[0];
+        assert!(e.previous_interchange_key.is_none());
+        assert!(e.previous_expires_at.is_none());
+    }
+
+    #[test]
+    fn sweep_preserves_unexpired_previous() {
+        let future = Utc::now() + ChronoDuration::seconds(3600);
+        let mut f = file_with(vec![psk("nqn.host.a", Some("old-key"), Some(future))]);
+        let swept = sweep_expired_previous(&mut f);
+        assert!(swept.is_empty());
+        let e = &f.psks[0];
+        assert_eq!(e.previous_interchange_key.as_deref(), Some("old-key"));
+        assert_eq!(e.previous_expires_at, Some(future));
+    }
+
+    #[test]
+    fn sweep_clears_at_exact_boundary() {
+        // The state machine uses `expires <= now` so a row whose
+        // expiry has just landed in the current tick is swept on that
+        // same call. Without this guard a row that hit its deadline
+        // mid-microsecond could linger one whole sweep interval.
+        let now_boundary = Utc::now() - ChronoDuration::milliseconds(1);
+        let mut f = file_with(vec![psk("nqn.host.a", Some("old-key"), Some(now_boundary))]);
+        let swept = sweep_expired_previous(&mut f);
+        assert_eq!(swept.len(), 1);
+        assert!(f.psks[0].previous_interchange_key.is_none());
+    }
+
+    #[test]
+    fn sweep_only_touches_rows_with_previous_key_set() {
+        // No previous key staged → sweep is a no-op on the row.
+        let mut f = file_with(vec![psk("nqn.host.a", None, None)]);
+        let swept = sweep_expired_previous(&mut f);
+        assert!(swept.is_empty());
+    }
+
+    #[test]
+    fn sweep_handles_mixed_population() {
+        let past = Utc::now() - ChronoDuration::seconds(10);
+        let future = Utc::now() + ChronoDuration::seconds(600);
+        let mut f = file_with(vec![
+            psk("nqn.expired", Some("k1"), Some(past)),
+            psk("nqn.in-grace", Some("k2"), Some(future)),
+            psk("nqn.no-previous", None, None),
+        ]);
+        let swept = sweep_expired_previous(&mut f);
+        assert_eq!(swept, vec!["nqn.expired".to_string()]);
+        assert!(f.psks[0].previous_interchange_key.is_none());
+        assert!(f.psks[1].previous_interchange_key.is_some());
+    }
+
+    #[test]
+    fn validate_host_nqn_rejects_empty_and_overlong() {
+        assert!(validate_host_nqn("").is_err());
+        let long = "a".repeat(224);
+        assert!(validate_host_nqn(&long).is_err());
+        assert!(validate_host_nqn("nqn.2025-01.example:host").is_ok());
+    }
+}

@@ -669,10 +669,7 @@ mod tests {
             .unwrap();
         assert_eq!(size, payload.len() as u64);
 
-        let got = backend
-            .download_chunk("chunks/ZC/obj-1.dat")
-            .await
-            .unwrap();
+        let got = backend.download_chunk("chunks/ZC/obj-1.dat").await.unwrap();
         assert_eq!(got, payload);
     }
 

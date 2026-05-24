@@ -328,7 +328,12 @@ pub async fn cmd_bounds(json: bool) -> Result<()> {
     if !bounds.explanations.is_empty() {
         println!();
         for e in &bounds.explanations {
-            println!("Min {} = {}: {}", e.field, count_for(&bounds, &e.field), e.reason);
+            println!(
+                "Min {} = {}: {}",
+                e.field,
+                count_for(&bounds, &e.field),
+                e.reason
+            );
         }
     }
     Ok(())
@@ -635,10 +640,7 @@ pub async fn cmd_partition_modify(
     check_daemon_not_running(data_dir)?;
     let mut library = open_library_for_chassis(data_dir)?;
 
-    if storage_start.is_none()
-        && storage_end.is_none()
-        && drives.is_none()
-    {
+    if storage_start.is_none() && storage_end.is_none() && drives.is_none() {
         anyhow::bail!(
             "no modifications specified. Provide at least one of: --storage-start, --storage-end, --drives"
         );
@@ -898,6 +900,18 @@ mod tests {
                 .to_string()
                 .contains("not adjacent")
         );
+    }
+
+    #[test]
+    fn absorb_range_rejects_off_by_one_gap() {
+        // The boundary case: end=10 vs start=11 leaves a one-slot
+        // hole. Without this guard a misconfigured partition merge
+        // could silently swallow slot 10 (or claim it twice).
+        let mut dst = range(0, 10);
+        let err = absorb_range(&mut dst, &range(11, 20), "storage");
+        assert!(err.is_err(), "one-slot gap must be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("not adjacent"), "wrong error: {msg}");
     }
 
     #[test]

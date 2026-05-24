@@ -66,10 +66,7 @@ fn build_declared_topology(
         missing.push("lto_generation");
     }
     if !missing.is_empty() {
-        let lines: Vec<String> = missing
-            .iter()
-            .map(|f| format!("library.{}", f))
-            .collect();
+        let lines: Vec<String> = missing.iter().map(|f| format!("library.{}", f)).collect();
         return Err(anyhow::anyhow!(
             "{}: required field(s) missing from library: block: {}",
             config_path,
@@ -728,13 +725,12 @@ async fn main() -> Result<()> {
     let tapes_root = std::path::PathBuf::from(&cfg.data_dir).join("tapes");
 
     let declared = build_declared_topology(cfg.library.as_ref(), &config_path)?;
-    let (library, reconcile_events) =
-        core_mediachanger::library::reconcile::open_or_materialize(
-            &lib_root,
-            &tapes_root,
-            &declared,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to bring up library: {}", e))?;
+    let (library, reconcile_events) = core_mediachanger::library::reconcile::open_or_materialize(
+        &lib_root,
+        &tapes_root,
+        &declared,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to bring up library: {}", e))?;
 
     for ev in &reconcile_events {
         if let core_mediachanger::library::reconcile::ReconcileEvent::DriveEvacuated(d) = ev {
@@ -2295,5 +2291,65 @@ mod config_parse_tests {
         };
         // No audit channel — must return without panicking.
         emit_audit_ratelimit_rollup(None, &rollup);
+    }
+
+    #[test]
+    fn build_declared_topology_missing_block_names_config_path() {
+        let err = build_declared_topology(None, "/etc/thurvtl/thurvtl.yaml")
+            .expect_err("missing library: block must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("library: block missing"), "msg={msg}");
+        assert!(msg.contains("/etc/thurvtl/thurvtl.yaml"), "msg={msg}");
+    }
+
+    #[test]
+    fn build_declared_topology_collects_all_missing_fields_at_once() {
+        // The whole point: operators get all three missing-field
+        // names on one shot, not "fix one, re-run, see the next."
+        let block = LibraryConfig {
+            num_slots: None,
+            num_drives: None,
+            lto_generation: None,
+            firmware: None,
+        };
+        let err = build_declared_topology(Some(&block), "/tmp/c.yaml")
+            .expect_err("all-missing must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("library.num_slots"), "msg={msg}");
+        assert!(msg.contains("library.num_drives"), "msg={msg}");
+        assert!(msg.contains("library.lto_generation"), "msg={msg}");
+    }
+
+    #[test]
+    fn build_declared_topology_reports_only_missing_field() {
+        // Only num_drives missing → error mentions just that field,
+        // not the two already-set ones.
+        let block = LibraryConfig {
+            num_slots: Some(40),
+            num_drives: None,
+            lto_generation: Some(8),
+            firmware: None,
+        };
+        let err = build_declared_topology(Some(&block), "/tmp/c.yaml").expect_err("partial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("library.num_drives"), "msg={msg}");
+        assert!(!msg.contains("library.num_slots"), "msg={msg}");
+        assert!(!msg.contains("library.lto_generation"), "msg={msg}");
+    }
+
+    #[test]
+    fn build_declared_topology_fully_specified_block_returns_topology() {
+        let block = LibraryConfig {
+            num_slots: Some(40),
+            num_drives: Some(3),
+            lto_generation: Some(8),
+            firmware: Some("TVL8".to_string()),
+        };
+        let topo = build_declared_topology(Some(&block), "/tmp/c.yaml")
+            .expect("fully specified must succeed");
+        assert_eq!(topo.num_storage_slots, 40);
+        assert_eq!(topo.num_drives, 3);
+        assert_eq!(topo.lto_generation, 8);
+        assert_eq!(topo.firmware.as_deref(), Some("TVL8"));
     }
 }
