@@ -14,7 +14,7 @@
 #      the artifact filenames — so the tag cannot drift from the build.
 #   2. Pushes the current branch and the tag to `origin`.
 #   3. Creates the GitHub Release for the tag and uploads everything in
-#      release-artifacts/ (.deb / .rpm / .tar.gz + any .asc signatures).
+#      release-artifacts/ (.deb / .rpm + any .asc signatures).
 #
 # The GitHub Release body is the annotated tag's message
 # (`gh release create --notes-from-tag`). A SemVer pre-release version
@@ -110,27 +110,11 @@ esac
 
 shopt -s nullglob
 ASSETS=("$OUT_DIR"/*)
-TARBALLS=("$OUT_DIR"/*.tar.gz)
 ASC=("$OUT_DIR"/*.asc)
 shopt -u nullglob
 
 [ ${#ASSETS[@]} -gt 0 ] || {
     echo "error: $OUT_DIR/ is empty — run release/release.sh first." >&2; exit 1; }
-[ ${#TARBALLS[@]} -gt 0 ] || {
-    echo "error: no .tar.gz artifacts in $OUT_DIR/ — run release/release.sh." >&2; exit 1; }
-
-# Every tarball must carry THIS version verbatim (release.sh stamps it
-# into the name). A mismatch means a stale build — version bumped after
-# release.sh ran, or stale files an earlier cache-on build left behind
-# (dev/alpha cuts skip the release-artifacts/ wipe).
-for t in "${TARBALLS[@]}"; do
-    case "$t" in
-        *"-${VERSION}-"*) ;;
-        *) echo "error: $t does not match version $VERSION." >&2
-           echo "       re-run release/release.sh for a clean $OUT_DIR/." >&2
-           exit 1 ;;
-    esac
-done
 
 if [ ${#ASC[@]} -gt 0 ]; then
     SIG_NOTE="${#ASC[@]} present"

@@ -149,10 +149,6 @@ are in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 Other install paths:
 
-- **Static binary tarball** — for distributions outside the
-  `.deb` / `.rpm` matrix; carries the binaries, a reference yaml, the
-  systemd unit, shell completions, man pages, and an install-focused
-  README.
 - **From source** — `cargo build --release`; binaries land in
   `target/release/`. Not recommended for production.
 

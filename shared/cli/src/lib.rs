@@ -96,7 +96,7 @@ pub enum ConfigAction {
 
     /// Emit the default systemd unit file on stdout.
     ///
-    /// Same content the .deb / .rpm / tarball ship — operator can
+    /// Same content the .deb / .rpm ship — operator can
     /// redirect into `/etc/systemd/system/` and `systemctl
     /// daemon-reload` to register it.
     SystemdUnit,

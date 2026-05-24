@@ -46,7 +46,7 @@ resolver = "2"
 # Single source of truth for every workspace crate's version. Each
 # crate's Cargo.toml inherits via `version.workspace = true` so a
 # release bump touches one line. release.sh reads this same field
-# (top-level `awk` on root Cargo.toml) to stamp tarball / .deb / .rpm
+# (top-level `awk` on root Cargo.toml) to stamp .deb / .rpm
 # filenames. SemVer prerelease tags (`-alpha.N`, `-beta.N`, `-rc.N`)
 # flow through to .deb via cargo-deb's `-` -> `~` translation; for RPM
 # release.sh splits them into Version + Release (Fedora convention).

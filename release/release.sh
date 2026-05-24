@@ -12,10 +12,8 @@
 # Produces under release-artifacts/:
 #   thurvtl_<ver>-1_amd64.deb            .deb for Debian/Ubuntu (tape library)
 #   thurvtl-<ver>-1.x86_64.rpm           .rpm for RHEL/SLES/openSUSE
-#   thurvtl-<ver>-x86_64.tar.gz          Static binaries + reference config
 #   thurvsa_<ver>-1_amd64.deb            .deb for Debian/Ubuntu (block target)
 #   thurvsa-<ver>-1.x86_64.rpm           .rpm for RHEL/SLES/openSUSE
-#   thurvsa-<ver>-x86_64.tar.gz          Static binaries + reference config
 #
 # Two product packages keep operators free to install only the pieces
 # they need (`thurvtl` tape library on port 3260, `thurvsa` block target on
@@ -243,7 +241,7 @@ fi
 
 OUT_DIR="release-artifacts"
 # Wipe stale artifacts from previous runs. Without this, the signing
-# loop further down (globs *.deb / *.rpm / *.tar.gz) would re-sign
+# loop further down (globs *.deb / *.rpm) would re-sign
 # old version-stamped files alongside the new ones, and `ls -lh`
 # at the end mixes them. We're inside the builder container with
 # CWD pinned to the workspace root, so the path is unambiguous.
@@ -255,16 +253,11 @@ if [ "$KEEP_CACHE" -eq 0 ]; then
 fi
 mkdir -p "$OUT_DIR"
 
-# Pull the version + arch out of the root Cargo.toml's
-# [workspace.package] block — single source of truth for every crate
-# (each inherits via `version.workspace = true`) and for the tarball
-# / .deb / .rpm filenames stamped below.
+# Pull the version out of the root Cargo.toml's [workspace.package]
+# block — single source of truth for every crate (each inherits via
+# `version.workspace = true`) and for the .deb / .rpm filenames
+# stamped below.
 VERSION=$(awk -F\" '/^version = / { print $2; exit }' Cargo.toml)
-ARCH=$(uname -m)
-THURVTL_TARBALL_DIR="thurvtl-${VERSION}-${ARCH}"
-THURVTL_TARBALL="${THURVTL_TARBALL_DIR}.tar.gz"
-THURVSA_TARBALL_DIR="thurvsa-${VERSION}-${ARCH}"
-THURVSA_TARBALL="${THURVSA_TARBALL_DIR}.tar.gz"
 
 # RPM Version: tags disallow `-`, so a SemVer pre-release like
 # `0.1.0-alpha.1` cannot flow through verbatim. Split it across the
@@ -274,8 +267,7 @@ THURVSA_TARBALL="${THURVSA_TARBALL_DIR}.tar.gz"
 # The leading `0.` on the prerelease Release is load-bearing — it
 # sorts before the eventual GA `Release: 1`, so `rpm -q` / `dnf
 # upgrade` order pre-release builds correctly relative to the final
-# cut. cargo-deb does an equivalent translation (`-` -> `~`) for us;
-# the tarball keeps the SemVer string verbatim.
+# cut. cargo-deb does an equivalent translation (`-` -> `~`) for us.
 if [[ "$VERSION" == *-* ]]; then
     RPM_VERSION="${VERSION%%-*}"
     RPM_RELEASE="0.${VERSION#*-}"
@@ -321,47 +313,13 @@ cargo generate-rpm --package vsa/cli --output "$OUT_DIR/" \
     --set-metadata "version = \"$RPM_VERSION\"" \
     --set-metadata "release = \"$RPM_RELEASE\""
 
-echo "==> static binary tarball $THURVTL_TARBALL"
-STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/$THURVTL_TARBALL_DIR"
-install -m 755 target/release/thurvtld              "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 755 target/release/thurvtl                 "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 release/thurvtld.service    "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 release/thurvtl.yaml              "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 release/thurvtl.env              "$STAGE/$THURVTL_TARBALL_DIR/thurvtl.env"
-install -m 644 dist/thurvtl.defaults.yaml                 "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 dist/thurvtl-completion.bash           "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 dist/thurvtl-completion.zsh            "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 dist/thurvtl.1                         "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 release/thurvtld.8                     "$STAGE/$THURVTL_TARBALL_DIR/"
-install -m 644 LICENSE                                   "$STAGE/$THURVTL_TARBALL_DIR/LICENSE"
-install -m 644 release/thurvtl-tarball-README.md "$STAGE/$THURVTL_TARBALL_DIR/README.md"
-tar --owner=0 --group=0 -czf "$OUT_DIR/$THURVTL_TARBALL" -C "$STAGE" "$THURVTL_TARBALL_DIR"
-
-echo "==> static binary tarball $THURVSA_TARBALL"
-mkdir -p "$STAGE/$THURVSA_TARBALL_DIR"
-install -m 755 target/release/thurvsad          "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 755 target/release/thurvsa             "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 release/thurvsad.service    "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 release/thurvsa.yaml              "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 release/thurvsa.env              "$STAGE/$THURVSA_TARBALL_DIR/thurvsa.env"
-install -m 644 dist/thurvsa.defaults.yaml                 "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 dist/thurvsa-completion.bash           "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 dist/thurvsa-completion.zsh            "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 dist/thurvsa.1                         "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 release/thurvsad.8                     "$STAGE/$THURVSA_TARBALL_DIR/"
-install -m 644 LICENSE                                   "$STAGE/$THURVSA_TARBALL_DIR/LICENSE"
-install -m 644 release/thurvsa-tarball-README.md "$STAGE/$THURVSA_TARBALL_DIR/README.md"
-tar --owner=0 --group=0 -czf "$OUT_DIR/$THURVSA_TARBALL" -C "$STAGE" "$THURVSA_TARBALL_DIR"
-
 if [ "$SIGN" -eq 1 ]; then
     # gpg-agent uses GPG_TTY to know where to send pinentry prompts.
     # The host's value (if any) doesn't apply inside the container —
     # set it to whatever TTY podman -it gave us.
     export GPG_TTY=$(tty)
     echo "==> signing artifacts with key $THUR_GPG_KEY_ID"
-    for f in "$OUT_DIR"/*.deb "$OUT_DIR"/*.rpm "$OUT_DIR"/*.tar.gz; do
+    for f in "$OUT_DIR"/*.deb "$OUT_DIR"/*.rpm; do
         [ -f "$f" ] || continue
         rm -f "${f}.asc"
         gpg --batch --yes \

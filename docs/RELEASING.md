@@ -1,11 +1,11 @@
 # Releasing thurvtl and thurvsa
 
-Each release cut produces two `.deb`s, two `.rpm`s, and two `.tar.gz`s —
-one per product (`thurvtl` tape VTL, `thurvsa` block target) — all built
-from a single pinned-glibc container so the resulting binaries install on
-every mainstream Linux distribution. Operators install whichever halves
-they need. The two packages co-exist cleanly on the same host because they
-use disjoint system users, data directories, unit names, and iSCSI ports.
+Each release cut produces two `.deb`s and two `.rpm`s — one per product
+(`thurvtl` tape VTL, `thurvsa` block target) — all built from a single
+pinned-glibc container so the resulting binaries install on every
+mainstream Linux distribution. Operators install whichever halves they
+need. The two packages co-exist cleanly on the same host because they use
+disjoint system users, data directories, unit names, and iSCSI ports.
 
 Releases are cut **manually** — there is no release CI workflow. The
 maintainer runs `release/release.sh` on a developer host.
@@ -19,7 +19,6 @@ Source and binaries ship under the **Apache License, Version 2.0**
   cargo-deb writes it to `/usr/share/doc/<package>/copyright`.
 - `.rpm` — `[package.metadata.generate-rpm] license = "Apache-2.0"`;
   LICENSE shipped at `/usr/share/licenses/<package>/LICENSE`.
-- `.tar.gz` — `LICENSE` copied into each tarball.
 
 ## Supported distros
 
@@ -55,19 +54,17 @@ separate effort tracked in `ROADMAP.md`.
 ## Layout
 
 ```
-release/                            # .deb / .rpm / .tar.gz artifact sources
+release/                            # .deb / .rpm artifact sources
 ├── Containerfile.builder           # Debian 11 base + cargo-deb + cargo-generate-rpm
 ├── release.sh                      # Builds the image and runs both product cuts inside it
 ├── thurvtld.service          # systemd unit (ExecStart=/usr/bin/thurvtld)
 ├── thurvtl.yaml                    # thurvtl minimal starter conffile
 ├── thurvtl.env                     # thurvtl daemon env file (cloud creds + ${ENV_VAR} secrets + feature flags)
-├── thurvtl-tarball-README.md       # README shipped in the thurvtl static tarball
 ├── thurvtl/
 │   └── postinst / prerm / postrm   # thurvtl .deb maintainer scripts
 ├── thurvsad.service          # systemd unit (ExecStart=/usr/bin/thurvsad)
 ├── thurvsa.yaml                    # thurvsa minimal starter conffile
 ├── thurvsa.env                     # thurvsa daemon env file (cloud creds + ${ENV_VAR} secrets + feature flags)
-├── thurvsa-tarball-README.md       # README shipped in the thurvsa static tarball
 └── thurvsa/
     └── postinst / prerm / postrm   # thurvsa .deb maintainer scripts (separate dir keeps cargo-deb's auto-discovery from confusing the two products)
 (RPM scriptlets are inlined in vtl/cli/Cargo.toml and vsa/cli/Cargo.toml respectively)
@@ -146,9 +143,8 @@ sentinel:
    as quality gates, then `cargo build --release --workspace` (both
    daemons + both CLIs in one pass). Then `cargo deb` /
    `cargo generate-rpm` once per product (`vtl-cli`, then `vsa-cli`),
-   packs both static tarballs, and — with `--sign` — detach-signs every
-   artifact. Clippy / test failures abort the cut before any artifact
-   is produced.
+   and — with `--sign` — detach-signs every artifact. Clippy / test
+   failures abort the cut before any artifact is produced.
 
 The first run takes roughly 10 minutes because rustup, cargo-deb, and
 cargo-generate-rpm all install from scratch; subsequent runs add only a
@@ -174,10 +170,8 @@ The script produces `release-artifacts/`:
 ```
 thurvtl_<ver>-1_amd64.deb            # binary, Apache-2.0 (tape VTL)
 thurvtl-<ver>-1.x86_64.rpm           # binary, Apache-2.0
-thurvtl-<ver>-x86_64.tar.gz          # binary, Apache-2.0
 thurvsa_<ver>-1_amd64.deb            # binary, Apache-2.0 (block target)
 thurvsa-<ver>-1.x86_64.rpm           # binary, Apache-2.0
-thurvsa-<ver>-x86_64.tar.gz          # binary, Apache-2.0
 ```
 
 Plus `*.asc` detached signatures alongside each artifact, if signing is
@@ -196,7 +190,7 @@ the fingerprint of an imported gpg key:
 
 ```bash
 THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
-# adds thurvtl_<ver>-1_amd64.deb.asc and the matching .rpm.asc / .tar.gz.asc
+# adds thurvtl_<ver>-1_amd64.deb.asc and the matching .rpm.asc
 ```
 
 `release.sh` aborts if `--sign` is passed without `THUR_GPG_KEY_ID`.
@@ -261,7 +255,7 @@ THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
 
 # 6. Tag, push, and publish to GitHub Releases. ghrelease.sh creates
 #    the signed tag v0.2.0 on HEAD, pushes branch + tag to origin, and
-#    uploads release-artifacts/* (.deb / .rpm / .tar.gz + .asc) as the
+#    uploads release-artifacts/* (.deb / .rpm + .asc) as the
 #    release assets. Release notes are the tag message — it opens
 #    $EDITOR, or pass -m "summary" / -F notes.md.
 release/ghrelease.sh
