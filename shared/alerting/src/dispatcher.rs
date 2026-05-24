@@ -420,9 +420,11 @@ mod tests {
 
     #[test]
     fn build_rejects_empty_sinks_when_enabled() {
-        let mut cfg = AlertingConfig::default();
-        cfg.enabled = true;
-        cfg.sinks.clear();
+        let cfg = AlertingConfig {
+            enabled: true,
+            sinks: Vec::new(),
+            ..AlertingConfig::default()
+        };
         match AlertingDispatcher::build(&cfg, &DISK, "test", Telemetry::noop()) {
             Ok(_) => panic!("empty sinks must fail"),
             Err(e) => assert!(matches!(e, DispatcherError::NoSinks)),
