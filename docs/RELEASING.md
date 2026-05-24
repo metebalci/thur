@@ -217,7 +217,7 @@ prompt may be buffered out of view.
 The current package signing key fingerprint:
 
 ```
-A481 BFF9 3718 99EC D816  EBBA 8BB9 77EF 27FC 5E57
+E1FF A6E4 4D8A F56E BD17  997C 9B4E 436A E137 3A4B
 ```
 
 Operators verify artifacts against this fingerprint; publish it
@@ -272,12 +272,52 @@ To retract a release: delete the GitHub Release and its remote tag
 (`git tag -d v0.2.0`), then bump the version forward and cut a new one.
 Don't reuse a version number.
 
-## Why not host an apt/yum repo?
+## Package repository
 
-1. The target audience pins versions, tests in staging, and deploys in
-   change windows — they don't `apt upgrade` storage software, so the
-   repo convenience is moot.
-2. Hosting a repo (signing metadata, mirrors, CDN, key management) adds
-   supply-chain attack surface.
+Operators install Thur via the **https://thur.metebalci.com** apt and yum
+repositories — one install line, signed by the key whose fingerprint
+appears in § Signing above:
+
+```bash
+curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
+```
+
+The site source and the publishing workflow live in the separate
+`metebalci/thur.metebalci.com` repository; that repo's `README.md` is the
+operational source of truth for URL layout, Cloudflare wiring, secrets
+inventory, and the rotation procedure for the signing key. Two channels
+are published in parallel:
+
+- **stable** — accumulates over time. Each tagged release publishes its
+  `release-artifacts/*.deb` and `release-artifacts/*.rpm` into the stable
+  pool; apt picks the latest version matching the operator's constraints.
+  This is what production audiences should pin against.
+- **dev** — rolling. Replaced on every publish to track the tip of
+  `main`. For maintainer validation and operators who want to test
+  unreleased changes against staging.
+
+The target audience is expected to pin versions, validate in staging, and
+deploy in change windows — not to `apt upgrade` storage software blindly.
+Hosting a repository simply makes the install-and-verify ceremony
+frictionless; it doesn't make the upgrade path automatic.
+
+### How artifacts get there
+
+After `release/ghrelease.sh` uploads the signed `release-artifacts/*` to
+the GitHub Release, a `publish.yml` workflow in
+`metebalci/thur.metebalci.com` downloads them, regenerates the apt suite
+indices and the rpm `repomd.xml`, signs both with the same package
+signing key documented above, and syncs the resulting tree to the R2
+bucket backing `pkg.thur.metebalci.com`. Cross-repo publishing is
+deliberate — it keeps the source repo free of CDN credentials and the
+publish-side CI free of release-cutting concerns.
+
+The supply-chain trust model rests on the signing key, not on TLS or
+the CDN: an attacker who compromises the R2 bucket can swap binaries
+but cannot forge a new signed `Release` / `repomd.xml` without the key,
+and apt / yum refuse to install artifacts that don't match the
+operator's trusted fingerprint. Publish the fingerprint prominently —
+release notes, this file, and the project website — so operators have
+an authoritative reference to verify against.
 
 CVE notifications go on a public mailing list (TBD); see `ROADMAP.md`.
