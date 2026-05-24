@@ -288,18 +288,22 @@ operational source of truth for URL layout, Cloudflare wiring, secrets
 inventory, and the rotation procedure for the signing key. Two channels
 are published in parallel:
 
-- **stable** — GA releases only (1.0.0+). Manually triggered via
-  `workflow_dispatch` in `thur.metebalci.com`; rare ceremony. Empty
-  until v1.0.0 ships.
-- **unstable** — every pre-GA tagged release (0.x, RCs, betas).
-  Auto-published on every release event in this repo via a small
-  `notify-publish.yml` bridge that fires `repository_dispatch` at
-  `thur.metebalci.com`. This is where 0.x operators install from
-  today.
+- **stable** — tagged releases without a pre-release suffix (`vN.M.P`).
+  Includes pre-1.0 (0.x) releases; the channel guarantees build and
+  signing hygiene, not API stability. Operators on 0.x should pin to
+  specific minor versions if they can't tolerate the breaks SemVer
+  reserves the right to introduce before 1.0.0.
+- **unstable** — pre-release tagged versions
+  (`vN.M.P-alpha.X` / `-beta.X` / `-rc.X`) for testing forthcoming
+  releases, plus any future per-commit dev builds.
 
-Both channels accumulate — every version ever published stays in the
-pool, so operators can pin against a specific tag rather than always
-taking the latest.
+Both channels are auto-published. A small `notify-publish.yml` bridge
+in this repo listens for the `release.published` event, inspects the
+tag string, and fires `repository_dispatch` at `thur.metebalci.com`
+with the routed channel — `vN.M.P` lands in `stable`,
+`vN.M.P-anything` lands in `unstable`. Both channels accumulate, so
+operators can pin against a specific tag rather than always taking the
+latest.
 
 The target audience is expected to pin versions, validate in staging, and
 deploy in change windows — not to `apt upgrade` storage software blindly.

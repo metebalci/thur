@@ -5,8 +5,14 @@ name: notify thur.metebalci.com on release
 # can regenerate the apt/yum tree against the new artifacts.
 #
 # Channel routing is driven entirely by the tag string:
-#   vN.M.P with N >= 1 and no pre-release suffix  -> stable channel (GA)
-#   everything else (0.x, -alpha/-beta/-rc, ...)  -> unstable channel
+#   vN.M.P (no pre-release suffix)         -> stable channel
+#   vN.M.P-anything (alpha/beta/rc/...)    -> unstable channel
+#
+# Note: stable here means "tagged release without pre-release suffix",
+# not "post-1.0 API-stable". Pre-1.0 (0.x) releases land in stable too
+# — the channel guarantees build/signing hygiene, not API stability.
+# Operators on 0.x should pin specific minor versions if they can't
+# tolerate the breaks SemVer reserves the right to introduce.
 #
 # The GitHub Release "prerelease" flag is a UI hint and depends on
 # ghrelease.sh remembering to set --prerelease; the tag is the truth.
@@ -33,7 +39,7 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "$TAG" =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ]; then
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             CHANNEL=stable
           else
             CHANNEL=unstable

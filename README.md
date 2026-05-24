@@ -102,9 +102,10 @@ repository — one line on any supported distro:
 curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
 ```
 
-This wires up the `stable` channel (GA only, 1.0.0+); set
-`CHANNEL=unstable` for the pre-GA channel that holds every 0.x and
-release-candidate tag. The script writes the right `sources.list.d` or
+This wires up the `stable` channel (tagged releases without a
+pre-release suffix; includes pre-1.0 builds). Set `CHANNEL=unstable`
+to install from the pre-release channel that holds alpha / beta /
+rc tags. The script writes the right `sources.list.d` or
 `yum.repos.d` entry and installs the signing public key alongside it.
 The fingerprint is documented in
 [`docs/RELEASING.md`](docs/RELEASING.md) — verify it against the key
