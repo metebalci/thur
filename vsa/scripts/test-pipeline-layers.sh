@@ -78,7 +78,7 @@ CLI_PATH=""
 ONLY_ROW=""
 KEEP_DATA=0
 KEEP_CLOUD=0
-SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.json}"
+SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -106,22 +106,25 @@ if [[ ! -r "$SOURCE_BACKENDS" ]]; then
     exit 1
 fi
 
-BACKEND_TYPE=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-BACKEND_BUCKET=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ENDPOINT=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-BACKEND_REGION=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ACCOUNT=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-BACKEND_CONTAINER=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
-BACKEND_AUTH_AKID_ENV=$(jq -r "
-    .backends.\"$THURVSA_TEST_BACKEND\".auth
+# Backends config is YAML under `cloud.backends.<name>` (mirrors what
+# every other cloud-backed VSA suite reads). yq is needed at the same
+# version contract as test-iscsi-fs-cloud.sh.
+BACKEND_TYPE=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+BACKEND_BUCKET=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ENDPOINT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+BACKEND_REGION=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ACCOUNT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+BACKEND_CONTAINER=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+BACKEND_AUTH_AKID_ENV=$(yq -r "
+    .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
     | select(.type == \"env\") | .access_key_id_env // \"\"
 " "$SOURCE_BACKENDS")
-BACKEND_AUTH_SECRET_ENV=$(jq -r "
-    .backends.\"$THURVSA_TEST_BACKEND\".auth
+BACKEND_AUTH_SECRET_ENV=$(yq -r "
+    .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
     | select(.type == \"env\") | .secret_access_key_env // \"\"
 " "$SOURCE_BACKENDS")
-RETENTION=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
-ORIG_PREFIX=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+RETENTION=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+ORIG_PREFIX=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
 
 if [[ "$BACKEND_TYPE" == "local" ]]; then
     log_error "matrix needs a real cloud backend; '$THURVSA_TEST_BACKEND' is type=local"

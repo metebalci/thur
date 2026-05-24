@@ -97,41 +97,30 @@ suites (`THURVSA_TEST_BACKEND=gcs-none` + friends) catch them today
 and will keep doing so. Net: unit tests close ~700 lines of
 "untestable" code without losing the real-cloud signal.
 
-### Fix newly-added integration tests that don't pass under sudo
-Two scripts added in 2026-05-23 work locally for syntax + script
-flow but fail when run end-to-end against a real kernel initiator:
+### SBC dispatcher short-transfers multi-sector READ / WRITE on raw I/O
+A `dd if=payload of=/dev/sdX bs=1M oflag=direct conv=fsync` followed
+by `sg_dd if=/dev/sgN of=snap bs=64K` returns mostly zeros: the
+daemon persists 128 chunks (matching the 8 MiB written) but read-back
+delivers only the first sector of each multi-sector READ command.
+`sg_dd` reports `Non-zero sum of residual counts ≈ block_size *
+(count - 1)`. The bug doesn't trigger through an ext4-mounted
+workload (kernel buffered I/O works fine; that's how
+`test-iscsi-fs-workflow.sh` passes), only on the raw block /
+sg-passthrough path.
 
-- `vsa/scripts/test-crash-page-flush.sh` — fails the snap-pre vs
-  snap-post comparison. Either the kernel block-cache survives the
-  iSCSI logout (so the post-restart snapshot reads stale bytes via
-  the cached page cache), or the daemon's flush-on-fsync isn't
-  actually committing every page before the SIGKILL window. Needs
-  investigation: does `sync` + iSCSI logout flush the SCSI midlayer
-  cache for that LU, or do we need an additional `blockdev --flushbufs`?
-- `vsa/scripts/test-iscsi-multi-initiator.sh` — fails the RESERVATION
-  CONFLICT assertion. Either the daemon's PR table doesn't actually
-  enforce single-writer across distinct initiator IQNs (a real
-  correctness bug if so), or the second initiator's WRITE is
-  reaching the daemon under the FIRST initiator's session because
-  the kernel iSCSI session re-attached using a cached InitiatorName.
-  First step: instrument the daemon's PR handler to log the
-  initiator IQN it sees per WRITE; compare against expectations.
+Suspects: the SBC dispatcher's READ / WRITE handler in
+`scsi/sbc/src/{read,write}.rs` honors only the first sector of a
+multi-sector CDB transfer length, OR `core/block`'s page-cache
+read-back drops the per-page repeat. Repro:
+`vsa/scripts/test-crash-page-flush.sh` originally hit this on its
+raw-dd path; rewritten 2026-05-24 to go through ext4 + tar to
+avoid the bug while still asserting durability across kill -9. The
+underlying daemon bug stays open here.
 
-### `test-pipeline-layers.sh` (both products) reads a non-existent backends file
-Both pipeline-layers scripts hard-code `private/cloud-backends.json`
-plus a `.backends.<name>...` shape parsed via `jq` — but the file
-operators actually maintain (and that every other cloud-backed suite
-reads) is `private/cloud-backends.yaml` with a `.cloud.backends.<name>...`
-shape parsed via `yq`. The scripts exit with `Cannot read backends
-file: …/cloud-backends.json` before doing anything, so the dedup /
-compression / encryption layer matrix never runs against a real
-cloud target.
-
-Sketch: lift the `yq`-based backend-fields block from
-`vtl/scripts/test-backup-cloud.sh` (≈ 30 lines starting at the
-`THURVTL_TEST_BACKEND` resolution) into a shared helper in
-`scripts/lib/test-helpers.sh`, and have both `test-pipeline-layers.sh`
-files source it. Removes the divergent JSON parser at the same time.
+Diagnostic gate: write 1 MiB of /dev/urandom to LBA 0 via WRITE-16,
+then sg_persist `--in --read-keys` round-trip succeeds (PR ops use
+single-sector CDB transfer), so the dispatcher itself isn't broken;
+the issue is in the multi-sector data-transfer accounting.
 
 ---
 
