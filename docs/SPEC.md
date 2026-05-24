@@ -119,7 +119,7 @@ separately in `<data_dir>/library/inventory.json`.
 | Session timeout | 300 s (configurable) |
 | HeaderDigest | None or CRC32C (negotiated) |
 | DataDigest | None or CRC32C (negotiated) |
-| MaxRecvDataSegmentLength | 128 KiB; PDUs whose `DataSegmentLength` exceeds this cap are rejected pre- and post-login (memory-DoS guard) |
+| MaxRecvDataSegmentLength | 128 KiB declared by the target (caps initiator Data-Out PDU size); PDUs whose `DataSegmentLength` exceeds the cap are rejected pre- and post-login (memory-DoS guard). The initiator's declared value is captured during operational negotiation (RFC 7143 §12.12 default 8192 if absent) and used to chunk outbound Data-In PDUs — multi-PDU READ responses carry sequential `DataSN` + monotonically increasing `BufferOffset`, with `F=1 \| S=1` only on the final PDU |
 | ImmediateData / InitialR2T | `Yes` / `No` |
 | FirstBurstLength | 128 KiB (= `MaxRecvDataSegmentLength`); the unsolicited window is sized to fit entirely in the SCSI Command PDU's data segment |
 | MaxBurstLength | 16 MiB; one R2T-solicited burst can carry a full max-block tape WRITE without subdivision |

@@ -29,13 +29,14 @@
 #   6. sg_dd snapshot into snap-post.bin.
 #   7. `cmp snap-pre snap-post` — every fsync'd byte must survive.
 #
-# Why ext4 + tar and not raw `dd` to /dev/sdX: the raw-write +
-# sg_dd-read path triggers an unrelated daemon bug (multi-sector
-# WRITE / READ short-transfer) that masks the durability question
-# we want to ask. Going through ext4 mirrors the production workload
-# and is the same pattern `test-iscsi-fs-workflow.sh` uses to assert
-# the daemon's reads round-trip through ordinary host I/O. The
-# raw-IO bug is tracked separately in ROADMAP.md.
+# Why ext4 + tar and not raw `dd` to /dev/sdX: ext4 mirrors the
+# production workload and is the same pattern
+# `test-iscsi-fs-workflow.sh` uses to assert the daemon's reads
+# round-trip through ordinary host I/O. The raw-IO multi-sector
+# round-trip path is covered separately by
+# `test-sbc-multi-sector-rw.sh` (sg_dd bs=4096 bpt=1024 → 4 MiB
+# READ-16 commands, exercising the iSCSI transport's Data-In
+# chunking against the initiator's MaxRecvDataSegmentLength).
 #
 # Prerequisites:
 #   - open-iscsi, sg3-utils, lsscsi, e2fsprogs (mkfs.ext4 / fsck.ext4),

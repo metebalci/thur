@@ -48,6 +48,14 @@ use crate::session::{ADVERTISED_CMDSN_WINDOW, CmdSnVerdict, SessionManager};
 /// Cap that bounds [`MAX_RECV_DATA_SEGMENT_LENGTH`]'s pre-auth
 /// allocation guard ([`read_pdu`]).
 pub const MAX_RECV_DATA_SEGMENT_LENGTH: u32 = 131072;
+
+/// RFC 7143 §12.12 default `MaxRecvDataSegmentLength` for any peer
+/// that does not explicitly declare one during operational-parameter
+/// negotiation. Used when chunking outbound Data-In PDUs against an
+/// initiator that omitted the key — the target falls back to the
+/// spec's 8 KiB rather than assuming the initiator can receive our
+/// own [`MAX_RECV_DATA_SEGMENT_LENGTH`].
+pub const DEFAULT_PEER_MAX_RECV_DATA_SEGMENT_LENGTH: u32 = 8192;
 /// Per-direction max bytes per solicited Data-Out burst (one R2T
 /// sequence). Bounded by tape `READ BLOCK LIMITS`'s declared 16 MiB
 /// max block, so a single host SCSI WRITE block fits in one R2T
@@ -716,6 +724,14 @@ pub struct LoginOutcome {
     pub statsn: u32,
     pub initiator_iqn: Option<String>,
     pub authenticated_partition: Option<String>,
+    /// Initiator-declared `MaxRecvDataSegmentLength` from operational
+    /// negotiation, falling back to the RFC 7143 §12.12 default of
+    /// 8192 bytes when the initiator omits the key. Bounds the data
+    /// segment of each outbound Data-In PDU in the FFP loop; multi-
+    /// PDU READs are chunked into back-to-back Data-Ins of at most
+    /// this many bytes each, with DataSN / BufferOffset / F / S bits
+    /// stamped per spec.
+    pub peer_max_recv_data_segment_length: u32,
 }
 
 /// CHAP state carried across login PDUs. Lives inside the login state
@@ -969,6 +985,7 @@ pub async fn handle_login_phase(
 
     let mut chap = ChapState::new();
     let mut initiator_name: Option<String> = None;
+    let mut peer_max_recv_data_segment_length: u32 = DEFAULT_PEER_MAX_RECV_DATA_SEGMENT_LENGTH;
 
     // Materialize the authenticator once at the top of the login.
     // The factory closure loads iscsi-users.json fresh on every
@@ -1019,6 +1036,18 @@ pub async fn handle_login_phase(
             && let Some(name) = req_keys.get("InitiatorName")
         {
             initiator_name = Some(name.clone());
+        }
+
+        // Initiator-declared MaxRecvDataSegmentLength bounds the
+        // data segment of each Data-In PDU we send back. RFC 7143
+        // §12.12: numeric, 512..=2**24-1. Anything outside that
+        // range is ignored — leaves the prior value (defaulting to
+        // RFC's 8192) so a malformed key never inflates buffers.
+        if let Some(v) = req_keys.get("MaxRecvDataSegmentLength")
+            && let Ok(parsed) = v.parse::<u32>()
+            && (512..=0x00FF_FFFF).contains(&parsed)
+        {
+            peer_max_recv_data_segment_length = parsed;
         }
 
         if current_stage == STAGE_SECURITY {
@@ -1141,6 +1170,7 @@ pub async fn handle_login_phase(
                 statsn,
                 initiator_iqn: initiator_name,
                 authenticated_partition: chap.authenticated_partition,
+                peer_max_recv_data_segment_length,
             });
         }
 
@@ -1301,6 +1331,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         mut statsn,
         initiator_iqn,
         authenticated_partition,
+        peer_max_recv_data_segment_length,
         ..
     } = outcome;
 
@@ -1487,23 +1518,55 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     if data_in.len() as u32 > edtl {
                         data_in.truncate(edtl as usize);
                     }
-                    let actual_len = data_in.len() as u32;
-                    let residual = edtl.saturating_sub(actual_len);
+                    let total_len = data_in.len();
+                    let residual = edtl.saturating_sub(total_len as u32);
 
-                    let mut din = build_empty_pdu(0x25, true, true);
-                    din.itt = pdu.itt;
-                    din.ttt = 0xFFFFFFFF;
-                    din.bhs[1] = 0x80 | 0x01; // F | S
-                    if residual > 0 {
-                        din.bhs[1] |= 0x02; // U (residual underflow)
+                    // RFC 7143 §11.7: chunk the Data-In stream into
+                    // PDUs of at most peer-declared MaxRecvData-
+                    // SegmentLength bytes, stamping DataSN (0, 1,
+                    // 2, …) and BufferOffset on every PDU. Only the
+                    // final PDU carries F=1 + S=1 + the SCSI status
+                    // byte; non-final PDUs leave the StatSN field
+                    // zero (S=0 makes it reserved). A single PDU
+                    // smaller than the cap collapses to the
+                    // historical one-PDU path.
+                    let chunk_size = peer_max_recv_data_segment_length as usize;
+                    let status_code = resp.status.code();
+                    let mut cursor = 0usize;
+                    let mut data_sn: u32 = 0;
+                    while cursor < total_len {
+                        let end = total_len.min(cursor + chunk_size);
+                        let is_last = end == total_len;
+                        let mut din = build_empty_pdu(0x25, true, is_last);
+                        din.itt = pdu.itt;
+                        din.ttt = 0xFFFFFFFF;
+                        if is_last {
+                            din.bhs[1] = 0x80 | 0x01; // F | S
+                            if residual > 0 {
+                                din.bhs[1] |= 0x02; // U
+                            }
+                            din.bhs[3] = status_code;
+                            din.bhs[44..48].copy_from_slice(&residual.to_be_bytes());
+                        }
+                        din.bhs[36..40].copy_from_slice(&data_sn.to_be_bytes());
+                        din.bhs[40..44].copy_from_slice(&(cursor as u32).to_be_bytes());
+                        if is_last {
+                            let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                            stamp_serials_for_response(&mut din.bhs, sn, exp_cmdsn, max_cmdsn);
+                        } else {
+                            // Non-final Data-In: StatSN reserved
+                            // (S=0). Still stamp ExpCmdSN /
+                            // MaxCmdSN so the initiator's CmdSN
+                            // window stays open while it gathers
+                            // the burst.
+                            din.bhs[28..32].copy_from_slice(&exp_cmdsn.to_be_bytes());
+                            din.bhs[32..36].copy_from_slice(&max_cmdsn.to_be_bytes());
+                        }
+                        din.data = data_in[cursor..end].to_vec();
+                        write_pdu(sock, &mut din).await?;
+                        data_sn = data_sn.wrapping_add(1);
+                        cursor = end;
                     }
-                    din.bhs[3] = resp.status.code();
-                    din.bhs[44..48].copy_from_slice(&residual.to_be_bytes());
-
-                    let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
-                    stamp_serials_for_response(&mut din.bhs, sn, exp_cmdsn, max_cmdsn);
-                    din.data = data_in;
-                    write_pdu(sock, &mut din).await?;
                 } else {
                     // SCSI Response only.
                     let mut sresp = build_empty_pdu(0x21, true, true);
@@ -2730,6 +2793,249 @@ mod tests {
         assert_eq!(rej.bhs[2], 0x04, "protocol error reason");
         drop(client);
         let _ = server.await.unwrap();
+    }
+
+    /// Test handler that returns a deterministic N-byte payload for
+    /// any SCSI command with CDB[0] = 0xC0 (vendor-unique). The
+    /// length is set at construction. Used to drive multi-PDU
+    /// Data-In chunking without dragging in the SBC dispatcher.
+    struct BigReadHandler {
+        iqn: String,
+        payload_len: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScsiHandler for BigReadHandler {
+        fn target_iqn(&self) -> &str {
+            &self.iqn
+        }
+        async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
+            if req.cdb[0] == 0xC0 {
+                let mut buf = Vec::with_capacity(self.payload_len);
+                for i in 0..self.payload_len {
+                    buf.push((i & 0xFF) as u8);
+                }
+                ScsiResponse::good(buf)
+            } else {
+                ScsiResponse::good(Vec::new())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn data_in_chunked_at_peer_max_recv_data_segment_length() {
+        // Reproduces the multi-sector READ short-transfer / EPIPE bug:
+        // the target used to send one Data-In PDU regardless of size,
+        // even when the initiator's MaxRecvDataSegmentLength was
+        // smaller. A 64 KiB payload against an initiator that
+        // declared 8 KiB MRDSL MUST come back as 8 back-to-back
+        // Data-In PDUs, each with the correct DataSN / BufferOffset,
+        // F=1 + S=1 only on the last, and the concatenated payload
+        // identical to what the handler returned.
+        const PAYLOAD: usize = 64 * 1024;
+        const PEER_MRDSL: u32 = 8192;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(BigReadHandler {
+            iqn: "iqn.test:big".into(),
+            payload_len: PAYLOAD,
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:99",
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Declare an 8 KiB MRDSL during the single-PDU login.
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[
+                ("InitiatorName", "iqn.init:chunk-test"),
+                ("MaxRecvDataSegmentLength", "8192"),
+            ],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+
+        // SCSI Command with CDB[0]=0xC0 and EDTL = PAYLOAD bytes.
+        let mut cmd = make_scsi_cmd(0xBEEF, 1, 0, 0xC0, PAYLOAD as u32);
+        write_pdu(&mut client, &mut cmd).await.unwrap();
+
+        // Pull every Data-In PDU off the wire and verify the chunking.
+        let expected_chunks = PAYLOAD.div_ceil(PEER_MRDSL as usize);
+        let mut collected: Vec<u8> = Vec::with_capacity(PAYLOAD);
+        for chunk_idx in 0..expected_chunks {
+            let pdu = read_pdu(&mut client).await.unwrap();
+            assert_eq!(pdu.opcode, 0x25, "expected Data-In on chunk {chunk_idx}");
+            let is_last = chunk_idx == expected_chunks - 1;
+            let f_bit = (pdu.bhs[1] & 0x80) != 0;
+            let s_bit = (pdu.bhs[1] & 0x01) != 0;
+            let data_sn = u32::from_be_bytes([pdu.bhs[36], pdu.bhs[37], pdu.bhs[38], pdu.bhs[39]]);
+            let buffer_offset =
+                u32::from_be_bytes([pdu.bhs[40], pdu.bhs[41], pdu.bhs[42], pdu.bhs[43]]);
+            assert_eq!(
+                data_sn, chunk_idx as u32,
+                "DataSN must be 0..N sequential, chunk {chunk_idx}"
+            );
+            assert_eq!(
+                buffer_offset as usize,
+                chunk_idx * PEER_MRDSL as usize,
+                "BufferOffset must walk by chunk size, chunk {chunk_idx}"
+            );
+            if is_last {
+                assert!(f_bit, "last Data-In must have F=1");
+                assert!(s_bit, "last Data-In must have S=1 (carries status)");
+                assert_eq!(pdu.bhs[3], 0x00, "GOOD status on the last Data-In");
+            } else {
+                assert!(!f_bit, "non-last Data-In must have F=0 (chunk {chunk_idx})");
+                assert!(!s_bit, "non-last Data-In must have S=0 (chunk {chunk_idx})");
+            }
+            assert!(
+                pdu.data.len() <= PEER_MRDSL as usize,
+                "data segment {} > MRDSL {} on chunk {chunk_idx}",
+                pdu.data.len(),
+                PEER_MRDSL
+            );
+            collected.extend_from_slice(&pdu.data);
+        }
+        assert_eq!(collected.len(), PAYLOAD, "total bytes match payload");
+        for (i, b) in collected.iter().enumerate() {
+            assert_eq!(*b, (i & 0xFF) as u8, "byte {i} round-tripped intact");
+        }
+
+        // Clean logout so serve_connection returns cleanly.
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0xAA;
+        logout.bhs[24..28].copy_from_slice(&2u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_in_single_pdu_when_payload_fits_in_peer_mrdsl() {
+        // Sub-MRDSL payloads collapse to exactly one Data-In PDU with
+        // F=1 + S=1, DataSN=0, BufferOffset=0 — the historical fast
+        // path. Anchors that chunking didn't regress single-PDU reads.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(BigReadHandler {
+            iqn: "iqn.test:small".into(),
+            payload_len: 256,
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:100",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[("InitiatorName", "iqn.init:small")],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        let mut cmd = make_scsi_cmd(0xCAFE, 1, 0, 0xC0, 256);
+        write_pdu(&mut client, &mut cmd).await.unwrap();
+        let pdu = read_pdu(&mut client).await.unwrap();
+        assert_eq!(pdu.opcode, 0x25);
+        assert_eq!(pdu.bhs[1] & 0x80, 0x80, "F=1");
+        assert_eq!(pdu.bhs[1] & 0x01, 0x01, "S=1");
+        let data_sn = u32::from_be_bytes([pdu.bhs[36], pdu.bhs[37], pdu.bhs[38], pdu.bhs[39]]);
+        let buf_off = u32::from_be_bytes([pdu.bhs[40], pdu.bhs[41], pdu.bhs[42], pdu.bhs[43]]);
+        assert_eq!(data_sn, 0);
+        assert_eq!(buf_off, 0);
+        assert_eq!(pdu.data.len(), 256);
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0xBB;
+        logout.bhs[24..28].copy_from_slice(&2u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_in_default_peer_mrdsl_chunks_at_8192_when_initiator_omits_key() {
+        // Initiator omits MaxRecvDataSegmentLength → RFC 7143 §12.12
+        // default of 8192. A 24 KiB payload arrives as 3 PDUs.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(BigReadHandler {
+            iqn: "iqn.test:default".into(),
+            payload_len: 24 * 1024,
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:101",
+            )
+            .await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // No MaxRecvDataSegmentLength key.
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[("InitiatorName", "iqn.init:no-mrdsl")],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        let mut cmd = make_scsi_cmd(0xC0FFEE, 1, 0, 0xC0, 24 * 1024);
+        write_pdu(&mut client, &mut cmd).await.unwrap();
+        for chunk in 0..3 {
+            let pdu = read_pdu(&mut client).await.unwrap();
+            assert_eq!(pdu.opcode, 0x25);
+            assert_eq!(
+                pdu.data.len(),
+                8192,
+                "chunk {chunk}: 8192 (RFC default MRDSL)"
+            );
+            if chunk == 2 {
+                assert_eq!(pdu.bhs[1] & 0x81, 0x81, "last Data-In F|S");
+            } else {
+                assert_eq!(pdu.bhs[1] & 0x81, 0, "non-last Data-In no F|S");
+            }
+        }
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0xCC;
+        logout.bhs[24..28].copy_from_slice(&2u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

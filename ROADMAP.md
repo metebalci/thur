@@ -97,31 +97,6 @@ suites (`THURVSA_TEST_BACKEND=gcs-none` + friends) catch them today
 and will keep doing so. Net: unit tests close ~700 lines of
 "untestable" code without losing the real-cloud signal.
 
-### SBC dispatcher short-transfers multi-sector READ / WRITE on raw I/O
-A `dd if=payload of=/dev/sdX bs=1M oflag=direct conv=fsync` followed
-by `sg_dd if=/dev/sgN of=snap bs=64K` returns mostly zeros: the
-daemon persists 128 chunks (matching the 8 MiB written) but read-back
-delivers only the first sector of each multi-sector READ command.
-`sg_dd` reports `Non-zero sum of residual counts ≈ block_size *
-(count - 1)`. The bug doesn't trigger through an ext4-mounted
-workload (kernel buffered I/O works fine; that's how
-`test-iscsi-fs-workflow.sh` passes), only on the raw block /
-sg-passthrough path.
-
-Suspects: the SBC dispatcher's READ / WRITE handler in
-`scsi/sbc/src/{read,write}.rs` honors only the first sector of a
-multi-sector CDB transfer length, OR `core/block`'s page-cache
-read-back drops the per-page repeat. Repro:
-`vsa/scripts/test-crash-page-flush.sh` originally hit this on its
-raw-dd path; rewritten 2026-05-24 to go through ext4 + tar to
-avoid the bug while still asserting durability across kill -9. The
-underlying daemon bug stays open here.
-
-Diagnostic gate: write 1 MiB of /dev/urandom to LBA 0 via WRITE-16,
-then sg_persist `--in --read-keys` round-trip succeeds (PR ops use
-single-sector CDB transfer), so the dispatcher itself isn't broken;
-the issue is in the multi-sector data-transfer accounting.
-
 ---
 
 ## FEATURES
