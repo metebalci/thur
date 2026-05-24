@@ -42,21 +42,80 @@ block, render `Used: <bytes> (<pct>% of size)` in `print_manifest`
 pages.idx (in-flight pages not yet committed there are an acceptable
 approximation for an operator-facing field).
 
-### Raise unit-test coverage on the low-coverage crates
-`docs/TESTCOVERAGE.md` (2026-05-22 `cargo llvm-cov` snapshot) flags four
-crates with real unit-test gaps — meaningful untested branches, not an
-instrumentation artifact:
+### Close the integrated-mode coverage gaps
+`scripts/coverage.sh --integrated-gate` flags two real gaps in the new
+control-plane critical tier (snapshot 2026-05-24, docs/TESTCOVERAGE.md
+§ Active targets):
 
-- `scsi-ssc` (48% line) — SSC-4 tape command dispatch
-- `scsi-smc` (49%) — SMC-3 changer command dispatch
-- `shared-iscsi` (46%) — iSCSI transport / session management
-- `shared-cloud` (54%) — cloud-backend error + retry paths
+- `shared/upload-worker` (74% line, floor 80%) — `run_upload_pipeline`
+  failure-path branches (PUT 5xx → backoff, HEAD-probe size mismatch,
+  hook ordering under concurrent completions) and the `upload_chunk_inert`
+  retry-classifier round-trip lack direct unit tests. Currently exercised
+  by cloud-backed shell suites only. Gap is ~6 pp; a half-day of focused
+  tests clears it. See `shared/upload-worker/src/{inert,pipeline}.rs`.
+- `shared/keystore` (79% < 80%) — measurement-method drift between
+  `--crates` mode (cargo llvm-cov, 80.6%) and `--integrated` mode
+  (`llvm-cov export` with explicit `-object`, 79.1%); the regex filter
+  used by integrated mode excludes some module paths the cargo wrapper
+  includes. Either tighten the filter or close the gap by lifting
+  `keystore/azurekv.rs` (49%) and `keystore/gcpkms.rs` (30%) once the
+  SDK-client mock refactor lands (see below). The other 9 keystore
+  files are already at 89-100%.
 
-Add unit tests for the untested branches in each. The daemon / CLI
-crates also read low (1–29%), but that is by construction — their
-request paths are covered by the `vtl/scripts/` + `vsa/scripts/`
-end-to-end suites, which `cargo llvm-cov` does not instrument; that is
-not a gap to close here.
+`shared/cloud-bench` (36% < 50%) stays a documented exception (1+ GiB
+transfers per cell — no unit-test path).
+
+### Refactor GCS / Azure-KV / GCP-KMS backends to accept an injected client
+`docs/TESTCOVERAGE.md` documents three Google / Azure-bound files that
+can't be exercised by the in-crate `wiremock` rig because the upstream
+SDKs build their HTTP client internally with no endpoint override:
+
+- `shared/cloud/src/gcs.rs` (307 lines, 5% — pulls the whole
+  `shared/cloud` crate close to its 80% floor)
+- `shared/keystore/src/gcpkms.rs` (172 lines, 30%)
+- `shared/keystore/src/azurekv.rs` (380 lines, 49%)
+
+The official `googleapis/google-cloud-rust` SDK ships a client-level
+mocking pattern (https://googleapis.github.io/google-cloud-rust/mock_a_client.html)
+that injects a mock `RequestRouter` at construction time, returning
+canned SDK responses without any HTTP wire. Azure's SDK has the same
+shape via its trait-based `Client`.
+
+Refactor:
+- `GcsBackend::new` / `GcpKmsBackend::new` / `AzureKvBackend::new`
+  take a pre-built `Client` parameter instead of building one
+  internally. Production callers wrap `Client::new(...)`; tests pass
+  a mock that returns the canonical happy + error responses.
+- Existing per-method coverage targets: 80%+ per-file for each of
+  the three files — well within reach with mocked clients (S3 and
+  Azure-blob already hit 90%+ via the `wiremock` rig).
+
+Tradeoff: mocks SDK-client behaviour, not the HTTP wire — won't catch
+malformed headers / JSON shapes. Those failure modes only surface
+against real GCS / Azure / GCP, where the cloud-backed integration
+suites (`THURVSA_TEST_BACKEND=gcs-none` + friends) catch them today
+and will keep doing so. Net: unit tests close ~700 lines of
+"untestable" code without losing the real-cloud signal.
+
+### Fix newly-added integration tests that don't pass under sudo
+Two scripts added in 2026-05-23 work locally for syntax + script
+flow but fail when run end-to-end against a real kernel initiator:
+
+- `vsa/scripts/test-crash-page-flush.sh` — fails the snap-pre vs
+  snap-post comparison. Either the kernel block-cache survives the
+  iSCSI logout (so the post-restart snapshot reads stale bytes via
+  the cached page cache), or the daemon's flush-on-fsync isn't
+  actually committing every page before the SIGKILL window. Needs
+  investigation: does `sync` + iSCSI logout flush the SCSI midlayer
+  cache for that LU, or do we need an additional `blockdev --flushbufs`?
+- `vsa/scripts/test-iscsi-multi-initiator.sh` — fails the RESERVATION
+  CONFLICT assertion. Either the daemon's PR table doesn't actually
+  enforce single-writer across distinct initiator IQNs (a real
+  correctness bug if so), or the second initiator's WRITE is
+  reaching the daemon under the FIRST initiator's session because
+  the kernel iSCSI session re-attached using a cached InitiatorName.
+  First step: instrument the daemon's PR handler to log the
+  initiator IQN it sees per WRITE; compare against expectations.
 
 ---
 
