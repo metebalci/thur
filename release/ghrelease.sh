@@ -108,13 +108,59 @@ esac
 [ -d "$OUT_DIR" ] || {
     echo "error: $OUT_DIR/ not found — run release/release.sh first." >&2; exit 1; }
 
+# Filter $OUT_DIR/ down to artifacts that match THIS version.
+# release.sh wipes $OUT_DIR/ on every run, so a mismatch here means
+# the Cargo.toml VERSION was bumped between release.sh and this run.
+# Stale files get skipped, not uploaded.
+#
+# Filename translations release.sh inherits from the packagers:
+#   .deb  cargo-deb maps `-` -> `~` in the version field, then stamps
+#         <package>_<deb-version>-1_amd64.deb
+#   .rpm  release.sh splits a SemVer prerelease across the Fedora
+#         Version / Release fields (0.1.0-alpha.1 -> 0.1.0 / 0.alpha.1),
+#         cargo-generate-rpm stamps <package>-<ver>-<rel>.x86_64.rpm
+# .asc signatures track their parent — match against the name with
+# `.asc` stripped.
+DEB_VERSION="${VERSION//-/~}"
+if [[ "$VERSION" == *-* ]]; then
+    RPM_VERREL="${VERSION%%-*}-0.${VERSION#*-}"
+else
+    RPM_VERREL="${VERSION}-1"
+fi
+
 shopt -s nullglob
-ASSETS=("$OUT_DIR"/*)
-ASC=("$OUT_DIR"/*.asc)
+ALL=("$OUT_DIR"/*)
 shopt -u nullglob
 
-[ ${#ASSETS[@]} -gt 0 ] || {
+[ ${#ALL[@]} -gt 0 ] || {
     echo "error: $OUT_DIR/ is empty — run release/release.sh first." >&2; exit 1; }
+
+ASSETS=()
+ASC=()
+SKIPPED=()
+for f in "${ALL[@]}"; do
+    name="${f##*/}"
+    base="${name%.asc}"
+    case "$base" in
+        *_${DEB_VERSION}-1_amd64.deb|*-${RPM_VERREL}.x86_64.rpm)
+            ASSETS+=("$f")
+            [ "$base" != "$name" ] && ASC+=("$f")
+            ;;
+        *)
+            SKIPPED+=("$name")
+            ;;
+    esac
+done
+
+[ ${#ASSETS[@]} -gt 0 ] || {
+    echo "error: no artifacts in $OUT_DIR/ match version $VERSION." >&2
+    echo "       re-run release/release.sh for a clean $OUT_DIR/." >&2
+    exit 1; }
+
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+    echo "==> skipping ${#SKIPPED[@]} stale file(s) in $OUT_DIR/ (do not match $VERSION):"
+    for s in "${SKIPPED[@]}"; do echo "       $s"; done
+fi
 
 if [ ${#ASC[@]} -gt 0 ]; then
     SIG_NOTE="${#ASC[@]} present"

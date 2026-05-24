@@ -240,17 +240,14 @@ fi
 # ---- Below this point we are inside the builder image. ----
 
 OUT_DIR="release-artifacts"
-# Wipe stale artifacts from previous runs. Without this, the signing
-# loop further down (globs *.deb / *.rpm) would re-sign
-# old version-stamped files alongside the new ones, and `ls -lh`
-# at the end mixes them. We're inside the builder container with
-# CWD pinned to the workspace root, so the path is unambiguous.
-# When the build cache is on (KEEP_CACHE=1, the dev/alpha default)
-# the wipe is skipped — fast-iteration mode, the operator accepts
-# mixed-version artifacts piling up. beta/rc/final always wipe.
-if [ "$KEEP_CACHE" -eq 0 ]; then
-    rm -rf -- "$OUT_DIR"
-fi
+# Always wipe stale artifacts from previous runs. The build cache
+# (KEEP_CACHE) is about cargo's target dir — orthogonal to the output
+# dir. Mixed-version files in release-artifacts/ would make the signing
+# loop re-sign stale builds, the final `ls -lh` ambiguous, and
+# ghrelease.sh's version filter noisier than it needs to be. We're
+# inside the builder container with CWD pinned to the workspace root,
+# so the path is unambiguous.
+rm -rf -- "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 # Pull the version out of the root Cargo.toml's [workspace.package]
