@@ -114,11 +114,32 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use futures::stream::{self, StreamExt};
+    use tempfile::TempDir;
+
+    use crate::payload::PendingUpload;
+    use crate::pipeline::run_upload_pipeline;
+    use crate::test_support::MockBackend;
+    use shared_cloud::DedupScope;
+
+    fn make_payload(item_id: u64, dir: &Path) -> PendingUpload {
+        let local = dir.join(format!("{}.dat", item_id));
+        std::fs::write(&local, format!("data-{}", item_id).as_bytes()).unwrap();
+        PendingUpload {
+            item_id,
+            hash: format!("{:02x}", item_id).repeat(32),
+            local_path: local,
+            cloud_key: format!("chunks/{}/v.dat", item_id),
+            dedup: DedupScope::Local,
+            backend_name: "primary".into(),
+        }
+    }
 
     /// Property the pipelined upload worker depends on: with N
     /// futures driven through `buffer_unordered(N)`, a single slow
@@ -165,5 +186,101 @@ mod tests {
              pipelining is gated if any are observed completing after",
             N - 1,
         );
+    }
+
+    #[tokio::test]
+    async fn empty_payloads_returns_empty_vec_without_invoking_hook() {
+        let backend = MockBackend::default();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_hook = hits.clone();
+        let outcomes = run_upload_pipeline(&backend, "label", vec![], 4, move |_| {
+            let hits = hits_for_hook.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert!(outcomes.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.puts(), 0);
+        assert_eq!(backend.heads(), 0);
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_zero_clamps_to_one_and_runs_all() {
+        let backend = MockBackend::default();
+        let tmp = TempDir::new().unwrap();
+        let payloads: Vec<PendingUpload> = (0..3).map(|i| make_payload(i, tmp.path())).collect();
+        let outcomes = run_upload_pipeline(&backend, "label", payloads, 0, |_| async {}).await;
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(backend.puts(), 3);
+    }
+
+    #[tokio::test]
+    async fn per_payload_error_does_not_gate_siblings_and_hook_only_fires_on_success() {
+        let backend = MockBackend::default();
+        backend
+            .fail_put_for_keys
+            .lock()
+            .unwrap()
+            .insert("chunks/2/v.dat".to_string());
+
+        let tmp = TempDir::new().unwrap();
+        let payloads: Vec<PendingUpload> =
+            (1..=4u64).map(|i| make_payload(i, tmp.path())).collect();
+
+        let hook_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let hook_ids_for_hook = hook_ids.clone();
+        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, move |o| {
+            let hook_ids = hook_ids_for_hook.clone();
+            async move {
+                hook_ids.lock().unwrap().push(o.item_id);
+            }
+        })
+        .await;
+
+        let mut returned: Vec<u64> = outcomes.iter().map(|o| o.item_id).collect();
+        returned.sort();
+        assert_eq!(returned, vec![1, 3, 4]);
+
+        let mut fired = hook_ids.lock().unwrap().clone();
+        fired.sort();
+        assert_eq!(fired, vec![1, 3, 4]);
+
+        // PUT was attempted for all 4 (the failing one still issued a PUT
+        // — the failure is on the backend side, not pre-filter).
+        assert_eq!(backend.puts(), 4);
+    }
+
+    #[tokio::test]
+    async fn global_dedup_hit_skips_put_but_still_fires_hook() {
+        let backend = MockBackend::default();
+        // Cloud-side HEAD returns true for every key → dedup hit; no PUT.
+        *backend.head_returns.lock().unwrap() = true;
+
+        let tmp = TempDir::new().unwrap();
+        let mut payloads: Vec<PendingUpload> =
+            (1..=3u64).map(|i| make_payload(i, tmp.path())).collect();
+        // Flip every payload to Global so the HEAD probe runs.
+        for p in &mut payloads {
+            p.dedup = DedupScope::Global;
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = hook_calls.clone();
+        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, move |o| {
+            let hook_calls = hook_calls_for_hook.clone();
+            async move {
+                assert!(o.dedup_hit, "every outcome must reflect the HEAD hit");
+                assert!(o.put_bytes.is_none());
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.heads(), 3);
+        assert_eq!(backend.puts(), 0);
     }
 }

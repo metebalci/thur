@@ -181,4 +181,82 @@ mod tests {
         let err = upload_chunk_inert(backend.as_ref(), &p).await.unwrap_err();
         assert!(matches!(err, UploadInertError::Io { .. }));
     }
+
+    #[tokio::test]
+    async fn head_probe_error_propagates_as_cloud_error_and_no_put_attempted() {
+        use crate::test_support::MockBackend;
+        use shared_cloud::CloudError;
+
+        let backend = MockBackend::default();
+        *backend.head_err.lock().unwrap() = Some(CloudError::Other("HEAD blew up".into()));
+
+        let tmp = TempDir::new().unwrap();
+        let local = tmp.path().join("payload.dat");
+        std::fs::write(&local, b"x").unwrap();
+        let p = PendingUpload {
+            item_id: 1,
+            hash: "ab".repeat(32),
+            local_path: local,
+            cloud_key: "chunks/ab/ab.dat".into(),
+            dedup: DedupScope::Global,
+            backend_name: "primary".into(),
+        };
+        let err = upload_chunk_inert(&backend, &p).await.unwrap_err();
+        assert!(matches!(err, UploadInertError::Cloud(_)));
+        assert_eq!(backend.heads(), 1);
+        assert_eq!(backend.puts(), 0);
+    }
+
+    #[tokio::test]
+    async fn put_error_after_head_miss_propagates_as_cloud_error() {
+        use crate::test_support::MockBackend;
+        use shared_cloud::CloudError;
+
+        let backend = MockBackend::default();
+        *backend.put_err.lock().unwrap() = Some(CloudError::Other("PUT 5xx after retries".into()));
+
+        let tmp = TempDir::new().unwrap();
+        let local = tmp.path().join("payload.dat");
+        std::fs::write(&local, b"hello").unwrap();
+        let p = PendingUpload {
+            item_id: 2,
+            hash: "cd".repeat(32),
+            local_path: local,
+            cloud_key: "chunks/cd/cd.dat".into(),
+            dedup: DedupScope::Global,
+            backend_name: "primary".into(),
+        };
+        let err = upload_chunk_inert(&backend, &p).await.unwrap_err();
+        assert!(matches!(err, UploadInertError::Cloud(_)));
+        assert_eq!(backend.heads(), 1);
+        assert_eq!(backend.puts(), 1);
+    }
+
+    #[tokio::test]
+    async fn compressed_put_records_compressed_bytes_and_algo() {
+        use crate::test_support::MockBackend;
+        use shared_cloud::CompressionAlgo;
+
+        let backend = MockBackend::default();
+        *backend.put_compressed_as.lock().unwrap() = Some((60, CompressionAlgo::Zstd));
+
+        let tmp = TempDir::new().unwrap();
+        let local = tmp.path().join("payload.dat");
+        std::fs::write(&local, vec![0u8; 100]).unwrap();
+        let p = PendingUpload {
+            item_id: 3,
+            hash: "ef".repeat(32),
+            local_path: local,
+            cloud_key: "chunks/ef/ef.dat".into(),
+            dedup: DedupScope::Local,
+            backend_name: "primary".into(),
+        };
+        let outcome = upload_chunk_inert(&backend, &p).await.unwrap();
+        assert!(!outcome.dedup_hit);
+        assert_eq!(outcome.put_bytes, Some(60));
+        assert_eq!(outcome.put_compression, Some(CompressionAlgo::Zstd));
+        // Local scope skips the HEAD probe.
+        assert_eq!(backend.heads(), 0);
+        assert_eq!(backend.puts(), 1);
+    }
 }

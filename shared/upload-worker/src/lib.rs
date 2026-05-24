@@ -56,6 +56,9 @@ pub mod inert;
 pub mod payload;
 pub mod pipeline;
 
+#[cfg(test)]
+mod test_support;
+
 pub use inert::{UploadInertError, upload_chunk_inert};
 pub use payload::{PendingUpload, UploadOutcome};
 pub use pipeline::run_upload_pipeline;

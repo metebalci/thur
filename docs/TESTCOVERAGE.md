@@ -77,7 +77,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-naming` | 94% | shared | per-product identity strings |
 | `shared-pool` | 91% | **critical** | content-addressed chunk pool, insertion, GC iteration, budget |
 | `shared-telemetry` | 66% | shared | OpenTelemetry instrument plumbing |
-| `shared-upload-worker` | 74% | **control-plane critical** | cloud-upload PUT + HEAD-probe primitive (below 80% floor, see § Active targets) |
+| `shared-upload-worker` | 89% | **control-plane critical** | cloud-upload PUT + HEAD-probe primitive |
 | `shared-verify-core` | 85% | **control-plane critical** | pool + cloud verify sweeps — exercised via the `core-*` verify tests |
 
 ### `scsi/` — SCSI command sets
@@ -185,20 +185,26 @@ so it isn't yet the CI gate.
 Crates currently below their integrated-mode floor — listed in priority
 order:
 
-1. **`shared/upload-worker` (74% < 80%)** — newly classified as
-   control-plane critical. The PUT-then-HEAD-probe primitive and
-   bounded-concurrency `run_upload_pipeline` need direct unit tests
-   for failure-path branches (PUT 5xx → backoff, HEAD-probe size
-   mismatch, hook ordering under concurrent completions). Gap is ~6
-   pp; ≤ a half-day of focused tests would clear it.
-2. **`shared/keystore` (79% < 80%)** — integrated-mode measurement
-   drift vs `cargo llvm-cov`'s native 80.6%; the regex filter in
-   `--integrated` excludes some paths the `--crates` mode includes.
-   Either tighten the filter or land the `azurekv.rs` (49%) and
-   `gcpkms.rs` (30%) mocked-client tests once the SDK refactor lands
-   (same path as the gcs.rs note above).
-3. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
+1. **`shared/keystore` (79% integrated, 80.6% `--crates`)** — small
+   measurement drift vs `cargo llvm-cov`'s native number; not
+   actionable until the broader integrated-mode profraw merge bug is
+   resolved (see § Known measurement issues below). The proper close
+   path is the `azurekv.rs` (49%) and `gcpkms.rs` (30%) mocked-client
+   tests once the SDK refactor lands (same path as the gcs.rs note
+   above).
+2. **`shared/cloud-bench` (36% < 50%)** — documented exception; no
    action expected.
+
+### Known measurement issues
+
+The `--integrated` runner's `llvm-profdata merge` step globs
+`target/llvm-cov-target/thur-*.profraw`, but the unit-test profraws
+produced by `cargo llvm-cov --no-report --workspace` end up in a
+location that doesn't survive the shell-suite phase by the time the
+merge runs — only the shell-suite-spawned daemon profraws are
+consolidated. This depresses every crate's integrated-mode number,
+not just `shared/keystore`. The `--crates` mode is unaffected and
+remains the authoritative unit-mode gate for CI.
 
 ## End-to-end suites
 
