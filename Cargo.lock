@@ -4129,6 +4129,7 @@ dependencies = [
  "shared-cloud",
  "shared-iscsi",
  "shared-naming",
+ "shared-telemetry",
  "tempfile",
  "tokio",
  "tracing",

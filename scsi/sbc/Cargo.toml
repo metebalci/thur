@@ -21,6 +21,10 @@ shared-naming = { path = "../../shared/naming" }
 # The product-side ScsiHandler trait the dispatcher implements; the
 # daemon's iSCSI transport binds via this trait.
 shared-iscsi = { path = "../../shared/iscsi" }
+# Per-product instrument table for EXTENDED COPY (XCOPY) counters.
+# Calls go through `shared_telemetry::record::*` which no-op when
+# the global registry is unset (CLI / unit tests).
+shared-telemetry = { path = "../../shared/telemetry" }
 
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "rt"] }

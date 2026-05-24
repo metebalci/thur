@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! INQUIRY (opcode 0x12) — standard data + VPD pages 0x00 / 0x80 /
-//! 0x83 / 0xB0 / 0xB2.
+//! 0x83 / 0x8F / 0xB0 / 0xB2.
 //!
 //! INQUIRY must always succeed against any LUN — that's how the
 //! initiator discovers which LUNs are present. For LUNs not in the
@@ -32,7 +32,7 @@ use scsi_spc::inquiry::{
 };
 use scsi_spc::vpd::{
     Association, CodeSet, DesignatorType, build_device_identification, build_supported_vpd_pages,
-    build_unit_serial_number, push_designator, vpd_header,
+    build_unit_serial_number, finalize_vpd, push_designator, vpd_header,
 };
 use shared_naming::{DISK_PRODUCT, VENDOR_INQUIRY};
 
@@ -80,6 +80,7 @@ pub(super) fn dispatch(req: &ScsiRequest<'_>, cache: Option<&PageCache>) -> Scsi
             0x00 => vpd_supported_pages(cache.is_some()),
             0x80 => vpd_unit_serial(cache),
             0x83 => vpd_device_id(cache),
+            0x8F => vpd_third_party_copy(cache),
             0xB0 => vpd_block_limits(cache),
             0xB2 => vpd_logical_block_provisioning(cache),
             _ => return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
@@ -114,7 +115,7 @@ fn standard_inquiry(cache: Option<&PageCache>) -> Vec<u8> {
 fn vpd_supported_pages(lun_present: bool) -> Vec<u8> {
     let (pq, pt) = pq_pt(lun_present);
     let pages: &[u8] = if lun_present {
-        &[0x80, 0x83, 0xB0, 0xB2]
+        &[0x80, 0x83, 0x8F, 0xB0, 0xB2]
     } else {
         &[]
     };
@@ -132,10 +133,19 @@ fn vpd_unit_serial(cache: Option<&PageCache>) -> Vec<u8> {
     build_unit_serial_number(pq, pt, &serial, serial.len())
 }
 
-/// VPD 0x83 — Device Identification. One T10 vendor ID descriptor
-/// (designator type 0x01) carrying `"MB      MBD_<uuid_hex>"`.
-/// Real NAA descriptors require an IEEE OUI we don't own and can
-/// land later; T10 is universally accepted by initiators.
+/// VPD 0x83 — Device Identification. Two descriptors per LUN:
+///
+/// 1. T10 vendor ID (designator type 0x01) carrying
+///    `"MB      MBD_<uuid_hex>"`. Initiators that gate on T10
+///    designators (most Linux SCSI mid-layer code, fio probes)
+///    consume this directly.
+/// 2. NAA Locally Assigned (designator type 0x03, NAA type 0x3) —
+///    an 8-byte binary identifier derived from the first 64 bits
+///    of the volume UUID with the top nibble forced to 0x3. The
+///    SPC-3 EXTENDED COPY identification target descriptor only
+///    has room for a 20-byte designator, so VAAI XCOPY references
+///    LUNs by NAA. Without this entry, ESXi can't address VSA
+///    volumes as XCOPY targets even with VPD 0x8F advertised.
 fn vpd_device_id(cache: Option<&PageCache>) -> Vec<u8> {
     let (pq, pt) = pq_pt(cache.is_some());
     let mut descriptors = Vec::new();
@@ -153,8 +163,145 @@ fn vpd_device_id(cache: Option<&PageCache>) -> Vec<u8> {
             DesignatorType::T10VendorId,
             &designator,
         );
+        // NAA Locally Assigned. 8 bytes: top nibble = NAA type 0x3,
+        // remaining 60 bits derived from the volume UUID's first
+        // 8 bytes. Stable across daemon restarts because the UUID
+        // is creation-frozen in the manifest.
+        let naa = naa_locally_assigned(&w.manifest().uuid);
+        push_designator(
+            &mut descriptors,
+            CodeSet::Binary,
+            Association::LogicalUnit,
+            DesignatorType::Naa,
+            &naa,
+        );
     }
     build_device_identification(pq, pt, &descriptors)
+}
+
+/// Derive the 8-byte NAA Locally Assigned identifier from a volume
+/// UUID. Top nibble forced to NAA type 0x3 (locally assigned),
+/// remaining 60 bits taken from the UUID's first 8 bytes. Stable
+/// across daemon restarts because the UUID is creation-frozen.
+///
+/// `pub(crate)` so [`crate::data_path`]'s XCOPY descriptor matcher
+/// can rebuild the same identifier when resolving an incoming
+/// target descriptor against the registered LUN set.
+pub(crate) fn naa_locally_assigned(uuid: &[u8; 16]) -> [u8; 8] {
+    let mut naa = [0u8; 8];
+    naa.copy_from_slice(&uuid[..8]);
+    // NAA type = 0x3 in bits 63-60 (top nibble of byte 0).
+    naa[0] = 0x30 | (naa[0] & 0x0F);
+    naa
+}
+
+/// VPD 0x8F — Third Party Copy (SPC-4 §7.7.18). Advertises the
+/// SPC-3 EXTENDED COPY (LID1) surface VAAI / VAAI-like initiators
+/// gate on before issuing offloaded copy. The page is a wrapper
+/// around a sequence of typed sub-descriptors; we publish four:
+///
+///   0x0001 SUPPORTED COMMANDS — declares opcode 0x83 (EXTENDED
+///          COPY) with service action 0x00 (LID1) and opcode 0x84
+///          (RECEIVE COPY RESULTS) with service actions 0x00
+///          (COPY STATUS) and 0x03 (OPERATING PARAMETERS). Without
+///          this, ESXi won't try the offload at all.
+///   0x0004 PARAMETER DATA — per-XCOPY limits matching what
+///          RECEIVE COPY RESULTS / OPERATING PARAMETERS reports:
+///          max target descriptors = 2, max segment descriptors = 1,
+///          max descriptor list length = 128, max inline = 0.
+///   0x0008 SUPPORTED DESCRIPTORS — the descriptor type codes we
+///          accept (target 0xE4, segment 0x02).
+///   0x8001 GENERAL COPY OPERATIONS — total bytes per XCOPY cap
+///          (16 MiB), concurrent-copy hints (1).
+///
+/// SPC-4 layout: each descriptor is a 2-byte descriptor type code
+/// followed by a 2-byte length and that many body bytes.
+fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
+    let (pq, pt) = pq_pt(cache.is_some());
+    let mut page = vpd_header(pq, pt, 0x8F, 0);
+    let Some(cache) = cache else {
+        finalize_vpd(&mut page);
+        return page;
+    };
+    // SPC-4 §7.7.18 requires a 4-byte reserved block at the start
+    // of the body (offsets 4-7 inclusive in the page-relative
+    // numbering). After that the descriptor list begins.
+    page.extend_from_slice(&[0u8; 4]);
+
+    // 0x0001 SUPPORTED COMMANDS (per SPC-4 §7.7.18.2). One entry
+    // per (opcode, service action) pair we honor. Body layout:
+    //   byte 0     COMMANDS SUPPORTED LIST LENGTH
+    //   per entry (variable):
+    //     byte 0   OPERATION CODE
+    //     bytes 1-2  SERVICE ACTION (BE16) — 0xFFFF when no SA
+    //     byte 3   reserved
+    //     bytes 4-7 CDB SIZES (4 bytes; we publish only the most
+    //              common SA size and reserve the rest as 0)
+    //
+    // Initiators only inspect the (opcode, SA) presence; the
+    // body layout details vary across vendors. We publish a
+    // compact form (one byte length, then a 4-byte (op, SA, SA,
+    // reserved) shape) that LIO interoperates with.
+    let mut commands: Vec<u8> = Vec::new();
+    // (0x83, 0x00) — EXTENDED COPY (LID1)
+    commands.extend_from_slice(&[0x83, 0x00, 0x00, 0x00]);
+    // (0x84, 0x00) — RECEIVE COPY RESULTS / COPY STATUS
+    commands.extend_from_slice(&[0x84, 0x00, 0x00, 0x00]);
+    // (0x84, 0x03) — RECEIVE COPY RESULTS / OPERATING PARAMETERS
+    commands.extend_from_slice(&[0x84, 0x00, 0x03, 0x00]);
+    push_tpc_descriptor(&mut page, 0x0001, &{
+        let mut body = Vec::with_capacity(1 + commands.len());
+        body.push(commands.len() as u8);
+        body.extend_from_slice(&commands);
+        body
+    });
+
+    // 0x0004 PARAMETER DATA (SPC-4 §7.7.18.6).
+    //   bytes 0-1   MAXIMUM CSCD DESCRIPTOR COUNT
+    //   bytes 2-3   MAXIMUM SEGMENT DESCRIPTOR COUNT
+    //   bytes 4-7   MAXIMUM DESCRIPTOR LIST LENGTH
+    //   bytes 8-11  MAXIMUM INLINE DATA LENGTH
+    let mut param_body = vec![0u8; 12];
+    param_body[0..2].copy_from_slice(&2u16.to_be_bytes());
+    param_body[2..4].copy_from_slice(&1u16.to_be_bytes());
+    param_body[4..8].copy_from_slice(&128u32.to_be_bytes());
+    // inline data length stays 0 — inline data unsupported.
+    push_tpc_descriptor(&mut page, 0x0004, &param_body);
+
+    // 0x0008 SUPPORTED DESCRIPTORS (SPC-4 §7.7.18.9).
+    //   byte 0      SUPPORTED DESCRIPTOR IDS LIST LENGTH
+    //   bytes 1..   descriptor type codes (one byte each)
+    let supported_descs = [0xE4u8, 0x02u8];
+    let mut sd_body = Vec::with_capacity(1 + supported_descs.len());
+    sd_body.push(supported_descs.len() as u8);
+    sd_body.extend_from_slice(&supported_descs);
+    push_tpc_descriptor(&mut page, 0x0008, &sd_body);
+
+    // 0x8001 GENERAL COPY OPERATIONS (SPC-4 §7.7.18.13).
+    //   bytes 0-3   TOTAL CONCURRENT COPIES
+    //   bytes 4-7   MAXIMUM IDENTIFIED CONCURRENT COPIES
+    //   bytes 8-11  MAXIMUM SEGMENT LENGTH (bytes)
+    //   byte 12     DATA SEGMENT GRANULARITY (log2(bytes))
+    //   byte 13     INLINE DATA GRANULARITY (log2(bytes))
+    //   bytes 14-15 reserved
+    let mut gen_body = vec![0u8; 16];
+    gen_body[0..4].copy_from_slice(&1u32.to_be_bytes());
+    gen_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    gen_body[8..12].copy_from_slice(&(16u32 << 20).to_be_bytes()); // 16 MiB
+    let page_log2 = u64::from(cache.manifest().page_size_bytes).trailing_zeros() as u8;
+    gen_body[12] = page_log2;
+    push_tpc_descriptor(&mut page, 0x8001, &gen_body);
+
+    finalize_vpd(&mut page);
+    page
+}
+
+/// Append one VPD 0x8F sub-descriptor: 4-byte header (2-byte type
+/// code + 2-byte length) followed by `body`.
+fn push_tpc_descriptor(page: &mut Vec<u8>, type_code: u16, body: &[u8]) {
+    page.extend_from_slice(&type_code.to_be_bytes());
+    page.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    page.extend_from_slice(body);
 }
 
 /// VPD 0xB0 — Block Limits (SBC-3 §6.6.4). 64-byte response
@@ -458,5 +605,74 @@ mod tests {
         assert_eq!(d[5] & 0x01, 0x00, "DP bit");
         // byte 6 PROVISIONING TYPE = 010 (thin).
         assert_eq!(d[6] & 0x07, 0b010);
+    }
+
+    #[tokio::test]
+    async fn vpd_page_zero_includes_8f_for_third_party_copy() {
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        let cdb = [0x12u8, 0x01, 0x00, 0x00, 0x40, 0];
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let d = &resp.data_in;
+        let n = d[3] as usize;
+        let pages = &d[4..4 + n];
+        assert!(pages.contains(&0x8F));
+    }
+
+    #[tokio::test]
+    async fn vpd_third_party_copy_publishes_required_descriptors() {
+        // ESXi gates VAAI XCOPY on this page. The descriptor sequence
+        // must include 0x0001 SUPPORTED COMMANDS (with opcodes 0x83
+        // and 0x84), 0x0004 PARAMETER DATA, 0x0008 SUPPORTED
+        // DESCRIPTORS (with type codes 0xE4 and 0x02), and 0x8001
+        // GENERAL COPY OPERATIONS.
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        let cdb = [0x12u8, 0x01, 0x8F, 0x00, 0x80, 0];
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let d = &resp.data_in;
+        assert!(resp.sense.is_none(), "{:?}", resp.sense);
+        assert_eq!(d[1], 0x8F);
+        let page_len = u16::from_be_bytes([d[2], d[3]]) as usize;
+        assert_eq!(d.len(), 4 + page_len);
+        // Skip the reserved 4 bytes after the header.
+        let mut cur = 4 + 4;
+        let mut found_codes = std::collections::BTreeSet::new();
+        let mut commands_body: Option<Vec<u8>> = None;
+        let mut supported_descs_body: Option<Vec<u8>> = None;
+        while cur + 4 <= d.len() {
+            let type_code = u16::from_be_bytes([d[cur], d[cur + 1]]);
+            let body_len = u16::from_be_bytes([d[cur + 2], d[cur + 3]]) as usize;
+            let body = &d[cur + 4..cur + 4 + body_len];
+            found_codes.insert(type_code);
+            if type_code == 0x0001 {
+                commands_body = Some(body.to_vec());
+            }
+            if type_code == 0x0008 {
+                supported_descs_body = Some(body.to_vec());
+            }
+            cur += 4 + body_len;
+        }
+        for code in [0x0001u16, 0x0004, 0x0008, 0x8001] {
+            assert!(
+                found_codes.contains(&code),
+                "descriptor {code:#06x} missing"
+            );
+        }
+        let commands = commands_body.expect("SUPPORTED COMMANDS body present");
+        // First byte is list length; the list of opcodes follows in
+        // 4-byte tuples (op, sa_hi, sa_lo, reserved).
+        let len = commands[0] as usize;
+        assert!(len >= 12);
+        let entries = &commands[1..1 + len];
+        let ops: Vec<u8> = entries.chunks(4).map(|e| e[0]).collect();
+        assert!(ops.contains(&0x83), "EXTENDED COPY not advertised");
+        assert!(ops.contains(&0x84), "RECEIVE COPY RESULTS not advertised");
+        let supported = supported_descs_body.expect("SUPPORTED DESCRIPTORS body present");
+        // First byte is the list length, then the type codes.
+        let n = supported[0] as usize;
+        let types = &supported[1..1 + n];
+        assert!(types.contains(&0xE4), "identification descriptor missing");
+        assert!(types.contains(&0x02), "block-to-block segment missing");
     }
 }

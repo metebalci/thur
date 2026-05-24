@@ -6,11 +6,12 @@
 //! trait (`thurvsad`'s `VolumeRegistry` implements it).
 //!
 //! Surface today: identity / sizing / discovery (TUR, INQUIRY +
-//! VPD 0x00 / 0x80 / 0x83 / 0xB0 / 0xB2, READ CAPACITY 10 / 16,
-//! REPORT LUNS, MODE SENSE 6 / 10 caching + control pages) plus the
-//! sector-grain data path (WRITE 10 / 16, READ 10 / 16, SYNCHRONIZE
-//! CACHE 10 / 16, COMPARE AND WRITE, UNMAP) routed through the per-
-//! volume `PageCache`.
+//! VPD 0x00 / 0x80 / 0x83 / 0x8F / 0xB0 / 0xB2, READ CAPACITY 10 /
+//! 16, REPORT LUNS, MODE SENSE 6 / 10 caching + control pages) plus
+//! the sector-grain data path (WRITE 10 / 16, READ 10 / 16,
+//! SYNCHRONIZE CACHE 10 / 16, COMPARE AND WRITE, UNMAP, EXTENDED
+//! COPY + RECEIVE COPY RESULTS) routed through the per-volume
+//! `PageCache`.
 //!
 //! The dispatcher is cheap to clone (`Arc` over the registry) and
 //! the per-opcode arms are async — the data-path arms await the
@@ -115,6 +116,8 @@ impl SbcScsiDispatcher {
                 .reservations
                 .persistent_reserve_in(&req, cache.is_some()),
             0x5F => self.reservations.persistent_reserve_out(&req, cache, nexus),
+            0x83 => data_path::extended_copy(&req, &self.registry, nexus, &self.reservations).await,
+            0x84 => data_path::receive_copy_results(&req),
             0x89 => {
                 data_path::compare_and_write(
                     &req,

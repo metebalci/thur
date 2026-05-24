@@ -14,7 +14,7 @@
 # Coverage map (see CLAUDE.md "thurvsa block-product initiative" for
 # the daemon source):
 #   SPC (shared discovery + config):
-#     0x12 INQUIRY (standard + VPD pages 0x00 / 0x80 / 0x83 / 0xB0 / 0xB2)
+#     0x12 INQUIRY (standard + VPD pages 0x00 / 0x80 / 0x83 / 0x8F / 0xB0 / 0xB2)
 #     0x9E READ CAPACITY 16 (LBPME + LBPRZ thin-provisioning hints)
 #     0x1A / 0x5A MODE SENSE 6 / 10 (Caching + Control pages)
 #     0x15 / 0x55 MODE SELECT 6 / 10 (round-trip + WCE mutation rejected)
@@ -24,6 +24,8 @@
 #     0x35 / 0x91 SYNCHRONIZE CACHE (real fence: kill-restart proves it)
 #     0x89 COMPARE AND WRITE       (success + MISCOMPARE)
 #     0x42 UNMAP                   (sub-page sector zero + page-index drop)
+#     0x83 EXTENDED COPY           (VAAI XCOPY, same-LUN page-aligned fast path)
+#     0x84 RECEIVE COPY RESULTS    (COPY STATUS + OPERATING PARAMETERS)
 #   SBC-3 reservations:
 #     0x5E / 0x5F PERSISTENT RESERVE IN / OUT
 #       (single-host scope — see cross-nexus-conflict caveat below)
@@ -377,6 +379,15 @@ t_inquiry_vpd_thin_provisioning() {
     out=$(sg_vpd -p lbpv "$RW_DEVICE" 2>&1); echo "$out"
     # LBPU=1, LBPRZ=001, PROVISIONING TYPE=010 (thin).
     echo "$out" | grep -qiE 'logical block provisioning|LBPU|LBPRZ|Thin'
+}
+
+t_inquiry_vpd_third_party_copy() {
+    # VPD 0x8F (Third Party Copy) is what ESXi gates VAAI XCOPY on.
+    # sg_vpd's short page name is "tpc". The page body lists the
+    # SUPPORTED COMMANDS sub-descriptor with opcodes 0x83 and 0x84.
+    local out
+    out=$(sg_vpd -p tpc "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qiE 'third party copy|tpc|extended copy|0x83|0x84'
 }
 
 # ---------------------------------------------------------------------------
@@ -898,7 +909,8 @@ t_report_supported_opcodes_lists_offload() {
     # `sg_opcodes` issues MAINTENANCE IN / REPORT SUPPORTED OPCODES
     # (0xA3 SA 0x0C). The list must include the offload primitives
     # VAAI / Linux probe for: COMPARE AND WRITE (0x89), UNMAP (0x42),
-    # WRITE SAME 10 (0x41) + 16 (0x93), VERIFY 10 (0x2F) + 16 (0x8F).
+    # WRITE SAME 10 (0x41) + 16 (0x93), VERIFY 10 (0x2F) + 16 (0x8F),
+    # EXTENDED COPY (0x83), RECEIVE COPY RESULTS (0x84).
     local out
     out=$(sg_opcodes "$RW_DEVICE" 2>&1); echo "$out"
     local need=(
@@ -907,6 +919,8 @@ t_report_supported_opcodes_lists_offload() {
         'Write same'
         'Verify'
         'Maintenance'
+        'Extended copy'
+        'Receive copy results'
     )
     local missing=0
     for pat in "${need[@]}"; do
@@ -947,6 +961,55 @@ t_verify_bytchk_zero_succeeds() {
     sg_verify --count=8 --lba=0 "$RW_DEVICE" 2>&1
 }
 
+t_xcopy_receive_copy_results_operating_parameters() {
+    # sg_copy_results queries RECEIVE COPY RESULTS (opcode 0x84). With
+    # service action 0x03 (OPERATING PARAMETERS) the response carries
+    # our advertised XCOPY limits + supported descriptor types
+    # (0xE4 identification, 0x02 block-to-block). sg_copy_results
+    # defaults to op_params (sa 0x03) when --list_id is omitted.
+    local out
+    out=$(sg_copy_results --op_params "$RW_DEVICE" 2>&1); echo "$out"
+    # Body bytes include "Maximum target descriptor count" / "Maximum
+    # segment descriptor count" / "Implemented descriptor list" in
+    # human-readable form across sg3_utils releases.
+    echo "$out" | grep -qiE 'maximum (target descriptor count|segment descriptor count)|implemented descriptor|0xe4|0x02'
+}
+
+t_xcopy_same_lun_intra_volume_copy() {
+    # End-to-end VAAI-style XCOPY: same LUN, page-aligned, source !=
+    # destination, no overlap. sg_xcopy on a recent sg3_utils builds
+    # a LID1 parameter list with identification target descriptors
+    # (NAA designators sourced from VPD 0x83) and block-to-block
+    # segment descriptors automatically.
+    #
+    # If sg_xcopy isn't available (older sg3_utils) skip cleanly —
+    # the unit tests cover the data-motion path; this case proves
+    # the wire surface is parseable by a real-world tool.
+    if ! command -v sg_xcopy >/dev/null 2>&1; then
+        log_info "sg_xcopy not present; skipping wire-level XCOPY case"
+        return 0
+    fi
+    # Seed the source range with a known random pattern.
+    dd if=/dev/urandom of="$TEST_DIR/xcopy-seed.bin" bs="$SECTOR_SIZE" count=16 status=none
+    sg_dd if="$TEST_DIR/xcopy-seed.bin" of="$RW_DEVICE" bs="$SECTOR_SIZE" count=16 seek=0 oflag=direct 2>&1 || return 1
+    blockdev --flushbufs "$RW_DEVICE" 2>/dev/null || true
+    # SYNC the seed through the cache so the source page is durable
+    # in the chunk pool — that lets the same-LUN fast path (page-
+    # index hash clone) take effect on the daemon side.
+    sg_sync "$RW_DEVICE" 2>&1 || true
+    # Copy 16 sectors (one 64 KiB page) from LBA 0 to LBA 16 of the
+    # same LUN.
+    sg_xcopy --on_src --on_dst --bs="$SECTOR_SIZE" --count=16 \
+        --skip=0 --seek=16 \
+        --src="$RW_DEVICE" --dst="$RW_DEVICE" 2>&1 || return 1
+    # Read both ranges back through the kernel block layer and
+    # compare bytewise.
+    blockdev --flushbufs "$RW_DEVICE" 2>/dev/null || true
+    sg_dd if="$RW_DEVICE" of="$TEST_DIR/xcopy-src.bin" bs="$SECTOR_SIZE" count=16 skip=0 iflag=direct 2>&1 || return 1
+    sg_dd if="$RW_DEVICE" of="$TEST_DIR/xcopy-dst.bin" bs="$SECTOR_SIZE" count=16 skip=16 iflag=direct 2>&1 || return 1
+    cmp "$TEST_DIR/xcopy-src.bin" "$TEST_DIR/xcopy-dst.bin"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -972,6 +1035,7 @@ main() {
     run_test "INQUIRY VPD 0x83 (Device Identification)"           t_inquiry_vpd_device_id
     run_test "INQUIRY VPD 0xB0 (Block Limits)"                    t_inquiry_vpd_block_limits
     run_test "INQUIRY VPD 0xB2 (Logical Block Provisioning)"      t_inquiry_vpd_thin_provisioning
+    run_test "INQUIRY VPD 0x8F (Third Party Copy / VAAI XCOPY)"   t_inquiry_vpd_third_party_copy
     # Group B
     run_test "READ CAPACITY 16 (LBPME=1, last LBA matches)"       t_read_capacity_16
     # Group C
@@ -1006,6 +1070,9 @@ main() {
     run_test "REPORT SUPPORTED OPCODES lists offload primitives"  t_report_supported_opcodes_lists_offload
     run_test "WRITE SAME zero-fill via blkdiscard --zeroout"      t_write_same_zerofills
     run_test "VERIFY BYTCHK=0 succeeds on sparse-hole range"      t_verify_bytchk_zero_succeeds
+    # Group L — VAAI XCOPY (EXTENDED COPY)
+    run_test "RECEIVE COPY RESULTS — OPERATING PARAMETERS"        t_xcopy_receive_copy_results_operating_parameters
+    run_test "EXTENDED COPY same-LUN intra-volume round-trip"     t_xcopy_same_lun_intra_volume_copy
 
     echo "========================================"
     echo "Test Summary"

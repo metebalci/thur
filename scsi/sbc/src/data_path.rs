@@ -33,6 +33,8 @@ use core_block::PageCache;
 use core_block::uploader::UploaderError;
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::VolumeLookup;
+use super::inquiry::naa_locally_assigned;
 use super::reservations::{Nexus, ReservationManager};
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
 
@@ -719,6 +721,544 @@ pub(super) async fn write_same(
         remaining -= this;
     }
     ScsiResponse::good(Vec::new())
+}
+
+/// EXTENDED COPY (LID1) — opcode 0x83 service action 0x00. The
+/// VMware VAAI "Hardware Accelerated Copy" primitive plus a
+/// passable subset of the SPC-3 §6.3 surface every other initiator
+/// expects when the page is advertised in VPD 0x8F.
+///
+/// Wire surface implemented (the same subset LIO and SCST expose):
+///   - Service action 0x00 only. LID4 (0x01) and any ODX action
+///     (POPULATE TOKEN 0x10 / WRITE USING TOKEN 0x11) are rejected
+///     as INVALID FIELD IN CDB. ESXi and Windows VAAI XCOPY both
+///     issue LID1.
+///   - Identification target descriptors (type 0xE4) carrying a
+///     T10 vendor-ID designator — the same format thurvsa publishes
+///     in INQUIRY VPD 0x83. NAA designators (designator type 0x03)
+///     aren't accepted yet because VPD 0x83 doesn't publish one.
+///   - Block-device-to-block-device segment descriptors (type 0x02)
+///     with a 16-bit block count and 64-bit source / destination
+///     LBAs (the spec's "small" form — sufficient for VAAI's per-
+///     command 4 MiB cap).
+///   - Inline-data descriptors aren't supported; a non-zero
+///     INLINE DATA LENGTH in the header is rejected.
+///
+/// Per-segment routing:
+///   - Fast path — when src and dst resolve to the same volume,
+///     the LBAs and block count are all multiples of the volume's
+///     page size, and src/dst ranges don't overlap: drop into
+///     `PageCache::clone_page_range`. A clean source page's chunk
+///     hash is rebound to the destination's page-index entry; no
+///     bytes cross the pool boundary.
+///   - Slow path — every other combination: drive 1 MiB chunks
+///     through `cache.read_bytes(src)` + `cache.write_bytes(dst)`.
+///     Handles unaligned ranges, cross-volume copies, dirty-source
+///     pages, and same-volume overlaps.
+///
+/// Synchronous: the whole copy completes before the handler returns
+/// GOOD. VAAI caps per-command transfer at a few MiB so latency is
+/// bounded. RECEIVE COPY RESULTS SA 0x00 reports "operation
+/// completed without errors" against any list ID.
+///
+/// Reservation-gated: every destination LUN is checked against the
+/// PERSISTENT RESERVATIONS manager before any cloning. A reservation
+/// conflict on any destination short-circuits the whole copy.
+/// WORM destination volumes refuse with WRITE PROTECTED.
+pub(super) async fn extended_copy(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: Nexus,
+    reservations: &ReservationManager,
+) -> ScsiResponse {
+    let (targets, planned) = match parse_extended_copy(req, registry, &nexus, reservations) {
+        Ok(v) => v,
+        Err(ExtendedCopyParseError::Noop) => {
+            // Zero-length parameter list or all-zero-block segments
+            // are valid no-ops; SPC-3 doesn't call that "success or
+            // reject" so we don't bump either counter.
+            return ScsiResponse::good(Vec::new());
+        }
+        Err(ExtendedCopyParseError::ReservationConflict) => {
+            shared_telemetry::record::scsi_xcopy("reject");
+            return ScsiResponse::reservation_conflict();
+        }
+        Err(ExtendedCopyParseError::Sense(s)) => {
+            shared_telemetry::record::scsi_xcopy("reject");
+            return ScsiResponse::check(s);
+        }
+    };
+    extended_copy_execute(targets, planned).await
+}
+
+/// Reasons `parse_extended_copy` returns early.
+enum ExtendedCopyParseError {
+    /// Zero-length parameter list — valid no-op.
+    Noop,
+    /// Active persistent reservation on the destination LUN.
+    ReservationConflict,
+    /// Any other rejection that surfaces as CHECK CONDITION.
+    Sense(SenseData),
+}
+
+/// (LUN, PageCache) pair resolved from one identification target
+/// descriptor. Segment descriptors' src / dst CSCD indices select
+/// into a `Vec<TargetHandle>` built by `parse_extended_copy`.
+type TargetHandle = (u64, Arc<PageCache>);
+
+/// Parse the EXTENDED COPY parameter list and run every pre-flight
+/// validation: CDB / header / descriptor shape, NAA resolution,
+/// destination reservation + WORM gates, range bounds. Returns the
+/// resolved target list and the executable plan, or the first
+/// rejection reason.
+fn parse_extended_copy(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: &Nexus,
+    reservations: &ReservationManager,
+) -> Result<(Vec<TargetHandle>, Vec<PlannedSegment>), ExtendedCopyParseError> {
+    // CDB byte 1 bits 4-0 carry the service action. Only LID1
+    // (SA 0x00) is supported. Reject ODX actions and LID4 with
+    // INVALID FIELD IN CDB — initiators interpret that as
+    // "primitive not supported" and fall back to host-side copy.
+    if req.cdb.len() < 16 {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_CDB,
+        ));
+    }
+    let service_action = req.cdb[1] & 0x1F;
+    if service_action != 0x00 {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_CDB,
+        ));
+    }
+    // PARAMETER LIST LENGTH in CDB bytes 10..14 (32-bit BE).
+    let plist_len =
+        u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
+    if plist_len == 0 {
+        // SPC-3 §6.3.2: a zero parameter list length is not an
+        // error — it specifies "no copy operation".
+        return Err(ExtendedCopyParseError::Noop);
+    }
+    if req.data_out.len() < plist_len {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let plist = &req.data_out[..plist_len];
+    // SPC-3 §6.3.3 parameter list header (16 bytes):
+    //   byte 0       LIST IDENTIFIER (ignored; we don't track lists)
+    //   byte 1       PRIORITY + LIST_ID_USAGE + reserved (ignored)
+    //   bytes 2-3    TARGET DESCRIPTOR LIST LENGTH (16-bit BE)
+    //   bytes 4-7    reserved
+    //   bytes 8-11   SEGMENT DESCRIPTOR LIST LENGTH (32-bit BE)
+    //   bytes 12-15  INLINE DATA LENGTH (32-bit BE)
+    if plist.len() < 16 {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let tdesc_len = u16::from_be_bytes([plist[2], plist[3]]) as usize;
+    let sdesc_len = u32::from_be_bytes([plist[8], plist[9], plist[10], plist[11]]) as usize;
+    let inline_len = u32::from_be_bytes([plist[12], plist[13], plist[14], plist[15]]) as usize;
+    if inline_len != 0 {
+        // Inline data isn't supported; VAAI doesn't use it.
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    if tdesc_len == 0 || sdesc_len == 0 {
+        // Need at least one target and one segment to copy anything.
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let need = 16usize.saturating_add(tdesc_len).saturating_add(sdesc_len);
+    if need > plist.len() {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    // Identification target descriptors are 32 bytes each (SPC-3
+    // §6.3.6.3). VAAI sends one per CSCD reference; the source
+    // and destination indices in each segment descriptor index
+    // into this list.
+    if !tdesc_len.is_multiple_of(32) {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let tdesc_count = tdesc_len / 32;
+    if tdesc_count == 0 || tdesc_count > u16::MAX as usize {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+
+    // Resolve every target descriptor up front. Each entry pairs the
+    // resolved LUN with its PageCache handle so per-segment
+    // reservation checks have everything they need without going
+    // back to the registry.
+    let mut targets: Vec<TargetHandle> = Vec::with_capacity(tdesc_count);
+    for i in 0..tdesc_count {
+        let off = 16 + i * 32;
+        let desc = &plist[off..off + 32];
+        let pair =
+            resolve_target_descriptor(registry, desc).map_err(ExtendedCopyParseError::Sense)?;
+        targets.push(pair);
+    }
+
+    // Walk segment descriptors. Each block-to-block descriptor is
+    // 4 (header) + 0x18 (body) = 28 bytes; reject any other
+    // segment type up front so a malformed parameter list never
+    // half-commits.
+    let sdesc_off = 16 + tdesc_len;
+    let mut seg_cursor = 0usize;
+    let mut planned: Vec<PlannedSegment> = Vec::new();
+    while seg_cursor < sdesc_len {
+        if seg_cursor + 4 > sdesc_len {
+            return Err(ExtendedCopyParseError::Sense(
+                SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+            ));
+        }
+        let sd = &plist[sdesc_off + seg_cursor..sdesc_off + sdesc_len];
+        let sdtype = sd[0];
+        let dlen = u16::from_be_bytes([sd[2], sd[3]]) as usize;
+        let total = 4 + dlen;
+        if seg_cursor + total > sdesc_len {
+            return Err(ExtendedCopyParseError::Sense(
+                SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+            ));
+        }
+        if sdtype != 0x02 || dlen != 0x18 {
+            return Err(ExtendedCopyParseError::Sense(
+                SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+            ));
+        }
+        // Block-to-block descriptor (SPC-3 §6.3.5.4):
+        //   bytes 4-5   source CSCD descriptor index
+        //   bytes 6-7   destination CSCD descriptor index
+        //   bytes 10-11 BLOCK DEVICE NUMBER OF BLOCKS (16-bit BE)
+        //   bytes 12-19 source LBA (64-bit BE)
+        //   bytes 20-27 destination LBA (64-bit BE)
+        let src_idx = u16::from_be_bytes([sd[4], sd[5]]) as usize;
+        let dst_idx = u16::from_be_bytes([sd[6], sd[7]]) as usize;
+        let blocks = u16::from_be_bytes([sd[10], sd[11]]) as u64;
+        let src_lba = u64::from_be_bytes([
+            sd[12], sd[13], sd[14], sd[15], sd[16], sd[17], sd[18], sd[19],
+        ]);
+        let dst_lba = u64::from_be_bytes([
+            sd[20], sd[21], sd[22], sd[23], sd[24], sd[25], sd[26], sd[27],
+        ]);
+        if src_idx >= targets.len() || dst_idx >= targets.len() {
+            return Err(ExtendedCopyParseError::Sense(
+                SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+            ));
+        }
+        planned.push(PlannedSegment {
+            src_idx,
+            dst_idx,
+            blocks,
+            src_lba,
+            dst_lba,
+        });
+        seg_cursor += total;
+    }
+
+    // Range-check every segment + gate every destination LUN
+    // before any data motion. SPC-3 doesn't require all-or-nothing
+    // semantics across segments, but doing the validation up front
+    // means a malformed segment N never half-commits a successful
+    // segment N-1.
+    for seg in &planned {
+        let (_src_lun, src_cache) = &targets[seg.src_idx];
+        let (dst_lun, dst_cache) = &targets[seg.dst_idx];
+        if dst_cache.manifest().worm {
+            return Err(ExtendedCopyParseError::Sense(SenseData::WRITE_PROTECTED));
+        }
+        if !reservations.allow_write(*dst_lun, nexus) {
+            return Err(ExtendedCopyParseError::ReservationConflict);
+        }
+        let src_sz = Sizing::from(src_cache.as_ref());
+        let dst_sz = Sizing::from(dst_cache.as_ref());
+        let src_range = LbaRange {
+            lba: seg.src_lba,
+            blocks: seg.blocks,
+        };
+        let dst_range = LbaRange {
+            lba: seg.dst_lba,
+            blocks: seg.blocks,
+        };
+        if seg.blocks == 0 {
+            continue;
+        }
+        if validate_in_range(&src_range, &src_sz).is_err()
+            || validate_in_range(&dst_range, &dst_sz).is_err()
+        {
+            return Err(ExtendedCopyParseError::Sense(SenseData::LBA_OUT_OF_RANGE));
+        }
+    }
+    Ok((targets, planned))
+}
+
+/// Execute a pre-validated XCOPY plan. Returns GOOD on full success,
+/// CHECK CONDITION on the first per-segment failure. Records the
+/// success / error outcome and the per-segment bytes / path
+/// telemetry.
+async fn extended_copy_execute(
+    targets: Vec<TargetHandle>,
+    planned: Vec<PlannedSegment>,
+) -> ScsiResponse {
+    // SPC-3 §6.3.7: failures stop further segments. Earlier segments
+    // stay committed (no rollback) — the COMMAND-SPECIFIC INFORMATION
+    // field would carry the failing segment index in a richer sense
+    // format than we emit today.
+    for seg in &planned {
+        if seg.blocks == 0 {
+            continue;
+        }
+        let (_src_lun, src_cache) = &targets[seg.src_idx];
+        let (_dst_lun, dst_cache) = &targets[seg.dst_idx];
+        match execute_segment(
+            src_cache.as_ref(),
+            seg.src_lba,
+            dst_cache.as_ref(),
+            seg.dst_lba,
+            seg.blocks,
+        )
+        .await
+        {
+            Ok(path) => {
+                let bytes = seg.blocks * Sizing::from(src_cache.as_ref()).sector;
+                shared_telemetry::record::scsi_xcopy_bytes(path, bytes);
+                shared_telemetry::record::scsi_xcopy_segment(path);
+            }
+            Err(s) => {
+                shared_telemetry::record::scsi_xcopy("error");
+                return ScsiResponse::check(s);
+            }
+        }
+    }
+    shared_telemetry::record::scsi_xcopy("success");
+    ScsiResponse::good(Vec::new())
+}
+
+/// RECEIVE COPY RESULTS — opcode 0x84. Companion to EXTENDED COPY.
+///
+/// Two service actions implemented:
+///   - 0x00 COPY STATUS — synchronous XCOPY always completes before
+///     EXTENDED COPY returns, so any list ID the host queries gets
+///     "operation completed without errors" with zero per-segment
+///     accounting. ESXi rarely polls.
+///   - 0x03 OPERATING PARAMETERS — what the host actually relies on
+///     to gate VAAI: the per-XCOPY limits and the descriptor types
+///     we accept. Numbers match VPD 0x8F's descriptor 0x0004 and
+///     0x8001 advertisements.
+///
+/// Other service actions (RECEIVE DATA, COPY ALL, FAILED SEGMENT
+/// DETAILS) aren't implemented; initiators that need them fall back
+/// to host-side accounting.
+pub(super) fn receive_copy_results(req: &ScsiRequest<'_>) -> ScsiResponse {
+    if req.cdb.len() < 16 {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
+    }
+    let sa = req.cdb[1] & 0x1F;
+    let alloc_len =
+        u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
+    let body = match sa {
+        0x00 => build_copy_status_response(),
+        0x03 => build_operating_parameters_response(),
+        _ => return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
+    };
+    let truncated: Vec<u8> = body.into_iter().take(alloc_len).collect();
+    ScsiResponse::good(truncated)
+}
+
+/// One block-to-block segment with everything the executor needs.
+/// CSCD indices are resolved into the segment's `targets` slice;
+/// LBAs / block count are in the source / destination volume's
+/// native sector units (4 KiB).
+struct PlannedSegment {
+    src_idx: usize,
+    dst_idx: usize,
+    blocks: u64,
+    src_lba: u64,
+    dst_lba: u64,
+}
+
+/// Run one segment, choosing the fast or slow path. Caller has
+/// already validated that the LBA ranges fit and that the
+/// destination accepts writes (reservation + WORM). Returns the
+/// path that ran (`"fast"` or `"slow"`) so the caller can tag
+/// per-path telemetry.
+async fn execute_segment(
+    src: &PageCache,
+    src_lba: u64,
+    dst: &PageCache,
+    dst_lba: u64,
+    blocks: u64,
+) -> Result<&'static str, SenseData> {
+    let src_sz = Sizing::from(src);
+    let dst_sz = Sizing::from(dst);
+    if src_sz.sector != dst_sz.sector {
+        // Cross-LUN copy between volumes with different sector
+        // sizes is theoretically meaningful but we don't model it.
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let src_off = src_lba * src_sz.sector;
+    let dst_off = dst_lba * dst_sz.sector;
+    let len = blocks * src_sz.sector;
+
+    let same_lun = std::ptr::eq(src as *const PageCache, dst as *const PageCache);
+    let page = src.page_size();
+    let aligned =
+        src_off.is_multiple_of(page) && dst_off.is_multiple_of(page) && len.is_multiple_of(page);
+    let overlap = same_lun && ranges_overlap(src_off, src_off + len, dst_off, dst_off + len);
+    if same_lun && aligned && !overlap {
+        // Fast path — page-index clone, no chunk-pool round trip.
+        src.clone_page_range(src_off, dst_off, len)
+            .await
+            .map_err(|e| map_write_error(&e))?;
+        return Ok("fast");
+    }
+    // Slow path — 1 MiB-bounded streaming bytes copy. Handles
+    // cross-LUN copies, unaligned ranges, and same-LUN overlap.
+    const CHUNK: u64 = 1024 * 1024;
+    let mut remaining = len;
+    let mut s_cur = src_off;
+    let mut d_cur = dst_off;
+    while remaining > 0 {
+        let this = std::cmp::min(remaining, CHUNK) as usize;
+        let buf = src
+            .read_bytes(s_cur, this)
+            .await
+            .map_err(|e| map_read_error(&e))?;
+        dst.write_bytes(d_cur, &buf)
+            .await
+            .map_err(|e| map_write_error(&e))?;
+        s_cur += this as u64;
+        d_cur += this as u64;
+        remaining -= this as u64;
+    }
+    Ok("slow")
+}
+
+fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Resolve one 32-byte identification target descriptor to the
+/// matching LUN + cache handle. Accepts NAA designators
+/// (designator type 0x03) only — the SPC-3 EXTENDED COPY target
+/// descriptor has just 20 bytes for the designator, which the T10
+/// form (44 bytes today) doesn't fit. VPD 0x83 publishes NAA
+/// alongside T10 specifically for this path.
+fn resolve_target_descriptor(
+    registry: &Arc<dyn VolumeLookup>,
+    desc: &[u8],
+) -> Result<(u64, Arc<PageCache>), SenseData> {
+    if desc.len() < 32 || desc[0] != 0xE4 {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    // SPC-3 §6.3.6.3 identification CSCD descriptor:
+    //   byte 4       CODE SET (bits 3-0)
+    //   byte 5       bit 4 PIV | bits 3-0 DESIGNATOR TYPE
+    //   byte 6       reserved / association
+    //   byte 7       DESIGNATOR LENGTH (N)
+    //   bytes 8..8+N DESIGNATOR
+    let designator_type = desc[5] & 0x0F;
+    let designator_len = desc[7] as usize;
+    if 8 + designator_len > 28 {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let designator = &desc[8..8 + designator_len];
+    if designator_type != 0x03 || designator_len != 8 {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    for lun in registry.luns() {
+        let Some(cache) = registry.get(lun) else {
+            continue;
+        };
+        let expected = naa_locally_assigned(&cache.manifest().uuid);
+        if designator == expected.as_slice() {
+            return Ok((lun, cache));
+        }
+    }
+    Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST)
+}
+
+/// Build the SPC-3 §6.18.4 OPERATING PARAMETERS response (RECEIVE
+/// COPY RESULTS service action 0x03). 44 bytes header + per-
+/// implemented-descriptor entries (one byte each).
+fn build_operating_parameters_response() -> Vec<u8> {
+    // We accept two descriptor type codes today: target descriptor
+    // 0xE4 (Identification) and segment descriptor 0x02 (Block to
+    // Block).
+    let supported: [u8; 2] = [0xE4, 0x02];
+    let header_len: usize = 44;
+    let body_len: usize = header_len + supported.len();
+    let mut data = vec![0u8; body_len];
+    // AVAILABLE DATA = length following these 4 bytes.
+    let avail = (body_len - 4) as u32;
+    data[0..4].copy_from_slice(&avail.to_be_bytes());
+    // byte 4 bit 0: SNLID = 1 — we support the SUPPORTED NO LIST
+    // ID form so initiators that prefer it can use it.
+    data[4] = 0x01;
+    // bytes 8-9: MAXIMUM TARGET DESCRIPTOR COUNT = 2 (source + dst
+    // for a single same-LUN or cross-LUN copy).
+    data[8..10].copy_from_slice(&2u16.to_be_bytes());
+    // bytes 10-11: MAXIMUM SEGMENT DESCRIPTOR COUNT = 1. Per-
+    // command segment count starts small; we lift it once we have
+    // a real ESXi workload to measure against.
+    data[10..12].copy_from_slice(&1u16.to_be_bytes());
+    // bytes 12-15: MAXIMUM DESCRIPTOR LIST LENGTH (bytes).
+    // 16-byte header + 2 × 32-byte target descriptors + 1 ×
+    // 28-byte block-to-block segment = 108 bytes; round to 128.
+    data[12..16].copy_from_slice(&128u32.to_be_bytes());
+    // bytes 16-19: MAXIMUM SEGMENT LENGTH (bytes). 16 MiB.
+    data[16..20].copy_from_slice(&(16u32 << 20).to_be_bytes());
+    // bytes 20-23: MAXIMUM INLINE DATA LENGTH = 0 (inline data
+    // unsupported).
+    // bytes 24-27: HELD DATA LIMIT = 0.
+    // bytes 28-31: MAXIMUM STREAM DEVICE TRANSFER SIZE = 0 (we
+    // only do block-to-block).
+    // bytes 32-33: reserved.
+    // bytes 34-35: TOTAL CONCURRENT COPIES = 0 (we don't track).
+    // byte 36: MAXIMUM CONCURRENT COPIES = 0 (synchronous; one at
+    // a time per connection).
+    // byte 37: DATA SEGMENT GRANULARITY = log2(page_size). 64 KiB
+    // page = 16; we publish the per-VSA default for the
+    // operating-parameters page since the wire field is target-
+    // wide, not per-LUN.
+    data[37] = 16; // log2(64 KiB)
+    // byte 38: INLINE DATA GRANULARITY = 0 (inline data unsupported).
+    // byte 39: HELD DATA GRANULARITY = 0.
+    // bytes 40-42: reserved.
+    // byte 43: IMPLEMENTED DESCRIPTOR LIST LENGTH.
+    data[43] = supported.len() as u8;
+    // bytes 44..: per-descriptor type codes.
+    data[44..44 + supported.len()].copy_from_slice(&supported);
+    data
+}
+
+/// Build the SPC-3 §6.18.2 COPY STATUS response (RECEIVE COPY
+/// RESULTS service action 0x00). 16-byte fixed shape. Synchronous
+/// XCOPY completes before EXTENDED COPY returns GOOD, so every list
+/// ID query reports "completed without errors" with zero per-segment
+/// accounting — matching the LIO behavior.
+fn build_copy_status_response() -> Vec<u8> {
+    let mut data = vec![0u8; 16];
+    // bytes 0-3: AVAILABLE DATA = 12 (bytes following).
+    data[0..4].copy_from_slice(&12u32.to_be_bytes());
+    // byte 4: COPY MANAGER STATUS = 0x02 ("operation completed
+    // without errors"). The previous EXTENDED COPY is implicitly
+    // the one this status answers.
+    data[4] = 0x02;
+    // bytes 5-6: SEGMENTS PROCESSED = 0 (not tracked).
+    // byte 7: TRANSFER COUNT UNITS = 0.
+    // bytes 8-11: TRANSFER COUNT = 0 (not tracked).
+    // bytes 12-15: reserved.
+    data
 }
 
 /// Map an `UploaderError` from the WRITE pipeline into a SCSI
@@ -2369,5 +2909,390 @@ mod tests {
             prop_assert_eq!(r.lba, lba);
             prop_assert_eq!(r.blocks, u64::from(blocks));
         }
+    }
+
+    // ----------------------------------------------------------------
+    // EXTENDED COPY (0x83) / RECEIVE COPY RESULTS (0x84)
+    // ----------------------------------------------------------------
+
+    use std::collections::BTreeMap;
+    use std::sync::RwLock;
+
+    /// Test-only `VolumeLookup` impl. Mirrors `dispatcher.rs::tests`
+    /// so XCOPY can resolve cross-LUN target descriptors.
+    #[derive(Default)]
+    struct TestRegistry {
+        by_lun: RwLock<BTreeMap<u64, Arc<PageCache>>>,
+    }
+
+    impl TestRegistry {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn register(&self, lun: u64, cache: Arc<PageCache>) {
+            self.by_lun.write().unwrap().insert(lun, cache);
+        }
+    }
+
+    impl VolumeLookup for TestRegistry {
+        fn get(&self, lun: u64) -> Option<Arc<PageCache>> {
+            self.by_lun.read().unwrap().get(&lun).map(Arc::clone)
+        }
+        fn luns(&self) -> Vec<u64> {
+            self.by_lun.read().unwrap().keys().copied().collect()
+        }
+    }
+
+    /// One independent volume backed by its own tempdir + LocalBackend.
+    async fn fresh_volume(name: &str) -> (TempDir, Arc<PageCache>) {
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        VolumeManifest::new(
+            name.into(),
+            8 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let writer = Arc::new(VolumeWriter::open(tmp.path(), name, backend).unwrap());
+        let cache = PageCache::new(writer);
+        (tmp, cache)
+    }
+
+    /// Build a 32-byte identification target descriptor (type 0xE4)
+    /// carrying the NAA designator the VSA publishes in VPD 0x83.
+    fn target_descriptor_for(cache: &PageCache) -> [u8; 32] {
+        let designator = naa_locally_assigned(&cache.manifest().uuid);
+        let mut desc = [0u8; 32];
+        desc[0] = 0xE4;
+        // byte 4: CODE SET = 0x01 (binary)
+        desc[4] = 0x01;
+        // byte 5: DESIGNATOR TYPE = 0x03 (NAA)
+        desc[5] = 0x03;
+        desc[7] = designator.len() as u8;
+        desc[8..8 + designator.len()].copy_from_slice(&designator);
+        desc
+    }
+
+    /// Build a block-to-block segment descriptor (type 0x02).
+    fn block_segment(
+        src_idx: u16,
+        dst_idx: u16,
+        blocks: u16,
+        src_lba: u64,
+        dst_lba: u64,
+    ) -> [u8; 28] {
+        let mut sd = [0u8; 28];
+        sd[0] = 0x02;
+        sd[2..4].copy_from_slice(&0x18u16.to_be_bytes());
+        sd[4..6].copy_from_slice(&src_idx.to_be_bytes());
+        sd[6..8].copy_from_slice(&dst_idx.to_be_bytes());
+        sd[10..12].copy_from_slice(&blocks.to_be_bytes());
+        sd[12..20].copy_from_slice(&src_lba.to_be_bytes());
+        sd[20..28].copy_from_slice(&dst_lba.to_be_bytes());
+        sd
+    }
+
+    /// Build an EXTENDED COPY parameter list from target descriptors
+    /// and one block-to-block segment descriptor.
+    fn build_xcopy_param_list(targets: &[[u8; 32]], segments: &[[u8; 28]]) -> Vec<u8> {
+        let tdesc_len = targets.len() * 32;
+        let sdesc_len = segments.len() * 28;
+        let mut p = vec![0u8; 16 + tdesc_len + sdesc_len];
+        p[2..4].copy_from_slice(&(tdesc_len as u16).to_be_bytes());
+        p[8..12].copy_from_slice(&(sdesc_len as u32).to_be_bytes());
+        let mut off = 16;
+        for t in targets {
+            p[off..off + 32].copy_from_slice(t);
+            off += 32;
+        }
+        for s in segments {
+            p[off..off + 28].copy_from_slice(s);
+            off += 28;
+        }
+        p
+    }
+
+    fn xcopy_cdb(param_list_len: u32) -> [u8; 16] {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x83;
+        cdb[10..14].copy_from_slice(&param_list_len.to_be_bytes());
+        cdb
+    }
+
+    fn rcr_cdb(service_action: u8, alloc_len: u32) -> [u8; 16] {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x84;
+        cdb[1] = service_action & 0x1F;
+        cdb[10..14].copy_from_slice(&alloc_len.to_be_bytes());
+        cdb
+    }
+
+    #[tokio::test]
+    async fn xcopy_same_lun_page_aligned_takes_fast_path() {
+        // Source page is flushed (clean + Uploaded) so the cache's
+        // clone_page_range takes the hash-clone path. Destination
+        // should read back identical bytes via the shared chunk.
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let payload = page_pattern(0x55);
+        cache.write_bytes(0, &payload).await.unwrap();
+        cache.flush_all().await.unwrap();
+
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
+        let params = build_xcopy_param_list(&[target], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let request = req(&cdb, &params, 0);
+
+        let r = extended_copy(&request, &registry, test_nexus(), &test_mgr()).await;
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+
+        // Destination page reads back the source bytes.
+        let dst_off = (SECTORS_PER_PAGE * SECTOR) as u64;
+        let read_back = cache.read_bytes(dst_off, PAGE).await.unwrap();
+        assert_eq!(read_back, payload);
+        // Both page-index entries point at the same chunk hash.
+        let src_hash = cache.writer().page_index().get(0).unwrap().unwrap();
+        let dst_hash = cache.writer().page_index().get(1).unwrap().unwrap();
+        assert_eq!(src_hash, dst_hash);
+    }
+
+    #[tokio::test]
+    async fn xcopy_cross_lun_routes_through_slow_path() {
+        // Different volumes → must use bytes copy; can't share a
+        // chunk because pool / namespace differs.
+        let (_tmp1, src_cache) = fresh_volume("src").await;
+        let (_tmp2, dst_cache) = fresh_volume("dst").await;
+        let payload = page_pattern(0xC3);
+        src_cache.write_bytes(0, &payload).await.unwrap();
+
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src_cache.clone());
+            r.register(1, dst_cache.clone());
+            Arc::new(r)
+        };
+        let targets = [
+            target_descriptor_for(src_cache.as_ref()),
+            target_descriptor_for(dst_cache.as_ref()),
+        ];
+        let seg = block_segment(0, 1, SECTORS_PER_PAGE as u16, 0, 0);
+        let params = build_xcopy_param_list(&targets, &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+
+        let read_back = dst_cache.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(read_back, payload);
+    }
+
+    #[tokio::test]
+    async fn xcopy_zero_parameter_list_is_noop() {
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache);
+            Arc::new(r)
+        };
+        let cdb = xcopy_cdb(0);
+        let r = extended_copy(&req(&cdb, &[], 0), &registry, test_nexus(), &test_mgr()).await;
+        assert!(r.sense.is_none());
+    }
+
+    #[tokio::test]
+    async fn xcopy_unsupported_service_action_rejected() {
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache);
+            Arc::new(r)
+        };
+        let mut cdb = xcopy_cdb(0);
+        cdb[1] = 0x01; // LID4 — not implemented
+        let r = extended_copy(&req(&cdb, &[], 0), &registry, test_nexus(), &test_mgr()).await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
+    }
+
+    #[tokio::test]
+    async fn xcopy_rejects_unknown_designator() {
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache);
+            Arc::new(r)
+        };
+        // Forge a target descriptor with a valid NAA designator
+        // that doesn't correspond to any registered volume.
+        let mut bad_desc = [0u8; 32];
+        bad_desc[0] = 0xE4;
+        bad_desc[4] = 0x01;
+        bad_desc[5] = 0x03; // NAA type
+        bad_desc[7] = 8;
+        bad_desc[8..16].copy_from_slice(&[0x3D, 0xEA, 0xDB, 0xEE, 0xFD, 0xEA, 0xDB, 0xEE]);
+        let seg = block_segment(0, 0, 1, 0, 1);
+        let params = build_xcopy_param_list(&[bad_desc], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
+    }
+
+    #[tokio::test]
+    async fn xcopy_rejects_unsupported_segment_descriptor_type() {
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        // Build a segment with an unknown descriptor type code.
+        let mut sd = [0u8; 28];
+        sd[0] = 0x99; // not 0x02
+        sd[2..4].copy_from_slice(&0x18u16.to_be_bytes());
+        let mut params = vec![0u8; 16 + 32 + 28];
+        params[2..4].copy_from_slice(&32u16.to_be_bytes());
+        params[8..12].copy_from_slice(&28u32.to_be_bytes());
+        params[16..48].copy_from_slice(&target);
+        params[48..76].copy_from_slice(&sd);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
+    }
+
+    #[tokio::test]
+    async fn xcopy_rejects_lba_past_end_of_destination() {
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let sz = Sizing::from(cache.as_ref());
+        // Destination LBA at the very end of the volume + a copy
+        // of one page — runs off the end.
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, sz.total_blocks);
+        let params = build_xcopy_param_list(&[target], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert_eq!(r.sense, Some(SenseData::LBA_OUT_OF_RANGE));
+    }
+
+    #[tokio::test]
+    async fn xcopy_refuses_worm_destination() {
+        // Single-volume WORM scenario: source = destination, WORM=1.
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path(), 8 * (1u64 << 20), true).await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
+        let params = build_xcopy_param_list(&[target], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert_eq!(r.sense, Some(SenseData::WRITE_PROTECTED));
+    }
+
+    #[tokio::test]
+    async fn xcopy_unaligned_takes_slow_path_and_round_trips() {
+        // Source LBA + length make the segment sub-page aligned —
+        // forces the bytes-copy slow path. Result must still match.
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let payload = page_pattern(0xAA);
+        cache.write_bytes(0, &payload).await.unwrap();
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        // Copy 8 sectors starting at LBA 4 → destination LBA 32
+        // (well past the source range; no overlap, but sub-page).
+        let seg = block_segment(0, 0, 8, 4, 32);
+        let params = build_xcopy_param_list(&[target], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+        // Destination has the source bytes spliced in.
+        let dst = cache
+            .read_bytes(32 * SECTOR as u64, 8 * SECTOR)
+            .await
+            .unwrap();
+        assert_eq!(dst, &payload[4 * SECTOR..12 * SECTOR]);
+    }
+
+    #[tokio::test]
+    async fn xcopy_zero_block_segment_completes_without_error() {
+        // A segment with NUMBER OF BLOCKS = 0 is a no-op but must
+        // not error out the whole copy.
+        let (_tmp, cache) = fresh_volume("vol1").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, 0, 0, 0);
+        let params = build_xcopy_param_list(&[target], &[seg]);
+        let cdb = xcopy_cdb(params.len() as u32);
+        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_operating_parameters_advertises_our_limits() {
+        let cdb = rcr_cdb(0x03, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256));
+        assert!(r.sense.is_none());
+        let d = &r.data_in;
+        // bytes 8-9 MAXIMUM TARGET DESCRIPTOR COUNT = 2.
+        assert_eq!(u16::from_be_bytes([d[8], d[9]]), 2);
+        // bytes 10-11 MAXIMUM SEGMENT DESCRIPTOR COUNT = 1.
+        assert_eq!(u16::from_be_bytes([d[10], d[11]]), 1);
+        // bytes 12-15 MAXIMUM DESCRIPTOR LIST LENGTH = 128.
+        assert_eq!(u32::from_be_bytes([d[12], d[13], d[14], d[15]]), 128);
+        // bytes 16-19 MAXIMUM SEGMENT LENGTH = 16 MiB.
+        assert_eq!(
+            u32::from_be_bytes([d[16], d[17], d[18], d[19]]),
+            16u32 << 20
+        );
+        // byte 43 IMPLEMENTED DESCRIPTOR LIST LENGTH.
+        let n = d[43] as usize;
+        // bytes 44..44+n are the type codes.
+        assert!(d[44..44 + n].contains(&0xE4));
+        assert!(d[44..44 + n].contains(&0x02));
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_copy_status_reports_completed() {
+        let cdb = rcr_cdb(0x00, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256));
+        assert!(r.sense.is_none());
+        // COPY MANAGER STATUS byte = 0x02 (completed without errors).
+        assert_eq!(r.data_in[4], 0x02);
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_unknown_service_action_rejected() {
+        let cdb = rcr_cdb(0x07, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256));
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
     }
 }

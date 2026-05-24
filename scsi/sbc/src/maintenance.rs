@@ -43,6 +43,8 @@ const SUPPORTED_OPCODES: &[u8] = &[
     0x5A, // MODE SENSE 10
     0x5E, // PERSISTENT RESERVE IN
     0x5F, // PERSISTENT RESERVE OUT
+    0x83, // EXTENDED COPY (VAAI XCOPY, LID1 SA only)
+    0x84, // RECEIVE COPY RESULTS (companion to 0x83)
     0x88, // READ 16
     0x89, // COMPARE AND WRITE
     0x8A, // WRITE 16
@@ -183,6 +185,18 @@ mod tests {
         assert!(opcodes.contains(&0x42), "UNMAP absent");
         assert!(opcodes.contains(&0x41), "WRITE SAME 10 absent");
         assert!(opcodes.contains(&0x93), "WRITE SAME 16 absent");
+    }
+
+    #[test]
+    fn report_supported_opcodes_includes_xcopy_and_receive_copy_results() {
+        // VAAI Hardware Accelerated Copy probes for opcode 0x83;
+        // 0x84 is the companion query opcode the host uses to read
+        // back COPY STATUS / OPERATING PARAMETERS.
+        let cdb = build_cdb(0x0C, 4 + 8 * 64);
+        let r = maintenance_in(&req(&cdb));
+        let opcodes: Vec<u8> = r.data_in[4..].chunks(8).map(|e| e[0]).collect();
+        assert!(opcodes.contains(&0x83), "EXTENDED COPY absent");
+        assert!(opcodes.contains(&0x84), "RECEIVE COPY RESULTS absent");
     }
 
     #[test]

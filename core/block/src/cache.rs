@@ -64,6 +64,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::page_index::PageId;
 use crate::runtime_state::VolumeRuntime;
+use crate::upload_index::UploadState;
 use crate::uploader::{UploaderError, VolumeWriter};
 use crate::volume::{SyncAfter, VolumeManifest};
 
@@ -510,6 +511,140 @@ impl PageCache {
         // "these LBAs are now zero" — that's still a write from the
         // host's perspective.
         self.bump_host_bytes(len);
+        Ok(())
+    }
+
+    /// Same-volume page-aligned clone primitive — backing for the
+    /// SBC-3 EXTENDED COPY (XCOPY) fast path. Copies `len` bytes
+    /// from `src_byte_offset` to `dst_byte_offset`, skipping the
+    /// chunk-pool round trip when the source page is clean and its
+    /// chunk is already in cloud: the destination's page-index entry
+    /// is rebound to the source's chunk hash, the cached destination
+    /// page (if any) is invalidated, and the pool's natural dedup
+    /// means no new bytes hit cloud.
+    ///
+    /// All three offsets and `len` must be whole multiples of
+    /// [`Self::page_size`]; the caller is responsible for range
+    /// validation against the volume and for ensuring the source
+    /// and destination ranges do not overlap (overlap forces the
+    /// SCSI layer down its bytes-copy slow path).
+    ///
+    /// Three per-page cases:
+    /// 1. Source dirty in cache — copy the cached bytes into a new
+    ///    dirty entry at the destination. One page-size memcpy, no
+    ///    cloud IO.
+    /// 2. Source clean and upload state is `Uploaded` — rebind
+    ///    the destination's page-index entry to the source's chunk
+    ///    hash (or clear it when the source is a sparse hole) and
+    ///    drop the destination from cache. Zero data IO. The chunk
+    ///    now has two page-index references; GC reclaims it only
+    ///    once both go away.
+    /// 3. Source clean but upload state is `LocalOnly` (chunk not
+    ///    yet acknowledged by cloud) — fall back to a full
+    ///    bytes-copy. The chunk isn't safe to alias yet because
+    ///    the destination's pending-upload tracker doesn't share
+    ///    the source's PUT.
+    ///
+    /// Counts as host-written bytes (the destination range was
+    /// "written" from the host's perspective), but does not bump
+    /// the cloud-PUT counter on the fast path — no new bytes
+    /// crossed the pool boundary.
+    pub async fn clone_page_range(
+        &self,
+        src_byte_offset: u64,
+        dst_byte_offset: u64,
+        len: u64,
+    ) -> Result<(), UploaderError> {
+        debug_assert_eq!(src_byte_offset % self.page_size, 0);
+        debug_assert_eq!(dst_byte_offset % self.page_size, 0);
+        debug_assert_eq!(len % self.page_size, 0);
+        if len == 0 {
+            return Ok(());
+        }
+        let pages = len / self.page_size;
+        let src_first_u64 = src_byte_offset / self.page_size;
+        let dst_first_u64 = dst_byte_offset / self.page_size;
+        for i in 0..pages {
+            let src =
+                u32::try_from(src_first_u64 + i).map_err(|_| UploaderError::PageOutOfRange {
+                    page_id: src_first_u64 + i,
+                    page_size: self.page_size as u32,
+                    size_bytes: self.size_bytes(),
+                })?;
+            let dst =
+                u32::try_from(dst_first_u64 + i).map_err(|_| UploaderError::PageOutOfRange {
+                    page_id: dst_first_u64 + i,
+                    page_size: self.page_size as u32,
+                    size_bytes: self.size_bytes(),
+                })?;
+            self.clone_one_page(src, dst).await?;
+        }
+        self.bump_host_bytes(len);
+        Ok(())
+    }
+
+    /// Per-page clone helper — the case analysis described in the
+    /// doc comment on [`Self::clone_page_range`].
+    async fn clone_one_page(&self, src: PageId, dst: PageId) -> Result<(), UploaderError> {
+        if src == dst {
+            return Ok(());
+        }
+        // Snapshot the source's cache state under the lock. We only
+        // need the bytes when the source is dirty; the clean case
+        // resolves through the page index instead and the bytes
+        // there would just be a stale clone.
+        let src_dirty_bytes = {
+            let inner = self.inner.lock().await;
+            match inner.pages.get(&src) {
+                Some(e) if e.state == PageState::Dirty => Some(e.bytes.clone()),
+                _ => None,
+            }
+        };
+        if let Some(bytes) = src_dirty_bytes {
+            // Case 1: dirty bytes copy. install_full_page marks the
+            // destination dirty so a later flush computes its hash
+            // through the normal pipeline (natural dedup if the
+            // bytes match the source's eventual hash).
+            self.install_full_page(dst, bytes).await?;
+            return Ok(());
+        }
+        // Source is not dirty in cache. The page index — possibly
+        // empty for a sparse-hole source — is the authoritative
+        // resolution. Before touching it, check that the chunk it
+        // points at has already been acknowledged by cloud; if not,
+        // fall back to a bytes copy so the destination doesn't
+        // inherit a SYNC-tracker entry it can never wait on.
+        let src_upload_state = self.writer.upload_index().read(src)?;
+        if !matches!(src_upload_state, UploadState::Uploaded) {
+            let bytes = self.acquire_page(src).await?;
+            self.install_full_page(dst, bytes).await?;
+            return Ok(());
+        }
+        // Case 2: hash clone. Drop the destination from cache so the
+        // next host read repopulates from the freshly-bound page
+        // index entry instead of returning stale cached bytes.
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.pages.remove(&dst).is_some() {
+                inner.lru_remove(dst);
+                inner.dirty.remove(&dst);
+            }
+        }
+        match self.writer.page_index().get(src)? {
+            Some(hash) => {
+                self.writer.page_index().set(dst, &hash)?;
+                // The destination now points at the same already-
+                // uploaded chunk as the source — its upload state
+                // is Uploaded by construction.
+                self.writer.upload_index().set(dst, UploadState::Uploaded)?;
+            }
+            None => {
+                // Source is a sparse hole; destination becomes one
+                // too. SBC-3 §5.7 reads-as-zero applies.
+                self.writer.page_index().clear(dst)?;
+                self.writer.upload_index().set(dst, UploadState::Uploaded)?;
+            }
+        }
         Ok(())
     }
 
@@ -1890,5 +2025,162 @@ mod tests {
                 "page {pid} should be clean (buffer_unordered does not cancel in-flight peers)"
             );
         }
+    }
+
+    // ─────────────────────── clone_page_range coverage ───────────────────────
+
+    #[tokio::test]
+    async fn clone_page_range_dirty_source_copies_bytes() {
+        // Source is dirty in cache (not yet flushed); clone should
+        // snapshot the cached bytes into the destination.
+        let (_tmp, cache, writer) = fixture_cache(8 * (1u64 << 20)).await;
+        let bytes = pattern(0x5A, PAGE);
+        cache.write_bytes(0, &bytes).await.unwrap();
+        // Page 0 is dirty (no SYNC). Clone page 0 → page 4.
+        let dst_off = 4 * PAGE as u64;
+        cache
+            .clone_page_range(0, dst_off, PAGE as u64)
+            .await
+            .unwrap();
+        // Source still readable.
+        let s = cache.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(s, bytes);
+        // Destination matches.
+        let d = cache.read_bytes(dst_off, PAGE).await.unwrap();
+        assert_eq!(d, bytes);
+        // Page index entries are still empty (both pages dirty in
+        // cache, neither has flushed).
+        assert!(writer.page_index().get(0).unwrap().is_none());
+        assert!(writer.page_index().get(4).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_clean_source_takes_hash_fast_path() {
+        // Flush the source so it is clean + Uploaded; clone should
+        // bind the destination's page-index entry to the same hash
+        // and leave the destination uncached.
+        let (_tmp, cache, writer) = fixture_cache(8 * (1u64 << 20)).await;
+        let bytes = pattern(0xC3, PAGE);
+        cache.write_bytes(0, &bytes).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let src_hash = writer.page_index().get(0).unwrap().expect("seeded");
+        // Clone page 0 → page 7.
+        cache
+            .clone_page_range(0, 7 * PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+        // Destination's page index points at the same chunk hash.
+        let dst_hash = writer.page_index().get(7).unwrap().expect("cloned");
+        assert_eq!(src_hash, dst_hash);
+        // Reading the destination returns the same bytes (resolved
+        // via the shared chunk).
+        let d = cache.read_bytes(7 * PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(d, bytes);
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_sparse_hole_source_clears_destination() {
+        // Destination starts non-empty (gets seeded then flushed);
+        // cloning from an unallocated source page must clear it back
+        // to a sparse hole that reads as zero.
+        let (_tmp, cache, writer) = fixture_cache(8 * (1u64 << 20)).await;
+        let seed = pattern(0x77, PAGE);
+        cache.write_bytes(PAGE as u64, &seed).await.unwrap();
+        cache.flush_all().await.unwrap();
+        assert!(writer.page_index().get(1).unwrap().is_some());
+        // Clone page 0 (sparse) → page 1 (seeded).
+        cache
+            .clone_page_range(0, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+        assert!(writer.page_index().get(1).unwrap().is_none());
+        let d = cache.read_bytes(PAGE as u64, PAGE).await.unwrap();
+        assert!(d.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_evicts_stale_destination_cache_entry() {
+        // Destination had its own writes (clean in cache + indexed),
+        // then gets cloned over. Subsequent reads must reflect the
+        // source bytes, not the stale destination bytes the cache
+        // still held.
+        let (_tmp, cache, _w) = fixture_cache(8 * (1u64 << 20)).await;
+        let src_bytes = pattern(0xAA, PAGE);
+        let dst_bytes = pattern(0xBB, PAGE);
+        cache.write_bytes(0, &src_bytes).await.unwrap();
+        cache.write_bytes(PAGE as u64, &dst_bytes).await.unwrap();
+        cache.flush_all().await.unwrap();
+        // Warm the cache by reading the destination back.
+        let dst_warm = cache.read_bytes(PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(dst_warm, dst_bytes);
+        // Clone src → dst.
+        cache
+            .clone_page_range(0, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+        // Destination must now read as the source bytes.
+        let dst_after = cache.read_bytes(PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(dst_after, src_bytes);
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_multi_page_round_trip() {
+        let (_tmp, cache, _w) = fixture_cache(16 * (1u64 << 20)).await;
+        // Seed four pages with distinct patterns and flush.
+        let seeded: Vec<Vec<u8>> = (0..4).map(|i| pattern(0x10 + i as u8, PAGE)).collect();
+        for (i, bytes) in seeded.iter().enumerate() {
+            cache
+                .write_bytes((i as u64) * PAGE as u64, bytes)
+                .await
+                .unwrap();
+        }
+        cache.flush_all().await.unwrap();
+        // Clone pages 0..4 → pages 8..12.
+        let dst_off = 8 * PAGE as u64;
+        cache
+            .clone_page_range(0, dst_off, 4 * PAGE as u64)
+            .await
+            .unwrap();
+        for (i, bytes) in seeded.iter().enumerate() {
+            let read = cache
+                .read_bytes(dst_off + (i as u64) * PAGE as u64, PAGE)
+                .await
+                .unwrap();
+            assert_eq!(&read, bytes, "page {i} clone mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_same_src_dst_is_noop() {
+        let (_tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+        let bytes = pattern(0x33, PAGE);
+        cache.write_bytes(0, &bytes).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let before = writer.page_index().get(0).unwrap();
+        cache.clone_page_range(0, 0, PAGE as u64).await.unwrap();
+        let after = writer.page_index().get(0).unwrap();
+        assert_eq!(before, after);
+        let r = cache.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(r, bytes);
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_zero_length_is_noop() {
+        let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.clone_page_range(0, PAGE as u64, 0).await.unwrap();
+        assert_eq!(cache.host_bytes_written(), 0);
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_bumps_host_bytes_written() {
+        let (_tmp, cache, _w) = fixture_cache(8 * (1u64 << 20)).await;
+        let bytes = pattern(0x42, PAGE);
+        cache.write_bytes(0, &bytes).await.unwrap();
+        let before = cache.host_bytes_written();
+        cache
+            .clone_page_range(0, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+        assert_eq!(cache.host_bytes_written(), before + PAGE as u64);
     }
 }

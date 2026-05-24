@@ -304,6 +304,20 @@ struct TelemetryInner {
     // ── cache (VSA per-volume page cache) ──
     cache_evictions_total: Counter<u64>,
 
+    // ── SCSI EXTENDED COPY (VSA VAAI XCOPY) ──
+    /// One increment per EXTENDED COPY command, labeled
+    /// `outcome ∈ {success, reject, error}`.
+    scsi_xcopy_total: Counter<u64>,
+    /// Host-visible bytes copied by EXTENDED COPY, labeled
+    /// `path ∈ {fast, slow}`. Fast = same-volume page-aligned
+    /// chunk-hash clone; slow = bytes-copy (cross-volume,
+    /// unaligned, or overlapping ranges).
+    scsi_xcopy_bytes_total: Counter<u64>,
+    /// One increment per executed segment descriptor, labeled
+    /// `path ∈ {fast, slow}`. Lets operators see how often the
+    /// fast path is actually taken vs the bytes-copy fallback.
+    scsi_xcopy_segments_total: Counter<u64>,
+
     // ── cloud (per-backend op latency / bytes / errors) ──
     cloud_requests_total: Counter<u64>,
     cloud_request_seconds: Histogram<f64>,
@@ -480,6 +494,33 @@ impl Telemetry {
                 KeyValue::new("outcome", outcome.to_string()),
             ],
         );
+    }
+
+    /// scsi_xcopy.* — one increment per EXTENDED COPY command.
+    /// `outcome` is `success` (returned GOOD), `reject` (parameter
+    /// list failed validation; nothing copied) or `error` (a segment
+    /// failed mid-execution; partial commit possible).
+    pub fn scsi_xcopy_inc(&self, outcome: &str) {
+        self.inner
+            .scsi_xcopy_total
+            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
+    }
+
+    /// scsi_xcopy.* — host-visible bytes copied. `path` is `fast`
+    /// (page-index clone) or `slow` (bytes copy).
+    pub fn scsi_xcopy_add_bytes(&self, path: &str, bytes: u64) {
+        self.inner
+            .scsi_xcopy_bytes_total
+            .add(bytes, &[KeyValue::new("path", path.to_string())]);
+    }
+
+    /// scsi_xcopy.* — segment count by path. Paired with
+    /// `scsi_xcopy_add_bytes`; the bytes/segment quotient lets
+    /// operators see the average segment size ESXi issues.
+    pub fn scsi_xcopy_inc_segment(&self, path: &str) {
+        self.inner
+            .scsi_xcopy_segments_total
+            .add(1, &[KeyValue::new("path", path.to_string())]);
     }
 
     /// cloud.* — `op` is one of `put`/`get`/`head`/`delete`,
@@ -775,6 +816,21 @@ impl TelemetryInner {
                 .with_description(
                     "VSA per-volume page-cache evictions, labeled clean vs dirty (dirty = required a cloud flush)",
                 )
+                .build(),
+
+            // SCSI EXTENDED COPY (VAAI XCOPY)
+            scsi_xcopy_total: meter
+                .u64_counter(name("scsi_xcopy_total"))
+                .with_description("EXTENDED COPY commands by outcome (success/reject/error)")
+                .build(),
+            scsi_xcopy_bytes_total: meter
+                .u64_counter(name("scsi_xcopy_bytes_total"))
+                .with_description("EXTENDED COPY host-visible bytes by path (fast/slow)")
+                .with_unit("By")
+                .build(),
+            scsi_xcopy_segments_total: meter
+                .u64_counter(name("scsi_xcopy_segments_total"))
+                .with_description("EXTENDED COPY segments executed by path (fast/slow)")
                 .build(),
 
             // cloud
@@ -1090,6 +1146,21 @@ pub mod record {
     pub fn cache_eviction(volume: &str, outcome: &str) {
         if let Some(t) = global() {
             t.cache_inc_eviction(volume, outcome);
+        }
+    }
+    pub fn scsi_xcopy(outcome: &str) {
+        if let Some(t) = global() {
+            t.scsi_xcopy_inc(outcome);
+        }
+    }
+    pub fn scsi_xcopy_bytes(path: &str, bytes: u64) {
+        if let Some(t) = global() {
+            t.scsi_xcopy_add_bytes(path, bytes);
+        }
+    }
+    pub fn scsi_xcopy_segment(path: &str) {
+        if let Some(t) = global() {
+            t.scsi_xcopy_inc_segment(path);
         }
     }
     pub fn cloud_request(backend: &str, op: &str, outcome: &str, bytes: u64, seconds: f64) {
