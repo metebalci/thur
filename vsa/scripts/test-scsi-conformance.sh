@@ -224,7 +224,8 @@ cloud:
       type: local
       root_dir: "$TEST_DIR/local-backend"
 
-EOFCONFIG}
+EOFCONFIG
+}
 
 start_daemon() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"

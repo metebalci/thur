@@ -242,7 +242,8 @@ cloud:
       type: local
       root_dir: "$TEST_DIR/local-backend"
 
-EOFCONFIG    mkdir -p "$TEST_DIR/local-backend"
+EOFCONFIG
+    mkdir -p "$TEST_DIR/local-backend"
 }
 
 start_daemon() {
