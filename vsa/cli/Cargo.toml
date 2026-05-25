@@ -5,8 +5,8 @@ edition = "2024"
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
-description = "Thur VSA — block-storage iSCSI target backed by cloud-tiered deduplicated chunks"
-homepage = "https://github.com/metebalci/thur"
+description = "Virtual Storage Appliance"
+homepage = "https://thur.metebalci.com"
 repository = "https://github.com/metebalci/thur"
 authors = ["Mete Balci <info@metebalci.com>"]
 
@@ -34,14 +34,6 @@ name = "thurvsa"
 maintainer = "Mete Balci <info@metebalci.com>"
 copyright = "2026 Mete Balci"
 license-file = ["../../LICENSE", "0"]
-extended-description = """\
-Thur VSA presents block-storage volumes as an iSCSI target speaking
-standard SCSI Block Commands (SBC-3). Storage is content-addressed
-and deduplicated at a per-volume page granularity, with chunks tiered
-out to S3, GCS, Azure, or a local filesystem. Designed for VMware,
-Hyper-V, and Linux hosts that want a thin-provisioned cloud-backed
-LUN with VAAI primitives (ATS / WRITE SAME / UNMAP) and persistent
-reservations."""
 section = "admin"
 priority = "optional"
 depends = "$auto"
@@ -77,7 +69,7 @@ systemd-units = [{ unit-name = "thurvsad", unit-scripts = "../../release", enabl
 
 [package.metadata.generate-rpm]
 name = "thurvsa"
-summary = "Block-storage iSCSI target backed by cloud-tiered deduplicated chunks"
+summary = "Virtual Storage Appliance"
 # cargo-generate-rpm reads this table directly and does NOT resolve
 # `license.workspace = true` inheritance — the field must be a literal
 # string. Keep in sync with [workspace.package].license in the root
