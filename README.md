@@ -85,13 +85,18 @@ Thur VSA additionally provides:
 
 ## Prerequisites
 
-- Linux (tested on Ubuntu 26.04).
-- Building from source: a C compiler, OpenSSL headers, pkg-config,
-  and Rust 1.92+ (2024 edition).
+- Linux. Tested on Ubuntu 26.04; `.deb` / `.rpm` packages also cover
+  Debian 12/13, Ubuntu 24.04, RHEL / Rocky / Alma 9/10, SLES 15 SP6+/16,
+  and openSUSE Leap 15.6+.
+- Building from source: Rust 1.92+ (2024 edition), plus a C toolchain
+  (gcc or clang, pkg-config, OpenSSL headers) — OpenSSL is vendored and
+  compiled from source so the release binary carries no runtime
+  `libssl` dependency.
 - Integration tests: `open-iscsi`, `sg3-utils`, `mtx`, `mt-st`,
   `libiscsi-bin`, `lsscsi`.
-- A cloud storage account (S3 / GCS / Azure) for production; the
-  `local` backend needs none.
+- Storage: a cloud account (AWS S3, GCS, Azure Blob), an on-premise
+  S3-compatible object store (MinIO, Ceph RGW, AIStore, …), or the
+  `local` filesystem backend.
 
 ## Install
 
@@ -103,13 +108,21 @@ curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
 ```
 
 This wires up the `stable` channel (tagged releases without a
-pre-release suffix; includes pre-1.0 builds). Set `CHANNEL=unstable`
-to install from the pre-release channel that holds alpha / beta /
-rc tags. The script writes the right `sources.list.d` or
-`yum.repos.d` entry and installs the signing public key alongside it.
-The fingerprint is documented in
-[`docs/RELEASING.md`](docs/RELEASING.md) — verify it against the key
-the script imports.
+pre-release suffix; includes pre-1.0 builds). Use the pre-release
+channel that holds alpha / beta / rc tags by setting `CHANNEL` in the
+same line:
+
+```bash
+curl -fsSL https://thur.metebalci.com/install.sh | sudo CHANNEL=unstable bash
+```
+
+The script writes the right `sources.list.d` or `yum.repos.d` entry
+and installs the signing public key alongside it. Verify the imported
+key against the current package signing fingerprint:
+
+```
+E1FF A6E4 4D8A F56E BD17  997C 9B4E 436A E137 3A4B
+```
 
 For air-gapped installs, offline staging, or anyone who'd rather not
 delegate the install ceremony to a piped shell script, the packages
@@ -139,13 +152,10 @@ sudo usermod -aG thurvtl $USER     # log out and back in to apply
 sudo usermod -aG thurvsa $USER     # ...and thurvsa, on a co-resident host
 ```
 
-Alternatively, invoke the CLI as the daemon user per command —
-`sudo -u thurvtl thurvtl ...`. Pure-local commands (`config defaults`)
-use no socket and need neither.
-
-Every release artifact ships a detached `.asc` GPG signature — verify
-it before installing. Key fingerprint and the build / signing process
-are in [`docs/RELEASING.md`](docs/RELEASING.md).
+Every release artifact ships a detached `.asc` GPG signature (except
+dev and alpha builds) — verify it before installing. Key fingerprint
+and the build / signing process are in
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 Other install paths:
 
@@ -154,11 +164,14 @@ Other install paths:
 
 ## Configure
 
-The one required key in each conffile is `data_dir`. Add at least one
-cloud backend under `cloud.backends:`. The `config defaults` command
-prints the full annotated reference — every key documented with its
-default value and a description — which you can redirect straight to a
-starter file:
+The absolute minimum each conffile needs is three things: `data_dir`
+(the packaged starter pre-fills `/var/lib/thurvtl` and
+`/var/lib/thurvsa` — change only if you want the data elsewhere), at
+least one entry under `cloud.backends:`, and — for Thur VTL only — a
+`library:` chassis declaration (see below). The `config defaults`
+command prints the full annotated reference — every key documented
+with its default value and a description — which you can redirect
+straight to a starter file:
 
 ```bash
 thurvtl config defaults > thurvtl.yaml
