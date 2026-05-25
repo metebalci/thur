@@ -1,6 +1,7 @@
-[![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=code)](https://github.com/metebalci/thur/) [![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=comments)](https://github.com/metebalci/thur/)
-
 # Thur
+
+[![Lines of code](https://sloc.xyz/github/metebalci/thur/?category=code)](https://github.com/metebalci/thur/)
+[![Comment lines](https://sloc.xyz/github/metebalci/thur/?category=comments)](https://github.com/metebalci/thur/)
 
 > **Status: alpha — under active development.** Thur has not had a
 > stable release. On-disk formats, configuration keys, and the
