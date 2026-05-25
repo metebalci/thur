@@ -69,7 +69,7 @@ Enforcement layers:
 - **SCSI surface**: WORMM bit in INQUIRY VPD page 0xB0
   (Sequential-Access Device Characteristics) reflecting the loaded
   cartridge.
-- **Cloud layer**: `retention_mode != none` triggers Object Lock /
+- **Storage layer**: `retention_mode != none` triggers Object Lock /
   retention policy on the bucket; the bucket auto-applies retention to
   every PUT (the daemon never sets per-object retention — too
   divergent across providers). The daemon validates the configured
@@ -79,7 +79,7 @@ Enforcement layers:
 ### Provider bucket setup
 
 A WORM cartridge needs a backend whose bucket has provider-side
-immutability turned on. That is **two layers** on every cloud — enable
+immutability turned on. That is **two layers** on every backend — enable
 the feature, *then* set a default retention rule. Skipping the second
 leaves "lock enabled, no rule"; the daemon reports that as `Off`, and a
 `retention_mode: governance` config then fails to start.
@@ -119,7 +119,7 @@ Azure WORM additionally needs `subscription_id` + `resource_group` on
 the backend config and AAD auth — the immutability policy lives on the
 ARM management plane, which SAS credentials can't reach.
 
-**IAM grants.** Every cloud-backed cartridge needs object
+**IAM grants.** Every storage-backed cartridge needs object
 read/write/delete + bucket list on its backend — `s3:PutObject` /
 `s3:GetObject` / `s3:DeleteObject` / `s3:ListBucket`, or
 `roles/storage.objectAdmin` on GCS, or **Storage Blob Data
@@ -138,7 +138,7 @@ verify the bucket policy out of band.
 ## Legal hold
 
 `thurvtl cartridge legal-hold set|clear|status BARCODE` is a thin
-wrapper over the cloud provider's per-object hold primitive:
+wrapper over the storage provider's per-object hold primitive:
 
 - S3 `PutObjectLegalHold`
 - GCS `eventBasedHold`

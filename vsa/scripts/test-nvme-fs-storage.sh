@@ -4,14 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# thurvsa End-to-End Filesystem Workflow Test (NVMe/TCP + real cloud)
+# thurvsa End-to-End Filesystem Workflow Test (NVMe/TCP + storage backend)
 #
 # Same shape as test-iscsi-fs-storage.sh, but driven through Linux nvme-cli +
 # nvme_tcp instead of open-iscsi. Clones a backend definition from
 # private/storage-backends.json (or $THURVSA_SOURCE_BACKENDS) so the
-# upload pipeline, HEAD-then-PUT dedup, page-eviction-driven cloud
-# refetch, and SYNC-fenced flush paths actually fire against real
-# cloud through the NVMe/TCP transport.
+# upload pipeline, HEAD-then-PUT dedup, page-eviction-driven storage
+# refetch, and SYNC-fenced flush paths actually fire against a real
+# storage backend through the NVMe/TCP transport.
 #
 # Selection: set THURVSA_TEST_BACKEND to the name of an entry under
 # `backends:` in the source storage-backends.json. The script copies that
@@ -23,10 +23,10 @@
 #   - Backend `retention_mode != none` (test cleanup can't delete locked objects)
 #
 # Cleanup: always purges the test sub-prefix from the bucket on exit
-# (even on failure), unless --keep-cloud is passed.
+# (even on failure), unless --keep-storage is passed.
 #
 # Stress / scale: bump the fixture via THURVSA_FIXTURE_MB (env, MiB,
-# default 8). Cloud round-trips dominate runtime — bigger fixture =
+# default 8). Storage round-trips dominate runtime — bigger fixture =
 # longer test = real egress $$$.
 #   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 \
 #     ./vsa/scripts/test-nvme-fs-storage.sh
@@ -36,25 +36,25 @@
 #   - nvme_tcp kernel module (sudo modprobe nvme_tcp)
 #   - e2fsprogs, util-linux, tar (usually present)
 #   - jq (parses private/storage-backends.json)
-#   - Cloud CLI matching the backend type:
+#   - Backend CLI matching the backend type:
 #       s3    -> aws       (sudo apt-get install awscli)
 #       gcs   -> gcloud    (https://cloud.google.com/sdk)
 #       azure -> az        (https://learn.microsoft.com/cli/azure/install-azure-cli)
-#   - Cloud credentials in env (same chain the daemon uses).
+#   - Storage credentials in env (same chain the daemon uses).
 #   - Root/sudo access (nvme connect + raw /dev/nvmeXn1 access require root).
 #
 # Usage (invoke from repo root):
 #   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-nvme-fs-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
-# cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
+# storage credentials into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
 # AISTOR_*) and your backend entry in `$REPO/private/storage-backends.json`.
 # The script auto-sources thur.env at startup and defaults
 # THURVSA_SOURCE_BACKENDS to private/storage-backends.json.
 #
 # NOTE on sudo: do NOT prefix with sudo — the script self-elevates
-# via `sudo KEY=VAL ... "$0"`, forwarding the cloud-relevant env
+# via `sudo KEY=VAL ... "$0"`, forwarding the backend-relevant env
 # vars one by one (sudo-rs on Ubuntu 26.04+ silently ignores `-E`
 # regardless of the SETENV sudoers tag).
 #
@@ -64,7 +64,7 @@
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up local test data directory
 #   --keep-nvme           Don't disconnect NVMe session after tests
-#   --keep-cloud          Don't purge the test sub-prefix from the bucket
+#   --keep-storage          Don't purge the test sub-prefix from the bucket
 #   --nvmetcp-port PORT   Override NVMe/TCP port (default: free ephemeral port)
 #   --http-port PORT      Override HTTP port (default: free ephemeral port)
 #
@@ -72,7 +72,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Auto-load maintainer-private cloud credentials if the file exists.
+# Auto-load maintainer-private storage credentials if the file exists.
 # Must run BEFORE self-elevation so the env is populated when sudo
 # forwards it.
 if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
@@ -82,7 +82,7 @@ if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set +a
 fi
 
-# Self-elevate via sudo, forwarding cloud-relevant env vars as
+# Self-elevate via sudo, forwarding backend-relevant env vars as
 # explicit `KEY=VAL` pairs. `sudo -E` is silently ignored on sudo-rs
 # (Ubuntu 26.04+); explicit forwarding is the only portable path.
 if [[ $EUID -ne 0 ]]; then
@@ -112,7 +112,7 @@ SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
 HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-fs-cloud-test"
 KEEP_DATA=0
 KEEP_NVME=0
-KEEP_CLOUD=0
+KEEP_STORAGE=0
 DAEMON_PID=""
 NVME_CONNECTED=0
 NVME_DEVICE=""
@@ -146,7 +146,7 @@ while [[ $# -gt 0 ]]; do
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
         --keep-nvme) KEEP_NVME=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
         --http-port) HTTP_PORT="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -175,11 +175,11 @@ cleanup() {
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
 
-    if [[ $KEEP_CLOUD -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
-        log_info "Purging cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
-        cloud_purge_test_prefix
-    elif [[ $KEEP_CLOUD -eq 1 && -n "$TEST_PREFIX" ]]; then
-        log_warn "Keeping cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+    if [[ $KEEP_STORAGE -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
+        log_info "Purging storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+        storage_purge_test_prefix
+    elif [[ $KEEP_STORAGE -eq 1 && -n "$TEST_PREFIX" ]]; then
+        log_warn "Keeping storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -324,7 +324,7 @@ check_prerequisites() {
         hints+=("  - nvme_tcp: sudo modprobe nvme_tcp (kernel >= 5.0 required)")
     fi
 
-    local cli; cli=$(cloud_cli_for_type)
+    local cli; cli=$(storage_cli_for_type)
     if [[ -n "$cli" && "$cli" != "unknown" ]] && ! command -v "$cli" >/dev/null 2>&1; then
         missing+=("$cli")
         case "$cli" in
@@ -350,7 +350,7 @@ check_prerequisites() {
 }
 
 create_test_config() {
-    log_info "Creating test configuration (cloud backend cloned from $SOURCE_BACKENDS)..."
+    log_info "Creating test configuration (storage backend cloned from $SOURCE_BACKENDS)..."
     mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
 
     local backend_json
@@ -505,9 +505,9 @@ phase_a_format_mount_extract() {
     log_info "[Phase A] umounted cleanly"
 }
 
-phase_b_assert_cloud_objects() {
-    log_info "[Phase B] Asserting chunk objects landed in cloud..."
-    # Async-upload health gate — same shape as the iSCSI cloud test.
+phase_b_assert_storage_objects() {
+    log_info "[Phase B] Asserting chunk objects landed in storage..."
+    # Async-upload health gate — same shape as the iSCSI storage test.
     # See vsa/scripts/test-iscsi-fs-storage.sh phase_b for rationale.
     if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
         log_error "[Phase B] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
@@ -531,14 +531,14 @@ phase_b_assert_cloud_objects() {
         return 1
     fi
     # SYNCHRONIZE CACHE / NVMe Flush on umount drains in-flight
-    # uploads, but the cloud bucket may take a beat to be listable.
-    # cloud_wait_for_key blocks until at least one object shows up.
-    if ! cloud_wait_for_key "" 60; then
+    # uploads, but the storage bucket may take a beat to be listable.
+    # storage_wait_for_key blocks until at least one object shows up.
+    if ! storage_wait_for_key "" 60; then
         log_error "[Phase B] No objects appeared under ${BACKEND_BUCKET}/${TEST_PREFIX} within 60s"
         return 1
     fi
     local count
-    count=$(cloud_list "" | wc -l)
+    count=$(storage_list "" | wc -l)
     log_info "[Phase B] Found $count object(s) under test prefix"
     return 0
 }
@@ -574,15 +574,15 @@ phase_c_restart_and_verify() {
 
 main() {
     echo "========================================"
-    echo "thurvsa Filesystem Workflow Test (NVMe/TCP + real cloud)"
+    echo "thurvsa Filesystem Workflow Test (NVMe/TCP + storage backend)"
     echo "========================================"
     echo ""
 
     resolve_backend
     check_prerequisites
-    verify_cloud_creds || {
+    verify_storage_creds || {
         echo ""
-        echo "Common cause: cloud creds aren't in this shell's env."
+        echo "Common cause: storage credentials aren't in this shell's env."
         echo "Set them in your user shell, then run (without sudo prefix):"
         echo "  THURVSA_TEST_BACKEND=$THURVSA_TEST_BACKEND $0 $*"
         exit 1
@@ -602,8 +602,8 @@ main() {
     log_test "Phase A — mkfs.ext4 + tar xf + sync + hash"
     if phase_a_format_mount_extract; then log_pass "Phase A"; else log_fail "Phase A"; exit 1; fi
     echo ""
-    log_test "Phase B — assert chunk objects landed in cloud"
-    if phase_b_assert_cloud_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
+    log_test "Phase B — assert chunk objects landed in storage"
+    if phase_b_assert_storage_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
     echo ""
     log_test "Phase C — restart daemon + NVMe reconnect + fsck + diff hashes"
     if phase_c_restart_and_verify; then log_pass "Phase C"; else log_fail "Phase C"; exit 1; fi

@@ -1,7 +1,7 @@
 # scripts/
 
 Workspace dev utilities, product-agnostic — host setup
-(`setup-system.sh`), a `docker-compose.yml` for local cloud
+(`setup-system.sh`), a `docker-compose.yml` for local storage
 backends, and shared test helpers under `lib/`.
 
 Per-product integration tests live under `vtl/scripts/` and

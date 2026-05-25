@@ -45,7 +45,7 @@ self-elevation. Use it to persist credentials across shells; skip it if
 your shell already exports them from your dotfiles or a credential
 manager.
 
-`private/` is gitignored — it carries live cloud credentials and bucket
+`private/` is gitignored — it carries live storage credentials and bucket
 coordinates. Override paths with `THURV{TL,SA}_SOURCE_BACKENDS` /
 `THURVSA_SOURCE_KEYSTORES` if your fixtures live elsewhere. Pick a
 backend per run with `THURV{TL,SA}_TEST_BACKEND=<name>` matching an entry

@@ -28,7 +28,7 @@
 ./shared/admin-server/src/lib.rs
 ./shared/audit/src/lib.rs
 ./shared/cli-system/src/lib.rs
-./shared/cloud/src/lib.rs
+./shared/object-store/src/lib.rs
 ./shared/iscsi/src/lib.rs
 ./shared/keystore/src/lib.rs
 ./shared/upload-worker/src/lib.rs
@@ -44,7 +44,7 @@
 ./scsi/spc/src/naa.rs
 ./scsi/smc/src/dispatch/types.rs
 ./shared/alerting/src/sinks/mod.rs
-./shared/cloud/src/error.rs
+./shared/object-store/src/error.rs
 ./shared/iscsi/src/error.rs
 ./shared/keystore/src/error.rs
 ./shared/upload-worker/src/payload.rs
@@ -83,13 +83,13 @@
 
 # --- CLI daemon-call adapters covered by the vtl/scripts/, vsa/scripts/
 #     integration suites (build a request, call the admin socket, print) ---
-./vsa/cli/src/cloud.rs
+./vsa/cli/src/storage.rs
 ./vsa/cli/src/gc.rs
 ./vsa/cli/src/main.rs
 ./vsa/cli/src/volume.rs
 ./vsa/cli/src/commands/generate_config.rs
 ./vtl/cli/src/commands/cartridge_key.rs
-./vtl/cli/src/commands/cloud.rs
+./vtl/cli/src/commands/storage.rs
 ./vtl/cli/src/commands/credentials.rs
 ./vtl/cli/src/commands/drive.rs
 ./vtl/cli/src/commands/gc.rs

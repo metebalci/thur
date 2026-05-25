@@ -435,7 +435,7 @@ t_mode_sense_wce_on_rcd_on() {
     # Issue MODE SENSE(10) page 0x08 directly via sg_raw and parse
     # the response bytes. thurvsa's PageCache is genuinely write-back
     # — WRITE returns GOOD when bytes hit the in-memory cache, before
-    # the cloud upload + page-index commit. SBC-3 §6.4.6.4 requires
+    # the storage upload + page-index commit. SBC-3 §6.4.6.4 requires
     # WCE=1 in that case so the host knows to issue SYNCHRONIZE CACHE
     # for durability. Lie WCE=0 and Linux elides the SYNC on umount,
     # losing every dirty page when the daemon next restarts.

@@ -14,7 +14,7 @@ import sys
 # Workspace members, grouped by coverage floor (line %).
 #
 # Two critical tiers — separated by failure mode, not by criticality
-# level. Tier 1 is data-path: bugs corrupt or lose on-disk / cloud
+# level. Tier 1 is data-path: bugs corrupt or lose on-disk / storage
 # data silently. Tier 2 is control-plane: bugs cause silent
 # operational failures (admin socket down, alert never fires, integrity
 # check skipped) or unrecoverable backups.
@@ -23,12 +23,12 @@ CRITICAL_DATA_PATH_80 = [
     "scsi/spc", "scsi/ssc", "scsi/smc", "scsi/sbc",
     "nvme/base", "nvme/nvm", "nvme/tcp",
     "shared/crypto", "shared/pool", "shared/iscsi",
-    "shared/audit", "shared/keystore", "shared/cloud",
+    "shared/audit", "shared/keystore", "shared/object-store",
 ]
 CRITICAL_CONTROL_PLANE_80 = [
     "shared/admin-server",   # admin Unix-socket bind, peer-cred, jobs
-    "shared/verify-core",    # pool / cloud integrity sweep
-    "shared/upload-worker",  # cloud PUT + HEAD-probe primitive
+    "shared/verify-core",    # pool / storage integrity sweep
+    "shared/upload-worker",  # storage PUT + HEAD-probe primitive
     "shared/dedup-stats",    # operator-visible dedup math
 ]
 PRODUCTS_30 = ["vtl/daemon", "vtl/cli", "vsa/daemon", "vsa/cli"]
@@ -36,7 +36,7 @@ SHARED_50 = [
     "shared/admin-audit", "shared/admin-client", "shared/admin-http",
     "shared/admin-iscsi", "shared/admin-proto",
     "shared/alerting", "shared/cli", "shared/cli-alerting",
-    "shared/cli-iscsi", "shared/cli-system", "shared/cloud-bench",
+    "shared/cli-iscsi", "shared/cli-system", "shared/object-store-bench",
     "shared/health", "shared/naming",
     "shared/telemetry",
 ]

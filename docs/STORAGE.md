@@ -24,8 +24,8 @@ and `<bb>` are its first two and next two hex chars (65 536-way
 fanout). `<namespace>` is the cartridge barcode (VTL) or the volume
 UUID hex (VSA). The **object key** is
 `chunks/[<namespace>/]<aa>/<bb>/<hash>.dat` — the per-backend bucket
-and optional prefix already isolate keys across backends, so the cloud
-key carries no `<backend>` segment. Pool layout, the `local` /
+and optional prefix already isolate keys across backends, so the
+storage-backend key carries no `<backend>` segment. Pool layout, the `local` /
 `global` scope choice, refcount-aware eviction, and GC are the dedup
 mechanism — see [`DEDUP.md`](DEDUP.md).
 
@@ -58,9 +58,9 @@ A cartridge is a directory under `<data_dir>/tapes/<barcode>/`:
   pre-dedup totals of what the host
   wrote and read; `backend_bytes_written` and `backend_bytes_read`
   are the post-dedup, post-compression bytes actually PUT to /
-  fetched from cloud, so the gap between a host counter and its
-  backend counterpart shows the dedup + compression saving (write
-  side) and the cache hit rate (read side). Rewritten via
+  fetched from the storage backend, so the gap between a host counter
+  and its backend counterpart shows the dedup + compression saving
+  (write side) and the cache hit rate (read side). Rewritten via
   `Cartridge::persist_runtime` at every runtime-mutating boundary
   (LOCATE-cross-partition, MODE SELECT 0x11, FORMAT MEDIUM, ERASE,
   SET CAPACITY, manifest backup) and once more when the cartridge is
@@ -109,7 +109,7 @@ stored explicitly). Magic `NVCI`. Carries:
   chunk can never exceed 4 GiB.
 - raw 32-byte BLAKE3 `hash`.
 - flags byte packing `hash_present` / `uploaded` / `location`
-  (LocalOnly|CloudOnly|Both) / storage-side `compression`.
+  (LocalOnly|CloudOnly|Both) / backend-side `compression`.
 
 `hash` is `Some(hex)` once sealed into the pool, `None` while in
 `.staging/`. Every per-chunk mutation (mark uploaded, transition
@@ -193,19 +193,19 @@ failure mode — none redundant with another.
 | BLAKE3      | per chunk, at-rest  | **at backend-download time only**     | backend bit-rot / wrong-bytes-for-hash             | filename is the hash (implicit) |
 
 LBP is wire-only (host ↔ target), fresh-computed per READ, gone after
-the response. BLAKE3 runs once per cloud download via
+the response. BLAKE3 runs once per backend download via
 `ChunkPool::insert_verified_bytes`; the pool refuses bytes that don't
 match the expected content address — so plaintext-uncompressed
 cartridges (which otherwise lack any at-rest integrity check) and the
 VSA block product both get the same backend-corruption guard.
 
-GCM and codec checks fire on every block read regardless of the cloud
+GCM and codec checks fire on every block read regardless of the storage
 path. A chunk corrupted by anything other than this daemon (manual
 edits, filesystem bit-rot) on an encrypted-or-compressed cartridge
 surfaces as a GCM auth failure or codec error. On a
 plaintext-uncompressed cartridge the on-disk pool is trusted — chunks
 are immutable after seal and the filesystem is the operator's
-responsibility. Cloud round-trip is the only path where untrusted
+responsibility. Storage round-trip is the only path where untrusted
 bytes can arrive, and it is guarded.
 
 Mismatch surfaces at the iSCSI layer as CHECK CONDITION + MEDIUM ERROR
@@ -234,10 +234,10 @@ A volume is a directory under `<data_dir>/volumes/<name>/`:
   pre-dedup totals of what the
   initiator wrote and read; `backend_bytes_written` and
   `backend_bytes_read` are the post-dedup, post-compression bytes
-  actually PUT to / fetched from cloud, so the gap between a host
-  counter and its backend counterpart shows the dedup + compression
+  actually PUT to / fetched from the storage backend, so the gap between
+  a host counter and its backend counterpart shows the dedup + compression
   saving (write side) and the cache hit rate (read side).
-  `sync_after` is the SYNCHRONIZE CACHE durability tier (`cloud` /
+  `sync_after` is the SYNCHRONIZE CACHE durability tier (`storage` /
   `disk` / `memory`, see [`BACKPRESSURE.md`](BACKPRESSURE.md) § VSA).
   The counters live as in-memory atomics and reach this file at
   flush boundaries plus a 60-second timer; `thurvsa volume info`

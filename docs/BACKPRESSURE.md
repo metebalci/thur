@@ -17,9 +17,9 @@ backpressure design. Two sections cover the product-specific details:
 
 A host workload can burst faster than backend upload can drain — a `tar` of a
 large dataset on VTL, or a journal flush, large copy, or snapshot cohort flush
-on VSA. Cloud upload throughput varies with network conditions, provider
+on VSA. Storage-backend upload throughput varies with network conditions, provider
 throttling, and retry backoff. The local chunk pool sits between the host write
-and the cloud PUT and absorbs that mismatch.
+and the backend PUT and absorbs that mismatch.
 
 If writes persistently outpace uploads, the pool grows. The difference between
 having backpressure and not having it is the difference between a graceful
@@ -34,7 +34,7 @@ pause and a failed backup:
   resumes normally.
 
 This is also why `disk_cache.size_gb` is impossible to tune correctly without
-this gate: no static size can absorb every burst against every cloud condition.
+this gate: no static size can absorb every burst against every backend condition.
 
 ## What's shared
 
@@ -163,7 +163,7 @@ disk_cache:
   # derives `min(50% of free, max_size_gb)` floored at min_size_gb,
   # recomputed every eviction tick. Multi-backend installs with
   # several `auto` entries split the 50%-of-free share evenly.
-  # Each cloud.backends entry may override via `disk_cache_size_gb`
+  # Each storage.backends entry may override via `disk_cache_size_gb`
   # (same shape).
   size_gb: auto
   min_size_gb: 4
@@ -173,7 +173,7 @@ disk_cache:
   # Reserve free filesystem space below which we also backpressure.
   disk_free_min_gb: 5
 
-cloud:
+storage:
   upload:
     # Per-seal max wait before surfacing SCSI NOT READY.
     backpressure_max_wait_seconds: 60
@@ -181,7 +181,7 @@ cloud:
 
 ### Tuning
 
-- **High write rate, slow cloud.** Raise `disk_cache.max_size_gb` so the
+- **High write rate, slow backend.** Raise `disk_cache.max_size_gb` so the
   `auto` cap can grow further on a roomy filesystem; the eviction worker
   re-derives the cap every tick. If only one backend is hot, pin it with
   `disk_cache_size_gb: 64` under its `storage.backends:` entry and leave the
@@ -205,13 +205,13 @@ cloud:
   throttling. Backpressure makes the failure mode graceful; it does not make
   uploads faster.
 - **Help if all chunks are `LocalOnly`.** Eviction can only free `Both`-state
-  chunks. If nothing has uploaded yet because the cloud is unreachable,
+  chunks. If nothing has uploaded yet because the backend is unreachable,
   eviction does nothing, the cap fills, and every seal eventually hits NOT
   READY — which is the correct behavior.
 - **Replace operator monitoring.** The `pool_backpressure_waits_total` /
   `pool_backpressure_wait_seconds` instruments and the warn-level "Upload
   backpressure waiting" log line are the signals to watch; if either is
-  sustained, add upload concurrency or fix cloud throughput.
+  sustained, add upload concurrency or fix storage throughput.
 
 ## Failure modes
 
@@ -220,9 +220,9 @@ cloud:
 If `upload.max_concurrent: 8` is configured but uploads are not completing,
 check:
 
-- Cloud credentials still valid (validated at startup; mid-run rotation can
+- Storage credentials still valid (validated at startup; mid-run rotation can
   break it).
-- Cloud bucket / container reachable (network, firewall, DNS).
+- Storage bucket / container reachable (network, firewall, DNS).
 - Provider-side throttling (S3 503 SlowDown, Azure 500 ServerBusy — the retry
   loop handles transient cases, but a prolonged throttling event keeps the
   seal blocked).
@@ -256,7 +256,7 @@ filesystem:
 
 On the block side the gate sits per-page in
 `VolumeWriter::write_page_unsynced` (`core/block/src/uploader.rs`), between the
-SBC-3 / NVMe write and the cloud PUT. Without it, the pool fills the
+SBC-3 / NVMe write and the backend PUT. Without it, the pool fills the
 filesystem, the next `pool.insert_bytes` hits `ENOSPC`, and the SCSI write
 returns MEDIUM ERROR. With the gate, `write_page` blocks at the per-backend
 cap; if uploads cannot free space within `backpressure_max_wait_seconds`, the
@@ -277,7 +277,7 @@ For each page, `write_page_unsynced` follows these steps:
 5. After backend upload and page-index update, the reservation stays held until
    the eviction worker releases it.
 
-Cloud upload errors do **not** release the reservation: the chunk is
+Storage upload errors do **not** release the reservation: the chunk is
 content-addressed and still on disk, so budget accounting stays consistent
 with reality. Orphan GC reclaims the chunk later if no page references it.
 
@@ -285,7 +285,7 @@ with reality. Orphan GC reclaims the chunk later if no page references it.
 
 `disk_cache.backpressure_max_wait_seconds` (default 30). Surfaces through
 `UploaderError::Backpressured` → SBC-3 NOT READY 0x04/0x07. Tune upward only
-if the eviction worker's recovery latency outruns the cloud PUT-then-HEAD
+if the eviction worker's recovery latency outruns the backend PUT-then-HEAD
 cadence.
 
 ## Eviction worker
@@ -343,7 +343,7 @@ file (`CSUI` magic header). Records the async-upload state:
 
 - `0x00 = Uploaded` (also: unallocated, legacy default for volumes
   created before async upload landed).
-- `0x01 = LocalOnly` (pool has the chunk, cloud PUT pending).
+- `0x01 = LocalOnly` (pool has the chunk, backend PUT pending).
 
 `VolumeWriter::write_page_unsynced` flags `LocalOnly` before enqueuing the
 [`UploadTask`]; the daemon's upload worker
@@ -371,7 +371,7 @@ responsibilities that have no tape analogue:
 
 1. **Sub-page RMW.** SBC-3 sector grain is 4 KiB; page grain is 64 KiB. A
    4 KiB host WRITE must merge into a 64 KiB page; without a RAM page the
-   merge costs a pool/cloud read plus write on every sub-page operation —
+   merge costs a pool/backend read plus write on every sub-page operation —
    fatal for random DB or filesystem workloads.
 2. **COMPARE AND WRITE atomicity.** SBC-3 CAW is per-page atomic. Serializing
    it on an in-RAM page under a `tokio::sync::Mutex` is straightforward; doing
@@ -395,17 +395,17 @@ lock-free.
 
 | Tier | SYNC blocks until | Survives | Lost on |
 |---|---|---|---|
-| `cloud` (default) | bytes are in backend object store | host-disk loss / daemon-process crash / power loss | provider outage during the upload window |
+| `storage` (default) | bytes are in backend object store | host-disk loss / daemon-process crash / power loss | provider outage during the upload window |
 | `disk` | bytes are in the local pool file | daemon-process crash / power loss (if pool is on stable storage) | host-disk loss |
 | `memory` | (no-op — bytes are in RAM cache only) | nothing | any crash; only the periodic flush worker tick eventually drains |
 
 Implementation in `PageCache::synchronize_bytes`:
 
-- `Cloud` (default) — `flush_pages_in_range` drives every dirty RAM page
+- `Storage` (default) — `flush_pages_in_range` drives every dirty RAM page
   through `VolumeWriter::write_page_unsynced` (pool insert + enqueue to the
   upload worker), then `VolumeWriter::pending_uploads().wait_for_range(...)`
   blocks until every page in the range has had its upload acked. A host
-  `fsync(2)` settles to "bytes are in cloud."
+  `fsync(2)` settles to "bytes are in the storage backend."
 - `Disk` — `flush_pages_in_range` only; skip phase 2. Host `fsync(2)` settles
   to "bytes are in the local pool." Faster; loses on daemon-host disk failure
   before the worker drains.

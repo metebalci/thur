@@ -147,15 +147,15 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `pages.idx`) and stays in each daemon's `job_dispatch::stats`.
 - **shared-object-store** — storage-backend abstraction. `object_store_backend.rs` (the
   `ObjectStoreBackend` trait), `object_store_config.rs` (`ObjectStoreConfig` schema +
-  `FailureKind` classifier + `validate_cloud_backend`),
+  `FailureKind` classifier + `validate_object_store_backend`),
   `object_store_helpers.rs` (decorrelated-jitter retry), `s3.rs` / `gcs.rs` /
   `azure.rs` / `local.rs`, `compression.rs` (LZ4 / zstd primitives).
   Errors are surfaced via `ObjectStoreError`; `core-mediachanger` defines
-  `From<CloudError> for VtlError` so `?` propagation is unaffected, and
-  re-exports the flat names (`core_mediachanger::CloudBackend`,
-  `…CloudConfig`, `…CompressionAlgo`, …).
+  `From<ObjectStoreError> for VtlError` so `?` propagation is unaffected, and
+  re-exports the flat names (`core_mediachanger::ObjectStoreBackend`,
+  `…ObjectStoreConfig`, `…CompressionAlgo`, …).
 - **shared-object-store-bench** — first-party storage-backend throughput
-  benchmark engine. `run` drives N parallel `CloudBackend::upload_chunk`
+  benchmark engine. `run` drives N parallel `ObjectStoreBackend::upload_chunk`
   / `download_chunk` / `delete_object` calls through the same SDK +
   network path the daemon uses. Output: `[BENCH]` lines on stdout,
   `[BENCH-ERR]` on stderr without aborting sibling cells. Knobs via
@@ -212,7 +212,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-telemetry** — OpenTelemetry SDK plumbing. One
   `SdkMeterProvider` with two readers: Prometheus pull (always wired) +
   OTLP push (opt-in). The `Telemetry` struct carries every instrument
-  handle (pool, cloud, chunk, iscsi, tape, prefetch, audit, daemon).
+  handle (pool, storage, chunk, iscsi, tape, prefetch, audit, daemon).
   Per-product instrument prefix (`thurvtl_*` / `thurvsa_*`)
   sourced from `shared_naming::PRODUCT.metric_prefix`; the
   `service.name` OTel resource attribute (`thurvtl` / `thurvsa`)
@@ -221,7 +221,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   free functions forward through it and no-op when it is unset (CLI /
   unit tests / `--test` smoke). core-mediachanger re-exports it as
   `pub use shared_telemetry as metrics;`.
-- **shared-upload-worker** — cloud-upload pipeline scaffold shared by
+- **shared-upload-worker** — storage-upload pipeline scaffold shared by
   tape (core-stream / VTL) and block (core-block / VSA). Two surfaces:
   `upload_chunk_inert(backend, &PendingUpload)` — stateless PUT with a
   storage-side dedup HEAD probe (under `DedupScope::Global`), returns
@@ -234,13 +234,13 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   open) stays in the daemons. `core_stream::cartridge` re-exports the
   payload types under their legacy names (`PendingUploadPayload`,
   `ChunkUploadOutcome`).
-- **shared-verify-core** — cross-product chunk-pool + cloud
+- **shared-verify-core** — cross-product chunk-pool + storage
   verification sweeps for `system verify`. A product implements the
   `VerifyTarget` trait — `live_chunks()` (the `(backend, namespace) ->
-  {hash}` map) and `cloud_entities()` (per-entity cloud expectations).
+  {hash}` map) and `cloud_entities()` (per-entity storage expectations).
   `sweep_local_pool(data_dir, target)` returns one `PoolSweep` per
   backend (the local orphan scan over every `(backend, namespace)`
-  pool); `sweep_cloud(target, backend_name, backend)` runs the bounded
+  pool); `sweep_storage(target, backend_name, backend)` runs the bounded
   HEAD storm against one storage backend and the `chunks/` orphan scan.
   The tape side additionally HEADs index-page objects + the manifest
   sentinel (no block analogue, stays in `core-mediachanger`); each
@@ -331,13 +331,13 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   (cross-backend / cross-region ops), `block_index.rs` (per-partition
   LBA index), `chunk_index.rs` (per-cartridge chunk index),
   `lru_index.rs`, `dirty_pages.rs` + `index_backup.rs` (page-granular
-  index backups to cloud), `prefetch.rs` (sequential read-ahead),
+  index backups to the storage backend), `prefetch.rs` (sequential read-ahead),
   `mode_state.rs` (SCSI MODE SELECT round-trip bodies), `drive_state.rs`
   (per-drive emulated NVRAM), `fastcdc.rs` (content-defined chunking),
   `encryption.rs` (LTO Application-Managed Encryption — AES-256-GCM),
   `disk_cache.rs` (refcount-aware eviction + `PoolBudget`),
   `chunk_store.rs` (re-export shell on `shared_pool::ChunkPool`),
-  `errors.rs` (`VtlError` + `From<CloudError>` / `From<IscsiError>` /
+  `errors.rs` (`VtlError` + `From<ObjectStoreError>` / `From<IscsiError>` /
   `From<ChunkPoolError>` bridges), `legal_hold.rs` (cartridge sentinel
   `manifests/<barcode>/manifest-latest.json`, key collection,
   apply-cartridge / read-status), `drive_topology.rs` (the
@@ -369,7 +369,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `shared_iscsi::transport::run` against `VtlTapeHandler`
   (`iscsi/handler.rs`) — the trait impl wraps the SSC-4 / SMC-3 / SPC-4
   dispatch tree (`iscsi/protocol.rs::handle_scsi_command` + the
-  per-opcode `handle_*` arms) and threads the cloud-prefetch / SEND
+  per-opcode `handle_*` arms) and threads the storage-prefetch / SEND
   DIAGNOSTIC self-test / MOVE MEDIUM legal-hold hooks around it.
   `iscsi/server.rs` constructs the handler from `DaemonState` and
   builds a `VtlLoginAudit` adapter bridging shared-iscsi login events
@@ -382,7 +382,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   in-process smoke tests and exits. Admin socket at
   `/run/thurvtl/admin.sock` — `admin/mod.rs` builds the product router,
   merges `jobs_router` (dispatch in `admin/job_dispatch/*.rs`: gc /
-  verify / stats / cloud_check / self_test / audit / archive /
+  verify / stats / cloud_check (job kind in code; CLI verb is `system storage check`) / self_test / audit / archive /
   restore_archive / migrate / alerting) and the alerting route, and
   hands off to `run_admin_server`.
 - **vtl-cli** (binary `thurvtl`) — top-level subcommands `library`,
@@ -427,11 +427,11 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   is atomic, idempotent on hash collision; `object_key` drops the
   per-backend prefix but keeps the volume namespace.
 - `core-block::uploader::VolumeWriter` — per-volume page write
-  primitive. `open(data_dir, name, Arc<dyn CloudBackend>)` bundles
+  primitive. `open(data_dir, name, Arc<dyn ObjectStoreBackend>)` bundles
   `VolumeManifest` + `PageIndex` + `ChunkPool`. `write_page(page_id,
-  &[u8])` runs BLAKE3 hash → pool insert → cloud `upload_chunk`
+  &[u8])` runs BLAKE3 hash → pool insert → backend `upload_chunk`
   (HEAD-skipped on `Global` dedup hits) → page index `set`.
-  `read_page(page_id)` is pool-first / cloud-fallback. Synchronous
+  `read_page(page_id)` is pool-first / backend-fallback. Synchronous
   per-call upload at this layer.
 - `core-block::cache::PageCache` — per-volume in-memory write-back
   cache fronting `VolumeWriter`. Byte-grained API (`read_bytes` /
@@ -445,7 +445,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   and a 5 s tick, drains the dirty set, exits when `request_shutdown`
   is set. SYNCHRONIZE CACHE is a real fence (await flush of every dirty
   page in the LBA range). Concurrency: single `tokio::sync::Mutex` over
-  cache state; load and flush paths drop the lock during the cloud
+  cache state; load and flush paths drop the lock during the backend
   await. Dirty pages carry a monotonic version counter so a flush
   racing a host rewrite leaves the entry dirty for the next pass.
 - Other modules: `disk_cache.rs`, `lru_index.rs`, `upload_index.rs`.
@@ -520,7 +520,7 @@ LBA / transfer length is supported via RMW. WORM volumes refuse WRITE /
 CAW / UNMAP with WRITE PROTECTED (sense key 0x07, ASC/ASCQ 0x27/0x00).
 Unallocated pages on READ surface as zeroed sector content (sparse
 holes). SYNCHRONIZE CACHE is a real fence —
-`cache.synchronize_bytes` awaits cloud-ack of every dirty page in the
+`cache.synchronize_bytes` awaits storage-backend ack of every dirty page in the
 LBA range; out-of-range sync gets ILLEGAL REQUEST.
 
 COMPARE AND WRITE (0x89) routes through `cache.compare_and_write_bytes`:
@@ -560,11 +560,11 @@ Modules:
 ### thurvsad boot wiring
 
 `config.rs` reads `/etc/thurvsa/thurvsa.yaml` (`--config PATH`
-overrides) into `DaemonConfig { data_dir, cloud:
-shared_cloud::CloudConfig }` and validates the cloud section.
+overrides) into `DaemonConfig { data_dir, storage:
+shared_object_store::ObjectStoreConfig }` and validates the storage section.
 `discovery.rs` walks `<data_dir>/volumes/` via `VolumeManifest::list`,
 sorts by name (deterministic LUN map across restarts), instantiates one
-`Arc<dyn CloudBackend>` per unique `manifest.backend`, opens a
+`Arc<dyn ObjectStoreBackend>` per unique `manifest.backend`, opens a
 `VolumeWriter` per volume, and returns a populated `VolumeRegistry`.
 Volumes referencing an undefined backend are a hard fail. `main.rs`
 parses the CLI, loads the config, opens the `shared_audit::AuditLog`,
@@ -592,7 +592,7 @@ router over a hyper-served `tokio::net::UnixListener` and `PeerCred`
 SO_PEERCRED plumbing as VTL. Routes: `GET /api/v1/health`, `GET
 /api/v1/volumes`, `GET /api/v1/volumes/{name}`, `POST /api/v1/volumes`
 (live create — writes the manifest, instantiates / reuses a cached
-`Arc<dyn CloudBackend>`, opens a `VolumeWriter`, picks the next free
+`Arc<dyn ObjectStoreBackend>`, opens a `VolumeWriter`, picks the next free
 LUN via `VolumeRegistry::next_free_lun`, registers — the SCSI
 dispatcher sees the new LUN on its next command without a restart),
 `DELETE /api/v1/volumes/{name}` (live destroy — unregisters and removes

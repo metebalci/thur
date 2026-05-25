@@ -4,16 +4,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL End-to-End Backup Workflow Test (cloud)
+# Thur VTL End-to-End Backup Workflow Test (storage backend)
 #
 # Same shape as test-backup-workflow.sh, but instead of pointing at the
 # `local` backend, this borrows a backend definition from
 # /etc/thurvtl/thurvtl.yaml so the upload pipeline, HEAD-then-PUT
 # dedup, manifest backup, and refetch-on-eviction paths actually fire
-# against real cloud.
+# against a real storage backend.
 #
 # Selection: set THURVTL_TEST_BACKEND to the name of an entry under
-# `cloud.backends:` in /etc/thurvtl/thurvtl.yaml. The script copies
+# `storage.backends:` in /etc/thurvtl/thurvtl.yaml. The script copies
 # that entry verbatim into the test config and appends a per-run
 # sub-prefix so test data is isolated and trivially purgeable.
 #
@@ -22,30 +22,30 @@
 #   - Backend `retention_mode != none` (test cleanup can't delete locked objects)
 #
 # Cleanup: always purges the test sub-prefix from the bucket on exit
-# (even on failure), unless --keep-cloud is passed.
+# (even on failure), unless --keep-storage is passed.
 #
 # Stress / scale runs: bump the fixture via THURVTL_FIXTURE_MB (env,
 # MiB per cartridge, default 8). The chunk-count and dedup assertions
 # scale with the fixture; the manifest-backup wait window grows with
-# it. Cloud round-trips dominate runtime — bigger fixture = longer
+# it. Storage round-trips dominate runtime — bigger fixture = longer
 # test = real egress $$$. Run the larger sizes opt-in.
 #   THURVTL_TEST_BACKEND=primary THURVTL_FIXTURE_MB=512 ./vtl/scripts/test-backup-storage.sh
 #
 # Prerequisites:
 #   - mtx, mt-st, open-iscsi, tar, lsscsi, curl   (same as test-backup-workflow.sh)
 #   - yq                                            (yaml extraction)
-#   - The cloud CLI matching the backend type:
+#   - The backend CLI matching the backend type:
 #       s3    -> aws       (sudo apt-get install awscli  OR  pip install awscli)
 #       gcs   -> gcloud    (https://cloud.google.com/sdk)
 #       azure -> az        (https://learn.microsoft.com/cli/azure/install-azure-cli)
-#   - Cloud credentials in env (same chain the daemon uses).
+#   - Storage credentials in env (same chain the daemon uses).
 #   - Root/sudo (iSCSI + /dev/stN).
 #
 # Usage (invoke from repo root):
 #   THURVTL_TEST_BACKEND=primary ./vtl/scripts/test-backup-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
-# cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
+# storage credentials into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
 # AISTOR_*) and your backend entry in `$REPO/private/storage-backends.yaml`.
 # The script auto-sources thur.env at startup and defaults
@@ -54,7 +54,7 @@
 # read happens out of the repo, every write under /tmp.
 #
 # NOTE on sudo: do NOT prefix with sudo — the script self-elevates
-# via `sudo KEY=VAL ... "$0"`, forwarding the cloud-relevant env
+# via `sudo KEY=VAL ... "$0"`, forwarding the backend-relevant env
 # vars one by one (sudo-rs on Ubuntu 26.04+ silently ignores `-E`
 # regardless of the SETENV sudoers tag, so explicit pass-through is
 # the only portable path). If you must run as root directly, set the
@@ -66,13 +66,13 @@
 #   --cli-path PATH       Path to thurvtl binary
 #   --keep-data           Don't clean up local test data directory
 #   --keep-iscsi          Don't disconnect iSCSI session after tests
-#   --keep-cloud          Don't purge the test sub-prefix from the bucket
+#   --keep-storage          Don't purge the test sub-prefix from the bucket
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Auto-load maintainer-private cloud credentials if the file exists.
+# Auto-load maintainer-private storage credentials if the file exists.
 # `set -a` auto-exports every KEY=VAL so the subsequent `sudo -E`
 # carries them across; `set +a` restores normal scoping. Skipped on
 # packaged installs (no private/ dir) — operators put credentials in
@@ -86,7 +86,7 @@ if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set +a
 fi
 
-# Self-elevate via sudo, forwarding the cloud-relevant env vars as
+# Self-elevate via sudo, forwarding the backend-relevant env vars as
 # explicit `KEY=VAL` pairs. `sudo -E` looks tempting but is silently
 # ignored on sudo-rs (Ubuntu 26.04+) regardless of the SETENV tag
 # in sudoers; explicit forwarding is the only portable path. Pattern-
@@ -202,7 +202,7 @@ HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
 KEEP_DATA=0
 KEEP_ISCSI=0
-KEEP_CLOUD=0
+KEEP_STORAGE=0
 DAEMON_PID=""
 ISCSI_CONNECTED=0
 CHANGER_DEVICE=""
@@ -227,7 +227,7 @@ while [[ $# -gt 0 ]]; do
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
         --keep-iscsi) KEEP_ISCSI=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
         --http-port) HTTP_PORT="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -239,9 +239,9 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
 # ---------------------------------------------------------------------------
-# Storage helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
-# cloud_wait_for_key / verify_cloud_creds / cloud_purge_test_prefix /
-# cloud_cli_for_type). Lifted in 2026-05-13.
+# Storage helpers are sourced from scripts/lib/test-helpers.sh (storage_list /
+# storage_wait_for_key / verify_storage_creds / storage_purge_test_prefix /
+# storage_cli_for_type). Lifted in 2026-05-13.
 # ---------------------------------------------------------------------------
 
 cleanup() {
@@ -260,11 +260,11 @@ cleanup() {
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
 
-    if [[ $KEEP_CLOUD -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
-        log_info "Purging cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
-        cloud_purge_test_prefix
-    elif [[ $KEEP_CLOUD -eq 1 && -n "$TEST_PREFIX" ]]; then
-        log_warn "Keeping cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+    if [[ $KEEP_STORAGE -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
+        log_info "Purging storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+        storage_purge_test_prefix
+    elif [[ $KEEP_STORAGE -eq 1 && -n "$TEST_PREFIX" ]]; then
+        log_warn "Keeping storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -317,7 +317,7 @@ resolve_backend() {
     ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
     # If the backend has `auth: { type: env, ... }` carrying explicit
     # env-var names for the access key / secret, capture them so the
-    # cred probe (verify_cloud_creds) can target the same credentials
+    # cred probe (verify_storage_creds) can target the same credentials
     # the daemon will use. Otherwise the probe falls back to whatever
     # AWS_* are already in the environment, which on a multi-S3-flavored
     # setup (real AWS + MinIO + AIStor) means the probe accidentally
@@ -402,7 +402,7 @@ check_prerequisites() {
         fi
     done
 
-    local cli; cli=$(cloud_cli_for_type)
+    local cli; cli=$(storage_cli_for_type)
     if [[ -n "$cli" ]] && ! command -v "$cli" >/dev/null 2>&1; then
         missing+=("$cli")
         case "$cli" in
@@ -431,7 +431,7 @@ check_prerequisites() {
 }
 
 create_test_config() {
-    log_info "Creating test configuration (cloud backend cloned from $SOURCE_BACKENDS)..."
+    log_info "Creating test configuration (storage backend cloned from $SOURCE_BACKENDS)..."
     # `library init` refuses to create data_dir itself (operator
     # responsibility on a packaged install — chowned to the daemon
     # user). Pre-create here so the daemon-down init succeeds.
@@ -449,7 +449,7 @@ create_test_config() {
     # boxes; the production 5 GB free-floor default would block every
     # chunk-seal that calls try_reserve, surfacing as SCSI NOT READY
     # 04/07 on the host (which then fails tar -cf with I/O error and
-    # looks like a data-path bug). The `cloud.backends:` block embeds
+    # looks like a data-path bug). The `storage.backends:` block embeds
     # one backend extracted from the operator's $SOURCE_BACKENDS file
     # with its prefix overridden to $TEST_PREFIX.
     mkdir -p "$TEST_DIR/data"
@@ -622,19 +622,19 @@ test_unload_first_tape() {
     mtx -f "$CHANGER_DEVICE" status 2>&1 | grep -q "Data Transfer Element 0:Empty" || return 1
 }
 
-test_chunks_uploaded_to_cloud() {
+test_chunks_uploaded_to_storage() {
     log_info "Waiting for upload pipeline to drain (manifest backup is the tail signal, up to ${MANIFEST_WAIT_SECS}s)..."
-    if ! cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" "$MANIFEST_WAIT_SECS"; then
-        log_error "Manifest backup for TAPE01L8 never appeared in cloud"
+    if ! storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" "$MANIFEST_WAIT_SECS"; then
+        log_error "Manifest backup for TAPE01L8 never appeared in the backend"
         return 1
     fi
     local chunk_count
-    chunk_count=$(cloud_list "chunks/" | wc -l)
+    chunk_count=$(storage_list "chunks/" | wc -l)
     if (( chunk_count < MIN_CHUNKS_EXPECTED )); then
         log_error "Only $chunk_count chunk object(s) under ${TEST_PREFIX}chunks/ — expected >= $MIN_CHUNKS_EXPECTED for ${FIXTURE_MB} MiB fixture"
         return 1
     fi
-    log_info "Cloud has $chunk_count chunk object(s) under test prefix (fixture: ${FIXTURE_MB} MiB, expected >= ${MIN_CHUNKS_EXPECTED})"
+    log_info "Storage has $chunk_count chunk object(s) under test prefix (fixture: ${FIXTURE_MB} MiB, expected >= ${MIN_CHUNKS_EXPECTED})"
 }
 
 test_load_second_tape_same_data() {
@@ -654,8 +654,8 @@ test_write_second_tape_same_fixture() {
 test_dedup_across_cartridges() {
     mtx -f "$CHANGER_DEVICE" unload 2 0 >/dev/null 2>&1 || return 1
     log_info "Waiting for second cartridge's manifest backup..."
-    if ! cloud_wait_for_key "manifests/TAPE02L8/manifest-latest.json" "$MANIFEST_WAIT_SECS"; then
-        log_error "Manifest backup for TAPE02L8 never appeared in cloud"
+    if ! storage_wait_for_key "manifests/TAPE02L8/manifest-latest.json" "$MANIFEST_WAIT_SECS"; then
+        log_error "Manifest backup for TAPE02L8 never appeared in the backend"
         return 1
     fi
 
@@ -666,8 +666,8 @@ test_dedup_across_cartridges() {
     # chunks landed.
     if [[ "$FIXTURE_DEDUP" != "1" ]]; then
         local t1_chunks t2_chunks
-        t1_chunks=$(cloud_list "chunks/TAPE01L8/" | wc -l)
-        t2_chunks=$(cloud_list "chunks/TAPE02L8/" | wc -l)
+        t1_chunks=$(storage_list "chunks/TAPE01L8/" | wc -l)
+        t2_chunks=$(storage_list "chunks/TAPE02L8/" | wc -l)
         log_info "Dedup disabled — TAPE01L8 chunks: $t1_chunks, TAPE02L8 chunks: $t2_chunks (no sharing expected)"
         if (( t1_chunks == 0 || t2_chunks == 0 )); then
             log_error "One or both per-cartridge chunk namespaces are empty under dedup-off"
@@ -683,14 +683,14 @@ test_dedup_across_cartridges() {
     # `DEDUP_NEW_CHUNKS_FLOOR` (boundary effects dominate at small
     # fixtures; the percentage tightens as the fixture grows).
     local total_chunks first_tape_chunks new_chunks ceiling
-    total_chunks=$(cloud_list "chunks/" | wc -l)
+    total_chunks=$(storage_list "chunks/" | wc -l)
     first_tape_chunks=$(yq -r '.chunks | length' "$TEST_DIR/data/tapes/TAPE01L8/manifest.json")
     new_chunks=$((total_chunks - first_tape_chunks))
     ceiling=$(( first_tape_chunks * DEDUP_NEW_CHUNKS_MAX_PCT / 100 ))
     if (( ceiling < DEDUP_NEW_CHUNKS_FLOOR )); then
         ceiling=$DEDUP_NEW_CHUNKS_FLOOR
     fi
-    log_info "First-tape chunks: $first_tape_chunks   Total cloud chunks: $total_chunks   New from tape 2: $new_chunks (ceiling $ceiling)"
+    log_info "First-tape chunks: $first_tape_chunks   Total storage chunks: $total_chunks   New from tape 2: $new_chunks (ceiling $ceiling)"
     if (( new_chunks > ceiling )); then
         log_error "Cross-cartridge dedup weak: tape 2 added $new_chunks net new chunks (ceiling $ceiling = max(${DEDUP_NEW_CHUNKS_MAX_PCT}% of $first_tape_chunks, $DEDUP_NEW_CHUNKS_FLOOR))"
         return 1
@@ -742,7 +742,7 @@ test_refetch_after_local_wipe() {
 
     # Time the extract and report effective throughput. Useful at any
     # fixture size; essential when bumping THURVTL_FIXTURE_MB to
-    # spot regressions in the cloud-prefetch path.
+    # spot regressions in the storage-prefetch path.
     local t0 t1 elapsed bytes mb_per_s
     t0=$(date +%s)
     tar -C "$out" -xf "$NOREWIND_DEVICE" || return 1
@@ -758,7 +758,7 @@ test_refetch_after_local_wipe() {
 
 main() {
     echo "================================================"
-    echo "Thur VTL End-to-End Backup Workflow Test (cloud)"
+    echo "Thur VTL End-to-End Backup Workflow Test (storage backend)"
     echo "================================================"
     echo "Fixture: ${FIXTURE_MB} MiB per cartridge   Min chunks expected: ${MIN_CHUNKS_EXPECTED}"
     echo "Chunking: ${FIXTURE_CHUNKING} (${FIXTURE_CHUNK_SIZE_MB} MiB)"
@@ -767,12 +767,12 @@ main() {
 
     resolve_backend
     check_prerequisites
-    verify_cloud_creds || {
+    verify_storage_creds || {
         echo ""
-        echo "Common cause: cloud creds aren't in this shell's env."
+        echo "Common cause: storage credentials aren't in this shell's env."
         echo "Set them in your user shell, then run (without sudo prefix):"
         echo "  THURVTL_TEST_BACKEND=$THURVTL_TEST_BACKEND $0 $*"
-        echo "(the script self-elevates via 'sudo KEY=VAL ... \$0' and forwards cloud-prefix env vars)"
+        echo "(the script self-elevates via 'sudo KEY=VAL ... \$0' and forwards backend-credential env vars)"
         exit 1
     }
     assign_ports
@@ -782,21 +782,21 @@ main() {
     connect_iscsi
 
     echo ""
-    echo "Running cloud-backed backup-workflow tests..."
+    echo "Running storage-backed backup-workflow tests..."
     echo "---------------------------------------------"
     echo ""
 
     run_test "load tape 1 from slot 1 to drive 0"     test_load_first_tape
     run_test "tar archive fixture to tape 1"          test_write_first_tape
     run_test "unload tape 1"                          test_unload_first_tape
-    run_test "chunks + manifest landed in cloud"      test_chunks_uploaded_to_cloud
+    run_test "chunks + manifest landed in storage"    test_chunks_uploaded_to_storage
     run_test "load tape 2"                            test_load_second_tape_same_data
     run_test "tar archive same fixture to tape 2"     test_write_second_tape_same_fixture
     run_test "dedup observed across cartridges"       test_dedup_across_cartridges
     run_test "swap back to tape 1"                    test_swap_back_to_first_tape
     run_test "tar -t lists tape 1 contents"           test_read_first_tape_lists_match
     run_test "tar -x tape 1 matches fixture"          test_extract_first_tape_matches_byte_for_byte
-    run_test "refetch from cloud after local wipe"    test_refetch_after_local_wipe
+    run_test "refetch from storage after local wipe"  test_refetch_after_local_wipe
 
     echo "================================================"
     echo "Test Summary"
@@ -809,7 +809,7 @@ main() {
     echo ""
 
     if [[ $FAILED -eq 0 ]]; then
-        log_pass "All cloud-backed backup-workflow tests passed"
+        log_pass "All storage-backed backup-workflow tests passed"
         exit 0
     else
         log_fail "$FAILED test(s) failed"
@@ -817,7 +817,7 @@ main() {
         echo "Debug:"
         echo "  - Daemon log: ${TEST_DIR}/daemon.log"
         echo "  - Test data:  ${TEST_DIR}"
-        echo "  - Cloud:      ${BACKEND_BUCKET}${BACKEND_CONTAINER}/${TEST_PREFIX}"
+        echo "  - Storage:    ${BACKEND_BUCKET}${BACKEND_CONTAINER}/${TEST_PREFIX}"
         exit 1
     fi
 }

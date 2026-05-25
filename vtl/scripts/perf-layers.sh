@@ -13,7 +13,7 @@
 #   L1 in-process       : Cartridge::write_data -> local pool. No
 #                         iSCSI, no daemon.
 #                         -> core/smc/examples/perf_write
-#   L2 in-process+cloud : same as L1, sealed chunks uploaded inline
+#   L2 in-process+storage : same as L1, sealed chunks uploaded inline
 #                         against the configured backend.
 #                         -> core/smc/examples/perf_cart_cloud
 #   L3 iscsi-tar        : daemon + iSCSI + library init + cartridge
@@ -34,8 +34,8 @@
 #                   examples' compressible mode)
 #
 # Default backend is `local-test` (auto-created at
-# $TEST_DIR/local-cloud); override with THURVTL_PERF_BACKEND=<name>
-# pointing at an entry in $REPO/private/cloud-backends.json (or
+# $TEST_DIR/local-storage); override with THURVTL_PERF_BACKEND=<name>
+# pointing at an entry in $REPO/private/storage-backends.json (or
 # THURVTL_SOURCE_BACKENDS).
 #
 # Usage (invoke from repo root):
@@ -49,7 +49,7 @@
 #   --only ROW            Run a single row (1..3); omit to run all three
 #   --total-mb N          Override fixture size (default: 1024)
 #   --keep-data           Don't clean up test data dirs
-#   --keep-cloud          Don't purge cloud test prefixes (remote only)
+#   --keep-storage          Don't purge storage test prefixes (remote only)
 #
 
 SCRIPT_DIR_RAW="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,8 +85,8 @@ CLI_PATH=""
 ONLY_ROW=""
 TOTAL_MB=1024
 KEEP_DATA=0
-KEEP_CLOUD=0
-SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.json}"
+KEEP_STORAGE=0
+SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.json}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -96,7 +96,7 @@ while [[ $# -gt 0 ]]; do
         --only) ONLY_ROW="$2"; shift 2 ;;
         --total-mb) TOTAL_MB="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -123,8 +123,8 @@ mkdir -p "$PERF_BASE_DIR"
 if [[ -n "$SUDO_USER" ]]; then
     chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$PERF_BASE_DIR"
 fi
-LOCAL_CLOUD_DIR="$PERF_BASE_DIR/local-cloud"
-mkdir -p "$LOCAL_CLOUD_DIR"
+LOCAL_STORAGE_DIR="$PERF_BASE_DIR/local-storage"
+mkdir -p "$LOCAL_STORAGE_DIR"
 PERF_BACKENDS_FILE="$PERF_BASE_DIR/perf-backends.json"
 FIXTURE_RANDOM="$PERF_BASE_DIR/perf-random-${TOTAL_MB}m.bin"
 FIXTURE_COMPRESSIBLE="$PERF_BASE_DIR/perf-compressible-${TOTAL_MB}m.bin"
@@ -146,11 +146,11 @@ if [[ "$PERF_BACKEND_NAME" == "local-test" ]]; then
 {
   "version": 1,
   "backends": {
-    "local-test": { "type": "local", "root_dir": "$LOCAL_CLOUD_DIR" }
+    "local-test": { "type": "local", "root_dir": "$LOCAL_STORAGE_DIR" }
   }
 }
 EOFJ
-    log_info "VTL perf-layers backend = local-test (self-managed at $LOCAL_CLOUD_DIR)"
+    log_info "VTL perf-layers backend = local-test (self-managed at $LOCAL_STORAGE_DIR)"
 else
     if [[ ! -r "$SOURCE_BACKENDS" ]]; then
         log_error "THURVTL_PERF_BACKEND=$PERF_BACKEND_NAME but SOURCE_BACKENDS=$SOURCE_BACKENDS unreadable"
@@ -180,7 +180,7 @@ else
         log_error "backend '$PERF_BACKEND_NAME' has retention_mode=$RETENTION; perf-layers refuses (purge would fail)"
         exit 1
     fi
-    verify_cloud_creds || exit 1
+    verify_storage_creds || exit 1
     log_info "VTL perf-layers backend = $PERF_BACKEND_NAME (type=$BACKEND_TYPE bucket=${BACKEND_BUCKET}${BACKEND_CONTAINER})"
 fi
 
@@ -238,8 +238,8 @@ row_dir_cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
         ISCSI_CONNECTED=0
     fi
-    if [[ $KEEP_CLOUD -eq 0 && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then
-        cloud_purge_test_prefix
+    if [[ $KEEP_STORAGE -eq 0 && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then
+        storage_purge_test_prefix
     fi
     if [[ $KEEP_DATA -eq 0 && -n "$TEST_DIR" && -d "$TEST_DIR" ]]; then
         rm -rf "$TEST_DIR"
@@ -336,7 +336,7 @@ wait_for_chunks() {
         return 1
     fi
     while (( elapsed < timeout )); do
-        local count; count=$(cloud_list "" | grep -cv 'manifests/' || true)
+        local count; count=$(storage_list "" | grep -cv 'manifests/' || true)
         if (( count > 0 )); then
             return 0
         fi
@@ -406,7 +406,7 @@ run_l1() {
 
 run_l2() {
     for fixture in random compressible; do
-        log_test "L2 in-process+cloud ($fixture, backend=$PERF_BACKEND_NAME)"
+        log_test "L2 in-process+storage ($fixture, backend=$PERF_BACKEND_NAME)"
         local tmp; tmp=$(mktemp -d "$PERF_BASE_DIR/l2-${fixture}-XXXX")
         local t0 t1 t2
         t0=$(date +%s%N)
@@ -419,7 +419,7 @@ run_l2() {
             continue
         }
         t1=$(date +%s%N); t2=$t1
-        perf_summary 2 in-process+cloud "$fixture" "$FIXTURE_BYTES" "$t0" "$t1" "$t2"
+        perf_summary 2 in-process+storage "$fixture" "$FIXTURE_BYTES" "$t0" "$t1" "$t2"
         [[ $KEEP_DATA -eq 0 ]] && rm -rf "$tmp"
     done
 }
@@ -465,7 +465,7 @@ run_row_if_selected() {
 }
 
 run_row_if_selected 1 in-process       run_l1
-run_row_if_selected 2 in-process+cloud run_l2
+run_row_if_selected 2 in-process+storage run_l2
 run_row_if_selected 3 iscsi-tar        run_l3
 
 echo ""

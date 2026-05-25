@@ -42,7 +42,7 @@
 #   - Persistence across daemon restarts via the PageCache flush +
 #     SYNC fence (Flush on NVMe is the analog of SCSI SYNCHRONIZE
 #     CACHE; both route to `PageCache::synchronize_bytes`).
-#   - Cloud-pool growth: each `tar xf` produces real content-addressed
+#   - Storage-pool growth: each `tar xf` produces real content-addressed
 #     uploads to the local backend.
 #
 # Prerequisites:

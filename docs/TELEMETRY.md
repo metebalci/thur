@@ -107,7 +107,7 @@ coherent area of the daemon and the files that instrument it:
 | Subsystem | What you're watching | Source files |
 |---|---|---|
 | `pool` | Disk-cache budget, eviction pressure, backpressure waits | `chunk_store.rs`, `disk_cache.rs` |
-| `cloud` | Per-backend request rates, latencies, error classes | `s3.rs` / `gcs.rs` / `azure.rs` / `local.rs` via `object_store_backend.rs` |
+| `storage` | Per-backend request rates, latencies, error classes | `s3.rs` / `gcs.rs` / `azure.rs` / `local.rs` via `object_store_backend.rs` |
 | `chunk` | Seal rate, dedup hit rate (local + storage-side via HEAD), upload bytes | `cartridge.rs`, upload worker in daemon |
 | `iscsi` | Active sessions, per-opcode throughput, data-in/out bytes | `vtl/daemon/src/iscsi/*` |
 | `tape` | Per-cartridge memory-buffer occupancy | `memory_buffer_manager.rs` |
@@ -128,8 +128,8 @@ operator actually cares about. Substitute the product prefix as needed
   saves relative to the host's logical write volume — the bytes the
   host thinks it wrote, over the unique bytes that actually had to be
   stored.
-- **Storage upload-skip rate** = `thurvtl_chunk_cloud_head_hits_total /
-  thurvtl_chunk_cloud_head_probes_total`. Before uploading a chunk the
+- **Storage upload-skip rate** = `thurvtl_chunk_storage_head_hits_total /
+  thurvtl_chunk_storage_head_probes_total`. Before uploading a chunk the
   daemon issues a HEAD request; if the object is already in the bucket
   the PUT is skipped. This ratio is that storage-side dedup signal — how
   often a HEAD said "already there."
@@ -158,7 +158,7 @@ so existing dashboards keep working unchanged.
 The point of the examples below is that each one maps to a concrete
 operator action — an alert you cannot act on is just noise. They use
 the `thurvtl_*` prefix; swap in `thurvsa_*` for the block product,
-since the `pool`, `cloud`, and `audit` instrument bodies exist on both.
+since the `pool`, `storage`, and `audit` instrument bodies exist on both.
 
 ```promql
 # Pool consistently > 90% full — operator should raise
@@ -173,7 +173,7 @@ rate(thurvtl_pool_backpressure_waits_total[5m]) > 0
 # Permanent storage-backend errors (Auth / Authz / NotFound / RegionMismatch) —
 # the retry layer already short-circuits these, so any non-zero rate
 # means broken credentials or config drift.
-rate(thurvtl_cloud_permanent_errors_total[5m]) > 0
+rate(thurvtl_storage_permanent_errors_total[5m]) > 0
 ```
 
 ## A note on the Prometheus exporter crate

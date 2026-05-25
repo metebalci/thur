@@ -255,7 +255,7 @@ A few loose ends remain:
   picks a conffile entry. The cheapest way to validate this matrix
   against running infrastructure is to add per-provider smoke targets —
   one entry per provider in a development `thurvtl.yaml` — and run the
-  existing backup-cloud cases against each.
+  existing backup-storage cases against each.
 - The `s3` backend already handles the AWS, MinIO, and Wasabi endpoint
   overrides, and the other providers should slot in with `endpoint_url`
   alone. Confirm each provider's SigV4 region-string quirks during the

@@ -234,11 +234,11 @@ storage:
   backends:
     primary:
       type: local
-      root_dir: "$TEST_DIR/cloud-primary"
+      root_dir: "$TEST_DIR/storage-primary"
 
 EOFCONFIG
 
-    mkdir -p "$TEST_DIR/cloud-primary"
+    mkdir -p "$TEST_DIR/storage-primary"
 }
 
 free_port() {

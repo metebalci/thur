@@ -9,16 +9,16 @@
 # Sibling of vtl/scripts/test-pipeline-layers.sh. Five required runs
 # (no DCE row — SBC-3 has no drive-side compression analog):
 #
-#   1. baseline   : dedup local,  encrypt off, cloud none
-#   2. + dedup    : dedup global, encrypt off, cloud none
+#   1. baseline   : dedup local,  encrypt off, storage zstd off
+#   2. + dedup    : dedup global, encrypt off, storage zstd off
 #                   -> two volumes, same fixture; second adds little
-#                      cloud byte volume (cross-volume dedup hit).
-#   3. + encrypt  : dedup local,  encrypt on,  cloud none
+#                      storage byte volume (cross-volume dedup hit).
+#   3. + encrypt  : dedup local,  encrypt on,  storage zstd off
 #                   -> at-rest AES-256-GCM via the default `local`
-#                      keystore backend; cloud chunk bytes are
+#                      keystore backend; storage chunk bytes are
 #                      ciphertext.
-#   4. + cloud zstd: dedup local, encrypt off, cloud zstd
-#                   -> compressible fixture; cloud bytes < 80% of input.
+#   4. + storage zstd: dedup local, encrypt off, storage zstd on
+#                   -> compressible fixture; storage bytes < 80% of input.
 #   5. + key-migrate: daemon-down `volume key migrate` flow using
 #                     two local backends (local + local-bak).
 #
@@ -27,7 +27,7 @@
 # as test-iscsi-fs-storage.sh: pick a backend by name from a source
 # JSON file (operator-local `private/keystore-backends.json`) and
 # splice into `keystore.backends:` of the YAML test config. Out of
-# scope here so the matrix run stays focused on the cloud /
+# scope here so the matrix run stays focused on the storage /
 # pipeline layers.
 #
 # Defaults to aistor-none for LAN iteration. Same cred-handling
@@ -42,7 +42,7 @@
 #   --cli-path PATH       Path to thurvsa binary
 #   --only ROW            Run a single row (1..5)
 #   --keep-data           Don't clean up test data dirs
-#   --keep-cloud          Don't purge cloud test prefixes
+#   --keep-storage          Don't purge storage test prefixes
 #
 
 SCRIPT_DIR_RAW="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +77,7 @@ DAEMON_PATH=""
 CLI_PATH=""
 ONLY_ROW=""
 KEEP_DATA=0
-KEEP_CLOUD=0
+KEEP_STORAGE=0
 SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 
 while [[ $# -gt 0 ]]; do
@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --only) ONLY_ROW="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -107,7 +107,7 @@ if [[ ! -r "$SOURCE_BACKENDS" ]]; then
 fi
 
 # Backends config is YAML under `storage.backends.<name>` (mirrors what
-# every other cloud-backed VSA suite reads). yq is needed at the same
+# every other storage-backed VSA suite reads). yq is needed at the same
 # version contract as test-iscsi-fs-storage.sh.
 BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
 BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
@@ -127,7 +127,7 @@ RETENTION=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".retention_mode //
 ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
 
 if [[ "$BACKEND_TYPE" == "local" ]]; then
-    log_error "matrix needs a real cloud backend; '$THURVSA_TEST_BACKEND' is type=local"
+    log_error "matrix needs a real storage backend; '$THURVSA_TEST_BACKEND' is type=local"
     exit 1
 fi
 if [[ "$RETENTION" != "none" ]]; then
@@ -180,8 +180,8 @@ row_dir_cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
         ISCSI_CONNECTED=0
     fi
-    if [[ $KEEP_CLOUD -eq 0 ]]; then
-        cloud_purge_test_prefix
+    if [[ $KEEP_STORAGE -eq 0 ]]; then
+        storage_purge_test_prefix
     fi
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
@@ -192,7 +192,7 @@ row_dir_cleanup() {
 }
 
 make_config() {
-    local cloud_compress="$1"
+    local storage_compress="$1"
     # Optional second keystore entry passed by the migrate row when it
     # needs `local-bak` alongside the default `local`.
     local extra_keystore_line="${2:-}"
@@ -211,7 +211,7 @@ disk_cache:
   disk_free_min_gb: 0
 storage:
   compression:
-    algorithm: $cloud_compress
+    algorithm: $storage_compress
   backends:
     testbackend: $backend_json
 keystore:
@@ -289,8 +289,8 @@ write_fixture() {
     log_info "fixture: $FIXTURE_BYTES bytes (1 GiB compressible)"
 }
 
-# Sum the bytes of every object under our cloud test prefix.
-total_cloud_bytes() {
+# Sum the bytes of every object under our storage test prefix.
+total_storage_bytes() {
     local subpath="${1:-}"
     local full="${TEST_PREFIX}${subpath}"
     case "$BACKEND_TYPE" in
@@ -326,7 +326,7 @@ total_cloud_bytes() {
 
 download_first_chunk() {
     local out="$1"
-    local key; key=$(cloud_list "" | grep -v 'manifests/' | head -1)
+    local key; key=$(storage_list "" | grep -v 'manifests/' | head -1)
     [[ -z "$key" ]] && return 1
     case "$BACKEND_TYPE" in
         s3)
@@ -360,7 +360,7 @@ wait_for_chunks() {
     local timeout="${1:-90}"
     local elapsed=0
     while (( elapsed < timeout )); do
-        local count; count=$(cloud_list "" | grep -cv 'manifests/' || true)
+        local count; count=$(storage_list "" | grep -cv 'manifests/' || true)
         if (( count > 0 )); then
             return 0
         fi
@@ -371,8 +371,8 @@ wait_for_chunks() {
 }
 
 row_bring_up() {
-    local cloud_compress="$1"
-    make_config "$cloud_compress" || return 1
+    local storage_compress="$1"
+    make_config "$storage_compress" || return 1
     start_daemon || return 1
 }
 
@@ -382,7 +382,7 @@ row_bring_up() {
 # matching test-iscsi-fs-storage.sh's full Phase C is overkill for the
 # matrix.
 row_baseline() {
-    log_test "row 1: baseline (dedup=local, encrypt=off, cloud=none)"
+    log_test "row 1: baseline (dedup=local, encrypt=off, storage=none)"
     row_dir_setup 1
     row_bring_up "none" || { row_dir_cleanup; return 1; }
     create_volume "v1" "local" "no" || { row_dir_cleanup; return 1; }
@@ -391,16 +391,16 @@ row_baseline() {
     t0=$(date +%s%N)
     write_fixture || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    wait_for_chunks 600 || { log_error "row 1: no chunks landed in cloud"; row_dir_cleanup; return 1; }
+    wait_for_chunks 600 || { log_error "row 1: no chunks landed in storage"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local cb; cb=$(total_cloud_bytes)
-    log_info "row 1: cloud bytes after write = $cb"
+    local cb; cb=$(total_storage_bytes)
+    log_info "row 1: storage bytes after write = $cb"
     perf_summary 1 baseline mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cb"
     if (( cb > 0 )); then
         row_dir_cleanup
         return 0
     fi
-    log_error "row 1: no bytes in cloud after write"
+    log_error "row 1: no bytes in storage after write"
     row_dir_cleanup
     return 1
 }
@@ -414,7 +414,7 @@ row_dedup() {
     create_volume "v2" "global" "no" || { row_dir_cleanup; return 1; }
     connect_iscsi_disk || { row_dir_cleanup; return 1; }
 
-    # First volume: write fixture, measure cloud bytes + snapshot
+    # First volume: write fixture, measure storage bytes + snapshot
     # the chunks/ key set.
     local t0 t1 t2
     t0=$(date +%s%N)
@@ -422,9 +422,9 @@ row_dedup() {
     t1=$(date +%s%N)
     wait_for_chunks 600 || { log_error "row 2: v1 chunks never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local bytes_one; bytes_one=$(total_cloud_bytes)
+    local bytes_one; bytes_one=$(total_storage_bytes)
     local snap_one="$TEST_DIR/chunks-after-v1.txt"
-    cloud_chunks_snapshot "$snap_one"
+    storage_chunks_snapshot "$snap_one"
     local count_one; count_one=$(wc -l < "$snap_one")
     log_info "row 2: after v1 — bytes=$bytes_one chunks=$count_one"
     perf_summary 2 dedup-first-write mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$bytes_one"
@@ -437,21 +437,21 @@ row_dedup() {
     t0=$(date +%s%N)
     write_fixture || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    # No wait_for_chunks here — the dedup hit should keep the cloud
+    # No wait_for_chunks here — the dedup hit should keep the storage
     # delta tiny. Sleep 6s to let pending upload activity settle.
     sleep 6
     t2=$(date +%s%N)
-    local bytes_two; bytes_two=$(total_cloud_bytes)
+    local bytes_two; bytes_two=$(total_storage_bytes)
     local snap_two="$TEST_DIR/chunks-after-v2.txt"
-    cloud_chunks_snapshot "$snap_two"
-    local new_chunks; new_chunks=$(cloud_chunks_new_count "$snap_one" "$snap_two")
+    storage_chunks_snapshot "$snap_two"
+    local new_chunks; new_chunks=$(storage_chunks_new_count "$snap_one" "$snap_two")
     log_info "row 2: after v2 — bytes=$bytes_two new_chunks=$new_chunks"
     local byte_delta=$(( bytes_two - bytes_one ))
     perf_summary 2 dedup-second-write mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$byte_delta"
 
     # Count-delta dedup assertion. With Global dedup and an identical
     # fixture, file-content chunks should all dedupe; the only new
-    # cloud objects come from per-volume ext4 metadata variance.
+    # storage objects come from per-volume ext4 metadata variance.
     # mkfs on a 2 GiB volume writes:
     #   - one group descriptor per 32 MiB block group → ~64 groups
     #   - sparse_super2 backup superblocks in groups 1,3,5,…
@@ -473,7 +473,7 @@ row_dedup() {
     return 1
 }
 
-# Row 3: at-rest encryption. Verify cloud bytes are ciphertext.
+# Row 3: at-rest encryption. Verify storage bytes are ciphertext.
 row_encrypt() {
     log_test "row 3: +encrypt (--encrypt at volume create)"
     row_dir_setup 3
@@ -502,7 +502,7 @@ row_encrypt() {
     t1=$(date +%s%N)
     wait_for_chunks 600 || { log_error "row 3: chunks never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local enc_cb; enc_cb=$(total_cloud_bytes)
+    local enc_cb; enc_cb=$(total_storage_bytes)
     perf_summary 3 encrypt mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$enc_cb"
 
     # Pull one chunk; we expect ciphertext.
@@ -630,9 +630,9 @@ row_key_migrate() {
     return 0
 }
 
-# Row 4: cloud zstd. Compressible fixture -> cloud bytes < 80% of input.
-row_cloud_zstd() {
-    log_test "row 4: +cloud zstd"
+# Row 4: storage zstd. Compressible fixture -> storage bytes < 80% of input.
+row_storage_zstd() {
+    log_test "row 4: +storage zstd"
     row_dir_setup 4
     row_bring_up "zstd" || { row_dir_cleanup; return 1; }
     create_volume "v1" "local" "no" || { row_dir_cleanup; return 1; }
@@ -643,23 +643,23 @@ row_cloud_zstd() {
     t1=$(date +%s%N)
     wait_for_chunks 600 || { log_error "row 4: chunks never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local cb; cb=$(total_cloud_bytes)
-    log_info "row 4: cloud bytes = $cb (input: $FIXTURE_BYTES)"
-    perf_summary 4 cloud-zstd mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cb"
+    local cb; cb=$(total_storage_bytes)
+    log_info "row 4: storage bytes = $cb (input: $FIXTURE_BYTES)"
+    perf_summary 4 storage-zstd mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cb"
     local ceiling=$(( FIXTURE_BYTES * 8 / 10 ))
     if (( cb > 0 && cb < ceiling )); then
-        log_info "row 4: cloud zstd observed ($cb < $ceiling = 80%)"
+        log_info "row 4: storage zstd observed ($cb < $ceiling = 80%)"
         row_dir_cleanup
         return 0
     fi
-    log_error "row 4: cloud bytes not compressed"
+    log_error "row 4: storage bytes not compressed"
     row_dir_cleanup
     return 1
 }
 
 trap 'row_dir_cleanup; exit 130' INT TERM
 
-verify_cloud_creds || exit 1
+verify_storage_creds || exit 1
 
 log_pass() { echo -e "\033[0;32m[PASS]\033[0m $*"; }
 log_fail() { echo -e "\033[0;31m[FAIL]\033[0m $*"; }
@@ -680,7 +680,7 @@ run_row() {
 run_row 1 baseline             row_baseline
 run_row 2 dedup                row_dedup
 run_row 3 encrypt              row_encrypt
-run_row 4 cloud-zstd           row_cloud_zstd
+run_row 4 storage-zstd           row_storage_zstd
 run_row 5 key-migrate          row_key_migrate
 
 echo ""

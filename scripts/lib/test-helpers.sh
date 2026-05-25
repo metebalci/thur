@@ -52,7 +52,7 @@ assign_ports() {
 
 # Poll a log file for an extended regex match until it appears or the
 # timeout elapses. Returns 0 if matched, 1 on timeout. Both args
-# required; useful for the cloud-failure tests that assert specific
+# required; useful for the storage-failure tests that assert specific
 # error-class strings show up in the daemon log.
 #
 # Usage:
@@ -79,7 +79,7 @@ wait_for_log_pattern() {
 #   t0=$(date +%s%N)
 #   <host-write step>            # tar_to_tape / write_fixture
 #   t1=$(date +%s%N)
-#   <wait-for-cloud step>        # cloud_wait_for_key / wait_for_chunks
+#   <wait-for-storage step>      # storage_wait_for_key / wait_for_chunks
 #   t2=$(date +%s%N)
 #   perf_summary 1 baseline random "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cb"
 #
@@ -94,7 +94,7 @@ wait_for_log_pattern() {
 # harness pairs `random` and `compressible` to attribute dedup /
 # compression cost cleanly.
 perf_summary() {
-    local row="$1" label="$2" fixture="$3" bytes="$4" t0="$5" t1="$6" t2="$7" cloud_bytes="${8:-}"
+    local row="$1" label="$2" fixture="$3" bytes="$4" t0="$5" t1="$6" t2="$7" storage_bytes="${8:-}"
     local mib host_s total_s host_mibps total_mibps
     mib=$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b/1048576 }')
     host_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", (b-a)/1e9 }')
@@ -103,9 +103,9 @@ perf_summary() {
         'BEGIN { if (s+0 <= 0) print "inf"; else printf "%.1f", (b/1048576)/s }')
     total_mibps=$(awk -v b="$bytes" -v s="$total_s" \
         'BEGIN { if (s+0 <= 0) print "inf"; else printf "%.1f", (b/1048576)/s }')
-    local cb_field=""
-    [[ -n "$cloud_bytes" ]] && cb_field=" cloud_bytes=$cloud_bytes"
-    local line="[PERF] row=$row label=$label fixture=$fixture fixture_MiB=$mib host_s=$host_s host_MiBps=$host_mibps total_s=$total_s total_MiBps=$total_mibps$cb_field"
+    local sb_field=""
+    [[ -n "$storage_bytes" ]] && sb_field=" storage_bytes=$storage_bytes"
+    local line="[PERF] row=$row label=$label fixture=$fixture fixture_MiB=$mib host_s=$host_s host_MiBps=$host_mibps total_s=$total_s total_MiBps=$total_mibps$sb_field"
     echo -e "${YELLOW}${line}${NC}"
     PERF_LINES+=("$line")
 }
@@ -158,7 +158,7 @@ perf_table_emit() {
 }
 
 # -----------------------------------------------------------------------
-# Cloud helpers — lifted from the duplicated bodies that previously
+# Storage helpers — lifted from the duplicated bodies that previously
 # lived in `vtl/scripts/test-backup-storage.sh` and
 # `vsa/scripts/test-iscsi-fs-storage.sh`. The matrix scripts
 # (test-pipeline-layers.sh, future shared lifts) consume the same
@@ -178,8 +178,8 @@ perf_table_emit() {
 #   TEST_PREFIX                  per-run sub-prefix (cleanup boundary)
 # -----------------------------------------------------------------------
 
-# Map BACKEND_TYPE -> the cloud CLI we use for assertions / cleanup.
-cloud_cli_for_type() {
+# Map BACKEND_TYPE -> the backend CLI we use for assertions / cleanup.
+storage_cli_for_type() {
     case "$BACKEND_TYPE" in
         s3)    echo "aws" ;;
         gcs)   echo "gcloud" ;;
@@ -191,8 +191,8 @@ cloud_cli_for_type() {
 # List keys under ${TEST_PREFIX}${subpath}. One key per line, the
 # bucket prefix stripped so the output is portable across backends.
 # Empty output on no hits / cleanup race / cred miss; callers that
-# need to distinguish use `cloud_wait_for_key` instead.
-cloud_list() {
+# need to distinguish use `storage_wait_for_key` instead.
+storage_list() {
     local subpath="$1"
     local full="${TEST_PREFIX}${subpath}"
     case "$BACKEND_TYPE" in
@@ -237,15 +237,15 @@ cloud_list() {
 # even when dedup was working perfectly. Set-difference against
 # chunks/ alone is fixture-size independent and tests the actual
 # dedup behaviour, not a size proxy.
-cloud_chunks_snapshot() {
+storage_chunks_snapshot() {
     local out="$1"
-    cloud_list "chunks/" | sort > "$out"
+    storage_list "chunks/" | sort > "$out"
 }
 
 # Count keys present in `after` but not in `before`. Stdout is the
 # integer; stderr is unused. Inputs must be the sorted output of
-# cloud_chunks_snapshot above.
-cloud_chunks_new_count() {
+# storage_chunks_snapshot above.
+storage_chunks_new_count() {
     local before="$1" after="$2"
     comm -23 "$after" "$before" | wc -l
 }
@@ -253,13 +253,13 @@ cloud_chunks_new_count() {
 # Block until at least one object exists under ${TEST_PREFIX}${subpath}.
 # Returns 0 on hit, 1 on timeout. Used for manifest-backup / chunk-
 # arrival assertions where the upload pipeline is asynchronous.
-cloud_wait_for_key() {
+storage_wait_for_key() {
     local subpath="$1"
     local timeout="${2:-60}"
     local elapsed=0
     while (( elapsed < timeout )); do
         local count
-        count=$(cloud_list "$subpath" | wc -l)
+        count=$(storage_list "$subpath" | wc -l)
         if (( count > 0 )); then
             return 0
         fi
@@ -274,8 +274,8 @@ cloud_wait_for_key() {
 # a CLI-side reach failure is reliably the same as the daemon would
 # hit at boot — catches the common "sudo stripped my creds" surprise
 # before we burn a minute on the rest of the test.
-verify_cloud_creds() {
-    log_info "Verifying cloud credentials are visible to the daemon's environment..."
+verify_storage_creds() {
+    log_info "Verifying storage credentials are visible to the daemon's environment..."
     local rc=0 out=""
     case "$BACKEND_TYPE" in
         s3)
@@ -312,11 +312,11 @@ verify_cloud_creds() {
             ;;
     esac
     if (( rc != 0 )); then
-        log_error "Cloud credential probe failed for backend type '$BACKEND_TYPE':"
+        log_error "Storage credential probe failed for backend type '$BACKEND_TYPE':"
         echo "$out" | sed 's/^/  /'
         return 1
     fi
-    log_info "Cloud credentials OK (cli=$(cloud_cli_for_type) can reach bucket)"
+    log_info "Storage credentials OK (cli=$(storage_cli_for_type) can reach bucket)"
     return 0
 }
 
@@ -425,7 +425,7 @@ scsi_set_session_key() {
 
 # Recursively delete everything under ${TEST_PREFIX} on the backend.
 # Always runs on cleanup; idempotent on a previously-clean prefix.
-cloud_purge_test_prefix() {
+storage_purge_test_prefix() {
     [[ -z "$TEST_PREFIX" ]] && return 0
     case "$BACKEND_TYPE" in
         s3)

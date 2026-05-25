@@ -60,7 +60,7 @@ are indistinguishable at the chunk level.
 
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
-| 0x00 | Flush | 🟩 Yes | M | `PageCache::synchronize_bytes(0, size_bytes)` — a real fence, awaits cloud-ack of every dirty page. NSID 0xFFFFFFFF (broadcast) accepted on the live namespace; one namespace per `PageCache` so no per-controller global flush is needed. |
+| 0x00 | Flush | 🟩 Yes | M | `PageCache::synchronize_bytes(0, size_bytes)` — a real fence, awaits storage-backend ack of every dirty page. NSID 0xFFFFFFFF (broadcast) accepted on the live namespace; one namespace per `PageCache` so no per-controller global flush is needed. |
 | 0x01 | Write | 🟩 Yes | M | `PageCache::write_bytes(slba * lba_bytes, data_out)`. Sub-page writes via cache RMW. WORM volumes refuse with a media-error status. |
 | 0x02 | Read | 🟩 Yes | M | `PageCache::read_bytes(slba * lba_bytes, nlb * lba_bytes)`. Unallocated pages return zeros (sparse holes). |
 | 0x04 | Write Uncorrectable | 🟨 No | O | No analog on a chunk-pool-backed virtual volume. Refused with `Invalid Command Opcode`. |

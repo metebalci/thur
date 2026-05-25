@@ -67,12 +67,12 @@ release/                            # .deb / .rpm artifact sources
 ├── tag-release.sh                  # Operator step: signs + pushes the release tag (triggers release.yml)
 ├── thurvtld.service          # systemd unit (ExecStart=/usr/bin/thurvtld)
 ├── thurvtl.yaml                    # thurvtl minimal starter conffile
-├── thurvtl.env                     # thurvtl daemon env file (cloud creds + ${ENV_VAR} secrets + feature flags)
+├── thurvtl.env                     # thurvtl daemon env file (storage credentials + ${ENV_VAR} secrets + feature flags)
 ├── thurvtl/
 │   └── postinst / prerm / postrm   # thurvtl .deb maintainer scripts
 ├── thurvsad.service          # systemd unit (ExecStart=/usr/bin/thurvsad)
 ├── thurvsa.yaml                    # thurvsa minimal starter conffile
-├── thurvsa.env                     # thurvsa daemon env file (cloud creds + ${ENV_VAR} secrets + feature flags)
+├── thurvsa.env                     # thurvsa daemon env file (storage credentials + ${ENV_VAR} secrets + feature flags)
 └── thurvsa/
     └── postinst / prerm / postrm   # thurvsa .deb maintainer scripts (separate dir keeps cargo-deb's auto-discovery from confusing the two products)
 (RPM scriptlets are inlined in vtl/cli/Cargo.toml and vsa/cli/Cargo.toml respectively)

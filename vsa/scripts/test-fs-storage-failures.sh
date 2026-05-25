@@ -4,12 +4,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VSA Cloud Failure-Path Tests
+# Thur VSA Storage Failure-Path Tests
 #
 # Drives the data-path smoke through `thurvsad --test` with the
 # `LocalBackend` failure-injection env var (THUR_STORAGE_INJECT_FAIL) set
 # per sub-test, then greps the daemon log for the expected error-class
-# strings. CI-friendly: no real cloud creds, no sudo, no kernel iSCSI
+# strings. CI-friendly: no real storage credentials, no sudo, no kernel iSCSI
 # initiator.
 #
 # Covers two scenarios. The third — "partial-upload resume" — would
@@ -180,7 +180,7 @@ test_network_timeout_with_retry() {
 
 main() {
     echo "========================================"
-    echo "Thur VSA Cloud Failure-Path Tests"
+    echo "Thur VSA Storage Failure-Path Tests"
     echo "========================================"
     echo ""
 

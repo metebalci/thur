@@ -118,7 +118,7 @@ setup_product() {
         log "    conffile $conffile not present (operator drops it later)"
     fi
 
-    # 3c. Optional daemon env file (cloud creds, ${ENV_VAR} secrets,
+    # 3c. Optional daemon env file (storage credentials, ${ENV_VAR} secrets,
     # feature flags). Same pattern as the conffile.
     local envfile="/etc/$name/$name.env"
     if [ -f "$envfile" ]; then

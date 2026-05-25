@@ -148,7 +148,7 @@ for the entire operation:
    (`log`, `progress`, `result`, `done`) until the terminal `Done`.
 
 Job kinds (`vtl/daemon/src/admin/job_dispatch/mod.rs`): `system.gc`,
-`system.verify`, `system.stats`, `system.cloud_check`,
+`system.verify`, `system.stats`, `system.cloud_check` (legacy name; CLI verb is `system storage check`),
 `system.audit.{tail,export,verify,rotate}`,
 `system.{library,drive}.self_test`, `system.alerting.test`,
 `cartridge.{migrate,archive}`, `library.restore_archive`.
@@ -170,7 +170,7 @@ can replay the full transcript.
   cartridge's `manifest.json`, `chunks.idx`, and `blocks-p<N>.idx`.
   It is the inverse of GC: rather than asking which chunks are alive, it
   asks whether the chunks the manifests claim to exist are actually
-  present, with the right size and within-bounds block records. A cloud
+  present, with the right size and within-bounds block records. A storage
   sweep is on by default and can be skipped with `--skip-storage`; when
   active it HEADs every `CloudOnly` and `Both` chunk, every index-page
   object, and the `manifest-latest.json` sentinel. Implementation:
@@ -184,7 +184,7 @@ can replay the full transcript.
   chunks by `(backend, namespace)`, and reports logical bytes, unique
   pool bytes, dedup ratio, per-cartridge exclusive vs shared chunk
   counts, and a location breakdown. The backend HEAD-skip rate is exposed
-  through Prometheus (`thurvtl_chunk_cloud_head_*_total`) rather than
+  through Prometheus (`thurvtl_chunk_storage_head_*_total`) rather than
   being re-walked here, since it is a runtime signal rather than state
   that exists on disk. On VSA the same verb walks each volume's
   `pages.idx` instead, sizes chunks from the local pool, and omits the

@@ -68,7 +68,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-cli-iscsi` | 56% | shared | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
 | `shared-cli-system` | 61% | shared | `system` CLI verbs — reached via the CLIs + scripts |
 | `shared-object-store` | 84% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
-| `shared-object-store-bench` | 90% | shared | storage benchmark engine — driven by a `MockCloudBackend` in-crate |
+| `shared-object-store-bench` | 90% | shared | storage benchmark engine — driven by a `MockBackend` in-crate |
 | `shared-crypto` | 95% | **critical** | AES-256-GCM encrypt / decrypt, IV derivation |
 | `shared-dedup-stats` | 100% | **control-plane critical** | dedup exclusive / shared byte split |
 | `shared-health` | 100% | shared | `/health` liveness handler |

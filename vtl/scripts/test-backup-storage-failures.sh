@@ -4,12 +4,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL Cloud Failure-Path Tests
+# Thur VTL Storage Failure-Path Tests
 #
 # Drives the upload worker through `thurvtld --test` with the
 # `LocalBackend` failure-injection env var (THUR_STORAGE_INJECT_FAIL) set
 # per sub-test, then greps the daemon log for the expected error-class
-# strings. CI-friendly: no real cloud creds, no sudo, no kernel iSCSI
+# strings. CI-friendly: no real storage credentials, no sudo, no kernel iSCSI
 # initiator.
 #
 # Covers two scenarios. The third — "partial-upload resume" — would
@@ -101,7 +101,7 @@ check_prerequisites() {
     fi
 }
 
-# Fresh data dir + YAML conffile (with cloud.backends: + library:) for each sub-test.
+# Fresh data dir + YAML conffile (with storage.backends: + library:) for each sub-test.
 # Daemon materializes library.json from the library: block on first start.
 prepare_fixture() {
     local sub="$1"
@@ -210,7 +210,7 @@ test_network_timeout_with_retry() {
 
 main() {
     echo "========================================"
-    echo "Thur VTL Cloud Failure-Path Tests"
+    echo "Thur VTL Storage Failure-Path Tests"
     echo "========================================"
     echo ""
 

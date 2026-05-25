@@ -82,7 +82,7 @@ probe entirely for locally-scoped chunks.
 The deduplication mechanism is always active — chunks are
 content-addressed, so collisions always collapse within whatever scope is
 configured. The **scope** is a sticky, per-unit choice
-(`shared_cloud::DedupScope`, set at create time, recorded in the manifest,
+(`shared_object_store::DedupScope`, set at create time, recorded in the manifest,
 and never changed thereafter):
 
 | Scope | Pool path | Object key | Cross-unit sharing |
@@ -292,7 +292,7 @@ ratio.
 
 ## Garbage collection
 
-`thurvtl system gc [--dry-run] [--cloud]` walks every
+`thurvtl system gc [--dry-run] [--storage]` walks every
 `manifest.json` under `<data_dir>/tapes/` and groups each `chunks[].hash`
 by `(manifest.backend, namespace)` — `None` for `global`-scope cartridges
 (the shared pool) and `Some(barcode)` for `local`-scope cartridges. For
@@ -343,7 +343,7 @@ are a prerequisite for RMW anyway.
 thurvsa volume create NAME [--dedup local|global]
 ```
 
-VSA uses the same `shared_cloud::DedupScope` as VTL, recorded in the
+VSA uses the same `shared_object_store::DedupScope` as VTL, recorded in the
 manifest's `dedup_scope` field and sticky for the volume's lifetime. The
 CLI default is **`local`** — the opposite of VTL — and the `local`
 namespace is the volume UUID hex. Using the UUID as the namespace is

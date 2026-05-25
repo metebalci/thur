@@ -44,7 +44,7 @@
 #   - sg3-utils, open-iscsi, lsscsi, e2fsprogs, util-linux, openssl
 #   - iscsid running  (sudo systemctl enable --now iscsid)
 #   - Root/sudo access
-#   - For non-local backends: yq, the matching cloud CLI, valid creds
+#   - For non-local backends: yq, the matching backend CLI, valid credentials
 #
 # Usage (invoke from repo root):
 #   ./vsa/scripts/test-monte-carlo.sh [OPTIONS]
@@ -158,7 +158,7 @@ cleanup() {
 
     # Purge backend test prefix if we wrote to a real backend.
     if [[ -n "$BACKEND_NAME" && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then
-        cloud_purge_test_prefix 2>/dev/null || true
+        storage_purge_test_prefix 2>/dev/null || true
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -284,7 +284,7 @@ EOFCONFIG
     fi
     TEST_PREFIX="monte-carlo/run-$$/$(date +%s)/"
 
-    # Globals for the cloud_purge_test_prefix helper.
+    # Globals for the storage_purge_test_prefix helper.
     BACKEND_BUCKET=$(yq -r ".storage.backends.\"$BACKEND_NAME\".bucket // \"\"" "$SOURCE_BACKENDS")
     BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$BACKEND_NAME\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
     BACKEND_REGION=$(yq -r ".storage.backends.\"$BACKEND_NAME\".region // \"\"" "$SOURCE_BACKENDS")

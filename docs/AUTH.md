@@ -1,7 +1,7 @@
-# Cloud Authentication
+# Storage Authentication
 
 This document explains how Thur VTL and Thur VSA authenticate to their
-cloud storage backends — S3, GCS, and Azure — and why credential
+storage backends — S3, GCS, and Azure — and why credential
 resolution is shaped the way it is. It is the authoritative reference
 on the subject; other docs link here rather than repeat it.
 
@@ -17,7 +17,7 @@ and adapt.
 The top-level YAML looks like this:
 
 ```yaml
-cloud:
+storage:
   compression: { algorithm: zstd, level: 3 }
   upload: { max_concurrent: 0 }
   backends:
@@ -54,7 +54,7 @@ present, the daemon ignores every env var, instance identity, and SDK
 chain for that one backend. Other backends are untouched, so the
 override is local to the entry it appears on.
 
-The reason this matters is that cloud SDK credential chains are
+The reason this matters is that storage SDK credential chains are
 process-global. The AWS chain, for example, reads `AWS_ACCESS_KEY_ID`
 once per process. That works fine for a single backend, but it breaks
 the moment two S3-flavored providers share one daemon: whichever
@@ -66,7 +66,7 @@ consulted for that backend.
 ### S3 (`type: s3`)
 
 ```yaml
-cloud:
+storage:
   backends:
     aws-prod:
       type: s3
@@ -141,7 +141,7 @@ key file given directly on the backend entry. There is no nested
 `auth:` block.
 
 ```yaml
-cloud:
+storage:
   backends:
     archive:
       type: gcs
@@ -165,7 +165,7 @@ Application Default Credentials.
 ### Azure (`type: azure`)
 
 ```yaml
-cloud:
+storage:
   backends:
     cold:
       type: azure
@@ -302,7 +302,7 @@ belong to, such as `MINIO_KEY`, `WASABI_KEY`, or `AWS_PROD_KEY`.
 
 ## File permissions
 
-Three files routinely hold cloud-auth secrets, and all three should be
+Three files routinely hold storage-auth secrets, and all three should be
 **root:thurvtl 0640** — readable by the daemon's group, writable only
 by root:
 
@@ -398,7 +398,7 @@ plaintext local file to enterprise HSMs:
 
 Named keystore backends live under **`keystore.backends:`** in the
 VSA conffile (`/etc/thurvsa/thurvsa.yaml`), and the shipped conffile
-carries a commented-out example per provider type. As with cloud
+carries a commented-out example per provider type. As with storage
 backends, the workflow is edit-then-restart — there is no hot reload,
 because the in-memory backend cache holds live SDK clients that are
 built once at boot.
@@ -710,7 +710,7 @@ Forward work on key custody is tracked in
 [`../ROADMAP.md`](../ROADMAP.md) § Encryption-key management.
 
 It is worth being explicit that keystore backends and storage-backend
-authentication are orthogonal concerns. The cloud credentials gate
+authentication are orthogonal concerns. The storage credentials gate
 access to the bucket itself; the keystore gates access to the bytes
 inside it. Neither substitutes for the other.
 
@@ -887,7 +887,7 @@ follow from that.
   therefore different hashes; within-cartridge dedup fails because
   chunk IDs are monotonic, so every chunk gets a fresh IV. This is the
   same tradeoff VSA pays — see [`DEDUP.md`](DEDUP.md).
-- Cloud objects are opaque on the wire. The flip side is that
+- Storage objects are opaque on the wire. The flip side is that
   restoring a cartridge from a cold bucket onto a different host
   requires that host's daemon to reach the same keystore. Without it
   the chunk fetch still succeeds, but the decrypt fails and the
@@ -953,7 +953,7 @@ need a note:
 
 The script deliberately exercises only the wrap and unwrap path
 against each backend type — roughly 10 seconds per run, and
-credential-light. The heavier coverage of iSCSI fixtures and cloud
+credential-light. The heavier coverage of iSCSI fixtures and storage
 chunks lives elsewhere, in `test-pipeline-layers.sh` row 3 (`+encrypt`
 against the default `local` backend).
 

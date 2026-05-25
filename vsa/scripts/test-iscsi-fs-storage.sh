@@ -4,16 +4,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# thurvsa End-to-End Filesystem Workflow Test (real cloud backend)
+# thurvsa End-to-End Filesystem Workflow Test (real storage backend)
 #
 # Same shape as test-iscsi-fs-workflow.sh, but instead of pointing at the
 # `local` backend, this clones a backend definition from
 # /etc/thurvsa/thurvsa.yaml so the upload pipeline, HEAD-then-PUT
-# dedup, page-eviction-driven cloud refetch, and SYNC-fenced flush
-# paths actually fire against real cloud.
+# dedup, page-eviction-driven storage refetch, and SYNC-fenced flush
+# paths actually fire against a real storage backend.
 #
 # Selection: set THURVSA_TEST_BACKEND to the name of an entry under
-# `cloud.backends:` in /etc/thurvsa/thurvsa.yaml. The script copies that
+# `storage.backends:` in /etc/thurvsa/thurvsa.yaml. The script copies that
 # entry verbatim into the test config and appends a per-run sub-prefix
 # so test data is isolated and trivially purgeable.
 #
@@ -22,28 +22,28 @@
 #   - Backend `retention_mode != none` (test cleanup can't delete locked objects)
 #
 # Cleanup: always purges the test sub-prefix from the bucket on exit
-# (even on failure), unless --keep-cloud is passed.
+# (even on failure), unless --keep-storage is passed.
 #
 # Stress / scale: bump the fixture via THURVSA_FIXTURE_MB (env, MiB,
-# default 8). Cloud round-trips dominate runtime — bigger fixture =
+# default 8). Storage round-trips dominate runtime — bigger fixture =
 # longer test = real egress $$$.
 #   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 ./vsa/scripts/test-iscsi-fs-storage.sh
 #
 # Prerequisites:
 #   - sg3-utils, open-iscsi, lsscsi, e2fsprogs, util-linux, tar
 #   - yq (kislyuk/yq — the jq-based Python wrapper; uses jq syntax)
-#   - Cloud CLI matching the backend type:
+#   - Backend CLI matching the backend type:
 #       s3    -> aws       (sudo apt-get install awscli  OR  pip install awscli)
 #       gcs   -> gcloud    (https://cloud.google.com/sdk)
 #       azure -> az        (https://learn.microsoft.com/cli/azure/install-azure-cli)
-#   - Cloud credentials in env (same chain the daemon uses).
+#   - Storage credentials in env (same chain the daemon uses).
 #   - Root/sudo access (iSCSI + /dev/sdX).
 #
 # Usage (invoke from repo root):
 #   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-iscsi-fs-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
-# cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
+# storage credentials into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
 # AISTOR_*) and your backend entry in `$REPO/private/storage-backends.yaml`.
 # The script auto-sources thur.env at startup and defaults
@@ -52,7 +52,7 @@
 # read happens out of the repo, every write under /tmp.
 #
 # NOTE on sudo: do NOT prefix with sudo — the script self-elevates
-# via `sudo KEY=VAL ... "$0"`, forwarding the cloud-relevant env
+# via `sudo KEY=VAL ... "$0"`, forwarding the backend-relevant env
 # vars one by one (sudo-rs on Ubuntu 26.04+ silently ignores `-E`
 # regardless of the SETENV sudoers tag, so explicit pass-through is
 # the only portable path). If you must run as root directly, set the
@@ -64,13 +64,13 @@
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up local test data directory
 #   --keep-iscsi          Don't disconnect iSCSI session after tests
-#   --keep-cloud          Don't purge the test sub-prefix from the bucket
+#   --keep-storage          Don't purge the test sub-prefix from the bucket
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Auto-load maintainer-private cloud credentials if the file exists.
+# Auto-load maintainer-private storage credentials if the file exists.
 # `set -a` auto-exports every KEY=VAL so the subsequent `sudo -E`
 # carries them across; `set +a` restores normal scoping. Skipped on
 # packaged installs (no private/ dir) — operators put credentials in
@@ -84,7 +84,7 @@ if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set +a
 fi
 
-# Self-elevate via sudo, forwarding the cloud-relevant env vars as
+# Self-elevate via sudo, forwarding the backend-relevant env vars as
 # explicit `KEY=VAL` pairs. `sudo -E` looks tempting but is silently
 # ignored on sudo-rs (Ubuntu 26.04+) regardless of the SETENV tag
 # in sudoers; explicit forwarding is the only portable path. Pattern-
@@ -129,7 +129,7 @@ HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
 KEEP_DATA=0
 KEEP_ISCSI=0
-KEEP_CLOUD=0
+KEEP_STORAGE=0
 DAEMON_PID=""
 ISCSI_CONNECTED=0
 MOUNT_POINT="${TEST_DIR}/mnt"
@@ -163,7 +163,7 @@ while [[ $# -gt 0 ]]; do
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
         --keep-iscsi) KEEP_ISCSI=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
         --http-port) HTTP_PORT="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -175,9 +175,9 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
 # ---------------------------------------------------------------------------
-# Storage helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
-# cloud_wait_for_key / verify_cloud_creds / cloud_purge_test_prefix /
-# cloud_cli_for_type). Lifted in 2026-05-13.
+# Storage helpers are sourced from scripts/lib/test-helpers.sh (storage_list /
+# storage_wait_for_key / verify_storage_creds / storage_purge_test_prefix /
+# storage_cli_for_type). Lifted in 2026-05-13.
 # ---------------------------------------------------------------------------
 
 cleanup() {
@@ -199,11 +199,11 @@ cleanup() {
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
 
-    if [[ $KEEP_CLOUD -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
-        log_info "Purging cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
-        cloud_purge_test_prefix
-    elif [[ $KEEP_CLOUD -eq 1 && -n "$TEST_PREFIX" ]]; then
-        log_warn "Keeping cloud test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+    if [[ $KEEP_STORAGE -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
+        log_info "Purging storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
+        storage_purge_test_prefix
+    elif [[ $KEEP_STORAGE -eq 1 && -n "$TEST_PREFIX" ]]; then
+        log_warn "Keeping storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -337,7 +337,7 @@ check_prerequisites() {
         fi
     done
 
-    local cli; cli=$(cloud_cli_for_type)
+    local cli; cli=$(storage_cli_for_type)
     if [[ -n "$cli" ]] && ! command -v "$cli" >/dev/null 2>&1; then
         missing+=("$cli")
         case "$cli" in
@@ -364,7 +364,7 @@ check_prerequisites() {
 }
 
 create_test_config() {
-    log_info "Creating test configuration (cloud backend cloned from $SOURCE_BACKENDS)..."
+    log_info "Creating test configuration (storage backend cloned from $SOURCE_BACKENDS)..."
     mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
 
     local backend_json
@@ -481,12 +481,12 @@ phase_a_format_mount_extract() {
     log_info "[Phase A] umounted cleanly"
 }
 
-phase_b_assert_cloud_objects() {
-    log_info "[Phase B] Asserting chunk objects landed in cloud..."
+phase_b_assert_storage_objects() {
+    log_info "[Phase B] Asserting chunk objects landed in storage..."
     # Async-upload health gate. Catches the upload-worker-snapshot
     # regression where a backend instantiated by runtime `volume
     # create` is invisible to the worker, every PUT silently no-op's
-    # into LocalOnly, and cloud_list below still returns >=1 only
+    # into LocalOnly, and storage_list below still returns >=1 only
     # because the crash-recovery scan replays LocalOnly markers on the
     # NEXT daemon start. Asserting on the warn line catches it before
     # phase C masks it.
@@ -514,7 +514,7 @@ phase_b_assert_cloud_objects() {
         return 1
     fi
     local count
-    count=$(cloud_list "" | wc -l)
+    count=$(storage_list "" | wc -l)
     if (( count < 1 )); then
         log_error "[Phase B] No objects found under ${BACKEND_BUCKET}/${TEST_PREFIX}"
         return 1
@@ -549,15 +549,15 @@ phase_c_restart_and_verify() {
 
 main() {
     echo "========================================"
-    echo "thurvsa Filesystem Workflow Test (real cloud)"
+    echo "thurvsa Filesystem Workflow Test (real storage backend)"
     echo "========================================"
     echo ""
 
     resolve_backend
     check_prerequisites
-    verify_cloud_creds || {
+    verify_storage_creds || {
         echo ""
-        echo "Common cause: cloud creds aren't in this shell's env."
+        echo "Common cause: storage credentials aren't in this shell's env."
         echo "Set them in your user shell, then run (without sudo prefix):"
         echo "  THURVSA_TEST_BACKEND=$THURVSA_TEST_BACKEND $0 $*"
         exit 1
@@ -573,8 +573,8 @@ main() {
     log_test "Phase A — mkfs.ext4 + tar xf + sync + hash"
     if phase_a_format_mount_extract; then log_pass "Phase A"; else log_fail "Phase A"; exit 1; fi
     echo ""
-    log_test "Phase B — assert chunk objects landed in cloud"
-    if phase_b_assert_cloud_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
+    log_test "Phase B — assert chunk objects landed in storage"
+    if phase_b_assert_storage_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
     echo ""
     log_test "Phase C — restart daemon + iSCSI + fsck + diff hashes"
     if phase_c_restart_and_verify; then log_pass "Phase C"; else log_fail "Phase C"; exit 1; fi

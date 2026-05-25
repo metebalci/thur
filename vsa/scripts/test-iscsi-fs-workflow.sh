@@ -43,14 +43,14 @@
 #    11. `system gc --dry-run` must report but delete nothing.
 #    12. `system gc` reclaims the orphan chunks from the local pool
 #        namespace (`<data_dir>/chunks/local/<uuid>/`); `system gc
-#        --cloud` then reclaims the matching objects from the backend.
+#        --storage` then reclaims the matching objects from the backend.
 #
 # Catches gaps that synthetic SCSI tests miss:
 #   - Variable-LBA WRITE / READ as the kernel sees it (the elevator,
 #     CAW, UNMAP, SYNCHRONIZE CACHE all flow through ext4).
 #   - Persistence across daemon restarts (the cache layer's flush +
 #     SYNC contract, not just SCSI-level sync).
-#   - Cloud-pool growth: each `tar xf` produces real content-addressed
+#   - Storage-pool growth: each `tar xf` produces real content-addressed
 #     uploads to the local backend.
 #   - Orphan-chunk garbage collection: a destroyed Local volume's
 #     UUID-keyed namespace is swept clean by `thurvsa system gc`.
@@ -528,7 +528,7 @@ phase_c_restart_and_verify() {
 # is its UUID hex, so the orphans sit under
 # `<data_dir>/chunks/local/<uuid>/` (warm cache) and
 # `<local-backend>/chunks/<uuid>/` (backend tier). A plain sweep
-# clears the pool; `--cloud` extends it to the backend. `--dry-run`
+# clears the pool; `--storage` extends it to the backend. `--dry-run`
 # must touch nothing.
 # ---------------------------------------------------------------------------
 
@@ -606,19 +606,19 @@ phase_d_destroy_and_gc() {
     fi
     log_info "[Phase D] gc reclaimed every orphan chunk from the local pool"
 
-    # `--cloud` sweep — reclaims the backend-tier objects too.
-    gc_out=$("$CLI_PATH" --config "$TEST_CONFIG" system gc --cloud 2>&1)
+    # `--storage` sweep — reclaims the backend-tier objects too.
+    gc_out=$("$CLI_PATH" --config "$TEST_CONFIG" system gc --storage 2>&1)
     if (( $? != 0 )); then
-        log_error "[Phase D] system gc --cloud failed"
+        log_error "[Phase D] system gc --storage failed"
         echo "$gc_out" | tail -5 | sed 's/^/    /'
         return 1
     fi
     echo "$gc_out" | tail -3 | sed 's/^/    /'
     if (( $(count_chunks "$backend_ns") != 0 )); then
-        log_error "[Phase D] orphan object(s) survived --cloud gc under $backend_ns"
+        log_error "[Phase D] orphan object(s) survived --storage gc under $backend_ns"
         return 1
     fi
-    log_info "[Phase D] --cloud gc reclaimed every orphan object from the backend"
+    log_info "[Phase D] --storage gc reclaimed every orphan object from the backend"
 }
 
 main() {

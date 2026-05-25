@@ -208,7 +208,7 @@ refuses to start with a `LibraryConfig` error and writes nothing.
 | 0x4C | LOG SELECT | |
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | cdb[4] bit 0 (data-transport) gates SCSI UNLOAD / MOVE MEDIUM-from-drive (refused with ILLEGAL REQUEST + ASC/ASCQ 0x53/0x02); bit 1 (mechanical) tracked but no enforcement target. State is per-I_T_L nexus (per TSIH+LUN), volatile, cleared on session close. |
 | 0x1C | RECEIVE DIAGNOSTIC RESULTS | Pages 0x00 (Supported, lists [0x00, 0x10]) and 0x10 (Self-Test Results, SPC-4 §7.2.21 layout) |
-| 0x1D | SEND DIAGNOSTIC | SELFTEST=1 routes by LUN: LU0 = library + inventory + storage-backend health (full `validate_cloud_backend` probe); LU1+ = loaded-cartridge `manifest.json`. |
+| 0x1D | SEND DIAGNOSTIC | SELFTEST=1 routes by LUN: LU0 = library + inventory + storage-backend health (full `validate_object_store_backend` probe); LU1+ = loaded-cartridge `manifest.json`. |
 
 ### Dispatch-level behavior
 
@@ -329,10 +329,10 @@ the per-product identity and are validated at startup.
 | 0x1B | START STOP UNIT | Accept-and-GOOD regardless of PowerCondition / NO_FLUSH / LOEJ / START bits — thurvsa volumes don't model power states. Linux's `sd_mod` issues this during attach / suspend / shutdown. |
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | Accept-and-GOOD regardless of bits 1-0 — thurvsa has no removable media, no enforcement target. |
 | 0x25 | READ CAPACITY (10) | Caps the last-LBA field at `0xFFFFFFFF` to force initiators onto READ CAPACITY (16) for big volumes. |
-| 0x28 | READ (10) | Sector-grain LBA + transfer length supported end-to-end via the per-volume `PageCache` (core-block::cache). Sub-page reads pull the affected page(s) from the cache or fall through to `VolumeWriter::read_page` (cloud / pool / sparse-hole zero) and slice. Unallocated pages return zeros. Reservation-gated. |
+| 0x28 | READ (10) | Sector-grain LBA + transfer length supported end-to-end via the per-volume `PageCache` (core-block::cache). Sub-page reads pull the affected page(s) from the cache or fall through to `VolumeWriter::read_page` (storage / pool / sparse-hole zero) and slice. Unallocated pages return zeros. Reservation-gated. |
 | 0x2A | WRITE (10) | Sector-grain via the cache: load the affected page(s), splice in host bytes at sector grain, mark dirty for asynchronous flush. Full-page writes skip the load. WORM volumes refuse with WRITE PROTECTED. Reservation-gated. |
 | 0x2F | VERIFY (10) | Per SBC-3 §5.46. CDB byte 1 bits 2-1 hold BYTCHK: 00b = no compare (read each block to surface medium errors — sparse-hole pages succeed), 01b = compare against Data-Out (Data-Out is `blocks * sector_bytes`; mismatch → CHECK CONDITION + MISCOMPARE). 10b/11b (LB protection) rejected with INVALID FIELD IN CDB. VRPROTECT (bits 7-5) must be 0. Reservation-gated as a read-side opcode. |
-| 0x35 | SYNCHRONIZE CACHE (10) | Real fence — awaits the cache's flush of every dirty page whose id falls in the requested LBA range through to cloud-ack via `VolumeWriter::write_page`. NUMBER OF BLOCKS = 0 means "from LBA to end of medium" per SBC-3 §5.21. Out-of-range → LBA OUT OF RANGE. Reservation-gated as a write-side opcode (SBC-3 §5.10). |
+| 0x35 | SYNCHRONIZE CACHE (10) | Real fence — awaits the cache's flush of every dirty page whose id falls in the requested LBA range through to storage-backend ack via `VolumeWriter::write_page`. NUMBER OF BLOCKS = 0 means "from LBA to end of medium" per SBC-3 §5.21. Out-of-range → LBA OUT OF RANGE. Reservation-gated as a write-side opcode (SBC-3 §5.10). |
 | 0x41 | WRITE SAME (10) | SBC-3 §5.49 — replicate one logical block of Data-Out across the requested LBA range. CDB byte 1: WRPROTECT (7-5) must be 0; ANCHOR (4) / PBDATA (2) / LBDATA (1) rejected. UNMAP (3) honored: when set with a zero pattern, route via `cache.unmap_bytes` (cheaper); other patterns expand the single-block payload across the range and route via `cache.write_bytes` in 16 MiB sector-aligned chunks. Data-Out length must equal one logical block. NUMBER OF BLOCKS = 0 is a no-op per §5.49.2. WORM refuses with WRITE PROTECTED. Reservation-gated. |
 | 0x42 | UNMAP | Thin-provisioning hint. Parameter list = 8-byte header + N × 16-byte UNMAP BLOCK DESCRIPTOR `{LBA u64, blocks u32, reserved 4}`. Sector-grain descriptors supported via the cache: full-page descriptors drop the cached entry and clear the page-index slot synchronously; sub-page descriptors zero the affected sectors in the cached page and mark dirty so the next flush commits the partial erase. Out-of-range → LBA OUT OF RANGE. ANCHOR=1 rejected (no separate "deallocated" state vs "never allocated"). Two-phase commit: validate every descriptor before any state mutation, so a malformed list leaves the volume untouched. WORM volumes refuse with WRITE PROTECTED. Reservation-gated as a write-side opcode. |
 | 0x4D | LOG SENSE | Page 0x00 (Supported Log Pages) only, listing just 0x00 itself — the SBC-3 / SPC-4 SAS-vintage log pages (temperature, retry counters, etc.) don't apply to a virtual block target. Other page codes / non-zero subpages → INVALID FIELD IN CDB per SPC-4 §7.2.5. |
@@ -483,7 +483,7 @@ in the following steps:
   drive NVRAM and survive cartridge swaps. `DriveManager` owns the
   file — it loads it at startup and rewrites it on every SP=1. The
   state is deliberately kept *out* of any `manifest.json`. The
-  manifest rides the cloud-backup pipeline and may end up on a
+  manifest rides the storage-backup pipeline and may end up on a
   retention-locked backend, whereas drive-side config has to stay
   freely re-writable; for that reason it gets the same local-only
   treatment as `lru.idx`. A missing or corrupt file simply yields
@@ -575,7 +575,7 @@ What the probe actually checks depends on the LUN:
 - **LU0 (changer)**: parse `<data_dir>/library/library.json` +
   `<data_dir>/library/inventory.json`, confirm every barcode in
   inventory has a readable `<data_dir>/tapes/<barcode>/manifest.json`,
-  then run `validate_cloud_backend` against every named
+  then run `validate_object_store_backend` against every named
   `storage.backends:` entry (auth + write + delete probe — the same
   routine `thurvtl system storage check` runs).
 - **LU1+ (drive)**: if a cartridge is loaded, re-read its
@@ -695,7 +695,7 @@ PROTECTED — WORM MEDIUM"). The per-operation behavior is:
 
 ### Legal hold (host-visible write-protect)
 
-Legal hold is anchored in the cloud, not on the host. The hold state
+Legal hold is anchored in the storage backend, not on the host. The hold state
 of each object is recorded with the provider's native primitive — S3
 `PutObjectLegalHold`, GCS `eventBasedHold`, Azure `Set Blob Legal
 Hold`. The `manifests/<barcode>/manifest-latest.json` key acts as the
@@ -731,7 +731,7 @@ Both `legal-hold set` and `legal-hold clear` refuse to act on a
 cartridge that is currently in a drive — they look this up in
 `<data_dir>/library/inventory.json`. The operator has to `unload`
 first, and the audit log records the refusal either way. A WORM
-cartridge can still be placed under legal hold (this is how cloud
+cartridge can still be placed under legal hold (this is how storage
 preservation is extended past the Object Lock retention window).
 When a cartridge is both WORM and held, the WORM SCSI gate runs ahead
 of the legal-hold gate, so a refused write surfaces the WORM ASC/ASCQ
@@ -796,13 +796,13 @@ Each provider's `lock_state` is derived as follows:
   storage-account scope.
 - **Local**: always `Off`. WORM cartridges cannot target a local backend.
 
-For a locked bucket (governance or compliance), `validate_cloud_backend`
+For a locked bucket (governance or compliance), `validate_object_store_backend`
 skips its usual write/delete probe — writing a test object you can
 never delete would just litter the bucket — and falls back to a
 list-only reachability check, which is enough.
 
 The IAM requirements split across two planes. Data-plane permissions —
-for chunks and manifests — are needed on every cloud. Management-plane
+for chunks and manifests — are needed on every backend. Management-plane
 permissions are needed only when the bidirectional retention check
 runs, and only for the `lock_state` query. An operator who cannot
 grant the management-plane permissions can opt out entirely with the
@@ -1079,8 +1079,8 @@ per-write.
   },
   "host_bytes_written":   5368709120, // lifetime host writes; pre-dedup, pre-compression; reset on ERASE
   "host_bytes_read":      4294967296, // lifetime plaintext bytes served to the host on READ
-  "backend_bytes_written": 2147483648, // lifetime on-wire bytes PUT to cloud; post-dedup, post-compression
-  "backend_bytes_read":    1073741824  // lifetime bytes fetched from cloud on a chunk cache miss
+  "backend_bytes_written": 2147483648, // lifetime on-wire bytes PUT to backend; post-dedup, post-compression
+  "backend_bytes_read":    1073741824  // lifetime bytes fetched from backend on a chunk cache miss
 }
 ```
 
@@ -1103,11 +1103,11 @@ length — counted before drive-side compression and before chunk dedup.
 `host_bytes_read` is its read-side
 mirror, incremented by the plaintext length handed back to the host on
 each READ (post-decrypt, post-decompress; filemark reads do not count).
-`backend_bytes_written` is the on-wire bytes PUT to cloud — post-dedup,
+`backend_bytes_written` is the on-wire bytes PUT to the backend — post-dedup,
 post-compression, the real backend storage cost — and is bumped as each
 chunk upload outcome is applied (a cross-namespace dedup hit performs
 no PUT and so does not count). `backend_bytes_read` is the bytes
-fetched from cloud on a chunk cache miss, bumped by the live-session
+fetched from the backend on a chunk cache miss, bumped by the live-session
 prefetch hook and the async refetch path. The gap between a host
 counter and its backend counterpart is the dedup + compression saving
 on the write side and the cache hit rate on the read side. All four
@@ -1126,7 +1126,7 @@ analogous thing, mixing a per-tape nonce into their position-based IV.
 value names a configured `storage.backends:` entry, and the daemon
 refuses to start if any cartridge references a backend that is not
 configured. A manifest with an empty or missing `backend` cannot be
-opened at all: `Cartridge::open` errors. Every cloud operation —
+opened at all: `Cartridge::open` errors. Every backend operation —
 upload, manifest backup, prefetch, refetch — routes through the named
 backend, and the chunk-pool sharding under
 `<data_dir>/chunks/<backend>/...` makes that routing physical on disk.
@@ -1478,7 +1478,7 @@ code:
 
 ## Object Layout
 
-Everything Thur VTL writes to the cloud lives under a single
+Everything Thur VTL writes to the storage backend lives under a single
 `<prefix>/` in an S3 or GCS bucket, or an Azure Blob Storage
 container. The keyspace is laid out like this:
 
@@ -1605,7 +1605,7 @@ thurvtl library restore --backend NAME
 
 The restore runs in four phases:
 
-1. **Discovery.** `CloudBackend::list_objects("manifests/")`
+1. **Discovery.** `ObjectStoreBackend::list_objects("manifests/")`
    enumerates every key under that prefix. A barcode that has a
    `manifest-latest.json` sentinel is kept; anything without one — an
    in-flight upload, a torn write — is surfaced as an orphan hint
@@ -1619,7 +1619,7 @@ The restore runs in four phases:
    **not** abort the batch — every cartridge is attempted and its
    outcome reported individually. Chunks are *not* downloaded in this
    phase; they lazy-load on the first host read, through
-   `read_block_async`'s cloud-refetch path.
+   `read_block_async`'s storage-refetch path.
 3. **Inventory rebuild.** The cartridges that restored successfully,
    sorted by barcode, are seated into storage slots via
    `Library::add_or_create_tape` — which short-circuits its create
@@ -1658,7 +1658,7 @@ thurvtl library restore --backend mirror
 systemctl start thurvtld
 ```
 
-This assumes the cloud provider has already replicated the source
+This assumes the storage provider has already replicated the source
 bucket to the mirror region out-of-band — S3, GCS, and Azure all offer
 bucket-level cross-region replication. Thur VTL itself does not drive
 cross-bucket replication; that is a separate feature ("cartridge
@@ -1675,7 +1675,7 @@ replication", see `ROADMAP.md`).
 
 - **Chassis topology.** The operator declares the chassis in the
   YAML `library:` block first; the topology fields (`num_slots`,
-  `num_drives`, `lto_generation`) are never pulled from cloud state.
+  `num_drives`, `lto_generation`) are never pulled from storage state.
 - **Daemon-routed warm-host restore.** `library restore` refuses to
   run if a daemon is alive on the data dir. Refreshing a single
   cartridge's metadata against a live daemon is a different operation
@@ -1935,7 +1935,7 @@ thurvtl library restore-archive
    uploaded=false`, so that the daemon's orphan-upload sweep will
    eventually mirror each chunk into the backend's *regular*
    `chunks/[ns/]<aa>/<bb>/<hash>.dat` key — which is where the live
-   cartridge will look for it on a cache eviction and cloud refetch.
+   cartridge will look for it on a cache eviction and storage refetch.
 6. **Seat.** The caller — the daemon handler — briefly acquires the
    library mutex and calls `Library::add_or_create_tape(local_barcode,
    backend_name)` to land the cartridge in a free storage slot. The
@@ -1986,7 +1986,7 @@ Required: `data_dir`, plus `storage.backends:` with at least one named
 entry.
 
 ```yaml
-cloud:
+storage:
   backends:
     primary: { type: s3,  bucket: thurvtl-data,    prefix: "tapes/", region: us-east-1 }
     archive: { type: gcs, bucket: thurvtl-cold,    prefix: "tapes/", project_id: ... }
@@ -1994,7 +1994,7 @@ cloud:
 ```
 
 Every entry is exactly one of `s3`, `gcs`, `azure`, or `local`,
-discriminated by its `type` field, and the per-cloud knobs (for
+discriminated by its `type` field, and the per-backend knobs (for
 example `endpoint_url` or `service_account_key_file`) sit inline in
 the entry. Per-backend credentials — the `auth:` blocks, the `_env`
 indirections, and the strict-override semantics — are documented
@@ -2071,11 +2071,11 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | scsi_xcopy | `scsi_xcopy_total` | Counter<u64> | — | `outcome` ∈ {`success`,`reject`,`error`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_bytes_total` | Counter<u64> | By | `path` ∈ {`fast`,`slow`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_segments_total` | Counter<u64> | — | `path` ∈ {`fast`,`slow`} (VSA only) |
-| cloud | `cloud_requests_total` | Counter<u64> | — | `backend`, `op`, `outcome` |
-| cloud | `cloud_request` | Histogram<f64> | s | `backend`, `op`, `outcome` |
-| cloud | `cloud_transferred` | Counter<u64> | By | `backend`, `op`, `outcome` |
-| cloud | `cloud_retries_total` | Counter<u64> | — | `backend`, `class` |
-| cloud | `cloud_permanent_errors_total` | Counter<u64> | — | `backend`, `class` |
+| storage | `storage_requests_total` | Counter<u64> | — | `backend`, `op`, `outcome` |
+| storage | `storage_request` | Histogram<f64> | s | `backend`, `op`, `outcome` |
+| storage | `storage_transferred` | Counter<u64> | By | `backend`, `op`, `outcome` |
+| storage | `storage_retries_total` | Counter<u64> | — | `backend`, `class` |
+| storage | `storage_permanent_errors_total` | Counter<u64> | — | `backend`, `class` |
 | chunk | `chunk_seals_total` | Counter<u64> | — | `backend`, `scope` |
 | chunk | `chunk_dedup_hits_total` | Counter<u64> | — | `backend`, `scope` |
 | chunk | `chunk_logical` | Counter<u64> | By | `backend`, `scope` |
@@ -2114,7 +2114,7 @@ sum or filter on `backend` keep working unchanged.
 
 ### Process-global handle
 
-The core call sites — cartridge, audit, cloud, iSCSI, pool budget —
+The core call sites — cartridge, audit, storage, iSCSI, pool budget —
 record through the `shared_telemetry::record::*` free functions, also
 re-exported as `core_mediachanger::metrics::record::*`. Those functions
 locate a process-global `Telemetry` that the daemon installs at boot

@@ -91,7 +91,7 @@ expose must answer.
 | 0x1A | MODE SENSE(6) | 🟩 Yes | M | See per-product / per-LUN mode-page tables. |
 | 0x1B | START STOP UNIT | 🟩 Yes | O | thurvtl tape: LOAD/UNLOAD on tape; no-op on changer. thurvsa block: accept-and-GOOD regardless of PowerCondition / LOEJ / START bits. |
 | 0x1C | RECEIVE DIAGNOSTIC RESULTS | 🟩 Partial | CC | Pages 0x00 (Supported Diagnostic Pages → `[0x00, 0x10]`) and 0x10 (Self-Test Results, SPC-4 §7.2.21 — 20 entries × 20 bytes, page-length 0x0190, most recent first). PCV=0 returns page 0x00. Other page codes return CHECK CONDITION + ILLEGAL REQUEST + INVALID FIELD IN CDB. (thurvtl only; thurvsa has no diagnostic ring buffer.) |
-| 0x1D | SEND DIAGNOSTIC | 🟩 Partial | M | thurvtl tape: default no-op probe (SELFTEST=0 + SELF-TEST CODE=0) returns GOOD without recording. SELFTEST=1 routes by LUN: LU0 runs library + inventory + storage-backend health (full `validate_cloud_backend` probe — auth + write + delete on every named entry); LU1+ re-validates the loaded cartridge's `manifest.json`, or GOOD if no cartridge loaded. Foreground/background extended self-test codes (0b001..0b110) accepted as GOOD without execution. Failures return CHECK CONDITION + HARDWARE ERROR + DIAGNOSTIC FAILURE ON COMPONENT 80h. Per-LUN history (most recent 20) queryable via RECEIVE DIAGNOSTIC RESULTS page 0x10. thurvsa block: no diagnostic surface. |
+| 0x1D | SEND DIAGNOSTIC | 🟩 Partial | M | thurvtl tape: default no-op probe (SELFTEST=0 + SELF-TEST CODE=0) returns GOOD without recording. SELFTEST=1 routes by LUN: LU0 runs library + inventory + storage-backend health (full `validate_object_store_backend` probe — auth + write + delete on every named entry); LU1+ re-validates the loaded cartridge's `manifest.json`, or GOOD if no cartridge loaded. Foreground/background extended self-test codes (0b001..0b110) accepted as GOOD without execution. Failures return CHECK CONDITION + HARDWARE ERROR + DIAGNOSTIC FAILURE ON COMPONENT 80h. Per-LUN history (most recent 20) queryable via RECEIVE DIAGNOSTIC RESULTS page 0x10. thurvsa block: no diagnostic surface. |
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | 🟩 Yes | O | thurvtl tape: per-I_T-nexus state. Bit 0 (data-transport) gates SCSI UNLOAD on the drive and MOVE MEDIUM with that drive as source — refused with ILLEGAL REQUEST + 0x53/0x02. Bit 1 (mechanical) gates the admin `POST /api/v1/changer/unload` endpoint — refused with HTTP 409 + `refused: "mechanical_eject_prevented"`; `force: true` overrides. The two bits are independent. State cleared when the I_T nexus ends. Issued against changer LUN: accepted, no enforcement. thurvsa block: accept-and-GOOD regardless of bit 0 / bit 1. |
 | 0x3B | WRITE BUFFER | 🟩 Stub | O | Firmware-download surface accepted, ignored. (thurvtl only; thurvsa rejects with INVALID OPERATION CODE.) |
 | 0x3C | READ BUFFER | 🟩 Stub | O | Returns zeros. (thurvtl only.) |
@@ -580,7 +580,7 @@ LTO-8) rather than by SSC-4.
 | Drive compression (LZ4/zstd) | 🟩 Yes | O | Per-block algorithm recorded. SLDC reserved (not implemented). |
 | Density: LTO-7 (0x5C) / LTO-8 (0x5E) | 🟩 Yes | M | |
 | WORM cartridges | 🟩 Yes | O | Per-cartridge `--worm` flag; non-EOD writes return WRITE PROTECTED. |
-| Legal hold (cloud-resident) | 🟩 Yes | — | VTL-specific; not an LTO feature. Sentinel-driven; host sees write-protect at LOAD time. |
+| Legal hold (storage-resident) | 🟩 Yes | — | VTL-specific; not an LTO feature. Sentinel-driven; host sees write-protect at LOAD time. |
 
 ---
 
@@ -837,7 +837,7 @@ VTL either reports a benign placeholder or does nothing at all:
   extended) and 0b101 / 0b110 (foreground). VTL accepts every code
   as GOOD without execution — only SELFTEST=1 runs an actual probe,
   a purely software check (parse `library.json` + `inventory.json` +
-  every cartridge `manifest.json` + `validate_cloud_backend` for
+  every cartridge `manifest.json` + `validate_object_store_backend` for
   LU0; cartridge `manifest.json` for LU1+). It completes in
   milliseconds; hosts polling LOG SENSE 0x10 never see an
   in-progress state.
@@ -968,7 +968,7 @@ VPD in Part 3; NVMe in
 | 0x28 | READ (10) | 🟩 Yes | M | Sub-page supported via cache RMW. Unallocated pages return zeros (sparse holes). Reservation-gated. |
 | 0x2A | WRITE (10) | 🟩 Yes | M | Sub-page supported via cache RMW. WORM volumes refuse with WRITE PROTECTED. Reservation-gated. |
 | 0x2F | VERIFY (10) | 🟩 Yes | O | BYTCHK=00 reads the requested range to surface medium errors (sparse-hole pages succeed). BYTCHK=01 compares Data-Out against on-medium bytes; mismatch surfaces as MISCOMPARE (sense key 0x0E, ASC/ASCQ 0x1D/0x00). BYTCHK=10/11 rejected with INVALID FIELD IN CDB. VRPROTECT must be 0. Reservation-gated as a read-side opcode. |
-| 0x35 | SYNCHRONIZE CACHE (10) | 🟩 Yes | O | Real fence — `cache.synchronize_bytes` awaits the cache's flush of every dirty page in the requested LBA range through to cloud-ack via `VolumeWriter::write_page`. Reservation-gated as a write-side opcode. |
+| 0x35 | SYNCHRONIZE CACHE (10) | 🟩 Yes | O | Real fence — `cache.synchronize_bytes` awaits the cache's flush of every dirty page in the requested LBA range through to storage-backend ack via `VolumeWriter::write_page`. Reservation-gated as a write-side opcode. |
 | 0x41 | WRITE SAME (10) | 🟩 Partial | O | VAAI Block Zero / `blkdiscard --zeroout` primitive. Data-Out is one logical block (the per-sector pattern); the daemon expands it across the requested range. UNMAP=1 with a zero pattern routes via `cache.unmap_bytes`; other patterns expand and route via `cache.write_bytes` in 16 MiB sector-aligned chunks. ANCHOR / WRPROTECT / PBDATA / LBDATA rejected with INVALID FIELD IN CDB. NUMBER OF BLOCKS = 0 is a no-op per SBC-3 §5.49. WORM refuses with WRITE PROTECTED. Reservation-gated. |
 | 0x42 | UNMAP | 🟩 Yes | O | 8-byte header + N × 16-byte UNMAP BLOCK DESCRIPTOR. Sub-page descriptors zero the affected sectors via cache RMW; full-page descriptors clear `PageIndex` entries (backend chunks linger until `system gc`). ANCHOR=1 rejected. Two-phase commit (validate every descriptor before any clear). WORM refuses with WRITE PROTECTED. Reservation-gated. Advertised via VPD 0xB0, VPD 0xB2 (LBPU=1, LBPRZ=001, PROVISIONING TYPE=thin), and RC16 LBPME=1. |
 | 0x83 sa 0x00 | EXTENDED COPY (LID1) | 🟩 Partial | O | The VAAI Hardware Accelerated Copy primitive — SPC-3 §6.3 LID1 subset, what ESXi and Windows VAAI issue. Identification target descriptors (type 0xE4) carrying NAA designators (designator type 0x03, 8 bytes, from VPD 0x83's NAA descriptor); block-to-block segment descriptors (type 0x02) with 16-bit block count + 64-bit src / dst LBAs. LID4 (sa 0x01) rejects as INVALID FIELD IN CDB; T10 identification descriptors and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment fast path: same backend + matching pool namespace + page-aligned + non-overlapping → `PageCache::clone_page_range_into` rebinds the destination's page-index entry to the source's chunk hash, zero data I/O. Cross-LUN clones now share the fast path (same backend + matching `DedupScope` namespace); only mismatched pools or unaligned ranges fall back to the 1 MiB streaming bytes copy. Synchronous (whole copy completes before GOOD). Destination LUN reservation-gated; WORM destinations refuse with WRITE PROTECTED. Advertised via VPD 0x8F and REPORT SUPPORTED OPERATION CODES. |
@@ -1011,7 +1011,7 @@ triggering a cascade of CHECK CONDITION responses.
 
 | Page | Name | Status | Spec | Notes |
 |-----:|------|--------|:----:|-------|
-| 0x08 | Caching | 🟩 Yes | O | WCE=1 (write-back cache is real — `PageCache` flushes asynchronously via the cloud uploader; SBC-3 §6.4.6.4 mandates WCE=1 when cached writes can be lost on power-cycle, so a compliant initiator issues SYNCHRONIZE CACHE on `sync(1)` / `umount`). RCD=1 (no read cache), DRA=1 (no read-ahead). Block descriptor reflects the volume's `(NUMBER OF LOGICAL BLOCKS, LOGICAL BLOCK LENGTH)` — short form by default, long form with MS10 LLBAA=1. WORM volumes flip WP=1 in the DEVICE-SPECIFIC PARAMETER byte. |
+| 0x08 | Caching | 🟩 Yes | O | WCE=1 (write-back cache is real — `PageCache` flushes asynchronously via the storage uploader; SBC-3 §6.4.6.4 mandates WCE=1 when cached writes can be lost on power-cycle, so a compliant initiator issues SYNCHRONIZE CACHE on `sync(1)` / `umount`). RCD=1 (no read cache), DRA=1 (no read-ahead). Block descriptor reflects the volume's `(NUMBER OF LOGICAL BLOCKS, LOGICAL BLOCK LENGTH)` — short form by default, long form with MS10 LLBAA=1. WORM volumes flip WP=1 in the DEVICE-SPECIFIC PARAMETER byte. |
 | 0x0A | Control | 🟩 Yes | O | SPC-4 baseline body (TST=0, D_SENSE=0, QUEUE ALG MOD=0). |
 | 0x3F | All Pages | 🟩 Yes | O | Concatenation of supported pages above. |
 
@@ -1071,7 +1071,7 @@ restored separately. The gap is tracked in
 - **Write:** plaintext page → AES-256-GCM encrypt with IV =
   `derive_iv(volume_uuid, page_id, 0)` → ciphertext+tag (page_size +
   16 B) → BLAKE3-hash → chunk pool insert → backend upload.
-- **Read:** chunk pool / cloud fetch → ciphertext+tag → AES-256-GCM
+- **Read:** chunk pool / storage fetch → ciphertext+tag → AES-256-GCM
   decrypt → plaintext page → SCSI READ buffer.
 - IV is never stored on disk; re-derived from the same identity
   tuple at decrypt time. Same pattern as VTL tape AME
@@ -1179,7 +1179,7 @@ dedicated module:
 - `scsi/sbc/src/maintenance.rs` — MAINTENANCE IN SAs 0x0C / 0x0D.
 
 The data path those opcodes drive — the per-volume in-memory cache
-and the cloud-upload pipeline — is in
+and the storage-upload pipeline — is in
 [`../core/block/src/cache.rs`](../core/block/src/cache.rs) and
 [`../core/block/src/uploader.rs`](../core/block/src/uploader.rs).
 

@@ -7,7 +7,7 @@
 # thurvsa keystore round-trip test (per-backend integration)
 #
 # Same shape as test-iscsi-fs-storage.sh, but the moving part is the keystore
-# backend instead of the cloud backend. Pick a keystore entry by name
+# backend instead of the storage backend. Pick a keystore entry by name
 # and the script exercises:
 #
 #   1. wrap  (volume create --encrypt --keystore <name>) — the daemon
@@ -50,7 +50,7 @@
 #   THURVSA_TEST_KEYSTORE=<name> ./vsa/scripts/test-keystore.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
-# cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
+# storage credentials into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names) and
 # your backend entries in `$REPO/private/keystore-backends.yaml`.
 # Override the source path with THURVSA_SOURCE_KEYSTORES.
@@ -66,7 +66,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Auto-load maintainer-private cloud credentials if the file exists.
+# Auto-load maintainer-private storage credentials if the file exists.
 # Same convention as test-iscsi-fs-storage.sh: anything KEY=VAL in thur.env
 # becomes exported for the daemon (which inherits our env). Skipped
 # on packaged installs — operators put creds in /etc/thurvsa/thurvsa.env
@@ -207,12 +207,12 @@ disk_cache:
   disk_free_min_gb: 0
 
 # A single local-filesystem backend. The keystore test isn't testing
-# the cloud path — pointing at /tmp keeps it self-contained.
+# the storage-backend path — pointing at /tmp keeps it self-contained.
 storage:
   backends:
     testbackend:
       type: local
-      root_dir: "$TEST_DIR/cloud"
+      root_dir: "$TEST_DIR/storage"
 
 keystore:
   backends:
@@ -220,7 +220,7 @@ keystore:
     $FALLBACK_LOCAL_NAME: { type: local }
 EOFCONFIG
 
-    mkdir -p "$TEST_DIR/cloud"
+    mkdir -p "$TEST_DIR/storage"
 }
 
 start_daemon() {

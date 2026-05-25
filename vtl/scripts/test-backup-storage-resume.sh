@@ -16,11 +16,11 @@
 # at boot and writes its two audit entries.
 #
 # What's asserted:
-#   1. The audit log carries `cloud.orphan_scan_started`.
-#   2. The audit log carries `cloud.orphan_scan_completed` with
+#   1. The audit log carries `storage.orphan_scan_started`.
+#   2. The audit log carries `storage.orphan_scan_completed` with
 #      `orphans_found: 0` (fresh dir, nothing to recover).
 #
-# No iSCSI, no sudo, no real cloud. LocalBackend rooted in the test
+# No iSCSI, no sudo, no real storage backend. LocalBackend rooted in the test
 # tmp dir. Daemon runs in normal mode (not `--test`) for a few seconds
 # so the audit writer + boot scan get a chance to fire, then killed.
 #
@@ -157,8 +157,8 @@ test_boot_scan_emits_audit_events() {
     DAEMON_PID=$!
 
     # Wait for the completed entry — implies started was already written.
-    if ! wait_for_audit_pattern "$audit_dir" '"op":"cloud\.orphan_scan_completed"' 15; then
-        log_error "  ✗ never saw 'cloud.orphan_scan_completed' in audit log within 15s"
+    if ! wait_for_audit_pattern "$audit_dir" '"op":"storage\.orphan_scan_completed"' 15; then
+        log_error "  ✗ never saw 'storage.orphan_scan_completed' in audit log within 15s"
         log_error "    last 30 lines of daemon log:"
         tail -30 "$log" >&2
         if compgen -G "${audit_dir}/audit-*.jsonl" > /dev/null; then
@@ -167,19 +167,19 @@ test_boot_scan_emits_audit_events() {
         fi
         return 1
     fi
-    log_info "  ✓ 'cloud.orphan_scan_completed' present"
+    log_info "  ✓ 'storage.orphan_scan_completed' present"
 
-    if ! grep -Eq '"op":"cloud\.orphan_scan_started"' "${audit_dir}"/audit-*.jsonl; then
-        log_error "  ✗ 'cloud.orphan_scan_started' missing — scan reported completion without start"
+    if ! grep -Eq '"op":"storage\.orphan_scan_started"' "${audit_dir}"/audit-*.jsonl; then
+        log_error "  ✗ 'storage.orphan_scan_started' missing — scan reported completion without start"
         return 1
     fi
-    log_info "  ✓ 'cloud.orphan_scan_started' present"
+    log_info "  ✓ 'storage.orphan_scan_started' present"
 
     # Fresh fixture: no orphans expected.
     if ! grep -Eq '"orphans_found":0' "${audit_dir}"/audit-*.jsonl; then
         log_error "  ✗ expected 'orphans_found:0' on the fresh fixture's completed entry"
         log_error "    matching entries:"
-        grep '"op":"cloud\.orphan_scan_completed"' "${audit_dir}"/audit-*.jsonl >&2
+        grep '"op":"storage\.orphan_scan_completed"' "${audit_dir}"/audit-*.jsonl >&2
         return 1
     fi
     log_info "  ✓ orphans_found: 0 on the fresh fixture (nothing to recover)"

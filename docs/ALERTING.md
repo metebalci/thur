@@ -23,14 +23,14 @@ off by default (useful, but potentially noisier in practice).
 
 | Class | Severity | Source | Dedup key |
 |---|---|---|---|
-| `backend_reachability` | error / info | `system cloud_check` job (VTL; VSA: future periodic ticker) | `<backend>:<failure\|recovery>` |
+| `backend_reachability` | error / info | `system storage check` job (VTL; VSA: future periodic ticker) | `<backend>:<failure\|recovery>` |
 | `audit_failure` | error | `shared/audit/src/audit_channel.rs` writer task on `AuditLog::append` Err (disk write / fsync / chain-state), via a function-pointer hook installed at boot (avoids the shared-alerting → shared-audit dep cycle) | `<op>` |
 | `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve` | `<backend>:watermark` / `<backend>:backpressure` |
 | `chap_failures` | warn | `shared/iscsi/src/transport.rs` CHAP path, surfaced by the daemon's `LoginAuditSink` adapter (VTL `IscsiLibraryLoginAudit`, VSA `IscsiDiskLoginAudit`). Per-user counter in the dispatcher; WARN fires once the user crosses `alerting.chap_failures_threshold` (default 3) inside one window | `chap:<user>` |
 
 The dispatcher special-cases `backend_reachability`: alerts fire
 only on status transitions (healthy → failing or failing → healthy),
-so a `cloud_check` invoked twice against an already-failed backend
+so a `storage check` invoked twice against an already-failed backend
 doesn't double-page.
 
 ## Rate-limiting
@@ -212,7 +212,7 @@ producers                       ┌───────────────
   audit_chan ─┐                 │  AlertingDispatcher         │
   iscsi xport ┼─► record::*  ──►│   ├─ AlertRateLimiter       │
   pool budget ┤                 │   ├─ ChapState (per-user)   │
-  cloud_check ┘                 │   ├─ BackendStatus (txns)   │
+  storage check ┘               │   ├─ BackendStatus (txns)   │
                                 │   └─ Vec<Arc<dyn AlertSink>>│
                                 │        ├ EmailSink (lettre) │
                                 │        └ WebhookSink (Tera) │
@@ -249,14 +249,15 @@ Both daemons:
 
 ## Open items (post-v1)
 
-1. **Periodic cloud-check ticker** — today `backend_reachability`
-   fires only on operator-invoked `system cloud_check`. A
+1. **Periodic storage-check ticker** — today `backend_reachability`
+   fires only on operator-invoked `system storage check`. A
    `storage.check_interval_seconds` knob (default off) would let
    overnight-failure detection ship without an operator at the
    console.
-2. **VSA `system.cloud_check` job** — VTL has the job, VSA doesn't.
-   Lift VTL's `cloud_check.rs` into a shared crate, mount on both
-   job_dispatch tables.
+2. **VSA `system.cloud_check` job** — VTL has the job (in-code job
+   kind is still `system.cloud_check`; CLI verb is `system storage
+   check`), VSA doesn't. Lift VTL's `cloud_check.rs` into a shared
+   crate, mount on both job_dispatch tables.
 3. **AlertingDispatcher::sink_specs()** — the
    `/api/v1/system/alerting` handler today labels every sink as
    `type: configured`. A sink-type round-trip would let the CLI's

@@ -16,7 +16,7 @@
 # This script asserts the surface that the Rust test can't:
 #   - the actual `thurvtl` binary parses --backend / --barcodes /
 #     --dry-run / --allow-existing
-#   - daemon-down dispatch reads `cloud.backends:` from the YAML conffile
+#   - daemon-down dispatch reads `storage.backends:` from the YAML conffile
 #     directly
 #   - precondition errors are well-shaped (missing `library init`,
 #     unknown backend, ambiguous when multiple backends configured)
@@ -194,7 +194,7 @@ test_refuses_when_uninitialized() {
 }
 
 # library restore refuses with a clear error when the operator names
-# a backend that isn't defined under `cloud.backends:`.
+# a backend that isn't defined under `storage.backends:`.
 test_refuses_unknown_backend() {
     log_test "library restore refuses an unknown backend name..."
     local data_dir="$TEST_DIR/unknown-backend"

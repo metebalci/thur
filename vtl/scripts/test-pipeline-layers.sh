@@ -6,21 +6,21 @@
 #
 # Thur VTL Pipeline-Layer Matrix Test
 #
-# Exercises each pipeline layer in isolation against a single cloud
+# Exercises each pipeline layer in isolation against a single storage
 # backend. Five runs:
 #
-#   1. baseline   : dedup local,  DCE off, encrypt off, cloud none
-#   2. + dedup    : dedup global, DCE off, encrypt off, cloud none
+#   1. baseline   : dedup local,  DCE off, encrypt off, storage zstd off
+#   2. + dedup    : dedup global, DCE off, encrypt off, storage zstd off
 #                   -> assert: second cartridge dedups against first
-#   3. + DCE      : dedup local,  DCE on,  encrypt off, cloud none
-#                   -> assert: cloud chunk bytes < 90% of input size
+#   3. + DCE      : dedup local,  DCE on,  encrypt off, storage zstd off
+#                   -> assert: chunk bytes on backend < 90% of input size
 #                              (drive-compressed before chunking)
-#   4. + encrypt  : dedup local,  DCE off, encrypt on,  cloud none
-#                   -> assert: cloud chunk bytes are ciphertext
+#   4. + encrypt  : dedup local,  DCE off, encrypt on,  storage zstd off
+#                   -> assert: chunk bytes on backend are ciphertext
 #                              (do NOT equal the plaintext fixture)
-#   5. + cloud zstd: dedup local, DCE off, encrypt off, cloud zstd
-#                   -> assert: cloud chunk bytes < 80% of input size
-#                              (post-dedup zstd at the cloud layer)
+#   5. + storage zstd: dedup local, DCE off, encrypt off, storage zstd on
+#                   -> assert: chunk bytes on backend < 80% of input size
+#                              (post-dedup zstd at the storage layer)
 #
 # Defaults to aistor-none for fast LAN iteration (override via
 # THURVTL_TEST_BACKEND). Refuses any backend with retention_mode != none
@@ -33,7 +33,7 @@
 #      earlier draft had it flipped, so the daemon never saw a
 #      MOVE MEDIUM (unload) and the chunk-seal-on-unload trigger
 #      never fired. Cartridges stayed in the drive forever, no
-#      chunks landed in cloud.
+#      chunks landed in storage.
 #   2. Unit Attention. MOVE MEDIUM (load) queues a 0x28/0x00 UA
 #      on the drive. The first SCSI command after load returns
 #      the UA and clears it; later commands work normally. The
@@ -56,7 +56,7 @@
 # accordingly.
 #
 # NOTE on sudo: the script self-elevates via `sudo KEY=VAL ... $0` and
-# forwards cloud-prefix env vars; sudo-rs on Ubuntu 26.04+ ignores `-E`
+# forwards backend-credential env vars; sudo-rs on Ubuntu 26.04+ ignores `-E`
 # so explicit forwarding is mandatory. See test-backup-storage.sh header
 # for the long form.
 #
@@ -69,13 +69,13 @@
 #   --cli-path PATH       Path to thurvtl binary
 #   --only ROW            Run a single row (1..5); omit to run all 5
 #   --keep-data           Don't clean up test data dirs (debug aid)
-#   --keep-cloud          Don't purge cloud test prefixes (debug aid)
+#   --keep-storage          Don't purge storage test prefixes (debug aid)
 #
 
 SCRIPT_DIR_RAW="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR_RAW}/../.." && pwd)"
 
-# Auto-load maintainer-private cloud credentials if the file exists.
+# Auto-load maintainer-private storage credentials if the file exists.
 if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set -a
     # shellcheck disable=SC1091
@@ -83,7 +83,7 @@ if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set +a
 fi
 
-# Self-elevate via sudo, forwarding the cloud-relevant env vars.
+# Self-elevate via sudo, forwarding the backend-relevant env vars.
 if [[ $EUID -ne 0 ]]; then
     forward=()
     for v in $(compgen -A variable); do
@@ -106,7 +106,7 @@ DAEMON_PATH=""
 CLI_PATH=""
 ONLY_ROW=""
 KEEP_DATA=0
-KEEP_CLOUD=0
+KEEP_STORAGE=0
 SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 
 while [[ $# -gt 0 ]]; do
@@ -116,7 +116,7 @@ while [[ $# -gt 0 ]]; do
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --only) ONLY_ROW="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
-        --keep-cloud) KEEP_CLOUD=1; shift ;;
+        --keep-storage) KEEP_STORAGE=1; shift ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -156,7 +156,7 @@ RETENTION=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode //
 ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
 
 if [[ "$BACKEND_TYPE" == "local" ]]; then
-    log_error "matrix needs a real cloud backend; '$THURVTL_TEST_BACKEND' is type=local"
+    log_error "matrix needs a real storage backend; '$THURVTL_TEST_BACKEND' is type=local"
     exit 1
 fi
 if [[ "$RETENTION" != "none" ]]; then
@@ -215,10 +215,10 @@ row_dir_cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
         ISCSI_CONNECTED=0
     fi
-    if [[ $KEEP_CLOUD -eq 0 ]]; then
-        cloud_purge_test_prefix
+    if [[ $KEEP_STORAGE -eq 0 ]]; then
+        storage_purge_test_prefix
     else
-        log_info "row cleanup: keeping cloud prefix $TEST_PREFIX"
+        log_info "row cleanup: keeping storage prefix $TEST_PREFIX"
     fi
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
@@ -231,10 +231,10 @@ row_dir_cleanup() {
 }
 
 # Generate a daemon config for this row. Caller passes
-# cloud_compression_algorithm as "none" | "zstd" (we only flip these
+# storage_compression_algorithm as "none" | "zstd" (we only flip these
 # two for the matrix).
 make_config() {
-    local cloud_compress="$1"
+    local storage_compress="$1"
     local backend_json
     backend_json=$(jq -c \
         ".backends.\"$THURVTL_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
@@ -254,7 +254,7 @@ disk_cache:
   disk_free_min_gb: 0
 storage:
   compression:
-    algorithm: $cloud_compress
+    algorithm: $storage_compress
   backends:
     testbackend: $backend_json
 EOFCFG
@@ -332,7 +332,7 @@ connect_iscsi() {
 # straight from disk to tape). 1 GiB total — sized for the perf
 # matrix; bigger than the 8 MiB correctness fixture so wall-clock
 # throughput numbers aren't dominated by setup overhead.
-# Mostly-compressible payload so DCE / cloud zstd assertions show
+# Mostly-compressible payload so DCE / storage zstd assertions show
 # visible size deltas.
 make_fixture() {
     local stage="$TEST_DIR/fixture-stage"
@@ -379,9 +379,9 @@ tar_to_tape() {
     }
 }
 
-# Sum the bytes of every object under our cloud test prefix (chunks +
+# Sum the bytes of every object under our storage test prefix (chunks +
 # manifest backups together). Used to compare against $FIXTURE_BYTES.
-total_cloud_bytes() {
+total_storage_bytes() {
     local subpath="${1:-}"
     local full="${TEST_PREFIX}${subpath}"
     case "$BACKEND_TYPE" in
@@ -416,10 +416,10 @@ total_cloud_bytes() {
 }
 
 # Pull a single chunk object's bytes into a local file. Used by the
-# encrypt row to assert the on-cloud bytes don't equal plaintext.
+# encrypt row to assert the on-storage bytes don't equal plaintext.
 download_first_chunk() {
     local out="$1"
-    local key; key=$(cloud_list "chunks/" | head -1)
+    local key; key=$(storage_list "chunks/" | head -1)
     [[ -z "$key" ]] && return 1
     case "$BACKEND_TYPE" in
         s3)
@@ -458,20 +458,20 @@ download_first_chunk() {
 # before the daemon starts because the daemon refuses to boot
 # without a library manifest.
 row_bring_up() {
-    local cloud_compress="$1"
-    make_config "$cloud_compress" || return 1
+    local storage_compress="$1"
+    make_config "$storage_compress" || return 1
     start_daemon || return 1
     connect_iscsi || return 1
     make_fixture || return 1
 }
 
-# Row 1: baseline. Write a fixture, verify chunks land in cloud, no
+# Row 1: baseline. Write a fixture, verify chunks land in storage, no
 # special property to assert beyond "data path works". The full
 # byte-equality + refetch coverage lives in test-backup-storage.sh —
 # the matrix is here to flag *regressions per layer*, not duplicate
 # the end-to-end suite.
 row_baseline() {
-    log_test "row 1: baseline (dedup=local, DCE=off, encrypt=off, cloud=none)"
+    log_test "row 1: baseline (dedup=local, DCE=off, encrypt=off, storage=none)"
     row_dir_setup 1
     row_bring_up "none" || { row_dir_cleanup; return 1; }
     create_cartridges 1 "local" || { row_dir_cleanup; return 1; }
@@ -479,23 +479,23 @@ row_baseline() {
     t0=$(date +%s%N)
     tar_to_tape 1 || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
         || { log_error "row 1: manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local cb; cb=$(total_cloud_bytes)
-    log_info "row 1: cloud bytes after write = $cb"
+    local cb; cb=$(total_storage_bytes)
+    log_info "row 1: storage bytes after write = $cb"
     perf_summary 1 baseline mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cb"
     if (( cb > 0 )); then
         row_dir_cleanup
         return 0
     fi
-    log_error "row 1: no bytes in cloud after write"
+    log_error "row 1: no bytes in storage after write"
     row_dir_cleanup
     return 1
 }
 
 # Row 2: cross-cartridge dedup. Write the same fixture to two carts;
-# verify the second one's cloud bytes are small enough to indicate
+# verify the second one's storage bytes are small enough to indicate
 # cross-cart sharing.
 row_dedup() {
     log_test "row 2: +dedup (cross-cartridge global dedup)"
@@ -507,12 +507,12 @@ row_dedup() {
     t0=$(date +%s%N)
     tar_to_tape 1 || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
         || { log_error "row 2: TAPE01L8 manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local bytes_after_one; bytes_after_one=$(total_cloud_bytes)
+    local bytes_after_one; bytes_after_one=$(total_storage_bytes)
     local snap_one="$TEST_DIR/chunks-after-tape01.txt"
-    cloud_chunks_snapshot "$snap_one"
+    storage_chunks_snapshot "$snap_one"
     local count_one; count_one=$(wc -l < "$snap_one")
     log_info "row 2: after TAPE01L8 — bytes=$bytes_after_one chunks=$count_one"
     perf_summary 2 dedup-first-write mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$bytes_after_one"
@@ -520,13 +520,13 @@ row_dedup() {
     t0=$(date +%s%N)
     tar_to_tape 2 || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE02L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE02L8/manifest-latest.json" 600 \
         || { log_error "row 2: TAPE02L8 manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local bytes_after_two; bytes_after_two=$(total_cloud_bytes)
+    local bytes_after_two; bytes_after_two=$(total_storage_bytes)
     local snap_two="$TEST_DIR/chunks-after-tape02.txt"
-    cloud_chunks_snapshot "$snap_two"
-    local new_chunks; new_chunks=$(cloud_chunks_new_count "$snap_one" "$snap_two")
+    storage_chunks_snapshot "$snap_two"
+    local new_chunks; new_chunks=$(storage_chunks_new_count "$snap_one" "$snap_two")
     log_info "row 2: after TAPE02L8 — bytes=$bytes_after_two new_chunks=$new_chunks"
     local byte_delta=$(( bytes_after_two - bytes_after_one ))
     perf_summary 2 dedup-second-write mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$byte_delta"
@@ -604,7 +604,7 @@ hook_set_session_key() {
     scsi_set_session_key "$TAPE_SG_DEVICE" "$key"
 }
 
-# Row 3: DCE on. Pre-tar, issue MODE SELECT page 0x0F. Assert cloud
+# Row 3: DCE on. Pre-tar, issue MODE SELECT page 0x0F. Assert storage
 # bytes are smaller than the fixture (compression worked).
 row_dce() {
     log_test "row 3: +DCE (drive-side compression via MODE SELECT page 0x0F)"
@@ -615,26 +615,26 @@ row_dce() {
     t0=$(date +%s%N)
     tar_to_tape_with_hook 1 hook_dce_on || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
         || { log_error "row 3: manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local cloud_bytes; cloud_bytes=$(total_cloud_bytes "chunks/")
-    log_info "row 3: chunk bytes-on-cloud = $cloud_bytes (input: $FIXTURE_BYTES)"
-    perf_summary 3 dce mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cloud_bytes"
+    local storage_bytes; storage_bytes=$(total_storage_bytes "chunks/")
+    log_info "row 3: chunk bytes-on-storage = $storage_bytes (input: $FIXTURE_BYTES)"
+    perf_summary 3 dce mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$storage_bytes"
     # Fixture is 8 MiB of repeating chars — DCE should compress to
     # well under 7 MiB. Generous ceiling at 90% of input.
     local ceiling=$(( FIXTURE_BYTES * 9 / 10 ))
-    if (( cloud_bytes > 0 && cloud_bytes < ceiling )); then
-        log_info "row 3: drive compression observed ($cloud_bytes < $ceiling = 90% of fixture)"
+    if (( storage_bytes > 0 && storage_bytes < ceiling )); then
+        log_info "row 3: drive compression observed ($storage_bytes < $ceiling = 90% of fixture)"
         row_dir_cleanup
         return 0
     fi
-    log_error "row 3: chunk bytes not compressed ($cloud_bytes >= $ceiling)"
+    log_error "row 3: chunk bytes not compressed ($storage_bytes >= $ceiling)"
     row_dir_cleanup
     return 1
 }
 
-# Row 4: SPOUT encryption. Set a session key, write, verify on-cloud
+# Row 4: SPOUT encryption. Set a session key, write, verify on-storage
 # bytes are NOT plaintext.
 row_encrypt() {
     log_test "row 4: +encrypt (SPOUT session key via SECURITY PROTOCOL OUT)"
@@ -645,16 +645,16 @@ row_encrypt() {
     t0=$(date +%s%N)
     tar_to_tape_with_hook 1 hook_set_session_key || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
         || { log_error "row 4: manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local enc_cloud_bytes; enc_cloud_bytes=$(total_cloud_bytes "chunks/")
-    perf_summary 4 encrypt mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$enc_cloud_bytes"
-    # Pull one chunk from the cloud and check its bytes don't match
+    local enc_storage_bytes; enc_storage_bytes=$(total_storage_bytes "chunks/")
+    perf_summary 4 encrypt mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$enc_storage_bytes"
+    # Pull one chunk from the backend and check its bytes don't match
     # the plaintext fixture. (We use head bytes; AES-GCM ciphertext
     # is high-entropy and won't share prefixes with a run of 'A's.)
     download_first_chunk "$TEST_DIR/sampled-chunk.bin" \
-        || { log_error "row 4: no chunks on cloud to sample"; row_dir_cleanup; return 1; }
+        || { log_error "row 4: no chunks on storage to sample"; row_dir_cleanup; return 1; }
     # 'A' = 0x41. If the chunk starts with that byte we either have
     # plaintext (regression) or a 1-in-256 chance with random bytes.
     # Sample more for confidence: count runs of 'A' in first 256 B —
@@ -672,10 +672,10 @@ row_encrypt() {
     return 1
 }
 
-# Row 5: cloud zstd. Write a compressible fixture; verify cloud
+# Row 5: storage zstd. Write a compressible fixture; verify storage
 # bytes are smaller than the input.
-row_cloud_zstd() {
-    log_test "row 5: +cloud zstd (cloud.compression.algorithm=zstd)"
+row_storage_zstd() {
+    log_test "row 5: +storage zstd (storage.compression.algorithm=zstd)"
     row_dir_setup 5
     row_bring_up "zstd" || { row_dir_cleanup; return 1; }
     create_cartridges 1 "local" || { row_dir_cleanup; return 1; }
@@ -684,19 +684,19 @@ row_cloud_zstd() {
     t0=$(date +%s%N)
     tar_to_tape 1 || { row_dir_cleanup; return 1; }
     t1=$(date +%s%N)
-    cloud_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
+    storage_wait_for_key "manifests/TAPE01L8/manifest-latest.json" 600 \
         || { log_error "row 5: manifest never landed"; row_dir_cleanup; return 1; }
     t2=$(date +%s%N)
-    local cloud_bytes; cloud_bytes=$(total_cloud_bytes "chunks/")
-    log_info "row 5: chunk bytes-on-cloud = $cloud_bytes (input: $FIXTURE_BYTES)"
-    perf_summary 5 cloud-zstd mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$cloud_bytes"
+    local storage_bytes; storage_bytes=$(total_storage_bytes "chunks/")
+    log_info "row 5: chunk bytes-on-storage = $storage_bytes (input: $FIXTURE_BYTES)"
+    perf_summary 5 storage-zstd mixed "$FIXTURE_BYTES" "$t0" "$t1" "$t2" "$storage_bytes"
     local ceiling=$(( FIXTURE_BYTES * 8 / 10 ))
-    if (( cloud_bytes > 0 && cloud_bytes < ceiling )); then
-        log_info "row 5: cloud compression observed ($cloud_bytes < $ceiling = 80% of fixture)"
+    if (( storage_bytes > 0 && storage_bytes < ceiling )); then
+        log_info "row 5: storage compression observed ($storage_bytes < $ceiling = 80% of fixture)"
         row_dir_cleanup
         return 0
     fi
-    log_error "row 5: cloud bytes not compressed ($cloud_bytes >= $ceiling)"
+    log_error "row 5: storage bytes not compressed ($storage_bytes >= $ceiling)"
     row_dir_cleanup
     return 1
 }
@@ -707,9 +707,9 @@ row_cloud_zstd() {
 
 trap 'row_dir_cleanup; exit 130' INT TERM
 
-# `verify_cloud_creds` from test-helpers.sh — uses BACKEND_* globals
+# `verify_storage_creds` from test-helpers.sh — uses BACKEND_* globals
 # we set above. Fails fast if AWS_ / AISTOR_ / etc are missing.
-verify_cloud_creds || exit 1
+verify_storage_creds || exit 1
 
 run_row() {
     local id="$1" name="$2" fn="$3"
@@ -731,7 +731,7 @@ run_row 1 baseline    row_baseline
 run_row 2 dedup       row_dedup
 run_row 3 dce         row_dce
 run_row 4 encrypt     row_encrypt
-run_row 5 cloud-zstd  row_cloud_zstd
+run_row 5 storage-zstd  row_storage_zstd
 
 echo ""
 echo "========================================"
