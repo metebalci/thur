@@ -1,3 +1,5 @@
+[![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=code,comments)](https://github.com/metebalci/thur/)
+
 # Thur
 
 > **Status: alpha — under active development.** Thur has not had a
