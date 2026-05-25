@@ -59,7 +59,7 @@ Thur VSA installed. To get running:
   2. sudo systemctl enable --now thurvsad
   3. thurvsa volume create myvol --size 100G
      (creates an iSCSI LUN backed by the configured backend;
-      target IQN is iqn.2025-10.com.thurvsa:volume on port 3260)
+      target IQN is iqn.2025-10.com.metebalci:thurvsa on port 3260)
 
 To use thurvsa against the running daemon, the admin socket
 (/run/thurvsa/admin.sock) is mode 0660 and owned by thurvsa:thurvsa.

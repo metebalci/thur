@@ -52,14 +52,15 @@ case "$1" in
             cat <<'EOF'
 
 Thur VTL installed. To get running:
-  1. Edit /etc/thurvtl/thurvtl.yaml — minimal starter; data_dir
-     defaults to /var/lib/thurvtl, you just uncomment a
-     cloud.backends entry. Full reference for every key:
+  1. Edit /etc/thurvtl/thurvtl.yaml — uncomment + fill in a
+     cloud.backends entry. Defaults give you a 40-slot / 3-drive
+     LTO-8 chassis at /var/lib/thurvtl; tune via the `library:`
+     block. Full reference for every key:
      /usr/share/doc/thurvtl/thurvtl.defaults.yaml
-  2. sudo thurvtl library init --slots 40 --drives 3 --lto-generation 8
-     (sudo drops privs to thurvtl; --user NAME overrides,
-      or run as `sudo -u thurvtl …` directly)
-  3. sudo systemctl enable --now thurvtld
+  2. sudo systemctl enable --now thurvtld
+     (the daemon materializes the library from the YAML on first
+      start and reconciles topology changes on every subsequent
+      start — no separate init step)
 
 To use thurvtl against the running daemon, the admin socket
 (/run/thurvtl/admin.sock) is mode 0660 and owned by thurvtl:thurvtl.

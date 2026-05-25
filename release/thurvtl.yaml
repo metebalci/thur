@@ -18,6 +18,19 @@
 # daemon must be able to read+write it.
 data_dir: "/var/lib/thurvtl"
 
+# Chassis topology — REQUIRED. The daemon materializes
+# <data_dir>/library/library.json from this block on first start and
+# reconciles YAML changes on every subsequent start. Grow ops always
+# apply; shrink ops refuse if any cartridge or loaded drive would be
+# orphaned (run `thurvtl library bounds` to see the safe-shrink
+# minima against current inventory). Defaults below give you a
+# working 40-slot / 3-drive LTO-8 chassis on first start — edit to
+# fit your needs.
+library:
+  num_slots: 40
+  num_drives: 3
+  lto_generation: 8
+
 # Cloud backends live under `cloud.backends:` below. Pick the
 # provider you need (local | s3 | gcs | azure), uncomment that block,
 # fill in the values. Each cartridge binds to one named backend at
