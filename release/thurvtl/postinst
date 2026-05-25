@@ -62,13 +62,10 @@ Thur VTL installed. To get running:
       start and reconciles topology changes on every subsequent
       start — no separate init step)
 
-To use thurvtl against the running daemon, the admin socket
-(/run/thurvtl/admin.sock) is mode 0660 and owned by thurvtl:thurvtl.
-Pick one:
-  - Add operator users to the thurvtl group:
-      sudo usermod -aG thurvtl <user>     # log out / log back in to apply
-  - Or run the CLI as the daemon user each time:
-      sudo -u thurvtl thurvtl ...
+To use thurvtl against the running daemon, add operator users to
+the thurvtl group (the admin socket /run/thurvtl/admin.sock is
+mode 0660 and owned by thurvtl:thurvtl):
+    sudo usermod -aG thurvtl <user>     # log out / log back in to apply
 
 Logs: sudo journalctl -u thurvtld -f
 EOF

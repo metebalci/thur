@@ -61,13 +61,10 @@ Thur VSA installed. To get running:
      (creates an iSCSI LUN backed by the configured backend;
       target IQN is iqn.2025-10.com.metebalci:thurvsa on port 3260)
 
-To use thurvsa against the running daemon, the admin socket
-(/run/thurvsa/admin.sock) is mode 0660 and owned by thurvsa:thurvsa.
-Pick one:
-  - Add operator users to the thurvsa group:
-      sudo usermod -aG thurvsa <user>     # log out / log back in to apply
-  - Or run the CLI as the daemon user each time:
-      sudo -u thurvsa thurvsa ...
+To use thurvsa against the running daemon, add operator users to
+the thurvsa group (the admin socket /run/thurvsa/admin.sock is
+mode 0660 and owned by thurvsa:thurvsa):
+    sudo usermod -aG thurvsa <user>     # log out / log back in to apply
 
 Logs: sudo journalctl -u thurvsad -f
 EOF
