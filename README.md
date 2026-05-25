@@ -18,10 +18,6 @@ chunk pool. Every chunk is keyed by its BLAKE3 hash, with no central
 index or database, so identical bytes from any source — across every
 volume and cartridge on a backend — are stored exactly once.
 
-The two products share that chunk pool, the dedup layer, and the
-cloud-tiering machinery, but they present different device types over
-different host protocols, and are packaged and deployed independently:
-
 - **Thur VTL** — a Virtual Tape Library that presents a spec-conformant
   SMC-3 medium changer and SSC-4 LTO-8 drive surface over iSCSI. From
   the backup software's perspective it is an ordinary tape library — no
