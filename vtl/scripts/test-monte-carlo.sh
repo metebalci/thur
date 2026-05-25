@@ -414,11 +414,11 @@ ensure_loaded() {
 }
 
 # Position at end-of-data so every write_record appends. We use
-# rewind+fsr(N) rather than `mt eod` because the latter goes pear-shaped
-# from the post-iSCSI-login `block_number=-1` "unknown" state — a probe
-# showed it corrupts subsequent writes in that path. rewind+fsr is O(N)
-# in record count but bulletproof: each fsr block is a single LBA step,
-# and the kernel/daemon agree on what those LBAs are.
+# rewind+fsr(N) rather than `mt eod`: the underlying filemark-on-READ
+# bug (#25) that made `mt eod` corrupt the next write has been fixed,
+# but rewind+fsr is still the more predictable form — each fsr block
+# is a single LBA step, and the kernel/daemon agree on what those
+# LBAs are regardless of how many filemarks sit on the medium.
 seek_eod() {
     local bc="$LOADED_CART"
     [[ -z "$bc" ]] && return 0

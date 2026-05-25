@@ -265,6 +265,74 @@ fn write_six_then_rewind_then_read_six_round_trips() {
 }
 
 #[test]
+fn read_six_on_filemark_returns_check_condition_with_fm_bit() {
+    // Regression for issue #25. A READ(6) that lands on a filemark
+    // block must surface SSC-4 §7.6's CHECK CONDITION / NO SENSE /
+    // FM=1 / INFO=allocated. Without the FM bit the Linux st driver
+    // misses the filemark, never advances `block_number`, and the
+    // empty Data-In we'd otherwise send back leaves the host's read
+    // buffer holding stale kernel bytes (the `14 00 00 08 ...`
+    // garbage the original bug reproduced).
+    let fx = Fixture::new();
+    let payload = vec![0x5Au8; 4096];
+
+    // Write one data record + one filemark, then rewind.
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
+    assert_eq!(
+        handlers::handle_write_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    let mut fm_cdb = cdb(0x10);
+    fm_cdb[4] = 1;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, fm_cdb);
+    assert_eq!(
+        handlers::handle_write_filemarks_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+
+    // Read the data block.
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut ctx = fx.ctx(&mut rp, cdb(0x08));
+    assert_eq!(
+        handlers::handle_read_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // Read across the filemark — must be CHECK CONDITION + FM.
+    let mut read_cdb = cdb(0x08);
+    // 24-bit BE transfer length = 0x000940 (2368).
+    read_cdb[2] = 0x00;
+    read_cdb[3] = 0x09;
+    read_cdb[4] = 0x40;
+    let mut rp = Pdu::synth(&read_cdb, 1, 2368, &[]);
+    let mut ctx = fx.ctx(&mut rp, read_cdb);
+    let resp = handlers::handle_read_6(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    assert!(resp.data_out.is_empty());
+    let sense = resp.sense.expect("filemark read must carry sense");
+    // Fixed-format sense: byte 0 response code 0x70, INFO valid bit
+    // 0x80; byte 2 has sense key (NO SENSE = 0x00) and FM=0x80;
+    // byte 3..7 INFO = transfer length (2368 = 0x00000940).
+    assert_eq!(sense[0] & 0x7f, 0x70, "fixed-format sense");
+    assert_eq!(sense[0] & 0x80, 0x80, "INFO valid bit set");
+    assert_eq!(sense[2] & 0x0f, 0x00, "sense key = NO SENSE");
+    assert_eq!(sense[2] & 0x80, 0x80, "FM bit set");
+    assert_eq!(sense[3], 0x00);
+    assert_eq!(sense[4], 0x00);
+    assert_eq!(sense[5], 0x09);
+    assert_eq!(sense[6], 0x40);
+    assert_eq!(sense[12], 0x00, "ASC = 0x00");
+    assert_eq!(sense[13], 0x01, "ASCQ = 0x01 (FILEMARK DETECTED)");
+}
+
+#[test]
 fn write_six_with_no_data_is_rejected() {
     let fx = Fixture::new();
     let mut p = pdu(); // empty data segment

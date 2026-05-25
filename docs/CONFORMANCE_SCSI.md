@@ -491,7 +491,7 @@ this file; SSC-4 / SMC-3 in Part 2; SBC-3 in Part 3; NVMe in
 | 0x01 | REWIND | 🟩 Yes | M | Seeks to BOM (block 0). |
 | 0x04 | FORMAT MEDIUM | 🟩 Partial | O | FORMAT field 0x00 (erase + rewind), 0x01 (apply pending Mode Page 0x11 partition layout), 0x02 (default single partition). FORMAT 0x03–0x0F return ILLEGAL REQUEST. IMMED bit ignored — completes synchronously. |
 | 0x05 | READ BLOCK LIMITS | 🟩 Yes | M | Max 16 MiB − 1 (`0x00FF_FFFF`, matches MaxBurstLength), min 0, optimal 0. |
-| 0x08 | READ(6) | 🟩 Yes | M | Variable + fixed block; SILI / FIXED bits honored. |
+| 0x08 | READ(6) | 🟩 Yes | M | Variable + fixed block; SILI / FIXED bits honored. Hitting a filemark surfaces CHECK CONDITION + NoSense + FM=1 + INFO = TRANSFER LENGTH (SSC-4 §7.6) so the host can advance position; without the FM signal the Linux st driver loses track of file boundaries on the post-relogin "unknown position" path. |
 | 0x0A | WRITE(6) | 🟩 Yes | M | Variable + fixed block; per-block WORM / legal-hold checks. |
 | 0x0B | SET CAPACITY | 🟩 Yes | O | Acts as ERASE-equivalent and persists CAPACITY PROPORTION VALUE (CDB[2..4]) in the manifest. Subsequent WRITE / WRITE FILEMARKS gate at the host-set effective capacity: 95% raises Early Warning (NoSense + EOM=1 + 0x00/0x02), 100% returns EndOfMedium (VolumeOverflow + EOM=1 + 0x00/0x02). EW is sticky-once-per-pass; rewind / locate-to-BOM / erase / SET CAPACITY clears it. IMMED bit ignored. |
 | 0x10 | WRITE FILEMARKS(6) | 🟩 Yes | M | 24-bit filemark count. |

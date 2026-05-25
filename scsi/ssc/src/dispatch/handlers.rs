@@ -748,11 +748,19 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         // Medium changer - no read operation
         return Ok(ScsiResp::check_condition());
     }
+    // Variable-block-mode transfer length (FIXED bit ignored — every
+    // READ(6) is currently treated as one logical block; cdb[2..5] is
+    // the requested byte count). Needed for the SSC-4 §7.6 filemark
+    // residual: host's allocated length minus what we returned.
+    let xfer_len =
+        ((ctx.cdb[2] as u32) << 16) | ((ctx.cdb[3] as u32) << 8) | (ctx.cdb[4] as u32);
     let mut data_out = vec![];
+    let mut is_filemark = false;
     match drive_manager.with_drive(drive_id, tsih, |cart| {
         let lba_before = cart.head_lba();
         match cart.read_next() {
             Ok(blk) => {
+                is_filemark = matches!(blk.kind, core_mediachanger::BlockKind::Filemark);
                 data_out = if blk.data.is_empty() {
                     vec![]
                 } else {
@@ -775,6 +783,26 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 chunk_id,
                 lba,
             });
+            // Filemark detection (SSC-4 §7.6): when READ(6) lands on a
+            // filemark block, the drive returns CHECK CONDITION with
+            // NO SENSE, FM=1, and INFO = residual (allocated bytes
+            // minus what was transferred — here, the host's full
+            // requested length since the filemark has zero data).
+            // Without this sense the Linux st driver doesn't know it
+            // crossed a filemark; the iSCSI layer sends back an empty
+            // Data-In with status GOOD, and the host's read buffer is
+            // left holding whatever was in it (which is what caused
+            // the post-`mt eod` corruption probed in issue #25).
+            if is_filemark {
+                let sense = scsi::sense::SenseDataBuilder::new(
+                    scsi::sense::SenseKey::NoSense,
+                    scsi::sense::ASC_FILEMARK_DETECTED,
+                )
+                .with_filemark()
+                .with_information(xfer_len)
+                .build();
+                return Ok(ScsiResp::check_condition_with_sense(sense));
+            }
             // Logical Block Protection (LTO-7+): if RDPROTECT field
             // (CDB byte 1 bits 7..5) is non-zero AND the drive's Mode
             // Page 0x0A/0xF0 LBP_R bit is set, append a 4-byte
@@ -782,9 +810,6 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             // the just-read plaintext — BLAKE3 chunk hashes + AES-GCM
             // already prove the plaintext bytes are the originals, so
             // there is no separate stored CRC to compare against.
-            // Filemark blocks (empty data) get no trailer; a real
-            // drive returns the host an empty TIR PDU and our zero-
-            // length data_out matches.
             let rdprotect = (ctx.cdb[1] >> 5) & 0x07;
             let (_, lbp_read_enabled) = drive_manager.lbp_enables(drive_id);
             if rdprotect != 0 && lbp_read_enabled && !data_out.is_empty() {
