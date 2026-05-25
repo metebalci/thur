@@ -54,7 +54,8 @@ The following capabilities are shared across both products:
 - **Cloud tiering** — S3-compatible (AWS S3, MinIO, Wasabi, …), Google
   Cloud Storage, Azure Blob. Disk is a warm cache with a per-backend
   budget and write backpressure when the budget is hit.
-- **Two-layer compression** (zstd / lz4); parallel cloud up/downloads.
+- **Compression on cloud uploads** (zstd / lz4, post-dedup); parallel
+  cloud up/downloads.
 - **CHAP authentication** for iSCSI; **TLS-PSK** for NVMe/TCP (VSA).
 - **Append-only, BLAKE3-chained audit log**; Prometheus metrics + OTLP.
 - **Optional at-rest encryption** under a pluggable DEK keystore.
@@ -69,6 +70,8 @@ Thur VTL additionally provides:
   Application-Managed Encryption.
 - Cross-region disaster recovery; cartridge migration and archive
   between cloud backends.
+- LTO-style per-block drive compression (lz4 / zstd) ahead of the
+  cloud-tier compression — off by default, matching real-drive convention.
 
 Thur VSA additionally provides:
 
