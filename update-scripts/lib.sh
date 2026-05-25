@@ -69,7 +69,9 @@ DRYRUN=0
 force=0
 DONT_RESTART=0
 DISCONNECT_ONLY=0
+USE_REPO=0
 PKGDIR=$PWD
+PKGDIR_EXPLICIT=0
 TAG=update
 # DONE is global (not function-local) so the EXIT trap can still read
 # it after update_vsa / update_vtl has returned.
@@ -81,7 +83,8 @@ die() { printf '[%s] ERROR: %s\n' "$TAG" "$*" >&2; exit 1; }
 usage() {
   cat >&2 <<EOF
 usage: $(basename "${0:-update script}") [--dry-run] [--force]
-              [--dont-restart | --disconnect-only] [package-dir]
+              [--dont-restart | --disconnect-only]
+              [--use-repo | package-dir]
 
   --dry-run          show the commands that would run; change nothing
   --force            proceed past the activating/reloading/deactivating
@@ -92,8 +95,13 @@ usage: $(basename "${0:-update script}") [--dry-run] [--force]
                      review the conffile before starting it back up
   --disconnect-only  unmount + logout only; do not touch the daemon
                      or the package (no stop, no install, no start)
+  --use-repo         install from the configured apt/yum/zypper repo
+                     instead of a local package file; refreshes repo
+                     metadata first (apt-get update / --refresh) so a
+                     newly published release is picked up
   package-dir        directory holding the package (default: current dir);
-                     the newest matching package in it is installed
+                     the newest matching package in it is installed.
+                     Mutually exclusive with --use-repo.
 EOF
 }
 
@@ -105,15 +113,21 @@ parse_args() {
       --force)           force=1 ;;
       --dont-restart)    DONT_RESTART=1 ;;
       --disconnect-only) DISCONNECT_ONLY=1 ;;
+      --use-repo)        USE_REPO=1 ;;
       -h|--help)         usage; exit 0 ;;
       --*)               usage; die "unknown option: $a" ;;
-      *)                 PKGDIR=$a ;;
+      *)                 PKGDIR=$a; PKGDIR_EXPLICIT=1 ;;
     esac
   done
   if [[ $DONT_RESTART -eq 1 && $DISCONNECT_ONLY -eq 1 ]]; then
     die "--dont-restart and --disconnect-only are mutually exclusive"
   fi
-  PKGDIR=$(cd "$PKGDIR" 2>/dev/null && pwd) || die "package dir not found: $PKGDIR"
+  if [[ $USE_REPO -eq 1 && $PKGDIR_EXPLICIT -eq 1 ]]; then
+    die "--use-repo and package-dir are mutually exclusive"
+  fi
+  if [[ $USE_REPO -eq 0 ]]; then
+    PKGDIR=$(cd "$PKGDIR" 2>/dev/null && pwd) || die "package dir not found: $PKGDIR"
+  fi
   [[ $DRYRUN -eq 1 ]] && log "DRY-RUN: nothing will be changed; planned commands shown as '[would run] ...'"
   return 0
 }
@@ -168,6 +182,42 @@ install_pkg() {
       else
         log "no dnf/yum/zypper — falling back to rpm -U (no dependency resolution)"
         cmd=(rpm -U --replacepkgs "$f")
+      fi
+      run "${cmd[@]}"
+      ;;
+  esac
+}
+
+# install_pkg_from_repo NAME — upgrade from the host's configured
+# apt / yum / zypper repository. Refreshes repo metadata first so a
+# newly published release is visible; this touches every configured
+# source, not just the thur one. NAME is the binary package name
+# (e.g. `thurvsa`). For deb, `--only-upgrade` is belt-and-suspenders
+# alongside `require_installed` — if the package is somehow absent
+# at this point, apt is a no-op rather than a fresh install (which
+# would skip the operator's conffile-edit checkpoint).
+install_pkg_from_repo() {
+  local name=$1
+  log "installing $name from configured repository (refreshes all repo metadata)"
+  case "$PKGFMT" in
+    deb)
+      if [[ $DRYRUN -eq 1 ]]; then
+        printf '  [would run] apt-get update\n'
+        printf '  [would run] apt-get install --only-upgrade -y %s\n' "$name"
+        return 0
+      fi
+      apt-get update
+      apt-get install --only-upgrade -y "$name"
+      ;;
+    rpm)
+      local -a cmd
+      if   command -v dnf    >/dev/null 2>&1; then cmd=(dnf -y --refresh upgrade "$name")
+      elif command -v yum    >/dev/null 2>&1; then cmd=(yum -y --refresh upgrade "$name")
+      elif command -v zypper >/dev/null 2>&1; then
+        run zypper --non-interactive refresh
+        cmd=(zypper --non-interactive update "$name")
+      else
+        die "no dnf/yum/zypper — --use-repo needs a repo-aware package manager"
       fi
       run "${cmd[@]}"
       ;;
@@ -341,12 +391,17 @@ print_vtl_next_steps() {
 # =====================================================================
 update_vsa() {
   TAG=vsa-update
-  local SERVICE=thurvsad IQN_MATCH=':thurvsa' NQN_MATCH='thurvsa'
+  local SERVICE=thurvsad PKGNAME=thurvsa IQN_MATCH=':thurvsa' NQN_MATCH='thurvsa'
   local STATE=/var/tmp/vsa-update.state DEV_WAIT=90
 
   need_root
-  local pkg; pkg=$(pick_pkg thurvsa)
-  log "package: $pkg"
+  local pkg=''
+  if [[ $USE_REPO -eq 1 ]]; then
+    log "package: $PKGNAME from configured repository (newest available)"
+  else
+    pkg=$(pick_pkg "$PKGNAME")
+    log "package: $pkg"
+  fi
   require_installed "$SERVICE"      # upgrade-only gate (bails clean)
   local WAS_ACTIVE
   sample_service_state "$SERVICE"   # default mode preserves this state
@@ -442,7 +497,11 @@ update_vsa() {
   else
     log "$SERVICE was $WAS_ACTIVE before this run — skipping stop"
   fi
-  install_pkg "$pkg"
+  if [[ $USE_REPO -eq 1 ]]; then
+    install_pkg_from_repo "$PKGNAME"
+  else
+    install_pkg "$pkg"
+  fi
 
   # ---- mode: --dont-restart -----------------------------------------
   if [[ $DONT_RESTART -eq 1 ]]; then
@@ -504,12 +563,17 @@ update_vsa() {
 # =====================================================================
 update_vtl() {
   TAG=vtl-update
-  local SERVICE=thurvtld IQN_MATCH=':thurvtl'
+  local SERVICE=thurvtld PKGNAME=thurvtl IQN_MATCH=':thurvtl'
   local STATED=/var/tmp/vtl-update.state.d DEV_WAIT=90
 
   need_root
-  local pkg; pkg=$(pick_pkg thurvtl)
-  log "package: $pkg"
+  local pkg=''
+  if [[ $USE_REPO -eq 1 ]]; then
+    log "package: $PKGNAME from configured repository (newest available)"
+  else
+    pkg=$(pick_pkg "$PKGNAME")
+    log "package: $pkg"
+  fi
   require_installed "$SERVICE"      # upgrade-only gate (bails clean)
   local WAS_ACTIVE
   sample_service_state "$SERVICE"   # default mode preserves this state
@@ -591,7 +655,11 @@ update_vtl() {
   else
     log "$SERVICE was $WAS_ACTIVE before this run — skipping stop"
   fi
-  install_pkg "$pkg"
+  if [[ $USE_REPO -eq 1 ]]; then
+    install_pkg_from_repo "$PKGNAME"
+  else
+    install_pkg "$pkg"
+  fi
 
   # ---- mode: --dont-restart -----------------------------------------
   if [[ $DONT_RESTART -eq 1 ]]; then

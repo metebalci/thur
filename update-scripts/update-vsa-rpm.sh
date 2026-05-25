@@ -6,7 +6,8 @@
 # update-vsa-rpm.sh — upgrade thurvsad from an .rpm package.
 #
 #   sudo ./update-vsa-rpm.sh [--dry-run]
-#               [--dont-restart | --disconnect-only] [package-dir]
+#               [--dont-restart | --disconnect-only]
+#               [--use-repo | package-dir]
 #
 # Upgrade-only wrapper — refuses if thurvsad has never been
 # installed; first install goes through `sudo rpm -i thurvsa-*.rpm`.
@@ -19,8 +20,11 @@
 # the package swap so the operator can review the conffile before
 # starting the daemon back up. --disconnect-only quiesces the host
 # (unmount + logout) without touching the daemon or the package.
-# --dry-run shows the plan without changing anything. Full sequence
-# + caveats are in lib.sh.
+# --use-repo installs from the configured dnf / yum / zypper
+# repository (refreshing repo metadata first) instead of a local
+# file — mutually exclusive with package-dir. --dry-run shows
+# the plan without changing anything. Full sequence + caveats are
+# in lib.sh.
 #
 set -euo pipefail
 PKGFMT=rpm

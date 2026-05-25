@@ -6,7 +6,8 @@
 # update-vtl-deb.sh — upgrade thurvtld from a .deb package.
 #
 #   sudo ./update-vtl-deb.sh [--dry-run] [--force]
-#               [--dont-restart | --disconnect-only] [package-dir]
+#               [--dont-restart | --disconnect-only]
+#               [--use-repo | package-dir]
 #
 # Upgrade-only wrapper — refuses if thurvtld has never been
 # installed; first install goes through `sudo dpkg -i thurvtl_*.deb`.
@@ -20,9 +21,12 @@
 # package swap so the operator can review the conffile before
 # starting the daemon back up. --disconnect-only quiesces the host
 # (LTFS unmount + iSCSI logout) without touching the daemon or the
-# package. --force proceeds even if backup-software sessions are
-# connected; --dry-run shows the plan without changing anything.
-# Full sequence + caveats are in lib.sh.
+# package. --use-repo installs from the configured apt repository
+# (apt-get update; apt-get install --only-upgrade thurvtl) instead
+# of a local file — mutually exclusive with package-dir. --force
+# proceeds even if backup-software sessions are connected;
+# --dry-run shows the plan without changing anything. Full sequence
+# + caveats are in lib.sh.
 #
 set -euo pipefail
 PKGFMT=deb

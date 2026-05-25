@@ -6,7 +6,8 @@
 # update-vtl-rpm.sh — upgrade thurvtld from an .rpm package.
 #
 #   sudo ./update-vtl-rpm.sh [--dry-run] [--force]
-#               [--dont-restart | --disconnect-only] [package-dir]
+#               [--dont-restart | --disconnect-only]
+#               [--use-repo | package-dir]
 #
 # Upgrade-only wrapper — refuses if thurvtld has never been
 # installed; first install goes through `sudo rpm -i thurvtl-*.rpm`.
@@ -21,9 +22,12 @@
 # so the operator can review the conffile before starting the
 # daemon back up. --disconnect-only quiesces the host (LTFS unmount
 # + iSCSI logout) without touching the daemon or the package.
-# --force proceeds even if backup-software sessions are connected;
-# --dry-run shows the plan without changing anything. Full sequence
-# + caveats are in lib.sh.
+# --use-repo installs from the configured dnf / yum / zypper
+# repository (refreshing repo metadata first) instead of a local
+# file — mutually exclusive with package-dir. --force proceeds
+# even if backup-software sessions are connected; --dry-run shows
+# the plan without changing anything. Full sequence + caveats are
+# in lib.sh.
 #
 set -euo pipefail
 PKGFMT=rpm

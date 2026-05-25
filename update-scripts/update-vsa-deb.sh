@@ -6,7 +6,8 @@
 # update-vsa-deb.sh — upgrade thurvsad from a .deb package.
 #
 #   sudo ./update-vsa-deb.sh [--dry-run]
-#               [--dont-restart | --disconnect-only] [package-dir]
+#               [--dont-restart | --disconnect-only]
+#               [--use-repo | package-dir]
 #
 # Upgrade-only wrapper — refuses if thurvsad has never been
 # installed; first install goes through `sudo dpkg -i thurvsa_*.deb`.
@@ -18,8 +19,11 @@
 # --dont-restart stops after the package swap so the operator can
 # review the conffile before starting the daemon back up.
 # --disconnect-only quiesces the host (unmount + logout) without
-# touching the daemon or the package. --dry-run shows the plan
-# without changing anything. Full sequence + caveats are in lib.sh.
+# touching the daemon or the package. --use-repo installs from the
+# configured apt repository (apt-get update; apt-get install
+# --only-upgrade thurvsa) instead of a local file — mutually
+# exclusive with package-dir. --dry-run shows the plan without
+# changing anything. Full sequence + caveats are in lib.sh.
 #
 set -euo pipefail
 PKGFMT=deb
