@@ -30,11 +30,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use core_block::PageCache;
+use core_block::upload_index::UploadState;
 use core_block::uploader::UploaderError;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::VolumeLookup;
 use super::inquiry::naa_locally_assigned;
+use super::odx::{JobResult, JobStatus, ROD_TOKEN_LEN, RodToken, TokenManager, TokenState};
 use super::reservations::{Nexus, ReservationManager};
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
 
@@ -770,6 +772,25 @@ pub(super) async fn extended_copy(
     registry: &Arc<dyn VolumeLookup>,
     nexus: Nexus,
     reservations: &ReservationManager,
+    tokens: &Arc<TokenManager>,
+) -> ScsiResponse {
+    if req.cdb.len() < 16 {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
+    }
+    let sa = req.cdb[1] & 0x1F;
+    match sa {
+        0x00 => extended_copy_lid1(req, registry, nexus, reservations).await,
+        0x10 => populate_token(req, registry, nexus, tokens).await,
+        0x11 => write_using_token(req, registry, nexus, reservations, tokens).await,
+        _ => ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
+    }
+}
+
+async fn extended_copy_lid1(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: Nexus,
+    reservations: &ReservationManager,
 ) -> ScsiResponse {
     let (targets, planned) = match parse_extended_copy(req, registry, &nexus, reservations) {
         Ok(v) => v,
@@ -817,21 +838,10 @@ fn parse_extended_copy(
     nexus: &Nexus,
     reservations: &ReservationManager,
 ) -> Result<(Vec<TargetHandle>, Vec<PlannedSegment>), ExtendedCopyParseError> {
-    // CDB byte 1 bits 4-0 carry the service action. Only LID1
-    // (SA 0x00) is supported. Reject ODX actions and LID4 with
-    // INVALID FIELD IN CDB — initiators interpret that as
-    // "primitive not supported" and fall back to host-side copy.
-    if req.cdb.len() < 16 {
-        return Err(ExtendedCopyParseError::Sense(
-            SenseData::INVALID_FIELD_IN_CDB,
-        ));
-    }
-    let service_action = req.cdb[1] & 0x1F;
-    if service_action != 0x00 {
-        return Err(ExtendedCopyParseError::Sense(
-            SenseData::INVALID_FIELD_IN_CDB,
-        ));
-    }
+    // Caller (`extended_copy`) has already checked CDB length and
+    // dispatched on service action — this function is only called
+    // for the LID1 path (SA 0x00).
+    //
     // PARAMETER LIST LENGTH in CDB bytes 10..14 (32-bit BE).
     let plist_len =
         u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
@@ -1058,7 +1068,10 @@ async fn extended_copy_execute(
 /// Other service actions (RECEIVE DATA, COPY ALL, FAILED SEGMENT
 /// DETAILS) aren't implemented; initiators that need them fall back
 /// to host-side accounting.
-pub(super) fn receive_copy_results(req: &ScsiRequest<'_>) -> ScsiResponse {
+pub(super) fn receive_copy_results(
+    req: &ScsiRequest<'_>,
+    tokens: &Arc<TokenManager>,
+) -> ScsiResponse {
     if req.cdb.len() < 16 {
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
@@ -1068,10 +1081,74 @@ pub(super) fn receive_copy_results(req: &ScsiRequest<'_>) -> ScsiResponse {
     let body = match sa {
         0x00 => build_copy_status_response(),
         0x03 => build_operating_parameters_response(),
+        0x07 => {
+            let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
+            build_rrti_response(tokens.job_result(list_id))
+        }
         _ => return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
     };
     let truncated: Vec<u8> = body.into_iter().take(alloc_len).collect();
     ScsiResponse::good(truncated)
+}
+
+/// Build the RECEIVE ROD TOKEN INFORMATION (SA 0x07) response per
+/// SPC-4 §6.21.2.3. Three cases:
+///
+/// - `Some(JobResult { token: Some(t), .. })` — completed POPULATE
+///   TOKEN: response carries the 512-byte ROD token wrapped in a
+///   single token descriptor.
+/// - `Some(JobResult { token: None, .. })` — completed WRITE USING
+///   TOKEN: response carries TRANSFER COUNT but no token descriptor.
+/// - `None` — no operation in progress for this LIST IDENTIFIER:
+///   response carries COPY OPERATION STATUS = 0x00 ("no copy
+///   operation in progress") and zero token / transfer counts.
+fn build_rrti_response(job: Option<JobResult>) -> Vec<u8> {
+    // Common base layout: 32-byte fixed header + 4-byte ROD TOKEN
+    // DESCRIPTORS LENGTH + optional token descriptor.
+    let mut out: Vec<u8> = Vec::with_capacity(32 + 4 + 4 + ROD_TOKEN_LEN);
+    // Reserve space for AVAILABLE DATA (filled at the end).
+    out.extend_from_slice(&[0u8; 4]);
+    let (response_to_sa, copy_op_status, transfer_blocks, token) = match job.as_ref() {
+        Some(j) => {
+            let resp_sa = if j.token.is_some() { 0x10 } else { 0x11 };
+            let status = match &j.status {
+                JobStatus::Done => 0x02u8,          // operation completed without errors
+                JobStatus::Failed { .. } => 0x03u8, // completed with errors
+            };
+            (resp_sa, status, j.transfer_blocks, j.token)
+        }
+        None => (0x10u8, 0x00u8, 0u64, None), // no operation in progress
+    };
+    out.push(response_to_sa);
+    out.push(copy_op_status);
+    out.extend_from_slice(&0u16.to_be_bytes()); // OPERATION COUNTER
+    out.extend_from_slice(&0u32.to_be_bytes()); // ESTIMATED STATUS UPDATE DELAY
+    // EXTENDED COPY COMPLETION STATUS — sense key surface; 0 on success.
+    let completion_status = match job.as_ref().map(|j| &j.status) {
+        Some(JobStatus::Failed { completion_status }) => *completion_status,
+        _ => 0,
+    };
+    out.push(completion_status);
+    out.push(0); // SENSE DATA FIELD LENGTH (we don't attach sense data)
+    out.push(0); // SENSE DATA LENGTH
+    out.push(0x01); // TRANSFER COUNT UNITS = blocks
+    out.extend_from_slice(&transfer_blocks.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // SEGMENTS PROCESSED
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    // ROD TOKEN DESCRIPTORS LENGTH + descriptor body.
+    if let Some(t) = token {
+        // One descriptor: 2-byte type-prefix + 2-byte length + 512-byte token.
+        let desc_len: u32 = (2 + 2 + ROD_TOKEN_LEN) as u32;
+        out.extend_from_slice(&desc_len.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes()); // descriptor type = 0x0000 (ROD token)
+        out.extend_from_slice(&(ROD_TOKEN_LEN as u16).to_be_bytes());
+        out.extend_from_slice(&t);
+    } else {
+        out.extend_from_slice(&0u32.to_be_bytes());
+    }
+    let available = (out.len() - 4) as u32;
+    out[0..4].copy_from_slice(&available.to_be_bytes());
+    out
 }
 
 /// One block-to-block segment with everything the executor needs.
@@ -1110,13 +1187,21 @@ async fn execute_segment(
     let len = blocks * src_sz.sector;
 
     let same_lun = std::ptr::eq(src as *const PageCache, dst as *const PageCache);
+    let same_page_size = src.page_size() == dst.page_size();
     let page = src.page_size();
-    let aligned =
-        src_off.is_multiple_of(page) && dst_off.is_multiple_of(page) && len.is_multiple_of(page);
+    let aligned = same_page_size
+        && src_off.is_multiple_of(page)
+        && dst_off.is_multiple_of(page)
+        && len.is_multiple_of(page);
     let overlap = same_lun && ranges_overlap(src_off, src_off + len, dst_off, dst_off + len);
-    if same_lun && aligned && !overlap {
-        // Fast path — page-index clone, no chunk-pool round trip.
-        src.clone_page_range(src_off, dst_off, len)
+    if aligned && !overlap {
+        // Fast path — per-page hash rebind via the cross-volume
+        // clone helper. Same-LUN delegates through the receiver-as-
+        // dst shim; cross-LUN uses the explicit src/dst signature.
+        // The helper internally falls back to a bytes copy per page
+        // when source and destination live in distinct chunk pools
+        // (mismatched backend or `DedupScope::Local` namespace).
+        src.clone_page_range_into(src_off, dst, dst_off, len)
             .await
             .map_err(|e| map_write_error(&e))?;
         return Ok("fast");
@@ -1293,6 +1378,443 @@ fn map_read_error(e: &UploaderError) -> SenseData {
     }
 }
 
+// ---------------------------------------------------------------------
+// Hyper-V ODX — POPULATE TOKEN (0x83 sa 0x10) + WRITE USING TOKEN
+// (0x83 sa 0x11). RECEIVE ROD TOKEN INFORMATION (0x84 sa 0x07) lives
+// next to `receive_copy_results` above.
+//
+// Parameter list layouts follow SPC-4 §6.18 (POPULATE TOKEN) and
+// §6.19 (WRITE USING TOKEN). Both build their data plane on top of
+// the Block Device Range Descriptor (16 bytes: 64-bit LBA + 32-bit
+// block count + 32 reserved). We cap N at 8 to match the value
+// published in VPD 0x8F descriptor 0x0000.
+// ---------------------------------------------------------------------
+
+const ODX_MAX_RANGE_DESCRIPTORS: usize = 8;
+const ODX_BDRD_BYTES: usize = 16;
+
+/// One 16-byte ODX Block Device Range Descriptor.
+struct Bdrd {
+    lba: u64,
+    blocks: u32,
+}
+
+/// Parse N consecutive BDRDs from `buf`. `buf.len()` must be exactly
+/// `N * 16`. Returns the descriptor list or `INVALID FIELD IN
+/// PARAMETER LIST` on shape errors.
+fn parse_bdrd_list(buf: &[u8]) -> Result<Vec<Bdrd>, SenseData> {
+    if !buf.len().is_multiple_of(ODX_BDRD_BYTES) {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let count = buf.len() / ODX_BDRD_BYTES;
+    if count > ODX_MAX_RANGE_DESCRIPTORS {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * ODX_BDRD_BYTES;
+        let lba = u64::from_be_bytes([
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+            buf[off + 4],
+            buf[off + 5],
+            buf[off + 6],
+            buf[off + 7],
+        ]);
+        let blocks = u32::from_be_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+        out.push(Bdrd { lba, blocks });
+    }
+    Ok(out)
+}
+
+/// POPULATE TOKEN (EXTENDED COPY service action 0x10). Snapshots the
+/// source's per-page chunk hashes across the requested LBA range,
+/// pins them in the chunk pool against eviction, mints a 512-byte
+/// ROD token, and records a `Done` job result under the CDB's LIST
+/// IDENTIFIER. The host fetches the token via
+/// RECEIVE ROD TOKEN INFORMATION (`0x84` sa `0x07`).
+///
+/// Sync-inline: the token is ready before this returns. The host's
+/// first RRTI poll sees `Done`. SPC-4 lets implementations report
+/// "in progress" intermediates, but our pipeline doesn't have
+/// useful intermediate state to surface.
+async fn populate_token(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: Nexus,
+    tokens: &Arc<TokenManager>,
+) -> ScsiResponse {
+    // POPULATE TOKEN's source is the LUN the CDB was sent to. No
+    // CSCD target descriptors.
+    let _ = nexus;
+    let src_cache = match registry.get(req.lun) {
+        Some(c) => c,
+        None => return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
+    };
+    let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
+    let plist_len =
+        u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
+    if plist_len == 0 {
+        // Zero-length parameter list is a no-op per SPC-4 §6.18.
+        return ScsiResponse::good(Vec::new());
+    }
+    if req.data_out.len() < plist_len || plist_len < 16 {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let plist = &req.data_out[..plist_len];
+    // Parameter list header (SPC-4 §6.18.2):
+    //   bytes 0-1   ROD TOKEN DATA LENGTH (BE16, plist_len - 2 here)
+    //   byte  2     IMMED (bit 0; we ignore — always sync)
+    //   byte  3     reserved
+    //   bytes 4-7   INACTIVITY TIMEOUT (BE32, seconds; 0 → default)
+    //   bytes 8-13  reserved
+    //   bytes 14-15 BLOCK DEVICE RANGE DESCRIPTORS LIST LENGTH (BE16)
+    let inactivity = u32::from_be_bytes([plist[4], plist[5], plist[6], plist[7]]);
+    let bdrd_total = u16::from_be_bytes([plist[14], plist[15]]) as usize;
+    if 16 + bdrd_total > plist.len() {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let bdrds = match parse_bdrd_list(&plist[16..16 + bdrd_total]) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
+    if bdrds.is_empty() {
+        return ScsiResponse::good(Vec::new());
+    }
+    // Range, alignment, sector-size validation against the source
+    // volume — every range must align to whole pages so the snapshot
+    // can record one chunk hash per page.
+    let sector = src_cache.sector_size();
+    let page = src_cache.page_size();
+    if !page.is_multiple_of(sector) || page == 0 {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let sectors_per_page = page / sector;
+    let sz = Sizing::from(src_cache.as_ref());
+    let mut total_blocks: u64 = 0;
+    for bd in &bdrds {
+        if bd.blocks == 0 {
+            continue;
+        }
+        let range = LbaRange {
+            lba: bd.lba,
+            blocks: bd.blocks as u64,
+        };
+        if validate_in_range(&range, &sz).is_err() {
+            return ScsiResponse::check(SenseData::LBA_OUT_OF_RANGE);
+        }
+        if !bd.lba.is_multiple_of(sectors_per_page)
+            || !(bd.blocks as u64).is_multiple_of(sectors_per_page)
+        {
+            return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+        }
+        total_blocks = total_blocks.saturating_add(bd.blocks as u64);
+    }
+    // Force a flush of any dirty source pages in the requested range
+    // so the page-index snapshot reflects host writes the dispatcher
+    // has acked. Hosts typically issue SYNCHRONIZE CACHE before ODX
+    // anyway; this is defense-in-depth so a missing host sync can't
+    // produce a stale snapshot.
+    for bd in &bdrds {
+        if bd.blocks == 0 {
+            continue;
+        }
+        let first_page = (bd.lba * sector) / page;
+        let last_page = ((bd.lba + bd.blocks as u64) * sector - 1) / page;
+        let first_u32 = match u32::try_from(first_page) {
+            Ok(v) => v,
+            Err(_) => return ScsiResponse::check(SenseData::LBA_OUT_OF_RANGE),
+        };
+        let last_u32 = match u32::try_from(last_page) {
+            Ok(v) => v,
+            Err(_) => return ScsiResponse::check(SenseData::LBA_OUT_OF_RANGE),
+        };
+        if let Err(e) = src_cache.flush_pages_in_range(first_u32, last_u32).await {
+            return ScsiResponse::check(map_write_error(&e));
+        }
+    }
+    // Snapshot per-page hashes + pin every referenced chunk.
+    let pool = src_cache.writer().pool();
+    let page_index = src_cache.writer().page_index();
+    let mut source_pages: Vec<u32> = Vec::new();
+    let mut hashes: Vec<Option<[u8; 32]>> = Vec::new();
+    let mut pins: Vec<shared_pool::PoolPinGuard> = Vec::new();
+    let mut pinned: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for bd in &bdrds {
+        if bd.blocks == 0 {
+            continue;
+        }
+        let first_page = ((bd.lba * sector) / page) as u32;
+        let pages_in_range = ((bd.blocks as u64) * sector / page) as u32;
+        for p in 0..pages_in_range {
+            let page_id = first_page + p;
+            let hash = match page_index.get(page_id) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    return ScsiResponse::check(map_read_error(&UploaderError::PageIndex(e)));
+                }
+            };
+            source_pages.push(page_id);
+            if let Some(h) = hash.as_ref()
+                && pinned.insert(*h)
+            {
+                pins.push(pool.pin(&hex::encode(h)));
+            }
+            hashes.push(hash);
+        }
+    }
+    let ttl = tokens.resolve_ttl(inactivity);
+    let manifest = src_cache.manifest();
+    let state = TokenState {
+        source_volume_uuid: manifest.uuid,
+        source_lun: req.lun,
+        source_backend: manifest.backend.clone(),
+        source_namespace: manifest.pool_namespace(),
+        source_page_size: manifest.page_size_bytes,
+        sector_size: manifest.sector_bytes,
+        source_pages,
+        hashes,
+        total_blocks,
+        deadline: std::time::Instant::now() + ttl,
+        pins,
+    };
+    let _ = tokens.mint_token(list_id, state);
+    ScsiResponse::good(Vec::new())
+}
+
+/// WRITE USING TOKEN (EXTENDED COPY service action 0x11). Look up
+/// the snapshot under the supplied ROD token; apply its per-page
+/// chunk hashes to the destination volume's `pages.idx` across the
+/// destination range. Cross-volume by design — Hyper-V's primary
+/// use of ODX is moving a VHDX between LUNs.
+///
+/// Sync-inline; records a job outcome under the CDB's LIST IDENTIFIER
+/// so RRTI can answer.
+async fn write_using_token(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: Nexus,
+    reservations: &ReservationManager,
+    tokens: &Arc<TokenManager>,
+) -> ScsiResponse {
+    let dst_cache = match registry.get(req.lun) {
+        Some(c) => c,
+        None => return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
+    };
+    if dst_cache.manifest().worm {
+        return ScsiResponse::check(SenseData::WRITE_PROTECTED);
+    }
+    if !reservations.allow_write(req.lun, &nexus) {
+        return ScsiResponse::reservation_conflict();
+    }
+    let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
+    let plist_len =
+        u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
+    if plist_len == 0 {
+        return ScsiResponse::good(Vec::new());
+    }
+    // Header (SPC-4 §6.19.2):
+    //   bytes 0-1     PARAMETER DATA LENGTH (BE16, plist_len - 2)
+    //   byte  2       IMMED (bit 0; ignored — sync)
+    //   byte  3       reserved
+    //   bytes 4-15    reserved
+    //   bytes 16-527  ROD TOKEN (512 bytes)
+    //   bytes 528-529 BLOCK DEVICE RANGE DESCRIPTORS LIST LENGTH (BE16)
+    //   bytes 530-535 reserved
+    //   bytes 536+    BDRD list
+    if req.data_out.len() < plist_len || plist_len < 16 + ROD_TOKEN_LEN + 8 {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let plist = &req.data_out[..plist_len];
+    let mut token: RodToken = [0u8; ROD_TOKEN_LEN];
+    token.copy_from_slice(&plist[16..16 + ROD_TOKEN_LEN]);
+    let bdrd_off = 16 + ROD_TOKEN_LEN + 8;
+    let bdrd_total =
+        u16::from_be_bytes([plist[16 + ROD_TOKEN_LEN], plist[16 + ROD_TOKEN_LEN + 1]]) as usize;
+    if bdrd_off + bdrd_total > plist.len() {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    }
+    let bdrds = match parse_bdrd_list(&plist[bdrd_off..bdrd_off + bdrd_total]) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
+    if bdrds.is_empty() {
+        return ScsiResponse::good(Vec::new());
+    }
+    // Token lookup + TTL check.
+    let snapshot = match tokens.snapshot_for(&token) {
+        Some(s) => s,
+        None => {
+            // Token state lookup miss: distinguish "expired" (token
+            // existed but past inactivity deadline) from "never
+            // existed" (invalid token). SPC-4 §6.18 maps the former
+            // to ASC 0x23/0x05 INVALID TOKEN OPERATION, TOKEN NOT
+            // MAINTAINED and the latter to ASC 0x23/0x07 INVALID
+            // TOKEN OPERATION, TOKEN INVALID — both under IllegalRequest.
+            let sense = if tokens.is_expired(&token) {
+                SenseData::new(scsi_spc::sense::SenseKey::IllegalRequest, 0x23, 0x05)
+            } else {
+                SenseData::new(scsi_spc::sense::SenseKey::IllegalRequest, 0x23, 0x07)
+            };
+            tokens.record_write_outcome(
+                list_id,
+                JobStatus::Failed {
+                    completion_status: sense.key as u8,
+                },
+                0,
+                tokens.resolve_ttl(0),
+            );
+            return ScsiResponse::check(sense);
+        }
+    };
+    // Page-size compatibility between source-at-snapshot-time and
+    // destination-now. Mismatched page sizes can't share hashes.
+    let dst_manifest = dst_cache.manifest();
+    if dst_manifest.page_size_bytes != snapshot.source_page_size {
+        let sense = SenseData::INVALID_FIELD_IN_PARAMETER_LIST;
+        tokens.record_write_outcome(
+            list_id,
+            JobStatus::Failed {
+                completion_status: sense.key as u8,
+            },
+            0,
+            tokens.resolve_ttl(0),
+        );
+        return ScsiResponse::check(sense);
+    }
+    let sector = dst_cache.sector_size();
+    let page = dst_cache.page_size();
+    let sectors_per_page = page / sector;
+    let sz = Sizing::from(dst_cache.as_ref());
+    // Validate every destination range + count pages so we can
+    // index into the snapshot one source page per destination page.
+    let mut total_blocks: u64 = 0;
+    let mut total_dst_pages: u64 = 0;
+    for bd in &bdrds {
+        if bd.blocks == 0 {
+            continue;
+        }
+        let range = LbaRange {
+            lba: bd.lba,
+            blocks: bd.blocks as u64,
+        };
+        if validate_in_range(&range, &sz).is_err() {
+            let sense = SenseData::LBA_OUT_OF_RANGE;
+            tokens.record_write_outcome(
+                list_id,
+                JobStatus::Failed {
+                    completion_status: sense.key as u8,
+                },
+                0,
+                tokens.resolve_ttl(0),
+            );
+            return ScsiResponse::check(sense);
+        }
+        if !bd.lba.is_multiple_of(sectors_per_page)
+            || !(bd.blocks as u64).is_multiple_of(sectors_per_page)
+        {
+            let sense = SenseData::INVALID_FIELD_IN_PARAMETER_LIST;
+            tokens.record_write_outcome(
+                list_id,
+                JobStatus::Failed {
+                    completion_status: sense.key as u8,
+                },
+                0,
+                tokens.resolve_ttl(0),
+            );
+            return ScsiResponse::check(sense);
+        }
+        total_blocks = total_blocks.saturating_add(bd.blocks as u64);
+        total_dst_pages = total_dst_pages.saturating_add((bd.blocks as u64) / sectors_per_page);
+    }
+    if total_dst_pages != snapshot.source_pages.len() as u64 {
+        // Destination must consume exactly as many pages as the
+        // token holds; partial consumption is allowed by SPC-4 but
+        // not modeled here.
+        let sense = SenseData::INVALID_FIELD_IN_PARAMETER_LIST;
+        tokens.record_write_outcome(
+            list_id,
+            JobStatus::Failed {
+                completion_status: sense.key as u8,
+            },
+            0,
+            tokens.resolve_ttl(0),
+        );
+        return ScsiResponse::check(sense);
+    }
+    // Apply: per destination page, take the matching snapshot hash
+    // and rebind dst.pages.idx to it. Cross-pool (source + dest in
+    // different pools) requires copying the chunk bytes between
+    // pools first, which we don't model in v1; if the pools don't
+    // match, refuse with INVALID FIELD IN PARAMETER LIST.
+    let same_pool = snapshot.source_backend == dst_manifest.backend
+        && snapshot.source_namespace == dst_manifest.pool_namespace();
+    if !same_pool {
+        let sense = SenseData::INVALID_FIELD_IN_PARAMETER_LIST;
+        tokens.record_write_outcome(
+            list_id,
+            JobStatus::Failed {
+                completion_status: sense.key as u8,
+            },
+            0,
+            tokens.resolve_ttl(0),
+        );
+        return ScsiResponse::check(sense);
+    }
+    let dst_pi = dst_cache.writer().page_index();
+    let dst_ui = dst_cache.writer().upload_index();
+    let mut snap_idx = 0usize;
+    for bd in &bdrds {
+        if bd.blocks == 0 {
+            continue;
+        }
+        let first_page = ((bd.lba * sector) / page) as u32;
+        let pages_in_range = ((bd.blocks as u64) * sector / page) as u32;
+        for p in 0..pages_in_range {
+            let dst_page = first_page + p;
+            let hash = &snapshot.hashes[snap_idx];
+            snap_idx += 1;
+            // Drop any cached destination entry so subsequent reads
+            // repopulate from the new page-index binding.
+            dst_cache.invalidate_cached_page(dst_page).await;
+            let res: Result<(), UploaderError> = (|| {
+                match hash {
+                    Some(h) => {
+                        dst_pi.set(dst_page, h)?;
+                        dst_ui.set(dst_page, UploadState::Uploaded)?;
+                    }
+                    None => {
+                        dst_pi.clear(dst_page)?;
+                        dst_ui.set(dst_page, UploadState::Uploaded)?;
+                    }
+                };
+                Ok(())
+            })();
+            if let Err(e) = res {
+                let sense = map_write_error(&e);
+                tokens.record_write_outcome(
+                    list_id,
+                    JobStatus::Failed {
+                        completion_status: sense.key as u8,
+                    },
+                    0,
+                    tokens.resolve_ttl(0),
+                );
+                return ScsiResponse::check(sense);
+            }
+        }
+    }
+    tokens.record_write_outcome(
+        list_id,
+        JobStatus::Done,
+        total_blocks,
+        tokens.resolve_ttl(0),
+    );
+    ScsiResponse::good(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,6 +1928,10 @@ mod tests {
 
     fn test_mgr() -> ReservationManager {
         ReservationManager::new()
+    }
+
+    fn test_tokens() -> Arc<TokenManager> {
+        Arc::new(TokenManager::new())
     }
 
     fn page_pattern(seed: u8) -> Vec<u8> {
@@ -2943,6 +3469,39 @@ mod tests {
         }
     }
 
+    /// Two volumes co-located on one tempdir + LocalBackend with
+    /// `DedupScope::Global` so they share the per-backend chunk pool —
+    /// the configuration ODX needs to reach the hash-rebind fast path
+    /// in `WRITE USING TOKEN`.
+    async fn fresh_two_volumes_global(
+        a: &str,
+        b: &str,
+    ) -> (TempDir, Arc<PageCache>, Arc<PageCache>) {
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        for name in [a, b] {
+            VolumeManifest::new(
+                name.into(),
+                8 * (1u64 << 20),
+                DEFAULT_SECTOR_BYTES,
+                DEFAULT_PAGE_SIZE_BYTES,
+                "primary".into(),
+                DedupScope::Global,
+                false,
+                0,
+            )
+            .unwrap()
+            .create(tmp.path())
+            .unwrap();
+        }
+        let wa = Arc::new(VolumeWriter::open(tmp.path(), a, backend.clone()).unwrap());
+        let wb = Arc::new(VolumeWriter::open(tmp.path(), b, backend).unwrap());
+        (tmp, PageCache::new(wa), PageCache::new(wb))
+    }
+
     /// One independent volume backed by its own tempdir + LocalBackend.
     async fn fresh_volume(name: &str) -> (TempDir, Arc<PageCache>) {
         let tmp = TempDir::new().unwrap();
@@ -3058,7 +3617,14 @@ mod tests {
         let cdb = xcopy_cdb(params.len() as u32);
         let request = req(&cdb, &params, 0);
 
-        let r = extended_copy(&request, &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &request,
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
 
         // Destination page reads back the source bytes.
@@ -3093,7 +3659,14 @@ mod tests {
         let seg = block_segment(0, 1, SECTORS_PER_PAGE as u16, 0, 0);
         let params = build_xcopy_param_list(&targets, &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
 
         let read_back = dst_cache.read_bytes(0, PAGE).await.unwrap();
@@ -3109,7 +3682,14 @@ mod tests {
             Arc::new(r)
         };
         let cdb = xcopy_cdb(0);
-        let r = extended_copy(&req(&cdb, &[], 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &[], 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert!(r.sense.is_none());
     }
 
@@ -3123,7 +3703,14 @@ mod tests {
         };
         let mut cdb = xcopy_cdb(0);
         cdb[1] = 0x01; // LID4 — not implemented
-        let r = extended_copy(&req(&cdb, &[], 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &[], 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
     }
 
@@ -3146,7 +3733,14 @@ mod tests {
         let seg = block_segment(0, 0, 1, 0, 1);
         let params = build_xcopy_param_list(&[bad_desc], &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
     }
 
@@ -3169,7 +3763,14 @@ mod tests {
         params[16..48].copy_from_slice(&target);
         params[48..76].copy_from_slice(&sd);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
     }
 
@@ -3188,7 +3789,14 @@ mod tests {
         let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, sz.total_blocks);
         let params = build_xcopy_param_list(&[target], &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert_eq!(r.sense, Some(SenseData::LBA_OUT_OF_RANGE));
     }
 
@@ -3206,7 +3814,14 @@ mod tests {
         let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
         let params = build_xcopy_param_list(&[target], &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert_eq!(r.sense, Some(SenseData::WRITE_PROTECTED));
     }
 
@@ -3228,7 +3843,14 @@ mod tests {
         let seg = block_segment(0, 0, 8, 4, 32);
         let params = build_xcopy_param_list(&[target], &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
         // Destination has the source bytes spliced in.
         let dst = cache
@@ -3252,14 +3874,21 @@ mod tests {
         let seg = block_segment(0, 0, 0, 0, 0);
         let params = build_xcopy_param_list(&[target], &[seg]);
         let cdb = xcopy_cdb(params.len() as u32);
-        let r = extended_copy(&req(&cdb, &params, 0), &registry, test_nexus(), &test_mgr()).await;
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
     }
 
     #[tokio::test]
     async fn receive_copy_results_operating_parameters_advertises_our_limits() {
         let cdb = rcr_cdb(0x03, 256);
-        let r = receive_copy_results(&req(&cdb, &[], 256));
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
         assert!(r.sense.is_none());
         let d = &r.data_in;
         // bytes 8-9 MAXIMUM TARGET DESCRIPTOR COUNT = 2.
@@ -3283,7 +3912,7 @@ mod tests {
     #[tokio::test]
     async fn receive_copy_results_copy_status_reports_completed() {
         let cdb = rcr_cdb(0x00, 256);
-        let r = receive_copy_results(&req(&cdb, &[], 256));
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
         assert!(r.sense.is_none());
         // COPY MANAGER STATUS byte = 0x02 (completed without errors).
         assert_eq!(r.data_in[4], 0x02);
@@ -3291,8 +3920,268 @@ mod tests {
 
     #[tokio::test]
     async fn receive_copy_results_unknown_service_action_rejected() {
-        let cdb = rcr_cdb(0x07, 256);
-        let r = receive_copy_results(&req(&cdb, &[], 256));
+        // 0x08 is unused — SA 0x07 (RECEIVE ROD TOKEN INFORMATION)
+        // is wired for ODX so it no longer rejects.
+        let cdb = rcr_cdb(0x08, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
+    }
+
+    // ----------------------------------------------------------------
+    // ODX (POPULATE TOKEN / WRITE USING TOKEN / RRTI sa 0x07)
+    // ----------------------------------------------------------------
+
+    /// 16-byte ODX CDB: opcode + service action in byte 1, LIST
+    /// IDENTIFIER in bytes 2..6, PARAMETER LIST LENGTH in bytes 10..14.
+    fn odx_cdb(opcode: u8, sa: u8, list_id: u32, plist_len: u32) -> [u8; 16] {
+        let mut cdb = [0u8; 16];
+        cdb[0] = opcode;
+        cdb[1] = sa & 0x1F;
+        cdb[2..6].copy_from_slice(&list_id.to_be_bytes());
+        cdb[10..14].copy_from_slice(&plist_len.to_be_bytes());
+        cdb
+    }
+
+    fn populate_token_param_list(ranges: &[(u64, u32)]) -> Vec<u8> {
+        let bdrd_total = ranges.len() * ODX_BDRD_BYTES;
+        let total = 16 + bdrd_total;
+        let mut plist = vec![0u8; total];
+        // bytes 0-1 ROD TOKEN DATA LENGTH = plist_len - 2
+        let data_len = (total - 2) as u16;
+        plist[0..2].copy_from_slice(&data_len.to_be_bytes());
+        // bytes 4-7 INACTIVITY TIMEOUT = 0 (use default)
+        // bytes 14-15 BDRD list length
+        plist[14..16].copy_from_slice(&(bdrd_total as u16).to_be_bytes());
+        let mut off = 16;
+        for (lba, blocks) in ranges {
+            plist[off..off + 8].copy_from_slice(&lba.to_be_bytes());
+            plist[off + 8..off + 12].copy_from_slice(&blocks.to_be_bytes());
+            off += ODX_BDRD_BYTES;
+        }
+        plist
+    }
+
+    fn write_using_token_param_list(token: &[u8; ROD_TOKEN_LEN], ranges: &[(u64, u32)]) -> Vec<u8> {
+        let bdrd_total = ranges.len() * ODX_BDRD_BYTES;
+        let total = 16 + ROD_TOKEN_LEN + 8 + bdrd_total;
+        let mut plist = vec![0u8; total];
+        // header length
+        let data_len = (total - 2) as u16;
+        plist[0..2].copy_from_slice(&data_len.to_be_bytes());
+        // ROD token bytes 16..528
+        plist[16..16 + ROD_TOKEN_LEN].copy_from_slice(token);
+        // BDRD list length at bytes 528..530
+        plist[16 + ROD_TOKEN_LEN..16 + ROD_TOKEN_LEN + 2]
+            .copy_from_slice(&(bdrd_total as u16).to_be_bytes());
+        // BDRD list at bytes 536..
+        let mut off = 16 + ROD_TOKEN_LEN + 8;
+        for (lba, blocks) in ranges {
+            plist[off..off + 8].copy_from_slice(&lba.to_be_bytes());
+            plist[off + 8..off + 12].copy_from_slice(&blocks.to_be_bytes());
+            off += ODX_BDRD_BYTES;
+        }
+        plist
+    }
+
+    /// Extract the 512-byte ROD token from a RRTI sa 0x07 response.
+    fn rod_token_from_rrti(body: &[u8]) -> [u8; ROD_TOKEN_LEN] {
+        // Header is 32 bytes, then ROD TOKEN DESCRIPTORS LENGTH (BE32)
+        // at 32..36, then the descriptor: 2-byte type + 2-byte length
+        // + 512-byte token. So token starts at byte 40.
+        let mut out = [0u8; ROD_TOKEN_LEN];
+        out.copy_from_slice(&body[40..40 + ROD_TOKEN_LEN]);
+        out
+    }
+
+    #[tokio::test]
+    async fn odx_round_trip_populate_then_write_using_token_across_volumes() {
+        let (_tmp, src, dst) = fresh_two_volumes_global("src_vol", "dst_vol").await;
+        // Seed two pages on the source.
+        let pattern_a = page_pattern(0x10);
+        let pattern_b = page_pattern(0x20);
+        src.write_bytes(0, &pattern_a).await.unwrap();
+        src.write_bytes(PAGE as u64, &pattern_b).await.unwrap();
+        src.flush_all().await.unwrap();
+
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src.clone());
+            r.register(1, dst.clone());
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+        let list_id: u32 = 0xCAFE_BABE;
+
+        // POPULATE TOKEN over LUN 0 (src), 2 pages = 32 sectors.
+        let pt_params = populate_token_param_list(&[(0, 2 * SECTORS_PER_PAGE as u32)]);
+        let pt_cdb = odx_cdb(0x83, 0x10, list_id, pt_params.len() as u32);
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &pt_cdb,
+                data_out: &pt_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                cid: 0,
+                peer: "",
+                session_partition: None,
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert!(r.sense.is_none(), "POPULATE TOKEN: {:?}", r.sense);
+
+        // RRTI sa 0x07 to fetch the minted token by list_id.
+        let rrti_cdb = odx_cdb(0x84, 0x07, list_id, 1024);
+        let rrti = receive_copy_results(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &rrti_cdb,
+                data_out: &[],
+                data_in_max: 1024,
+                tsih: 0,
+                initiator_iqn: None,
+                cid: 0,
+                peer: "",
+                session_partition: None,
+            },
+            &tokens,
+        );
+        assert!(rrti.sense.is_none());
+        // RESPONSE TO SERVICE ACTION = 0x10 (POPULATE TOKEN),
+        // COPY OPERATION STATUS = 0x02 (completed without errors).
+        assert_eq!(rrti.data_in[4], 0x10);
+        assert_eq!(rrti.data_in[5], 0x02);
+        let token = rod_token_from_rrti(&rrti.data_in);
+
+        // WRITE USING TOKEN onto LUN 1 (dst) at offset of page 4.
+        let dst_lba = 4 * SECTORS_PER_PAGE as u64;
+        let wut_params =
+            write_using_token_param_list(&token, &[(dst_lba, 2 * SECTORS_PER_PAGE as u32)]);
+        let wut_cdb = odx_cdb(0x83, 0x11, list_id + 1, wut_params.len() as u32);
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 1,
+                cdb: &wut_cdb,
+                data_out: &wut_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                cid: 0,
+                peer: "",
+                session_partition: None,
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert!(r.sense.is_none(), "WRITE USING TOKEN: {:?}", r.sense);
+
+        // Destination reads back the seeded patterns.
+        let read_a = dst.read_bytes(4 * PAGE as u64, PAGE).await.unwrap();
+        let read_b = dst.read_bytes(5 * PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(read_a, pattern_a, "page A bytes round-trip");
+        assert_eq!(read_b, pattern_b, "page B bytes round-trip");
+
+        // Both volumes' page-index entries point at the same chunk
+        // hashes — the cross-volume hash rebind happened.
+        let src_h0 = src.writer().page_index().get(0).unwrap().unwrap();
+        let dst_h0 = dst.writer().page_index().get(4).unwrap().unwrap();
+        assert_eq!(src_h0, dst_h0, "page 0 rebound to src hash");
+
+        // RRTI on the WRITE USING TOKEN job reports completed + 32 blocks.
+        let rrti_w_cdb = odx_cdb(0x84, 0x07, list_id + 1, 1024);
+        let rrti_w = receive_copy_results(
+            &ScsiRequest {
+                lun: 1,
+                cdb: &rrti_w_cdb,
+                data_out: &[],
+                data_in_max: 1024,
+                tsih: 0,
+                initiator_iqn: None,
+                cid: 0,
+                peer: "",
+                session_partition: None,
+            },
+            &tokens,
+        );
+        assert!(rrti_w.sense.is_none());
+        assert_eq!(rrti_w.data_in[4], 0x11);
+        assert_eq!(rrti_w.data_in[5], 0x02);
+        let transfer = u64::from_be_bytes([
+            rrti_w.data_in[16],
+            rrti_w.data_in[17],
+            rrti_w.data_in[18],
+            rrti_w.data_in[19],
+            rrti_w.data_in[20],
+            rrti_w.data_in[21],
+            rrti_w.data_in[22],
+            rrti_w.data_in[23],
+        ]);
+        assert_eq!(transfer, 2 * SECTORS_PER_PAGE as u64);
+    }
+
+    #[tokio::test]
+    async fn odx_write_using_token_with_unknown_token_rejects() {
+        let (_tmp, src, dst) = fresh_two_volumes_global("s", "d").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src);
+            r.register(1, dst);
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+        let bogus = [0x77u8; ROD_TOKEN_LEN];
+        let wut_params = write_using_token_param_list(&bogus, &[(0, SECTORS_PER_PAGE as u32)]);
+        let wut_cdb = odx_cdb(0x83, 0x11, 1, wut_params.len() as u32);
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 1,
+                cdb: &wut_cdb,
+                data_out: &wut_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                cid: 0,
+                peer: "",
+                session_partition: None,
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        let sense = r.sense.expect("must reject unknown token");
+        assert_eq!(sense.asc, 0x23);
+        assert_eq!(sense.ascq, 0x07);
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_rrti_unknown_list_id_emits_no_op_in_progress() {
+        // RRTI on a list ID with no minted token / job returns the
+        // SPC-4 "no copy operation in progress" header — COPY
+        // OPERATION STATUS = 0, no token descriptor, zero
+        // TRANSFER COUNT.
+        let cdb = rcr_cdb(0x07, 64);
+        let r = receive_copy_results(&req(&cdb, &[], 64), &test_tokens());
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+        let d = &r.data_in;
+        // AVAILABLE DATA at bytes 0..4 covers everything after byte 3.
+        let available = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+        assert_eq!(available as usize, d.len() - 4);
+        // COPY OPERATION STATUS at byte 5 — 0x00 = no op in progress.
+        assert_eq!(d[5], 0x00);
+        // TRANSFER COUNT (BE64) at bytes 16..24 is zero for the
+        // no-operation-in-progress case (UNITS at byte 15 = 0x01
+        // blocks regardless).
+        let transfer = u64::from_be_bytes([d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23]]);
+        assert_eq!(transfer, 0);
     }
 }

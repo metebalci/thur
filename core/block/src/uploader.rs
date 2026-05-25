@@ -233,6 +233,12 @@ pub enum UploaderError {
         size_bytes: u64,
     },
 
+    #[error(
+        "cannot clone between volumes with mismatched page sizes \
+         (src page_size = {src} B, dst page_size = {dst} B)"
+    )]
+    IncompatiblePageSize { src: u32, dst: u32 },
+
     #[error("invalid hash from chunk pool: {0}")]
     BadHash(String),
 

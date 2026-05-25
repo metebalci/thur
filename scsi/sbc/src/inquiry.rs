@@ -198,19 +198,27 @@ pub(crate) fn naa_locally_assigned(uuid: &[u8; 16]) -> [u8; 8] {
 /// VPD 0x8F — Third Party Copy (SPC-4 §7.7.18). Advertises the
 /// SPC-3 EXTENDED COPY (LID1) surface VAAI / VAAI-like initiators
 /// gate on before issuing offloaded copy. The page is a wrapper
-/// around a sequence of typed sub-descriptors; we publish four:
+/// around a sequence of typed sub-descriptors; we publish five:
 ///
+///   0x0000 ROD DEVICE TYPE SPECIFIC LIMITS — Hyper-V ODX probes
+///          this for ROD token lifetime + size limits. Absence is
+///          read as "no ODX" by Windows.
 ///   0x0001 SUPPORTED COMMANDS — declares opcode 0x83 (EXTENDED
-///          COPY) with service action 0x00 (LID1) and opcode 0x84
+///          COPY) with service actions 0x00 (LID1), 0x10 (POPULATE
+///          TOKEN) and 0x11 (WRITE USING TOKEN); opcode 0x84
 ///          (RECEIVE COPY RESULTS) with service actions 0x00
-///          (COPY STATUS) and 0x03 (OPERATING PARAMETERS). Without
-///          this, ESXi won't try the offload at all.
+///          (COPY STATUS), 0x03 (OPERATING PARAMETERS) and 0x07
+///          (RECEIVE ROD TOKEN INFORMATION). Without the right
+///          (opcode, SA) entries, neither ESXi nor Windows will
+///          try the corresponding offload.
 ///   0x0004 PARAMETER DATA — per-XCOPY limits matching what
 ///          RECEIVE COPY RESULTS / OPERATING PARAMETERS reports:
 ///          max target descriptors = 2, max segment descriptors = 1,
 ///          max descriptor list length = 128, max inline = 0.
 ///   0x0008 SUPPORTED DESCRIPTORS — the descriptor type codes we
-///          accept (target 0xE4, segment 0x02).
+///          accept: target 0xE4, segment 0x02, and the ODX Block
+///          Device Range Descriptor type used by POPULATE TOKEN /
+///          WRITE USING TOKEN parameter lists.
 ///   0x8001 GENERAL COPY OPERATIONS — total bytes per XCOPY cap
 ///          (16 MiB), concurrent-copy hints (1).
 ///
@@ -228,6 +236,39 @@ fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
     // numbering). After that the descriptor list begins.
     page.extend_from_slice(&[0u8; 4]);
 
+    // 0x0000 ROD DEVICE TYPE SPECIFIC LIMITS (SPC-4 §7.7.18.1) — the
+    // descriptor Hyper-V ODX gates on. Body layout (32 bytes):
+    //   byte  0       PERIPHERAL DEVICE TYPE (00h for SBC direct-access)
+    //   byte  1       reserved
+    //   bytes 2-3     reserved
+    //   bytes 4-5     MAXIMUM RANGE DESCRIPTORS (BE16)
+    //   bytes 6-9     MAXIMUM INACTIVITY TIMEOUT (BE32, seconds)
+    //   bytes 10-13   DEFAULT INACTIVITY TIMEOUT (BE32, seconds)
+    //   bytes 14-21   MAXIMUM TOKEN TRANSFER SIZE (BE64, blocks)
+    //   bytes 22-29   OPTIMAL TRANSFER COUNT (BE64, blocks)
+    //   bytes 30-31   reserved
+    //
+    // Token transfer sizes use logical block units (the volume's
+    // sector size, 4 KiB by default). Caps:
+    //   - MAX RANGE DESCRIPTORS = 8 — POPULATE TOKEN /
+    //     WRITE USING TOKEN parameter lists carry at most 8 16-byte
+    //     Block Device Range Descriptors.
+    //   - MAX TOKEN TRANSFER SIZE = 1 GiB / sector_size.
+    //   - OPTIMAL TRANSFER COUNT = 256 MiB / sector_size.
+    //   - DEFAULT / MAX INACTIVITY TIMEOUT = 300 / 600 s — matches
+    //     `odx::DEFAULT_ROD_INACTIVITY_SECS` / `MAX_ROD_INACTIVITY_SECS`.
+    let sector_size = u64::from(cache.manifest().sector_bytes);
+    let max_token_blocks = (1u64 << 30) / sector_size;
+    let optimal_blocks = (256u64 << 20) / sector_size;
+    let mut rod_body = vec![0u8; 32];
+    rod_body[0] = 0x00;
+    rod_body[4..6].copy_from_slice(&8u16.to_be_bytes());
+    rod_body[6..10].copy_from_slice(&crate::odx::MAX_ROD_INACTIVITY_SECS.to_be_bytes());
+    rod_body[10..14].copy_from_slice(&crate::odx::DEFAULT_ROD_INACTIVITY_SECS.to_be_bytes());
+    rod_body[14..22].copy_from_slice(&max_token_blocks.to_be_bytes());
+    rod_body[22..30].copy_from_slice(&optimal_blocks.to_be_bytes());
+    push_tpc_descriptor(&mut page, 0x0000, &rod_body);
+
     // 0x0001 SUPPORTED COMMANDS (per SPC-4 §7.7.18.2). One entry
     // per (opcode, service action) pair we honor. Body layout:
     //   byte 0     COMMANDS SUPPORTED LIST LENGTH
@@ -243,12 +284,18 @@ fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
     // compact form (one byte length, then a 4-byte (op, SA, SA,
     // reserved) shape) that LIO interoperates with.
     let mut commands: Vec<u8> = Vec::new();
-    // (0x83, 0x00) — EXTENDED COPY (LID1)
+    // (0x83, 0x00) — EXTENDED COPY (LID1)         [VAAI XCOPY]
     commands.extend_from_slice(&[0x83, 0x00, 0x00, 0x00]);
+    // (0x83, 0x10) — POPULATE TOKEN               [ODX]
+    commands.extend_from_slice(&[0x83, 0x00, 0x10, 0x00]);
+    // (0x83, 0x11) — WRITE USING TOKEN            [ODX]
+    commands.extend_from_slice(&[0x83, 0x00, 0x11, 0x00]);
     // (0x84, 0x00) — RECEIVE COPY RESULTS / COPY STATUS
     commands.extend_from_slice(&[0x84, 0x00, 0x00, 0x00]);
     // (0x84, 0x03) — RECEIVE COPY RESULTS / OPERATING PARAMETERS
     commands.extend_from_slice(&[0x84, 0x00, 0x03, 0x00]);
+    // (0x84, 0x07) — RECEIVE ROD TOKEN INFORMATION   [ODX]
+    commands.extend_from_slice(&[0x84, 0x00, 0x07, 0x00]);
     push_tpc_descriptor(&mut page, 0x0001, &{
         let mut body = Vec::with_capacity(1 + commands.len());
         body.push(commands.len() as u8);
@@ -271,7 +318,12 @@ fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
     // 0x0008 SUPPORTED DESCRIPTORS (SPC-4 §7.7.18.9).
     //   byte 0      SUPPORTED DESCRIPTOR IDS LIST LENGTH
     //   bytes 1..   descriptor type codes (one byte each)
-    let supported_descs = [0xE4u8, 0x02u8];
+    //
+    // 0xE4 target descriptor + 0x02 block-segment descriptor are
+    // the VAAI XCOPY shapes; 0x00 is the ODX Block Device Range
+    // Descriptor used by POPULATE TOKEN / WRITE USING TOKEN
+    // parameter lists.
+    let supported_descs = [0xE4u8, 0x02u8, 0x00u8];
     let mut sd_body = Vec::with_capacity(1 + supported_descs.len());
     sd_body.push(supported_descs.len() as u8);
     sd_body.extend_from_slice(&supported_descs);
@@ -621,11 +673,13 @@ mod tests {
 
     #[tokio::test]
     async fn vpd_third_party_copy_publishes_required_descriptors() {
-        // ESXi gates VAAI XCOPY on this page. The descriptor sequence
-        // must include 0x0001 SUPPORTED COMMANDS (with opcodes 0x83
-        // and 0x84), 0x0004 PARAMETER DATA, 0x0008 SUPPORTED
-        // DESCRIPTORS (with type codes 0xE4 and 0x02), and 0x8001
-        // GENERAL COPY OPERATIONS.
+        // ESXi VAAI XCOPY and Windows Hyper-V ODX both gate on this
+        // page. Required descriptor sequence: 0x0000 ROD LIMITS (for
+        // ODX), 0x0001 SUPPORTED COMMANDS (with opcodes 0x83 SAs
+        // 0x00 / 0x10 / 0x11 and 0x84 SAs 0x00 / 0x03 / 0x07),
+        // 0x0004 PARAMETER DATA, 0x0008 SUPPORTED DESCRIPTORS (with
+        // type codes 0xE4 / 0x02 / 0x00), and 0x8001 GENERAL COPY
+        // OPERATIONS.
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x8F, 0x00, 0x80, 0];
@@ -640,11 +694,15 @@ mod tests {
         let mut found_codes = std::collections::BTreeSet::new();
         let mut commands_body: Option<Vec<u8>> = None;
         let mut supported_descs_body: Option<Vec<u8>> = None;
+        let mut rod_limits_body: Option<Vec<u8>> = None;
         while cur + 4 <= d.len() {
             let type_code = u16::from_be_bytes([d[cur], d[cur + 1]]);
             let body_len = u16::from_be_bytes([d[cur + 2], d[cur + 3]]) as usize;
             let body = &d[cur + 4..cur + 4 + body_len];
             found_codes.insert(type_code);
+            if type_code == 0x0000 {
+                rod_limits_body = Some(body.to_vec());
+            }
             if type_code == 0x0001 {
                 commands_body = Some(body.to_vec());
             }
@@ -653,7 +711,7 @@ mod tests {
             }
             cur += 4 + body_len;
         }
-        for code in [0x0001u16, 0x0004, 0x0008, 0x8001] {
+        for code in [0x0000u16, 0x0001, 0x0004, 0x0008, 0x8001] {
             assert!(
                 found_codes.contains(&code),
                 "descriptor {code:#06x} missing"
@@ -663,16 +721,39 @@ mod tests {
         // First byte is list length; the list of opcodes follows in
         // 4-byte tuples (op, sa_hi, sa_lo, reserved).
         let len = commands[0] as usize;
-        assert!(len >= 12);
-        let entries = &commands[1..1 + len];
-        let ops: Vec<u8> = entries.chunks(4).map(|e| e[0]).collect();
-        assert!(ops.contains(&0x83), "EXTENDED COPY not advertised");
-        assert!(ops.contains(&0x84), "RECEIVE COPY RESULTS not advertised");
+        let entries: Vec<(u8, u16)> = commands[1..1 + len]
+            .chunks(4)
+            .map(|e| (e[0], u16::from_be_bytes([e[1], e[2]])))
+            .collect();
+        for want in [
+            (0x83u8, 0x0000u16),
+            (0x83, 0x0010),
+            (0x83, 0x0011),
+            (0x84, 0x0000),
+            (0x84, 0x0003),
+            (0x84, 0x0007),
+        ] {
+            assert!(
+                entries.contains(&want),
+                "SUPPORTED COMMANDS missing (op={:#04x}, sa={:#06x})",
+                want.0,
+                want.1
+            );
+        }
         let supported = supported_descs_body.expect("SUPPORTED DESCRIPTORS body present");
         // First byte is the list length, then the type codes.
         let n = supported[0] as usize;
         let types = &supported[1..1 + n];
         assert!(types.contains(&0xE4), "identification descriptor missing");
         assert!(types.contains(&0x02), "block-to-block segment missing");
+        assert!(types.contains(&0x00), "ODX block-device range missing");
+        let rod = rod_limits_body.expect("ROD LIMITS body present");
+        assert_eq!(rod.len(), 32);
+        let max_ranges = u16::from_be_bytes([rod[4], rod[5]]);
+        let max_timeout = u32::from_be_bytes([rod[6], rod[7], rod[8], rod[9]]);
+        let default_timeout = u32::from_be_bytes([rod[10], rod[11], rod[12], rod[13]]);
+        assert_eq!(max_ranges, 8);
+        assert_eq!(max_timeout, crate::odx::MAX_ROD_INACTIVITY_SECS);
+        assert_eq!(default_timeout, crate::odx::DEFAULT_ROD_INACTIVITY_SECS);
     }
 }

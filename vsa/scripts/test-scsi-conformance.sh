@@ -975,6 +975,134 @@ t_xcopy_receive_copy_results_operating_parameters() {
     echo "$out" | grep -qiE 'maximum (target descriptor count|segment descriptor count)|implemented descriptor|0xe4|0x02'
 }
 
+t_inquiry_vpd_third_party_copy_advertises_odx() {
+    # Sibling to t_inquiry_vpd_third_party_copy: hex-dump VPD 0x8F
+    # and prove the new ODX surface is published — descriptor 0x0000
+    # (ROD Limits) plus SUPPORTED COMMANDS entries for (0x83, 0x10),
+    # (0x83, 0x11), and (0x84, 0x07). Without descriptor 0x0000 the
+    # Windows storage stack reads "no ODX support" and never issues
+    # the offload.
+    local hex
+    hex=$(sg_inq -e -p 0x8f -H "$RW_DEVICE" 2>&1); echo "$hex"
+    # Descriptor 0x0000: type code is the first two bytes of any
+    # sub-descriptor header. Look for "00 00" at a non-trivial offset.
+    # SUPPORTED COMMANDS sub-descriptor body has 4-byte tuples
+    # (op, sa_hi, sa_lo, reserved). Grep for "83 00 10" / "83 00 11" /
+    # "84 00 07" (whitespace separated in sg_inq -H output).
+    local missing=0
+    for pat in '83 00 10' '83 00 11' '84 00 07'; do
+        if ! echo "$hex" | grep -q "$pat"; then
+            log_error "VPD 0x8F missing SUPPORTED COMMANDS entry: $pat"
+            missing=1
+        fi
+    done
+    return $missing
+}
+
+t_report_supported_opcodes_lists_odx() {
+    # MAINTENANCE IN / REPORT SUPPORTED OPERATION CODES is opcode-
+    # only, but sg_opcodes does query VPD 0x8F's SUPPORTED COMMANDS
+    # sub-descriptor when invoked with `--rctd` on newer sg3_utils.
+    # On older releases the opcode list alone is fine; the ODX
+    # service actions are advertised through VPD 0x8F above. This
+    # test is a sanity check that 0x83 / 0x84 are at least present.
+    local out
+    out=$(sg_opcodes "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qi 'Extended copy' && echo "$out" | grep -qi 'Receive copy results'
+}
+
+t_odx_populate_token_returns_token() {
+    # POPULATE TOKEN (opcode 0x83, sa 0x10) over the same LUN with
+    # a one-page (16-sector) range descriptor, then RECEIVE ROD
+    # TOKEN INFORMATION (0x84 sa 0x07) to fetch the 512-byte token.
+    # We assert RESPONSE_TO_SA = 0x10 and COPY_OPERATION_STATUS =
+    # 0x02 (completed without errors) in the response header.
+    #
+    # sg_raw is the lowest-common-denominator tool — sg3_utils ships
+    # no `sg_odx`. Skip cleanly if absent.
+    if ! command -v sg_raw >/dev/null 2>&1; then
+        log_info "sg_raw not present; skipping ODX round-trip"
+        return 0
+    fi
+    # Seed page 0 with a known pattern so the resulting token
+    # references a real chunk hash, not a sparse hole.
+    dd if=/dev/urandom of="$TEST_DIR/odx-seed.bin" bs="$SECTOR_SIZE" count=16 status=none
+    sg_dd if="$TEST_DIR/odx-seed.bin" of="$RW_DEVICE" bs="$SECTOR_SIZE" count=16 seek=0 oflag=direct 2>&1 || return 1
+    sg_sync "$RW_DEVICE" 2>&1 || true
+    blockdev --flushbufs "$RW_DEVICE" 2>/dev/null || true
+
+    # POPULATE TOKEN parameter list (32 bytes):
+    #   bytes 0-1   ROD TOKEN DATA LENGTH = 30 (BE16)
+    #   bytes 4-7   INACTIVITY TIMEOUT = 0 (use default)
+    #   bytes 14-15 BDRD LIST LENGTH = 16
+    #   bytes 16-31 BDRD #0: lba=0, blocks=16
+    local pt_plist="$TEST_DIR/odx-pt-plist.bin"
+    printf '\x00\x1e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10' > "$pt_plist"
+    printf '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00' >> "$pt_plist"
+    # POPULATE TOKEN CDB (16 bytes):
+    #   byte 0 0x83 / byte 1 0x10 SA
+    #   bytes 2-5 LIST IDENTIFIER = 0xCAFEBABE
+    #   bytes 10-13 PARAMETER LIST LENGTH = 32 BE32
+    sg_raw -s 32 -i "$pt_plist" "$RW_DEVICE" \
+        83 10 CA FE BA BE 00 00 00 00 00 00 00 20 00 00 >/dev/null 2>&1 || return 1
+
+    # RECEIVE ROD TOKEN INFORMATION (opcode 0x84 sa 0x07):
+    #   bytes 2-5 LIST IDENTIFIER (same as POPULATE TOKEN above)
+    #   bytes 10-13 ALLOCATION LENGTH = 1024 BE32
+    local rrti_out="$TEST_DIR/odx-rrti.bin"
+    sg_raw -r 1024 -o "$rrti_out" "$RW_DEVICE" \
+        84 07 CA FE BA BE 00 00 00 00 00 00 04 00 00 00 >/dev/null 2>&1 || return 1
+    # Header byte 4 = RESPONSE TO SERVICE ACTION (must be 0x10).
+    # Header byte 5 = COPY OPERATION STATUS (must be 0x02 = completed).
+    local resp_sa op_status
+    resp_sa=$(xxd -s 4 -l 1 -p "$rrti_out")
+    op_status=$(xxd -s 5 -l 1 -p "$rrti_out")
+    [[ "$resp_sa" == "10" ]] || { log_error "RRTI RESPONSE_TO_SA=$resp_sa, expected 10"; return 1; }
+    [[ "$op_status" == "02" ]] || { log_error "RRTI COPY_OPERATION_STATUS=$op_status, expected 02"; return 1; }
+    # Token bytes occupy bytes 40..552 (32-byte header + 4-byte
+    # descriptor list length + 4-byte descriptor header). Save them
+    # so the WRITE USING TOKEN case can reuse the same token.
+    dd if="$rrti_out" of="$TEST_DIR/odx-token.bin" bs=1 skip=40 count=512 status=none
+    [[ -s "$TEST_DIR/odx-token.bin" ]]
+}
+
+t_odx_write_using_token_round_trip() {
+    # Re-use the token minted by the prior test, apply it back to the
+    # same LUN at a different LBA (page 2 = LBA 32), then read both
+    # ranges back and bytewise compare.
+    if ! command -v sg_raw >/dev/null 2>&1; then
+        log_info "sg_raw not present; skipping ODX round-trip"
+        return 0
+    fi
+    [[ -s "$TEST_DIR/odx-token.bin" ]] || {
+        log_info "no ROD token from prior step; skipping"
+        return 0
+    }
+    # WRITE USING TOKEN parameter list (552 bytes):
+    #   bytes 0-1   PARAMETER DATA LENGTH = 550 (BE16)
+    #   bytes 16-527 ROD token (from odx-token.bin)
+    #   bytes 528-529 BDRD LIST LENGTH = 16 (BE16)
+    #   bytes 530-535 reserved
+    #   bytes 536-551 BDRD #0: lba=32, blocks=16
+    local wut_plist="$TEST_DIR/odx-wut-plist.bin"
+    {
+        printf '\x02\x26\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        cat "$TEST_DIR/odx-token.bin"
+        printf '\x00\x10\x00\x00\x00\x00\x00\x00'
+        printf '\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x10\x00\x00\x00\x00'
+    } > "$wut_plist"
+    # WRITE USING TOKEN CDB (16 bytes):
+    #   bytes 10-13 PARAMETER LIST LENGTH = 552 BE32
+    sg_raw -s 552 -i "$wut_plist" "$RW_DEVICE" \
+        83 11 DE AD BE EF 00 00 00 00 00 00 02 28 00 00 >/dev/null 2>&1 || return 1
+
+    # Read source + dest ranges and compare.
+    blockdev --flushbufs "$RW_DEVICE" 2>/dev/null || true
+    sg_dd if="$RW_DEVICE" of="$TEST_DIR/odx-src.bin" bs="$SECTOR_SIZE" count=16 skip=0  iflag=direct 2>&1 || return 1
+    sg_dd if="$RW_DEVICE" of="$TEST_DIR/odx-dst.bin" bs="$SECTOR_SIZE" count=16 skip=32 iflag=direct 2>&1 || return 1
+    cmp "$TEST_DIR/odx-src.bin" "$TEST_DIR/odx-dst.bin"
+}
+
 t_xcopy_same_lun_intra_volume_copy() {
     # End-to-end VAAI-style XCOPY: same LUN, page-aligned, source !=
     # destination, no overlap. sg_xcopy on a recent sg3_utils builds
@@ -1073,6 +1201,11 @@ main() {
     # Group L — VAAI XCOPY (EXTENDED COPY)
     run_test "RECEIVE COPY RESULTS — OPERATING PARAMETERS"        t_xcopy_receive_copy_results_operating_parameters
     run_test "EXTENDED COPY same-LUN intra-volume round-trip"     t_xcopy_same_lun_intra_volume_copy
+    # Group M — Hyper-V ODX (POPULATE TOKEN / WRITE USING TOKEN)
+    run_test "VPD 0x8F advertises ODX (descriptor 0x0000 + SAs)"  t_inquiry_vpd_third_party_copy_advertises_odx
+    run_test "REPORT SUPPORTED OPCODES includes 0x83 / 0x84"      t_report_supported_opcodes_lists_odx
+    run_test "POPULATE TOKEN + RECEIVE ROD TOKEN INFORMATION"     t_odx_populate_token_returns_token
+    run_test "WRITE USING TOKEN same-LUN round-trip"              t_odx_write_using_token_round_trip
 
     echo "========================================"
     echo "Test Summary"

@@ -7,7 +7,7 @@ use crate::chunk_store::ChunkStore;
 use crate::errors::Result;
 use crate::lru_index::LruIndexFile;
 use shared_object_store::ObjectStoreBackend;
-use shared_pool::PoolBudget;
+use shared_pool::{ChunkPool, PoolBudget};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -216,6 +216,11 @@ impl DiskCacheManager {
         let mut candidates = self.collect_eviction_candidates(&cartridges)?;
         let pinned = self.collect_pinned_hashes(&cartridges)?;
 
+        let before_token = candidates.len();
+        candidates.retain(|c| {
+            !ChunkPool::is_pinned_for(&self.backend_name, c.namespace.as_deref(), &c.hash)
+        });
+        let pinned_token = before_token - candidates.len();
         let pinned_recent = if self.recent_seal_pin_seconds > 0 {
             let cutoff = now_unix_secs().saturating_sub(self.recent_seal_pin_seconds);
             let before = candidates.len();
@@ -226,10 +231,10 @@ impl DiskCacheManager {
         };
 
         if candidates.is_empty() {
-            if pinned_recent > 0 {
+            if pinned_recent > 0 || pinned_token > 0 {
                 warn!(
-                    "All {} candidate chunk(s) pinned by recent-seal window ({}s) - eviction can't proceed until the window slides forward",
-                    pinned_recent, self.recent_seal_pin_seconds,
+                    "All candidate chunk(s) pinned ({} by outstanding ROD token, {} by recent-seal window {}s) - eviction can't proceed until pins drop",
+                    pinned_token, pinned_recent, self.recent_seal_pin_seconds,
                 );
             } else {
                 warn!(
@@ -243,13 +248,14 @@ impl DiskCacheManager {
         candidates.sort_by_key(|c| c.last_accessed);
 
         info!(
-            "Found {} eviction candidates ({} unique hashes, {} pinned by recent-seal {}s), need to free {} bytes",
+            "Found {} eviction candidates ({} unique hashes, {} pinned by ROD token, {} pinned by recent-seal {}s), need to free {} bytes",
             candidates.len(),
             candidates
                 .iter()
                 .map(|c| c.hash.clone())
                 .collect::<HashSet<_>>()
                 .len(),
+            pinned_token,
             pinned_recent,
             self.recent_seal_pin_seconds,
             bytes_to_free

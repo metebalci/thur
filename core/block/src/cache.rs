@@ -555,96 +555,75 @@ impl PageCache {
         dst_byte_offset: u64,
         len: u64,
     ) -> Result<(), UploaderError> {
+        self.clone_page_range_into(src_byte_offset, self, dst_byte_offset, len)
+            .await
+    }
+
+    /// Cross-volume variant of [`Self::clone_page_range`]: clone
+    /// `len` bytes from `self` (source) into `dst` (destination)
+    /// without round-tripping through host memory when every per-page
+    /// case allows hash-index rebinding. The receiver is the source —
+    /// `self.clone_page_range_into(src_off, &dst, dst_off, len)` reads
+    /// like "self into dst at dst_off."
+    ///
+    /// Powers two callers:
+    /// - VAAI XCOPY same-volume fast path — delegated through
+    ///   [`Self::clone_page_range`] with `dst = self`.
+    /// - Hyper-V ODX `WRITE USING TOKEN` cross-volume fast path —
+    ///   `src` and `dst` are distinct `PageCache` instances on the
+    ///   same backend.
+    ///
+    /// Cross-volume hash rebind is only safe when source and
+    /// destination share the same chunk pool (same backend +
+    /// matching dedup-scope namespace), since the destination's
+    /// later reads resolve the rebound hash from `dst`'s pool. When
+    /// either constraint fails (different backends, mismatched
+    /// `DedupScope::Local` namespaces), the per-page logic falls
+    /// back to a full bytes copy through host memory; correctness is
+    /// preserved at the cost of going off-fast-path.
+    ///
+    /// Returns [`UploaderError::IncompatiblePageSize`] when the two
+    /// caches differ on `page_size_bytes` — there is no meaningful
+    /// per-page mapping in that case and the caller must shape its
+    /// own bytes-copy fallback.
+    pub async fn clone_page_range_into(
+        &self,
+        src_byte_offset: u64,
+        dst: &PageCache,
+        dst_byte_offset: u64,
+        len: u64,
+    ) -> Result<(), UploaderError> {
+        if self.page_size != dst.page_size {
+            return Err(UploaderError::IncompatiblePageSize {
+                src: self.page_size as u32,
+                dst: dst.page_size as u32,
+            });
+        }
         debug_assert_eq!(src_byte_offset % self.page_size, 0);
-        debug_assert_eq!(dst_byte_offset % self.page_size, 0);
+        debug_assert_eq!(dst_byte_offset % dst.page_size, 0);
         debug_assert_eq!(len % self.page_size, 0);
         if len == 0 {
             return Ok(());
         }
         let pages = len / self.page_size;
         let src_first_u64 = src_byte_offset / self.page_size;
-        let dst_first_u64 = dst_byte_offset / self.page_size;
+        let dst_first_u64 = dst_byte_offset / dst.page_size;
         for i in 0..pages {
-            let src =
+            let src_id =
                 u32::try_from(src_first_u64 + i).map_err(|_| UploaderError::PageOutOfRange {
                     page_id: src_first_u64 + i,
                     page_size: self.page_size as u32,
                     size_bytes: self.size_bytes(),
                 })?;
-            let dst =
+            let dst_id =
                 u32::try_from(dst_first_u64 + i).map_err(|_| UploaderError::PageOutOfRange {
                     page_id: dst_first_u64 + i,
-                    page_size: self.page_size as u32,
-                    size_bytes: self.size_bytes(),
+                    page_size: dst.page_size as u32,
+                    size_bytes: dst.size_bytes(),
                 })?;
-            self.clone_one_page(src, dst).await?;
+            clone_one_page_into(self, src_id, dst, dst_id).await?;
         }
-        self.bump_host_bytes(len);
-        Ok(())
-    }
-
-    /// Per-page clone helper — the case analysis described in the
-    /// doc comment on [`Self::clone_page_range`].
-    async fn clone_one_page(&self, src: PageId, dst: PageId) -> Result<(), UploaderError> {
-        if src == dst {
-            return Ok(());
-        }
-        // Snapshot the source's cache state under the lock. We only
-        // need the bytes when the source is dirty; the clean case
-        // resolves through the page index instead and the bytes
-        // there would just be a stale clone.
-        let src_dirty_bytes = {
-            let inner = self.inner.lock().await;
-            match inner.pages.get(&src) {
-                Some(e) if e.state == PageState::Dirty => Some(e.bytes.clone()),
-                _ => None,
-            }
-        };
-        if let Some(bytes) = src_dirty_bytes {
-            // Case 1: dirty bytes copy. install_full_page marks the
-            // destination dirty so a later flush computes its hash
-            // through the normal pipeline (natural dedup if the
-            // bytes match the source's eventual hash).
-            self.install_full_page(dst, bytes).await?;
-            return Ok(());
-        }
-        // Source is not dirty in cache. The page index — possibly
-        // empty for a sparse-hole source — is the authoritative
-        // resolution. Before touching it, check that the chunk it
-        // points at has already been acknowledged by cloud; if not,
-        // fall back to a bytes copy so the destination doesn't
-        // inherit a SYNC-tracker entry it can never wait on.
-        let src_upload_state = self.writer.upload_index().read(src)?;
-        if !matches!(src_upload_state, UploadState::Uploaded) {
-            let bytes = self.acquire_page(src).await?;
-            self.install_full_page(dst, bytes).await?;
-            return Ok(());
-        }
-        // Case 2: hash clone. Drop the destination from cache so the
-        // next host read repopulates from the freshly-bound page
-        // index entry instead of returning stale cached bytes.
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.pages.remove(&dst).is_some() {
-                inner.lru_remove(dst);
-                inner.dirty.remove(&dst);
-            }
-        }
-        match self.writer.page_index().get(src)? {
-            Some(hash) => {
-                self.writer.page_index().set(dst, &hash)?;
-                // The destination now points at the same already-
-                // uploaded chunk as the source — its upload state
-                // is Uploaded by construction.
-                self.writer.upload_index().set(dst, UploadState::Uploaded)?;
-            }
-            None => {
-                // Source is a sparse hole; destination becomes one
-                // too. SBC-3 §5.7 reads-as-zero applies.
-                self.writer.page_index().clear(dst)?;
-                self.writer.upload_index().set(dst, UploadState::Uploaded)?;
-            }
-        }
+        dst.bump_host_bytes(len);
         Ok(())
     }
 
@@ -1061,9 +1040,26 @@ impl PageCache {
     /// Awaits each cloud upload sequentially — concurrent flushes
     /// against the same cloud backend can saturate it; thurvsa
     /// workloads don't currently need parallel sync flushes.
-    async fn flush_pages_in_range(&self, first: PageId, last: PageId) -> Result<(), UploaderError> {
+    pub async fn flush_pages_in_range(
+        &self,
+        first: PageId,
+        last: PageId,
+    ) -> Result<(), UploaderError> {
         self.flush_drain(move |dirty, n| dirty.range(first..=last).take(n).copied().collect())
             .await
+    }
+
+    /// Drop a single cached page entry without going through the
+    /// dirty-flush path. Caller asserts the page's on-disk state
+    /// has been authoritatively rewritten (e.g. ODX `WRITE USING
+    /// TOKEN` rebound `pages.idx[page_id]` to a different hash) and
+    /// that any cached bytes would be stale.
+    pub async fn invalidate_cached_page(&self, page_id: PageId) {
+        let mut inner = self.inner.lock().await;
+        if inner.pages.remove(&page_id).is_some() {
+            inner.lru_remove(page_id);
+            inner.dirty.remove(&page_id);
+        }
     }
 
     /// Shared drain loop for `flush_all` and `flush_pages_in_range`.
@@ -1175,6 +1171,92 @@ impl PageCache {
             self.flush_notify.notify_one();
         }
     }
+}
+
+/// Per-page clone shared by [`PageCache::clone_page_range`] (same
+/// volume, `src` and `dst` are the same `Arc`) and the cross-volume
+/// ODX path (distinct volumes on the same backend + matching pool
+/// namespace). Three case branches:
+///
+/// 1. **Source dirty in cache** — copy the cached bytes and install
+///    them as a dirty page on the destination. One memcpy, no pool
+///    or backend IO.
+/// 2. **Source clean and `Uploaded`, same pool namespace** — rebind
+///    `dst`'s page-index slot to the source's chunk hash and mark
+///    the destination's upload state `Uploaded`. Zero data IO; the
+///    chunk now has two page-index references.
+/// 3. **Source `LocalOnly` (pending upload) OR cross-pool mismatch**
+///    — full bytes copy through `acquire_page` + `install_full_page`.
+///    Cross-pool happens when the two volumes are scoped
+///    `DedupScope::Local` to different namespaces; the hash isn't
+///    reachable from `dst`'s pool, so a rebind would leave the
+///    destination unable to read the chunk back.
+async fn clone_one_page_into(
+    src: &PageCache,
+    src_id: PageId,
+    dst: &PageCache,
+    dst_id: PageId,
+) -> Result<(), UploaderError> {
+    if std::ptr::eq(src, dst) && src_id == dst_id {
+        return Ok(());
+    }
+    // Case 1: source dirty in cache.
+    let src_dirty_bytes = {
+        let inner = src.inner.lock().await;
+        match inner.pages.get(&src_id) {
+            Some(e) if e.state == PageState::Dirty => Some(e.bytes.clone()),
+            _ => None,
+        }
+    };
+    if let Some(bytes) = src_dirty_bytes {
+        dst.install_full_page(dst_id, bytes).await?;
+        return Ok(());
+    }
+    // Case 3 trigger A — source not yet acked by backend; bytes copy.
+    let src_upload_state = src.writer.upload_index().read(src_id)?;
+    if !matches!(src_upload_state, UploadState::Uploaded) {
+        let bytes = src.acquire_page(src_id).await?;
+        dst.install_full_page(dst_id, bytes).await?;
+        return Ok(());
+    }
+    // Case 3 trigger B — cross-pool: source and destination live in
+    // distinct chunk pools (different backend or different Local
+    // namespace), so the source's hash isn't addressable from
+    // `dst.pool`. Fall back to bytes copy.
+    let same_pool = src.writer.manifest().backend == dst.writer.manifest().backend
+        && src.writer.manifest().pool_namespace() == dst.writer.manifest().pool_namespace();
+    if !same_pool {
+        let bytes = src.acquire_page(src_id).await?;
+        dst.install_full_page(dst_id, bytes).await?;
+        return Ok(());
+    }
+    // Case 2: hash rebind. Drop any cached destination entry so the
+    // next host read repopulates from the freshly-bound page-index
+    // entry instead of returning stale cached bytes.
+    {
+        let mut inner = dst.inner.lock().await;
+        if inner.pages.remove(&dst_id).is_some() {
+            inner.lru_remove(dst_id);
+            inner.dirty.remove(&dst_id);
+        }
+    }
+    match src.writer.page_index().get(src_id)? {
+        Some(hash) => {
+            dst.writer.page_index().set(dst_id, &hash)?;
+            dst.writer
+                .upload_index()
+                .set(dst_id, UploadState::Uploaded)?;
+        }
+        None => {
+            // Source is a sparse hole; destination becomes one too.
+            // SBC-3 §5.7 reads-as-zero applies.
+            dst.writer.page_index().clear(dst_id)?;
+            dst.writer
+                .upload_index()
+                .set(dst_id, UploadState::Uploaded)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2185,5 +2267,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.host_bytes_written(), before + PAGE as u64);
+    }
+
+    /// Build two volumes against one shared backend root + one shared
+    /// `tmp/` data dir. `dedup` controls whether they share the pool
+    /// (Global) or each get their own namespaced sub-pool (Local).
+    async fn fixture_two_caches(
+        size_bytes: u64,
+        dedup: DedupScope,
+    ) -> (
+        TempDir,
+        Arc<PageCache>,
+        Arc<PageCache>,
+        Arc<VolumeWriter>,
+        Arc<VolumeWriter>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let cloud = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let backend = LocalBackend::new(&cloud).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        for name in ["src_vol", "dst_vol"] {
+            VolumeManifest::new(
+                name.into(),
+                size_bytes,
+                DEFAULT_SECTOR_BYTES,
+                DEFAULT_PAGE_SIZE_BYTES,
+                "primary".into(),
+                dedup,
+                false,
+                0,
+            )
+            .unwrap()
+            .create(tmp.path())
+            .unwrap();
+        }
+        let w_src = Arc::new(VolumeWriter::open(tmp.path(), "src_vol", backend.clone()).unwrap());
+        let w_dst = Arc::new(VolumeWriter::open(tmp.path(), "dst_vol", backend).unwrap());
+        let c_src = PageCache::new(w_src.clone());
+        let c_dst = PageCache::new(w_dst.clone());
+        (tmp, c_src, c_dst, w_src, w_dst)
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_into_cross_volume_global_takes_hash_fast_path() {
+        // Global dedup: both volumes share the per-backend pool.
+        // Cross-volume clone must rebind hashes without touching cloud
+        // bytes — verified by reading the rebound page-index slot.
+        let (_tmp, c_src, c_dst, w_src, w_dst) =
+            fixture_two_caches(8 * (1u64 << 20), DedupScope::Global).await;
+        let bytes = pattern(0x77, PAGE);
+        c_src.write_bytes(0, &bytes).await.unwrap();
+        c_src.flush_all().await.unwrap();
+        let src_hash = w_src.page_index().get(0).unwrap().unwrap();
+
+        c_src
+            .clone_page_range_into(0, &c_dst, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+
+        let dst_hash = w_dst.page_index().get(1).unwrap().unwrap();
+        assert_eq!(
+            dst_hash, src_hash,
+            "Global-scope cross-vol clone must rebind to the source's hash"
+        );
+        let read = c_dst.read_bytes(PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(read, bytes);
+    }
+
+    #[tokio::test]
+    async fn clone_page_range_into_cross_volume_local_falls_back_to_bytes_copy() {
+        // Local dedup: each volume gets its own namespaced sub-pool,
+        // so the source's hash isn't reachable from the destination's
+        // pool — the per-page helper must fall back to a bytes copy
+        // (correctness is what matters; the dst still ends up with
+        // identical bytes, just routed through host memory).
+        let (_tmp, c_src, c_dst, _w_src, _w_dst) =
+            fixture_two_caches(8 * (1u64 << 20), DedupScope::Local).await;
+        let bytes = pattern(0x99, PAGE);
+        c_src.write_bytes(0, &bytes).await.unwrap();
+        c_src.flush_all().await.unwrap();
+
+        c_src
+            .clone_page_range_into(0, &c_dst, 0, PAGE as u64)
+            .await
+            .unwrap();
+
+        let read = c_dst.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(read, bytes);
     }
 }

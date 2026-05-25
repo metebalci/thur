@@ -27,8 +27,16 @@ shared-iscsi = { path = "../../shared/iscsi" }
 shared-telemetry = { path = "../../shared/telemetry" }
 
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 tracing = "0.1"
+# OsRng for minting the 512-byte ROD tokens that POPULATE TOKEN
+# returns to the host. Token bytes are opaque to initiators; we
+# only require they don't collide across outstanding tokens.
+rand = "0.8"
+# PoolPinGuard handed to TokenState so the chunk-pool eviction
+# worker and the manifest-walking GC skip the chunks an outstanding
+# ROD token references.
+shared-pool = { path = "../../shared/pool" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

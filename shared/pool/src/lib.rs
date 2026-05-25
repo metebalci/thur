@@ -65,14 +65,57 @@ pub mod disk_cache_size;
 pub use budget::{BackpressureError, PoolBudget};
 pub use disk_cache_size::{DiskCacheBounds, DiskCacheSize};
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blake3::Hasher;
 use thiserror::Error;
 use tracing::warn;
+
+/// Process-global pin table for outstanding chunk references that
+/// outlive any single live `pages.idx` entry — at present only the
+/// Hyper-V ODX (`POPULATE TOKEN` → `WRITE USING TOKEN`) flow holds
+/// these. Keyed by `(backend, namespace, hash_hex)` with a refcount
+/// value; the eviction sweep and the manifest-walking GC both consult
+/// [`ChunkPool::is_pinned`] before removing a chunk file.
+///
+/// In-memory only — process restart drops every pin, which matches
+/// ODX semantics (tokens are TTL-bounded and don't survive daemon
+/// restart). Pin acquisition is a take-the-mutex, bump-the-counter
+/// operation; uncontended pin/unpin pairs are sub-microsecond.
+type PinKey = (String, Option<String>, String);
+static PIN_TABLE: Mutex<BTreeMap<PinKey, u32>> = Mutex::new(BTreeMap::new());
+
+/// RAII handle returned by [`ChunkPool::pin`]. Drop decrements the
+/// refcount and removes the entry when it hits zero. Cheap to hold —
+/// three `String`s — and `Send + Sync`, so token state can keep a
+/// `Vec<PoolPinGuard>` across `.await` points.
+#[derive(Debug)]
+pub struct PoolPinGuard {
+    key: Option<PinKey>,
+}
+
+impl Drop for PoolPinGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let mut table = match PIN_TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(slot) = table.get_mut(&key) {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                table.remove(&key);
+            }
+        }
+    }
+}
 
 // Per-process monotonic counter for tempfile names. Combined with the
 // pid this gives every concurrent insert_* call a unique sibling
@@ -375,6 +418,65 @@ impl ChunkPool {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Increment the process-global refcount on `hash_hex` for this
+    /// pool's `(backend, namespace)` and return a guard whose drop
+    /// decrements it. While at least one guard is alive,
+    /// [`Self::is_pinned`] returns `true` and the eviction worker
+    /// (`DiskCacheManager::evict_lru_chunks`) plus the manifest-walking
+    /// GC skip the chunk file.
+    ///
+    /// Pinning does **not** materialize the chunk locally, hash-check
+    /// it, or extend its TTL on the backend — it only blocks local
+    /// removal. The caller is responsible for fetching the chunk
+    /// (typically via `ChunkPool::insert_verified_bytes` from a
+    /// backend GET) before the pinned reference is consumed.
+    pub fn pin(&self, hash_hex: &str) -> PoolPinGuard {
+        let key: PinKey = (
+            self.backend_name.clone(),
+            self.namespace.clone(),
+            hash_hex.to_string(),
+        );
+        let mut table = match PIN_TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *table.entry(key.clone()).or_insert(0) += 1;
+        PoolPinGuard { key: Some(key) }
+    }
+
+    /// True iff at least one [`PoolPinGuard`] is currently alive for
+    /// `hash_hex` in this pool. Cheap (one mutex lock + map lookup);
+    /// fine to call per-chunk inside an eviction sweep.
+    pub fn is_pinned(&self, hash_hex: &str) -> bool {
+        let key: PinKey = (
+            self.backend_name.clone(),
+            self.namespace.clone(),
+            hash_hex.to_string(),
+        );
+        let table = match PIN_TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        table.get(&key).copied().unwrap_or(0) > 0
+    }
+
+    /// Backend-scoped pin check that doesn't require an open pool
+    /// instance — used by the manifest-walking GC, which iterates
+    /// namespaces from disk without constructing one `ChunkPool` per
+    /// chunk.
+    pub fn is_pinned_for(backend: &str, namespace: Option<&str>, hash_hex: &str) -> bool {
+        let key: PinKey = (
+            backend.to_string(),
+            namespace.map(str::to_string),
+            hash_hex.to_string(),
+        );
+        let table = match PIN_TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        table.get(&key).copied().unwrap_or(0) > 0
     }
 
     /// Walk every chunk currently in this pool. Yields
@@ -841,6 +943,63 @@ mod tests {
             );
         }
         assert_eq!(hashes.len(), 8);
+    }
+
+    // -- Pool pin API -----------------------------------------------------
+
+    #[test]
+    fn pin_increments_then_drop_releases() {
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "pin_a").unwrap();
+        let (hash, _) = pool.insert_bytes(b"pinable").unwrap();
+
+        assert!(!pool.is_pinned(&hash));
+        {
+            let _g = pool.pin(&hash);
+            assert!(pool.is_pinned(&hash));
+        }
+        assert!(!pool.is_pinned(&hash));
+    }
+
+    #[test]
+    fn pin_refcount_survives_overlapping_holders() {
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "pin_b").unwrap();
+        let (hash, _) = pool.insert_bytes(b"refcount").unwrap();
+
+        let a = pool.pin(&hash);
+        let b = pool.pin(&hash);
+        assert!(pool.is_pinned(&hash));
+        drop(a);
+        assert!(pool.is_pinned(&hash), "still held by b");
+        drop(b);
+        assert!(!pool.is_pinned(&hash));
+    }
+
+    #[test]
+    fn pins_are_scoped_per_backend_and_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let a = ChunkPool::new(tmp.path(), "pin_scope_x").unwrap();
+        let b = ChunkPool::new(tmp.path(), "pin_scope_y").unwrap();
+        let ns = ChunkPool::new_namespaced(tmp.path(), "pin_scope_x", "vol1").unwrap();
+
+        let hash = "deadbeef".repeat(8);
+        let _g = a.pin(&hash);
+
+        assert!(a.is_pinned(&hash));
+        assert!(!b.is_pinned(&hash), "distinct backend must not see the pin");
+        assert!(
+            !ns.is_pinned(&hash),
+            "namespaced sibling must not see the parent pin"
+        );
+
+        assert!(ChunkPool::is_pinned_for("pin_scope_x", None, &hash));
+        assert!(!ChunkPool::is_pinned_for(
+            "pin_scope_x",
+            Some("vol1"),
+            &hash
+        ));
+        assert!(!ChunkPool::is_pinned_for("pin_scope_y", None, &hash));
     }
 
     #[test]

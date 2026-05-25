@@ -29,6 +29,7 @@ use crate::data_path::CawLocks;
 use crate::inquiry;
 use crate::maintenance;
 use crate::mode_sense;
+use crate::odx::TokenManager;
 use crate::probes;
 use crate::reservations::{Nexus, ReservationManager};
 use crate::sizing;
@@ -59,15 +60,41 @@ pub struct SbcScsiDispatcher {
     target_iqn: String,
     reservations: Arc<ReservationManager>,
     caw_locks: Arc<CawLocks>,
+    /// Hyper-V ODX state: outstanding ROD tokens + per-list-ID job
+    /// outcomes. The sweeper task spawned in [`Self::new`] runs every
+    /// 30 s and drops entries past their inactivity deadline.
+    tokens: Arc<TokenManager>,
 }
 
 impl SbcScsiDispatcher {
     pub fn new(registry: Arc<dyn VolumeLookup>, target_iqn: String) -> Self {
+        let tokens = Arc::new(TokenManager::new());
+        // Best-effort sweeper: only spawns when called from within a
+        // tokio runtime. Construction from non-tokio contexts (unit
+        // tests outside `#[tokio::test]`) silently skips it; the
+        // manager still drops expired entries on every live lookup.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let m = Arc::clone(&tokens);
+            // Fire-and-forget background sweeper — we don't await or
+            // store the JoinHandle. The closure runs for the daemon's
+            // process lifetime; the upgraded Arc keeps the manager
+            // alive (this is intentional, since the dispatcher Arc
+            // holds the other strong reference and they share fate).
+            std::mem::drop(handle.spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    m.sweep_expired();
+                }
+            }));
+        }
         Self {
             registry,
             target_iqn,
             reservations: Arc::new(ReservationManager::new()),
             caw_locks: Arc::new(CawLocks::new()),
+            tokens,
         }
     }
 
@@ -116,8 +143,17 @@ impl SbcScsiDispatcher {
                 .reservations
                 .persistent_reserve_in(&req, cache.is_some()),
             0x5F => self.reservations.persistent_reserve_out(&req, cache, nexus),
-            0x83 => data_path::extended_copy(&req, &self.registry, nexus, &self.reservations).await,
-            0x84 => data_path::receive_copy_results(&req),
+            0x83 => {
+                data_path::extended_copy(
+                    &req,
+                    &self.registry,
+                    nexus,
+                    &self.reservations,
+                    &self.tokens,
+                )
+                .await
+            }
+            0x84 => data_path::receive_copy_results(&req, &self.tokens),
             0x89 => {
                 data_path::compare_and_write(
                     &req,

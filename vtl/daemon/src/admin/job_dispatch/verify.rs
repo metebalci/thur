@@ -146,9 +146,10 @@ mod tests {
 
     #[test]
     fn verify_params_parses_skip_cloud_and_barcodes() {
-        let p: VerifyParams =
-            serde_json::from_value(serde_json::json!({"skip_storage": true, "barcodes": ["A", "B"]}))
-                .expect("explicit body");
+        let p: VerifyParams = serde_json::from_value(
+            serde_json::json!({"skip_storage": true, "barcodes": ["A", "B"]}),
+        )
+        .expect("explicit body");
         assert!(p.skip_storage);
         assert_eq!(p.barcodes, vec!["A".to_string(), "B".to_string()]);
     }

@@ -33,6 +33,7 @@ mod dispatcher;
 mod inquiry;
 mod maintenance;
 mod mode_sense;
+mod odx;
 mod probes;
 mod reservations;
 mod sizing;

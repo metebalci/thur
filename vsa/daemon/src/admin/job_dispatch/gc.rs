@@ -333,6 +333,15 @@ fn sweep_one_pool(
         if live.contains(&hash) {
             continue;
         }
+        if pool.is_pinned(&hash) {
+            lines.push(format!(
+                "  skipped orphan chunk {}.. ({} bytes, {}) - pinned by outstanding ROD token",
+                &hash[..hash.len().min(8)],
+                size,
+                ns_label,
+            ));
+            continue;
+        }
         orphans += 1;
         bytes_freed += size;
         if dry_run {

@@ -274,6 +274,11 @@ impl DiskCacheManager {
         let total_candidates = chunks.len();
         chunks.retain(|c| c.uploaded);
         let pinned_localonly = total_candidates - chunks.len();
+        let before_token = chunks.len();
+        chunks.retain(|c| {
+            !ChunkPool::is_pinned_for(&self.backend_name, c.namespace.as_deref(), &c.hash)
+        });
+        let pinned_token = before_token - chunks.len();
         let pinned_recent = if self.recent_seal_pin_seconds > 0 {
             let cutoff = now_unix_secs().saturating_sub(self.recent_seal_pin_seconds);
             let before = chunks.len();
@@ -285,12 +290,13 @@ impl DiskCacheManager {
         chunks.sort_by_key(|c| c.last_accessed);
 
         if chunks.is_empty() {
-            if pinned_localonly > 0 || pinned_recent > 0 {
+            if pinned_localonly > 0 || pinned_recent > 0 || pinned_token > 0 {
                 warn!(
-                    "Backend '{}': all {} candidate chunk(s) pinned ({} pending upload, {} within recent-seal window {}s) - eviction can't proceed",
+                    "Backend '{}': all {} candidate chunk(s) pinned ({} pending upload, {} held by outstanding ROD token, {} within recent-seal window {}s) - eviction can't proceed",
                     self.backend_name,
-                    pinned_localonly + pinned_recent,
+                    pinned_localonly + pinned_recent + pinned_token,
                     pinned_localonly,
+                    pinned_token,
                     pinned_recent,
                     self.recent_seal_pin_seconds,
                 );
@@ -304,10 +310,11 @@ impl DiskCacheManager {
         }
 
         info!(
-            "Backend '{}' over budget: {} candidates ({} pinned by pending upload, {} pinned by recent-seal {}s), need to free {} bytes",
+            "Backend '{}' over budget: {} candidates ({} pinned by pending upload, {} pinned by outstanding ROD token, {} pinned by recent-seal {}s), need to free {} bytes",
             self.backend_name,
             chunks.len(),
             pinned_localonly,
+            pinned_token,
             pinned_recent,
             self.recent_seal_pin_seconds,
             bytes_to_free
