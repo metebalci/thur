@@ -3,11 +3,11 @@
 # Copyright (c) 2026 Mete Balci
 # SPDX-License-Identifier: Apache-2.0
 #
-# release.sh — build thurvtl + thurvsa release artifacts
-# inside the Debian 11 builder image so glibc, openssl, and the cargo
-# toolchain are pinned to a portable floor. Artifacts install cleanly
-# on every mainstream Linux distro (RHEL 9 / SLES 15 SP6+ /
-# Debian 12 / Ubuntu 24.04 / etc.).
+# release.sh — build thurvtl + thurvsa release artifacts inside the
+# Debian 11 builder image so glibc, openssl, and the cargo toolchain
+# are pinned to a portable floor. Artifacts install cleanly on every
+# mainstream Linux distro (RHEL 9 / SLES 15 SP6+ / Debian 12 /
+# Ubuntu 24.04 / etc.).
 #
 # Produces under release-artifacts/:
 #   thurvtl_<ver>-1_amd64.deb            .deb for Debian/Ubuntu (tape library)
@@ -15,35 +15,23 @@
 #   thurvsa_<ver>-1_amd64.deb            .deb for Debian/Ubuntu (block target)
 #   thurvsa-<ver>-1.x86_64.rpm           .rpm for RHEL/SLES/openSUSE
 #
-# Two product packages keep operators free to install only the pieces
-# they need (`thurvtl` tape library on port 3260, `thurvsa` block target on
-# port 3260; co-resident installs work because the system users /
-# data dirs / conffile paths / unit names are disjoint).
+# This script always produces UNSIGNED artifacts. The canonical
+# signed-and-validated release path is the tag-triggered
+# .github/workflows/release.yml — it builds in the same container
+# here, runs the per-distro smoke matrix, signs the artifacts, and
+# publishes the GitHub Release. Use this script locally for dev
+# iteration, smoke-testing changes to the packaging itself, and for
+# the CI build step (which invokes it under the hood).
 #
-# All artifacts ship under the Apache License, Version 2.0.
-#
-# Signing is opt-in via `--sign` (requires THUR_GPG_KEY_ID env var set
-# to a gpg key fingerprint). For dev / alpha / beta cuts the flag is
-# optional; for release-candidate and final cuts release.sh refuses
-# to proceed without it (chain of trust to the release key is
-# load-bearing once a cut hits a public repo). Your host's ~/.gnupg
-# is mounted into the container only when --sign is passed.
-#
-# Build cache: the cargo target dir is reused across runs (a named
-# podman volume) by default on dev / alpha cuts for fast iteration;
-# pass --no-cache to force a cold build. beta / rc / final cuts
-# always build cold — passing --keep-cache to one is a hard error.
+# Build cache: the cargo target dir is reused across runs by default
+# (named podman volume `thur-builder-target`) so iteration is fast.
+# Pass --no-cache to force a cold build (this is what release.yml
+# does — promotable cuts must match what a fresh checkout produces).
 #
 # Usage:
-#   release/release.sh                              # unsigned dev/alpha/beta cut
-#   THUR_GPG_KEY_ID=ABC… release/release.sh --sign  # signed cut
-#   release/release.sh --allow-dirty                # cut from a dirty
-#                                                   # working tree (testing only)
-#   release/release.sh --no-cache                   # force a cold build (already
-#                                                   # the default on beta/rc/final)
-#   release/release.sh --keep-cache                 # explicit cache opt-in; already
-#                                                   # the dev/alpha default, and
-#                                                   # an error on beta/rc/final
+#   release/release.sh                 # default: cache ON, clean tree required
+#   release/release.sh --no-cache      # cold build (CI uses this)
+#   release/release.sh --allow-dirty   # cut from a dirty working tree (local only)
 
 set -euo pipefail
 
@@ -51,94 +39,20 @@ cd "$(dirname "$0")/.."
 
 IMAGE="thur-builder:latest"
 
-# Parse host-side flags. `--sign` opts in to detach-signing every
-# artifact via THUR_GPG_KEY_ID (required when --sign is passed; the
-# env var alone no longer triggers signing). `--allow-dirty` skips
-# the working-tree cleanliness gate (see below). `--keep-cache` /
-# `--no-cache` request the build cache on / off; the effective
-# decision (KEEP_CACHE) is resolved against the version channel just
-# below. The two flags are mutually exclusive.
-SIGN=0
+# Flags.
 ALLOW_DIRTY=0
-WANT_KEEP_CACHE=0
-WANT_NO_CACHE=0
+NO_CACHE=0
 for arg in "$@"; do
     case "$arg" in
-        --sign) SIGN=1 ;;
         --allow-dirty) ALLOW_DIRTY=1 ;;
-        --keep-cache) WANT_KEEP_CACHE=1 ;;
-        --no-cache) WANT_NO_CACHE=1 ;;
+        --no-cache)    NO_CACHE=1 ;;
         *) echo "error: unknown flag: $arg" >&2; exit 1 ;;
     esac
 done
-if [ "$WANT_KEEP_CACHE" -eq 1 ] && [ "$WANT_NO_CACHE" -eq 1 ]; then
-    echo "error: --keep-cache and --no-cache are mutually exclusive." >&2
-    exit 1
-fi
-
-# Signing-enforcement gate. Read the workspace version off the host
-# filesystem (root Cargo.toml's [workspace.package].version, same
-# field the inner half stamps onto artifact filenames) and refuse to
-# proceed unsigned if the cut is anything other than dev / alpha /
-# beta. Conservative default: unknown / future prerelease channels
-# (rc, preview, snapshot, …) and the final cut all require --sign.
-# Done on the host BEFORE podman build so the operator gets a fast
-# error instead of waiting through the container build first.
-VERSION=$(awk -F\" '/^version = / { print $2; exit }' Cargo.toml)
-case "$VERSION" in
-    *-alpha*|*-beta*|*-dev*) SIGN_REQUIRED=0 ;;
-    *)                       SIGN_REQUIRED=1 ;;
-esac
-if [ "$SIGN_REQUIRED" -eq 1 ] && [ "$SIGN" -eq 0 ]; then
-    echo "error: version $VERSION is a release-candidate or final cut — refusing to build unsigned." >&2
-    echo "       set THUR_GPG_KEY_ID and pass --sign to release.sh." >&2
-    exit 1
-fi
-if [ "$SIGN" -eq 1 ] && [ -z "${THUR_GPG_KEY_ID:-}" ]; then
-    echo "error: --sign passed but THUR_GPG_KEY_ID is not set." >&2
-    exit 1
-fi
-
-# Build-cache policy. The "cache" is the cargo target dir, reused
-# across container runs via the named podman volume
-# `thur-builder-target` (versus an anonymous volume thrown away when
-# the container exits).
-#
-#   dev / alpha cuts  -- cache ON by default for fast iteration;
-#                        pass --no-cache to force a cold build.
-#   beta / rc / final -- always a cold build; passing --keep-cache to
-#                        one is a hard error. A promotable cut must
-#                        match what a fresh checkout produces, and
-#                        incremental cargo state can mask
-#                        reproducibility issues.
-#
-# Resolved in this shared section so the host half (target-volume
-# choice) and the inner half (release-artifacts/ wipe) agree. Channel
-# detection mirrors the signing gate above: anything that is not an
-# explicit dev / alpha string is treated as cache-ineligible — the
-# same conservative default the signing gate applies.
-case "$VERSION" in
-    *-alpha*|*-dev*) CACHE_ELIGIBLE=1 ;;
-    *)               CACHE_ELIGIBLE=0 ;;
-esac
-if [ "$CACHE_ELIGIBLE" -eq 1 ]; then
-    if [ "$WANT_NO_CACHE" -eq 1 ]; then KEEP_CACHE=0; else KEEP_CACHE=1; fi
-else
-    # beta / rc / final: a cold build is mandatory. --keep-cache is a
-    # hard error rather than a silent downgrade — the operator asked
-    # for something a promotable cut must not do.
-    if [ "$WANT_KEEP_CACHE" -eq 1 ]; then
-        echo "error: --keep-cache is not allowed for $VERSION — beta/rc/final cuts must" >&2
-        echo "       build cold so the artifacts match a fresh checkout. Drop --keep-cache" >&2
-        echo "       (the cut builds cold either way)." >&2
-        exit 1
-    fi
-    KEEP_CACHE=0
-fi
 
 # Two-stage script: outer half (host) builds the podman image and
 # re-execs self inside it; inner half (container, sentinel env var
-# set) does the actual cargo build + packaging + signing.
+# set) does the actual cargo build + packaging.
 if [ -z "${THUR_IN_BUILDER:-}" ]; then
     if ! command -v podman >/dev/null 2>&1; then
         echo "error: podman not on PATH (try: sudo apt install podman)" >&2
@@ -151,8 +65,7 @@ if [ -z "${THUR_IN_BUILDER:-}" ]; then
     # dirty tree stamps them `-dirty`, so the artifacts wouldn't be
     # reproducible from any tagged commit. Bypass with --allow-dirty
     # for local verification builds (artifacts will still build, just
-    # don't publish them). Host-side only because once we exec into
-    # the container the working tree is already locked in.
+    # don't publish them).
     if [ "$ALLOW_DIRTY" -eq 0 ]; then
         if ! git rev-parse --git-dir >/dev/null 2>&1; then
             echo "error: release.sh must run inside a git checkout " \
@@ -179,59 +92,32 @@ if [ -z "${THUR_IN_BUILDER:-}" ]; then
     echo "==> podman build $IMAGE"
     podman build -t "$IMAGE" -f release/Containerfile.builder .
 
-    # Mount the host GPG agent only when the operator opted into
-    # signing. Without --sign the container has no path to the host's
-    # secret keys even by accident.
-    GPG_MOUNT=()
-    if [ "$SIGN" -eq 1 ] && [ -d "${HOME}/.gnupg" ]; then
-        GPG_MOUNT=(-v "${HOME}/.gnupg:/root/.gnupg")
-    fi
-
-    # Volume strategy for /work/target (the cargo target dir), driven
-    # by the KEEP_CACHE decision resolved above:
-    #   KEEP_CACHE=1  -- named podman volume `thur-builder-target`,
-    #                    persisted across runs (the dev/alpha default).
-    #                    Cuts incremental builds from minutes to
-    #                    seconds during development.
-    #   KEEP_CACHE=0  -- anonymous volume, destroyed on container exit
-    #                    (--rm): a cold build, so what we ship matches
-    #                    what cargo produces from a fresh checkout.
-    #                    Always the case for beta/rc/final cuts.
+    # Volume strategy for /work/target (the cargo target dir):
+    #   default       -- named podman volume `thur-builder-target`,
+    #                    persisted across runs. Cuts incremental
+    #                    builds from minutes to seconds.
+    #   --no-cache    -- anonymous volume destroyed on container exit:
+    #                    cold build, so what we ship matches what
+    #                    cargo produces from a fresh checkout. CI
+    #                    (.github/workflows/release.yml) passes this.
     # Either way, the host's own target/ is never mounted: it's built
     # against the host glibc and would fail with `GLIBC_2.32 not found`
     # inside the Debian 11 builder (cargo's fingerprint doesn't include
     # libc version).
-    # -it: allocate a TTY and keep stdin attached so gpg-agent's
-    # pinentry can prompt for the signing-key passphrase. Without
-    # this, signing fails with "Inappropriate ioctl for device".
-    # Harmless for non-signing runs.
-    if [ "$KEEP_CACHE" -eq 1 ]; then
-        echo "==> build cache ON: reusing cargo target via named volume thur-builder-target"
-        TARGET_VOL_ARGS=(-v thur-builder-target:/work/target)
-    else
+    if [ "$NO_CACHE" -eq 1 ]; then
         echo "==> build cache OFF: cold build via throwaway target volume"
         TARGET_VOL_ARGS=(-v /work/target)
+    else
+        echo "==> build cache ON: reusing cargo target via named volume thur-builder-target"
+        TARGET_VOL_ARGS=(-v thur-builder-target:/work/target)
     fi
 
     echo "==> podman run $IMAGE ./release/release.sh"
     INNER_ARGS=()
-    if [ "$SIGN" -eq 1 ]; then
-        INNER_ARGS+=(--sign)
-    fi
-    # Forward the *resolved* cache decision, not the raw flags: the
-    # inner half re-runs the same resolution and must land on the
-    # same KEEP_CACHE without re-deriving the channel or re-printing
-    # the ignored-flag warning.
-    if [ "$KEEP_CACHE" -eq 1 ]; then
-        INNER_ARGS+=(--keep-cache)
-    else
-        INNER_ARGS+=(--no-cache)
-    fi
-    exec podman run --rm -it \
+    [ "$NO_CACHE" -eq 1 ] && INNER_ARGS+=(--no-cache)
+    exec podman run --rm \
         -v "$PWD:/work" \
         "${TARGET_VOL_ARGS[@]}" \
-        "${GPG_MOUNT[@]}" \
-        -e THUR_GPG_KEY_ID \
         -e THUR_IN_BUILDER=1 \
         "$IMAGE" \
         ./release/release.sh "${INNER_ARGS[@]}"
@@ -240,13 +126,10 @@ fi
 # ---- Below this point we are inside the builder image. ----
 
 OUT_DIR="release-artifacts"
-# Always wipe stale artifacts from previous runs. The build cache
-# (KEEP_CACHE) is about cargo's target dir — orthogonal to the output
-# dir. Mixed-version files in release-artifacts/ would make the signing
-# loop re-sign stale builds, the final `ls -lh` ambiguous, and
-# ghrelease.sh's version filter noisier than it needs to be. We're
-# inside the builder container with CWD pinned to the workspace root,
-# so the path is unambiguous.
+# Always wipe stale artifacts from previous runs. The build cache is
+# about cargo's target dir — orthogonal to the output dir. Mixed-version
+# files in release-artifacts/ would make the final `ls -lh` ambiguous
+# and confuse downstream tooling.
 rm -rf -- "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
@@ -278,10 +161,7 @@ fi
 # volume — so the bar that gates the release is the bar the artifacts
 # were built against. `-D warnings` promotes any clippy warning to an
 # error: a regression in a previously clean lint fails the cut here
-# instead of shipping. The deny-level safety set
-# (unwrap_used / panic / unwrap_in_result / unsafe_code) was already
-# baked into the workspace lints; this just enforces the rest of the
-# bar consistently.
+# instead of shipping.
 echo "==> cargo clippy --workspace --release --all-targets"
 cargo clippy --workspace --release --all-targets -- -D warnings
 
@@ -310,26 +190,6 @@ cargo generate-rpm --package vsa/cli --output "$OUT_DIR/" \
     --set-metadata "version = \"$RPM_VERSION\"" \
     --set-metadata "release = \"$RPM_RELEASE\""
 
-if [ "$SIGN" -eq 1 ]; then
-    # gpg-agent uses GPG_TTY to know where to send pinentry prompts.
-    # The host's value (if any) doesn't apply inside the container —
-    # set it to whatever TTY podman -it gave us.
-    export GPG_TTY=$(tty)
-    echo "==> signing artifacts with key $THUR_GPG_KEY_ID"
-    for f in "$OUT_DIR"/*.deb "$OUT_DIR"/*.rpm; do
-        [ -f "$f" ] || continue
-        rm -f "${f}.asc"
-        gpg --batch --yes \
-            --local-user "$THUR_GPG_KEY_ID" \
-            --detach-sign --armor \
-            --output "${f}.asc" \
-            "$f"
-        echo "    signed ${f}.asc"
-    done
-else
-    echo "==> --sign not passed — skipping signatures (allowed for $VERSION)"
-fi
-
 echo
-echo "==> artifacts:"
+echo "==> artifacts (unsigned — signing lives in .github/workflows/release.yml):"
 ls -lh "$OUT_DIR"

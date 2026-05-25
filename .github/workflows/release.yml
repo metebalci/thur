@@ -1,0 +1,188 @@
+name: release
+
+# Tag-triggered release workflow. Cuts an official release when a
+# `v*` tag is pushed:
+#
+#   1. build   — cold build inside the Debian 11 builder container,
+#                produces unsigned .deb / .rpm under release-artifacts/.
+#                Uploaded as a workflow artifact for the downstream jobs.
+#   2. smoke   — matrix of distro x product: install the package on a
+#                stock distro image (so postinst runs as root, creates
+#                the system user, fixes conffile perms), write a minimal
+#                local-backend conffile, exec the daemon directly (no
+#                systemctl in containers), wait for the admin socket,
+#                run one verb per product. Any cell fails -> publish
+#                is skipped.
+#   3. publish — import GPG_PRIVATE_KEY (passphrase from GPG_PASSPHRASE),
+#                detach-sign every .deb / .rpm, create the GitHub
+#                Release for the tag, upload all artifacts + .asc
+#                signatures. A SemVer pre-release tag (-alpha/-beta/-rc)
+#                publishes as a GitHub pre-release.
+#
+# The local release/release.sh path produces unsigned dev artifacts for
+# iteration; this workflow is the canonical signed-and-validated cut.
+# release/tag-release.sh is the operator-side helper that signs the
+# git tag and pushes it, which is what triggers this workflow.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build a release for'
+        required: true
+
+permissions:
+  contents: write  # publish step needs to create the GH release
+
+env:
+  ARTIFACT_NAME: release-artifacts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0   # release.sh reads git history for SHA stamping
+
+      - name: Build artifacts (cold, unsigned)
+        run: release/release.sh --no-cache
+
+      - name: List artifacts
+        run: ls -lh release-artifacts/
+
+      - name: Upload artifacts for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [vtl, vsa]
+        target:
+          - { distro: 'debian:12',          pkg: deb }
+          - { distro: 'debian:13',          pkg: deb }
+          - { distro: 'ubuntu:24.04',       pkg: deb }
+          - { distro: 'ubuntu:26.04',       pkg: deb }
+          - { distro: 'rockylinux:9',       pkg: rpm }
+          - { distro: 'rockylinux:10',      pkg: rpm }
+          - { distro: 'fedora:latest',      pkg: rpm }
+          - { distro: 'opensuse/leap:15.6', pkg: rpm }
+    container:
+      image: ${{ matrix.target.distro }}
+      options: --user 0  # smoke harness needs root for postinst + /run binds
+    steps:
+      - name: Checkout (for smoke harness)
+        uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: release-artifacts
+
+      - name: Pick package
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          case "${{ matrix.target.pkg }}" in
+              deb) files=(release-artifacts/thur${{ matrix.product }}_*.deb) ;;
+              rpm) files=(release-artifacts/thur${{ matrix.product }}-*.x86_64.rpm) ;;
+          esac
+          [ ${#files[@]} -eq 1 ] || { echo "expected exactly one package, got: ${files[*]:-<none>}"; exit 1; }
+          echo "pkg=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        shell: bash
+        run: release/smoke-install.sh ${{ matrix.product }} ${{ steps.pick.outputs.pkg }}
+
+  publish:
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: release-artifacts
+
+      - name: Import GPG signing key
+        id: gpg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # Import the armored private key. Pinentry-loopback lets us
+          # feed the passphrase non-interactively to detach-sign below.
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          printf 'allow-loopback-pinentry\n' > ~/.gnupg/gpg-agent.conf
+          printf 'use-agent\npinentry-mode loopback\n' > ~/.gnupg/gpg.conf
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # Derive the long key id from whatever was imported. The
+          # fingerprint is public (documented in the install docs);
+          # we don't keep it as a separate secret.
+          KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          [ -n "$KEY_ID" ] || { echo "no secret key imported"; exit 1; }
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "imported key $KEY_ID"
+
+      - name: Sign artifacts
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for f in release-artifacts/*.deb release-artifacts/*.rpm; do
+              [ -f "$f" ] || continue
+              rm -f "${f}.asc"
+              gpg --batch --yes \
+                  --pinentry-mode loopback \
+                  --passphrase "$GPG_PASSPHRASE" \
+                  --local-user "${{ steps.gpg.outputs.key_id }}" \
+                  --detach-sign --armor \
+                  --output "${f}.asc" "$f"
+              echo "signed ${f}.asc"
+          done
+
+      - name: Resolve tag + pre-release flag
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # SemVer pre-release (any '-' suffix after vN.M.P) -> GH pre-release.
+          if [[ "$TAG" == v*-* ]]; then
+              echo "prerelease=true"  >> "$GITHUB_OUTPUT"
+          else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARGS=(--title "${{ steps.meta.outputs.tag }}" --notes "" --verify-tag)
+          [ "${{ steps.meta.outputs.prerelease }}" = "true" ] && ARGS+=(--prerelease)
+          gh release create "${{ steps.meta.outputs.tag }}" \
+              release-artifacts/*.deb release-artifacts/*.rpm \
+              release-artifacts/*.asc \
+              "${ARGS[@]}"

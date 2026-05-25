@@ -7,8 +7,14 @@ mainstream Linux distribution. Operators install whichever halves they
 need. The two packages co-exist cleanly on the same host because they use
 disjoint system users, data directories, unit names, and iSCSI ports.
 
-Releases are cut **manually** — there is no release CI workflow. The
-maintainer runs `release/release.sh` on a developer host.
+Releases are cut by a **tag-triggered CI workflow**
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+The maintainer signs and pushes a `v<version>` tag with
+`release/tag-release.sh`; CI then builds the artifacts in the
+canonical Debian 11 builder container, runs the per-distro smoke
+matrix, signs the `.deb` / `.rpm`, and publishes the GitHub Release.
+The local `release/release.sh` produces unsigned artifacts for dev
+iteration and is what the build step in CI invokes under the hood.
 
 ## Licensing
 
@@ -56,7 +62,9 @@ separate effort tracked in `ROADMAP.md`.
 ```
 release/                            # .deb / .rpm artifact sources
 ├── Containerfile.builder           # Debian 11 base + cargo-deb + cargo-generate-rpm
-├── release.sh                      # Builds the image and runs both product cuts inside it
+├── release.sh                      # Builds .deb/.rpm inside the container (unsigned; local + CI build step)
+├── smoke-install.sh                # Per-distro install + start + one-verb smoke harness (invoked by release.yml)
+├── tag-release.sh                  # Operator step: signs + pushes the release tag (triggers release.yml)
 ├── thurvtld.service          # systemd unit (ExecStart=/usr/bin/thurvtld)
 ├── thurvtl.yaml                    # thurvtl minimal starter conffile
 ├── thurvtl.env                     # thurvtl daemon env file (cloud creds + ${ENV_VAR} secrets + feature flags)
@@ -126,10 +134,34 @@ fresh installation.
 
 ## Building a release
 
-Single command, requires `podman`:
+The canonical release build is `.github/workflows/release.yml`,
+triggered by a `v<version>` tag push. It runs three jobs:
+
+1. **build** — checks out the tag, runs `release/release.sh --no-cache`
+   inside the pinned Debian 11 builder container (cold build),
+   uploads `release-artifacts/` as a workflow artifact.
+2. **smoke** — fans out across the supported distros (matrix:
+   `debian:12`, `debian:13`, `ubuntu:24.04`, `ubuntu:26.04`,
+   `rockylinux:9`, `rockylinux:10`, `fedora:latest`,
+   `opensuse/leap:15.6` × `vtl` / `vsa`). Each cell installs the
+   package as root in a stock distro container, writes a minimal
+   conffile (`release/smoke-install.sh` is the harness), execs the
+   daemon directly (no systemctl in containers), waits for the
+   admin socket, and runs one verb (`cartridge create` /
+   `volume create`). Any cell failing fails the release.
+3. **publish** — imports the GPG signing key from the
+   `GPG_PRIVATE_KEY` / `GPG_PASSPHRASE` repo secrets, detach-signs
+   every `.deb` / `.rpm`, creates the GitHub Release, uploads
+   artifacts + `.asc` signatures. A SemVer pre-release tag
+   (`-alpha` / `-beta` / `-rc`) publishes as a GitHub pre-release.
+
+The local `release/release.sh` produces the same unsigned artifacts
+for dev iteration. Single command, requires `podman`:
 
 ```bash
-release/release.sh
+release/release.sh                 # default: cache ON, clean tree required
+release/release.sh --no-cache      # cold build (what CI does)
+release/release.sh --allow-dirty   # cut from a dirty working tree (local only)
 ```
 
 The script runs in two halves, divided by the `THUR_IN_BUILDER`
@@ -142,23 +174,22 @@ sentinel:
    --all-targets -- -D warnings` and `cargo test --workspace --release`
    as quality gates, then `cargo build --release --workspace` (both
    daemons + both CLIs in one pass). Then `cargo deb` /
-   `cargo generate-rpm` once per product (`vtl-cli`, then `vsa-cli`),
-   and — with `--sign` — detach-signs every artifact. Clippy / test
-   failures abort the cut before any artifact is produced.
+   `cargo generate-rpm` once per product (`vtl-cli`, then `vsa-cli`).
+   Clippy / test failures abort the cut before any artifact is produced.
 
 The first run takes roughly 10 minutes because rustup, cargo-deb, and
 cargo-generate-rpm all install from scratch; subsequent runs add only a
 few seconds of overhead.
 
-The container's `target/` directory is an anonymous podman volume mounted
-over the bind-mounted repo's `target/`. This isolation is necessary for
-two reasons. First, cargo's fingerprint does not include the libc version,
-so reusing a host `target/release/build/...` binary inside the Debian 11
-builder would fail with `GLIBC_2.32 not found`. Second, the volume is
-destroyed when the container exits (`--rm`), which guarantees that every
-release is a **cold build** — the next run always starts from an empty
-target directory. The cost is roughly 4 minutes of cargo compilation per
-release.
+The container's `target/` directory is a podman volume mounted over the
+bind-mounted repo's `target/`. This isolation is necessary because
+cargo's fingerprint does not include the libc version, so reusing a host
+`target/release/build/...` binary inside the Debian 11 builder would fail
+with `GLIBC_2.32 not found`. With `--no-cache` the volume is anonymous
+and destroyed on container exit, guaranteeing a cold build that matches
+a fresh checkout; without it the volume is the named `thur-builder-target`
+and the cargo target dir persists across runs (the dev default — cuts
+iterative builds from minutes to seconds).
 
 Install podman if it is not already present: `sudo apt install podman` on
 Debian/Ubuntu, and it is available by default on RHEL, Fedora, and SUSE.
@@ -174,39 +205,33 @@ thurvsa_<ver>-1_amd64.deb            # binary, Apache-2.0 (block target)
 thurvsa-<ver>-1.x86_64.rpm           # binary, Apache-2.0
 ```
 
-Plus `*.asc` detached signatures alongside each artifact, if signing is
-enabled. The full source is published in the public repository; anyone who
-wants to audit or rebuild simply clones it at the released tag.
+`release.sh` itself produces unsigned artifacts only; `.asc`
+signatures are added by the publish step in CI. The full source is
+published in the public repository; anyone who wants to audit or
+rebuild simply clones it at the released tag.
 
 Both binaries embed the build's git short-SHA in `--version`
 (`thurvtl 0.1.0 (a42f57b)`); a `-dirty` suffix means the working
-tree had uncommitted changes. **Don't release `-dirty` artifacts** —
-start from a clean checkout, then build.
+tree had uncommitted changes. The clean-tree check in `release.sh`
+prevents `-dirty` cuts unless `--allow-dirty` is passed explicitly,
+and `tag-release.sh` refuses to tag a dirty tree.
 
 ## Signing
 
-Signing is opt-in via `--sign`, which requires `THUR_GPG_KEY_ID` set to
-the fingerprint of an imported gpg key:
+Signing happens in CI's publish job, using the GPG key stored in two
+repository secrets:
 
-```bash
-THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
-# adds thurvtl_<ver>-1_amd64.deb.asc and the matching .rpm.asc
-```
+- `GPG_PRIVATE_KEY` — the ASCII-armored private key (`gpg --armor
+  --export-secret-key <fingerprint>` output).
+- `GPG_PASSPHRASE` — the passphrase that unlocks it.
 
-`release.sh` aborts if `--sign` is passed without `THUR_GPG_KEY_ID`.
-Only with `--sign` does it bind-mount the host's `~/.gnupg` into the
-builder — an unsigned build has no path to the host's secret keys.
-
-Omitting `--sign` produces unsigned artifacts and the script logs
-`--sign not passed — skipping signatures`. Unsigned artifacts are
-permitted **only** for `-dev` / `-alpha` / `-beta` versions. For a
-release-candidate or final version, `release.sh` refuses to build without
-signing. **Don't ship unsigned artifacts** beyond local QA.
-
-The container launches with `podman run -it` so that gpg-agent's pinentry
-has a TTY for the passphrase prompt. Run `release/release.sh` directly
-from your terminal — don't pipe its stdout during a signed build, or the
-prompt may be buffered out of view.
+The fingerprint is public (it's printed below and on the package
+repository site) and not stored as a secret — the workflow derives it
+from whatever key is imported. `release.sh` no longer takes a `--sign`
+flag and no longer mounts the host's `~/.gnupg` — local builds are
+unsigned by construction. To sign artifacts ad-hoc outside CI, run
+`gpg --detach-sign --armor` against the files in `release-artifacts/`
+directly.
 
 The current package signing key fingerprint:
 
@@ -215,20 +240,18 @@ E1FF A6E4 4D8A F56E BD17  997C 9B4E 436A E137 3A4B
 ```
 
 Operators verify artifacts against this fingerprint; publish it
-prominently in release notes, the README, and the project website. The
-key signs the package artifacts and lives only on the maintainer's
-release host.
+prominently in release notes, the README, and the project website.
 
-When rotating the signing key: generate a new key, document the new
+When rotating the signing key: generate a new key, replace the
+`GPG_PRIVATE_KEY` + `GPG_PASSPHRASE` repo secrets, document the new
 fingerprint in the next release notes, this file, and the README, and
-leave the old public key on the keyserver so that historical signatures
+leave the old public key on the keyserver so historical signatures
 continue to verify.
 
 ## Cutting a release
 
-Order: **bump → commit → build → smoke → tag → push.** Building from a
-clean, committed HEAD means `--version` reports the release commit's SHA
-without `-dirty`.
+Order: **bump → commit → tag-push → CI does the rest.** CI is the
+only path that produces signed, smoke-tested, published artifacts.
 
 ```bash
 # 1. Bump the version. It lives in ONE place — [workspace.package]
@@ -242,38 +265,31 @@ cargo set-version --workspace 0.2.0
 # 2. Sanity-check the bump — release.sh reads this to stamp filenames.
 awk -F\" '/^version = / { print $2; exit }' Cargo.toml
 
-# 3. Commit the bump. Tagging happens after smoke-test, so a build
-#    or smoke failure can still be amended without retracting a tag.
+# 3. Commit the bump.
 git commit -am "release: v0.2.0"
 
-# 4. Build + sign the artifacts. Clean HEAD, no -dirty in --version.
-THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
+# 4. (Optional) Build locally to catch obvious breakage before CI does.
+#    Same container, same toolchain — just unsigned and cached:
+release/release.sh
 
-# 5. Smoke-test on a fresh VM (or at least `dpkg -i` / `rpm -i` on
-#    a non-dev host). On failure, fix and amend the commit (no
-#    published tag yet) before re-running release.sh.
-
-# 6. Tag, push, and publish to GitHub Releases. ghrelease.sh creates
-#    the signed tag v0.2.0 on the commit the artifacts were built
-#    from — it extracts each .deb / .rpm, reads the short SHA every
-#    binary embeds via `--version`, and tags that commit (not HEAD).
-#    A follow-up commit between release.sh and ghrelease.sh (a docs
-#    tweak, a CHANGELOG add) is fine: the tag stays pinned to the
-#    build. All artifacts must agree on the SHA, none may be
-#    `-dirty`, and the SHA must be an ancestor of HEAD so the branch
-#    push publishes it. Tag message is a bare stub by default;
-#    pushes branch + tag to origin, and uploads release-artifacts/*
-#    (.deb / .rpm + .asc) as the release assets. The GitHub Release
-#    body is left empty by default; pass -m "summary" / -F notes.md
-#    to write real notes (also becomes the tag message), or -e to
-#    compose in $EDITOR.
-release/ghrelease.sh
+# 5. Tag, sign, push. Pushing the tag triggers release.yml, which
+#    builds in the canonical container, runs the per-distro smoke
+#    matrix, signs the .deb / .rpm, and publishes the GitHub Release.
+#    Default tag message is a bare stub; pass -m "summary" / -F
+#    notes.md to write real notes, or -e to compose in $EDITOR.
+release/tag-release.sh
 ```
 
-To retract a release: delete the GitHub Release and its remote tag
-(`gh release delete v0.2.0 --cleanup-tag --yes`), drop the local tag
-(`git tag -d v0.2.0`), then bump the version forward and cut a new one.
-Don't reuse a version number.
+If smoke fails in CI no release is published — the tag exists at
+origin but there is no GitHub Release for it. Recover by deleting
+the remote and local tag (`git push origin :v0.2.0 && git tag -d
+v0.2.0`), fixing the issue, and re-running `tag-release.sh` from a
+new HEAD. Don't re-use the tag from the broken commit.
+
+To retract a published release: delete the GitHub Release and its
+remote tag (`gh release delete v0.2.0 --cleanup-tag --yes`), drop
+the local tag (`git tag -d v0.2.0`), then bump the version forward
+and cut a new one. Don't reuse a version number.
 
 ## Package repository
 
@@ -315,7 +331,7 @@ frictionless; it doesn't make the upgrade path automatic.
 
 ### How artifacts get there
 
-After `release/ghrelease.sh` uploads the signed `release-artifacts/*` to
+After `release.yml` publishes the signed `release-artifacts/*` to
 the GitHub Release, a `publish.yml` workflow in
 `metebalci/thur.metebalci.com` downloads them, regenerates the apt suite
 indices and the rpm `repomd.xml`, signs both with the same package
