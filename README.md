@@ -1,4 +1,4 @@
-[![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=code,comments)](https://github.com/metebalci/thur/)
+[![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=code)](https://github.com/metebalci/thur/) [![Scc Count Badge](https://sloc.xyz/github/metebalci/thur/?category=comments)](https://github.com/metebalci/thur/)
 
 # Thur
 
