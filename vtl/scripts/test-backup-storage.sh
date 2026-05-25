@@ -47,9 +47,9 @@
 # NOTE on credentials: from a fresh checkout, drop your maintainer
 # cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
-# AISTOR_*) and your backend entry in `$REPO/private/cloud-backends.yaml`.
+# AISTOR_*) and your backend entry in `$REPO/private/storage-backends.yaml`.
 # The script auto-sources thur.env at startup and defaults
-# THURVTL_SOURCE_BACKENDS to private/cloud-backends.yaml, so you
+# THURVTL_SOURCE_BACKENDS to private/storage-backends.yaml, so you
 # don't need either piece installed under /etc or /var/lib — every
 # read happens out of the repo, every write under /tmp.
 #
@@ -115,15 +115,15 @@ CLI_PATH=""
 # (daemon-owned). The script extracts the chosen entry from
 # $SOURCE_BACKENDS and embeds it under `testbackend` inside the
 # generated test config. Default points at the maintainer-private
-# `private/cloud-backends.yaml` so running from a fresh checkout
+# `private/storage-backends.yaml` so running from a fresh checkout
 # requires no host-side setup; override with THURVTL_SOURCE_BACKENDS
 # to point at a packaged install path (e.g. /var/lib/thurvtl/...).
 #
 # The daemon's *own* YAML config (data_dir, ports, IQN, disk_cache
 # tuning) is generated fresh under $TEST_DIR/test.yaml — the script
 # never reads /etc/thurvtl/thurvtl.yaml. So everything below the
-# cloud-backends.yaml read happens entirely under /tmp.
-SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
+# storage-backends.yaml read happens entirely under /tmp.
+SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 TEST_DIR="/tmp/test-backup-storage-$$"
 
 # Fixture-size knob (env: THURVTL_FIXTURE_MB, MiB per cartridge,
@@ -291,7 +291,7 @@ resolve_backend() {
     fi
     if [[ ! -r "$SOURCE_BACKENDS" ]]; then
         log_error "Cannot read source backends file: $SOURCE_BACKENDS"
-        echo "Override with THURVTL_SOURCE_BACKENDS=<path>/cloud-backends.yaml"
+        echo "Override with THURVTL_SOURCE_BACKENDS=<path>/storage-backends.yaml"
         exit 1
     fi
     if ! command -v yq >/dev/null 2>&1; then

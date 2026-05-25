@@ -36,7 +36,7 @@
 #
 # Backend selection: defaults to an inline local backend. Set
 # THURVSA_TEST_BACKEND=<name> (or --backend <name>) to pick an entry
-# from a backends YAML (defaulting to private/cloud-backends.yaml,
+# from a backends YAML (defaulting to private/storage-backends.yaml,
 # override via THURVSA_SOURCE_BACKENDS). The named backend's `prefix`
 # is overridden per-run so test data is isolated and purged on cleanup.
 #
@@ -92,7 +92,7 @@ SEED=""
 QUICK=0
 OPS=""
 BACKEND_NAME="${THURVSA_TEST_BACKEND:-}"
-SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
+SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 BACKEND_TYPE=""
 TEST_PREFIX=""
 RW_DEVICE=""

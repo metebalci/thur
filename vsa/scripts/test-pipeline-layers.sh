@@ -78,7 +78,7 @@ CLI_PATH=""
 ONLY_ROW=""
 KEEP_DATA=0
 KEEP_CLOUD=0
-SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
+SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -106,7 +106,7 @@ if [[ ! -r "$SOURCE_BACKENDS" ]]; then
     exit 1
 fi
 
-# Backends config is YAML under `cloud.backends.<name>` (mirrors what
+# Backends config is YAML under `storage.backends.<name>` (mirrors what
 # every other cloud-backed VSA suite reads). yq is needed at the same
 # version contract as test-iscsi-fs-storage.sh.
 BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")

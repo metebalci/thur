@@ -107,7 +107,7 @@ CLI_PATH=""
 ONLY_ROW=""
 KEEP_DATA=0
 KEEP_CLOUD=0
-SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
+SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -135,7 +135,7 @@ if [[ ! -r "$SOURCE_BACKENDS" ]]; then
     exit 1
 fi
 
-# Parse the chosen backend's coordinates out of cloud-backends.yaml
+# Parse the chosen backend's coordinates out of storage-backends.yaml
 # (same shape test-backup-storage.sh uses, so cred forwarding + probes
 # work identically). yq required at the same version contract.
 BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
