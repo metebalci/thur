@@ -51,9 +51,9 @@ The following capabilities are shared across both products:
 
 - **Content-addressed dedup** — BLAKE3-hashed chunks stored once per
   backend pool; cross-volume / cross-cartridge.
-- **Cloud tiering** — S3-compatible (AWS S3, MinIO, Wasabi, …), Google
-  Cloud Storage, Azure Blob. Disk is a warm cache with a per-backend
-  budget and write backpressure when the budget is hit.
+- **Cloud-backed storage** — S3-compatible (AWS S3, MinIO, Wasabi, …),
+  Google Cloud Storage, Azure Blob. Disk is a warm cache with a
+  per-backend budget and write backpressure when the budget is hit.
 - **Compression on cloud uploads** (zstd / lz4, post-dedup); parallel
   cloud up/downloads.
 - **CHAP authentication** for iSCSI; **TLS-PSK** for NVMe/TCP (VSA).
