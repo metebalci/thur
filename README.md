@@ -5,29 +5,30 @@
 > SCSI / NVMe surface may change without notice or migration path.
 > Not recommended for production use.
 
-**Thur VTL** and **Thur VSA** are two sibling storage-backed
-products built on a shared Rust codebase. Each presents
-spec-conformant storage devices to the host, but the data lives in
-a storage backend — S3-compatible object stores (AWS S3, GCS, Azure
-Blob, AIStore, MinIO, Ceph RGW, Wasabi, …) or a local filesystem.
-Local disk holds only a warm, refcount-evicted cache in front of it.
-The capacity a host can address is set by the storage backend, not the
-local disk: a modest cache machine can front a dataset many times its
-own size.
+**Thur VTL** and **Thur VSA** are two sibling products presenting
+spec-conformant storage devices to the host — a virtual tape library
+and a virtual storage appliance. Both are **thin-provisioned**
+(addressable capacity is declared, not reserved; only written data
+consumes any storage), and both run a **small local cache** in front
+of a durable backend: an object store (AWS S3, GCS, Azure Blob,
+AIStore, MinIO, Ceph RGW, Wasabi, …) or a local filesystem holds the
+source of truth, while a refcount-evicted on-host disk cache —
+typically far smaller than the addressable capacity — fronts the
+working set.
 
-Furthermore, stored data is deduplicated in a shared content-addressed
-chunk pool. Every chunk is keyed by its BLAKE3 hash, with no central
-index or database, so identical bytes from any source — across every
-volume and cartridge on a backend — are stored exactly once.
+Stored data is **deduplicated** in a shared content-addressed chunk
+pool. Every chunk is keyed by its BLAKE3 hash, with no central index
+or database, so identical bytes from any source — across every volume
+and cartridge on a backend — are stored exactly once.
 
 - **Thur VTL** — a Virtual Tape Library that presents a spec-conformant
   SMC-3 medium changer and SSC-4 LTO-8 drive surface over iSCSI. From
   the backup software's perspective it is an ordinary tape library — no
   proprietary agent required.
-- **Thur VSA** — a Virtual Storage Appliance: a block-storage target
-  that serves thin-provisioned SBC-3 LUNs over iSCSI or NVMe/TCP. It
-  behaves as a backend-backed virtual disk for VMware, Hyper-V, and
-  Linux hosts.
+- **Thur VSA** — a Virtual Storage Appliance that presents any number
+  of spec-conformant SBC-3 direct-access LUNs over iSCSI or NVMe/TCP.
+  From the host's perspective each LUN is an ordinary block device —
+  VMware, Hyper-V, Linux, no proprietary agent required.
 
 Both products can live co-resident on a single host; they use disjoint
 system users, data directories, conffiles, systemd unit names, and admin
@@ -35,9 +36,15 @@ sockets. The configured storage backend (S3, GCS, Azure, or another
 S3-compatible object store) is, in all cases, the durable source of
 truth.
 
+The two share a common codebase — chunk pool, storage backends, iSCSI
+transport, audit log, telemetry, alerting are all the same code — and
+diverge only in the SCSI command surfaces they expose (SMC-3 + SSC-4 vs
+SBC-3) and the on-host data shapes layered above (cartridges vs
+volumes). Hence the single repository, **Thur**.
+
 # Disclaimer
 
-**Thur is experimental backup and storage software.** It is provided
+**Thur VTL and Thur VSA are experimental backup and storage software.** It is provided
 **"as is"**, **without any warranty** of any kind. There is **no
 guarantee of data integrity, reliability, or fitness for any
 purpose**.
@@ -79,8 +86,7 @@ Thur VTL additionally provides:
 
 Thur VSA additionally provides:
 
-- **SBC-3 block target** over iSCSI, or the **NVM Command Set over
-  NVMe/TCP**.
+- **SBC-3 over iSCSI**, or the **NVM Command Set over NVMe/TCP**.
 - Thin-provisioned per-volume LUNs, 4 KiB sectors, sparse page table,
   write-back page cache.
 - VAAI / NVMe data-path primitives and persistent reservations.

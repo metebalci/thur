@@ -1,7 +1,7 @@
 # Releasing thurvtl and thurvsa
 
 Each release cut produces two `.deb`s and two `.rpm`s — one per product
-(`thurvtl` tape VTL, `thurvsa` block target) — all built from a single
+(`thurvtl` virtual tape library, `thurvsa` virtual storage appliance) — all built from a single
 pinned-glibc container so the resulting binaries install on every
 mainstream Linux distribution. Operators install whichever halves they
 need. The two packages co-exist cleanly on the same host because they use
@@ -199,9 +199,9 @@ will be owned by your user.
 The script produces `release-artifacts/`:
 
 ```
-thurvtl_<ver>-1_amd64.deb            # binary, Apache-2.0 (tape VTL)
+thurvtl_<ver>-1_amd64.deb            # binary, Apache-2.0 (virtual tape library)
 thurvtl-<ver>-1.x86_64.rpm           # binary, Apache-2.0
-thurvsa_<ver>-1_amd64.deb            # binary, Apache-2.0 (block target)
+thurvsa_<ver>-1_amd64.deb            # binary, Apache-2.0 (virtual storage appliance)
 thurvsa-<ver>-1.x86_64.rpm           # binary, Apache-2.0
 ```
 

@@ -310,7 +310,7 @@ suffix.
 
 ### thurvsa block (SBC-3) — `iqn.2025-10.com.metebalci:thurvsa`, port 3260
 
-This is the sibling product: a direct-access block target that draws
+This is the sibling product: a virtual storage appliance that draws
 on the same backend chunk pool. Internally, volumes are page-grained
 with a default 64 KiB page, but to the host they advertise plain 4 KiB
 sectors over SBC-3 — the paging is invisible at the SCSI surface. The

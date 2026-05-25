@@ -7,7 +7,7 @@ index.
 
 ## Project Overview
 
-Two sibling Rust products on a shared backend chunk pool, packaged separately
+Two sibling products on a shared backend chunk pool, packaged separately
 and co-resident on the same host:
 
 - **Thur VTL** (working name `thurvtl`) — Virtual Tape Library presenting
@@ -25,9 +25,9 @@ and co-resident on the same host:
   Single-tape-drive deployments declare
   `library: { num_slots: 1, num_drives: 1, lto_generation: 8 }` in
   the YAML conffile.
-- **Thur VSA** (working name `thurvsa`) — Virtual Storage Appliance, a
-  block-storage target serving SBC-3
-  direct-access LUNs. Sparse per-volume page table backed by the same
+- **Thur VSA** (working name `thurvsa`) — Virtual Storage Appliance
+  presenting any number of spec-conformant SBC-3 direct-access LUNs over
+  iSCSI or NVMe/TCP. Sparse per-volume page table backed by the same
   dedup-capable chunk pool, 4 KiB sectors, default 64 KiB page,
   thin-provisioned. iSCSI default port 3260 — co-resident installs override
   one in YAML so the two products don't clash. IQN `iqn.2025-10.com.metebalci:thurvsa`.
