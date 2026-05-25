@@ -165,12 +165,60 @@ thurvtl config defaults > thurvtl.yaml
 thurvsa config defaults > thurvsa.yaml
 ```
 
-Cloud credentials are wired per-backend (`auth:` blocks) or via the
-default credential chain / daemon env file; the reference is
-[`docs/AUTH.md`](docs/AUTH.md). Every config file and YAML key is
-catalogued in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Both
-the daemon and CLI resolve `--config PATH` first, otherwise
+Every config file and YAML key is catalogued in
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Both the daemon and
+CLI resolve `--config PATH` first, otherwise
 `/etc/<product>/<product>.yaml`.
+
+### Cloud backends
+
+Both products store data as content-addressed chunks in a per-backend
+pool. The backend type determines where those chunks live; configure
+backends under `cloud.backends:` in the conffile, giving each entry a
+name, a `type` (`s3` / `gcs` / `azure` / `local`), and its
+per-cloud knobs:
+
+```yaml
+cloud:
+  backends:
+    primary:
+      type: s3
+      bucket: thur-data
+      prefix: "data/"
+      region: us-east-1
+    archive:
+      type: gcs
+      bucket: thur-cold
+      prefix: "data/"
+      project_id: my-project
+```
+
+The `local` backend is filesystem-only — no credentials, no cloud —
+ideal for testing:
+
+```yaml
+cloud:
+  backends:
+    primary:
+      type: local
+      root_dir: "./.thur/local-backend"
+```
+
+On startup the daemon validates each cloud backend's credentials,
+bucket existence, and read/write/delete permissions, and refuses to
+start on failure. Validate ahead of time, without starting the
+daemon, with `thurvtl system cloud check`.
+
+- **Credentials** — `auth:` blocks, default chains, the daemon env
+  file, multi-provider layouts: [`docs/AUTH.md`](docs/AUTH.md).
+- **S3-compatible provider matrix** — Backblaze B2, Wasabi, Hetzner,
+  OVHcloud, …: [`docs/S3_BACKENDS.md`](docs/S3_BACKENDS.md).
+- **WORM, legal hold, at-rest encryption** (incl. provider bucket
+  setup): [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md).
+- **Cross-region DR, cartridge migration / archive** —
+  [`docs/SPEC.md`](docs/SPEC.md).
+
+### Thur VTL library
 
 Thur VTL also needs a chassis declaration. Add a `library:` block to
 your `thurvtl.yaml` — every field is required:
@@ -227,22 +275,11 @@ On Windows, use the built-in iSCSI Initiator (Control Panel) — add
 the portal, connect, and the devices appear under Tape drives and
 Medium Changers.
 
-The host kernel sees a standard tape library — back up with `tar`,
-control the drive with `mt`, drive the changer with `mtx`:
-
-```bash
-sudo tar -cvf /dev/nst0 /path/to/backup      # write
-sudo tar -xvf /dev/nst0                      # restore
-sudo mt  -f /dev/st0  status                 # drive status
-sudo mtx -f /dev/sch0 status                 # library status
-sudo mtx -f /dev/sch0 load 1 0               # load slot 1 -> drive 0
-```
-
 ## Manage cartridges
 
-`thurvtl` manages the library without an iSCSI initiator. This is
-useful for provisioning cartridges, inspecting inventory, and running
-analytics before or after a backup session:
+`thurvtl` manages the library without an iSCSI initiator. Cartridges
+have to exist before any backup software can write to them, so this
+is the next step after connecting:
 
 ```bash
 thurvtl cartridge create TAPE001         # new cartridge, first free slot
@@ -255,19 +292,22 @@ thurvtl system stats                     # dedup analytics
 Cartridge lifecycle — creation flags, WORM, legal hold, at-rest
 encryption — is in [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md).
 
-# Using Thur VSA
+## Examples
 
-## Create a volume
-
-`thurvsa` talks to the running daemon over its admin socket
-(the daemon must be up):
+With the iSCSI session active, drive the changer with `mtx` and the
+drive with `mt`, then back up with `tar`:
 
 ```bash
-thurvsa volume create myvol --size 100G
-thurvsa volume list
+sudo mt  -f /dev/st0  status                 # drive status
+sudo mtx -f /dev/sch0 status                 # library + slot inventory
+sudo mtx -f /dev/sch0 load 1 0               # load slot 1 -> drive 0
+sudo tar -cvf /dev/nst0 /path/to/backup      # write
+sudo tar -xvf /dev/nst0                      # restore
 ```
 
-## Connect
+# Using Thur VSA
+
+## Connect (iSCSI or NVMe/TCP)
 
 VSA serves each volume as a block LUN. The default transport is
 iSCSI; set `transport: nvmetcp` in `thurvsa.yaml` to serve NVMe/TCP
@@ -284,114 +324,44 @@ sudo nvme connect -t tcp -a <target_ip> -s 4420 \
      -n nqn.2025-10.com.metebalci:thurvsa
 ```
 
-The host sees a thin-provisioned block device — partition, format,
-and mount it like any disk. The NVMe/TCP transport design (handshake,
-R2T flow, auth) is in [`docs/NVMETCP.md`](docs/NVMETCP.md).
+The NVMe/TCP transport design (handshake, R2T flow, auth) is in
+[`docs/NVMETCP.md`](docs/NVMETCP.md).
 
-# Cloud Backends
+## Create a volume
 
-Both products store data as content-addressed chunks in a per-backend
-pool. The backend type determines where those chunks live; configure
-backends under `cloud.backends:` in the conffile, giving each entry a
-name, a `type` (`s3` / `gcs` / `azure` / `local`), and its
-per-cloud knobs:
-
-```yaml
-cloud:
-  backends:
-    primary:
-      type: s3
-      bucket: thur-data
-      prefix: "data/"
-      region: us-east-1
-    archive:
-      type: gcs
-      bucket: thur-cold
-      prefix: "data/"
-      project_id: my-project
-```
-
-The `local` backend is filesystem-only — no credentials, no cloud —
-ideal for testing:
-
-```yaml
-cloud:
-  backends:
-    primary:
-      type: local
-      root_dir: "./.thur/local-backend"
-```
-
-On startup the daemon validates each cloud backend's credentials,
-bucket existence, and read/write/delete permissions, and refuses to
-start on failure. Validate ahead of time, without starting the
-daemon, with `thurvtl system cloud check`.
-
-- **Credentials** — `auth:` blocks, default chains, the daemon env
-  file, multi-provider layouts: [`docs/AUTH.md`](docs/AUTH.md).
-- **S3-compatible provider matrix** — Backblaze B2, Wasabi, Hetzner,
-  OVHcloud, …: [`docs/S3_BACKENDS.md`](docs/S3_BACKENDS.md).
-- **WORM, legal hold, at-rest encryption** (incl. provider bucket
-  setup): [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md).
-- **Cross-region DR, cartridge migration / archive** —
-  [`docs/SPEC.md`](docs/SPEC.md).
-
-# Monitoring & Audit
-
-Each daemon exposes HTTP on port 9090 for health and observability
-probes. The `/metrics` endpoint serves Prometheus-formatted metrics
-and is always wired — there is no on/off switch separate from the HTTP
-listener itself:
+`thurvsa` talks to the running daemon over its admin socket
+(the daemon must be up):
 
 ```bash
-curl http://localhost:9090/health      # liveness probe
-curl http://localhost:9090/metrics     # Prometheus
-curl http://localhost:9090/sessions    # iSCSI sessions
-curl http://localhost:9090/info        # topology (library / volume count)
+thurvsa volume create myvol --size 100G
+thurvsa volume list
 ```
 
-Metrics are prefixed `thurvtl_*` / `thurvsa_*`. Both daemons keep an
-always-on, append-only, BLAKE3-chained audit log under
-`<data_dir>/audit/`, with optional offsite shipping to a cloud
-backend. The chain means any after-the-fact modification to the log
-is detectable:
+After creating a new volume, rescan the initiator so the host sees
+the new LUN:
 
 ```bash
-thurvtl system audit tail -f
-thurvtl system audit verify         # exit 0 valid, 1 break, 2 io error
+sudo iscsiadm -m session --rescan        # iSCSI
+sudo nvme ns-rescan /dev/nvme0           # NVMe/TCP
 ```
 
-Telemetry design — [`docs/TELEMETRY.md`](docs/TELEMETRY.md); audit
-design — [`docs/AUDIT.md`](docs/AUDIT.md); opt-in email / webhook
-alerting — [`docs/ALERTING.md`](docs/ALERTING.md).
+## Examples
 
-# Development
+The host now sees a thin-provisioned block device — partition,
+format, and mount it like any disk:
 
 ```bash
-cargo build [--release]       # binaries in target/{debug,release}/
-cargo test
-cargo fmt && cargo clippy
-
-# Run a daemon in the foreground from the build tree
-RUST_LOG=info ./target/release/thurvtld --config thurvtl.yaml
+lsblk                                    # find the new device (e.g. sdb, nvme0n1)
+sudo parted -s /dev/sdb mklabel gpt mkpart primary ext4 0% 100%
+sudo mkfs.ext4 /dev/sdb1
+sudo mkdir -p /mnt/myvol
+sudo mount /dev/sdb1 /mnt/myvol
 ```
-
-`cargo test` runs the workspace suite — 1,299 unit and integration
-tests across the 38 crates. Measured with `cargo llvm-cov`, the storage
-and protocol crates (storage engines, SCSI / NVMe command sets, dedup,
-crypto, chunk pool) carry **75–95% line coverage**; the daemon and CLI
-integration surface is covered separately by the end-to-end conformance
-suites under `vtl/scripts/` and `vsa/scripts/` (`test-smoke.sh`,
-`test-*-conformance.sh`, and backup / filesystem workflow tests) — each
-script's header documents its prerequisites and what it covers.
-[`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md) has the per-crate
-coverage breakdown, the methodology, and the suite catalogue.
-
-The release-cut process is in [`docs/RELEASING.md`](docs/RELEASING.md);
-the workspace crate map is in [`docs/WORKSPACE.md`](docs/WORKSPACE.md).
 
 # Documentation
 
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source,
+  the test suite, running a daemon from the build tree.
 - [`CLAUDE.md`](CLAUDE.md) — architecture orientation and repo map.
 - Roadmap and open work — tracked as
   [GitHub issues](https://github.com/metebalci/thur/issues).
