@@ -41,10 +41,15 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
             SenseDataBuilder::new(SenseKey::NotReady, ASC_NOT_READY_NO_MEDIUM).build()
         }
 
-        // Tape position conditions (with special flags)
-        SmcError::EndOfData => SenseDataBuilder::new(SenseKey::BlankCheck, ASC_EOD_DETECTED)
-            .with_eom()
-            .build(),
+        // Tape position conditions (with special flags). EOD is *not*
+        // physical end-of-medium — SSC-4 §8.3.1 reserves the EOM bit
+        // for the VolumeOverflow / EarlyWarning paths below. Handlers
+        // that own CDB context (`handle_read_6`) build their own sense
+        // with INFORMATION = residual; this fallback is for paths
+        // without a transfer length to populate.
+        SmcError::EndOfData => {
+            SenseDataBuilder::new(SenseKey::BlankCheck, ASC_EOD_DETECTED).build()
+        }
         SmcError::BeginningOfTape => {
             SenseDataBuilder::new(SenseKey::NoSense, ASC_BOT_DETECTED).build()
         }
@@ -322,7 +327,7 @@ mod tests {
 
         assert_eq!(sense.len(), 18);
         assert_eq!(sense[2] & 0x0F, 0x08); // BlankCheck
-        assert_eq!(sense[2] & 0x40, 0x40); // EOM bit set
+        assert_eq!(sense[2] & 0x40, 0x00); // EOM bit clear (EOD != physical EOM)
         assert_eq!(sense[12], 0x00); // ASC
         assert_eq!(sense[13], 0x05); // ASCQ = EOD
     }

@@ -752,8 +752,7 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     // READ(6) is currently treated as one logical block; cdb[2..5] is
     // the requested byte count). Needed for the SSC-4 §7.6 filemark
     // residual: host's allocated length minus what we returned.
-    let xfer_len =
-        ((ctx.cdb[2] as u32) << 16) | ((ctx.cdb[3] as u32) << 8) | (ctx.cdb[4] as u32);
+    let xfer_len = ((ctx.cdb[2] as u32) << 16) | ((ctx.cdb[3] as u32) << 8) | (ctx.cdb[4] as u32);
     let mut data_out = vec![];
     let mut is_filemark = false;
     match drive_manager.with_drive(drive_id, tsih, |cart| {
@@ -821,6 +820,26 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 data_out,
                 sense: None,
             })
+        }
+        Err(core_mediachanger::errors::SmcError::EndOfData) => {
+            // Past-EOD READ(6) (SSC-4 §4.2.20 + 8.3.1). Return CHECK
+            // CONDITION + BLANK CHECK + ASC/ASCQ 0x00/0x05 with INFO
+            // = TRANSFER LENGTH — the host's full allocation is the
+            // residual since zero data bytes were transferred.
+            // Without the INFO field (and its VALID bit) the Linux
+            // st driver can't compute the short-read count and dd's
+            // userspace buffer comes back holding whatever stale
+            // bytes its kernel page started with — the `14 00 00 08
+            // ...` garbage in issue #26's reproducer. The EOM bit is
+            // *not* set: end-of-data is not physical end-of-medium
+            // (SSC-4 reserves EOM for VolumeOverflow / EarlyWarning).
+            let sense = scsi::sense::SenseDataBuilder::new(
+                scsi::sense::SenseKey::BlankCheck,
+                scsi::sense::ASC_EOD_DETECTED,
+            )
+            .with_information(xfer_len)
+            .build();
+            Ok(ScsiResp::check_condition_with_sense(sense))
         }
         Err(e) => {
             tracing::warn!("READ(6) failed: {}", e);

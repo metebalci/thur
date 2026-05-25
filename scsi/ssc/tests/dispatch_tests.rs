@@ -333,6 +333,64 @@ fn read_six_on_filemark_returns_check_condition_with_fm_bit() {
 }
 
 #[test]
+fn read_six_past_eod_returns_check_condition_with_blank_check_and_info() {
+    // Regression for issue #26 (the past-EOD twin of #25). After one
+    // record is written, rewound, and read back successfully, the
+    // head sits past the only record; the next READ(6) must surface
+    // CHECK CONDITION + BLANK CHECK + ASC/ASCQ 0x00/0x05 with
+    // INFO = TRANSFER LENGTH (residual = the host's full allocation,
+    // since zero bytes were transferred). Without the INFO field the
+    // Linux st driver can't compute the short-read count and dd
+    // returns its kernel buffer untouched — the same `14 00 00 08
+    // ...` garbage #25 hit on the filemark path. The EOM bit must
+    // *not* be set; EOD is not physical end-of-medium.
+    let fx = Fixture::new();
+    let payload = vec![0xA5u8; 4096];
+
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
+    assert_eq!(
+        handlers::handle_write_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut ctx = fx.ctx(&mut rp, cdb(0x08));
+    assert_eq!(
+        handlers::handle_read_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // Past-EOD read — dd bs=65536 from the bug reproducer.
+    let mut read_cdb = cdb(0x08);
+    // 24-bit BE transfer length = 0x010000 (65536).
+    read_cdb[2] = 0x01;
+    read_cdb[3] = 0x00;
+    read_cdb[4] = 0x00;
+    let mut rp = Pdu::synth(&read_cdb, 1, 65536, &[]);
+    let mut ctx = fx.ctx(&mut rp, read_cdb);
+    let resp = handlers::handle_read_6(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    assert!(resp.data_out.is_empty(), "no data on past-EOD read");
+    let sense = resp.sense.expect("past-EOD read must carry sense");
+    assert_eq!(sense[0] & 0x7f, 0x70, "fixed-format sense");
+    assert_eq!(sense[0] & 0x80, 0x80, "INFO valid bit set");
+    assert_eq!(sense[2] & 0x0f, 0x08, "sense key = BLANK CHECK");
+    assert_eq!(sense[2] & 0x40, 0x00, "EOM bit clear (EOD != EOM)");
+    // INFO = TRANSFER LENGTH residual (0x00010000, big-endian).
+    assert_eq!(sense[3], 0x00);
+    assert_eq!(sense[4], 0x01);
+    assert_eq!(sense[5], 0x00);
+    assert_eq!(sense[6], 0x00);
+    assert_eq!(sense[12], 0x00, "ASC = 0x00");
+    assert_eq!(sense[13], 0x05, "ASCQ = 0x05 (END-OF-DATA DETECTED)");
+}
+
+#[test]
 fn write_six_with_no_data_is_rejected() {
     let fx = Fixture::new();
     let mut p = pdu(); // empty data segment

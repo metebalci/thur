@@ -237,7 +237,7 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
 |-------:|---------|-------|
 | 0x01 | REWIND | |
 | 0x05 | READ BLOCK LIMITS | |
-| 0x08 | READ(6) | Variable-block. Filemark hit → CHECK CONDITION + NoSense + FM=1 + INFO = TRANSFER LENGTH (SSC-4 §7.6); EOD → CHECK CONDITION + BlankCheck + EOM=1 + ASC/ASCQ 0x00/0x05. |
+| 0x08 | READ(6) | Variable-block. Filemark hit → CHECK CONDITION + NoSense + FM=1 + INFO = TRANSFER LENGTH (SSC-4 §7.6); past-EOD → CHECK CONDITION + BlankCheck + ASC/ASCQ 0x00/0x05 + INFO = TRANSFER LENGTH (SSC-4 §4.2.20 / §8.3.1; EOM bit clear — EOD is not physical end-of-medium). |
 | 0x0A | WRITE(6) | Variable-block |
 | 0x0B | SET CAPACITY | 6-byte CDB. CDB[2..4] = CAPACITY PROPORTION VALUE (16-bit BE; 0 = full native, 65535 = full native, intermediate = fraction). Persisted in the cartridge manifest as `set_capacity_proportion`. Erases the cartridge and rewinds to BOM, then gates subsequent WRITE / WRITE FILEMARKS at the host-set effective capacity: 95% raises Early Warning (CHECK CONDITION + NoSense + EOM=1 + ASC/ASCQ 0x00/0x02), 100% returns EndOfMedium (CHECK CONDITION + VolumeOverflow + EOM=1 + 0x00/0x02). EW is sticky-once-per-pass; rewind / locate-to-BOM / erase / SET CAPACITY clears the latch. IMMED bit ignored. |
 | 0x10 | WRITE FILEMARKS(6) | Per-iteration errors (WORM / legal-hold) propagate as CC + sense |
