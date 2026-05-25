@@ -5,13 +5,13 @@
 > SCSI / NVMe surface may change without notice or migration path.
 > Not recommended for production use.
 
-Thur is a cloud-backed Virtual Tape Library and Virtual Storage
-Appliance, built on a shared Rust codebase. Each presents
-spec-conformant storage devices to the host, but the data lives in cloud
-object storage — local disk holds only a warm, refcount-evicted cache
-in front of it. The capacity a host can address is set by the cloud
-bucket, not the local disk: a modest cache machine can front a dataset
-many times its own size.
+**Thur VTL** and **Thur VSA** are two sibling cloud-backed storage
+products built on a shared Rust codebase. Each presents
+spec-conformant storage devices to the host, but the data lives in
+cloud object storage — local disk holds only a warm, refcount-evicted
+cache in front of it. The capacity a host can address is set by the
+cloud bucket, not the local disk: a modest cache machine can front a
+dataset many times its own size.
 
 Furthermore, stored data is deduplicated in a shared content-addressed
 chunk pool. Every chunk is keyed by its BLAKE3 hash, with no central
