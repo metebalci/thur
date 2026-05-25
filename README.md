@@ -1,4 +1,4 @@
-# Thur
+# Thur VTL and Thur VSA
 
 [![Lines of code](https://sloc.xyz/github/metebalci/thur/?category=code)](https://github.com/metebalci/thur/)
 [![Comment lines](https://sloc.xyz/github/metebalci/thur/?category=comments)](https://github.com/metebalci/thur/)
