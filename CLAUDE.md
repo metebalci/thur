@@ -462,12 +462,18 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
-- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage}.sh`
-- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage}.sh`
+- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,monte-carlo}.sh`
+- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
 entry in the conffile; refuses `retention_mode != none`.
+`test-monte-carlo.sh` (both products) runs seeded random op sequences
+with a boundary-biased size distribution and lazy iSCSI/mount/load
+prereqs — VSA does file ops over ext4, VTL does tape record ops.
+Reproduce with `--seed N` (printed at start), `--quick` for ~30 s
+smoke (200 ops) vs the ~5 min default (3000 ops). VSA also accepts
+`--backend NAME` / `THURVSA_TEST_BACKEND`.
 `test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
