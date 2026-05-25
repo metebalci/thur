@@ -263,7 +263,7 @@ iscsi:
   target_iqn: "$TARGET_IQN"
 disk_cache:
   disk_free_min_gb: 0
-cloud:
+storage:
   compression:
     algorithm: none
   backends:

@@ -93,7 +93,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
 
     if is_worm {
         let mode = state
-            .cloud_config
+            .storage_config
             .retention_mode_named(&params.target_backend);
         if !mode.requires_lock() {
             let reason = format!(
@@ -111,7 +111,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     // Construct backend handles. Source for chunk-fetch fallback,
     // target for the archive PUTs.
     let source = match state
-        .cloud_config
+        .storage_config
         .create_backend_named(&source_backend)
         .await
     {
@@ -124,7 +124,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
         }
     };
     let target = match state
-        .cloud_config
+        .storage_config
         .create_backend_named(&params.target_backend)
         .await
     {
@@ -221,7 +221,7 @@ async fn preflight(params: &ArchiveParams, state: &DaemonState) -> Result<(), St
     if params.label.is_empty() {
         return Err("label must be non-empty".to_string());
     }
-    let names = state.cloud_config.backend_names();
+    let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.target_backend) {
         return Err(format!(
             "target backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",

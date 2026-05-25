@@ -145,21 +145,21 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   trait, no I/O, no serde. Entity enumeration differs per product
   (VTL walks each cartridge's `chunks.idx`, VSA each volume's
   `pages.idx`) and stays in each daemon's `job_dispatch::stats`.
-- **shared-cloud** — cloud-backend abstraction. `cloud_backend.rs` (the
-  `CloudBackend` trait), `cloud_config.rs` (`CloudConfig` schema +
+- **shared-object-store** — storage-backend abstraction. `object_store_backend.rs` (the
+  `ObjectStoreBackend` trait), `object_store_config.rs` (`ObjectStoreConfig` schema +
   `FailureKind` classifier + `validate_cloud_backend`),
-  `cloud_helpers.rs` (decorrelated-jitter retry), `s3.rs` / `gcs.rs` /
+  `object_store_helpers.rs` (decorrelated-jitter retry), `s3.rs` / `gcs.rs` /
   `azure.rs` / `local.rs`, `compression.rs` (LZ4 / zstd primitives).
-  Errors are surfaced via `CloudError`; `core-mediachanger` defines
+  Errors are surfaced via `ObjectStoreError`; `core-mediachanger` defines
   `From<CloudError> for VtlError` so `?` propagation is unaffected, and
   re-exports the flat names (`core_mediachanger::CloudBackend`,
   `…CloudConfig`, `…CompressionAlgo`, …).
-- **shared-cloud-bench** — first-party cloud-backend throughput
+- **shared-object-store-bench** — first-party storage-backend throughput
   benchmark engine. `run` drives N parallel `CloudBackend::upload_chunk`
   / `download_chunk` / `delete_object` calls through the same SDK +
   network path the daemon uses. Output: `[BENCH]` lines on stdout,
   `[BENCH-ERR]` on stderr without aborting sibling cells. Knobs via
-  `BenchOptions`. Consumed by the `system cloud benchmark` CLI verbs of
+  `BenchOptions`. Consumed by the `system storage benchmark` CLI verbs of
   both products.
 - **shared-iscsi** — cross-product iSCSI primitives.
   - `auth.rs` — CHAP (MD5 / SHA-1 / SHA-256 / SHA3-256 with
@@ -194,7 +194,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   plaintext sidecar), `awskms.rs`, `vault.rs`, `azurekv.rs`,
   `gcpkms.rs`, `kmip.rs` (+ `kmip_wire.rs` hand-rolled TTLV). Config /
   auth resolution via `keystore_config.rs`; `error.rs`,
-  `passphrase_envelope.rs`. Tagged-enum config mirrors `shared-cloud`.
+  `passphrase_envelope.rs`. Tagged-enum config mirrors `shared-object-store`.
 - **shared-audit** — append-only, BLAKE3-chained audit log. `audit.rs`
   (`AuditLog`, daily JSONL rotation + zstd-encoded post-rollover
   compression, `replay_pending` queue drain, `verify` / `read_entries`,
@@ -224,7 +224,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-upload-worker** — cloud-upload pipeline scaffold shared by
   tape (core-stream / VTL) and block (core-block / VSA). Two surfaces:
   `upload_chunk_inert(backend, &PendingUpload)` — stateless PUT with a
-  cloud-side dedup HEAD probe (under `DedupScope::Global`), returns
+  storage-side dedup HEAD probe (under `DedupScope::Global`), returns
   `UploadOutcome`; no cartridge / volume borrow held during the await.
   `run_upload_pipeline` — drives a batch through `upload_chunk_inert`
   with at most `max_concurrent` PUTs in flight (`buffer_unordered`),
@@ -241,7 +241,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `sweep_local_pool(data_dir, target)` returns one `PoolSweep` per
   backend (the local orphan scan over every `(backend, namespace)`
   pool); `sweep_cloud(target, backend_name, backend)` runs the bounded
-  HEAD storm against one cloud backend and the `chunks/` orphan scan.
+  HEAD storm against one storage backend and the `chunks/` orphan scan.
   The tape side additionally HEADs index-page objects + the manifest
   sentinel (no block analogue, stays in `core-mediachanger`); each
   product assembles its own `VerifyReport` from the sweep results.
@@ -254,7 +254,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-pool** — content-addressed chunk pool. One `ChunkPool`
   carrying both insertion APIs (`insert_bytes(&[u8])` for buffer-driven
   block writes, `insert_from_path(src, hash)` for staging-file-driven
-  tape writes), namespace-aware `cloud_key`, `iter_chunks` for GC,
+  tape writes), namespace-aware `object_key`, `iter_chunks` for GC,
   atomic tmp+rename inserts. Layout
   `<root>/chunks/<backend>/[<namespace>/]<aa>/<bb>/<hash>.dat`.
   core-stream's `chunk_store.rs` aliases `ChunkPool` as `ChunkStore`
@@ -326,7 +326,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **core-stream** — SSC-4 / LTO tape-cartridge primitives. `tape.rs`
   (Block / BlockKind / Filemark), `cartridge/` (Cartridge, manifest,
   write_data, read_block, capacity / Early Warning / EOM, partitions —
-  split into `mod.rs`, `chunking.rs`, `cloud.rs`, `indexing.rs`,
+  split into `mod.rs`, `chunking.rs`, `storage.rs`, `indexing.rs`,
   `runtime.rs`), `cartridge_archive.rs` / `cartridge_migrate.rs`
   (cross-backend / cross-region ops), `block_index.rs` (per-partition
   LBA index), `chunk_index.rs` (per-cartridge chunk index),
@@ -359,7 +359,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   (Logical Block Protection trailer), `direct_io.rs` / `io_uring.rs`
   (vestigial, feature-gated). Flat-re-exports the core-stream surface
   (`core_mediachanger::Cartridge`, `…ChunkStore`,
-  `core_mediachanger::cartridge`, …) plus the shared-cloud /
+  `core_mediachanger::cartridge`, …) plus the shared-object-store /
   shared-audit / shared-telemetry crates' flat names + module paths.
 
 ## vtl crates
@@ -424,7 +424,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   pool, layout `<data_dir>/chunks/<backend>/[<volume>/]<aa>/<bb>/
   <hash>.dat`. Optional volume-name namespace fires under `Local` dedup
   scope (no cross-volume sharing); absent under `Global`. `insert_bytes`
-  is atomic, idempotent on hash collision; `cloud_key` drops the
+  is atomic, idempotent on hash collision; `object_key` drops the
   per-backend prefix but keeps the volume namespace.
 - `core-block::uploader::VolumeWriter` — per-volume page write
   primitive. `open(data_dir, name, Arc<dyn CloudBackend>)` bundles
@@ -534,7 +534,7 @@ is honored end-to-end. UNMAP (0x42) parses an 8-byte header + N ×
 16-byte UNMAP BLOCK DESCRIPTOR list, validates every descriptor up
 front, then routes each through `cache.unmap_bytes`: full-page
 descriptors drop the cached entry and synchronously clear the
-page-index slot (cloud chunks linger until `system gc`); sub-page
+page-index slot (backend chunks linger until `system gc`); sub-page
 descriptors zero the affected sectors and mark dirty.
 
 UNMAP and CAW are advertised end-to-end: VPD 0xB0 carries MAXIMUM
@@ -611,7 +611,7 @@ Telemetry installed via `shared_telemetry::set_global` at boot with
 ### thurvsa
 
 `vsa-cli` (binary `thurvsa`) reads `/etc/thurvsa/thurvsa.yaml` (or
-`--config PATH`) for `data_dir` and the `cloud.backends` registry.
+`--config PATH`) for `data_dir` and the `storage.backends` registry.
 Top-level subcommands: `volume`, `system`, `iscsi`, `nvmetcp`,
 `alerting`, `config`. `volume create / list / info / destroy / modify`
 are daemon-routed; `volume key migrate` and `system regenerate-cert`
@@ -625,7 +625,7 @@ mirrors `src/commands/defaults_reference.yaml` to
 ## Shared infrastructure summary
 
 The shared layer exists so the two products never diverge silently on
-behaviors that have to match. `shared-cloud` carries the `CloudBackend`
+behaviors that have to match. `shared-object-store` carries the `ObjectStoreBackend`
 trait plus S3 / GCS / Azure / Local implementations, retry logic, and
 compression primitives. `shared-audit` carries the BLAKE3-chained audit
 log, the cloneable `AuditChannel` producer and single-writer drainer,
@@ -633,6 +633,6 @@ and the `AuditRateLimiter`. `shared-telemetry` carries the OpenTelemetry
 SDK plumbing, the Prometheus pull and OTLP push readers, and the
 `record::*` global-handle pattern. `shared-iscsi`,
 `shared-admin-*`, `shared-cli-*`, `shared-keystore`, `shared-alerting`,
-`shared-health`, `shared-cloud-bench`, and `shared-upload-worker` are
+`shared-health`, `shared-object-store-bench`, and `shared-upload-worker` are
 likewise consumed by both products. The tape-side disk cache lives in
 `core-stream`; the block-side equivalent is in `core-block`.

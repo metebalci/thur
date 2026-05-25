@@ -1,7 +1,7 @@
 # S3-compatible backend matrix
 
 This document surveys the S3-compatible object-storage providers that
-can be wired into the daemon as a `cloud.backends` entry of type `s3`,
+can be wired into the daemon as a `storage.backends` entry of type `s3`,
 typically with an `endpoint_url` and region override. The data here
 was gathered in May 2026, and provider feature sets move — re-verify
 anything load-bearing before relying on it in production. The scope is
@@ -36,7 +36,7 @@ until its retention period expires.
 ## What Thur VTL needs from the backend
 
 The requirements below are drawn from the code that actually talks to
-the backend — `shared/cloud/src/s3.rs`,
+the backend — `shared/object-store/src/s3.rs`,
 `core/mediachanger/src/legal_hold.rs`, and the WORM cartridge gate in
 `core/stream/src/cartridge/mod.rs`. Six features matter:
 
@@ -206,10 +206,10 @@ For every provider that passes the feature gate — that is, all of them
 except R2 — the integration work is light:
 
 - Basic read/write needs no code changes beyond setting `endpoint_url`
-  and the region. The existing `S3Backend` in `shared/cloud/src/s3.rs`
+  and the region. The existing `S3Backend` in `shared/object-store/src/s3.rs`
   already absorbs the variant endpoint shapes through `endpoint_url`.
 - The WORM `retention_mode` reconcile already runs at startup, in
-  `shared/cloud/src/s3.rs` via `GetObjectLockConfiguration`, and it
+  `shared/object-store/src/s3.rs` via `GetObjectLockConfiguration`, and it
   should work against any provider whose Object Lock surface mirrors
   AWS. Still, spot-test each one — some providers return slightly
   different XML for `GetObjectLockConfiguration`.
@@ -251,7 +251,7 @@ Pulling the per-provider catches into one place:
 
 A few loose ends remain:
 
-- `test-backup-cloud` accepts a `THURVTL_TEST_BACKEND` env var that
+- `test-backup-storage` accepts a `THURVTL_TEST_BACKEND` env var that
   picks a conffile entry. The cheapest way to validate this matrix
   against running infrastructure is to add per-provider smoke targets —
   one entry per provider in a development `thurvtl.yaml` — and run the

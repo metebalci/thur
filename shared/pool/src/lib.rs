@@ -35,7 +35,7 @@
 //! - **Not refcounted.** Garbage collection is a separate manifest-
 //!   walking pass per product (thurvtl's `system gc`, thurvsa's pending
 //!   GC sweep).
-//! - **Not aware of the cloud.** [`ChunkPool::cloud_key`] computes the
+//! - **Not aware of the cloud.** [`ChunkPool::object_key`] computes the
 //!   key shape; uploads are driven by the consuming product.
 //! - **Not aware of higher-level identity.** Hashes are global within
 //!   a (backend, namespace) pair.
@@ -194,15 +194,15 @@ impl ChunkPool {
     /// backend already has its own bucket / prefix.
     ///
     /// Returned as a forward-slash-separated string so it works on
-    /// every CloudBackend implementation regardless of host OS.
-    pub fn cloud_key(&self, hash_hex: &str) -> String {
-        Self::cloud_key_for(self.namespace.as_deref(), hash_hex)
+    /// every ObjectStoreBackend implementation regardless of host OS.
+    pub fn object_key(&self, hash_hex: &str) -> String {
+        Self::object_key_for(self.namespace.as_deref(), hash_hex)
     }
 
     /// Cloud key with the namespace passed in explicitly. Useful when
     /// the caller has the namespace string but no live `ChunkPool`
     /// (e.g. legal-hold / verify paths walking manifests).
-    pub fn cloud_key_for(namespace: Option<&str>, hash_hex: &str) -> String {
+    pub fn object_key_for(namespace: Option<&str>, hash_hex: &str) -> String {
         let (s1, s2) = shard_pair(hash_hex);
         match namespace {
             Some(ns) => format!("chunks/{ns}/{s1}/{s2}/{hash_hex}.dat"),
@@ -210,12 +210,12 @@ impl ChunkPool {
         }
     }
 
-    /// Backwards-compat alias for [`Self::cloud_key`] —
+    /// Backwards-compat alias for [`Self::object_key`] —
     /// thurvtl's historical surface called this method
-    /// `cloud_key_in_store`. Kept distinct so existing call sites
+    /// `object_key_in_store`. Kept distinct so existing call sites
     /// resolve unchanged.
-    pub fn cloud_key_in_store(&self, hash_hex: &str) -> String {
-        self.cloud_key(hash_hex)
+    pub fn object_key_in_store(&self, hash_hex: &str) -> String {
+        self.object_key(hash_hex)
     }
 
     /// Does the chunk exist in the local pool?
@@ -477,10 +477,10 @@ mod tests {
     fn cloud_key_strips_backend_keeps_namespace() {
         let tmp = TempDir::new().unwrap();
         let global = ChunkPool::new(tmp.path(), "primary").unwrap();
-        assert_eq!(global.cloud_key("deadbeef"), "chunks/de/ad/deadbeef.dat");
+        assert_eq!(global.object_key("deadbeef"), "chunks/de/ad/deadbeef.dat");
         let local = ChunkPool::new_namespaced(tmp.path(), "primary", "vol1").unwrap();
         assert_eq!(
-            local.cloud_key("deadbeef"),
+            local.object_key("deadbeef"),
             "chunks/vol1/de/ad/deadbeef.dat"
         );
     }
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn cloud_key_for_static_form_no_namespace() {
         assert_eq!(
-            ChunkPool::cloud_key_for(None, "deadbeef"),
+            ChunkPool::object_key_for(None, "deadbeef"),
             "chunks/de/ad/deadbeef.dat"
         );
     }
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn cloud_key_for_static_form_with_namespace() {
         assert_eq!(
-            ChunkPool::cloud_key_for(Some("TAPE001"), "deadbeef"),
+            ChunkPool::object_key_for(Some("TAPE001"), "deadbeef"),
             "chunks/TAPE001/de/ad/deadbeef.dat"
         );
     }

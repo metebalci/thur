@@ -8,7 +8,7 @@
 
 use crate::chunk_store::ChunkStore;
 use crate::errors::Result;
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -46,14 +46,14 @@ pub struct PrefetchManager {
     /// Active prefetch tasks: (cartridge_id, chunk_id) -> JoinHandle
     active_tasks: ActiveTaskMap,
     /// Cloud backend for downloading chunks
-    cloud_backend: Arc<Box<dyn CloudBackend>>,
+    cloud_backend: Arc<Box<dyn ObjectStoreBackend>>,
     /// Configuration
     config: PrefetchConfig,
 }
 
 impl PrefetchManager {
     /// Create a new prefetch manager
-    pub fn new(cloud_backend: Arc<Box<dyn CloudBackend>>, config: PrefetchConfig) -> Self {
+    pub fn new(cloud_backend: Arc<Box<dyn ObjectStoreBackend>>, config: PrefetchConfig) -> Self {
         Self {
             active_tasks: Arc::new(Mutex::new(HashMap::new())),
             cloud_backend,
@@ -265,16 +265,16 @@ pub struct ChunkLocationInfo {
 /// `DiskCacheManager` walks `<root>/chunks/<backend>/...` only.
 /// Going through the pool API fixes that too.
 ///
-/// The cloud key uses `chunk_store.cloud_key_in_store(hash)`, matching
+/// The cloud key uses `chunk_store.object_key_in_store(hash)`, matching
 /// the `--dedup local` per-cartridge prefix the SCSI READ /
 /// upload-worker paths already speak.
 async fn download_chunk_to_store(
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
     hash: &str,
     chunk_store: &ChunkStore,
 ) -> Result<usize> {
-    let cloud_key = chunk_store.cloud_key_in_store(hash);
-    let data = backend.download_chunk(&cloud_key).await?;
+    let object_key = chunk_store.object_key_in_store(hash);
+    let data = backend.download_chunk(&object_key).await?;
     let size = data.len();
 
     let store = chunk_store.clone();
@@ -287,7 +287,7 @@ async fn download_chunk_to_store(
 
     debug!(
         "Wrote prefetched chunk to pool: {} ({} bytes)",
-        cloud_key, size
+        object_key, size
     );
     Ok(size)
 }

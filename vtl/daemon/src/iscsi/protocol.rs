@@ -45,12 +45,13 @@ use unit_attention::UnitAttentionTracker;
 
 use anyhow::{Result, anyhow};
 use core_mediachanger::{
-    AuditChannel, AuditRateLimiter, CloudConfig, Library, LibraryFacade, NextReadChunk, TapeEvent,
+    AuditChannel, AuditRateLimiter, Library, LibraryFacade, NextReadChunk, ObjectStoreConfig,
+    TapeEvent,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-use super::server::CloudBackendRegistry;
+use super::server::ObjectStoreRegistry;
 
 // Re-use shared dispatch types so the library wrapper, library-side
 // handlers, and the moved drive-LUN handlers all speak the same
@@ -117,7 +118,7 @@ const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
 /// cartridge for the chunk backing the next read LBA and, if the
 /// local pool file is missing, pulls it from the cartridge's bound
 /// cloud backend (lazy-initialized via the shared
-/// [`CloudBackendRegistry`]) and writes it into the pool. This
+/// [`ObjectStoreRegistry`]) and writes it into the pool. This
 /// covers two failure modes:
 ///   1. Cold-start daemon facing a wiped chunks directory (e.g.
 ///      operator nuked `/chunks/`, or the host was reimaged) —
@@ -138,8 +139,8 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     drive_manager: &Arc<DriveManager>,
     drive_id: usize,
     tsih: u16,
-    backends: &CloudBackendRegistry,
-    cloud_config: &Arc<CloudConfig>,
+    backends: &ObjectStoreRegistry,
+    storage_config: &Arc<ObjectStoreConfig>,
 ) -> Result<()> {
     // Snapshot the next-read chunk metadata under the drive lock,
     // then release the lock before any async I/O. Holding the
@@ -161,13 +162,13 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     }
 
     // Lazy-init the bound backend if this is the first cache miss
-    // for it. `clone()` here returns a fresh `Box<dyn CloudBackend>`
+    // for it. `clone()` here returns a fresh `Box<dyn ObjectStoreBackend>`
     // (via the trait's `clone_box`); cheap by design — the
     // expensive work was the auth/network round-trip during init.
     let backend = {
         let mut reg = backends.lock().await;
         if !reg.contains_key(&next.backend_name) {
-            let b = cloud_config
+            let b = storage_config
                 .create_backend_named(&next.backend_name)
                 .await
                 .map_err(|e| {
@@ -182,8 +183,8 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
         reg.get(&next.backend_name).expect("just inserted").clone()
     };
 
-    let cloud_key = next.cloud_key.clone();
-    let bytes = backend.download_chunk(&cloud_key).await.map_err(|e| {
+    let object_key = next.object_key.clone();
+    let bytes = backend.download_chunk(&object_key).await.map_err(|e| {
         anyhow!(
             "download chunk {} ({}..) from {}: {}",
             next.chunk_id,
@@ -234,15 +235,15 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 /// (mirroring `ensure_chunk_local_for_next_read`) so the same handle
 /// is reused for every subsequent load against the same backend.
 pub(crate) async fn read_legal_hold_at_load(
-    backends: &CloudBackendRegistry,
-    cloud_config: &Arc<CloudConfig>,
+    backends: &ObjectStoreRegistry,
+    storage_config: &Arc<ObjectStoreConfig>,
     backend_name: &str,
     barcode: &str,
 ) -> bool {
     let backend = {
         let mut reg = backends.lock().await;
         if !reg.contains_key(backend_name) {
-            match cloud_config.create_backend_named(backend_name).await {
+            match storage_config.create_backend_named(backend_name).await {
                 Ok(b) => {
                     reg.insert(backend_name.to_string(), b);
                 }
@@ -261,7 +262,7 @@ pub(crate) async fn read_legal_hold_at_load(
     if !backend.supports_legal_hold() {
         return false;
     }
-    let backend_arc: Arc<dyn core_mediachanger::CloudBackend> = Arc::from(backend);
+    let backend_arc: Arc<dyn core_mediachanger::ObjectStoreBackend> = Arc::from(backend);
     match core_mediachanger::read_cartridge_held(backend_arc, barcode.to_string()).await {
         Ok(held) => held,
         Err(e) => {

@@ -20,7 +20,7 @@ impl IoUringBackend {
     /// Create a new io_uring backend with specified queue depth
     pub fn new(queue_depth: u32) -> Result<Self> {
         let ring = IoUring::new(queue_depth)
-            .map_err(|e| SmcError::CloudError(format!("Failed to create io_uring: {}", e)))?;
+            .map_err(|e| SmcError::ObjectStoreError(format!("Failed to create io_uring: {}", e)))?;
 
         Ok(Self { ring })
     }
@@ -37,23 +37,23 @@ impl IoUringBackend {
             self.ring
                 .submission()
                 .push(&read_op.build().user_data(0x01))
-                .map_err(|e| SmcError::CloudError(format!("Failed to submit read: {}", e)))?;
+                .map_err(|e| SmcError::ObjectStoreError(format!("Failed to submit read: {}", e)))?;
         }
 
         self.ring
             .submit_and_wait(1)
-            .map_err(|e| SmcError::CloudError(format!("Failed to submit io_uring: {}", e)))?;
+            .map_err(|e| SmcError::ObjectStoreError(format!("Failed to submit io_uring: {}", e)))?;
 
         // Get completion
         let cqe = self
             .ring
             .completion()
             .next()
-            .ok_or_else(|| SmcError::CloudError("No completion event".to_string()))?;
+            .ok_or_else(|| SmcError::ObjectStoreError("No completion event".to_string()))?;
 
         let bytes_read = cqe.result();
         if bytes_read < 0 {
-            return Err(SmcError::CloudError(format!(
+            return Err(SmcError::ObjectStoreError(format!(
                 "Read failed with error code: {}",
                 bytes_read
             )));
@@ -72,21 +72,23 @@ impl IoUringBackend {
             self.ring
                 .submission()
                 .push(&write_op.build().user_data(0x02))
-                .map_err(|e| SmcError::CloudError(format!("Failed to submit write: {}", e)))?;
+                .map_err(|e| {
+                    SmcError::ObjectStoreError(format!("Failed to submit write: {}", e))
+                })?;
         }
 
         self.ring
             .submit_and_wait(1)
-            .map_err(|e| SmcError::CloudError(format!("Failed to submit io_uring: {}", e)))?;
+            .map_err(|e| SmcError::ObjectStoreError(format!("Failed to submit io_uring: {}", e)))?;
 
         let cqe = self
             .ring
             .completion()
             .next()
-            .ok_or_else(|| SmcError::CloudError("No completion event".to_string()))?;
+            .ok_or_else(|| SmcError::ObjectStoreError("No completion event".to_string()))?;
 
         if cqe.result() < 0 {
-            return Err(SmcError::CloudError(format!(
+            return Err(SmcError::ObjectStoreError(format!(
                 "Write failed with error code: {}",
                 cqe.result()
             )));
@@ -103,7 +105,7 @@ pub struct IoUringBackend;
 #[cfg(not(feature = "io-uring-support"))]
 impl IoUringBackend {
     pub fn new(_queue_depth: u32) -> Result<Self> {
-        Err(SmcError::CloudError(
+        Err(SmcError::ObjectStoreError(
             "io_uring support not compiled in".to_string(),
         ))
     }

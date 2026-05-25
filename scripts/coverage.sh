@@ -131,7 +131,7 @@ integrated_report() {
         "vtl/scripts/test-iscsi-conformance.sh"
         "vsa/scripts/test-crash-audit-append.sh"
         "vtl/scripts/test-crash-audit-append.sh"
-        "vtl/scripts/test-backup-cloud-resume.sh"
+        "vtl/scripts/test-backup-storage-resume.sh"
         "scripts/test-coresident-smoke.sh"
     )
     local soak=(

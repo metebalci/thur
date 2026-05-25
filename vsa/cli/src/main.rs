@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-mod cloud;
 mod commands;
 mod credentials;
 mod gc;
 mod stats;
+mod storage;
 mod verify;
 mod volume;
 
@@ -213,8 +213,8 @@ async fn run(cli: Cli) -> Result<()> {
             },
         },
         Commands::System { action } => match action {
-            SystemAction::Cloud { action } => match action {
-                CloudAction::Benchmark {
+            SystemAction::Storage { action } => match action {
+                StorageAction::Benchmark {
                     backends,
                     total_gb,
                     chunk_size_mb,
@@ -224,7 +224,7 @@ async fn run(cli: Cli) -> Result<()> {
                     skip_download,
                     yes,
                 } => {
-                    cloud::cmd_benchmark(
+                    storage::cmd_benchmark(
                         std::path::Path::new(&config_path),
                         backends,
                         total_gb,
@@ -238,7 +238,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                 }
             },
-            SystemAction::Gc { dry_run, cloud } => gc::cmd_gc(dry_run, cloud).await,
+            SystemAction::Gc { dry_run, storage } => gc::cmd_gc(dry_run, storage).await,
             SystemAction::RegenerateCert => {
                 shared_cli_system::cmd_regenerate_cert(
                     &shared_naming::DISK,
@@ -286,12 +286,12 @@ async fn run(cli: Cli) -> Result<()> {
                 std::process::exit(i32::from(code))
             }
             SystemAction::Verify {
-                skip_cloud,
+                skip_storage,
                 verbose,
                 json,
                 volumes,
             } => {
-                let code = verify::cmd_verify(skip_cloud, verbose, json, volumes).await?;
+                let code = verify::cmd_verify(skip_storage, verbose, json, volumes).await?;
                 std::process::exit(i32::from(code))
             }
         },

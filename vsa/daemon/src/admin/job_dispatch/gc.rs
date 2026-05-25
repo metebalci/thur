@@ -28,7 +28,7 @@ use core_block::{ChunkPool, PageIndex, VolumeManifest};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_audit::{AuditActor, AuditResult};
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 use tracing::warn;
 
 use crate::admin::handlers::AdminState;
@@ -38,7 +38,7 @@ pub struct GcParams {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
-    pub cloud: bool,
+    pub storage: bool,
 }
 
 /// Per-(backend, namespace) live-hash bucket. `namespace` is `None`
@@ -91,7 +91,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
     // Phase 2 — per-backend sweeps.
     let mut total_freed: u64 = 0;
     let mut local_summary: Vec<serde_json::Value> = Vec::new();
-    let backend_names = state.cloud.backend_names();
+    let backend_names = state.storage.backend_names();
     for backend_name in &backend_names {
         emitter
             .info(format!("=== Backend: {} ===", backend_name))
@@ -126,9 +126,15 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             }
         }
 
-        if params.cloud
-            && let Err(e) =
-                run_cloud_gc(&emitter, &state.cloud, backend_name, &live, params.dry_run).await
+        if params.storage
+            && let Err(e) = run_storage_gc(
+                &emitter,
+                &state.storage,
+                backend_name,
+                &live,
+                params.dry_run,
+            )
+            .await
         {
             emitter
                 .error(format!("cloud gc on backend {}: {}", backend_name, e))
@@ -136,7 +142,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
         }
         emitter.info("").await;
     }
-    if !params.cloud {
+    if !params.storage {
         emitter
             .info("(Skipping cloud GC — re-run with cloud:true to clean buckets too.)")
             .await;
@@ -157,7 +163,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
 
     let result = serde_json::json!({
         "dry_run": params.dry_run,
-        "cloud": params.cloud,
+        "cloud": params.storage,
         "bytes_freed_local": total_freed,
         "backends": local_summary,
     });
@@ -172,7 +178,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             "gc.run",
             AuditActor::system(),
             serde_json::json!({
-                "cloud": params.cloud,
+                "cloud": params.storage,
                 "bytes_freed_local": total_freed,
                 "backends": backend_names,
             }),
@@ -378,9 +384,9 @@ fn remove_empty_pool_dir(pool_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn run_cloud_gc(
+async fn run_storage_gc(
     emitter: &JobEmitter,
-    cfg: &CloudConfig,
+    cfg: &ObjectStoreConfig,
     backend_name: &str,
     live: &LiveSet,
     dry_run: bool,
@@ -449,7 +455,7 @@ struct ParsedChunkKey {
 
 /// Parse a cloud chunk key — `chunks/[<ns>/]<aa>/<bb>/<hash>.dat` —
 /// into its namespace + hash. The key shape is produced by
-/// `ChunkPool::cloud_key_for`, shared with VTL. Anything that doesn't
+/// `ChunkPool::object_key_for`, shared with VTL. Anything that doesn't
 /// match (other prefixes, malformed hash) → `None`.
 fn parse_namespace_and_hash(key: &str) -> Option<ParsedChunkKey> {
     let stripped = key.strip_suffix(".dat")?;

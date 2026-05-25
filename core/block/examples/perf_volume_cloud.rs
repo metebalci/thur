@@ -28,7 +28,7 @@
 
 use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
 use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
-use shared_cloud::{CloudBackend, CloudConfig};
+use shared_object_store::{ObjectStoreBackend, ObjectStoreConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -89,13 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let body = std::fs::read_to_string(&config_path)?;
     #[derive(serde::Deserialize)]
-    struct CloudOnly {
+    struct StorageOnly {
         #[serde(default)]
-        cloud: CloudConfig,
+        storage: ObjectStoreConfig,
     }
-    let cfg: CloudOnly = serde_yaml::from_str(&body)?;
-    let backend_box = cfg.cloud.create_backend_named(&backend_name).await?;
-    let backend: Arc<dyn CloudBackend> = Arc::from(backend_box);
+    let cfg: StorageOnly = serde_yaml::from_str(&body)?;
+    let backend_box = cfg.storage.create_backend_named(&backend_name).await?;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::from(backend_box);
 
     let total_bytes: usize = total_mb * 1024 * 1024;
     let size_bytes = (total_bytes as u64) * 2;

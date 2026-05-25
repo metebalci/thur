@@ -40,13 +40,13 @@ pub enum SmcError {
     ContentHashMismatch { expected: String, actual: String },
 
     #[error("cloud error: {0}")]
-    CloudError(String),
+    ObjectStoreError(String),
 
     /// HTTP 412 Precondition Failed from a cloud op. On the legal-hold
     /// path this is "your AAD identity has the right role but the
     /// container's immutability policy disallows the requested
     /// operation" — distinct from `CloudConflict` (a racing concurrent
-    /// change) and from the generic `CloudError` catch-all (5xx /
+    /// change) and from the generic `ObjectStoreError` catch-all (5xx /
     /// throttling / unclassified). Carries the provider's response
     /// body so the operator can read the actual policy decision
     /// without diving into a server log.
@@ -217,26 +217,28 @@ pub enum SmcError {
 
 pub type Result<T> = std::result::Result<T, SmcError>;
 
-/// Bridge `shared_cloud::CloudError` into `SmcError`. Keeps every
+/// Bridge `shared_object_store::ObjectStoreError` into `SmcError`. Keeps every
 /// existing `?` propagation working unchanged after the cloud layer
 /// was lifted out of core-mediachanger. Mapping is one-to-one against the
 /// pre-extraction variants:
 ///
-/// - `CloudError::Other(msg)` → `SmcError::CloudError(msg)`
-/// - `CloudError::PreconditionFailed(msg)` → `SmcError::CloudPreconditionFailed(msg)`
-/// - `CloudError::Conflict(msg)` → `SmcError::CloudConflict(msg)`
-/// - `CloudError::NotSupported(msg)` → `SmcError::NotSupported(msg)`
-/// - `CloudError::Compression(msg)` → `SmcError::CompressionError(msg)`
-/// - `CloudError::Io(e)` → `SmcError::Io(e)`
-impl From<shared_cloud::CloudError> for SmcError {
-    fn from(e: shared_cloud::CloudError) -> Self {
+/// - `ObjectStoreError::Other(msg)` → `SmcError::ObjectStoreError(msg)`
+/// - `ObjectStoreError::PreconditionFailed(msg)` → `SmcError::CloudPreconditionFailed(msg)`
+/// - `ObjectStoreError::Conflict(msg)` → `SmcError::CloudConflict(msg)`
+/// - `ObjectStoreError::NotSupported(msg)` → `SmcError::NotSupported(msg)`
+/// - `ObjectStoreError::Compression(msg)` → `SmcError::CompressionError(msg)`
+/// - `ObjectStoreError::Io(e)` → `SmcError::Io(e)`
+impl From<shared_object_store::ObjectStoreError> for SmcError {
+    fn from(e: shared_object_store::ObjectStoreError) -> Self {
         match e {
-            shared_cloud::CloudError::Other(s) => Self::CloudError(s),
-            shared_cloud::CloudError::PreconditionFailed(s) => Self::CloudPreconditionFailed(s),
-            shared_cloud::CloudError::Conflict(s) => Self::CloudConflict(s),
-            shared_cloud::CloudError::NotSupported(s) => Self::NotSupported(s),
-            shared_cloud::CloudError::Compression(s) => Self::CompressionError(s),
-            shared_cloud::CloudError::Io(e) => Self::Io(e),
+            shared_object_store::ObjectStoreError::Other(s) => Self::ObjectStoreError(s),
+            shared_object_store::ObjectStoreError::PreconditionFailed(s) => {
+                Self::CloudPreconditionFailed(s)
+            }
+            shared_object_store::ObjectStoreError::Conflict(s) => Self::CloudConflict(s),
+            shared_object_store::ObjectStoreError::NotSupported(s) => Self::NotSupported(s),
+            shared_object_store::ObjectStoreError::Compression(s) => Self::CompressionError(s),
+            shared_object_store::ObjectStoreError::Io(e) => Self::Io(e),
         }
     }
 }
@@ -261,13 +263,13 @@ impl From<shared_pool::ChunkPoolError> for SmcError {
 /// Bridge `shared_upload_worker::UploadInertError` into `SmcError`.
 /// Keeps `Cartridge::upload_chunk_to_cloud`'s `?` propagation working
 /// after `upload_chunk_inert` moved into the shared crate. The shared
-/// error carries either a `CloudError` or a local IO failure
+/// error carries either a `ObjectStoreError` or a local IO failure
 /// (file read of the chunk's pool path); both fan out to the existing
 /// `SmcError` variants.
 impl From<shared_upload_worker::UploadInertError> for SmcError {
     fn from(e: shared_upload_worker::UploadInertError) -> Self {
         match e {
-            shared_upload_worker::UploadInertError::Cloud(c) => c.into(),
+            shared_upload_worker::UploadInertError::ObjectStore(c) => c.into(),
             shared_upload_worker::UploadInertError::Io { source, .. } => Self::Io(source),
         }
     }
@@ -279,25 +281,25 @@ mod tests {
 
     #[test]
     fn cloud_error_routes_to_the_matching_smc_variant() {
-        let cases: Vec<(shared_cloud::CloudError, SmcError)> = vec![
+        let cases: Vec<(shared_object_store::ObjectStoreError, SmcError)> = vec![
             (
-                shared_cloud::CloudError::Other("x".into()),
-                SmcError::CloudError("x".into()),
+                shared_object_store::ObjectStoreError::Other("x".into()),
+                SmcError::ObjectStoreError("x".into()),
             ),
             (
-                shared_cloud::CloudError::PreconditionFailed("p".into()),
+                shared_object_store::ObjectStoreError::PreconditionFailed("p".into()),
                 SmcError::CloudPreconditionFailed("p".into()),
             ),
             (
-                shared_cloud::CloudError::Conflict("c".into()),
+                shared_object_store::ObjectStoreError::Conflict("c".into()),
                 SmcError::CloudConflict("c".into()),
             ),
             (
-                shared_cloud::CloudError::NotSupported("n".into()),
+                shared_object_store::ObjectStoreError::NotSupported("n".into()),
                 SmcError::NotSupported("n".into()),
             ),
             (
-                shared_cloud::CloudError::Compression("z".into()),
+                shared_object_store::ObjectStoreError::Compression("z".into()),
                 SmcError::CompressionError("z".into()),
             ),
         ];
@@ -306,7 +308,7 @@ mod tests {
             assert_eq!(got.to_string(), expected.to_string());
         }
 
-        let io = shared_cloud::CloudError::Io(std::io::Error::other("boom"));
+        let io = shared_object_store::ObjectStoreError::Io(std::io::Error::other("boom"));
         assert!(matches!(SmcError::from(io), SmcError::Io(_)));
     }
 
@@ -337,10 +339,13 @@ mod tests {
 
     #[test]
     fn upload_inert_error_routes_cloud_and_io_arms() {
-        let cloud = shared_upload_worker::UploadInertError::Cloud(shared_cloud::CloudError::Other(
-            "svc".into(),
+        let cloud = shared_upload_worker::UploadInertError::ObjectStore(
+            shared_object_store::ObjectStoreError::Other("svc".into()),
+        );
+        assert!(matches!(
+            SmcError::from(cloud),
+            SmcError::ObjectStoreError(_)
         ));
-        assert!(matches!(SmcError::from(cloud), SmcError::CloudError(_)));
 
         let io = shared_upload_worker::UploadInertError::Io {
             path: "/tmp/chunk.dat".into(),

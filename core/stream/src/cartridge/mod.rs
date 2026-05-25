@@ -40,8 +40,8 @@ use crate::tape::{Block, BlockKind};
 use blake3;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use shared_cloud::CloudBackend;
-use shared_cloud::compression::{self, CompressionAlgo, DriveCompressionState};
+use shared_object_store::ObjectStoreBackend;
+use shared_object_store::compression::{self, CompressionAlgo, DriveCompressionState};
 use shared_pool::PoolBudget;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -82,7 +82,7 @@ pub fn lto_default_capacity_gb(lto_generation: u8) -> u64 {
 /// directly.
 #[derive(Default)]
 pub struct CartridgeOpenOptions {
-    cloud_backend: Option<Box<dyn CloudBackend>>,
+    cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
     chunk_size_bytes: Option<u64>,
     capacity_gb: u64,
     lto_generation: u8,
@@ -119,7 +119,7 @@ impl CartridgeOpenOptions {
         Self::default()
     }
 
-    pub fn with_cloud(mut self, cloud_backend: Option<Box<dyn CloudBackend>>) -> Self {
+    pub fn with_cloud(mut self, cloud_backend: Option<Box<dyn ObjectStoreBackend>>) -> Self {
         self.cloud_backend = cloud_backend;
         self
     }
@@ -206,13 +206,13 @@ pub enum CartridgeOpenMode {
 }
 
 /// Scope of content-addressed dedup for a cartridge. Sticky once the
-/// cartridge is created. Re-exported from `shared_cloud::DedupScope`
+/// cartridge is created. Re-exported from `shared_object_store::DedupScope`
 /// so the upload pipeline (`shared-upload-worker`) carries the same
 /// enum across the boundary. The `namespace(label)` method on the
 /// shared enum is what callers reach for to compute per-cartridge
 /// vs shared-pool routing — the legacy `cartridge_namespace` alias
 /// was removed alongside the lift.
-pub use shared_cloud::DedupScope;
+pub use shared_object_store::DedupScope;
 
 /// Creation-frozen identity for one cartridge. Persisted at
 /// `<root>/manifest.json`; written once at `cartridge create` and
@@ -595,7 +595,7 @@ pub struct Cartridge {
     // tape "head": next LBA to read in the *active partition* (BOT = 0)
     head_lba: u64,
     // optional cloud backend for cloud tiering (S3, GCS, etc.)
-    cloud_backend: Option<Box<dyn CloudBackend>>,
+    cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
     // optional prefetch manager for aggressive prefetching
     prefetch_manager: Option<Arc<PrefetchManager>>,
     /// Per-cartridge chunking strategy. Resolved at open/create time
@@ -838,7 +838,7 @@ impl Cartridge {
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn CloudBackend>>,
+        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Self> {
         Self::open_with(
             root,
@@ -901,7 +901,7 @@ impl Cartridge {
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn CloudBackend>>,
+        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Self> {
         Self::open_async_with(
             root,
@@ -923,7 +923,7 @@ impl Cartridge {
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn CloudBackend>>,
+        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
         dek: Option<[u8; shared_crypto::KEY_LEN]>,
     ) -> Result<Self> {
         let mut opts = CartridgeOpenOptions::new().with_cloud(cloud_backend);
@@ -1088,7 +1088,7 @@ impl Cartridge {
         chunk_size_bytes: u64,
         capacity_gb: u64,
         lto_generation: u8,
-        cloud_backend: Option<Box<dyn CloudBackend>>,
+        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
         at_rest: Option<AtRestCreateParams>,
     ) -> Result<Self> {
         if root.exists() {
@@ -1171,7 +1171,7 @@ impl Cartridge {
         root: PathBuf,
         m: Manifest,
         runtime: Runtime,
-        cloud_backend: Option<Box<dyn CloudBackend>>,
+        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
         at_rest_dek: Option<[u8; shared_crypto::KEY_LEN]>,
     ) -> Result<Self> {
         if m.backend.is_empty() {
@@ -1236,7 +1236,7 @@ impl Cartridge {
     /// configured (cloud restore needs the async runtime).
     fn load_manifest_sync(
         root: &Path,
-        cloud_backend: &Option<Box<dyn CloudBackend>>,
+        cloud_backend: &Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Manifest> {
         if !root.exists() && cloud_backend.is_none() {
             return Err(SmcError::InvalidOp("cartridge does not exist"));
@@ -1285,7 +1285,7 @@ impl Cartridge {
     async fn load_manifest_async(
         root: &Path,
         label: &str,
-        cloud_backend: &Option<Box<dyn CloudBackend>>,
+        cloud_backend: &Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<(Manifest, Runtime)> {
         if !root.exists() && cloud_backend.is_none() {
             return Err(SmcError::InvalidOp("cartridge does not exist"));
@@ -1809,7 +1809,7 @@ impl Cartridge {
             chunk_id: bi.chunk_id,
             hash: hash.clone(),
             store_path: self.chunk_store.store_path(&hash),
-            cloud_key: self.chunk_store.cloud_key_in_store(&hash),
+            object_key: self.chunk_store.object_key_in_store(&hash),
             backend_name: self.manifest.backend.clone(),
         })
     }
@@ -1945,13 +1945,13 @@ impl Cartridge {
             let backend = self.cloud_backend.as_ref().ok_or(SmcError::InvalidOp(
                 "chunk missing from local pool and no cloud backend configured to refetch",
             ))?;
-            let cloud_key = self.chunk_store.cloud_key_in_store(&hash);
+            let object_key = self.chunk_store.object_key_in_store(&hash);
             tracing::info!(
                 "Cache miss: downloading chunk {} (hash {}..) from cloud",
                 chunk_id,
                 &hash[..8]
             );
-            let data = backend.download_chunk(&cloud_key).await?;
+            let data = backend.download_chunk(&object_key).await?;
 
             // Hand the BLAKE3 verify + atomic tmp+rename to
             // `ChunkPool::insert_verified_bytes`. The verify catches
@@ -2970,7 +2970,7 @@ pub struct NextReadChunk {
     pub store_path: PathBuf,
     /// Cloud key the prefetch hook should fetch — already namespaced
     /// per the source cartridge's dedup policy.
-    pub cloud_key: String,
+    pub object_key: String,
     /// Sticky cloud backend the cartridge is bound to, drawn from
     /// `cloud.backends` in the daemon config. The prefetch hook
     /// resolves this name through its backend registry.

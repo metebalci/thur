@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     // now live in the YAML conffile under `cloud.backends:`. The
     // operator has to copy the entries over and delete the JSON file
     // before the daemon will come up.
-    shared_cloud::reject_legacy_cloud_backends_json(&data_dir, &config_path)
+    shared_object_store::reject_legacy_cloud_backends_json(&data_dir, &config_path)
         .map_err(anyhow::Error::msg)?;
 
     // Same one-shot migration guard for the keystore-backends JSON
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     // Validate cloud backend definitions (from YAML cloud.backends:).
-    cfg.cloud
+    cfg.storage
         .validate_backends()
         .with_context(|| "validate cloud.backends in YAML conffile")?;
 
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         config = %config_path.display(),
         data_dir = %data_dir.display(),
-        backends = cfg.cloud.backends.len(),
+        backends = cfg.storage.backends.len(),
         keystore_backends = cfg.keystore.backends.len(),
         users = iscsi_users.users.len(),
         "thurvsad: config loaded"
@@ -246,7 +246,8 @@ async fn main() -> Result<()> {
     // knob VTL's upload worker honors. Logged with source so the
     // operator sees "auto-detected from num_cpus=N" or "operator
     // override" in the boot log.
-    let (max_concurrent_flushes, max_concurrent_source) = cfg.cloud.upload.resolve_max_concurrent();
+    let (max_concurrent_flushes, max_concurrent_source) =
+        cfg.storage.upload.resolve_max_concurrent();
     tracing::info!(
         "page-flush concurrency: max_concurrent={} ({})",
         max_concurrent_flushes,
@@ -274,12 +275,12 @@ async fn main() -> Result<()> {
         let bounds = cfg.disk_cache.bounds();
 
         let resolved: Vec<(String, core_block::DiskCacheSize, bool)> = cfg
-            .cloud
+            .storage
             .backend_names()
             .into_iter()
             .map(|name| {
                 let override_size = cfg
-                    .cloud
+                    .storage
                     .backend_entry(&name)
                     .ok()
                     .and_then(|e| e.disk_cache_size_gb());
@@ -350,7 +351,7 @@ async fn main() -> Result<()> {
 
     let (registry, volumes, caches, backends, keystores) = discovery::discover_and_register(
         &data_dir,
-        &cfg.cloud,
+        &cfg.storage,
         &cfg.keystore,
         max_concurrent_flushes,
         &pool_budgets,
@@ -598,7 +599,7 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
-        cloud: Arc::new(cfg.cloud.clone()),
+        storage: Arc::new(cfg.storage.clone()),
         registry: Arc::clone(&registry),
         backends: admin_backends,
         audit: audit_channel_for_admin,
@@ -639,7 +640,7 @@ async fn main() -> Result<()> {
         let recent_seal_pin_seconds = cfg.disk_cache.recent_seal_pin_seconds;
         let default_size = cfg.disk_cache.size_gb;
         let bounds = cfg.disk_cache.bounds();
-        let cloud_config_clone = cfg.cloud.clone();
+        let cloud_config_clone = cfg.storage.clone();
         let backend_names: Vec<String> = pool_budgets.keys().cloned().collect();
         Some(tokio::spawn(async move {
             run_disk_cache_eviction_worker(
@@ -822,7 +823,7 @@ async fn run_disk_cache_eviction_worker(
     recent_seal_pin_seconds: u64,
     default_size: core_block::DiskCacheSize,
     bounds: core_block::DiskCacheBounds,
-    cloud_config: shared_cloud::CloudConfig,
+    storage_config: shared_object_store::ObjectStoreConfig,
 ) {
     use core_block::DiskCacheManager;
     let mut tick = tokio::time::interval(interval);
@@ -839,7 +840,7 @@ async fn run_disk_cache_eviction_worker(
         let resolved_sizes: Vec<(String, core_block::DiskCacheSize)> = backend_names
             .iter()
             .map(|name| {
-                let size = cloud_config
+                let size = storage_config
                     .backend_entry(name)
                     .ok()
                     .and_then(|e| e.disk_cache_size_gb())

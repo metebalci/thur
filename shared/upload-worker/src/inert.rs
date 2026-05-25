@@ -4,18 +4,19 @@
 //! Stateless per-chunk uploader. No cartridge / volume borrow held
 //! during the await; safe to run in parallel worker tasks.
 
-use shared_cloud::{CloudBackend, CloudError, DedupScope};
+use shared_object_store::{DedupScope, ObjectStoreBackend, ObjectStoreError};
 use thiserror::Error;
 
 use crate::payload::{PendingUpload, UploadOutcome};
 
-/// Error type for [`upload_chunk_inert`]. Aggregates the cloud-trait
-/// error and the local-IO error so callers can `?`-propagate without
-/// dragging both upstream types into their signatures.
+/// Error type for [`upload_chunk_inert`]. Aggregates the
+/// storage-backend trait error and the local-IO error so callers can
+/// `?`-propagate without dragging both upstream types into their
+/// signatures.
 #[derive(Error, Debug)]
 pub enum UploadInertError {
-    #[error("cloud: {0}")]
-    Cloud(#[from] CloudError),
+    #[error("object store: {0}")]
+    ObjectStore(#[from] ObjectStoreError),
 
     #[error("io reading {path}: {source}")]
     Io {
@@ -37,10 +38,10 @@ pub enum UploadInertError {
 /// Lifted from `core_stream::cartridge::mod::upload_chunk_inert`; the
 /// `chunk_id` field is now [`PendingUpload::item_id`].
 pub async fn upload_chunk_inert(
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
     payload: &PendingUpload,
 ) -> Result<UploadOutcome, UploadInertError> {
-    let cloud_key = payload.cloud_key.clone();
+    let object_key = payload.object_key.clone();
 
     // Cloud-side dedup HEAD probe is only useful under `Global`
     // scope, where a sibling cartridge / volume may have already
@@ -48,9 +49,9 @@ pub async fn upload_chunk_inert(
     // namespaced by construction, so the HEAD is guaranteed to miss
     // — wasted round-trip per chunk.
     if matches!(payload.dedup, DedupScope::Global) {
-        shared_telemetry::record::chunk_cloud_head_probe(&payload.backend_name);
-        if backend.chunk_exists(&cloud_key).await? {
-            shared_telemetry::record::chunk_cloud_head_hit(&payload.backend_name);
+        shared_telemetry::record::chunk_storage_head_probe(&payload.backend_name);
+        if backend.chunk_exists(&object_key).await? {
+            shared_telemetry::record::chunk_storage_head_hit(&payload.backend_name);
             tracing::debug!(
                 "Cloud-side dedup hit for item {} (hash {}..); skipping upload",
                 payload.item_id,
@@ -58,7 +59,7 @@ pub async fn upload_chunk_inert(
             );
             return Ok(UploadOutcome {
                 item_id: payload.item_id,
-                cloud_key,
+                object_key,
                 dedup_hit: true,
                 put_compression: None,
                 put_bytes: None,
@@ -81,16 +82,16 @@ pub async fn upload_chunk_inert(
         "Uploading item {} (hash {}..) to cloud: {} ({} bytes)",
         payload.item_id,
         &payload.hash[..8.min(payload.hash.len())],
-        cloud_key,
+        object_key,
         logical_bytes
     );
     let (_uncompressed_size, compressed_size, applied_algo) =
-        backend.upload_chunk(&cloud_key, &data).await?;
+        backend.upload_chunk(&object_key, &data).await?;
     shared_telemetry::record::chunk_uploaded_bytes(&payload.backend_name, logical_bytes);
 
     Ok(UploadOutcome {
         item_id: payload.item_id,
-        cloud_key,
+        object_key,
         dedup_hit: false,
         put_compression: applied_algo,
         // On-wire size: the compressed length when a compressor ran,
@@ -103,11 +104,11 @@ pub async fn upload_chunk_inert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_cloud::LocalBackend;
+    use shared_object_store::LocalBackend;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn local_backend() -> (TempDir, Arc<dyn CloudBackend>) {
+    async fn local_backend() -> (TempDir, Arc<dyn ObjectStoreBackend>) {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let b = LocalBackend::new(&root).await.unwrap();
@@ -124,7 +125,7 @@ mod tests {
             item_id: 7,
             hash: "deadbeef".repeat(8),
             local_path: local,
-            cloud_key: "chunks/de/ad/deadbeef.dat".into(),
+            object_key: "chunks/de/ad/deadbeef.dat".into(),
             dedup: DedupScope::Global,
             backend_name: "primary".into(),
         };
@@ -152,7 +153,7 @@ mod tests {
             item_id: 1,
             hash: "cafebabe".repeat(8),
             local_path: local,
-            cloud_key: "chunks/vol1/ca/fe/cafebabe.dat".into(),
+            object_key: "chunks/vol1/ca/fe/cafebabe.dat".into(),
             dedup: DedupScope::Local,
             backend_name: "primary".into(),
         };
@@ -174,7 +175,7 @@ mod tests {
             item_id: 1,
             hash: "00".repeat(32),
             local_path: tmp.path().join("does-not-exist.dat"),
-            cloud_key: "chunks/00/00/zeros.dat".into(),
+            object_key: "chunks/00/00/zeros.dat".into(),
             dedup: DedupScope::Local,
             backend_name: "primary".into(),
         };
@@ -185,10 +186,10 @@ mod tests {
     #[tokio::test]
     async fn head_probe_error_propagates_as_cloud_error_and_no_put_attempted() {
         use crate::test_support::MockBackend;
-        use shared_cloud::CloudError;
+        use shared_object_store::ObjectStoreError;
 
         let backend = MockBackend::default();
-        *backend.head_err.lock().unwrap() = Some(CloudError::Other("HEAD blew up".into()));
+        *backend.head_err.lock().unwrap() = Some(ObjectStoreError::Other("HEAD blew up".into()));
 
         let tmp = TempDir::new().unwrap();
         let local = tmp.path().join("payload.dat");
@@ -197,12 +198,12 @@ mod tests {
             item_id: 1,
             hash: "ab".repeat(32),
             local_path: local,
-            cloud_key: "chunks/ab/ab.dat".into(),
+            object_key: "chunks/ab/ab.dat".into(),
             dedup: DedupScope::Global,
             backend_name: "primary".into(),
         };
         let err = upload_chunk_inert(&backend, &p).await.unwrap_err();
-        assert!(matches!(err, UploadInertError::Cloud(_)));
+        assert!(matches!(err, UploadInertError::ObjectStore(_)));
         assert_eq!(backend.heads(), 1);
         assert_eq!(backend.puts(), 0);
     }
@@ -210,10 +211,11 @@ mod tests {
     #[tokio::test]
     async fn put_error_after_head_miss_propagates_as_cloud_error() {
         use crate::test_support::MockBackend;
-        use shared_cloud::CloudError;
+        use shared_object_store::ObjectStoreError;
 
         let backend = MockBackend::default();
-        *backend.put_err.lock().unwrap() = Some(CloudError::Other("PUT 5xx after retries".into()));
+        *backend.put_err.lock().unwrap() =
+            Some(ObjectStoreError::Other("PUT 5xx after retries".into()));
 
         let tmp = TempDir::new().unwrap();
         let local = tmp.path().join("payload.dat");
@@ -222,12 +224,12 @@ mod tests {
             item_id: 2,
             hash: "cd".repeat(32),
             local_path: local,
-            cloud_key: "chunks/cd/cd.dat".into(),
+            object_key: "chunks/cd/cd.dat".into(),
             dedup: DedupScope::Global,
             backend_name: "primary".into(),
         };
         let err = upload_chunk_inert(&backend, &p).await.unwrap_err();
-        assert!(matches!(err, UploadInertError::Cloud(_)));
+        assert!(matches!(err, UploadInertError::ObjectStore(_)));
         assert_eq!(backend.heads(), 1);
         assert_eq!(backend.puts(), 1);
     }
@@ -235,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn compressed_put_records_compressed_bytes_and_algo() {
         use crate::test_support::MockBackend;
-        use shared_cloud::CompressionAlgo;
+        use shared_object_store::CompressionAlgo;
 
         let backend = MockBackend::default();
         *backend.put_compressed_as.lock().unwrap() = Some((60, CompressionAlgo::Zstd));
@@ -247,7 +249,7 @@ mod tests {
             item_id: 3,
             hash: "ef".repeat(32),
             local_path: local,
-            cloud_key: "chunks/ef/ef.dat".into(),
+            object_key: "chunks/ef/ef.dat".into(),
             dedup: DedupScope::Local,
             backend_name: "primary".into(),
         };

@@ -27,7 +27,7 @@ pub struct DriveSelfTestParams {
 
 pub async fn run_library(emitter: JobEmitter, _body: serde_json::Value, state: Arc<DaemonState>) {
     emitter.info("library self-test: starting").await;
-    let entry = run_library_diagnostic(&state.data_dir, &state.cloud_config).await;
+    let entry = run_library_diagnostic(&state.data_dir, &state.storage_config).await;
     state.diagnostic_store.record(0, entry.clone());
 
     audit(&state, "library.self_test", None, &entry);

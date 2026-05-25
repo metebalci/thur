@@ -22,7 +22,7 @@ shared-admin-monitor = { path = "../../shared/admin-monitor" }
 shared-admin-server = { path = "../../shared/admin-server" }
 shared-alerting = { path = "../../shared/alerting", features = ["http"] }
 shared-audit = { path = "../../shared/audit" }
-shared-cloud = { path = "../../shared/cloud" }
+shared-object-store = { path = "../../shared/object-store" }
 # At-rest volume encryption: keystore.rs uses KEY_LEN constant + OsRng
 # re-export for auto-generated keys; the daemon also passes the key
 # bytes into core-block::VolumeWriter::open_with_key at boot / create.

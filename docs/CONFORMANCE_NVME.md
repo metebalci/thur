@@ -19,7 +19,7 @@ Related docs:
 
 The two transports are mutually exclusive — only one listener binds per
 daemon — and they reduce to the same `PageCache` + `ChunkPool` below the
-dispatcher boundary, so encryption, dedup, and cloud upload behave
+dispatcher boundary, so encryption, dedup, and backend upload behave
 identically regardless of which transport the host used.
 
 **Targets:** NVMe Base 1.4, NVM Command Set 1.0, NVMe-oF 1.1, NVMe

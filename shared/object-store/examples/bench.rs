@@ -18,8 +18,8 @@
 //     [--skip-download] [--yes]
 
 use clap::Parser;
-use shared_cloud::CloudConfig;
-use shared_cloud_bench::{BenchOptions, BenchTarget};
+use shared_object_store::ObjectStoreConfig;
+use shared_object_store_bench::{BenchOptions, BenchTarget};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -73,13 +73,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     #[derive(serde::Deserialize)]
-    struct CloudOnly {
+    struct StorageOnly {
         #[serde(default)]
-        cloud: CloudConfig,
+        storage: ObjectStoreConfig,
     }
     let body = std::fs::read_to_string(&args.config)?;
-    let parsed: CloudOnly = serde_yaml::from_str(&body)?;
-    let cfg = parsed.cloud;
+    let parsed: StorageOnly = serde_yaml::from_str(&body)?;
+    let cfg = parsed.storage;
 
     let backend_names: Vec<String> = if args.backends.is_empty() {
         cfg.backends.keys().cloned().collect()
@@ -119,6 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         yes: args.yes,
     };
 
-    shared_cloud_bench::run(targets, opts).await?;
+    shared_object_store_bench::run(targets, opts).await?;
     Ok(())
 }

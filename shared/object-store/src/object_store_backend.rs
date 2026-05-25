@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloud backend trait for modular storage support
+//! Object-store backend trait for modular storage support.
 //!
-//! This module defines a common interface for cloud storage backends,
-//! allowing Thur VTL to support multiple cloud providers (S3, GCS, etc.)
+//! Defines the common interface every storage backend implements — S3,
+//! GCS, Azure, Local. All four follow the same PUT / GET / HEAD / DELETE
+//! contract on opaque blobs keyed by hash, which is why "object store"
+//! describes the trait honestly. Operator-facing naming uses the
+//! broader "storage backends" umbrella.
 
 use crate::Result;
 use async_trait::async_trait;
@@ -12,9 +15,9 @@ use std::fmt::Debug;
 use std::path::Path;
 
 /// State of a backend bucket's immutability / retention configuration,
-/// observed by querying the cloud provider directly. Used by
+/// observed by querying the storage provider directly. Used by
 /// startup validation to confirm the bucket matches the operator's
-/// declared `retention_mode` in `cloud.backends`. Mismatches in either
+/// declared `retention_mode` in `storage.backends`. Mismatches in either
 /// direction are fatal — the bucket is the contract, and a mismatch
 /// means every WORM tape written from that point would lie about its
 /// retention.
@@ -48,15 +51,18 @@ impl LockState {
     }
 }
 
-/// Cloud backend trait for chunk and manifest operations
+/// Object-store backend trait for chunk and manifest operations.
 ///
-/// This trait provides a common interface for all cloud storage backends,
-/// enabling support for AWS S3, Google Cloud Storage, Azure Blob Storage, etc.
+/// Common interface for every storage backend — S3, GCS, Azure, Local.
+/// All four follow the same PUT / GET / HEAD / DELETE contract on
+/// opaque, immutable blobs keyed by hash. Operator-facing naming uses
+/// "storage backends" as the umbrella; the trait stays precise about
+/// the contract.
 ///
 /// All implementations must be thread-safe (Clone + Send + Sync).
 #[async_trait]
-pub trait CloudBackend: Debug + Send + Sync {
-    /// Upload a chunk to cloud storage with retry logic and optional compression
+pub trait ObjectStoreBackend: Debug + Send + Sync {
+    /// Upload a chunk to the storage backend with retry logic and optional compression
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix, e.g., "chunks/TAPE001/obj-000001.dat")
@@ -83,7 +89,7 @@ pub trait CloudBackend: Debug + Send + Sync {
     /// upload-side caching the wrapper may apply — the meta-cache
     /// assumes once-and-done content addressing, so a cache hit on a
     /// versioned key would silently skip the PUT and the new content
-    /// would never reach cloud.
+    /// would never reach the storage backend.
     ///
     /// Use this for index-page snapshots, backup index files, and
     /// any other "same key, new content" write path. Content-
@@ -99,7 +105,7 @@ pub trait CloudBackend: Debug + Send + Sync {
 
     /// Upload a chunk from a file path using zero-copy streaming
     ///
-    /// This method streams the file directly to cloud storage without loading it into memory,
+    /// This method streams the file directly to the storage backend without loading it into memory,
     /// providing better performance for large chunks.
     ///
     /// # Arguments
@@ -113,7 +119,7 @@ pub trait CloudBackend: Debug + Send + Sync {
     /// This method does NOT support compression. Use upload_chunk() if compression is needed.
     async fn upload_chunk_zerocopy(&self, key: &str, file_path: &Path) -> Result<u64>;
 
-    /// Download a chunk from cloud storage with retry logic
+    /// Download a chunk from the storage backend with retry logic
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix)
@@ -131,14 +137,14 @@ pub trait CloudBackend: Debug + Send + Sync {
     /// Vec of chunk data bytes on success (decompressed if needed), preserving order of input keys
     async fn download_chunks_parallel(&self, keys: &[String]) -> Result<Vec<Vec<u8>>>;
 
-    /// Upload a manifest JSON to cloud storage
+    /// Upload a manifest JSON to the storage backend
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix, e.g., "manifests/TAPE001/manifest-latest.json")
     /// * `json` - Manifest JSON string
     async fn upload_manifest(&self, key: &str, json: &str) -> Result<()>;
 
-    /// Download a manifest JSON from cloud storage
+    /// Download a manifest JSON from the storage backend
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix)
@@ -147,7 +153,7 @@ pub trait CloudBackend: Debug + Send + Sync {
     /// Manifest JSON string on success
     async fn download_manifest(&self, key: &str) -> Result<String>;
 
-    /// Check if a chunk exists in cloud storage
+    /// Check if a chunk exists in the storage backend
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix)
@@ -165,7 +171,7 @@ pub trait CloudBackend: Debug + Send + Sync {
     /// Vector of object keys (without bucket prefix)
     async fn list_objects(&self, key_prefix: &str) -> Result<Vec<String>>;
 
-    /// Delete an object from cloud storage
+    /// Delete an object from the storage backend
     ///
     /// # Arguments
     /// * `key` - Object key (without prefix)
@@ -233,12 +239,12 @@ pub trait CloudBackend: Debug + Send + Sync {
         Ok(0)
     }
 
-    /// Clone the backend (required for Arc<dyn CloudBackend>)
-    fn clone_box(&self) -> Box<dyn CloudBackend>;
+    /// Clone the backend (required for `Arc<dyn ObjectStoreBackend>`)
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend>;
 }
 
-/// Enable cloning for boxed CloudBackend trait objects
-impl Clone for Box<dyn CloudBackend> {
+/// Enable cloning for boxed `ObjectStoreBackend` trait objects
+impl Clone for Box<dyn ObjectStoreBackend> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
@@ -308,7 +314,7 @@ mod tests {
     async fn boxed_backend_clone_yields_independent_handle() {
         let dir = TempDir::new().expect("tempdir");
         let backend = LocalBackend::new(dir.path()).await.expect("backend");
-        let boxed: Box<dyn CloudBackend> = Box::new(backend);
+        let boxed: Box<dyn ObjectStoreBackend> = Box::new(backend);
         let cloned = boxed.clone();
         assert_eq!(cloned.backend_type(), "local");
         assert_eq!(boxed.backend_type(), "local");

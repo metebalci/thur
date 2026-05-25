@@ -113,8 +113,8 @@ Cartridge create/import/export, daemon-side chassis bring-up
 (`library.materialize` on first start, `library.reconcile` on
 subsequent YAML diffs, `inventory.move_medium` per auto-evacuated
 drive), load/unload/move, gc, daemon start/stop, boot-time
-orphan-upload recovery (`cloud.orphan_scan_started` /
-`cloud.orphan_scan_completed`). **Read paths are NOT logged.**
+orphan-upload recovery (`storage.orphan_scan_started` /
+`storage.orphan_scan_completed`). **Read paths are NOT logged.**
 
 ### SCSI-layer events
 

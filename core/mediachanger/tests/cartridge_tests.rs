@@ -418,7 +418,7 @@ fn test_worm_cartridge_refuses_erase_and_format_and_allow_overwrite() {
 }
 
 /// Regression for the cold-start "wiped local pool" scenario
-/// (`test-backup-cloud.sh`, 2026-05-03): the manifest still claims
+/// (`test-backup-storage.sh`, 2026-05-03): the manifest still claims
 /// `Both` for every chunk, but the pool file under
 /// `<data_dir>/chunks/<backend>/<aa>/<bb>/<hash>.dat` is missing. The
 /// async read path must refetch from cloud on miss instead of
@@ -447,7 +447,7 @@ async fn read_block_async_refetches_when_pool_file_missing() {
     }
 
     // Reopen with a cloud backend and push the chunk to "the cloud".
-    let backend: Box<dyn core_mediachanger::CloudBackend> = Box::new(
+    let backend: Box<dyn core_mediachanger::ObjectStoreBackend> = Box::new(
         LocalBackend::new(&bucket_path)
             .await
             .expect("create LocalBackend"),
@@ -489,7 +489,7 @@ async fn read_block_async_refetches_when_pool_file_missing() {
 
     // Reopen with the same cloud backend and read — must transparently
     // refetch the chunk from the bucket and re-cache it locally.
-    let backend2: Box<dyn core_mediachanger::CloudBackend> = Box::new(
+    let backend2: Box<dyn core_mediachanger::ObjectStoreBackend> = Box::new(
         LocalBackend::new(&bucket_path)
             .await
             .expect("reopen LocalBackend"),

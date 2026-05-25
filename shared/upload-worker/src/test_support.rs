@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only `CloudBackend` mock shared by the `inert` and `pipeline`
+//! Test-only `ObjectStoreBackend` mock shared by the `inert` and `pipeline`
 //! unit tests. `LocalBackend` is too well-behaved for failure-path
-//! coverage — it never returns `CloudError`, never reports a
+//! coverage — it never returns `ObjectStoreError`, never reports a
 //! compressed size, and doesn't distinguish HEAD vs PUT call counts.
 //!
 //! Gated on `#[cfg(test)]` via `lib.rs` so it never ships.
@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use shared_cloud::{CloudBackend, CloudError, CompressionAlgo, LockState, Result};
+use shared_object_store::{
+    CompressionAlgo, LockState, ObjectStoreBackend, ObjectStoreError, Result,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct MockCounters {
@@ -26,8 +28,8 @@ pub(crate) struct MockCounters {
 pub(crate) struct MockBackend {
     pub counters: MockCounters,
     pub head_returns: Mutex<bool>,
-    pub head_err: Mutex<Option<CloudError>>,
-    pub put_err: Mutex<Option<CloudError>>,
+    pub head_err: Mutex<Option<ObjectStoreError>>,
+    pub put_err: Mutex<Option<ObjectStoreError>>,
     pub put_compressed_as: Mutex<Option<(u64, CompressionAlgo)>>,
     pub fail_put_for_keys: Mutex<HashSet<String>>,
 }
@@ -56,7 +58,7 @@ impl MockBackend {
 }
 
 #[async_trait]
-impl CloudBackend for MockBackend {
+impl ObjectStoreBackend for MockBackend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -67,7 +69,10 @@ impl CloudBackend for MockBackend {
             return Err(e);
         }
         if self.fail_put_for_keys.lock().unwrap().contains(key) {
-            return Err(CloudError::Other(format!("mock PUT fail for {}", key)));
+            return Err(ObjectStoreError::Other(format!(
+                "mock PUT fail for {}",
+                key
+            )));
         }
         let logical = data.len() as u64;
         if let Some((compressed_len, algo)) = *self.put_compressed_as.lock().unwrap() {
@@ -128,7 +133,7 @@ impl CloudBackend for MockBackend {
         Ok(false)
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         unimplemented!("MockBackend does not support clone_box")
     }
 }

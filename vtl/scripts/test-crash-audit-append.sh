@@ -100,7 +100,7 @@ http:
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
   target_iqn: "iqn.2025-10.com.metebalci:thurvtl"
-cloud:
+storage:
   backends:
     local:
       type: local

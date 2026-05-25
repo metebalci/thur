@@ -8,10 +8,10 @@
 //! - AWS credential handling (env vars, IAM, shared credentials)
 //! - Error handling and logging
 
-use crate::cloud_backend::CloudBackend;
-use crate::cloud_config::ResolvedS3Auth;
 use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
-use crate::{CloudError, Result};
+use crate::object_store_backend::ObjectStoreBackend;
+use crate::object_store_config::ResolvedS3Auth;
+use crate::{ObjectStoreError, Result};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
@@ -82,7 +82,7 @@ use tracing::{debug, warn};
 const MAX_UPLOAD_RETRIES: u32 = 5;
 /// Maximum number of retry attempts for downloads.
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
-// Backoff cadence is owned by `cloud_helpers::retry_async`.
+// Backoff cadence is owned by `object_store_helpers::retry_async`.
 
 /// S3 backend for storing chunks and manifests
 #[derive(Clone, Debug)]
@@ -273,7 +273,7 @@ impl S3Backend {
         // that's ~1.5 GiB of avoided churn on a stalled batch.
         let data_bytes = bytes::Bytes::from(data_to_upload);
 
-        crate::cloud_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
+        crate::object_store_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
             let body = ByteStream::from(data_bytes.clone());
             let mut put_request = self
                 .client
@@ -319,7 +319,7 @@ impl S3Backend {
                         std::any::type_name_of_val(&e)
                     )
                 };
-                CloudError::Other(error_msg)
+                ObjectStoreError::Other(error_msg)
             })?;
             Ok(())
         })
@@ -348,7 +348,7 @@ impl S3Backend {
         // Get file metadata for content-length
         let metadata = tokio::fs::metadata(file_path)
             .await
-            .map_err(|e| CloudError::Other(format!("failed to stat file: {}", e)))?;
+            .map_err(|e| ObjectStoreError::Other(format!("failed to stat file: {}", e)))?;
         let file_size = metadata.len();
 
         debug!(
@@ -362,14 +362,14 @@ impl S3Backend {
             );
         }
 
-        crate::cloud_helpers::retry_async(
+        crate::object_store_helpers::retry_async(
             "upload_chunk_zerocopy",
             MAX_UPLOAD_RETRIES,
             || async {
                 // Use ByteStream::from_path for zero-copy streaming
                 let body = ByteStream::from_path(file_path)
                     .await
-                    .map_err(|e| CloudError::Other(format!("failed to create stream from path: {}", e)))?;
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to create stream from path: {}", e)))?;
 
                 let mut put_request = self.client
                     .put_object()
@@ -397,7 +397,7 @@ impl S3Backend {
                             format!("chunk upload (zero-copy) failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        CloudError::Other(error_msg)
+                        ObjectStoreError::Other(error_msg)
                     })?;
                 Ok(())
             },
@@ -418,7 +418,7 @@ impl S3Backend {
         let full_key = self.full_key(key);
         debug!("Downloading chunk from S3: {}", full_key);
 
-        crate::cloud_helpers::retry_async(
+        crate::object_store_helpers::retry_async(
             "download_chunk",
             MAX_DOWNLOAD_RETRIES,
             || async {
@@ -441,7 +441,7 @@ impl S3Backend {
                             format!("chunk download failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        CloudError::Other(error_msg)
+                        ObjectStoreError::Other(error_msg)
                     })?;
 
                 // Check compression metadata (clone the string to avoid borrow issues)
@@ -454,7 +454,7 @@ impl S3Backend {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| CloudError::Other(format!("failed to read body: {}", e)))?
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to read body: {}", e)))?
                     .into_bytes()
                     .to_vec();
 
@@ -478,7 +478,7 @@ impl S3Backend {
                         compressed_data
                     }
                     Some(other) => {
-                        return Err(CloudError::Other(format!(
+                        return Err(ObjectStoreError::Other(format!(
                             "unsupported compression type: {}",
                             other
                         )));
@@ -521,10 +521,11 @@ impl S3Backend {
             // Wait if we've hit the concurrency limit
             if tasks.len() >= MAX_CONCURRENT_DOWNLOADS {
                 let Some(finished) = tasks.join_next().await else {
-                    return Err(CloudError::Other("Task join failed".to_string()));
+                    return Err(ObjectStoreError::Other("Task join failed".to_string()));
                 };
-                let (result_idx, data) = finished
-                    .map_err(|e| CloudError::Other(format!("Download task panicked: {}", e)))??;
+                let (result_idx, data) = finished.map_err(|e| {
+                    ObjectStoreError::Other(format!("Download task panicked: {}", e))
+                })??;
                 results[result_idx] = Some(data);
             }
 
@@ -533,14 +534,14 @@ impl S3Backend {
 
             tasks.spawn(async move {
                 let data = s3.download_chunk(&key_clone).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, data))
+                Ok::<(usize, Vec<u8>), ObjectStoreError>((idx, data))
             });
         }
 
         // Collect remaining results
         while let Some(finished) = tasks.join_next().await {
             let (result_idx, data) = finished
-                .map_err(|e| CloudError::Other(format!("Download task panicked: {}", e)))??;
+                .map_err(|e| ObjectStoreError::Other(format!("Download task panicked: {}", e)))??;
             results[result_idx] = Some(data);
         }
 
@@ -550,7 +551,7 @@ impl S3Backend {
             .enumerate()
             .map(|(idx, opt)| {
                 opt.ok_or_else(|| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Missing download result for chunk at index {}",
                         idx
                     ))
@@ -572,7 +573,7 @@ impl S3Backend {
             json.len()
         );
 
-        crate::cloud_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
+        crate::object_store_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
             let body = ByteStream::from(json.as_bytes().to_vec());
             self.client
                 .put_object()
@@ -584,7 +585,7 @@ impl S3Backend {
                 .await
                 .map_err(|e| {
                     let detail = describe_sdk_error("manifest upload", &e);
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "{detail} (bucket: {}, key: {})",
                         self.bucket, full_key
                     ))
@@ -605,7 +606,7 @@ impl S3Backend {
         let full_key = self.full_key(key);
         debug!("Downloading manifest from S3: {}", full_key);
 
-        crate::cloud_helpers::retry_async(
+        crate::object_store_helpers::retry_async(
             "download_manifest",
             MAX_DOWNLOAD_RETRIES,
             || async {
@@ -628,18 +629,18 @@ impl S3Backend {
                             format!("manifest download failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        CloudError::Other(error_msg)
+                        ObjectStoreError::Other(error_msg)
                     })?;
 
                 let data = resp
                     .body
                     .collect()
                     .await
-                    .map_err(|e| CloudError::Other(format!("failed to read manifest body: {}", e)))?
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to read manifest body: {}", e)))?
                     .into_bytes();
 
                 let json = String::from_utf8(data.to_vec())
-                    .map_err(|e| CloudError::Other(format!("manifest not valid UTF-8: {}", e)))?;
+                    .map_err(|e| ObjectStoreError::Other(format!("manifest not valid UTF-8: {}", e)))?;
 
                 debug!("Downloaded manifest from S3: {} ({} bytes)", full_key, json.len());
                 Ok(json)
@@ -702,7 +703,7 @@ impl S3Backend {
                         std::any::type_name_of_val(&e)
                     )
                 };
-                Err(CloudError::Other(error_msg))
+                Err(ObjectStoreError::Other(error_msg))
             }
         }
     }
@@ -727,7 +728,7 @@ impl S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("list_objects", &e);
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "{detail} (bucket: {}, prefix: {})",
                     self.bucket, full_prefix
                 ))
@@ -768,7 +769,7 @@ impl S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("delete_object", &e);
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "{detail} (bucket: {}, key: {})",
                     self.bucket, full_key
                 ))
@@ -780,13 +781,13 @@ impl S3Backend {
 
     /// Construct full S3 key with prefix.
     fn full_key(&self, key: &str) -> String {
-        crate::cloud_helpers::full_key(&self.prefix, key)
+        crate::object_store_helpers::full_key(&self.prefix, key)
     }
 }
 
-/// CloudBackend trait implementation for S3Backend
+/// ObjectStoreBackend trait implementation for S3Backend
 #[async_trait]
-impl CloudBackend for S3Backend {
+impl ObjectStoreBackend for S3Backend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -831,7 +832,7 @@ impl CloudBackend for S3Backend {
         "s3"
     }
 
-    async fn lock_state(&self) -> Result<crate::cloud_backend::LockState> {
+    async fn lock_state(&self) -> Result<crate::object_store_backend::LockState> {
         use aws_sdk_s3::types::ObjectLockRetentionMode;
         // GetObjectLockConfiguration on a bucket without Object Lock
         // enabled returns InvalidRequest / ObjectLockConfigurationNotFoundError —
@@ -850,9 +851,9 @@ impl CloudBackend for S3Backend {
                 if msg.contains("ObjectLockConfigurationNotFoundError")
                     || msg.contains("InvalidRequest")
                 {
-                    return Ok(crate::cloud_backend::LockState::Off);
+                    return Ok(crate::object_store_backend::LockState::Off);
                 }
-                return Err(crate::CloudError::Other(format!(
+                return Err(crate::ObjectStoreError::Other(format!(
                     "GetObjectLockConfiguration on {}: {}",
                     self.bucket, msg
                 )));
@@ -860,20 +861,20 @@ impl CloudBackend for S3Backend {
         };
         let lock_cfg = match resp.object_lock_configuration() {
             Some(c) => c,
-            None => return Ok(crate::cloud_backend::LockState::Off),
+            None => return Ok(crate::object_store_backend::LockState::Off),
         };
         // ObjectLockEnabled "Enabled" is required for retention to apply;
         // anything else means Off.
         if lock_cfg.object_lock_enabled().map(|e| e.as_str()) != Some("Enabled") {
-            return Ok(crate::cloud_backend::LockState::Off);
+            return Ok(crate::object_store_backend::LockState::Off);
         }
         let rule = match lock_cfg.rule() {
             Some(r) => r,
-            None => return Ok(crate::cloud_backend::LockState::Off),
+            None => return Ok(crate::object_store_backend::LockState::Off),
         };
         let default = match rule.default_retention() {
             Some(d) => d,
-            None => return Ok(crate::cloud_backend::LockState::Off),
+            None => return Ok(crate::object_store_backend::LockState::Off),
         };
         // Default retention can be expressed in days OR years; normalize
         // to days for our LockState shape (years -> days * 365 is close
@@ -883,16 +884,16 @@ impl CloudBackend for S3Backend {
         } else if let Some(y) = default.years() {
             (y.max(0) as u32).saturating_mul(365)
         } else {
-            return Ok(crate::cloud_backend::LockState::Off);
+            return Ok(crate::object_store_backend::LockState::Off);
         };
         match default.mode() {
             Some(ObjectLockRetentionMode::Governance) => {
-                Ok(crate::cloud_backend::LockState::Governance { default_days: days })
+                Ok(crate::object_store_backend::LockState::Governance { default_days: days })
             }
             Some(ObjectLockRetentionMode::Compliance) => {
-                Ok(crate::cloud_backend::LockState::Compliance { default_days: days })
+                Ok(crate::object_store_backend::LockState::Compliance { default_days: days })
             }
-            _ => Ok(crate::cloud_backend::LockState::Off),
+            _ => Ok(crate::object_store_backend::LockState::Off),
         }
     }
 
@@ -914,7 +915,7 @@ impl CloudBackend for S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("put_object_legal_hold", &e);
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "{detail} (bucket: {}, key: {})",
                     self.bucket, full_key
                 ))
@@ -934,7 +935,7 @@ impl CloudBackend for S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("get_object_legal_hold", &e);
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "{detail} (bucket: {}, key: {})",
                     self.bucket, full_key
                 ))
@@ -945,7 +946,7 @@ impl CloudBackend for S3Backend {
         ))
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         Box::new(self.clone())
     }
 }
@@ -1017,16 +1018,16 @@ mod tests {
     // Stand up an in-process wiremock server, point the AWS S3 SDK at it
     // via endpoint_url, and verify that canned XML error responses with
     // realistic AWS error codes flow through the SDK -> describe_sdk_error
-    // -> CloudError::Other -> classify() pipeline to the correct
+    // -> ObjectStoreError::Other -> classify() pipeline to the correct
     // FailureKind. These are the contracts that decide whether a failure
     // burns through the retry budget or fails fast.
     //
-    // The existing tests in cloud_helpers.rs cover the retry policy
-    // against hand-built CloudError values; these cover the SDK adapter
+    // The existing tests in object_store_helpers.rs cover the retry policy
+    // against hand-built ObjectStoreError values; these cover the SDK adapter
     // layer with real SDK errors.
 
-    use crate::cloud_config::{FailureKind, classify, is_retryable};
     use crate::compression::CompressionConfig;
+    use crate::object_store_config::{FailureKind, classify, is_retryable};
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1056,7 +1057,7 @@ mod tests {
         )
     }
 
-    async fn capture_list_error(server: MockServer) -> crate::CloudError {
+    async fn capture_list_error(server: MockServer) -> crate::ObjectStoreError {
         let backend = mock_s3_backend(&server).await;
         backend
             .list_objects("")
@@ -1478,7 +1479,7 @@ mod tests {
         let backend = mock_s3_backend(&server).await;
         assert_eq!(
             backend.lock_state().await.expect("lock state"),
-            crate::cloud_backend::LockState::Off
+            crate::object_store_backend::LockState::Off
         );
     }
 
@@ -1501,7 +1502,7 @@ mod tests {
         let backend = mock_s3_backend(&server).await;
         assert_eq!(
             backend.lock_state().await.expect("lock state"),
-            crate::cloud_backend::LockState::Compliance { default_days: 30 }
+            crate::object_store_backend::LockState::Compliance { default_days: 30 }
         );
     }
 
@@ -1524,7 +1525,7 @@ mod tests {
         let backend = mock_s3_backend(&server).await;
         assert_eq!(
             backend.lock_state().await.expect("lock state"),
-            crate::cloud_backend::LockState::Governance { default_days: 365 }
+            crate::object_store_backend::LockState::Governance { default_days: 365 }
         );
     }
 

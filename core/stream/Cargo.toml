@@ -10,8 +10,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-# Cloud backends + compression primitives.
-shared-cloud = { path = "../../shared/cloud" }
+# Storage backends + compression primitives.
+shared-object-store = { path = "../../shared/object-store" }
 # AES-256-GCM primitives + IV derivation. Lifted out so core-block can
 # share them; the SCSI-flavored types (EncryptionMode, KeyScope,
 # DriveEncryptionState, algorithm-code constants) stay in this crate

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use common::create_test_dir;
 use core_mediachanger::cartridge_migrate::{MigrateMode, MigrateOptions, run_migrate};
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, CloudBackend, DedupScope, LocalBackend, SmcError,
+    Cartridge, CartridgeOpenMode, DedupScope, LocalBackend, ObjectStoreBackend, SmcError,
 };
 use std::fs;
 use std::path::Path;
@@ -34,7 +34,7 @@ async fn seed_cartridge(
     dedup: DedupScope,
     n_blocks: usize,
 ) -> Vec<Vec<u8>> {
-    let backend: Box<dyn CloudBackend> =
+    let backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(bucket).await.expect("test setup"));
     let mut cart = Cartridge::open_with_cloud_async(
         tapes,
@@ -176,9 +176,9 @@ async fn migrate_move_global_dedup_round_trip() {
     );
 
     // Migrate.
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let report = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -228,7 +228,7 @@ async fn migrate_move_global_dedup_round_trip() {
     assert_eq!(count_bucket_manifests(&src_bucket, "TAPE001"), 0);
 
     // Re-open against the new backend; reads still match the fixture.
-    let target_again: Box<dyn CloudBackend> =
+    let target_again: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let mut cart = Cartridge::open_with_cloud_async(
         &tapes,
@@ -270,9 +270,9 @@ async fn migrate_move_local_dedup_deletes_source_chunks() {
     )
     .await;
 
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let report = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -327,9 +327,9 @@ async fn migrate_dry_run_writes_nothing() {
     let bucket_src_chunks_before = count_bucket_chunks(&src_bucket);
     let bucket_src_manifests_before = count_bucket_manifests(&src_bucket, "TAPE_DR");
 
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let report = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -393,9 +393,9 @@ async fn migrate_rebind_verify_happy_path() {
     // operator's out-of-band bucket replication having finished).
     copy_tree(&src_bucket, &dst_bucket);
 
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let report = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -429,7 +429,7 @@ async fn migrate_rebind_verify_happy_path() {
     assert!(count_bucket_manifests(&src_bucket, "TAPE_RB") > 0);
 
     // Reads off the new backend match the fixture.
-    let target_again: Box<dyn CloudBackend> =
+    let target_again: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let mut cart = Cartridge::open_with_cloud_async(
         &tapes,
@@ -467,9 +467,9 @@ async fn migrate_rebind_refuses_when_target_missing_chunks() {
     .await;
 
     // Target bucket is empty — the operator forgot to run replication.
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let err = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -518,9 +518,9 @@ async fn migrate_rebind_no_verify_proceeds_without_check() {
     .await;
 
     // Target is empty; we tell migrate to trust us anyway.
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let report = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
@@ -562,8 +562,10 @@ async fn migrate_refuses_same_source_and_target() {
     )
     .await;
 
-    let a: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("test setup"));
-    let b: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("test setup"));
+    let a: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("test setup"));
+    let b: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("test setup"));
     let err = run_migrate(MigrateOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_SAME",
@@ -602,9 +604,9 @@ async fn migrate_refuses_when_manifest_backend_does_not_match() {
 
     // Tell migrate the source is "other" — disagrees with the
     // manifest's recorded backend.
-    let source: Box<dyn CloudBackend> =
+    let source: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
-    let target: Box<dyn CloudBackend> =
+    let target: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
     let err = run_migrate(MigrateOptions {
         tapes_dir: &tapes,

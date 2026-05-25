@@ -159,8 +159,8 @@ perf_table_emit() {
 
 # -----------------------------------------------------------------------
 # Cloud helpers — lifted from the duplicated bodies that previously
-# lived in `vtl/scripts/test-backup-cloud.sh` and
-# `vsa/scripts/test-iscsi-fs-cloud.sh`. The matrix scripts
+# lived in `vtl/scripts/test-backup-storage.sh` and
+# `vsa/scripts/test-iscsi-fs-storage.sh`. The matrix scripts
 # (test-pipeline-layers.sh, future shared lifts) consume the same
 # functions.
 #

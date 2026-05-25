@@ -51,7 +51,7 @@ read-write protocol, persistent reservations, partition support — is
    chunk pool, so the question never arises.
 4. **RAO buys very little.** Real drives need seek optimization because
    the head physically traverses media. A VTL's equivalent of a seek is
-   a cloud-chunk fetch, and RAO's reordering does not optimize that. A
+   a backend-chunk fetch, and RAO's reordering does not optimize that. A
    passthrough implementation that returns the initiator's own order
    would go unnoticed by any real workload.
 5. **Most enterprise backup products don't care.** NetBackup, Veeam,
@@ -133,7 +133,7 @@ cartridge creation. The reasoning:
 - **The deferred work is small and well-scoped.** The table above is the
   full change list; nothing in the current design forecloses LTO-9, so
   it can ship in a point release without touching anything structural.
-- **Deferring focuses 1.0.0 testing on what matters** — cloud-backend
+- **Deferring focuses 1.0.0 testing on what matters** — storage-backend
   reliability, dedup correctness, encryption, and the iSCSI/SCSI
   conformance surface for LTO-8.
 

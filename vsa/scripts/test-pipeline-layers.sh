@@ -24,14 +24,14 @@
 #
 # Per-keystore wrap/unwrap coverage (awskms / vault / azurekv /
 # gcpkms / etc.) lives in vsa/scripts/test-keystore.sh — same shape
-# as test-iscsi-fs-cloud.sh: pick a backend by name from a source
+# as test-iscsi-fs-storage.sh: pick a backend by name from a source
 # JSON file (operator-local `private/keystore-backends.json`) and
 # splice into `keystore.backends:` of the YAML test config. Out of
 # scope here so the matrix run stays focused on the cloud /
 # pipeline layers.
 #
 # Defaults to aistor-none for LAN iteration. Same cred-handling
-# conventions as test-iscsi-fs-cloud.sh.
+# conventions as test-iscsi-fs-storage.sh.
 #
 # Usage (invoke from repo root):
 #   THURVSA_TEST_BACKEND=aistor-none ./vsa/scripts/test-pipeline-layers.sh [OPTIONS]
@@ -108,23 +108,23 @@ fi
 
 # Backends config is YAML under `cloud.backends.<name>` (mirrors what
 # every other cloud-backed VSA suite reads). yq is needed at the same
-# version contract as test-iscsi-fs-cloud.sh.
-BACKEND_TYPE=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-BACKEND_BUCKET=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ENDPOINT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-BACKEND_REGION=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ACCOUNT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-BACKEND_CONTAINER=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+# version contract as test-iscsi-fs-storage.sh.
+BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+BACKEND_REGION=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
 BACKEND_AUTH_AKID_ENV=$(yq -r "
-    .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
+    .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
     | select(.type == \"env\") | .access_key_id_env // \"\"
 " "$SOURCE_BACKENDS")
 BACKEND_AUTH_SECRET_ENV=$(yq -r "
-    .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
+    .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
     | select(.type == \"env\") | .secret_access_key_env // \"\"
 " "$SOURCE_BACKENDS")
-RETENTION=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
-ORIG_PREFIX=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+RETENTION=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
 
 if [[ "$BACKEND_TYPE" == "local" ]]; then
     log_error "matrix needs a real cloud backend; '$THURVSA_TEST_BACKEND' is type=local"
@@ -209,7 +209,7 @@ iscsi:
   target_iqn: "$TARGET_IQN"
 disk_cache:
   disk_free_min_gb: 0
-cloud:
+storage:
   compression:
     algorithm: $cloud_compress
   backends:
@@ -379,7 +379,7 @@ row_bring_up() {
 # Row 1: baseline. Create volume, mkfs+mount+write+umount, no
 # special assertion beyond "everything completes cleanly". The
 # byte-equality check is heavy here (read-back across reboot);
-# matching test-iscsi-fs-cloud.sh's full Phase C is overkill for the
+# matching test-iscsi-fs-storage.sh's full Phase C is overkill for the
 # matrix.
 row_baseline() {
     log_test "row 1: baseline (dedup=local, encrypt=off, cloud=none)"

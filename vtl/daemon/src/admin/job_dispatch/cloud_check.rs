@@ -5,16 +5,16 @@
 //! configured cloud backend.
 //!
 //! Body: `{}` (no parameters — backends come from the daemon's
-//! already-loaded `cloud_config`).
+//! already-loaded `storage_config`).
 
 use std::sync::Arc;
 
 use crate::state::DaemonState;
-use core_mediachanger::{CloudCheckStep, validate_cloud_backend};
+use core_mediachanger::{ObjectStoreCheckStep, validate_object_store_backend};
 use shared_admin_server::{JobEmitter, JobEvent};
 
 pub async fn run(emitter: JobEmitter, _body: serde_json::Value, state: Arc<DaemonState>) {
-    let cfg = state.cloud_config.as_ref();
+    let cfg = state.storage_config.as_ref();
     let names = cfg.backend_names();
 
     emitter
@@ -35,14 +35,14 @@ pub async fn run(emitter: JobEmitter, _body: serde_json::Value, state: Arc<Daemo
             emitter.info(format!("Target: {}", target)).await;
         }
 
-        // Bridge the sync `validate_cloud_backend` step callback into
+        // Bridge the sync `validate_object_store_backend` step callback into
         // async event emission. The callback is sync; we collect into
         // a Vec then ship the lines after each backend completes.
         // (Cloud check steps are a handful per backend — buffering is
         // fine. If a future kind has thousands of sync callbacks
         // we'd want a sync->async bridge instead.)
-        let mut steps: Vec<CloudCheckStep> = Vec::new();
-        let result = validate_cloud_backend(cfg, name, |step| {
+        let mut steps: Vec<ObjectStoreCheckStep> = Vec::new();
+        let result = validate_object_store_backend(cfg, name, |step| {
             steps.push(step);
         })
         .await;
@@ -133,7 +133,7 @@ pub async fn run(emitter: JobEmitter, _body: serde_json::Value, state: Arc<Daemo
 mod tests {
     use super::*;
     use crate::state::{DaemonState, DaemonStateConfig};
-    use core_mediachanger::{AuditRateLimiter, CloudConfig};
+    use core_mediachanger::{AuditRateLimiter, ObjectStoreConfig};
     use scsi_smc::changer::ElementAddressConfig;
     use shared_admin_server::JobRegistry;
     use std::collections::HashMap;
@@ -141,7 +141,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, broadcast};
 
-    /// Build a `DaemonState` with an empty `CloudConfig` — the cloud
+    /// Build a `DaemonState` with an empty `ObjectStoreConfig` — the cloud
     /// check then iterates zero backends and takes the all-passed
     /// branch.
     fn empty_state(dir: &std::path::Path) -> Arc<DaemonState> {
@@ -174,7 +174,7 @@ mod tests {
             audit_dir: dir.join("audit"),
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
-            cloud_config: Arc::new(CloudConfig::default()),
+            storage_config: Arc::new(ObjectStoreConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 1,
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,

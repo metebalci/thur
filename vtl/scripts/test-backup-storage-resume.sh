@@ -25,7 +25,7 @@
 # so the audit writer + boot scan get a chance to fire, then killed.
 #
 # Usage (invoke from repo root):
-#   ./vtl/scripts/test-backup-cloud-resume.sh [OPTIONS]
+#   ./vtl/scripts/test-backup-storage-resume.sh [OPTIONS]
 #
 # Options:
 #   --release       Use ./target/release/ binaries (default is ./target/debug/)
@@ -38,7 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
 BUILD_PROFILE="debug"
-TEST_DIR="/tmp/test-backup-cloud-resume-$$"
+TEST_DIR="/tmp/test-backup-storage-resume-$$"
 KEEP_DATA=0
 DAEMON_PATH=""
 CLI_PATH=""
@@ -115,7 +115,7 @@ http:
   listen: "127.0.0.1:$http_port"
 license:
   file: "${fixture}/no-such.lic"
-cloud:
+storage:
   backends:
     primary:
       type: local

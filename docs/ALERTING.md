@@ -120,7 +120,7 @@ Empty `body_template` sends the canonical Alert JSON unchanged:
   "version": "0.1.0-alpha.1",
   "class": "backend_reachability",
   "severity": "error",
-  "message": "Cloud backend 'primary' unreachable",
+  "message": "Storage backend 'primary' unreachable",
   "fields": { "backend": "primary", "outcome": "failure" },
   "timestamp": "2026-05-17T14:22:01.123Z"
 }
@@ -251,7 +251,7 @@ Both daemons:
 
 1. **Periodic cloud-check ticker** — today `backend_reachability`
    fires only on operator-invoked `system cloud_check`. A
-   `cloud.check_interval_seconds` knob (default off) would let
+   `storage.check_interval_seconds` knob (default off) would let
    overnight-failure detection ship without an operator at the
    console.
 2. **VSA `system.cloud_check` job** — VTL has the job, VSA doesn't.

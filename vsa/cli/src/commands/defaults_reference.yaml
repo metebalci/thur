@@ -173,13 +173,22 @@ http:
     # regenerate-cert` after editing. Example: ["vsa.example.com", "10.0.0.5"]
     extra_sans: []
 
-# Cloud storage. Workspace-wide tuning knobs (compression, upload
+# Storage backends. Workspace-wide tuning knobs (compression, upload
 # concurrency, retention-mode check) plus the named backend
-# definitions under `cloud.backends:`. Each volume picks one backend
+# definitions under `storage.backends:`. Each volume picks one backend
 # at create time (`volume create --backend NAME`) and is bound to it
-# for life. See docs/AUTH.md for the per-backend `auth:`
-# block shapes (S3 / GCS / Azure / local).
-cloud:
+# for life.
+#
+# "Storage backend" is the umbrella term — local-filesystem, S3, GCS,
+# Azure, and on-prem S3-compatible object stores (AIStore, MinIO,
+# Ceph RGW) all live here. Every backend the daemon currently
+# implements is object-shaped (PUT/GET/HEAD/DELETE on opaque blobs);
+# the "storage" naming leaves room for a future block-shaped backend
+# variant without another rename.
+#
+# See docs/AUTH.md for the per-backend `auth:` block shapes
+# (S3 / GCS / Azure / local).
+storage:
   # Opt out of bucket-immutability validation at startup. When true,
   # lock_state() is never called against any backend; retention_mode
   # is still parsed and still gates `volume create --worm`, but thurvsa
@@ -188,7 +197,7 @@ cloud:
   # management-plane IAM. Default: false.
   # skip_retention_mode_check: false
 
-  # Cloud-layer compression (S3/GCS/Azure only; ignored for local).
+  # Backend-side compression (S3/GCS/Azure only; ignored for local).
   # Applied per-page on upload, post-dedup. Default zstd because
   # page-sized inputs (64 KiB-1 MiB) compress well with the heavier
   # algorithm; lz4 is faster but compresses less.
@@ -203,7 +212,7 @@ cloud:
     # Maximum concurrent in-flight page uploads per backend per
     # volume. `0` (default) means "auto-scale": at daemon start,
     # resolve to min(16, available_parallelism * 4). On 4+ core hosts
-    # this caps at 16, which captures most cloud-backend throughput
+    # this caps at 16, which captures most storage-backend throughput
     # while bounding the in-flight memory footprint (N × chunk_size).
     # Operators who want higher concurrency at the cost of memory can
     # set this to an explicit value (e.g. 32). Resolved value + source

@@ -14,7 +14,7 @@
 //!
 //! Trade-off: a malformed JSON / header bug in the SDK adapter layer
 //! won't surface from `cargo test`. Those failure modes are caught
-//! by the env-gated `vsa/scripts/test-iscsi-fs-cloud.sh` rig that
+//! by the env-gated `vsa/scripts/test-iscsi-fs-storage.sh` rig that
 //! runs against a real GCS bucket — same coverage we had before.
 
 use async_trait::async_trait;
@@ -26,13 +26,13 @@ use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model::Object;
 use google_cloud_wkt::FieldMask;
 
-use crate::{CloudError, Result};
+use crate::{ObjectStoreError, Result};
 
 /// Retention policy snapshot returned by [`GcsApi::get_bucket_retention`].
 ///
 /// `seconds == 0` is reported via [`Option::None`]; any positive period
 /// surfaces here. `is_locked` reflects the GCS "locked retention
-/// policy" bit — see [`crate::cloud_backend::LockState::Compliance`].
+/// policy" bit — see [`crate::object_store_backend::LockState::Compliance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RetentionPolicy {
     pub seconds: u64,
@@ -74,13 +74,15 @@ impl RealGcsApi {
             .with_credentials(creds.clone())
             .build()
             .await
-            .map_err(|e| CloudError::Other(format!("GCS Storage client build failed: {}", e)))?;
+            .map_err(|e| {
+                ObjectStoreError::Other(format!("GCS Storage client build failed: {}", e))
+            })?;
         let control = StorageControl::builder()
             .with_credentials(creds.clone())
             .build()
             .await
             .map_err(|e| {
-                CloudError::Other(format!("GCS StorageControl client build failed: {}", e))
+                ObjectStoreError::Other(format!("GCS StorageControl client build failed: {}", e))
             })?;
         Ok(Self { data, control })
     }
@@ -98,7 +100,7 @@ impl GcsApi for RealGcsApi {
             .send_buffered()
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS write_object failed: {} (bucket: {}, key: {})",
                     e, bucket, key
                 ))
@@ -113,7 +115,7 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS read_object failed: {} (bucket: {}, key: {})",
                     e, bucket, key
                 ))
@@ -121,7 +123,7 @@ impl GcsApi for RealGcsApi {
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.next().await {
             let chunk = chunk.map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS read_object stream failed: {} (bucket: {}, key: {})",
                     e, bucket, key
                 ))
@@ -152,7 +154,7 @@ impl GcsApi for RealGcsApi {
                 if is_absent {
                     Ok(false)
                 } else {
-                    Err(CloudError::Other(format!(
+                    Err(ObjectStoreError::Other(format!(
                         "GCS get_object failed: {} (bucket: {}, key: {})",
                         e, bucket, key
                     )))
@@ -170,7 +172,7 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS get_object (legal hold) failed: {} (bucket: {}, key: {})",
                     e, bucket, key
                 ))
@@ -197,7 +199,7 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS update_object (event_based_hold={}) failed: {} (bucket: {}, key: {})",
                     held, e, bucket, key
                 ))
@@ -217,7 +219,7 @@ impl GcsApi for RealGcsApi {
             .by_item();
         while let Some(item) = items.next().await {
             let obj = item.map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS list_objects failed: {} (bucket: {}, prefix: {})",
                     e, bucket, prefix
                 ))
@@ -235,7 +237,7 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS delete_object failed: {} (bucket: {}, key: {})",
                     e, bucket, key
                 ))
@@ -250,7 +252,7 @@ impl GcsApi for RealGcsApi {
             .set_name(Self::bucket_resource(bucket))
             .send()
             .await
-            .map_err(|e| CloudError::Other(format!("GCS get_bucket on {}: {}", bucket, e)))?;
+            .map_err(|e| ObjectStoreError::Other(format!("GCS get_bucket on {}: {}", bucket, e)))?;
         let policy = match b.retention_policy {
             Some(p) => p,
             None => return Ok(None),
@@ -279,24 +281,24 @@ pub(crate) async fn build_credentials(
     match service_account_key_file {
         Some(path) => {
             let json = tokio::fs::read_to_string(path).await.map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS service-account key file '{}' could not be loaded: {}",
                     path, e
                 ))
             })?;
             let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "GCS service-account key file '{}' could not be loaded: {}",
                     path, e
                 ))
             })?;
             service_account::Builder::new(value).build().map_err(|e| {
-                CloudError::Other(format!("GCS auth from key file '{}' failed: {}", path, e))
+                ObjectStoreError::Other(format!("GCS auth from key file '{}' failed: {}", path, e))
             })
         }
         None => CredsBuilder::default()
             .build()
-            .map_err(|e| CloudError::Other(format!("GCS auth failed: {}", e))),
+            .map_err(|e| ObjectStoreError::Other(format!("GCS auth failed: {}", e))),
     }
 }
 
@@ -321,7 +323,7 @@ mod tests {
         let err = build_credentials(Some("/no/such/key.json"))
             .await
             .expect_err("missing key file");
-        let CloudError::Other(msg) = err else {
+        let ObjectStoreError::Other(msg) = err else {
             panic!("expected Other");
         };
         assert!(msg.contains("/no/such/key.json"));
@@ -335,6 +337,6 @@ mod tests {
         let err = build_credentials(Some(path.to_str().unwrap()))
             .await
             .expect_err("bad json");
-        assert!(matches!(err, CloudError::Other(_)));
+        assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 }

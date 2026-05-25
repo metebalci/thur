@@ -8,7 +8,7 @@
 //! configured backend before the daemon ever opens it.
 
 use anyhow::Result;
-use shared_cloud_bench::BenchOptions;
+use shared_object_store_bench::BenchOptions;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
@@ -32,7 +32,7 @@ pub async fn cmd_benchmark(
         skip_download,
         yes,
     };
-    shared_cloud_bench::run_from_config_path(config_path, backends, opts)
+    shared_object_store_bench::run_from_config_path(config_path, backends, opts)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use common::create_test_dir;
 use core_mediachanger::cartridge_archive::{ArchiveOptions, run_archive};
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, CloudBackend, DedupScope, LocalBackend, SmcError,
+    Cartridge, CartridgeOpenMode, DedupScope, LocalBackend, ObjectStoreBackend, SmcError,
 };
 use std::fs;
 use std::path::Path;
@@ -32,7 +32,7 @@ async fn seed(
     dedup: DedupScope,
     n_blocks: usize,
 ) -> Vec<Vec<u8>> {
-    let backend: Box<dyn CloudBackend> =
+    let backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(bucket).await.expect("backend"));
     let mut cart = Cartridge::open_with_cloud_async(
         tapes,
@@ -112,8 +112,10 @@ async fn archive_global_dedup_round_trip() {
     let src_chunks_idx_before = fs::read(tapes.join("TAPE_A1").join("chunks.idx")).expect("read");
     let src_bucket_files_before = walkdir_count_files(&src_bucket);
 
-    let source: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
     let report = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_A1",
@@ -187,8 +189,10 @@ async fn archive_dry_run_writes_nothing() {
     let _written = seed(&tapes, &src_bucket, "TAPE_DR", DedupScope::Global, 2).await;
     assert_eq!(walkdir_count_files(&dst_bucket), 0);
 
-    let source: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
     let report = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_DR",
@@ -222,8 +226,10 @@ async fn archive_refuses_duplicate_label() {
 
     let _written = seed(&tapes, &src_bucket, "TAPE_DUP", DedupScope::Global, 1).await;
 
-    let source: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
 
     // First archive succeeds.
     let _ = run_archive(ArchiveOptions {
@@ -240,9 +246,9 @@ async fn archive_refuses_duplicate_label() {
     .expect("first archive");
 
     // Same label refused.
-    let source2: Box<dyn CloudBackend> =
+    let source2: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target2: Box<dyn CloudBackend> =
+    let target2: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
     let err = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
@@ -259,9 +265,9 @@ async fn archive_refuses_duplicate_label() {
     matches!(err, SmcError::InvalidOp(_));
 
     // Distinct label succeeds — both archives coexist.
-    let source3: Box<dyn CloudBackend> =
+    let source3: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target3: Box<dyn CloudBackend> =
+    let target3: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
     let _ = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
@@ -292,14 +298,18 @@ async fn archive_refuses_invalid_label() {
     fs::create_dir_all(&dst_bucket).expect("mkdir");
     let _ = seed(&tapes, &src_bucket, "TAPE_LBL", DedupScope::Global, 1).await;
 
-    let source: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
 
     for bad in &["", "has space", "with/slash", &"x".repeat(65)] {
-        let s: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+        let s: Box<dyn ObjectStoreBackend> =
+            Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
         let _ = source;
         let _ = target;
-        let t: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+        let t: Box<dyn ObjectStoreBackend> =
+            Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
         let err = run_archive(ArchiveOptions {
             tapes_dir: &tapes,
             barcode: "TAPE_LBL",
@@ -338,8 +348,10 @@ async fn archive_local_dedup_chunks_land_under_archive_prefix() {
 
     let _ = seed(&tapes, &src_bucket, "TAPE_L", DedupScope::Local, 2).await;
 
-    let source: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
-    let target: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("be"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("be"));
     let report = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_L",

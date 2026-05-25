@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dirty_pages::{DirtyPageTracker, PAGE_SIZE};
 use crate::errors::{Result, SmcError};
-use shared_cloud::compression::CompressionAlgo;
+use shared_object_store::compression::CompressionAlgo;
 
 /// On-disk record size. Asserted in tests to catch accidental drift.
 pub const RECORD_SIZE: usize = 64;

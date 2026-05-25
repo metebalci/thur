@@ -14,13 +14,13 @@ default = []
 io-uring-support = ["io-uring"]
 
 [dependencies]
-# Cloud backends + compression primitives live in shared-cloud so
-# the sibling block-storage product (core-block) can consume them
+# Storage backends + compression primitives live in shared-object-store
+# so the sibling block-storage product (core-block) can consume them
 # without depending on core-mediachanger. core-mediachanger re-exports the same
-# module paths it used to own (`compression`, `cloud_backend`,
-# `cloud_config`, `cloud_helpers`, `s3`, `gcs`, `azure`, `local`)
-# so downstream callers (thurvtld, thurvtl) don't change.
-shared-cloud = { path = "../../shared/cloud" }
+# module paths it used to own (`compression`, `object_store_backend`,
+# `object_store_config`, `object_store_helpers`, `s3`, `gcs`, `azure`,
+# `local`) so downstream callers (thurvtld, thurvtl) don't change.
+shared-object-store = { path = "../../shared/object-store" }
 # `From<shared_iscsi::IscsiError> for SmcError` lives here so the
 # session/auth modules in shared-iscsi propagate cleanly through every
 # `?` in the iscsi handler tree without each consumer re-deriving the

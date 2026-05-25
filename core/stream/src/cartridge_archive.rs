@@ -46,7 +46,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use shared_pool::ChunkPool;
 
 use crate::chunk_index::ChunkIndexFile;
@@ -59,12 +59,12 @@ pub struct ArchiveOptions<'a> {
     pub barcode: &'a str,
     /// The source cartridge's bound cloud backend (handle), used to
     /// fetch chunks marked `CloudOnly` that aren't in the local pool.
-    /// May be the same `CloudBackend` impl as `target` if the operator
+    /// May be the same `ObjectStoreBackend` impl as `target` if the operator
     /// is archiving back to the cartridge's own bucket under a
     /// different prefix.
-    pub source: &'a dyn CloudBackend,
+    pub source: &'a dyn ObjectStoreBackend,
     /// Where the archive bytes land.
-    pub target: &'a dyn CloudBackend,
+    pub target: &'a dyn ObjectStoreBackend,
     pub target_name: &'a str,
     /// 1-64-char alphanumeric (`-` and `_` allowed). Pre-validated by
     /// the daemon-side handler; the primitive re-validates anyway.
@@ -238,7 +238,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
     ));
     let local_pool = open_local_pool(opts.tapes_dir, &slice.backend, namespace)?;
     for (i, hash) in hashes.iter().enumerate() {
-        let src_key = ChunkPool::cloud_key_for(namespace, hash);
+        let src_key = ChunkPool::object_key_for(namespace, hash);
         let dst_key = archive_chunk_key(opts.barcode, opts.label, hash);
         let (bytes, from_local) = if local_pool.exists(hash) {
             (local_pool.read_bytes(hash)?, true)
@@ -386,8 +386,8 @@ fn open_local_pool(tapes_dir: &Path, backend: &str, namespace: Option<&str>) -> 
     Ok(pool)
 }
 
-fn cloud_err(e: shared_cloud::CloudError) -> SmcError {
-    SmcError::CloudError(e.to_string())
+fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+    SmcError::ObjectStoreError(e.to_string())
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {

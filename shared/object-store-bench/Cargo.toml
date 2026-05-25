@@ -1,5 +1,5 @@
 [package]
-name = "shared-cloud-bench"
+name = "shared-object-store-bench"
 version.workspace = true
 edition = "2024"
 license.workspace = true
@@ -11,10 +11,11 @@ workspace = true
 
 [dependencies]
 # Trait + types the bench drives. The `run_from_config_path` entry
-# point parses a daemon YAML conffile into a `CloudConfig`, then
-# constructs each named backend via `CloudConfig::create_backend_named`
-# and hands the lot to `run` as a list of `BenchTarget`s.
-shared-cloud = { path = "../cloud" }
+# point parses a daemon YAML conffile into an `ObjectStoreConfig`,
+# then constructs each named backend via
+# `ObjectStoreConfig::create_backend_named` and hands the lot to `run`
+# as a list of `BenchTarget`s.
+shared-object-store = { path = "../object-store" }
 
 bytes = "1"
 futures = "0.3"

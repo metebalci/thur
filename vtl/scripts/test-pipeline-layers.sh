@@ -49,15 +49,15 @@
 #      `scripts/lib/test-helpers.sh` use process substitution to
 #      pipe the binary into sg_raw's `-i` fd directly.
 #
-# NOTE on credentials: same convention as test-backup-cloud.sh — drop
+# NOTE on credentials: same convention as test-backup-storage.sh — drop
 # AWS_* / GOOGLE_* / AZURE_* / AISTOR_* into $REPO/private/thur.env
-# and the backend entry into $REPO/private/cloud-backends.json. The
+# and the backend entry into $REPO/private/storage-backends.json. The
 # script auto-sources thur.env and defaults THURVTL_SOURCE_BACKENDS
 # accordingly.
 #
 # NOTE on sudo: the script self-elevates via `sudo KEY=VAL ... $0` and
 # forwards cloud-prefix env vars; sudo-rs on Ubuntu 26.04+ ignores `-E`
-# so explicit forwarding is mandatory. See test-backup-cloud.sh header
+# so explicit forwarding is mandatory. See test-backup-storage.sh header
 # for the long form.
 #
 # Usage (invoke from repo root):
@@ -136,24 +136,24 @@ if [[ ! -r "$SOURCE_BACKENDS" ]]; then
 fi
 
 # Parse the chosen backend's coordinates out of cloud-backends.yaml
-# (same shape test-backup-cloud.sh uses, so cred forwarding + probes
+# (same shape test-backup-storage.sh uses, so cred forwarding + probes
 # work identically). yq required at the same version contract.
-BACKEND_TYPE=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-BACKEND_BUCKET=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ENDPOINT=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-BACKEND_REGION=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-BACKEND_ACCOUNT=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-BACKEND_CONTAINER=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+BACKEND_REGION=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
 BACKEND_AUTH_AKID_ENV=$(yq -r "
-    .cloud.backends.\"$THURVTL_TEST_BACKEND\".auth
+    .storage.backends.\"$THURVTL_TEST_BACKEND\".auth
     | select(.type == \"env\") | .access_key_id_env // \"\"
 " "$SOURCE_BACKENDS")
 BACKEND_AUTH_SECRET_ENV=$(yq -r "
-    .cloud.backends.\"$THURVTL_TEST_BACKEND\".auth
+    .storage.backends.\"$THURVTL_TEST_BACKEND\".auth
     | select(.type == \"env\") | .secret_access_key_env // \"\"
 " "$SOURCE_BACKENDS")
-RETENTION=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
-ORIG_PREFIX=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+RETENTION=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
 
 if [[ "$BACKEND_TYPE" == "local" ]]; then
     log_error "matrix needs a real cloud backend; '$THURVTL_TEST_BACKEND' is type=local"
@@ -252,7 +252,7 @@ iscsi:
   target_iqn: "$TARGET_IQN"
 disk_cache:
   disk_free_min_gb: 0
-cloud:
+storage:
   compression:
     algorithm: $cloud_compress
   backends:
@@ -289,7 +289,7 @@ init_library() {
 }
 
 # Create N cartridges with the given dedup-scope. Same chunking +
-# chunk-size as test-backup-cloud.sh's defaults so the seal pipeline
+# chunk-size as test-backup-storage.sh's defaults so the seal pipeline
 # behaves identically — fastcdc avoids the fixed-block alignment
 # trap that prevented small writes from sealing in earlier iterations.
 create_cartridges() {
@@ -319,7 +319,7 @@ connect_iscsi() {
         return 1
     fi
     # Use the no-rewind device for actual writes — same convention as
-    # test-backup-cloud.sh; rewinding between tar segments is the
+    # test-backup-storage.sh; rewinding between tar segments is the
     # caller's job, not the kernel's.
     NOREWIND_DEVICE=$(echo "$TAPE_DEVICE" | sed 's|/dev/st|/dev/nst|')
     log_info "changer=$CHANGER_DEVICE tape=$TAPE_DEVICE no-rewind=$NOREWIND_DEVICE sg=$TAPE_SG_DEVICE"
@@ -344,7 +344,7 @@ make_fixture() {
 }
 
 # Load slot $1 -> drive 0, tar the fixture stage to /dev/nstN, weof,
-# unload. Same shape as test-backup-cloud.sh's tape write.
+# unload. Same shape as test-backup-storage.sh's tape write.
 tar_to_tape() {
     local slot="$1"
     mtx -f "$CHANGER_DEVICE" load "$slot" 0 2>"$TEST_DIR/mtx-load.err" || {
@@ -366,7 +366,7 @@ tar_to_tape() {
     # machine treats as a flush boundary; then `mt rewind` closes the
     # device handle so unload can fire cleanly without contending
     # with the kernel st driver's lingering open. Same sequence the
-    # existing test-backup-cloud.sh uses.
+    # existing test-backup-storage.sh uses.
     mt -f "$NOREWIND_DEVICE" weof   >/dev/null 2>&1 || true
     mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || true
     # mtx args: `unload [SLOTNUM] DRIVENUM` — unload cartridge in
@@ -467,7 +467,7 @@ row_bring_up() {
 
 # Row 1: baseline. Write a fixture, verify chunks land in cloud, no
 # special property to assert beyond "data path works". The full
-# byte-equality + refetch coverage lives in test-backup-cloud.sh —
+# byte-equality + refetch coverage lives in test-backup-storage.sh —
 # the matrix is here to flag *regressions per layer*, not duplicate
 # the end-to-end suite.
 row_baseline() {

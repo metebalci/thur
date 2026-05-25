@@ -21,7 +21,7 @@
 //! `maybe_decompress`, `maybe_decrypt`, `open_chunk_for_read`. They
 //! straddle the read state machine and aren't pure indexing.
 
-use shared_cloud::compression::CompressionAlgo;
+use shared_object_store::compression::CompressionAlgo;
 
 use super::{
     BlockIndex, BlockIndexFile, BlockKind, BlockKindSerde, BlockRec, Cartridge, ChunkRec,

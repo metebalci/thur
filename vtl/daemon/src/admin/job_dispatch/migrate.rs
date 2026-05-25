@@ -121,7 +121,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     // WORM cartridges require the target to have governance/compliance.
     if is_worm {
         let target_mode = state
-            .cloud_config
+            .storage_config
             .retention_mode_named(&params.target_backend);
         if !target_mode.requires_lock() {
             let reason = format!(
@@ -138,7 +138,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
 
     // Build backend handles.
     let source = match state
-        .cloud_config
+        .storage_config
         .create_backend_named(&source_backend)
         .await
     {
@@ -151,7 +151,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
         }
     };
     let target = match state
-        .cloud_config
+        .storage_config
         .create_backend_named(&params.target_backend)
         .await
     {
@@ -267,7 +267,7 @@ async fn preflight(params: &MigrateParams, state: &DaemonState) -> Result<(), St
         return Err("target_backend must be non-empty".to_string());
     }
     // Target backend must be defined under `cloud.backends:`.
-    let names = state.cloud_config.backend_names();
+    let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.target_backend) {
         return Err(format!(
             "target backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",

@@ -2,7 +2,7 @@
 
 This document is the external technical reference for Thur VTL: it
 pins down the SCSI device model, the iSCSI/SCSI surface, the on-disk
-layout, and the cloud object layout. Think of it as the wire-level and
+layout, and the backend object layout. Think of it as the wire-level and
 file-format contract — the bytes a host or a tool will actually see —
 whereas CLAUDE.md covers the internal architecture. If what you need
 is the behavioral picture instead — the device model, the deliberate
@@ -208,7 +208,7 @@ refuses to start with a `LibraryConfig` error and writes nothing.
 | 0x4C | LOG SELECT | |
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | cdb[4] bit 0 (data-transport) gates SCSI UNLOAD / MOVE MEDIUM-from-drive (refused with ILLEGAL REQUEST + ASC/ASCQ 0x53/0x02); bit 1 (mechanical) tracked but no enforcement target. State is per-I_T_L nexus (per TSIH+LUN), volatile, cleared on session close. |
 | 0x1C | RECEIVE DIAGNOSTIC RESULTS | Pages 0x00 (Supported, lists [0x00, 0x10]) and 0x10 (Self-Test Results, SPC-4 §7.2.21 layout) |
-| 0x1D | SEND DIAGNOSTIC | SELFTEST=1 routes by LUN: LU0 = library + inventory + cloud-backend health (full `validate_cloud_backend` probe); LU1+ = loaded-cartridge `manifest.json`. |
+| 0x1D | SEND DIAGNOSTIC | SELFTEST=1 routes by LUN: LU0 = library + inventory + storage-backend health (full `validate_cloud_backend` probe); LU1+ = loaded-cartridge `manifest.json`. |
 
 ### Dispatch-level behavior
 
@@ -311,7 +311,7 @@ suffix.
 ### thurvsa block (SBC-3) — `iqn.2025-10.com.metebalci:thurvsa`, port 3260
 
 This is the sibling product: a direct-access block target that draws
-on the same cloud chunk pool. Internally, volumes are page-grained
+on the same backend chunk pool. Internally, volumes are page-grained
 with a default 64 KiB page, but to the host they advertise plain 4 KiB
 sectors over SBC-3 — the paging is invisible at the SCSI surface. The
 iSCSI target IQN is configurable via `iscsi.target_iqn`, and when the
@@ -340,7 +340,7 @@ the per-product identity and are validated at startup.
 | 0x5A | MODE SENSE(10) | Same coverage as 0x1A. |
 | 0x5E | PERSISTENT RESERVE IN | Service actions 0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES, 0x03 READ FULL STATUS. PR_GENERATION counter; in-memory state. REPORT CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01` (WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR, EX_AC_AR), TMV=1, PTPL_C=0. READ FULL STATUS renders an iSCSI format-0 TransportID per registrant (initiator IQN, NUL-padded). See *Persistent reservations (thurvsa)* below for state model. |
 | 0x5F | PERSISTENT RESERVE OUT | Service actions 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT (collapses to PREEMPT — no taskman hook), 0x06 REGISTER AND IGNORE EXISTING KEY. SA 0x07 REGISTER AND MOVE rejected. APTPL=1 / SPEC_I_PT=1 / ALL_TG_PT=1 in the parameter list reject as INVALID FIELD IN PARAMETER LIST. SCOPE must be 0x00 (LU_SCOPE) for SAs other than REGISTER variants. |
-| 0x83 sa 0x00 | EXTENDED COPY (LID1) | SPC-3 §6.3 EXTENDED COPY service action 0x00 — the VMware VAAI "Hardware Accelerated Copy" primitive. Parameter list = 16-byte header (target descriptor list length, segment descriptor list length, inline data length must be 0) + N × 32-byte identification target descriptors (type 0xE4, designator type 0x03 NAA only — 8 bytes binary; T10 designators rejected because they don't fit the descriptor's 20-byte designator slot) + M × 28-byte block-to-block segment descriptors (type 0x02; src CSCD index, dst CSCD index, 16-bit block count, 64-bit src LBA, 64-bit dst LBA). Other service actions (LID4 = 0x01, ODX POPULATE TOKEN = 0x10, ODX WRITE USING TOKEN = 0x11) reject as INVALID FIELD IN CDB. Other target descriptor types and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment routing: when src and dst resolve to the same volume, LBAs and block count are all whole multiples of the volume's page size, and src/dst byte ranges don't overlap → page-index hash clone fast path (`PageCache::clone_page_range`) — zero chunk-pool I/O, no cloud round-trip. Otherwise → 1 MiB-bounded streaming bytes copy. Destination LUN reservation-gated; WORM destination volumes refuse with WRITE PROTECTED. Synchronous: the whole copy completes before GOOD returns. RECEIVE COPY RESULTS SA 0x00 reports "completed without errors" for any list ID. |
+| 0x83 sa 0x00 | EXTENDED COPY (LID1) | SPC-3 §6.3 EXTENDED COPY service action 0x00 — the VMware VAAI "Hardware Accelerated Copy" primitive. Parameter list = 16-byte header (target descriptor list length, segment descriptor list length, inline data length must be 0) + N × 32-byte identification target descriptors (type 0xE4, designator type 0x03 NAA only — 8 bytes binary; T10 designators rejected because they don't fit the descriptor's 20-byte designator slot) + M × 28-byte block-to-block segment descriptors (type 0x02; src CSCD index, dst CSCD index, 16-bit block count, 64-bit src LBA, 64-bit dst LBA). Other service actions (LID4 = 0x01, ODX POPULATE TOKEN = 0x10, ODX WRITE USING TOKEN = 0x11) reject as INVALID FIELD IN CDB. Other target descriptor types and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment routing: when src and dst resolve to the same volume, LBAs and block count are all whole multiples of the volume's page size, and src/dst byte ranges don't overlap → page-index hash clone fast path (`PageCache::clone_page_range`) — zero chunk-pool I/O, no backend round-trip. Otherwise → 1 MiB-bounded streaming bytes copy. Destination LUN reservation-gated; WORM destination volumes refuse with WRITE PROTECTED. Synchronous: the whole copy completes before GOOD returns. RECEIVE COPY RESULTS SA 0x00 reports "completed without errors" for any list ID. |
 | 0x84 sa 0x00 | RECEIVE COPY RESULTS — COPY STATUS | SPC-3 §6.18.2. 16-byte response. COPY MANAGER STATUS = 0x02 (operation completed without errors). Per-segment accounting (SEGMENTS PROCESSED, TRANSFER COUNT) reports 0; XCOPY runs synchronously so the list ID isn't tracked. |
 | 0x84 sa 0x03 | RECEIVE COPY RESULTS — OPERATING PARAMETERS | SPC-3 §6.18.4. Reports our per-XCOPY limits: SNLID=1, MAXIMUM TARGET DESCRIPTOR COUNT = 2, MAXIMUM SEGMENT DESCRIPTOR COUNT = 1, MAXIMUM DESCRIPTOR LIST LENGTH = 128, MAXIMUM SEGMENT LENGTH = 16 MiB, DATA SEGMENT GRANULARITY = log2(page_size) (16 for the default 64 KiB page). IMPLEMENTED DESCRIPTOR LIST advertises target type 0xE4 and segment type 0x02. Other service actions (0x01 RECEIVE DATA, 0x04 RECEIVE FAILED SEGMENT DETAILS, 0x05 RECEIVE COPY OPERATIONS COUNT) reject as INVALID FIELD IN CDB. |
 | 0x88 | READ (16) | 64-bit LBA / 32-bit transfer length. Same sector-grain + reservation rules as READ (10). |
@@ -554,7 +554,7 @@ polls just 00, 0D, and 2E on the changer.
 
 `SEND DIAGNOSTIC` (0x1D) does real work only when the host sets
 `SELFTEST=1` in CDB byte 1. The probe itself runs in the iSCSI request
-loop, *before* SCSI dispatch — this is what lets the cloud-backend
+loop, *before* SCSI dispatch — this is what lets the storage-backend
 health check be an async operation rather than blocking the synchronous
 handler. The handler then translates the freshest stored result into a
 terminal SCSI status:
@@ -573,8 +573,8 @@ What the probe actually checks depends on the LUN:
   `<data_dir>/library/inventory.json`, confirm every barcode in
   inventory has a readable `<data_dir>/tapes/<barcode>/manifest.json`,
   then run `validate_cloud_backend` against every named
-  `cloud.backends:` entry (auth + write + delete probe — the same
-  routine `thurvtl system cloud check` runs).
+  `storage.backends:` entry (auth + write + delete probe — the same
+  routine `thurvtl system storage check` runs).
 - **LU1+ (drive)**: if a cartridge is loaded, re-read its
   `manifest.json` and confirm it parses; if no cartridge is loaded,
   GOOD trivially.
@@ -747,7 +747,7 @@ the hold-while-loaded refusal already means no fresh writes happen
 during a hold.
 
 A second, independent layer of immutability sits on top of legal hold:
-cloud-side retention, driven by the bound backend's `retention_mode`.
+storage-side retention, driven by the bound backend's `retention_mode`.
 Thur VTL never sets per-object retention itself; instead the
 bucket-level Object Lock or retention policy auto-applies retention to
 every PUT. At startup the daemon validates the configured
@@ -803,7 +803,7 @@ for chunks and manifests — are needed on every cloud. Management-plane
 permissions are needed only when the bidirectional retention check
 runs, and only for the `lock_state` query. An operator who cannot
 grant the management-plane permissions can opt out entirely with the
-top-level `cloud.skip_retention_mode_check: true` flag (default
+top-level `storage.skip_retention_mode_check: true` flag (default
 `false`). With it set, `lock_state` is never queried, Azure backends
 with `retention_mode != none` no longer require `subscription_id` or
 `resource_group`, and only data-plane permissions are needed. The cost
@@ -889,7 +889,7 @@ while object-level ops (`PutObject`/`GetObject`/`DeleteObject`) target
 │   └── BARCODE2/
 │       └── …
 ├── chunks/                     # Per-backend content-addressed pools
-│   ├── primary/                # Names match `cloud.backends:` entries
+│   ├── primary/                # Names match `storage.backends:` entries
 │   │   ├── 00/
 │   │   │   ├── cd/
 │   │   │   │   └── 00cdef…ab.dat   # `<aa>/<bb>/<full_blake3>.dat`, two 2-hex-char shards (65 536-way fanout)
@@ -910,8 +910,8 @@ path is `<data_dir>/chunks/<backend>/<aa>/<bb>/<full_blake3>.dat` for
 `--dedup global` cartridges, where the pool is shared, or
 `<data_dir>/chunks/<backend>/<barcode>/<aa>/<bb>/<full_blake3>.dat` for
 `--dedup local` cartridges, which get a per-cartridge namespace. The
-leading `<backend>` segment names the cloud backend the cartridge is
-bound to — a configured `cloud.backends:` entry. The `<aa>` and `<bb>`
+leading `<backend>` segment names the storage backend the cartridge is
+bound to — a configured `storage.backends:` entry. The `<aa>` and `<bb>`
 segments are the first two and next two hex characters of the chunk's
 BLAKE3 hash; this gives a 65 536-way fanout, which keeps any single
 leaf directory from growing unbounded. While a chunk is still being
@@ -1021,7 +1021,7 @@ now the sole live writer and a cross-process lock is no longer needed.
   "chunking": { "mode": "fast_cdc", "min": 1048576, "avg": 8388608, "max": 33554432 },
   "capacity_gb": 12000,
   "lto_generation": 8,             // drive-compat generation; currently 8 only
-  "backend": "primary",            // sticky cloud-backend name; required
+  "backend": "primary",            // sticky storage-backend name; required
   "worm": false,                   // sticky WORM flag; default false
   "dedup": "global",               // sticky dedup scope; "global" or "local"
   "encryption": {                  // optional; absent on plaintext cartridges
@@ -1120,7 +1120,7 @@ with the same key can never share an IV — real LTO drives do the
 analogous thing, mixing a per-tape nonce into their position-based IV.
 
 `backend` is sticky — set at create time and never modified. Its
-value names a configured `cloud.backends:` entry, and the daemon
+value names a configured `storage.backends:` entry, and the daemon
 refuses to start if any cartridge references a backend that is not
 configured. A manifest with an empty or missing `backend` cannot be
 opened at all: `Cartridge::open` errors. Every cloud operation —
@@ -1204,7 +1204,7 @@ transitioning its `location`, is a single O(1) `pwrite`.
 
 The last-accessed timestamps that drive disk-cache LRU eviction are
 kept out of this file, in a separate `lru.idx` sidecar (see below).
-They are a local cache hint, not part of the cloud-replicated index.
+They are a local cache hint, not part of the storage-replicated index.
 
 There is one `chunks.idx` per cartridge, not one per partition.
 `chunk_id`s span partitions, so unlike `blocks-pN.idx` the file cannot
@@ -1244,7 +1244,7 @@ each:
 |------|--------|
 | `chunk_id` | Derivable from offset (positional, like LBA in `blocks-pN.idx`). |
 | `compressed_size` | Was a write-only field in the legacy JSON manifest — set by the upload worker but never read. Compression metrics are emitted directly from the backend at upload time. |
-| `last_accessed` | Lives in the local-only `lru.idx` sidecar (see below) so the read path's `touch` doesn't dirty cloud-replicated metadata pages. |
+| `last_accessed` | Lives in the local-only `lru.idx` sidecar (see below) so the read path's `touch` doesn't dirty storage-replicated metadata pages. |
 
 The 64-byte record breaks down as 4 bytes of size, 32 of hash, 1 of
 flags, and 27 reserved — so only about 37 bytes are load-bearing
@@ -1473,7 +1473,7 @@ code:
 
 ---
 
-## Cloud Object Layout
+## Object Layout
 
 Everything Thur VTL writes to the cloud lives under a single
 `<prefix>/` in an S3 or GCS bucket, or an Azure Blob Storage
@@ -1501,9 +1501,9 @@ container. The keyspace is laid out like this:
 
 - **Chunk key.** A `--dedup global` cartridge writes chunks to
   `<prefix>/chunks/<aa>/<bb>/<full_blake3>.dat`. Each backend has its
-  own bucket (and optional `prefix`), so the cloud key is
+  own bucket (and optional `prefix`), so the object key is
   backend-flat: the on-disk per-backend sharding under
-  `<data_dir>/chunks/<backend>/...` does not bleed into the cloud key
+  `<data_dir>/chunks/<backend>/...` does not bleed into the object key
   shape. A `--dedup local` cartridge instead writes under a
   per-cartridge namespace,
   `<prefix>/chunks/<barcode>/<aa>/<bb>/<full_blake3>.dat`. The dedup
@@ -1547,7 +1547,7 @@ container. The keyspace is laid out like this:
   — the same ordering rule as legal-hold — so that a torn upload
   leaves the sentinel still pointing at the previous, page-consistent
   epoch.
-- **Compression.** When `cloud.compression.algorithm != none`, chunk
+- **Compression.** When `storage.compression.algorithm != none`, chunk
   bytes are compressed on the way up (zstd level 3 by default, with
   lz4 also available) and the algorithm chosen is recorded in the
   per-cartridge manifest. Compression runs **post-dedup** — only after
@@ -1557,7 +1557,7 @@ container. The keyspace is laid out like this:
   metadata.
 
 The `local` backend uses this same key shape, just rooted at
-`cloud.local.root_dir` on the filesystem instead of in a bucket.
+`storage.local.root_dir` on the filesystem instead of in a bucket.
 
 Azure Blob Storage works the same way: blob names are the identical
 key strings, `<prefix>/` and all, with the container playing the role
@@ -1572,7 +1572,7 @@ blocks versus the default credential chain — are in
 This verb brings a fresh host up from a cold mirror bucket. It can
 only replicate what the bucket actually holds, which is the cartridge
 state — manifests, index pages, and chunks. The chassis topology in
-`library.json` is **not** cloud-replicated, so the operator has to
+`library.json` is **not** storage-replicated, so the operator has to
 declare it themselves in the new host's `thurvtl.yaml` `library:`
 block (and start the daemon once to materialize it). Restored
 cartridges are seated into storage slots sequentially in barcode-sort
@@ -1587,7 +1587,7 @@ thurvtl library restore --backend NAME
                             [--allow-existing]
 ```
 
-- `--backend NAME` — required when `cloud.backends:` declares more
+- `--backend NAME` — required when `storage.backends:` declares more
   than one backend; inferred when exactly one is configured.
 - `--barcodes` — optional comma-separated allowlist; default is every
   barcode whose `manifest-latest.json` sentinel is reachable under
@@ -1637,7 +1637,7 @@ On a fresh host, a cold-bucket recovery is three steps:
 
 ```
 # 1. Declare chassis topology in thurvtl.yaml (operator's call,
-#    not cloud-replicated):
+#    not storage-replicated):
 #    library:
 #      num_slots: N
 #      num_drives: M
@@ -1687,7 +1687,7 @@ replication", see `ROADMAP.md`).
 
 ## Cartridge migration — `thurvtl cartridge migrate`
 
-Migration moves a single cartridge from one cloud backend to another.
+Migration moves a single cartridge from one storage backend to another.
 The cartridge keeps its barcode and its logical identity — the only
 field that actually changes is `manifest.backend`. It runs as a
 daemon-routed admin job (kind `cartridge.migrate`), backed by
@@ -1715,8 +1715,8 @@ thurvtl cartridge migrate <BARCODE> --target-backend <NAME>
 ### Move mode — phases
 
 1. **Discover chunks.** Walk `chunks.idx`; every record that has a
-   hash contributes one `(hash, cloud_key)` pair. The cloud key shape
-   is the backend-independent one from § Cloud Object Layout.
+   hash contributes one `(hash, object_key)` pair. The object key shape
+   is the backend-independent one from § Object Layout.
 2. **Copy chunks.** Issue a HEAD on the target first — this is what
    makes a retry idempotent — and if the chunk is missing,
    `source.download_chunk(key)`, then BLAKE3-verify, then
@@ -1754,7 +1754,7 @@ thurvtl cartridge migrate <BARCODE> --target-backend <NAME>
 - Daemon must be running (admin socket is the only entry point).
 - Cartridge must not be loaded in any drive
   (`find_drive_for_loaded_cartridge` on `inventory.json`).
-- Target backend must exist in `cloud.backends:`.
+- Target backend must exist in `storage.backends:`.
 - Source ≠ target.
 - WORM cartridges require the target's `retention_mode` to be
   `governance` or `compliance`.
@@ -1796,7 +1796,7 @@ makes a crash recoverable from either side of it:
 
 ## Cartridge archive — `thurvtl cartridge archive`
 
-Archiving snapshots a cartridge onto a different cloud backend as a
+Archiving snapshots a cartridge onto a different storage backend as a
 frozen, self-contained blob. The contrast with migrate is that archive
 leaves the source cartridge entirely untouched — its manifest,
 indexes, local pool, and bound backend all stay intact — so the same
@@ -1833,12 +1833,12 @@ backend, and `archived_at`, an ISO-8601 UTC timestamp.
 
 1. **Validate.** The label must be 1-64 characters, alphanumeric with
    `-` and `_` allowed; the target backend must be named in
-   `cloud.backends:`; source and target must differ; and
+   `storage.backends:`; source and target must differ; and
    `archives/<barcode>/<label>/manifest.json` must not already exist
    on the target.
 2. **Walk `chunks.idx`** to collect every sealed chunk's hash.
 3. **Copy chunks.** For each hash, prefer the local pool and fall back
-   to the source backend's cloud key
+   to the source backend's object key
    (`chunks/[ns/]<aa>/<bb>/<hash>.dat`). BLAKE3-verify the bytes, then
    `target.upload_chunk` them under the archive prefix.
 4. **Snapshot index files.** Read `chunks.idx` and every
@@ -1853,7 +1853,7 @@ backend, and `archived_at`, an ISO-8601 UTC timestamp.
 
 - Daemon running.
 - Cartridge not loaded in any drive.
-- Target backend named in `cloud.backends:`.
+- Target backend named in `storage.backends:`.
 - Source ≠ target.
 - Label is non-empty + matches the allowed character set.
 - Archive at the same `(barcode, label)` doesn't already exist.
@@ -1906,7 +1906,7 @@ thurvtl library restore-archive
 
 ### Phases
 
-1. **Validate.** The backend must be named in `cloud.backends:`, and
+1. **Validate.** The backend must be named in `storage.backends:`, and
    the archive sentinel must exist on it — confirmed with a HEAD of
    `manifest.json` under the archive prefix.
 2. **Plan destination.** The local cartridge directory is
@@ -1941,7 +1941,7 @@ thurvtl library restore-archive
 ### Refuse-gates
 
 - Daemon running.
-- Backend named in `cloud.backends:`.
+- Backend named in `storage.backends:`.
 - Archive sentinel exists on the backend at the named
   `(barcode, label)`.
 - Local cart dir doesn't already exist (unless `--allow-existing`).
@@ -1979,7 +1979,7 @@ and you can print the same content with:
 thurvtl config defaults > dist/thurvtl.defaults.yaml
 ```
 
-Required: `data_dir`, plus `cloud.backends:` with at least one named
+Required: `data_dir`, plus `storage.backends:` with at least one named
 entry.
 
 ```yaml
@@ -2078,11 +2078,11 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | chunk | `chunk_logical` | Counter<u64> | By | `backend`, `scope` |
 | chunk | `chunk_unique` | Counter<u64> | By | `backend`, `scope` |
 | chunk | `chunk_uploaded` | Counter<u64> | By | `backend` |
-| chunk | `chunk_cloud_head_probes_total` | Counter<u64> | — | `backend` |
-| chunk | `chunk_cloud_head_hits_total` | Counter<u64> | — | `backend` |
-| chunk | `chunk_cloud_cache_hits_total` | Counter<u64> | — | `backend` |
-| chunk | `chunk_cloud_cache_inflight_coalesced_total` | Counter<u64> | — | `backend` |
-| chunk | `chunk_cloud_cache_warmup_seeded_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_storage_head_probes_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_storage_head_hits_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_storage_cache_hits_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_storage_cache_inflight_coalesced_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_storage_cache_warmup_seeded_total` | Counter<u64> | — | `backend` |
 | iscsi | `iscsi_sessions_active` | Gauge<i64> | — | — |
 | iscsi | `iscsi_commands_total` | Counter<u64> | — | `opcode`, `outcome` |
 | iscsi | `iscsi_command` | Histogram<f64> | s | `opcode`, `outcome` |
@@ -2182,8 +2182,8 @@ rather than this open HTTP endpoint.
 
 | Event | When | Body |
 |---|---|---|
-| `cloud.orphan_scan_started` | Boot-time scan begins walking `<data_dir>/tapes/` for sealed-but-not-uploaded chunks. One entry per daemon start. | `cartridges_scanned: u64`. |
-| `cloud.orphan_scan_completed` | Same scan ends. `orphans_requeued < orphans_found` indicates one or more upload-worker dispatches failed (channel closed). | `orphans_found: u64`, `orphans_requeued: u64`, `duration_seconds: f64`. |
+| `storage.orphan_scan_started` | Boot-time scan begins walking `<data_dir>/tapes/` for sealed-but-not-uploaded chunks. One entry per daemon start. | `cartridges_scanned: u64`. |
+| `storage.orphan_scan_completed` | Same scan ends. `orphans_requeued < orphans_found` indicates one or more upload-worker dispatches failed (channel closed). | `orphans_found: u64`, `orphans_requeued: u64`, `duration_seconds: f64`. |
 
 ---
 

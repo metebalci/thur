@@ -22,21 +22,21 @@ This is the single explanation of how deduplication works. Other docs
 Every sealed chunk is addressed by the **BLAKE3 hash of its on-disk
 bytes**. The chunk store (`shared_pool::ChunkPool`) is content-addressed,
 which means identical bytes from any source always land at the same
-filesystem path and the same cloud key. Duplicate data is therefore
+filesystem path and the same object key. Duplicate data is therefore
 stored exactly once, wherever it first appears. The unit of deduplication
 is the **whole sealed chunk** — nothing smaller than a chunk participates
 in dedup on its own.
 
 There is **no central index or database**. The hash is the address at
-both the local and cloud layers; checking whether a chunk already exists
+both the local and backend layers; checking whether a chunk already exists
 is a filesystem `stat` call locally and a `HEAD` request against the
-cloud bucket. The pool path includes a two-level `<aa>/<bb>` shard
+storage backend. The pool path includes a two-level `<aa>/<bb>` shard
 prefix — the first two and next two hex characters of the hash — which
 creates a 65,536-way fanout. That fanout keeps individual leaf directories
 small enough that `readdir` remains fast during garbage collection and
 manual inspection, even on a heavily loaded pool.
 
-### Two stages — local pool, then cloud bucket
+### Two stages — local pool, then storage backend
 
 Deduplication fires at two independent stages, one synchronous at chunk
 seal time and one asynchronous in the upload worker.
@@ -56,9 +56,9 @@ The filesystem itself serves as the lookup table. Two writers racing on
 stage 1 is benign — both produced byte-identical chunks, so whichever
 `rename` wins, the final file is correct.
 
-**Stage 2 — cloud bucket (asynchronous, in the upload worker).** When a
+**Stage 2 — storage backend (asynchronous, in the upload worker).** When a
 sealed chunk reaches the upload worker, the daemon issues a `HEAD` on the
-cloud key before attempting a `PUT`:
+object key before attempting a `PUT`:
 
 - **HEAD 200** → some other cartridge or volume on this backend already
   uploaded this chunk. The `PUT` is skipped, and the chunk is recorded
@@ -70,9 +70,9 @@ that key responds to `HEAD`. No separate metadata service is involved.
 
 **The two stages are independent.** A chunk can be a stage-1 local hit
 and still require a `PUT` if no peer has uploaded it to the bucket yet.
-Conversely, the local copy may have been evicted while the cloud copy
+Conversely, the local copy may have been evicted while the backend copy
 survives; a new producer of identical bytes will then find the chunk via
-the stage-2 HEAD probe. Under the `local` dedup scope, the cloud key
+the stage-2 HEAD probe. Under the `local` dedup scope, the object key
 includes a per-unit namespace, so a stage-2 HEAD is guaranteed to miss
 against another unit's chunks — the upload worker therefore skips the
 probe entirely for locally-scoped chunks.
@@ -85,7 +85,7 @@ configured. The **scope** is a sticky, per-unit choice
 (`shared_cloud::DedupScope`, set at create time, recorded in the manifest,
 and never changed thereafter):
 
-| Scope | Pool path | Cloud key | Cross-unit sharing |
+| Scope | Pool path | Object key | Cross-unit sharing |
 | --- | --- | --- | --- |
 | `global` | `chunks/<backend>/<aa>/<bb>/<hash>.dat` | `chunks/<aa>/<bb>/<hash>.dat` | Yes — with other `global` units on the same backend |
 | `local` | `chunks/<backend>/<namespace>/<aa>/<bb>/<hash>.dat` | `chunks/<namespace>/<aa>/<bb>/<hash>.dat` | None — chunks isolated per unit |
@@ -108,9 +108,9 @@ to opposite choices** — see the per-product sections below.
 
 ### Refcount-aware eviction
 
-The local pool is a warm cache; the cloud copy is the source of truth.
+The local pool is a warm cache; the backend copy is the source of truth.
 When a per-backend disk-cache budget is exceeded, the eviction worker
-removes least-recently-used chunks — but only chunks whose cloud copy is
+removes least-recently-used chunks — but only chunks whose backend copy is
 already durable, and only chunks that no other unit still pins locally.
 
 Eviction is **refcount-aware and per-namespace**. Before unlinking a
@@ -131,12 +131,12 @@ the backpressure gate — is described in [`BACKPRESSURE.md`](BACKPRESSURE.md).
 ### Garbage collection
 
 Eviction reclaims disk space for chunks that are still live but whose
-cloud copy makes them safe to drop locally. **Garbage collection** does
+backend copy makes them safe to drop locally. **Garbage collection** does
 something different: it reclaims chunks that are no longer referenced by
 anything — orphaned when a page is rewritten to new content, or when a
 unit is deleted. GC walks every manifest and page index to build the
 live set of `(backend, namespace) → {hash}`, then sweeps both pool
-layouts (and, on request, the cloud buckets), removing anything not in
+layouts (and, on request, the storage backends), removing anything not in
 that live set. The command surface differs per product — see below.
 
 ---
@@ -214,7 +214,7 @@ Lifting the sub-block limitation would require `BlockIndex` to become a
 `Vec<Segment>` so that a logical block can span multiple chunks. This has
 been evaluated and **declined** — see `ROADMAP.md` "Considered, declined"
 for the full rationale (encrypted chunks dedup near-zero anyway, zstd
-captures most savings, cold-cloud read seams double, AME ordering becomes
+captures most savings, cold-backend read seams double, AME ordering becomes
 trickier, manifest grows O(segments), and the correctness surface
 expands). Revisit only for a workload that is plaintext, highly redundant
 under sub-block shifts, and not already covered by compression.
@@ -224,7 +224,7 @@ under sub-block shifts, and not already covered by compression.
 8 MiB average is a reasonable starting point — small enough for
 cross-backup dedup to fire reliably, large enough to keep S3 PUT counts
 manageable on a 12 TB tape (roughly 1.5 million chunks in the worst case).
-Smaller average = more dedup opportunities but more cloud objects. Larger
+Smaller average = more dedup opportunities but more backend objects. Larger
 average = fewer objects but less dedup sensitivity to boundary shifts.
 
 ## Interactions
@@ -237,7 +237,7 @@ dedup ratios because compressed bytes are highly sensitive to surrounding
 context — a tiny shift in the source produces wildly different compressed
 bytes, preventing the content addresses from matching. The recommended
 setting is to leave drive compression off (it is off by default; real LTO
-drives also ship with DCE off) and let the post-dedup cloud-compression
+drives also ship with DCE off) and let the post-dedup backend-compression
 layer do the work instead.
 
 ### Encryption (AME) × dedup
@@ -274,16 +274,16 @@ consider **bucket-level SSE** (S3 SSE-KMS, GCS CMEK, Azure CMK): the
 provider encrypts opaquely, the daemon's dedup hashes are computed over
 plaintext and survive across cartridges, and the key management chain
 lives in the provider's KMS. The appliance-side layer is for shops where
-the bucket-key model is not sufficient — zero-trust against the cloud
+the bucket-key model is not sufficient — zero-trust against the storage backend
 provider, or HSM-backed KMIP custody chains.
 
-### Cloud-side compression × dedup
+### Backend-side compression × dedup
 
-Cloud-tier compression (`cloud.compression.algorithm`,
-`cloud.compression.level`) runs **post-dedup**: by the time the upload
+Backend-tier compression (`storage.compression.algorithm`,
+`storage.compression.level`) runs **post-dedup**: by the time the upload
 worker pulls bytes from a chunk and compresses them for the bucket, the
 chunk has already sealed and its hash already exists. Dedup decisions are
-therefore made on the on-disk plaintext bytes, and cloud-side compression
+therefore made on the on-disk plaintext bytes, and storage-side compression
 does not interfere with them. The compression format used is stored in
 object metadata (S3 object metadata, GCS custom metadata, Azure blob
 metadata) so the download path knows how to decompress. The default is
@@ -300,14 +300,14 @@ each configured backend it sweeps both layouts: the shared pool against
 the backend's `(_, None)` live set, and every `local` namespace against
 that namespace's `(_, Some(barcode))` live set. Orphan namespace
 directories left by deleted cartridges have an empty live set, so every
-chunk in them is reclaimed and the empty directory removed. `--cloud` does
-the same for each cloud bucket. `--dry-run` previews what would be
+chunk in them is reclaimed and the empty directory removed. `--storage` does
+the same for each storage backend. `--dry-run` previews what would be
 removed without deleting anything.
 
 ## Analytics
 
 Both the dedup mechanism and its analytics are always on. The dedup
-ratio, per-cartridge contribution, and pool-vs-cloud upload-skip rates
+ratio, per-cartridge contribution, and pool-vs-backend upload-skip rates
 surface as Prometheus metrics and through `thurvtl system stats`.
 
 ---
@@ -388,7 +388,7 @@ meaningful dedup, the right approach is bucket-level SSE.
 VSA's refcount-aware eviction and the per-volume `lru.idx` and
 `upload.idx` sidecars that drive it are covered in
 [`BACKPRESSURE.md`](BACKPRESSURE.md) § VSA. The dedup-relevant point is
-that a chunk is evictable only once its cloud copy is durable and no
+that a chunk is evictable only once its backend copy is durable and no
 volume still pins it locally — the same union rule as VTL, with each
 volume's `pages.idx` standing in for the cartridge manifest.
 
@@ -399,7 +399,7 @@ leaves pool chunks behind. `thurvsa system gc` reclaims them: it walks
 every volume's `pages.idx` into a live `(backend, namespace) → {hash}` set
 and removes pool chunks not in that set, including every chunk under a
 destroyed volume's now-orphan namespace directory. `--dry-run` reports
-what would be deleted without touching anything; `--cloud` extends the
-sweep to the cloud bucket's `chunks/` objects. The verb mirrors VTL's
+what would be deleted without touching anything; `--storage` extends the
+sweep to the storage backend's `chunks/` objects. The verb mirrors VTL's
 `thurvtl system gc` — daemon-routed, runs alongside live traffic,
 audited as `gc.run`.

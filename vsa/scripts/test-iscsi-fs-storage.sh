@@ -27,7 +27,7 @@
 # Stress / scale: bump the fixture via THURVSA_FIXTURE_MB (env, MiB,
 # default 8). Cloud round-trips dominate runtime — bigger fixture =
 # longer test = real egress $$$.
-#   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 ./vsa/scripts/test-iscsi-fs-cloud.sh
+#   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 ./vsa/scripts/test-iscsi-fs-storage.sh
 #
 # Prerequisites:
 #   - sg3-utils, open-iscsi, lsscsi, e2fsprogs, util-linux, tar
@@ -40,7 +40,7 @@
 #   - Root/sudo access (iSCSI + /dev/sdX).
 #
 # Usage (invoke from repo root):
-#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-iscsi-fs-cloud.sh [OPTIONS]
+#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-iscsi-fs-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
 # cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
@@ -109,7 +109,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-# Cloud backend definitions live in `<data_dir>/cloud-backends.json`
+# Storage backend definitions live in `<data_dir>/storage-backends.json`
 # (daemon-owned). The script extracts the chosen entry from
 # $SOURCE_BACKENDS and embeds it under `testbackend` inside the
 # generated test config. Default points at the maintainer-private
@@ -122,7 +122,7 @@ CLI_PATH=""
 # reads /etc/thurvsa/thurvsa.yaml. So everything below the
 # cloud-backends.yaml read happens entirely under /tmp.
 SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
-TEST_DIR="/tmp/thurvsa-test-iscsi-fs-cloud-$$"
+TEST_DIR="/tmp/thurvsa-test-iscsi-fs-storage-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 ISCSI_PORT=""
 HTTP_PORT=""
@@ -175,7 +175,7 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
 # ---------------------------------------------------------------------------
-# Cloud helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
+# Storage helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
 # cloud_wait_for_key / verify_cloud_creds / cloud_purge_test_prefix /
 # cloud_cli_for_type). Lifted in 2026-05-13.
 # ---------------------------------------------------------------------------
@@ -238,36 +238,36 @@ resolve_backend() {
     fi
 
     local exists
-    exists=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
+    exists=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
     if [[ "$exists" == "__missing__" || "$exists" == "null" ]]; then
         log_error "Backend '$THURVSA_TEST_BACKEND' not found in $SOURCE_BACKENDS"
         echo "Available backends:"
-        yq -r '.cloud.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
+        yq -r '.storage.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
         exit 1
     fi
 
-    BACKEND_TYPE=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-    BACKEND_BUCKET=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ENDPOINT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_REGION=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ACCOUNT=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_CONTAINER=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
-    ORIG_PREFIX=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+    BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_REGION=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+    ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
     # If the backend has `auth: { type: env, ... }` carrying explicit
     # env-var names, capture them so the cred probe and cleanup target
     # the same credentials the daemon will use. See VTL twin script
     # for the full rationale (mixing real-AWS with MinIO/AIStor in one
     # daemon needs explicit per-backend auth on the non-AWS one).
     BACKEND_AUTH_AKID_ENV=$(yq -r "
-        .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
+        .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
         | select(.type == \"env\") | .access_key_id_env // \"\"
     " "$SOURCE_BACKENDS")
     BACKEND_AUTH_SECRET_ENV=$(yq -r "
-        .cloud.backends.\"$THURVSA_TEST_BACKEND\".auth
+        .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
         | select(.type == \"env\") | .secret_access_key_env // \"\"
     " "$SOURCE_BACKENDS")
     local retention
-    retention=$(yq -r ".cloud.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+    retention=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
 
     if [[ "$BACKEND_TYPE" == "local" ]]; then
         log_error "Backend '$THURVSA_TEST_BACKEND' has type 'local' — use test-iscsi-fs-workflow.sh for local-backend coverage."
@@ -369,7 +369,7 @@ create_test_config() {
 
     local backend_json
     backend_json=$(yq -c \
-        ".cloud.backends.\"$THURVSA_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
+        ".storage.backends.\"$THURVSA_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
         "$SOURCE_BACKENDS")
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
@@ -379,7 +379,7 @@ iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
 audit:
   enabled: true
-cloud:
+storage:
   backends:
     testbackend: $backend_json
 EOFCONFIG

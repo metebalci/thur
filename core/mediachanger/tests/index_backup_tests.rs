@@ -21,7 +21,7 @@ async fn cold_bucket_dr_via_index_pages() {
     let tapes = work.path().join("tapes");
     let backend_dir = work.path().join("backend");
     fs::create_dir_all(&tapes).unwrap();
-    let backend: Box<dyn core_mediachanger::CloudBackend> =
+    let backend: Box<dyn core_mediachanger::ObjectStoreBackend> =
         Box::new(LocalBackend::new(&backend_dir).await.unwrap());
 
     let label = "DR0001";

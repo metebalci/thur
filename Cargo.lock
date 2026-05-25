@@ -1161,8 +1161,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "shared-cloud",
  "shared-crypto",
+ "shared-object-store",
  "shared-pool",
  "shared-telemetry",
  "shared-upload-worker",
@@ -1210,8 +1210,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shared-audit",
- "shared-cloud",
  "shared-iscsi",
+ "shared-object-store",
  "shared-pool",
  "shared-telemetry",
  "shared-verify-core",
@@ -1236,8 +1236,8 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "shared-cloud",
  "shared-crypto",
+ "shared-object-store",
  "shared-pool",
  "shared-telemetry",
  "shared-upload-worker",
@@ -3000,8 +3000,8 @@ dependencies = [
  "async-trait",
  "core-block",
  "nvme-base",
- "shared-cloud",
  "shared-naming",
+ "shared-object-store",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4126,9 +4126,9 @@ dependencies = [
  "scsi-spc",
  "serde",
  "serde_json",
- "shared-cloud",
  "shared-iscsi",
  "shared-naming",
+ "shared-object-store",
  "shared-telemetry",
  "tempfile",
  "tokio",
@@ -4613,59 +4613,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shared-cloud"
-version = "0.1.0-dev.4"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "azure_core",
- "azure_identity",
- "azure_storage_blob",
- "bytes",
- "chrono",
- "clap",
- "futures",
- "google-cloud-auth",
- "google-cloud-gax",
- "google-cloud-storage",
- "google-cloud-wkt",
- "lz4_flex",
- "openssl",
- "rand 0.9.4",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "shared-cloud-bench",
- "shared-pool",
- "shared-telemetry",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wiremock",
- "zstd",
-]
-
-[[package]]
-name = "shared-cloud-bench"
-version = "0.1.0-dev.4"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "serde",
- "serde_yaml",
- "shared-cloud",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "shared-crypto"
 version = "0.1.0-dev.4"
 dependencies = [
@@ -4753,6 +4700,59 @@ name = "shared-naming"
 version = "0.1.0-dev.4"
 
 [[package]]
+name = "shared-object-store"
+version = "0.1.0-dev.4"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "azure_core",
+ "azure_identity",
+ "azure_storage_blob",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures",
+ "google-cloud-auth",
+ "google-cloud-gax",
+ "google-cloud-storage",
+ "google-cloud-wkt",
+ "lz4_flex",
+ "openssl",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shared-object-store-bench",
+ "shared-pool",
+ "shared-telemetry",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+ "zstd",
+]
+
+[[package]]
+name = "shared-object-store-bench"
+version = "0.1.0-dev.4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde",
+ "serde_yaml",
+ "shared-object-store",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "shared-pool"
 version = "0.1.0-dev.4"
 dependencies = [
@@ -4792,7 +4792,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
- "shared-cloud",
+ "shared-object-store",
  "shared-telemetry",
  "tempfile",
  "thiserror 1.0.69",
@@ -4805,7 +4805,7 @@ name = "shared-verify-core"
 version = "0.1.0-dev.4"
 dependencies = [
  "futures",
- "shared-cloud",
+ "shared-object-store",
  "shared-pool",
 ]
 
@@ -5540,12 +5540,12 @@ dependencies = [
  "shared-cli-alerting",
  "shared-cli-iscsi",
  "shared-cli-system",
- "shared-cloud",
- "shared-cloud-bench",
  "shared-crypto",
  "shared-iscsi",
  "shared-keystore",
  "shared-naming",
+ "shared-object-store",
+ "shared-object-store-bench",
  "tokio",
 ]
 
@@ -5578,13 +5578,13 @@ dependencies = [
  "shared-admin-server",
  "shared-alerting",
  "shared-audit",
- "shared-cloud",
  "shared-crypto",
  "shared-dedup-stats",
  "shared-health",
  "shared-iscsi",
  "shared-keystore",
  "shared-naming",
+ "shared-object-store",
  "shared-pool",
  "shared-telemetry",
  "shared-upload-worker",
@@ -5626,11 +5626,11 @@ dependencies = [
  "shared-cli-alerting",
  "shared-cli-iscsi",
  "shared-cli-system",
- "shared-cloud",
- "shared-cloud-bench",
  "shared-iscsi",
  "shared-keystore",
  "shared-naming",
+ "shared-object-store",
+ "shared-object-store-bench",
  "tempfile",
  "tokio",
  "tracing",
@@ -5673,12 +5673,12 @@ dependencies = [
  "shared-admin-server",
  "shared-alerting",
  "shared-audit",
- "shared-cloud",
  "shared-dedup-stats",
  "shared-health",
  "shared-iscsi",
  "shared-keystore",
  "shared-naming",
+ "shared-object-store",
  "shared-telemetry",
  "shared-upload-worker",
  "tempfile",

@@ -5,13 +5,15 @@
 > SCSI / NVMe surface may change without notice or migration path.
 > Not recommended for production use.
 
-**Thur VTL** and **Thur VSA** are two sibling cloud-backed storage
+**Thur VTL** and **Thur VSA** are two sibling storage-backed
 products built on a shared Rust codebase. Each presents
 spec-conformant storage devices to the host, but the data lives in
-cloud object storage — local disk holds only a warm, refcount-evicted
-cache in front of it. The capacity a host can address is set by the
-cloud bucket, not the local disk: a modest cache machine can front a
-dataset many times its own size.
+a storage backend — S3-compatible object stores (AWS S3, GCS, Azure
+Blob, AIStore, MinIO, Ceph RGW, Wasabi, …) or a local filesystem.
+Local disk holds only a warm, refcount-evicted cache in front of it.
+The capacity a host can address is set by the storage backend, not the
+local disk: a modest cache machine can front a dataset many times its
+own size.
 
 Furthermore, stored data is deduplicated in a shared content-addressed
 chunk pool. Every chunk is keyed by its BLAKE3 hash, with no central
@@ -24,13 +26,14 @@ volume and cartridge on a backend — are stored exactly once.
   proprietary agent required.
 - **Thur VSA** — a Virtual Storage Appliance: a block-storage target
   that serves thin-provisioned SBC-3 LUNs over iSCSI or NVMe/TCP. It
-  behaves as a cloud-backed virtual disk for VMware, Hyper-V, and Linux
-  hosts.
+  behaves as a backend-backed virtual disk for VMware, Hyper-V, and
+  Linux hosts.
 
 Both products can live co-resident on a single host; they use disjoint
 system users, data directories, conffiles, systemd unit names, and admin
-sockets. Cloud storage (S3, GCS, or Azure) is, in all cases, the durable
-source of truth.
+sockets. The configured storage backend (S3, GCS, Azure, or another
+S3-compatible object store) is, in all cases, the durable source of
+truth.
 
 # Disclaimer
 
@@ -51,11 +54,12 @@ The following capabilities are shared across both products:
 
 - **Content-addressed dedup** — BLAKE3-hashed chunks stored once per
   backend pool; cross-volume / cross-cartridge.
-- **Cloud-backed storage** — S3-compatible (AWS S3, MinIO, Wasabi, …),
-  Google Cloud Storage, Azure Blob. Disk is a warm cache with a
-  per-backend budget and write backpressure when the budget is hit.
-- **Compression on cloud uploads** (zstd / lz4, post-dedup); parallel
-  cloud up/downloads.
+- **Object-store-backed storage** — S3-compatible (AWS S3, AIStore,
+  MinIO, Ceph RGW, Wasabi, …), Google Cloud Storage, Azure Blob, or
+  a local filesystem. Disk is a warm cache with a per-backend budget
+  and write backpressure when the budget is hit.
+- **Compression on backend uploads** (zstd / lz4, post-dedup); parallel
+  backend up/downloads.
 - **CHAP authentication** for iSCSI; **TLS-PSK** for NVMe/TCP (VSA).
 - **Append-only, BLAKE3-chained audit log**; Prometheus metrics + OTLP.
 - **Optional at-rest encryption** under a pluggable DEK keystore.
@@ -66,12 +70,12 @@ Thur VTL additionally provides:
   iSCSI; configurable topology (caps 65535 slots / 65535 mail slots /
   255 drives).
 - Virtual cartridges with full sequential-access semantics, WORM,
-  cloud-native legal hold, the LTFS two-partition layout, and LTO
+  backend-native legal hold, the LTFS two-partition layout, and LTO
   Application-Managed Encryption.
 - Cross-region disaster recovery; cartridge migration and archive
-  between cloud backends.
+  between storage backends.
 - LTO-style per-block drive compression (lz4 / zstd) ahead of the
-  cloud-tier compression — off by default, matching real-drive convention.
+  storage-tier compression — off by default, matching real-drive convention.
 
 Thur VSA additionally provides:
 
@@ -94,7 +98,7 @@ Thur VSA additionally provides:
   `libssl` dependency.
 - Integration tests: `open-iscsi`, `sg3-utils`, `mtx`, `mt-st`,
   `libiscsi-bin`, `lsscsi`.
-- Storage: a cloud account (AWS S3, GCS, Azure Blob), an on-premise
+- Storage: a cloud account (AWS S3, GCS, Azure Blob), an on-prem
   S3-compatible object store (MinIO, Ceph RGW, AIStore, …), or the
   `local` filesystem backend.
 
@@ -167,7 +171,7 @@ Other install paths:
 The absolute minimum each conffile needs is three things: `data_dir`
 (the packaged starter pre-fills `/var/lib/thurvtl` and
 `/var/lib/thurvsa` — change only if you want the data elsewhere), at
-least one entry under `cloud.backends:`, and — for Thur VTL only — a
+least one entry under `storage.backends:`, and — for Thur VTL only — a
 `library:` chassis declaration (see below). The `config defaults`
 command prints the full annotated reference — every key documented
 with its default value and a description — which you can redirect
@@ -183,16 +187,16 @@ Every config file and YAML key is catalogued in
 CLI resolve `--config PATH` first, otherwise
 `/etc/<product>/<product>.yaml`.
 
-### Cloud backends
+### Storage backends
 
 Both products store data as content-addressed chunks in a per-backend
 pool. The backend type determines where those chunks live; configure
-backends under `cloud.backends:` in the conffile, giving each entry a
+backends under `storage.backends:` in the conffile, giving each entry a
 name, a `type` (`s3` / `gcs` / `azure` / `local`), and its
-per-cloud knobs:
+per-provider knobs:
 
 ```yaml
-cloud:
+storage:
   backends:
     primary:
       type: s3
@@ -206,21 +210,21 @@ cloud:
       project_id: my-project
 ```
 
-The `local` backend is filesystem-only — no credentials, no cloud —
+The `local` backend is filesystem-only — no credentials, no network —
 ideal for testing:
 
 ```yaml
-cloud:
+storage:
   backends:
     primary:
       type: local
       root_dir: "./.thur/local-backend"
 ```
 
-On startup the daemon validates each cloud backend's credentials,
+On startup the daemon validates each storage backend's credentials,
 bucket existence, and read/write/delete permissions, and refuses to
 start on failure. Validate ahead of time, without starting the
-daemon, with `thurvtl system cloud check`.
+daemon, with `thurvtl system storage check`.
 
 - **Credentials** — `auth:` blocks, default chains, the daemon env
   file, multi-provider layouts: [`docs/AUTH.md`](docs/AUTH.md).
@@ -410,7 +414,7 @@ configuration file and YAML key; the same per-key reference is what
 **Wire-level & storage reference:**
 
 - [`docs/SPEC.md`](docs/SPEC.md) — VTL wire surface, schemas,
-  on-disk + cloud layout, DR / migration / archive.
+  on-disk + storage-backend layout, DR / migration / archive.
 - [`docs/STORAGE.md`](docs/STORAGE.md),
   [`docs/DEDUP.md`](docs/DEDUP.md),
   [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md),

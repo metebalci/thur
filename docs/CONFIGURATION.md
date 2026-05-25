@@ -90,14 +90,14 @@ is entirely separate from the on-disk `disk_cache`.
 
 | Key | Default | Description |
 |---|---|---|
-| `memory_buffers.write_gb_per_tape` | `10` | Per-tape write-buffer size (GB) staged before cloud upload. |
+| `memory_buffers.write_gb_per_tape` | `10` | Per-tape write-buffer size (GB) staged before backend upload. |
 | `memory_buffers.read_gb_per_tape` | `5` | Per-tape read-buffer size (GB) for prefetched chunks. |
 | `memory_buffers.read_prefetch_chunks_ahead` | `2` | Chunks prefetched ahead during sequential reads (0 disables; 1–3 typical). |
 
 ### `disk_cache`
 
 The disk cache is the content-addressed chunk-pool budget on disk at
-`<data_dir>/chunks/`, enforced per cloud backend. When a chunk seal would
+`<data_dir>/chunks/`, enforced per storage backend. When a chunk seal would
 push a backend's pool over its cap, or drop free filesystem space below
 `disk_free_min_gb`, the seal blocks on the upload and eviction worker.
 This backpressure gate is what prevents an overfull disk from turning
@@ -128,24 +128,24 @@ used when the host does enable it — not whether it is enabled.
 | `drive.compression.algorithm` | `lz4` | `lz4`, `zstd`, or `sldc` (reserved — selecting it errors). Recorded per-block so the knob can change without breaking old reads. |
 | `drive.compression.zstd_level` | `3` | Zstd level 1–22. Used only when `algorithm: zstd`. |
 
-### `cloud`
+### `storage`
 
-This section holds workspace-wide cloud tuning parameters plus the named
+This section holds workspace-wide storage tuning parameters plus the named
 backend definitions. Each cartridge or volume binds to one named backend
 at create time, and that binding is permanent. Per-backend `auth:` block
 shapes are in [`AUTH.md`](AUTH.md).
 
 | Key | Default | Description |
 |---|---|---|
-| `cloud.skip_retention_mode_check` | `false` | Skip bucket-immutability validation at startup / `cloud check`. `retention_mode` still parses and still gates `--worm`. Use when the principal can't be granted management-plane IAM. |
-| `cloud.compression.algorithm` | `zstd` | Cloud-tier compression (post-dedup, per-chunk on upload): `none` / `lz4` / `zstd`. S3/GCS/Azure only. |
-| `cloud.compression.level` | `3` | Zstd level 1–22. Ignored for `lz4` / `none`. |
-| `cloud.upload.max_concurrent` | `0` | In-flight uploads per backend. `0` = auto-scale to `min(16, parallelism × 4)`. |
-| `cloud.upload.retry_max_attempts` | `10` | Retries per upload (exponential backoff 1 s → 30 s). |
-| `cloud.upload.backpressure_max_wait_seconds` | `60` | Max seconds a chunk-seal blocks on the per-backend pool budget before surfacing SCSI NOT READY. Range 1–600. Present on both products. |
-| `cloud.backends` | empty | Named backend map — see below. |
+| `storage.skip_retention_mode_check` | `false` | Skip bucket-immutability validation at startup / `storage check`. `retention_mode` still parses and still gates `--worm`. Use when the principal can't be granted management-plane IAM. |
+| `storage.compression.algorithm` | `zstd` | Backend-tier compression (post-dedup, per-chunk on upload): `none` / `lz4` / `zstd`. S3/GCS/Azure only. |
+| `storage.compression.level` | `3` | Zstd level 1–22. Ignored for `lz4` / `none`. |
+| `storage.upload.max_concurrent` | `0` | In-flight uploads per backend. `0` = auto-scale to `min(16, parallelism × 4)`. |
+| `storage.upload.retry_max_attempts` | `10` | Retries per upload (exponential backoff 1 s → 30 s). |
+| `storage.upload.backpressure_max_wait_seconds` | `60` | Max seconds a chunk-seal blocks on the per-backend pool budget before surfacing SCSI NOT READY. Range 1–600. Present on both products. |
+| `storage.backends` | empty | Named backend map — see below. |
 
-`cloud.backends` is a map whose keys — `primary`, `cold-archive`, and so
+`storage.backends` is a map whose keys — `primary`, `cold-archive`, and so
 on — are the names that cartridges and volumes bind to at create time. The
 `type:` field inside each entry discriminates `local` / `s3` / `gcs` /
 `azure`. An empty map is valid and the daemon boots fine; a cartridge or
@@ -222,7 +222,7 @@ which is off by default. Full design and worked examples:
 | `alerting.enabled` | `false` | Master switch. `true` requires a non-empty `sinks`. |
 | `alerting.dedup_window_seconds` | `300` | Window within which repeats of the same `(class, dedup_key)` collapse to one. |
 | `alerting.chap_failures_threshold` | `3` | CHAP-failure alerts fire after this many failures from one user in a window. `0` disables. |
-| `alerting.events.backend_reachability` | `false` | Per-class on/off — cloud-backend reachability. |
+| `alerting.events.backend_reachability` | `false` | Per-class on/off — storage-backend reachability. |
 | `alerting.events.audit_failure` | `true` | Per-class on/off — audit-log append failures. |
 | `alerting.events.disk_cache_backpressure` | `false` | Per-class on/off — disk-cache watermark / backpressure timeout. |
 | `alerting.events.chap_failures` | `true` | Per-class on/off — repeated CHAP login failures. |
@@ -285,7 +285,7 @@ NVMe/TCP TLS-PSK and [`NVMETCP.md`](NVMETCP.md).
 
 `/etc/thurvtl/thurvtl.env` and `/etc/thurvsa/thurvsa.env` are optional
 `KEY=VALUE` files that the packaged systemd unit loads via
-`EnvironmentFile=-`. They are the on-prem path for supplying cloud
+`EnvironmentFile=-`. They are the on-prem path for supplying storage
 credentials through environment variables — the variable names that a
 backend's `auth:` block references are set here. The daemon picks up
 changes on restart. The full recipe — variable names per provider, file

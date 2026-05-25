@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 # Backend trait + DedupScope enum that `upload_chunk_inert` keys its
 # HEAD-probe decision off.
-shared-cloud = { path = "../cloud" }
+shared-object-store = { path = "../object-store" }
 
 # Per-backend HEAD-probe / upload-bytes counters fired from
 # `upload_chunk_inert`. record::* helpers no-op when the global handle

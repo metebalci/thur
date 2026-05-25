@@ -17,10 +17,10 @@
 //! Storage-account shared-key auth is no longer supported by the new
 //! SDK; SAS or AAD remain.
 
-use crate::cloud_backend::CloudBackend;
-use crate::cloud_config::ResolvedAzureAuth;
 use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
-use crate::{CloudError, Result};
+use crate::object_store_backend::ObjectStoreBackend;
+use crate::object_store_config::ResolvedAzureAuth;
+use crate::{ObjectStoreError, Result};
 use async_trait::async_trait;
 use azure_core::Bytes;
 use azure_core::credentials::{AccessToken, Secret, TokenCredential, TokenRequestOptions};
@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 const MAX_UPLOAD_RETRIES: u32 = 5;
 /// Maximum number of retry attempts for downloads.
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
-// Backoff cadence is owned by `cloud_helpers::retry_async`.
+// Backoff cadence is owned by `object_store_helpers::retry_async`.
 
 /// Azure Blob Storage backend for storing chunks and manifests.
 ///
@@ -154,7 +154,7 @@ impl AzureBackend {
                     None,
                 )
                 .map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "ClientSecretCredential build failed for backend '{account}': {e}"
                     ))
                 })?;
@@ -171,9 +171,9 @@ impl AzureBackend {
         // which appends the container path itself.
         let container = if let Some(sas) = &sas_url_override {
             let url = Url::parse(sas)
-                .map_err(|e| CloudError::Other(format!("Azure SAS URL parse failed: {e}")))?;
+                .map_err(|e| ObjectStoreError::Other(format!("Azure SAS URL parse failed: {e}")))?;
             BlobContainerClient::from_url(url, None, None).map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "BlobContainerClient::from_url (SAS) failed (account: {account}, \
                      container: {container_name}): {e}"
                 ))
@@ -193,7 +193,7 @@ impl AzureBackend {
                 None,
             )
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "BlobContainerClient::new failed (account: {account}, container: \
                      {container_name}): {e}"
                 ))
@@ -221,7 +221,7 @@ impl AzureBackend {
 
     /// Construct full blob name with prefix.
     fn full_key(&self, key: &str) -> String {
-        crate::cloud_helpers::full_key(&self.prefix, key)
+        crate::object_store_helpers::full_key(&self.prefix, key)
     }
 
     /// Get a blob client for `full_key`.
@@ -277,7 +277,9 @@ fn discover_credentials_from_env(account: &str) -> Result<ResolvedCredential> {
         let cred =
             ClientSecretCredential::new(&tenant_id, client_id, Secret::from(client_secret), None)
                 .map_err(|e| {
-                CloudError::Other(format!("ClientSecretCredential build failed from env: {e}"))
+                ObjectStoreError::Other(format!(
+                    "ClientSecretCredential build failed from env: {e}"
+                ))
             })?;
         Ok((None, Some(cred as Arc<dyn TokenCredential>)))
     } else {
@@ -286,7 +288,7 @@ fn discover_credentials_from_env(account: &str) -> Result<ResolvedCredential> {
             account
         );
         let cred = build_default_aad_chain().map_err(|e| {
-            CloudError::Other(format!(
+            ObjectStoreError::Other(format!(
                 "Azure AAD fallback chain build failed: {e} — set \
                  AZURE_STORAGE_SAS_URL, AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET, or \
                  ensure the host is on Azure with a managed identity / has run \
@@ -370,7 +372,7 @@ fn upload_options_with_metadata(
 }
 
 #[async_trait]
-impl CloudBackend for AzureBackend {
+impl ObjectStoreBackend for AzureBackend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -408,7 +410,7 @@ impl CloudBackend for AzureBackend {
         let level = self.compression_config.level;
         // Wrap once: per-retry `Bytes::clone` is just an Arc bump.
         let data_bytes = Bytes::from(data_to_upload);
-        crate::cloud_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || {
+        crate::object_store_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || {
             let full_key = full_key.clone();
             let body = data_bytes.clone();
             let blob = self.blob(&full_key);
@@ -417,7 +419,7 @@ impl CloudBackend for AzureBackend {
             async move {
                 let opts = upload_options_with_metadata(applied_algo, level);
                 blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure chunk upload failed: {e} (account: {account}, \
                              container: {container_name}, key: {full_key})"
                     ))
@@ -434,7 +436,7 @@ impl CloudBackend for AzureBackend {
         let full_key = self.full_key(key);
         let metadata = tokio::fs::metadata(file_path)
             .await
-            .map_err(|e| CloudError::Other(format!("failed to stat file: {e}")))?;
+            .map_err(|e| ObjectStoreError::Other(format!("failed to stat file: {e}")))?;
         let file_size = metadata.len();
 
         debug!(
@@ -448,28 +450,32 @@ impl CloudBackend for AzureBackend {
             );
         }
 
-        crate::cloud_helpers::retry_async("upload_chunk_zerocopy", MAX_UPLOAD_RETRIES, || {
-            let full_key = full_key.clone();
-            let blob = self.blob(&full_key);
-            let path = file_path.to_path_buf();
-            let account = self.account.clone();
-            let container_name = self.container_name.clone();
-            async move {
-                let data = tokio::fs::read(&path)
-                    .await
-                    .map_err(|e| CloudError::Other(format!("failed to read file: {e}")))?;
-                let body = Bytes::from(data);
-                let opts = upload_options_with_metadata(None, 0);
-                blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                    CloudError::Other(format!(
-                        "Azure chunk upload (zero-copy) failed: {e} (account: \
+        crate::object_store_helpers::retry_async(
+            "upload_chunk_zerocopy",
+            MAX_UPLOAD_RETRIES,
+            || {
+                let full_key = full_key.clone();
+                let blob = self.blob(&full_key);
+                let path = file_path.to_path_buf();
+                let account = self.account.clone();
+                let container_name = self.container_name.clone();
+                async move {
+                    let data = tokio::fs::read(&path).await.map_err(|e| {
+                        ObjectStoreError::Other(format!("failed to read file: {e}"))
+                    })?;
+                    let body = Bytes::from(data);
+                    let opts = upload_options_with_metadata(None, 0);
+                    blob.upload(body.into(), Some(opts)).await.map_err(|e| {
+                        ObjectStoreError::Other(format!(
+                            "Azure chunk upload (zero-copy) failed: {e} (account: \
                              {account}, container: {container_name}, key: {full_key}, \
                              file: {path:?})"
-                    ))
-                })?;
-                Ok(())
-            }
-        })
+                        ))
+                    })?;
+                    Ok(())
+                }
+            },
+        )
         .await?;
 
         Ok(file_size)
@@ -479,7 +485,7 @@ impl CloudBackend for AzureBackend {
         let full_key = self.full_key(key);
         debug!("Downloading chunk from Azure: {}", full_key);
 
-        crate::cloud_helpers::retry_async("download_chunk", MAX_DOWNLOAD_RETRIES, || {
+        crate::object_store_helpers::retry_async("download_chunk", MAX_DOWNLOAD_RETRIES, || {
             let full_key = full_key.clone();
             let blob = self.blob(&full_key);
             let account = self.account.clone();
@@ -494,13 +500,13 @@ impl CloudBackend for AzureBackend {
                 // round-trips, both small — the bulk of the time is
                 // the body transfer.
                 let props = blob.get_properties(None).await.map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure chunk get_properties failed: {e} (account: {account}, \
                          container: {container_name}, key: {full_key})"
                     ))
                 })?;
                 let metadata = props.metadata().map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure chunk metadata header parse: {e} (account: {account}, \
                          container: {container_name}, key: {full_key})"
                     ))
@@ -508,7 +514,7 @@ impl CloudBackend for AzureBackend {
                 let compression_type = metadata.get("compression").cloned();
 
                 let response = blob.download(None).await.map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure chunk download failed: {e} (account: {account}, \
                          container: {container_name}, key: {full_key})"
                     ))
@@ -517,7 +523,7 @@ impl CloudBackend for AzureBackend {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| CloudError::Other(format!("failed to read body: {e}")))?
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to read body: {e}")))?
                     .to_vec();
 
                 debug!("Downloaded {} bytes from Azure: {}", buffer.len(), full_key);
@@ -533,7 +539,7 @@ impl CloudBackend for AzureBackend {
                     }
                     Some("none") | None => buffer,
                     Some(other) => {
-                        return Err(CloudError::Other(format!(
+                        return Err(ObjectStoreError::Other(format!(
                             "unsupported compression type: {other}"
                         )));
                     }
@@ -563,10 +569,11 @@ impl CloudBackend for AzureBackend {
         for (idx, key) in keys.iter().enumerate() {
             if tasks.len() >= MAX_CONCURRENT_DOWNLOADS {
                 let Some(finished) = tasks.join_next().await else {
-                    return Err(CloudError::Other("Task join failed".to_string()));
+                    return Err(ObjectStoreError::Other("Task join failed".to_string()));
                 };
-                let (result_idx, data) = finished
-                    .map_err(|e| CloudError::Other(format!("Download task panicked: {e}")))??;
+                let (result_idx, data) = finished.map_err(|e| {
+                    ObjectStoreError::Other(format!("Download task panicked: {e}"))
+                })??;
                 results[result_idx] = Some(data);
             }
 
@@ -575,13 +582,13 @@ impl CloudBackend for AzureBackend {
 
             tasks.spawn(async move {
                 let data = azure.download_chunk(&key_clone).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, data))
+                Ok::<(usize, Vec<u8>), ObjectStoreError>((idx, data))
             });
         }
 
         while let Some(finished) = tasks.join_next().await {
             let (result_idx, data) = finished
-                .map_err(|e| CloudError::Other(format!("Download task panicked: {e}")))??;
+                .map_err(|e| ObjectStoreError::Other(format!("Download task panicked: {e}")))??;
             results[result_idx] = Some(data);
         }
 
@@ -590,7 +597,9 @@ impl CloudBackend for AzureBackend {
             .enumerate()
             .map(|(idx, opt)| {
                 opt.ok_or_else(|| {
-                    CloudError::Other(format!("Missing download result for chunk at index {idx}"))
+                    ObjectStoreError::Other(format!(
+                        "Missing download result for chunk at index {idx}"
+                    ))
                 })
             })
             .collect()
@@ -605,7 +614,7 @@ impl CloudBackend for AzureBackend {
         );
 
         let body_len = json.len();
-        crate::cloud_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || {
+        crate::object_store_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || {
             let full_key = full_key.clone();
             let body = Bytes::copy_from_slice(json.as_bytes());
             let blob = self.blob(&full_key);
@@ -617,7 +626,7 @@ impl CloudBackend for AzureBackend {
                     ..Default::default()
                 };
                 blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure manifest upload failed: {e} (account: {account}, \
                              container: {container_name}, key: {full_key}, size: \
                              {body_len} bytes)"
@@ -633,14 +642,14 @@ impl CloudBackend for AzureBackend {
         let full_key = self.full_key(key);
         debug!("Downloading manifest from Azure: {}", full_key);
 
-        crate::cloud_helpers::retry_async("download_manifest", MAX_DOWNLOAD_RETRIES, || {
+        crate::object_store_helpers::retry_async("download_manifest", MAX_DOWNLOAD_RETRIES, || {
             let full_key = full_key.clone();
             let blob = self.blob(&full_key);
             let account = self.account.clone();
             let container_name = self.container_name.clone();
             async move {
                 let response = blob.download(None).await.map_err(|e| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Azure manifest download failed: {e} (account: {account}, \
                          container: {container_name}, key: {full_key})"
                     ))
@@ -649,10 +658,11 @@ impl CloudBackend for AzureBackend {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| CloudError::Other(format!("failed to read body: {e}")))?
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to read body: {e}")))?
                     .to_vec();
-                let json = String::from_utf8(bytes)
-                    .map_err(|e| CloudError::Other(format!("manifest not valid UTF-8: {e}")))?;
+                let json = String::from_utf8(bytes).map_err(|e| {
+                    ObjectStoreError::Other(format!("manifest not valid UTF-8: {e}"))
+                })?;
                 debug!(
                     "Downloaded manifest from Azure: {} ({} bytes)",
                     full_key,
@@ -669,7 +679,7 @@ impl CloudBackend for AzureBackend {
         debug!("Checking if chunk exists in Azure: {}", full_key);
 
         self.blob(&full_key).exists().await.map_err(|e| {
-            CloudError::Other(format!(
+            ObjectStoreError::Other(format!(
                 "Azure exists check failed: {e} (account: {}, container: {}, key: \
                  {full_key})",
                 self.account, self.container_name
@@ -686,7 +696,7 @@ impl CloudBackend for AzureBackend {
             ..Default::default()
         };
         let mut pager = self.container.list_blobs(Some(opts)).map_err(|e| {
-            CloudError::Other(format!(
+            ObjectStoreError::Other(format!(
                 "Azure list_blobs build failed: {e} (account: {}, container: {}, \
                  prefix: {full_prefix})",
                 self.account, self.container_name
@@ -699,7 +709,7 @@ impl CloudBackend for AzureBackend {
         // ever need next-marker / continuation handling.)
         let mut keys = Vec::new();
         while let Some(item) = pager.try_next().await.map_err(|e| {
-            CloudError::Other(format!(
+            ObjectStoreError::Other(format!(
                 "Azure list_blobs failed: {e} (account: {}, container: {}, prefix: \
                  {full_prefix})",
                 self.account, self.container_name
@@ -725,7 +735,7 @@ impl CloudBackend for AzureBackend {
         debug!("Deleting blob from Azure: {}", full_key);
 
         self.blob(&full_key).delete(None).await.map_err(|e| {
-            CloudError::Other(format!(
+            ObjectStoreError::Other(format!(
                 "Azure delete_blob failed: {e} (account: {}, container: {}, key: \
                  {full_key})",
                 self.account, self.container_name
@@ -740,7 +750,7 @@ impl CloudBackend for AzureBackend {
         "azure"
     }
 
-    async fn lock_state(&self) -> Result<crate::cloud_backend::LockState> {
+    async fn lock_state(&self) -> Result<crate::object_store_backend::LockState> {
         // Container immutability policies live on the ARM management
         // plane (https://management.azure.com/.../immutabilityPolicies/default),
         // not on the data-plane blob endpoint. We hit the REST API
@@ -751,11 +761,11 @@ impl CloudBackend for AzureBackend {
         // address the policy resource, so report Off — the startup
         // retention validation already enforces "if retention_mode
         // != none then both fields must be set" via
-        // CloudConfig::validate, so this branch only triggers for
+        // ObjectStoreConfig::validate, so this branch only triggers for
         // non-WORM Azure backends where the answer is correctly Off.
         let (subscription, resource_group) = match (&self.subscription_id, &self.resource_group) {
             (Some(s), Some(r)) => (s, r),
-            _ => return Ok(crate::cloud_backend::LockState::Off),
+            _ => return Ok(crate::object_store_backend::LockState::Off),
         };
         let credential = match &self.aad_credential {
             Some(c) => c,
@@ -763,7 +773,7 @@ impl CloudBackend for AzureBackend {
                 // SAS auth: management plane requires AAD, so we
                 // can't introspect. Report a clear error so the
                 // operator knows to switch auth.
-                return Err(CloudError::Other(
+                return Err(ObjectStoreError::Other(
                     "Azure lock_state requires AAD (managed identity / az login / \
                      service principal); SAS auth cannot query the ARM management \
                      plane"
@@ -775,7 +785,9 @@ impl CloudBackend for AzureBackend {
         let token = credential
             .get_token(&["https://management.azure.com/.default"], None)
             .await
-            .map_err(|e| CloudError::Other(format!("Azure ARM token acquisition failed: {e}")))?;
+            .map_err(|e| {
+                ObjectStoreError::Other(format!("Azure ARM token acquisition failed: {e}"))
+            })?;
 
         let url = format!(
             "https://management.azure.com/subscriptions/{}/resourceGroups/{}/\
@@ -789,17 +801,19 @@ impl CloudBackend for AzureBackend {
             .bearer_auth(token.token.secret())
             .send()
             .await
-            .map_err(|e| CloudError::Other(format!("Azure ARM immutabilityPolicies GET: {e}")))?;
+            .map_err(|e| {
+                ObjectStoreError::Other(format!("Azure ARM immutabilityPolicies GET: {e}"))
+            })?;
 
         // 404 from this endpoint means "no immutability policy exists"
         // — bucket is mutable, lock state is Off.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(crate::cloud_backend::LockState::Off);
+            return Ok(crate::object_store_backend::LockState::Off);
         }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(CloudError::Other(format!(
+            return Err(ObjectStoreError::Other(format!(
                 "Azure ARM immutabilityPolicies GET returned {status}: {body}"
             )));
         }
@@ -823,25 +837,25 @@ impl CloudBackend for AzureBackend {
         let body: PolicyResponse = resp
             .json()
             .await
-            .map_err(|e| CloudError::Other(format!("Azure ARM JSON parse: {e}")))?;
+            .map_err(|e| ObjectStoreError::Other(format!("Azure ARM JSON parse: {e}")))?;
         let props = match body.properties {
             Some(p) => p,
-            None => return Ok(crate::cloud_backend::LockState::Off),
+            None => return Ok(crate::object_store_backend::LockState::Off),
         };
         let days = props
             .immutability_period_since_creation_in_days
             .unwrap_or(0);
         if days == 0 {
-            return Ok(crate::cloud_backend::LockState::Off);
+            return Ok(crate::object_store_backend::LockState::Off);
         }
         match props.state.as_deref() {
             Some("Locked") => {
-                Ok(crate::cloud_backend::LockState::Compliance { default_days: days })
+                Ok(crate::object_store_backend::LockState::Compliance { default_days: days })
             }
             Some("Unlocked") => {
-                Ok(crate::cloud_backend::LockState::Governance { default_days: days })
+                Ok(crate::object_store_backend::LockState::Governance { default_days: days })
             }
-            _ => Ok(crate::cloud_backend::LockState::Off),
+            _ => Ok(crate::object_store_backend::LockState::Off),
         }
     }
 
@@ -866,13 +880,15 @@ impl CloudBackend for AzureBackend {
                 // ("concurrent writer raced"):
                 //   412 Precondition Failed → CloudPreconditionFailed
                 //   409 Conflict            → CloudConflict
-                //   anything else           → CloudError (existing default)
+                //   anything else           → ObjectStoreError (existing default)
                 use azure_core::http::StatusCode;
                 Err(match e.http_status() {
-                    Some(StatusCode::PreconditionFailed) => CloudError::PreconditionFailed(detail),
-                    Some(StatusCode::Conflict) => CloudError::Conflict(detail),
-                    Some(other) => CloudError::Other(format!("status {other}: {detail}")),
-                    None => CloudError::Other(detail),
+                    Some(StatusCode::PreconditionFailed) => {
+                        ObjectStoreError::PreconditionFailed(detail)
+                    }
+                    Some(StatusCode::Conflict) => ObjectStoreError::Conflict(detail),
+                    Some(other) => ObjectStoreError::Other(format!("status {other}: {detail}")),
+                    None => ObjectStoreError::Other(detail),
                 })
             }
         }
@@ -885,7 +901,7 @@ impl CloudBackend for AzureBackend {
             .get_properties(None)
             .await
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "Azure Get Blob Properties (legal hold) failed: {e} (account: {}, \
                  container: {}, key: {full_key})",
                     self.account, self.container_name
@@ -894,7 +910,7 @@ impl CloudBackend for AzureBackend {
         let held = props
             .legal_hold()
             .map_err(|e| {
-                CloudError::Other(format!(
+                ObjectStoreError::Other(format!(
                     "Azure Get Blob Properties legal_hold header parse: {e}"
                 ))
             })?
@@ -902,7 +918,7 @@ impl CloudBackend for AzureBackend {
         Ok(held)
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         Box::new(self.clone())
     }
 }
@@ -938,7 +954,7 @@ mod tests {
     //
     // Stand up an in-process wiremock server, point the Azure Blob SDK
     // at it via a synthetic SAS URL, and verify canned XML / status
-    // responses flow through the SDK -> CloudError::Other -> classify()
+    // responses flow through the SDK -> ObjectStoreError::Other -> classify()
     // pipeline to the correct FailureKind.
     //
     // Coverage scope:
@@ -957,10 +973,10 @@ mod tests {
     //     S3 side instead.
 
     use super::AzureBackend;
-    use crate::CloudError;
-    use crate::cloud_backend::CloudBackend;
-    use crate::cloud_config::{FailureKind, ResolvedAzureAuth, classify};
+    use crate::ObjectStoreError;
     use crate::compression::CompressionConfig;
+    use crate::object_store_backend::ObjectStoreBackend;
+    use crate::object_store_config::{FailureKind, ResolvedAzureAuth, classify};
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -989,7 +1005,7 @@ mod tests {
         )
     }
 
-    async fn capture_azure_list_error(server: MockServer) -> CloudError {
+    async fn capture_azure_list_error(server: MockServer) -> ObjectStoreError {
         let backend = mock_azure_backend(&server).await;
         backend
             .list_objects("")
@@ -1286,7 +1302,7 @@ mod tests {
         let backend = mock_azure_backend(&server).await;
         assert_eq!(
             backend.lock_state().await.expect("lock state"),
-            crate::cloud_backend::LockState::Off
+            crate::object_store_backend::LockState::Off
         );
         assert_eq!(backend.backend_type(), "azure");
         assert!(backend.supports_legal_hold());

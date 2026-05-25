@@ -15,7 +15,7 @@ backpressure design. Two sections cover the product-specific details:
 
 ## The shared problem
 
-A host workload can burst faster than cloud upload can drain — a `tar` of a
+A host workload can burst faster than backend upload can drain — a `tar` of a
 large dataset on VTL, or a journal flush, large copy, or snapshot cohort flush
 on VSA. Cloud upload throughput varies with network conditions, provider
 throttling, and retry backoff. The local chunk pool sits between the host write
@@ -43,9 +43,9 @@ end-to-end between both products:
 
 - **`shared_pool::PoolBudget`** + per-backend cap map — the same hard cap
   and disk-free floor apply to both products. One `PoolBudget` is
-  constructed per `cloud.backends` entry at startup. The YAML
+  constructed per `storage.backends` entry at startup. The YAML
   `disk_cache.size_gb` is the per-backend default; individual
-  `cloud.backends:` entries may override it with their own
+  `storage.backends:` entries may override it with their own
   `disk_cache_size_gb`. Both take the `auto | <gb>` shape: an explicit
   GB integer pins the cap, or `auto` (default) derives
   `min(50% of free, max_size_gb)` floored at `min_size_gb`, recomputed
@@ -84,7 +84,7 @@ end-to-end between both products:
 - **Two trigger conditions.** A reservation blocks if **either** is true:
 
   1. **Pool cap.** `current_bytes + payload > cap` — host writes
-     outrunning cloud uploads.
+     outrunning backend uploads.
   2. **Disk-free floor.** `statvfs(data_dir).free < disk_free_min_bytes`
      — catches disk-fill from outside the pool (audit retention,
      manifest growth, external writers on the same partition).
@@ -184,7 +184,7 @@ cloud:
 - **High write rate, slow cloud.** Raise `disk_cache.max_size_gb` so the
   `auto` cap can grow further on a roomy filesystem; the eviction worker
   re-derives the cap every tick. If only one backend is hot, pin it with
-  `disk_cache_size_gb: 64` under its `cloud.backends:` entry and leave the
+  `disk_cache_size_gb: 64` under its `storage.backends:` entry and leave the
   rest on `auto`.
 - **Tight disk budget.** Drop `disk_cache.max_size_gb` or pin an explicit
   `disk_cache.size_gb: <n>`. Lower `disk_free_min_gb` in lockstep so
@@ -201,7 +201,7 @@ cloud:
   applies only when the chunk *rolls*. Per-block latency spikes would tank
   throughput.
 - **Auto-scale upload concurrency.** `upload.max_concurrent` stays static. If
-  upload rate is the bottleneck, raise the knob or fix the cloud-side
+  upload rate is the bottleneck, raise the knob or fix the storage-side
   throttling. Backpressure makes the failure mode graceful; it does not make
   uploads faster.
 - **Help if all chunks are `LocalOnly`.** Eviction can only free `Both`-state
@@ -274,7 +274,7 @@ For each page, `write_page_unsynced` follows these steps:
    already on disk, so the reservation never consumed new bytes.
 4. On `insert_bytes` error, `release(payload.len())` — backs out the
    reservation.
-5. After cloud upload and page-index update, the reservation stays held until
+5. After backend upload and page-index update, the reservation stays held until
    the eviction worker releases it.
 
 Cloud upload errors do **not** release the reservation: the chunk is
@@ -309,7 +309,7 @@ works through the following steps:
    remove calls `PoolBudget::release(size)`, immediately waking any
    `write_page` parked on backpressure.
 
-Eviction skips any chunk whose pages still have a pending cloud upload. The
+Eviction skips any chunk whose pages still have a pending backend upload. The
 per-volume `upload.idx` sidecar records `LocalOnly` vs `Uploaded`, and
 `collect_lru_touches_and_upload_state` ANDs across every referencing page, so
 a chunk shared by an uploaded page and a pending-upload page stays pinned.
@@ -395,7 +395,7 @@ lock-free.
 
 | Tier | SYNC blocks until | Survives | Lost on |
 |---|---|---|---|
-| `cloud` (default) | bytes are in cloud object store | host-disk loss / daemon-process crash / power loss | provider outage during the upload window |
+| `cloud` (default) | bytes are in backend object store | host-disk loss / daemon-process crash / power loss | provider outage during the upload window |
 | `disk` | bytes are in the local pool file | daemon-process crash / power loss (if pool is on stable storage) | host-disk loss |
 | `memory` | (no-op — bytes are in RAM cache only) | nothing | any crash; only the periodic flush worker tick eventually drains |
 
@@ -426,7 +426,7 @@ durability boundary is cartridge unload, handled via
 
 ### Principle
 
-Align where the workloads are similar (storage, dedup, cloud tiering, async
+Align where the workloads are similar (storage, dedup, storage tiering, async
 upload, eviction); diverge where the SCSI semantics differ (sequential
 streaming vs random RMW with atomic ops). What remains in VSA-specific code is
 the RAM cache, the SYNCHRONIZE CACHE drain hook, and the per-page sidecar
@@ -438,7 +438,7 @@ format.
   appear in the daemon log and in the `thurvsa_pool_backpressure_wait_seconds`
   histogram. On `auto`, raise `disk_cache.max_size_gb`; on explicit, raise
   `disk_cache.size_gb`. Either knob can also be set per-backend via
-  `disk_cache_size_gb` on each `cloud.backends:` entry.
+  `disk_cache_size_gb` on each `storage.backends:` entry.
 - **Eviction-interval too long.** The steady-state cache stays at the ceiling
   longer than necessary; new pages park on backpressure even though older pages
   could have been evicted. Lower `disk_cache.eviction_interval_seconds`.

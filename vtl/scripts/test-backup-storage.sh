@@ -29,7 +29,7 @@
 # scale with the fixture; the manifest-backup wait window grows with
 # it. Cloud round-trips dominate runtime — bigger fixture = longer
 # test = real egress $$$. Run the larger sizes opt-in.
-#   THURVTL_TEST_BACKEND=primary THURVTL_FIXTURE_MB=512 ./vtl/scripts/test-backup-cloud.sh
+#   THURVTL_TEST_BACKEND=primary THURVTL_FIXTURE_MB=512 ./vtl/scripts/test-backup-storage.sh
 #
 # Prerequisites:
 #   - mtx, mt-st, open-iscsi, tar, lsscsi, curl   (same as test-backup-workflow.sh)
@@ -42,7 +42,7 @@
 #   - Root/sudo (iSCSI + /dev/stN).
 #
 # Usage (invoke from repo root):
-#   THURVTL_TEST_BACKEND=primary ./vtl/scripts/test-backup-cloud.sh [OPTIONS]
+#   THURVTL_TEST_BACKEND=primary ./vtl/scripts/test-backup-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
 # cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
@@ -111,7 +111,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-# Cloud backend definitions live in `<data_dir>/cloud-backends.json`
+# Storage backend definitions live in `<data_dir>/storage-backends.json`
 # (daemon-owned). The script extracts the chosen entry from
 # $SOURCE_BACKENDS and embeds it under `testbackend` inside the
 # generated test config. Default points at the maintainer-private
@@ -124,14 +124,14 @@ CLI_PATH=""
 # never reads /etc/thurvtl/thurvtl.yaml. So everything below the
 # cloud-backends.yaml read happens entirely under /tmp.
 SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.yaml}"
-TEST_DIR="/tmp/test-backup-cloud-$$"
+TEST_DIR="/tmp/test-backup-storage-$$"
 
 # Fixture-size knob (env: THURVTL_FIXTURE_MB, MiB per cartridge,
 # floor 8). Default keeps the smoke run quick (~8 MiB ≈ a handful of
 # chunks). Bump for stress/scale runs:
-#   THURVTL_FIXTURE_MB=512 ./vtl/scripts/test-backup-cloud.sh    # ~64 chunks
-#   THURVTL_FIXTURE_MB=1024 ./vtl/scripts/test-backup-cloud.sh   # ~128 chunks
-# Cloud round-trips dominate runtime — bigger fixture = longer test
+#   THURVTL_FIXTURE_MB=512 ./vtl/scripts/test-backup-storage.sh    # ~64 chunks
+#   THURVTL_FIXTURE_MB=1024 ./vtl/scripts/test-backup-storage.sh   # ~128 chunks
+# Storage round-trips dominate runtime — bigger fixture = longer test
 # = real egress $$$. Run the larger sizes opt-in, not on every commit.
 FIXTURE_MB="${THURVTL_FIXTURE_MB:-8}"
 if (( FIXTURE_MB < 8 )); then
@@ -239,7 +239,7 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
 # ---------------------------------------------------------------------------
-# Cloud helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
+# Storage helpers are sourced from scripts/lib/test-helpers.sh (cloud_list /
 # cloud_wait_for_key / verify_cloud_creds / cloud_purge_test_prefix /
 # cloud_cli_for_type). Lifted in 2026-05-13.
 # ---------------------------------------------------------------------------
@@ -300,21 +300,21 @@ resolve_backend() {
     fi
 
     local exists
-    exists=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
+    exists=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
     if [[ "$exists" == "__missing__" || "$exists" == "null" ]]; then
         log_error "Backend '$THURVTL_TEST_BACKEND' not found in $SOURCE_BACKENDS"
         echo "Available backends:"
-        yq -r '.cloud.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
+        yq -r '.storage.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
         exit 1
     fi
 
-    BACKEND_TYPE=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-    BACKEND_BUCKET=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ENDPOINT=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_REGION=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ACCOUNT=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_CONTAINER=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
-    ORIG_PREFIX=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+    BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_REGION=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+    ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
     # If the backend has `auth: { type: env, ... }` carrying explicit
     # env-var names for the access key / secret, capture them so the
     # cred probe (verify_cloud_creds) can target the same credentials
@@ -324,15 +324,15 @@ resolve_backend() {
     # tests the wrong service. Empty when the backend uses the default
     # AWS credential chain.
     BACKEND_AUTH_AKID_ENV=$(yq -r "
-        .cloud.backends.\"$THURVTL_TEST_BACKEND\".auth
+        .storage.backends.\"$THURVTL_TEST_BACKEND\".auth
         | select(.type == \"env\") | .access_key_id_env // \"\"
     " "$SOURCE_BACKENDS")
     BACKEND_AUTH_SECRET_ENV=$(yq -r "
-        .cloud.backends.\"$THURVTL_TEST_BACKEND\".auth
+        .storage.backends.\"$THURVTL_TEST_BACKEND\".auth
         | select(.type == \"env\") | .secret_access_key_env // \"\"
     " "$SOURCE_BACKENDS")
     local retention
-    retention=$(yq -r ".cloud.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+    retention=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
 
     if [[ "$BACKEND_TYPE" == "local" ]]; then
         log_error "Backend '$THURVTL_TEST_BACKEND' has type 'local' — use test-backup-workflow.sh for local-backend coverage."
@@ -455,7 +455,7 @@ create_test_config() {
     mkdir -p "$TEST_DIR/data"
     local backend_json
     backend_json=$(yq -c \
-        ".cloud.backends.\"$THURVTL_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
+        ".storage.backends.\"$THURVTL_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
         "$SOURCE_BACKENDS")
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
@@ -470,7 +470,7 @@ iscsi:
   target_iqn: "$TARGET_IQN"
 disk_cache:
   disk_free_min_gb: 0
-cloud:
+storage:
   backends:
     testbackend: $backend_json
 EOFCONFIG

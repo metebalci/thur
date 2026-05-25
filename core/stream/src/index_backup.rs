@@ -56,7 +56,7 @@ use crate::chunk_index::{ChunkIndexFile, HEADER_SIZE as CHUNK_HEADER_SIZE};
 use crate::dirty_pages::{DirtyPageTracker, PAGE_SIZE};
 use crate::errors::{Result, SmcError};
 use serde::{Deserialize, Serialize};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 
@@ -102,7 +102,7 @@ pub struct IndexFileRef<'a> {
 pub async fn upload_one_index(
     barcode: &str,
     file_ref: &IndexFileRef<'_>,
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
 ) -> Result<(IndexEpoch, Vec<String>)> {
     let snapshot = file_ref.tracker.snapshot();
     let file = std::fs::File::open(file_ref.path)?;
@@ -163,7 +163,7 @@ pub async fn restore_one_index(
     label: &str,
     dest: &Path,
     epoch: &IndexEpoch,
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
 ) -> Result<()> {
     if epoch.page_size != PAGE_SIZE {
         return Err(SmcError::InvalidOp(
@@ -246,8 +246,8 @@ mod tests {
     use crate::block_index::{BlockIndexFile, BlockRec, EncryptionTag};
     use crate::chunk_index::{ChunkIndexFile, ChunkRec, LocationTag};
     use crate::tape::BlockKind;
-    use shared_cloud::compression::CompressionAlgo;
-    use shared_cloud::local::LocalBackend;
+    use shared_object_store::compression::CompressionAlgo;
+    use shared_object_store::local::LocalBackend;
     use tempfile::TempDir;
 
     #[tokio::test]

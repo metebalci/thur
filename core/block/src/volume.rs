@@ -68,13 +68,13 @@ pub const MAX_VOLUME_NAME_LEN: usize = 64;
 /// per-backend pool. Default on VSA is `Local` because cross-volume
 /// LBA-0 dedup hits would be coincidental — boot sectors, partition
 /// tables, and filesystem superblocks differ per volume. Re-exported
-/// from `shared_cloud::DedupScope` so the upload pipeline
+/// from `shared_object_store::DedupScope` so the upload pipeline
 /// (`shared-upload-worker`) carries the same enum across the
 /// boundary.
-pub use shared_cloud::DedupScope;
+pub use shared_object_store::DedupScope;
 
 /// Parse a dedup scope string with VSA's product-specific error
-/// type. Thin wrapper over `shared_cloud::DedupScope: FromStr` —
+/// type. Thin wrapper over `shared_object_store::DedupScope: FromStr` —
 /// preserved so existing VSA call sites (CLI / volume create) keep
 /// `?`-propagating through `VolumeError`.
 pub fn parse_dedup_scope(s: &str) -> Result<DedupScope, VolumeError> {
@@ -89,7 +89,7 @@ pub fn parse_dedup_scope(s: &str) -> Result<DedupScope, VolumeError> {
 ///
 /// Three tiers, descending durability:
 ///
-/// - [`SyncAfter::Cloud`] (default) — SYNC blocks until every dirty
+/// - [`SyncAfter::Storage`] (default) — SYNC blocks until every dirty
 ///   page in the synced range is in the cloud object store. Bytes
 ///   survive host-disk loss, daemon-process crash, and power loss.
 ///   Slowest tier; matches the operator contract that cloud-backed
@@ -116,9 +116,9 @@ pub fn parse_dedup_scope(s: &str) -> Result<DedupScope, VolumeError> {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncAfter {
-    /// fsync = bytes in cloud. Default; safest.
+    /// fsync = bytes durable in the storage backend. Default; safest.
     #[default]
-    Cloud,
+    Storage,
     /// fsync = bytes in local disk pool. Faster; loses on disk failure.
     Disk,
     /// fsync = no-op. Fastest; loses on any crash.
@@ -128,7 +128,7 @@ pub enum SyncAfter {
 impl SyncAfter {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Cloud => "cloud",
+            Self::Storage => "storage",
             Self::Disk => "disk",
             Self::Memory => "memory",
         }
@@ -136,11 +136,11 @@ impl SyncAfter {
 
     /// On-disk encoding for the `VolumeWriter::sync_after`
     /// `AtomicU8` hot-path cache. 0/1/2; any other byte falls back
-    /// to [`SyncAfter::Cloud`] (safe default — preserves
-    /// cloud-durable semantics if the atomic is ever corrupted).
+    /// to [`SyncAfter::Storage`] (safe default — preserves
+    /// storage-durable semantics if the atomic is ever corrupted).
     pub const fn as_u8(self) -> u8 {
         match self {
-            Self::Cloud => 0,
+            Self::Storage => 0,
             Self::Disk => 1,
             Self::Memory => 2,
         }
@@ -150,7 +150,7 @@ impl SyncAfter {
         match b {
             1 => Self::Disk,
             2 => Self::Memory,
-            _ => Self::Cloud,
+            _ => Self::Storage,
         }
     }
 }
@@ -159,11 +159,11 @@ impl std::str::FromStr for SyncAfter {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "cloud" => Ok(Self::Cloud),
+            "storage" => Ok(Self::Storage),
             "disk" => Ok(Self::Disk),
             "memory" => Ok(Self::Memory),
             other => Err(format!(
-                "invalid --sync-after '{other}': expected 'cloud', 'disk', or 'memory'"
+                "invalid --sync-after '{other}': expected 'storage', 'disk', or 'memory'"
             )),
         }
     }
@@ -697,10 +697,10 @@ mod tests {
     #[test]
     fn sync_after_round_trips_each_tier() {
         for (raw, expected) in [
-            ("cloud", SyncAfter::Cloud),
+            ("storage", SyncAfter::Storage),
             ("disk", SyncAfter::Disk),
             ("memory", SyncAfter::Memory),
-            ("CLOUD", SyncAfter::Cloud),
+            ("STORAGE", SyncAfter::Storage),
             (" Memory ", SyncAfter::Memory),
         ] {
             let parsed: SyncAfter = raw.parse().unwrap();
@@ -718,17 +718,17 @@ mod tests {
         // Load-bearing for the contract: every new volume + every
         // legacy runtime.json without the field comes up on
         // cloud-durable.
-        assert_eq!(SyncAfter::default(), SyncAfter::Cloud);
+        assert_eq!(SyncAfter::default(), SyncAfter::Storage);
     }
 
     #[test]
     fn sync_after_atomic_byte_roundtrip() {
-        for m in [SyncAfter::Cloud, SyncAfter::Disk, SyncAfter::Memory] {
+        for m in [SyncAfter::Storage, SyncAfter::Disk, SyncAfter::Memory] {
             assert_eq!(SyncAfter::from_u8(m.as_u8()), m);
         }
         // Unrecognised byte → Cloud (safe default; matches the
         // doc comment on from_u8).
-        assert_eq!(SyncAfter::from_u8(0xFF), SyncAfter::Cloud);
+        assert_eq!(SyncAfter::from_u8(0xFF), SyncAfter::Storage);
     }
 
     #[test]

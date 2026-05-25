@@ -8,7 +8,7 @@
 //! [`crate::gcs_api`]; this module composes the backend on top of the
 //! [`GcsApi`] seam — retry policy, compression, prefix joining,
 //! key-name shaping. Tests inject a mock `GcsApi` impl to exercise
-//! every `CloudBackend` method without an HTTP wire.
+//! every `ObjectStoreBackend` method without an HTTP wire.
 //!
 //! Provides upload/download operations for chunks and manifests with:
 //! - Automatic retry with exponential backoff
@@ -16,10 +16,10 @@
 //! - Optional compression support (zstd/lz4)
 //! - Error handling and logging
 
-use crate::cloud_backend::CloudBackend;
 use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
 use crate::gcs_api::{GcsApi, RealGcsApi, build_credentials};
-use crate::{CloudError, Result};
+use crate::object_store_backend::ObjectStoreBackend;
+use crate::{ObjectStoreError, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
@@ -48,7 +48,7 @@ fn ensure_rustls_provider() {
 const MAX_UPLOAD_RETRIES: u32 = 5;
 /// Maximum number of retry attempts for downloads.
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
-// Backoff cadence is owned by `cloud_helpers::retry_async`.
+// Backoff cadence is owned by `object_store_helpers::retry_async`.
 
 /// Google Cloud Storage backend for storing chunks and manifests
 #[derive(Clone)]
@@ -143,13 +143,13 @@ impl GcsBackend {
 
     /// Construct full GCS object name with prefix.
     fn full_key(&self, key: &str) -> String {
-        crate::cloud_helpers::full_key(&self.prefix, key)
+        crate::object_store_helpers::full_key(&self.prefix, key)
     }
 }
 
-/// CloudBackend trait implementation for GcsBackend
+/// ObjectStoreBackend trait implementation for GcsBackend
 #[async_trait]
-impl CloudBackend for GcsBackend {
+impl ObjectStoreBackend for GcsBackend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -189,7 +189,7 @@ impl CloudBackend for GcsBackend {
         let data_bytes = Bytes::from(data_to_upload);
         let bucket = self.bucket.as_str();
 
-        crate::cloud_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
+        crate::object_store_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
             self.api
                 .write_object(bucket, &full_key, data_bytes.clone())
                 .await
@@ -204,7 +204,7 @@ impl CloudBackend for GcsBackend {
 
         let metadata = tokio::fs::metadata(file_path)
             .await
-            .map_err(|e| CloudError::Other(format!("failed to stat file: {}", e)))?;
+            .map_err(|e| ObjectStoreError::Other(format!("failed to stat file: {}", e)))?;
         let file_size = metadata.len();
 
         debug!(
@@ -220,14 +220,18 @@ impl CloudBackend for GcsBackend {
 
         let bucket = self.bucket.as_str();
 
-        crate::cloud_helpers::retry_async("upload_chunk_zerocopy", MAX_UPLOAD_RETRIES, || async {
-            let data = tokio::fs::read(file_path)
-                .await
-                .map_err(|e| CloudError::Other(format!("failed to read file: {}", e)))?;
-            self.api
-                .write_object(bucket, &full_key, Bytes::from(data))
-                .await
-        })
+        crate::object_store_helpers::retry_async(
+            "upload_chunk_zerocopy",
+            MAX_UPLOAD_RETRIES,
+            || async {
+                let data = tokio::fs::read(file_path)
+                    .await
+                    .map_err(|e| ObjectStoreError::Other(format!("failed to read file: {}", e)))?;
+                self.api
+                    .write_object(bucket, &full_key, Bytes::from(data))
+                    .await
+            },
+        )
         .await?;
 
         Ok(file_size)
@@ -239,7 +243,7 @@ impl CloudBackend for GcsBackend {
 
         let bucket = self.bucket.as_str();
 
-        crate::cloud_helpers::retry_async("download_chunk", MAX_DOWNLOAD_RETRIES, || async {
+        crate::object_store_helpers::retry_async("download_chunk", MAX_DOWNLOAD_RETRIES, || async {
             // Drain the streamed body into a single Vec inside the
             // retry closure so a mid-stream error replays the whole
             // RPC instead of returning a half-filled buffer.
@@ -280,10 +284,11 @@ impl CloudBackend for GcsBackend {
         for (idx, key) in keys.iter().enumerate() {
             if tasks.len() >= MAX_CONCURRENT_DOWNLOADS {
                 let Some(finished) = tasks.join_next().await else {
-                    return Err(CloudError::Other("Task join failed".to_string()));
+                    return Err(ObjectStoreError::Other("Task join failed".to_string()));
                 };
-                let (result_idx, data) = finished
-                    .map_err(|e| CloudError::Other(format!("Download task panicked: {}", e)))??;
+                let (result_idx, data) = finished.map_err(|e| {
+                    ObjectStoreError::Other(format!("Download task panicked: {}", e))
+                })??;
                 results[result_idx] = Some(data);
             }
 
@@ -292,13 +297,13 @@ impl CloudBackend for GcsBackend {
 
             tasks.spawn(async move {
                 let data = gcs.download_chunk(&key_clone).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, data))
+                Ok::<(usize, Vec<u8>), ObjectStoreError>((idx, data))
             });
         }
 
         while let Some(finished) = tasks.join_next().await {
             let (result_idx, data) = finished
-                .map_err(|e| CloudError::Other(format!("Download task panicked: {}", e)))??;
+                .map_err(|e| ObjectStoreError::Other(format!("Download task panicked: {}", e)))??;
             results[result_idx] = Some(data);
         }
 
@@ -307,7 +312,7 @@ impl CloudBackend for GcsBackend {
             .enumerate()
             .map(|(idx, opt)| {
                 opt.ok_or_else(|| {
-                    CloudError::Other(format!(
+                    ObjectStoreError::Other(format!(
                         "Missing download result for chunk at index {}",
                         idx
                     ))
@@ -327,7 +332,7 @@ impl CloudBackend for GcsBackend {
         let bucket = self.bucket.as_str();
         let body = Bytes::from(json.as_bytes().to_vec());
 
-        crate::cloud_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
+        crate::object_store_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
             self.api.write_object(bucket, &full_key, body.clone()).await
         })
         .await
@@ -339,17 +344,22 @@ impl CloudBackend for GcsBackend {
 
         let bucket = self.bucket.as_str();
 
-        crate::cloud_helpers::retry_async("download_manifest", MAX_DOWNLOAD_RETRIES, || async {
-            let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
-            let json = String::from_utf8(buf)
-                .map_err(|e| CloudError::Other(format!("manifest not valid UTF-8: {}", e)))?;
-            debug!(
-                "Downloaded manifest from GCS: {} ({} bytes)",
-                full_key,
-                json.len()
-            );
-            Ok(json)
-        })
+        crate::object_store_helpers::retry_async(
+            "download_manifest",
+            MAX_DOWNLOAD_RETRIES,
+            || async {
+                let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
+                let json = String::from_utf8(buf).map_err(|e| {
+                    ObjectStoreError::Other(format!("manifest not valid UTF-8: {}", e))
+                })?;
+                debug!(
+                    "Downloaded manifest from GCS: {} ({} bytes)",
+                    full_key,
+                    json.len()
+                );
+                Ok(json)
+            },
+        )
         .await
     }
 
@@ -396,7 +406,7 @@ impl CloudBackend for GcsBackend {
         "gcs"
     }
 
-    async fn lock_state(&self) -> Result<crate::cloud_backend::LockState> {
+    async fn lock_state(&self) -> Result<crate::object_store_backend::LockState> {
         let policy = self.api.get_bucket_retention(&self.bucket).await?;
         let Some(policy) = policy else {
             debug!(
@@ -406,7 +416,7 @@ impl CloudBackend for GcsBackend {
                  is a different feature and lives elsewhere). Returning LockState::Off.",
                 self.bucket
             );
-            return Ok(crate::cloud_backend::LockState::Off);
+            return Ok(crate::object_store_backend::LockState::Off);
         };
         // GCS retention duration is a wkt::Duration. A configured
         // policy is in effect as long as seconds > 0 — sub-day
@@ -419,9 +429,9 @@ impl CloudBackend for GcsBackend {
             self.bucket, policy.seconds, days, policy.is_locked
         );
         if policy.is_locked {
-            Ok(crate::cloud_backend::LockState::Compliance { default_days: days })
+            Ok(crate::object_store_backend::LockState::Compliance { default_days: days })
         } else {
-            Ok(crate::cloud_backend::LockState::Governance { default_days: days })
+            Ok(crate::object_store_backend::LockState::Governance { default_days: days })
         }
     }
 
@@ -437,7 +447,7 @@ impl CloudBackend for GcsBackend {
         self.api.get_event_based_hold(&self.bucket, &full_key).await
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         Box::new(self.clone())
     }
 }
@@ -445,9 +455,9 @@ impl CloudBackend for GcsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud_backend::LockState;
     use crate::compression::CompressionConfig;
     use crate::gcs_api::RetentionPolicy;
+    use crate::object_store_backend::LockState;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -604,7 +614,7 @@ mod tests {
     #[test]
     fn clone_box_yields_independent_handle() {
         let backend = backend_with(Arc::new(MockGcsApi::default()));
-        let boxed: Box<dyn CloudBackend> = Box::new(backend);
+        let boxed: Box<dyn ObjectStoreBackend> = Box::new(backend);
         let cloned = boxed.clone();
         assert_eq!(cloned.backend_type(), "gcs");
     }
@@ -649,8 +659,10 @@ mod tests {
         // Fail twice (retryable), succeed on the 3rd attempt.
         {
             let mut g = api.write_outcomes.lock().expect("queue");
-            g.push(Err(CloudError::Other("503 service unavailable".into())));
-            g.push(Err(CloudError::Other("502 bad gateway".into())));
+            g.push(Err(ObjectStoreError::Other(
+                "503 service unavailable".into(),
+            )));
+            g.push(Err(ObjectStoreError::Other("502 bad gateway".into())));
             g.push(Ok(()));
         }
         let backend = backend_with(api.clone());
@@ -666,7 +678,9 @@ mod tests {
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.write_outcomes.lock().expect("queue");
-            g.push(Err(CloudError::Other("AccessDenied: forbidden".into())));
+            g.push(Err(ObjectStoreError::Other(
+                "AccessDenied: forbidden".into(),
+            )));
         }
         let backend = backend_with(api.clone());
         let err = backend
@@ -674,7 +688,7 @@ mod tests {
             .await
             .expect_err("must fail fast");
         match err {
-            CloudError::Other(_) => {}
+            ObjectStoreError::Other(_) => {}
             other => panic!("expected Other, got {other:?}"),
         }
         // Permanent classification → single attempt, no retry burn.
@@ -727,7 +741,7 @@ mod tests {
             .upload_chunk_zerocopy("chunks/zc.dat", std::path::Path::new("/no/such/file.dat"))
             .await
             .expect_err("missing file must error");
-        assert!(matches!(err, CloudError::Other(_)));
+        assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -769,7 +783,7 @@ mod tests {
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.read_outcomes.lock().expect("queue");
-            g.push(Err(CloudError::Other("504 gateway timeout".into())));
+            g.push(Err(ObjectStoreError::Other("504 gateway timeout".into())));
             g.push(Ok(b"ok".to_vec()));
         }
         let backend = backend_with(api.clone());
@@ -860,7 +874,7 @@ mod tests {
             .download_manifest("manifests/bad.json")
             .await
             .expect_err("must reject");
-        assert!(matches!(err, CloudError::Other(_)));
+        assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -881,11 +895,13 @@ mod tests {
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.exists_outcomes.lock().expect("queue");
-            g.push(Err(CloudError::Other("AccessDenied: forbidden".into())));
+            g.push(Err(ObjectStoreError::Other(
+                "AccessDenied: forbidden".into(),
+            )));
         }
         let backend = backend_with(api);
         let err = backend.chunk_exists("a").await.expect_err("must error");
-        assert!(matches!(err, CloudError::Other(_)));
+        assert!(matches!(err, ObjectStoreError::Other(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -999,7 +1015,7 @@ mod tests {
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.retention_outcomes.lock().expect("queue");
-            g.push(Err(CloudError::Other("AccessDenied".into())));
+            g.push(Err(ObjectStoreError::Other("AccessDenied".into())));
         }
         let backend = backend_with(api);
         backend.lock_state().await.expect_err("error");
@@ -1050,7 +1066,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn warmup_prefix_default_returns_zero() {
         let backend = backend_with(Arc::new(MockGcsApi::default()));
-        // CloudBackend trait default — GCS doesn't override.
+        // ObjectStoreBackend trait default — GCS doesn't override.
         let n = backend.warmup_prefix("chunks/").await.expect("warmup");
         assert_eq!(n, 0);
     }

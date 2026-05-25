@@ -94,7 +94,7 @@ impl std::fmt::Debug for AzureKvBackend {
 
 impl AzureKvBackend {
     /// Construct a KV client + handle bound to one RSA key. Credential
-    /// construction matches `shared_cloud::azure::AzureBackend`'s AAD
+    /// construction matches `shared_object_store::azure::AzureBackend`'s AAD
     /// service-principal path so the same operator-facing env-var
     /// shape works (`AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET`).
     pub async fn new(

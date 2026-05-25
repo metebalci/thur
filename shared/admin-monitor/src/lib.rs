@@ -106,7 +106,7 @@ pub struct MonitorSnapshot {
     pub started_at_unix: i64,
     pub product: ProductSnapshot,
     pub pool: Vec<PoolEntry>,
-    pub cloud: Vec<CloudEntry>,
+    pub storage: Vec<StorageEntry>,
     pub audit: AuditEntry,
 }
 
@@ -132,7 +132,7 @@ pub struct PoolEntry {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CloudEntry {
+pub struct StorageEntry {
     pub backend: String,
     pub put_ops_total: u64,
     pub get_ops_total: u64,
@@ -222,10 +222,10 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
             .then_with(|| a.namespace.cmp(&b.namespace))
     });
 
-    let mut cloud: Vec<CloudEntry> = snap
-        .cloud
+    let mut storage: Vec<StorageEntry> = snap
+        .storage
         .iter()
-        .map(|(name, c)| CloudEntry {
+        .map(|(name, c)| StorageEntry {
             backend: name.clone(),
             put_ops_total: c.put_ops,
             get_ops_total: c.get_ops,
@@ -234,7 +234,7 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
             errors_total: c.errors,
         })
         .collect();
-    cloud.sort_by(|a, b| a.backend.cmp(&b.backend));
+    storage.sort_by(|a, b| a.backend.cmp(&b.backend));
 
     MonitorSnapshot {
         ts_unix,
@@ -243,7 +243,7 @@ fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
         started_at_unix: state.started_at_unix(),
         product: state.snapshot_product(),
         pool,
-        cloud,
+        storage,
         audit: AuditEntry {
             entries_total: snap.audit_entries_total,
         },
@@ -296,8 +296,8 @@ mod tests {
     fn build_payload_sorts_backends_and_threads_counters() {
         let live = Arc::new(LiveStats::default());
         // Bump a couple of counters so the snapshot is non-empty.
-        live.record_cloud_op("z-backend", "put", "ok", 100);
-        live.record_cloud_op("a-backend", "get", "ok", 50);
+        live.record_storage_op("z-backend", "put", "ok", 100);
+        live.record_storage_op("a-backend", "get", "ok", 50);
         live.record_audit_entry();
         live.record_audit_entry();
 
@@ -311,11 +311,11 @@ mod tests {
 
         assert_eq!(snap.daemon, "fake");
         assert_eq!(snap.started_at_unix, 1_000_000);
-        assert_eq!(snap.cloud.len(), 2);
-        assert_eq!(snap.cloud[0].backend, "a-backend");
-        assert_eq!(snap.cloud[0].get_ops_total, 1);
-        assert_eq!(snap.cloud[1].backend, "z-backend");
-        assert_eq!(snap.cloud[1].put_ops_total, 1);
+        assert_eq!(snap.storage.len(), 2);
+        assert_eq!(snap.storage[0].backend, "a-backend");
+        assert_eq!(snap.storage[0].get_ops_total, 1);
+        assert_eq!(snap.storage[1].backend, "z-backend");
+        assert_eq!(snap.storage[1].put_ops_total, 1);
         assert_eq!(snap.audit.entries_total, 2);
 
         match snap.product {

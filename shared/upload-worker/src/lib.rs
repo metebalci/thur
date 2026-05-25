@@ -7,7 +7,7 @@
 //! Two surfaces:
 //!
 //! - [`upload_chunk_inert`] — stateless async function that uploads a
-//!   single [`PendingUpload`] to a [`CloudBackend`], doing the
+//!   single [`PendingUpload`] to a [`ObjectStoreBackend`], doing the
 //!   cloud-side dedup HEAD probe (under `DedupScope::Global`) before
 //!   the PUT. Returns an [`UploadOutcome`] the caller can use to update
 //!   product-specific index state. No cartridge / volume borrow held
@@ -66,4 +66,4 @@ pub use pipeline::run_upload_pipeline;
 // Re-export DedupScope for callers of this crate so the `payload`
 // surface is self-contained — they don't need a parallel
 // `shared-cloud` dep just to construct a `PendingUpload`.
-pub use shared_cloud::DedupScope;
+pub use shared_object_store::DedupScope;

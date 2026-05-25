@@ -83,7 +83,7 @@ pub async fn scan_and_enqueue_orphans(
 
     if let Some(ref a) = audit {
         a.try_append(
-            "cloud.orphan_scan_started",
+            "storage.orphan_scan_started",
             AuditActor::system(),
             json!({ "cartridges_scanned": cartridges_scanned }),
             AuditResult::Ok,
@@ -149,7 +149,7 @@ fn finalize(
     shared_telemetry::record::orphan_scan_completed(orphans_found as u64, elapsed);
     if let Some(a) = audit {
         a.try_append(
-            "cloud.orphan_scan_completed",
+            "storage.orphan_scan_completed",
             AuditActor::system(),
             json!({
                 "orphans_found": orphans_found,

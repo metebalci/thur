@@ -38,7 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use shared_pool::ChunkPool;
 
 use crate::chunk_index::ChunkIndexFile;
@@ -76,9 +76,9 @@ pub struct MigrateOptions<'a> {
     /// Backend handles. Source and target must be distinct named
     /// backends (the operator-stated names below are validated against
     /// `manifest.backend`).
-    pub source: &'a dyn CloudBackend,
+    pub source: &'a dyn ObjectStoreBackend,
     pub source_name: &'a str,
-    pub target: &'a dyn CloudBackend,
+    pub target: &'a dyn ObjectStoreBackend,
     pub target_name: &'a str,
     pub mode: MigrateMode,
     /// `true` short-circuits before any mutation. The report carries
@@ -204,7 +204,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
     for entry in chunk_idx.iter() {
         let (_id, rec) = entry?;
         if let Some(hash) = rec.hash {
-            chunk_keys.push(ChunkPool::cloud_key_for(namespace, &hash));
+            chunk_keys.push(ChunkPool::object_key_for(namespace, &hash));
             chunk_hashes.push(hash);
             chunk_sizes.push(rec.size);
         }
@@ -380,9 +380,9 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
     Ok(report)
 }
 
-/// Translate `shared_cloud` errors into `SmcError` for `?` propagation.
-fn cloud_err(e: shared_cloud::CloudError) -> SmcError {
-    SmcError::CloudError(e.to_string())
+/// Translate `shared_object_store` errors into `SmcError` for `?` propagation.
+fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+    SmcError::ObjectStoreError(e.to_string())
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
@@ -392,8 +392,8 @@ fn blake3_hex(bytes: &[u8]) -> String {
 }
 
 async fn copy_one_object(
-    source: &dyn CloudBackend,
-    target: &dyn CloudBackend,
+    source: &dyn ObjectStoreBackend,
+    target: &dyn ObjectStoreBackend,
     key: &str,
 ) -> Result<()> {
     // Two key shapes live under `manifests/<barcode>/`:

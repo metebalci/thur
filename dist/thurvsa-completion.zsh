@@ -53,13 +53,13 @@ _arguments "${_arguments_options[@]}" : \
             (create)
 _arguments "${_arguments_options[@]}" : \
 '--size=[Logical volume size, e.g. \`1T\`, \`500G\`, \`4096\`]:SIZE:_default' \
-'--backend=[Cloud backend name to bind this volume to]:BACKEND:_default' \
-'--page-size=[Page size — chunk unit for cloud upload + disk cache]:PAGE_SIZE:_default' \
+'--backend=[Storage backend name to bind this volume to]:BACKEND:_default' \
+'--page-size=[Page size — chunk unit for backend upload + disk cache]:PAGE_SIZE:_default' \
 '--dedup=[Dedup scope\: \`local\` (default) or \`global\`]:DEDUP:(local global)' \
 '--key-file=[Supply the at-rest DEK from PATH instead of minting one]:PATH:_files' \
 '--keystore=[Keystore backend that wraps this volume'\''s DEK]:NAME:_default' \
 '--dek-source=[Where the DEK is minted (requires --encrypt)]:DEK_SOURCE:(daemon backend)' \
-'--sync-after=[Initial SYNCHRONIZE CACHE durability tier (mutable later via \`volume modify --sync-after\`)]:SYNC_AFTER:(cloud disk memory)' \
+'--sync-after=[Initial SYNCHRONIZE CACHE durability tier (mutable later via \`volume modify --sync-after\`)]:SYNC_AFTER:(storage disk memory)' \
 '--lun=[Pin this volume to LUN N]:N:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -109,7 +109,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (modify)
 _arguments "${_arguments_options[@]}" : \
-'--sync-after=[New SYNCHRONIZE CACHE durability tier]:SYNC_AFTER:(cloud disk memory)' \
+'--sync-after=[New SYNCHRONIZE CACHE durability tier]:SYNC_AFTER:(storage disk memory)' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
@@ -302,7 +302,7 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-system-command-$line[1]:"
         case $line[1] in
-            (cloud)
+            (storage)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -310,15 +310,15 @@ _arguments "${_arguments_options[@]}" : \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-":: :_thurvsa__subcmd__system__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvsa__subcmd__system__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvsa-system-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvsa-system-storage-command-$line[1]:"
         case $line[1] in
             (benchmark)
 _arguments "${_arguments_options[@]}" : \
@@ -340,7 +340,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvsa__subcmd__system__subcmd__cloud__subcmd__help_commands" \
+":: :_thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -348,7 +348,7 @@ _arguments "${_arguments_options[@]}" : \
     (help)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvsa-system-cloud-help-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvsa-system-storage-help-command-$line[1]:"
         case $line[1] in
             (benchmark)
 _arguments "${_arguments_options[@]}" : \
@@ -372,7 +372,7 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--dry-run[Show what would be deleted without actually deleting]' \
-'--cloud[Also delete orphan objects from the cloud bucket]' \
+'--storage[Also delete orphan objects from the storage backend]' \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -620,7 +620,7 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--skip-cloud[Skip the cloud sweep (local-only audit)]' \
+'--skip-storage[Skip the storage-backend sweep (local-only audit)]' \
 '--verbose[Per-volume breakdown (every error and warning)]' \
 '--json[Emit the full report as JSON for CI / automation]' \
 '--copyright[Print the copyright + license notice and exit]' \
@@ -641,17 +641,17 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-system-help-command-$line[1]:"
         case $line[1] in
-            (cloud)
+            (storage)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvsa__subcmd__system__subcmd__help__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvsa-system-help-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvsa-system-help-storage-command-$line[1]:"
         case $line[1] in
             (benchmark)
 _arguments "${_arguments_options[@]}" : \
@@ -1486,17 +1486,17 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-help-system-command-$line[1]:"
         case $line[1] in
-            (cloud)
+            (storage)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvsa__subcmd__help__subcmd__system__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvsa-help-system-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvsa-help-system-storage-command-$line[1]:"
         case $line[1] in
             (benchmark)
 _arguments "${_arguments_options[@]}" : \
@@ -2009,7 +2009,7 @@ _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands()
 (( $+functions[_thurvsa__subcmd__help__subcmd__system_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system_commands() {
     local commands; commands=(
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -2075,18 +2075,6 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__audit__subcmd__verify-offline_co
     local commands; commands=()
     _describe -t commands 'thurvsa help system audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__cloud_commands] )) ||
-_thurvsa__subcmd__help__subcmd__system__subcmd__cloud_commands() {
-    local commands; commands=(
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-    )
-    _describe -t commands 'thurvsa help system cloud commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvsa__subcmd__help__subcmd__system__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvsa help system cloud benchmark commands' commands "$@"
-}
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__daemon-health_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -2111,6 +2099,18 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvsa__subcmd__help__subcmd__system__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help system stats commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands] )) ||
+_thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands() {
+    local commands; commands=(
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+    )
+    _describe -t commands 'thurvsa help system storage commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help system storage benchmark commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__verify_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__verify_commands() {
@@ -2570,7 +2570,7 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands() {
 (( $+functions[_thurvsa__subcmd__system_commands] )) ||
 _thurvsa__subcmd__system_commands() {
     local commands; commands=(
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -2705,37 +2705,6 @@ _thurvsa__subcmd__system__subcmd__audit__subcmd__verify-offline_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvsa__subcmd__system__subcmd__cloud_commands] )) ||
-_thurvsa__subcmd__system__subcmd__cloud_commands() {
-    local commands; commands=(
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-'help:Print this message or the help of the given subcommand(s)' \
-    )
-    _describe -t commands 'thurvsa system cloud commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__system__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvsa__subcmd__system__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvsa system cloud benchmark commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__system__subcmd__cloud__subcmd__help_commands] )) ||
-_thurvsa__subcmd__system__subcmd__cloud__subcmd__help_commands() {
-    local commands; commands=(
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-'help:Print this message or the help of the given subcommand(s)' \
-    )
-    _describe -t commands 'thurvsa system cloud help commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__system__subcmd__cloud__subcmd__help__subcmd__benchmark_commands] )) ||
-_thurvsa__subcmd__system__subcmd__cloud__subcmd__help__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvsa system cloud help benchmark commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__system__subcmd__cloud__subcmd__help__subcmd__help_commands] )) ||
-_thurvsa__subcmd__system__subcmd__cloud__subcmd__help__subcmd__help_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvsa system cloud help help commands' commands "$@"
-}
 (( $+functions[_thurvsa__subcmd__system__subcmd__daemon-health_commands] )) ||
 _thurvsa__subcmd__system__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -2749,7 +2718,7 @@ _thurvsa__subcmd__system__subcmd__gc_commands() {
 (( $+functions[_thurvsa__subcmd__system__subcmd__help_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help_commands() {
     local commands; commands=(
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
@@ -2816,18 +2785,6 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__audit__subcmd__verify-offline_co
     local commands; commands=()
     _describe -t commands 'thurvsa system help audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__cloud_commands] )) ||
-_thurvsa__subcmd__system__subcmd__help__subcmd__cloud_commands() {
-    local commands; commands=(
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-    )
-    _describe -t commands 'thurvsa system help cloud commands' commands "$@"
-}
-(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvsa__subcmd__system__subcmd__help__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvsa system help cloud benchmark commands' commands "$@"
-}
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__daemon-health_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -2858,6 +2815,18 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system help stats commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands] )) ||
+_thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands() {
+    local commands; commands=(
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+    )
+    _describe -t commands 'thurvsa system help storage commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system help storage benchmark commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__verify_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__verify_commands() {
     local commands; commands=()
@@ -2877,6 +2846,37 @@ _thurvsa__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvsa__subcmd__system__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system stats commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage_commands() {
+    local commands; commands=(
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa system storage commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands() {
+    local commands; commands=(
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa system storage help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system storage help benchmark commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system storage help help commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__system__subcmd__verify_commands] )) ||
 _thurvsa__subcmd__system__subcmd__verify_commands() {

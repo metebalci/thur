@@ -22,7 +22,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 
 use super::{
     BlockIndexFile, Cartridge, ChunkIndexFile, ChunkUploadOutcome, LocationTag,
@@ -76,7 +76,7 @@ impl Cartridge {
                 let hash = chunk.hash.as_ref().ok_or(SmcError::InvalidOp(
                     "chunk has no hash (still in staging) — seal before uploading",
                 ))?;
-                return Ok(self.chunk_store.cloud_key_in_store(hash));
+                return Ok(self.chunk_store.object_key_in_store(hash));
             }
         };
 
@@ -90,7 +90,7 @@ impl Cartridge {
         if !outcome.dedup_hit {
             tracing::info!("Successfully uploaded chunk {} to cloud", chunk_id);
         }
-        Ok(outcome.cloud_key)
+        Ok(outcome.object_key)
     }
 
     /// Snapshot of everything an external caller needs to upload a
@@ -110,7 +110,7 @@ impl Cartridge {
             item_id: chunk_id,
             hash: hash.clone(),
             local_path: self.chunk_store.store_path(hash),
-            cloud_key: self.chunk_store.cloud_key_in_store(hash),
+            object_key: self.chunk_store.object_key_in_store(hash),
             dedup: self.manifest.dedup,
             backend_name: self.manifest.backend.clone(),
         })
@@ -308,7 +308,7 @@ impl Cartridge {
     /// shape: `{"manifest": {...identity...}, "runtime": {...sidecar...}}`.
     pub async fn restore_manifest_from_cloud(
         label: &str,
-        backend: &dyn CloudBackend,
+        backend: &dyn ObjectStoreBackend,
     ) -> Result<(String, String)> {
         let latest_key = format!("manifests/{}/manifest-latest.json", label);
         tracing::info!(
@@ -353,7 +353,7 @@ impl Cartridge {
         cart_root: &Path,
         label: &str,
         runtime_json: &str,
-        backend: &dyn CloudBackend,
+        backend: &dyn ObjectStoreBackend,
     ) -> Result<()> {
         // Parse just enough of the runtime sidecar to read
         // index_epoch. We don't trust the existing on-disk file

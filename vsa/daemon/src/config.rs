@@ -10,7 +10,7 @@
 //!   manifests + page indexes and the per-backend chunk pool under
 //!   `<data_dir>/chunks/<backend>/...`. Symmetric to thurvtl's
 //!   `data_dir`.
-//! - `cloud`: the shared `CloudConfig` schema (named `backends:`
+//! - `cloud`: the shared `ObjectStoreConfig` schema (named `backends:`
 //!   map + retry / compression knobs) consumed by `shared-cloud`'s
 //!   backend constructors.
 //! - `iscsi.auth`: optional CHAP block. Schema mirrors thurvtl's
@@ -21,10 +21,10 @@
 //! - `audit`: minimal JSONL audit log (daily-rotating). Default
 //!   directory is `<data_dir>/audit/` when unset.
 //!
-//! Validation runs `CloudConfig::validate()` so an empty backend
+//! Validation runs `ObjectStoreConfig::validate()` so an empty backend
 //! map or a misconfigured Azure-WORM entry surfaces here, not later
 //! when the first volume tries to open. Connectivity probes (the
-//! list/write/delete dance from `validate_cloud_backend`) happen at
+//! list/write/delete dance from `validate_object_store_backend`) happen at
 //! discovery time on a per-volume basis — the daemon doesn't sweep
 //! every backend at boot since most runs reference only one or two.
 
@@ -32,7 +32,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 
 /// Default location for thurvsad's config. Sourced from
 /// [`shared_naming::DISK`] so the CLI and daemon agree on the path
@@ -53,7 +53,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub transport: Transport,
     #[serde(default)]
-    pub cloud: CloudConfig,
+    pub storage: ObjectStoreConfig,
     #[serde(default)]
     pub iscsi: IscsiSettings,
     /// NVMe/TCP listener settings. Only consulted when
@@ -549,11 +549,11 @@ nvmetcp:
         let f = write_config(
             r#"
 data_dir: /var/lib/thurvsa
-cloud:
+storage:
   backends:
     devbox:
       type: local
-      root_dir: /tmp/thurvsa-cloud
+      root_dir: /tmp/thurvsa-storage
 audit:
   enabled: false
 "#,

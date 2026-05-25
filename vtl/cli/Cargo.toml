@@ -217,13 +217,13 @@ shared-cli = { path = "../../shared/cli" }
 shared-cli-alerting = { path = "../../shared/cli-alerting" }
 shared-cli-iscsi = { path = "../../shared/cli-iscsi" }
 shared-cli-system = { path = "../../shared/cli-system" }
-# Direct shared-cloud dep so `library restore` (daemon-down) can read
-# `<data_dir>/cloud-backends.json` and instantiate a `CloudBackend`
-# without going through the daemon. Every other CLI verb routes
-# through the admin socket so the daemon owns this file.
-shared-cloud = { path = "../../shared/cloud" }
-# `system cloud benchmark` reuses the daemon-down benchmark engine.
-shared-cloud-bench = { path = "../../shared/cloud-bench" }
+# Direct shared-object-store dep so `library restore` (daemon-down) can
+# read `<data_dir>/storage-backends.json` and instantiate an
+# `ObjectStoreBackend` without going through the daemon. Every other
+# CLI verb routes through the admin socket so the daemon owns this file.
+shared-object-store = { path = "../../shared/object-store" }
+# `system storage benchmark` reuses the daemon-down benchmark engine.
+shared-object-store-bench = { path = "../../shared/object-store-bench" }
 # `cartridge key migrate` round-trips key material through a keystore
 # backend offline; same crate the daemon links.
 shared-keystore = { path = "../../shared/keystore" }

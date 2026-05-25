@@ -91,7 +91,7 @@ expose must answer.
 | 0x1A | MODE SENSE(6) | 🟩 Yes | M | See per-product / per-LUN mode-page tables. |
 | 0x1B | START STOP UNIT | 🟩 Yes | O | thurvtl tape: LOAD/UNLOAD on tape; no-op on changer. thurvsa block: accept-and-GOOD regardless of PowerCondition / LOEJ / START bits. |
 | 0x1C | RECEIVE DIAGNOSTIC RESULTS | 🟩 Partial | CC | Pages 0x00 (Supported Diagnostic Pages → `[0x00, 0x10]`) and 0x10 (Self-Test Results, SPC-4 §7.2.21 — 20 entries × 20 bytes, page-length 0x0190, most recent first). PCV=0 returns page 0x00. Other page codes return CHECK CONDITION + ILLEGAL REQUEST + INVALID FIELD IN CDB. (thurvtl only; thurvsa has no diagnostic ring buffer.) |
-| 0x1D | SEND DIAGNOSTIC | 🟩 Partial | M | thurvtl tape: default no-op probe (SELFTEST=0 + SELF-TEST CODE=0) returns GOOD without recording. SELFTEST=1 routes by LUN: LU0 runs library + inventory + cloud-backend health (full `validate_cloud_backend` probe — auth + write + delete on every named entry); LU1+ re-validates the loaded cartridge's `manifest.json`, or GOOD if no cartridge loaded. Foreground/background extended self-test codes (0b001..0b110) accepted as GOOD without execution. Failures return CHECK CONDITION + HARDWARE ERROR + DIAGNOSTIC FAILURE ON COMPONENT 80h. Per-LUN history (most recent 20) queryable via RECEIVE DIAGNOSTIC RESULTS page 0x10. thurvsa block: no diagnostic surface. |
+| 0x1D | SEND DIAGNOSTIC | 🟩 Partial | M | thurvtl tape: default no-op probe (SELFTEST=0 + SELF-TEST CODE=0) returns GOOD without recording. SELFTEST=1 routes by LUN: LU0 runs library + inventory + storage-backend health (full `validate_cloud_backend` probe — auth + write + delete on every named entry); LU1+ re-validates the loaded cartridge's `manifest.json`, or GOOD if no cartridge loaded. Foreground/background extended self-test codes (0b001..0b110) accepted as GOOD without execution. Failures return CHECK CONDITION + HARDWARE ERROR + DIAGNOSTIC FAILURE ON COMPONENT 80h. Per-LUN history (most recent 20) queryable via RECEIVE DIAGNOSTIC RESULTS page 0x10. thurvsa block: no diagnostic surface. |
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | 🟩 Yes | O | thurvtl tape: per-I_T-nexus state. Bit 0 (data-transport) gates SCSI UNLOAD on the drive and MOVE MEDIUM with that drive as source — refused with ILLEGAL REQUEST + 0x53/0x02. Bit 1 (mechanical) gates the admin `POST /api/v1/changer/unload` endpoint — refused with HTTP 409 + `refused: "mechanical_eject_prevented"`; `force: true` overrides. The two bits are independent. State cleared when the I_T nexus ends. Issued against changer LUN: accepted, no enforcement. thurvsa block: accept-and-GOOD regardless of bit 0 / bit 1. |
 | 0x3B | WRITE BUFFER | 🟩 Stub | O | Firmware-download surface accepted, ignored. (thurvtl only; thurvsa rejects with INVALID OPERATION CODE.) |
 | 0x3C | READ BUFFER | 🟩 Stub | O | Returns zeros. (thurvtl only.) |
@@ -787,7 +787,7 @@ second, **opt-in** encryption layer that a physical drive has no
 analog for. This layer runs entirely daemon-side, in the gap between
 chunk-seal and pool insertion: once a chunk is sealed, the whole
 chunk is wrapped in AES-256-GCM under a per-cartridge DEK before it
-is allowed into the local pool or the cloud bucket. Crucially, the
+is allowed into the local pool or the storage backend. Crucially, the
 SCSI surface does not change — host INQUIRY, the encryption-status
 pages, and MODE SENSE 0x10/0x01 all report exactly what they would
 for a plaintext cartridge, because this layer is invisible to the
@@ -970,7 +970,7 @@ VPD in Part 3; NVMe in
 | 0x2F | VERIFY (10) | 🟩 Yes | O | BYTCHK=00 reads the requested range to surface medium errors (sparse-hole pages succeed). BYTCHK=01 compares Data-Out against on-medium bytes; mismatch surfaces as MISCOMPARE (sense key 0x0E, ASC/ASCQ 0x1D/0x00). BYTCHK=10/11 rejected with INVALID FIELD IN CDB. VRPROTECT must be 0. Reservation-gated as a read-side opcode. |
 | 0x35 | SYNCHRONIZE CACHE (10) | 🟩 Yes | O | Real fence — `cache.synchronize_bytes` awaits the cache's flush of every dirty page in the requested LBA range through to cloud-ack via `VolumeWriter::write_page`. Reservation-gated as a write-side opcode. |
 | 0x41 | WRITE SAME (10) | 🟩 Partial | O | VAAI Block Zero / `blkdiscard --zeroout` primitive. Data-Out is one logical block (the per-sector pattern); the daemon expands it across the requested range. UNMAP=1 with a zero pattern routes via `cache.unmap_bytes`; other patterns expand and route via `cache.write_bytes` in 16 MiB sector-aligned chunks. ANCHOR / WRPROTECT / PBDATA / LBDATA rejected with INVALID FIELD IN CDB. NUMBER OF BLOCKS = 0 is a no-op per SBC-3 §5.49. WORM refuses with WRITE PROTECTED. Reservation-gated. |
-| 0x42 | UNMAP | 🟩 Yes | O | 8-byte header + N × 16-byte UNMAP BLOCK DESCRIPTOR. Sub-page descriptors zero the affected sectors via cache RMW; full-page descriptors clear `PageIndex` entries (cloud chunks linger until `system gc`). ANCHOR=1 rejected. Two-phase commit (validate every descriptor before any clear). WORM refuses with WRITE PROTECTED. Reservation-gated. Advertised via VPD 0xB0, VPD 0xB2 (LBPU=1, LBPRZ=001, PROVISIONING TYPE=thin), and RC16 LBPME=1. |
+| 0x42 | UNMAP | 🟩 Yes | O | 8-byte header + N × 16-byte UNMAP BLOCK DESCRIPTOR. Sub-page descriptors zero the affected sectors via cache RMW; full-page descriptors clear `PageIndex` entries (backend chunks linger until `system gc`). ANCHOR=1 rejected. Two-phase commit (validate every descriptor before any clear). WORM refuses with WRITE PROTECTED. Reservation-gated. Advertised via VPD 0xB0, VPD 0xB2 (LBPU=1, LBPRZ=001, PROVISIONING TYPE=thin), and RC16 LBPME=1. |
 | 0x83 sa 0x00 | EXTENDED COPY (LID1) | 🟩 Partial | O | The VAAI Hardware Accelerated Copy primitive — SPC-3 §6.3 LID1 subset, what ESXi and Windows VAAI issue. Identification target descriptors (type 0xE4) carrying NAA designators (designator type 0x03, 8 bytes, from VPD 0x83's NAA descriptor); block-to-block segment descriptors (type 0x02) with 16-bit block count + 64-bit src / dst LBAs. LID4 (sa 0x01) and ODX (sa 0x10 / 0x11) reject as INVALID FIELD IN CDB; T10 identification descriptors and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment fast path: same volume + page-aligned + non-overlapping → `PageCache::clone_page_range` rebinds the destination's page-index entry to the source's chunk hash, zero data I/O. Otherwise: 1 MiB streaming bytes copy via `read_bytes` + `write_bytes`. Synchronous (whole copy completes before GOOD). Destination LUN reservation-gated; WORM destinations refuse with WRITE PROTECTED. Cross-volume / multi-LUN copies supported (slow path only — cross-volume fast path is future work). Advertised via VPD 0x8F and REPORT SUPPORTED OPERATION CODES. |
 | 0x84 sa 0x00 | RECEIVE COPY RESULTS — COPY STATUS | 🟩 Yes | O | 16-byte response. COPY MANAGER STATUS = 0x02 (operation completed without errors); per-segment accounting always zero (XCOPY is synchronous so no list ID tracking). |
 | 0x84 sa 0x03 | RECEIVE COPY RESULTS — OPERATING PARAMETERS | 🟩 Yes | O | Advertises our per-XCOPY limits — max target descriptors = 2, max segment descriptors = 1, max descriptor list length = 128 bytes, max segment length = 16 MiB, data segment granularity = log2(page_size). IMPLEMENTED DESCRIPTOR LIST: 0xE4 (identification target), 0x02 (block-to-block segment). Other service actions (0x01 RECEIVE DATA, 0x04 RECEIVE FAILED SEGMENT DETAILS, 0x05 RECEIVE COPY OPERATIONS COUNT) reject with INVALID FIELD IN CDB. |
@@ -1034,7 +1034,7 @@ daemon-side**, with nothing exposed on the wire. The operator opts in
 at `volume create`; the daemon then either mints a per-volume AES-256
 key itself or takes one supplied via `--key-file`, and from that
 point on every page is AES-256-GCM encrypted before it reaches the
-chunk pool and cloud upload pipeline. Because none of this is visible
+chunk pool and backend upload pipeline. Because none of this is visible
 over SCSI, the SCSI surface is unchanged.
 
 **Operator surface:**
@@ -1067,7 +1067,7 @@ restored separately. The gap is tracked in
 
 - **Write:** plaintext page → AES-256-GCM encrypt with IV =
   `derive_iv(volume_uuid, page_id, 0)` → ciphertext+tag (page_size +
-  16 B) → BLAKE3-hash → chunk pool insert → cloud upload.
+  16 B) → BLAKE3-hash → chunk pool insert → backend upload.
 - **Read:** chunk pool / cloud fetch → ciphertext+tag → AES-256-GCM
   decrypt → plaintext page → SCSI READ buffer.
 - IV is never stored on disk; re-derived from the same identity
@@ -1078,7 +1078,7 @@ restored separately. The gap is tracked in
 
 **Threat model.** The protection this layer offers is specific: it
 keeps ciphertext meaningful only against an attacker who has read
-access to the cloud bucket or the daemon's data directory but *not*
+access to the storage backend or the daemon's data directory but *not*
 the daemon's key file. It does **not** defend against a fully
 compromised thurvsad host, where the running daemon holds the
 key in memory anyway. Stronger custody — KMIP, an external KMS, or
@@ -1114,7 +1114,7 @@ here — they are in
 | PROUT REGISTER AND MOVE (SA 0x07) rejected | thurvsa is single-port; the multi-port SA has no analog. |
 | PTPL persistence absent | PTPL_C cleared in REPORT CAPABILITIES; in-memory state only. Initiators re-register on daemon restart. |
 | MAXIMUM WRITE SAME LENGTH = 0 | No specific limit advertised. The host-side block layer or VAAI module sets its own ceiling. |
-| LBP soft-threshold notification absent | THRESHOLD EXPONENT = 0 in VPD 0xB2; thin-provisioning is bounded by the cloud backend's capacity, not a local pool watermark. |
+| LBP soft-threshold notification absent | THRESHOLD EXPONENT = 0 in VPD 0xB2; thin-provisioning is bounded by the storage backend's capacity, not a local pool watermark. |
 | TASK MANAGEMENT FUNCTIONS via REPORT SUPPORTED TMF only | ATS / ATSS / CTSS / LURS / ITNRS advertised via MAINTENANCE IN SA 0x0D; the actual TMF dispatch is shared-iscsi's responsibility. |
 
 ---

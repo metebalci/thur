@@ -150,7 +150,7 @@ iscsi:
 
 audit:
   enabled: true
-cloud:
+storage:
   backends:
     local:
       type: local

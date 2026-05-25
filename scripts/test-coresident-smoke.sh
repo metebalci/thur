@@ -111,7 +111,7 @@ http:
 iscsi:
   listen: "127.0.0.1:$VTL_ISCSI_PORT"
   target_iqn: "iqn.2025-10.com.metebalci:thurvtl"
-cloud:
+storage:
   backends:
     local:
       type: local
@@ -124,7 +124,7 @@ http:
   listen: "127.0.0.1:$VSA_HTTP_PORT"
 iscsi:
   listen: "127.0.0.1:$VSA_ISCSI_PORT"
-cloud:
+storage:
   backends:
     local:
       type: local

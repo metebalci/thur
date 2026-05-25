@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "
 bytes = "1"
 
 # TLS-PSK helpers (NVMe-TCP §3.6.1.5). openssl is already vendored
-# in the workspace dep graph via shared-cloud / shared-keystore; we
+# in the workspace dep graph via shared-object-store / shared-keystore; we
 # use it for HKDF + HMAC so there's a single crypto source of truth
 # alongside the openssl-backed TLS handshake the server uses.
 base64 = "0.22"
@@ -44,7 +44,7 @@ serde_json = "1"
 # (NVMe-TCP §3.6.1.5). s2n-tls is the only Rust TLS stack that
 # exposes a server-side external-PSK API today — see
 # memory project_tls_dependency_landscape for the full rationale.
-# Used here ONLY for nvme-tcp server-side TLS; shared-cloud /
+# Used here ONLY for nvme-tcp server-side TLS; shared-object-store /
 # shared-keystore stay on rustls + reqwest as before.
 s2n-tls = "0.3"
 s2n-tls-tokio = "0.3"

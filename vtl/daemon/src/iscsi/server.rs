@@ -10,7 +10,8 @@
 
 use anyhow::{Result, anyhow};
 use core_mediachanger::{
-    AuditActor, AuditChannel, AuditRateLimitDecision, AuditRateLimiter, AuditResult, CloudBackend,
+    AuditActor, AuditChannel, AuditRateLimitDecision, AuditRateLimiter, AuditResult,
+    ObjectStoreBackend,
 };
 use shared_iscsi::transport::{ChapAuthFactory, LoginAuditEvent, LoginAuditSink, ServerConfig};
 use std::collections::HashMap;
@@ -26,10 +27,10 @@ use crate::state::DaemonState;
 use shared_iscsi::auth::parse_chap_algorithms;
 
 /// Shared cloud-backend registry: backend-name → already-initialized
-/// `CloudBackend` handle. Lazy-populated on first use; the iSCSI READ
+/// `ObjectStoreBackend` handle. Lazy-populated on first use; the iSCSI READ
 /// prefetch hook and the daemon's upload/cache workers all resolve
 /// backend handles through this map.
-pub type CloudBackendRegistry = Arc<TokioMutex<HashMap<String, Box<dyn CloudBackend>>>>;
+pub type ObjectStoreRegistry = Arc<TokioMutex<HashMap<String, Box<dyn ObjectStoreBackend>>>>;
 
 /// iSCSI Server
 ///
@@ -132,7 +133,7 @@ impl IscsiServer {
             audit_log: self.state.audit_log.clone(),
             audit_ratelimiter: Arc::clone(&self.state.audit_ratelimiter),
             cloud_backends: Arc::clone(&self.state.cloud_backends),
-            cloud_config: Arc::clone(&self.state.cloud_config),
+            storage_config: Arc::clone(&self.state.storage_config),
             diagnostic_store: Arc::clone(&self.state.diagnostic_store),
             target_iqn: self.config.iscsi.target_iqn.clone(),
         });

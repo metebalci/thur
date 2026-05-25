@@ -5,8 +5,8 @@ cloud storage backends — S3, GCS, and Azure — and why credential
 resolution is shaped the way it is. It is the authoritative reference
 on the subject; other docs link here rather than repeat it.
 
-Every cloud backend the daemon talks to is a named definition under
-`cloud.backends:` in the daemon's YAML conffile, which is
+Every storage backend the daemon talks to is a named definition under
+`storage.backends:` in the daemon's YAML conffile, which is
 `/etc/thurvtl/thurvtl.yaml` on the VTL side and
 `/etc/thurvsa/thurvsa.yaml` on the VSA side. The workflow is the same
 each time: edit the conffile, restart the daemon, and the backends
@@ -48,7 +48,7 @@ chain.
 
 ## Per-backend `auth:` blocks
 
-Any `cloud.backends:` entry may carry an `auth:` block that pins its
+Any `storage.backends:` entry may carry an `auth:` block that pins its
 credentials. Adding that block is a **strict override** — once it is
 present, the daemon ignores every env var, instance identity, and SDK
 chain for that one backend. Other backends are untouched, so the
@@ -225,12 +225,12 @@ usable credentials.
 | **Azure** | `AZURE_STORAGE_SAS_URL` → `AZURE_TENANT_ID` + `_CLIENT_ID` + `_CLIENT_SECRET` service principal → AAD fallback chain (`ManagedIdentityCredential` IMDS / Azure VM / AKS → `DeveloperToolsCredential` `az login`) |
 
 The Azure env-var precedence is implemented in
-`shared/cloud/src/azure.rs::discover_credentials_from_env`. So that the
+`shared/object-store/src/azure.rs::discover_credentials_from_env`. So that the
 choice is never a mystery, the daemon logs which rung it picked at
 startup and warns whenever a higher-precedence env var has shadowed the
 one the operator expected.
 
-## Cloud-VM installs (instance and workload identity)
+## Managed-identity installs (instance and workload identity)
 
 On a cloud VM, the cleanest setup is to configure no credentials at
 all. Skip both the `auth:` blocks **and** the daemon env file, and let
@@ -298,7 +298,7 @@ belong to, such as `MINIO_KEY`, `WASABI_KEY`, or `AWS_PROD_KEY`.
 | Single-provider, on-prem | Credentials in `thurvtl.env` / `thurvsa.env`, no `auth:` block — the default chain reads the env vars. |
 | Single-provider, cloud VM | Nothing in the env file, no `auth:` block — instance identity flows through the SDK chain. |
 | Multi-provider (AWS + MinIO + Wasabi + …) | `auth: { type: env, ... }` on every backend with distinct env-var names per backend; drop those vars in `thurvtl.env`. The single-provider chain can't carry more than one credential set. |
-| Mixed: one cloud-VM-native + one external | Native backend gets no `auth:` block (instance identity); external backend gets `auth: { type: env, ... }` with creds in `thurvtl.env`. |
+| Mixed: one managed-identity-native + one external | Native backend gets no `auth:` block (instance identity); external backend gets `auth: { type: env, ... }` with creds in `thurvtl.env`. |
 
 ## File permissions
 
@@ -372,7 +372,7 @@ plaintext local file to enterprise HSMs:
 
 - `local` (default) — on-disk plaintext sidecar at
   `<data_dir>/keys/<volume_uuid_hex>.key` (mode 0600). Protects
-  ciphertext in cloud buckets and the local pool against bucket-leak /
+  ciphertext in storage backends and the local pool against bucket-leak /
   cold-disk theft, but **not** against a compromised thurvsad
   host.
 - `awskms` — AWS KMS envelope encryption. The plaintext DEK is never
@@ -709,7 +709,7 @@ interacts with dedup — lives in
 Forward work on key custody is tracked in
 [`../ROADMAP.md`](../ROADMAP.md) § Encryption-key management.
 
-It is worth being explicit that keystore backends and cloud-backend
+It is worth being explicit that keystore backends and storage-backend
 authentication are orthogonal concerns. The cloud credentials gate
 access to the bucket itself; the keystore gates access to the bytes
 inside it. Neither substitutes for the other.
@@ -878,7 +878,7 @@ while the `local` backend keeps a plaintext sidecar at
 `<data_dir>/keys/<cartridge_uuid_hex>.key` with mode 0600.
 
 **Pool layout.** When at-rest encryption is on, both the local chunk
-pool and the cloud bucket store **ciphertext**, under content hashes
+pool and the storage backend store **ciphertext**, under content hashes
 that are themselves computed over the **ciphertext**. Two consequences
 follow from that.
 
@@ -924,7 +924,7 @@ exit 1 with the resolved fingerprint named in the error.
 ### Testing a keystore backend end-to-end
 
 `vsa/scripts/test-keystore.sh` is the keystore counterpart of
-`test-iscsi-fs-cloud.sh`. Pick one entry from a
+`test-iscsi-fs-storage.sh`. Pick one entry from a
 `keystore-backends.yaml` source file and the script runs three phases
 against it: **wrap** (volume create stamps the manifest), **unwrap**
 (a daemon restart makes discovery re-open the volume), and **migrate**
@@ -1240,12 +1240,12 @@ Debian and Ubuntu that ships in the `ktls-utils` package.
 
 ## Test-only failure injection (LocalBackend)
 
-`LocalBackend` (`type: local`) reads the `THUR_CLOUD_INJECT_FAIL` env
+`LocalBackend` (`type: local`) reads the `THUR_STORAGE_INJECT_FAIL` env
 var at construction time. When it is set, its value is a
 comma-separated list of `kind@pattern` rules. On each operation the
 backend short-circuits with a synthetic classified error, and that
 error lands in the daemon log through the very same
-`cloud_helpers::retry_async` path the real backends use — so the test
+`object_store_helpers::retry_async` path the real backends use — so the test
 exercises the genuine error-handling code, not a separate stub.
 
 The rule grammar has two parts:
@@ -1263,16 +1263,16 @@ The rule grammar has two parts:
 
 ```bash
 # Make every chunk upload fail as if creds were revoked.
-THUR_CLOUD_INJECT_FAIL="auth@chunks/*"
+THUR_STORAGE_INJECT_FAIL="auth@chunks/*"
 
 # Time out chunks but let manifests through (exercises the give-up path).
-THUR_CLOUD_INJECT_FAIL="timeout@chunks/*"
+THUR_STORAGE_INJECT_FAIL="timeout@chunks/*"
 
 # Multiple rules: first match wins.
-THUR_CLOUD_INJECT_FAIL="authz@manifests/*,notfound@indexes/*"
+THUR_STORAGE_INJECT_FAIL="authz@manifests/*,notfound@indexes/*"
 ```
 
 This is off by default and exists for the failure-path shell tests —
-`vtl/scripts/test-backup-cloud-failures.sh` and
-`vsa/scripts/test-fs-cloud-failures.sh`. Real cloud backends ignore
+`vtl/scripts/test-backup-storage-failures.sh` and
+`vsa/scripts/test-fs-storage-failures.sh`. Real storage backends ignore
 the env var entirely.

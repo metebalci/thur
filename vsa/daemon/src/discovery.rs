@@ -4,7 +4,7 @@
 //! Volume discovery + LUN assignment + backend instantiation.
 //!
 //! Boot path: walk `<data_dir>/volumes/`, group by `manifest.backend`,
-//! instantiate one `Arc<dyn CloudBackend>` per unique backend name (so
+//! instantiate one `Arc<dyn ObjectStoreBackend>` per unique backend name (so
 //! N volumes pointing at the same backend share one client + cred
 //! material), and bind each volume to a deterministic LUN — sorted
 //! ascending by volume name, starting at 0. Operator-pinned LUNs are
@@ -20,8 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use core_block::{self, PageCache, UploadTask, VolumeManifest, VolumeWriter};
-use shared_cloud::{CloudBackend, CloudConfig};
 use shared_keystore::{KeyStoreBackend, KeystoreYamlConfig};
+use shared_object_store::{ObjectStoreBackend, ObjectStoreConfig};
 use shared_pool::PoolBudget;
 use tokio::sync::mpsc;
 
@@ -42,7 +42,7 @@ pub struct DiscoveredVolume {
 /// Walk `<data_dir>/volumes/`, build a [`VolumeRegistry`], and return
 /// it alongside a per-volume summary list (LUN order), the per-
 /// volume [`PageCache`] handles (so the daemon can spawn flush
-/// workers), and the cache of `Arc<dyn CloudBackend>` instances
+/// workers), and the cache of `Arc<dyn ObjectStoreBackend>` instances
 /// built up during discovery. Returns an empty registry + empty
 /// summary list when no volumes exist — the daemon can still boot
 /// to wait for the first `thurvsa volume create`. The backend
@@ -53,7 +53,7 @@ pub struct DiscoveredVolume {
 #[allow(clippy::too_many_arguments)]
 pub async fn discover_and_register(
     data_dir: &Path,
-    cloud: &CloudConfig,
+    cloud: &ObjectStoreConfig,
     keystore_config: &KeystoreYamlConfig,
     max_concurrent_flushes: usize,
     pool_budgets: &HashMap<String, Arc<PoolBudget>>,
@@ -63,7 +63,7 @@ pub async fn discover_and_register(
     VolumeRegistry,
     Vec<DiscoveredVolume>,
     Vec<Arc<PageCache>>,
-    BTreeMap<String, Arc<dyn CloudBackend>>,
+    BTreeMap<String, Arc<dyn ObjectStoreBackend>>,
     BTreeMap<String, Arc<dyn KeyStoreBackend>>,
 )> {
     let names = VolumeManifest::list(data_dir)
@@ -136,17 +136,17 @@ pub async fn discover_and_register(
         }
     }
 
-    // One CloudBackend per unique manifest.backend. Instantiation
+    // One ObjectStoreBackend per unique manifest.backend. Instantiation
     // reads creds and (for non-Local) issues an SDK construction
     // call, so we do it once per name.
-    let mut backends: BTreeMap<String, Arc<dyn CloudBackend>> = BTreeMap::new();
+    let mut backends: BTreeMap<String, Arc<dyn ObjectStoreBackend>> = BTreeMap::new();
     for m in &manifests {
         if backends.contains_key(&m.backend) {
             continue;
         }
         if !cloud.backends.contains_key(&m.backend) {
             return Err(anyhow!(
-                "volume '{}' references cloud backend '{}' which is not defined under `cloud.backends:` in the YAML conffile",
+                "volume '{}' references storage backend '{}' which is not defined under `cloud.backends:` in the YAML conffile",
                 m.name,
                 m.backend
             ));
@@ -156,16 +156,16 @@ pub async fn discover_and_register(
             .await
             .with_context(|| {
                 format!(
-                    "instantiate cloud backend '{}' (referenced by volume '{}')",
+                    "instantiate storage backend '{}' (referenced by volume '{}')",
                     m.backend, m.name
                 )
             })?;
-        let backend_arc: Arc<dyn CloudBackend> = Arc::from(backend_box);
+        let backend_arc: Arc<dyn ObjectStoreBackend> = Arc::from(backend_box);
         // Cache warmup: LIST chunks/ once and seed every key as
         // `Probed` so subsequent chunk_exists / upload_chunk hit the
         // cache. Non-blocking — a LIST failure leaves the cache cold;
         // next write does a real HEAD/PUT (same as pre-cache behaviour).
-        let warmup_arc: Arc<dyn CloudBackend> = Arc::clone(&backend_arc);
+        let warmup_arc: Arc<dyn ObjectStoreBackend> = Arc::clone(&backend_arc);
         let warmup_name = m.backend.clone();
         tokio::spawn(async move {
             match warmup_arc.warmup_prefix("chunks/").await {
@@ -315,7 +315,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
-    fn local_cloud_config(root: &Path) -> CloudConfig {
+    fn local_storage_config(root: &Path) -> ObjectStoreConfig {
         let yaml = format!(
             r#"
 backends:
@@ -325,7 +325,8 @@ backends:
 "#,
             root.display()
         );
-        let cfg: CloudConfig = serde_yaml::from_str(&yaml).expect("parse local CloudConfig");
+        let cfg: ObjectStoreConfig =
+            serde_yaml::from_str(&yaml).expect("parse local ObjectStoreConfig");
         cfg.validate_backends().expect("validate");
         cfg
     }
@@ -366,7 +367,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
 
         let (reg, vols, _caches, _backends, _keystores) = discover_and_register(
             tmp.path(),
@@ -388,7 +389,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
 
         create_volume(tmp.path(), "zeta", "devbox");
         create_volume(tmp.path(), "alpha", "devbox");
@@ -419,7 +420,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
         create_volume(tmp.path(), "vol1", "devbox");
 
         let (registry, vols, _caches, _backends, _keystores) = discover_and_register(
@@ -464,7 +465,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
 
         // Volume points at a backend name not in thurvsa.yaml.
         create_volume(tmp.path(), "vol1", "ghost");
@@ -521,7 +522,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
 
         create_volume_with_lun(tmp.path(), "alpha", "devbox", 5);
         create_volume_with_lun(tmp.path(), "beta", "devbox", 5);
@@ -557,7 +558,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
 
         create_volume_with_lun(tmp.path(), "pinned", "devbox", 0);
         create_volume(tmp.path(), "auto_a", "devbox");
@@ -589,7 +590,7 @@ backends:
         let tmp = TempDir::new().expect("tempdir");
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_cloud_config(&cloud_root);
+        let cfg = local_storage_config(&cloud_root);
         create_volume(tmp.path(), "a", "devbox");
         create_volume(tmp.path(), "b", "devbox");
 

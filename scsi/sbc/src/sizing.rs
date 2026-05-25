@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
     use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
-    use shared_cloud::{CloudBackend, LocalBackend};
+    use shared_object_store::{LocalBackend, ObjectStoreBackend};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -143,7 +143,7 @@ mod tests {
         let cloud_root = data_dir.join("cloud");
         std::fs::create_dir_all(&cloud_root).unwrap();
         let backend = LocalBackend::new(&cloud_root).await.unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),
             size,

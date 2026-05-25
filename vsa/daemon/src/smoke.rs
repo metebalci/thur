@@ -25,7 +25,7 @@ use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
 use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
 use scsi_sbc::{SbcScsiDispatcher, VolumeLookup};
 use scsi_spc::scsi::ScsiRequest;
-use shared_cloud::{CloudBackend, LocalBackend};
+use shared_object_store::{LocalBackend, ObjectStoreBackend};
 
 use crate::registry::VolumeRegistry;
 
@@ -97,7 +97,7 @@ async fn build_smoke_dispatcher() -> Result<(SbcScsiDispatcher, TempDir)> {
     let backend = LocalBackend::new(&cloud_root)
         .await
         .map_err(|e| anyhow!("LocalBackend init failed: {e}"))?;
-    let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     VolumeManifest::new(
         "SMOKE-VOL-1".to_string(),

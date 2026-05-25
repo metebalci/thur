@@ -18,7 +18,7 @@
 use anyhow::Result;
 use shared_admin_client::AdminClient;
 use shared_admin_proto::JobEvent;
-use shared_cloud_bench::BenchOptions;
+use shared_object_store_bench::BenchOptions;
 use std::path::Path;
 
 pub async fn cmd_check() -> Result<()> {
@@ -55,7 +55,7 @@ pub async fn cmd_benchmark(
         skip_download,
         yes,
     };
-    shared_cloud_bench::run_from_config_path(Path::new(config_path), backends, opts)
+    shared_object_store_bench::run_from_config_path(Path::new(config_path), backends, opts)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())

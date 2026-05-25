@@ -54,7 +54,7 @@ pub struct VolumeRuntime {
     /// Mutable durability tier for SCSI SYNCHRONIZE CACHE.
     /// `#[serde(default)]` so legacy runtime.json files without
     /// this field deserialise to the safe default
-    /// ([`SyncAfter::Cloud`]).
+    /// ([`SyncAfter::Storage`]).
     #[serde(default)]
     pub sync_after: SyncAfter,
 }
@@ -67,7 +67,7 @@ impl VolumeRuntime {
     }
 
     /// Build a freshly-zeroed runtime — used at `volume create` time.
-    /// `sync_after` defaults to [`SyncAfter::Cloud`]; the CLI's
+    /// `sync_after` defaults to [`SyncAfter::Storage`]; the CLI's
     /// `--sync-after <MODE>` flag can override via
     /// [`Self::new_zero_with_sync_after`].
     pub fn new_zero() -> Self {
@@ -163,7 +163,7 @@ mod tests {
         // Default `sync_after` is the safest tier — explicit so a
         // future change to the enum default doesn't silently flip
         // newly-created volumes off cloud-durable.
-        assert_eq!(r.sync_after, SyncAfter::Cloud);
+        assert_eq!(r.sync_after, SyncAfter::Storage);
     }
 
     #[test]
@@ -181,7 +181,7 @@ mod tests {
         .unwrap();
         let loaded = VolumeRuntime::load(dir.path()).unwrap();
         assert_eq!(loaded.host_bytes_written, 42);
-        assert_eq!(loaded.sync_after, SyncAfter::Cloud);
+        assert_eq!(loaded.sync_after, SyncAfter::Storage);
         assert_eq!(loaded.host_bytes_read, 0);
         assert_eq!(loaded.backend_bytes_written, 0);
         assert_eq!(loaded.backend_bytes_read, 0);

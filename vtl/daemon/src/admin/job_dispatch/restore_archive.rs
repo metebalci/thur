@@ -64,7 +64,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
 
     // Build backend handle.
     let backend = match state
-        .cloud_config
+        .storage_config
         .create_backend_named(&params.backend)
         .await
     {
@@ -195,7 +195,7 @@ fn preflight(params: &RestoreArchiveParams, state: &DaemonState) -> Result<(), S
     if params.label.is_empty() {
         return Err("label must be non-empty".to_string());
     }
-    let names = state.cloud_config.backend_names();
+    let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.backend) {
         return Err(format!(
             "backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",

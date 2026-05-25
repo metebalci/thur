@@ -226,7 +226,7 @@ impl PageCache {
     /// in-flight `VolumeWriter::write_page` calls during `flush_all` /
     /// `flush_pages_in_range` / `run_flush_worker`. The VSA daemon
     /// resolves it from `cloud.upload.max_concurrent` via
-    /// [`shared_cloud::UploadConfig::resolve_max_concurrent`] at boot
+    /// [`shared_object_store::UploadConfig::resolve_max_concurrent`] at boot
     /// and passes the resolved value here. `0` is clamped to `1` so
     /// the drain loop always makes forward progress.
     ///
@@ -652,7 +652,7 @@ impl PageCache {
     /// the operator-chosen [`SyncAfter`] tier (mutable via
     /// `thurvsa volume modify --sync-after <MODE>`):
     ///
-    /// - [`SyncAfter::Cloud`] (default) — flush dirty cache pages
+    /// - [`SyncAfter::Storage`] (default) — flush dirty cache pages
     ///   to the pool + enqueue uploads, then await the pending
     ///   tracker so every PUT for the synced range has acked. The
     ///   host's `fsync(2)` settles to "bytes are in cloud."
@@ -686,7 +686,7 @@ impl PageCache {
         // Phase 2 (Cloud only): drain the pending-upload tracker.
         // No-op under inline dispatch (pending tracker stays
         // empty) and on already-drained ranges.
-        if matches!(self.writer.sync_after(), SyncAfter::Cloud) {
+        if matches!(self.writer.sync_after(), SyncAfter::Storage) {
             self.writer
                 .pending_uploads()
                 .wait_for_range(first..=last)
@@ -1182,7 +1182,7 @@ mod tests {
     use super::*;
     use crate::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
     use crate::{DedupScope, VolumeManifest};
-    use shared_cloud::{CloudBackend, LocalBackend};
+    use shared_object_store::{LocalBackend, ObjectStoreBackend};
     use tempfile::TempDir;
 
     const PAGE: usize = DEFAULT_PAGE_SIZE_BYTES as usize;
@@ -1194,7 +1194,7 @@ mod tests {
         let cloud = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
         let backend = LocalBackend::new(&cloud).await.unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),
             size_bytes,
@@ -1361,7 +1361,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cloud = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&cloud).await.unwrap());
         VolumeManifest::new(
             "vol1".into(),
             8 * (1u64 << 20),
@@ -1670,15 +1671,15 @@ mod tests {
     // concurrency-aware constructor and a fail-injecting backend
     // wrapper.
 
-    use shared_cloud::cloud_backend::LockState;
-    use shared_cloud::compression::CompressionAlgo;
-    use shared_cloud::{CloudError, Result as CloudResult};
+    use shared_object_store::compression::CompressionAlgo;
+    use shared_object_store::object_store_backend::LockState;
+    use shared_object_store::{ObjectStoreError, Result as CloudResult};
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
-    /// Test-only `CloudBackend` decorator. Sleeps `delay` before
+    /// Test-only `ObjectStoreBackend` decorator. Sleeps `delay` before
     /// every `upload_chunk` call so the test can observe serial vs
     /// parallel drain timing; tracks max simultaneous in-flight
     /// `upload_chunk` callers; fails any call whose key is in the
@@ -1687,7 +1688,7 @@ mod tests {
     /// and inject it). Every other trait method delegates unchanged.
     #[derive(Debug)]
     struct DelayingBackend {
-        inner: Arc<dyn CloudBackend>,
+        inner: Arc<dyn ObjectStoreBackend>,
         delay: Duration,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
@@ -1695,7 +1696,7 @@ mod tests {
     }
 
     impl DelayingBackend {
-        fn new(inner: Arc<dyn CloudBackend>, delay: Duration) -> Arc<Self> {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 inner,
                 delay,
@@ -1715,7 +1716,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CloudBackend for DelayingBackend {
+    impl ObjectStoreBackend for DelayingBackend {
         async fn upload_chunk(
             &self,
             key: &str,
@@ -1740,7 +1741,9 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             if self.fail_keys.lock().unwrap().contains(key) {
-                return Err(CloudError::Other(format!("injected failure for key {key}")));
+                return Err(ObjectStoreError::Other(format!(
+                    "injected failure for key {key}"
+                )));
             }
             self.inner.upload_chunk(key, data).await
         }
@@ -1793,7 +1796,7 @@ mod tests {
             self.inner.get_object_legal_hold(key).await
         }
 
-        fn clone_box(&self) -> Box<dyn CloudBackend> {
+        fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
             Box::new(DelayingBackend {
                 inner: Arc::clone(&self.inner),
                 delay: self.delay,
@@ -1818,9 +1821,9 @@ mod tests {
         let cloud = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
         let local = LocalBackend::new(&cloud).await.unwrap();
-        let local: Arc<dyn CloudBackend> = Arc::new(local);
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(local);
         let delaying = DelayingBackend::new(Arc::clone(&local), delay);
-        let backend: Arc<dyn CloudBackend> = Arc::clone(&delaying) as _;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
         VolumeManifest::new(
             "vol1".into(),
             size_bytes,
@@ -1939,9 +1942,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cloud = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud).unwrap();
-        let local: Arc<dyn CloudBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
         let delaying = DelayingBackend::new(Arc::clone(&local), Duration::from_millis(200));
-        let backend: Arc<dyn CloudBackend> = Arc::clone(&delaying) as _;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
         VolumeManifest::new(
             "vol1".into(),
             8 * (1u64 << 20),
@@ -2000,7 +2003,7 @@ mod tests {
         // Compute the exact local-scope cloud key for page 3's
         // contents now that the writer (and its volume uuid) exist.
         let page3_hash = blake3::hash(&pattern(3, PAGE)).to_hex().to_string();
-        let fail_key = writer.pool().cloud_key(&page3_hash);
+        let fail_key = writer.pool().object_key(&page3_hash);
         delaying.add_fail_key(fail_key);
 
         for i in 0..8u32 {

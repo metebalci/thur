@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers used by every `CloudBackend` impl (S3 / GCS / Azure).
+//! Shared helpers used by every `ObjectStoreBackend` impl (S3 / GCS / Azure).
 //!
 //! Each of the three backend modules used to define near-identical
 //! versions of these utilities side by side; pulling them into one
@@ -12,7 +12,7 @@
 //! closures where adding a `self` argument adds noise without value.
 
 use crate::Result;
-use crate::cloud_config::{classify, is_retryable};
+use crate::object_store_config::{classify, is_retryable};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
@@ -61,7 +61,7 @@ pub fn full_key(prefix: &str, key: &str) -> String {
 /// * `f` — closure producing a fresh future on each call.
 ///
 /// **Permanent failures fail fast.** Each error goes through
-/// [`crate::cloud_config::classify`] and [`crate::cloud_config::is_retryable`];
+/// [`crate::object_store_config::classify`] and [`crate::object_store_config::is_retryable`];
 /// `Auth` / `Authz` / `NotFound` / `RegionMismatch` short-circuit out
 /// without consuming the backoff budget. `Network` / `Timeout` /
 /// `Other` (5xx, throttling, unclassified SDK noise) keep retrying.
@@ -114,7 +114,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CloudError;
+    use crate::ObjectStoreError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_async_fails_fast_on_permanent_auth() {
-        // CloudError::Other with an AccessDenied substring classifies
+        // ObjectStoreError::Other with an AccessDenied substring classifies
         // as Authz — permanent. retry_async must short-circuit on the
         // first attempt instead of consuming the retry budget.
         let attempts = Arc::new(AtomicU32::new(0));
@@ -145,7 +145,7 @@ mod tests {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(CloudError::Other(
+                Err(ObjectStoreError::Other(
                     "AccessDenied: bucket is forbidden".to_string(),
                 ))
             }
@@ -167,7 +167,9 @@ mod tests {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(CloudError::Other("NoSuchBucket: my-bucket".to_string()))
+                Err(ObjectStoreError::Other(
+                    "NoSuchBucket: my-bucket".to_string(),
+                ))
             }
         })
         .await;
@@ -186,7 +188,9 @@ mod tests {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(CloudError::Other("500 internal server error".to_string()))
+                Err(ObjectStoreError::Other(
+                    "500 internal server error".to_string(),
+                ))
             }
         })
         .await;
@@ -204,7 +208,7 @@ mod tests {
             async move {
                 let n = attempts.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    Err(CloudError::Other("transient".to_string()))
+                    Err(ObjectStoreError::Other("transient".to_string()))
                 } else {
                     Ok("recovered")
                 }
@@ -223,7 +227,7 @@ mod tests {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(CloudError::Other("transient".to_string()))
+                Err(ObjectStoreError::Other("transient".to_string()))
             }
         })
         .await;

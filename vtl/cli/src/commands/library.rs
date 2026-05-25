@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use core_mediachanger::{Library, LibraryPartition, SlotRange, check_daemon_not_running};
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 use std::path::{Path, PathBuf};
 
 use crate::output::{create_table, format_bytes, with_host_ratio};
@@ -44,7 +44,7 @@ pub async fn cmd_restore(
     // Parse the daemon's YAML conffile. We read it directly because
     // the daemon is down — every other CLI verb routes through the
     // admin socket so the daemon owns the live state.
-    let cloud_cfg = load_cloud_config_from_yaml(config_path)?;
+    let cloud_cfg = load_storage_config_from_yaml(config_path)?;
 
     // Resolve the backend name: --backend wins, otherwise infer when
     // exactly one is configured (mirrors `cartridge create`).
@@ -78,7 +78,7 @@ pub async fn cmd_restore(
     let backend_box = cloud_cfg
         .create_backend_named(&backend_name)
         .await
-        .with_context(|| format!("instantiate cloud backend '{}'", backend_name))?;
+        .with_context(|| format!("instantiate storage backend '{}'", backend_name))?;
 
     println!("Restoring cartridges from backend: {}", backend_name);
     if dry_run {
@@ -834,17 +834,17 @@ pub async fn cmd_restore_archive(
 /// need to know about backends shouldn't pay the cost of parsing the
 /// full daemon Config struct (which transitively pulls in every
 /// product-specific config block).
-fn load_cloud_config_from_yaml(config_path: &str) -> Result<CloudConfig> {
+fn load_storage_config_from_yaml(config_path: &str) -> Result<ObjectStoreConfig> {
     #[derive(serde::Deserialize)]
-    struct CloudOnly {
+    struct StorageOnly {
         #[serde(default)]
-        cloud: CloudConfig,
+        storage: ObjectStoreConfig,
     }
     let body =
         std::fs::read_to_string(config_path).with_context(|| format!("read {}", config_path))?;
-    let parsed: CloudOnly = serde_yaml::from_str(&body)
+    let parsed: StorageOnly = serde_yaml::from_str(&body)
         .with_context(|| format!("parse YAML conffile {}", config_path))?;
-    Ok(parsed.cloud)
+    Ok(parsed.storage)
 }
 
 #[cfg(test)]
@@ -999,17 +999,17 @@ mod tests {
     }
 
     #[test]
-    fn load_cloud_config_from_yaml_missing_file_errors() {
-        let err = load_cloud_config_from_yaml("/nonexistent/thurvtl.yaml");
+    fn load_storage_config_from_yaml_missing_file_errors() {
+        let err = load_storage_config_from_yaml("/nonexistent/thurvtl.yaml");
         assert!(err.is_err());
     }
 
     #[test]
-    fn load_cloud_config_from_yaml_empty_cloud_block_defaults() {
+    fn load_storage_config_from_yaml_empty_cloud_block_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = dir.path().join("thurvtl.yaml");
         std::fs::write(&cfg, "data_dir: /srv/thur\n").expect("write cfg");
-        let cloud = load_cloud_config_from_yaml(cfg.to_str().expect("utf8"))
+        let cloud = load_storage_config_from_yaml(cfg.to_str().expect("utf8"))
             .expect("parse yaml with no cloud block");
         assert!(cloud.backend_names().is_empty());
     }

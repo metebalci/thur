@@ -66,10 +66,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum SystemAction {
-    /// Cloud-backend operations.
-    Cloud {
+    /// Storage-backend operations.
+    Storage {
         #[command(subcommand)]
-        action: CloudAction,
+        action: StorageAction,
     },
 
     /// Garbage-collect orphan chunks from the chunk pool.
@@ -78,11 +78,11 @@ enum SystemAction {
         #[arg(long)]
         dry_run: bool,
 
-        /// Also delete orphan objects from the cloud bucket.
+        /// Also delete orphan objects from the storage backend.
         ///
         /// Skipped by default — local cleanup is the common case.
         #[arg(long)]
-        cloud: bool,
+        storage: bool,
     },
 
     /// Regenerate the admin HTTP self-signed TLS cert.
@@ -122,7 +122,7 @@ enum SystemAction {
     ///
     /// Daemon-routed. Streams a per-second snapshot over the admin
     /// socket: uptime, volumes online, iSCSI sessions, per-backend
-    /// pool used/cap + backpressure, per-backend cloud PUT/GET rate
+    /// pool used/cap + backpressure, per-backend storage PUT/GET rate
     /// over the last 60s, audit events over the last 5m.
     Monitor,
 
@@ -146,12 +146,12 @@ enum SystemAction {
 
     /// Volume-wide consistency check.
     Verify {
-        /// Skip the cloud sweep (local-only audit).
+        /// Skip the storage-backend sweep (local-only audit).
         ///
-        /// Cloud is the default — verifying without it leaves
-        /// cold-bucket DR untested.
+        /// The storage sweep is the default — verifying without it
+        /// leaves cold-bucket DR untested.
         #[arg(long)]
-        skip_cloud: bool,
+        skip_storage: bool,
 
         /// Per-volume breakdown (every error and warning).
         #[arg(long)]
@@ -271,18 +271,18 @@ enum AlertingAction {
 }
 
 #[derive(Subcommand)]
-enum CloudAction {
-    /// First-party cloud-backend throughput benchmark (daemon-down).
+enum StorageAction {
+    /// First-party storage-backend throughput benchmark (daemon-down).
     ///
     /// Drives parallel upload / download / delete against the named
-    /// backend(s) defined under `cloud.backends:` in the YAML conffile
-    /// and prints parseable `[BENCH]` lines. Issues real cloud API
+    /// backend(s) defined under `storage.backends:` in the YAML conffile
+    /// and prints parseable `[BENCH]` lines. Issues real backend API
     /// calls and transfers real bytes — runs against the operator's
     /// bucket, so expect non-zero cost on metered backends.
     Benchmark {
         /// Backend name to benchmark. Repeatable.
         ///
-        /// Defaults to every backend defined under `cloud.backends:`
+        /// Defaults to every backend defined under `storage.backends:`
         /// in the YAML conffile (lexicographic order).
         #[arg(long = "backend")]
         backends: Vec<String>,
@@ -337,14 +337,14 @@ enum VolumeAction {
         #[arg(long)]
         size: String,
 
-        /// Cloud backend name to bind this volume to.
+        /// Storage backend name to bind this volume to.
         ///
         /// Required when thurvsa.yaml defines multiple entries under
-        /// `cloud.backends`; inferred when only one backend exists.
+        /// `storage.backends`; inferred when only one backend exists.
         #[arg(long)]
         backend: Option<String>,
 
-        /// Page size — chunk unit for cloud upload + disk cache.
+        /// Page size — chunk unit for backend upload + disk cache.
         ///
         /// Power of two, multiple of the sector size. Default 64K.
         #[arg(long, default_value = "64K")]
@@ -394,9 +394,9 @@ enum VolumeAction {
         /// Initial SYNCHRONIZE CACHE durability tier (mutable later
         /// via `volume modify --sync-after`).
         ///
-        /// `cloud` (default) — fsync waits until bytes are in cloud
-        /// object store. Safest; matches the cloud-backed-storage
-        /// contract.
+        /// `storage` (default) — fsync waits until bytes are durable
+        /// in the configured storage backend. Safest; matches the
+        /// storage-backend-durable contract.
         ///
         /// `disk` — fsync waits until bytes are in the local pool.
         /// Faster; loses on daemon-host disk failure before the
@@ -405,7 +405,7 @@ enum VolumeAction {
         /// `memory` — fsync is a no-op; dirty pages stay in RAM
         /// until the periodic flush worker tick. Fastest; loses on
         /// any crash. ZFS sync=disabled equivalent.
-        #[arg(long, value_parser = ["cloud", "disk", "memory"], default_value = "cloud")]
+        #[arg(long, value_parser = ["storage", "disk", "memory"], default_value = "storage")]
         sync_after: String,
 
         /// Pin this volume to LUN N.
@@ -475,11 +475,11 @@ enum VolumeAction {
         /// New SYNCHRONIZE CACHE durability tier.
         ///
         /// See `volume create --sync-after` for the per-tier
-        /// semantic. Flipping `cloud → memory` is the dangerous
+        /// semantic. Flipping `storage → memory` is the dangerous
         /// direction — host fsyncs that previously meant
-        /// "cloud-durable" silently become no-ops; bytes the host
+        /// "storage-durable" silently become no-ops; bytes the host
         /// believes are persisted are lost on the next crash.
-        #[arg(long, value_parser = ["cloud", "disk", "memory"])]
+        #[arg(long, value_parser = ["storage", "disk", "memory"])]
         sync_after: String,
     },
 
@@ -849,7 +849,7 @@ mod cli_tests {
         assert_eq!(page_size, "64K");
         assert_eq!(dedup, "local");
         assert!(!worm);
-        assert_eq!(sync_after, "cloud");
+        assert_eq!(sync_after, "storage");
         assert!(lun.is_none());
     }
 
@@ -1052,13 +1052,13 @@ mod cli_tests {
     #[test]
     fn system_gc_flags() {
         let cli =
-            parse(&["thurvsa", "system", "gc", "--dry-run", "--cloud"]).expect("gc parses");
+            parse(&["thurvsa", "system", "gc", "--dry-run", "--storage"]).expect("gc parses");
         assert!(matches!(
             cli.command,
             Commands::System {
                 action: SystemAction::Gc {
                     dry_run: true,
-                    cloud: true
+                    storage: true
                 }
             }
         ));
@@ -1067,35 +1067,35 @@ mod cli_tests {
     #[test]
     fn system_verify_collects_volume_names() {
         let cli = parse(&[
-            "thurvsa", "system", "verify", "--skip-cloud", "--verbose", "vol1", "vol2",
+            "thurvsa", "system", "verify", "--skip-storage", "--verbose", "vol1", "vol2",
         ])
         .expect("verify parses");
         let verify = match cli.command {
             Commands::System {
                 action:
                     SystemAction::Verify {
-                        skip_cloud,
+                        skip_storage,
                         verbose,
                         json,
                         volumes,
                     },
-            } => Some((skip_cloud, verbose, json, volumes)),
+            } => Some((skip_storage, verbose, json, volumes)),
             _ => None,
         }
         .expect("expected system verify");
-        let (skip_cloud, verbose, json, volumes) = verify;
-        assert!(skip_cloud);
+        let (skip_storage, verbose, json, volumes) = verify;
+        assert!(skip_storage);
         assert!(verbose);
         assert!(!json);
         assert_eq!(volumes, vec!["vol1", "vol2"]);
     }
 
     #[test]
-    fn system_cloud_benchmark_defaults_and_sweeps() {
+    fn system_storage_benchmark_defaults_and_sweeps() {
         let cli = parse(&[
             "thurvsa",
             "system",
-            "cloud",
+            "storage",
             "benchmark",
             "--backend",
             "s3",
@@ -1106,9 +1106,9 @@ mod cli_tests {
         let bench = match cli.command {
             Commands::System {
                 action:
-                    SystemAction::Cloud {
+                    SystemAction::Storage {
                         action:
-                            CloudAction::Benchmark {
+                            StorageAction::Benchmark {
                                 backends,
                                 total_gb,
                                 chunk_size_mb,
@@ -1126,7 +1126,7 @@ mod cli_tests {
             )),
             _ => None,
         }
-        .expect("expected cloud benchmark");
+        .expect("expected storage benchmark");
         let (backends, total_gb, chunk_size_mb, concurrency, concurrency_sweep) = bench;
         assert_eq!(backends, vec!["s3"]);
         assert_eq!(total_gb, 32);

@@ -4,7 +4,7 @@
 //! Local backend for testing and development
 //!
 //! This backend stores chunks and manifests in the local filesystem without any cloud operations.
-//! It implements the CloudBackend trait but all operations are local - no network calls.
+//! It implements the ObjectStoreBackend trait but all operations are local - no network calls.
 //!
 //! This is useful for:
 //! - Development and testing without cloud dependencies
@@ -12,9 +12,9 @@
 //! - Scenarios where cloud storage is not needed
 
 use crate::Result;
-use crate::cloud_backend::CloudBackend;
-use crate::cloud_config::FailureKind;
-use crate::error::CloudError;
+use crate::error::ObjectStoreError;
+use crate::object_store_backend::ObjectStoreBackend;
+use crate::object_store_config::FailureKind;
 use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,15 +32,15 @@ use tracing::{debug, info, warn};
 /// Examples:
 ///
 /// ```text
-/// THUR_CLOUD_INJECT_FAIL="auth@chunks/*"
-/// THUR_CLOUD_INJECT_FAIL="timeout@chunks/*,authz@manifests/*"
-/// THUR_CLOUD_INJECT_FAIL="notfound@*"
+/// THUR_STORAGE_INJECT_FAIL="auth@chunks/*"
+/// THUR_STORAGE_INJECT_FAIL="timeout@chunks/*,authz@manifests/*"
+/// THUR_STORAGE_INJECT_FAIL="notfound@*"
 /// ```
 ///
 /// Off-by-default; intended for shell tests that drive
-/// `vtl/scripts/test-backup-cloud-failures.sh` and
-/// `vsa/scripts/test-fs-cloud-failures.sh`.
-pub const INJECT_ENV_VAR: &str = "THUR_CLOUD_INJECT_FAIL";
+/// `vtl/scripts/test-backup-storage-failures.sh` and
+/// `vsa/scripts/test-fs-storage-failures.sh`.
+pub const INJECT_ENV_VAR: &str = "THUR_STORAGE_INJECT_FAIL";
 
 /// Retry budget per op when injection is wired through `retry_async`.
 /// Small on purpose: a smoke test that exhausts the budget on a
@@ -57,7 +57,7 @@ const MAX_LOCAL_INJECT_RETRIES: u32 = 2;
 pub struct LocalBackend {
     /// Root directory for local storage
     root_dir: PathBuf,
-    /// Per-op failure-injection plan, read once from `THUR_CLOUD_INJECT_FAIL`
+    /// Per-op failure-injection plan, read once from `THUR_STORAGE_INJECT_FAIL`
     /// at construction. `None` in any non-test config.
     inject: Option<Arc<InjectionPlan>>,
 }
@@ -70,7 +70,7 @@ impl LocalBackend {
     ///
     /// # Example
     /// ```no_run
-    /// use shared_cloud::LocalBackend;
+    /// use shared_object_store::LocalBackend;
     ///
     /// # async fn example() {
     /// let backend = LocalBackend::new("./.thurvtl/local-backend").await.unwrap();
@@ -105,7 +105,7 @@ impl LocalBackend {
     }
 
     /// If the configured injection plan matches `key`, return a classified
-    /// synthetic `CloudError`. Otherwise `Ok(())` and the real op runs.
+    /// synthetic `ObjectStoreError`. Otherwise `Ok(())` and the real op runs.
     fn check_injection(&self, op: &'static str, key: &str) -> Result<()> {
         let Some(plan) = self.inject.as_ref() else {
             return Ok(());
@@ -117,7 +117,7 @@ impl LocalBackend {
     }
 }
 
-/// Single `kind@pattern` rule parsed from `THUR_CLOUD_INJECT_FAIL`.
+/// Single `kind@pattern` rule parsed from `THUR_STORAGE_INJECT_FAIL`.
 #[derive(Debug)]
 struct InjectionRule {
     kind: FailureKind,
@@ -223,11 +223,11 @@ impl InjectionPlan {
     }
 }
 
-/// Build a `CloudError::Other(...)` whose message contains a token that
-/// `cloud_config::classify` will deterministically map back to `kind`.
+/// Build a `ObjectStoreError::Other(...)` whose message contains a token that
+/// `object_store_config::classify` will deterministically map back to `kind`.
 /// Keeps the synthetic error indistinguishable from a real one as far
 /// as the retry classifier is concerned.
-fn synthetic_error(op: &'static str, key: &str, kind: FailureKind) -> CloudError {
+fn synthetic_error(op: &'static str, key: &str, kind: FailureKind) -> ObjectStoreError {
     let token = match kind {
         FailureKind::Auth => "InvalidAccessKeyId",
         FailureKind::Authz => "AccessDenied",
@@ -237,14 +237,14 @@ fn synthetic_error(op: &'static str, key: &str, kind: FailureKind) -> CloudError
         FailureKind::Timeout => "timed out",
         FailureKind::Other => "other",
     };
-    CloudError::Other(format!(
+    ObjectStoreError::Other(format!(
         "{token}: synthetic LocalBackend injection ({} on key={key})",
         op
     ))
 }
 
 #[async_trait]
-impl CloudBackend for LocalBackend {
+impl ObjectStoreBackend for LocalBackend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -261,35 +261,39 @@ impl CloudBackend for LocalBackend {
         // failure-path shell tests grep for. With no injection the
         // inner closure succeeds on the first try; retry_async
         // returns immediately.
-        crate::cloud_helpers::retry_async("upload_chunk", MAX_LOCAL_INJECT_RETRIES, || async {
-            self.check_injection("upload_chunk", key)?;
-            let path = self.get_path(key);
+        crate::object_store_helpers::retry_async(
+            "upload_chunk",
+            MAX_LOCAL_INJECT_RETRIES,
+            || async {
+                self.check_injection("upload_chunk", key)?;
+                let path = self.get_path(key);
 
-            // Create parent directories if needed.
-            // The `create_dir_all` is small so it stays sync.
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+                // Create parent directories if needed.
+                // The `create_dir_all` is small so it stays sync.
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
 
-            // Up to 128 MiB per chunk on the LocalBackend path. Sync
-            // `fs::write` would park a tokio worker for the full kernel
-            // flush; `tokio::fs::write` runs the syscall on the blocking
-            // pool.
-            tokio::fs::write(&path, data).await?;
+                // Up to 128 MiB per chunk on the LocalBackend path. Sync
+                // `fs::write` would park a tokio worker for the full kernel
+                // flush; `tokio::fs::write` runs the syscall on the blocking
+                // pool.
+                tokio::fs::write(&path, data).await?;
 
-            let size = data.len() as u64;
-            debug!("Local backend uploaded chunk: {} ({} bytes)", key, size);
+                let size = data.len() as u64;
+                debug!("Local backend uploaded chunk: {} ({} bytes)", key, size);
 
-            // Local backend never compresses (it's a dev / air-gapped
-            // surface). Returns no algorithm so the manifest records
-            // the chunk as uncompressed.
-            Ok((size, None, None))
-        })
+                // Local backend never compresses (it's a dev / air-gapped
+                // surface). Returns no algorithm so the manifest records
+                // the chunk as uncompressed.
+                Ok((size, None, None))
+            },
+        )
         .await
     }
 
     async fn upload_chunk_zerocopy(&self, key: &str, file_path: &Path) -> Result<u64> {
-        crate::cloud_helpers::retry_async(
+        crate::object_store_helpers::retry_async(
             "upload_chunk_zerocopy",
             MAX_LOCAL_INJECT_RETRIES,
             || async {
@@ -310,7 +314,9 @@ impl CloudBackend for LocalBackend {
                     Ok(fs::metadata(&dst)?.len())
                 })
                 .await
-                .map_err(|e| crate::CloudError::Other(format!("spawn_blocking join: {e}")))??;
+                .map_err(|e| {
+                    crate::ObjectStoreError::Other(format!("spawn_blocking join: {e}"))
+                })??;
 
                 debug!(
                     "Local backend uploaded chunk (zerocopy): {} ({} bytes)",
@@ -324,21 +330,25 @@ impl CloudBackend for LocalBackend {
     }
 
     async fn download_chunk(&self, key: &str) -> Result<Vec<u8>> {
-        crate::cloud_helpers::retry_async("download_chunk", MAX_LOCAL_INJECT_RETRIES, || async {
-            self.check_injection("download_chunk", key)?;
-            let path = self.get_path(key);
+        crate::object_store_helpers::retry_async(
+            "download_chunk",
+            MAX_LOCAL_INJECT_RETRIES,
+            || async {
+                self.check_injection("download_chunk", key)?;
+                let path = self.get_path(key);
 
-            // Up to 128 MiB; same reasoning as `upload_chunk`.
-            let data = tokio::fs::read(&path).await?;
+                // Up to 128 MiB; same reasoning as `upload_chunk`.
+                let data = tokio::fs::read(&path).await?;
 
-            debug!(
-                "Local backend downloaded chunk: {} ({} bytes)",
-                key,
-                data.len()
-            );
+                debug!(
+                    "Local backend downloaded chunk: {} ({} bytes)",
+                    key,
+                    data.len()
+                );
 
-            Ok(data)
-        })
+                Ok(data)
+            },
+        )
         .await
     }
 
@@ -356,45 +366,57 @@ impl CloudBackend for LocalBackend {
     }
 
     async fn upload_manifest(&self, key: &str, json: &str) -> Result<()> {
-        crate::cloud_helpers::retry_async("upload_manifest", MAX_LOCAL_INJECT_RETRIES, || async {
-            self.check_injection("upload_manifest", key)?;
-            let path = self.get_path(key);
+        crate::object_store_helpers::retry_async(
+            "upload_manifest",
+            MAX_LOCAL_INJECT_RETRIES,
+            || async {
+                self.check_injection("upload_manifest", key)?;
+                let path = self.get_path(key);
 
-            // Create parent directories if needed
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+                // Create parent directories if needed
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
 
-            // Write manifest JSON
-            fs::write(&path, json)?;
+                // Write manifest JSON
+                fs::write(&path, json)?;
 
-            debug!("Local backend uploaded manifest: {}", key);
+                debug!("Local backend uploaded manifest: {}", key);
 
-            Ok(())
-        })
+                Ok(())
+            },
+        )
         .await
     }
 
     async fn download_manifest(&self, key: &str) -> Result<String> {
-        crate::cloud_helpers::retry_async("download_manifest", MAX_LOCAL_INJECT_RETRIES, || async {
-            self.check_injection("download_manifest", key)?;
-            let path = self.get_path(key);
+        crate::object_store_helpers::retry_async(
+            "download_manifest",
+            MAX_LOCAL_INJECT_RETRIES,
+            || async {
+                self.check_injection("download_manifest", key)?;
+                let path = self.get_path(key);
 
-            let json = fs::read_to_string(&path)?;
+                let json = fs::read_to_string(&path)?;
 
-            debug!("Local backend downloaded manifest: {}", key);
+                debug!("Local backend downloaded manifest: {}", key);
 
-            Ok(json)
-        })
+                Ok(json)
+            },
+        )
         .await
     }
 
     async fn chunk_exists(&self, key: &str) -> Result<bool> {
-        crate::cloud_helpers::retry_async("chunk_exists", MAX_LOCAL_INJECT_RETRIES, || async {
-            self.check_injection("chunk_exists", key)?;
-            let path = self.get_path(key);
-            Ok(path.exists())
-        })
+        crate::object_store_helpers::retry_async(
+            "chunk_exists",
+            MAX_LOCAL_INJECT_RETRIES,
+            || async {
+                self.check_injection("chunk_exists", key)?;
+                let path = self.get_path(key);
+                Ok(path.exists())
+            },
+        )
         .await
     }
 
@@ -462,9 +484,9 @@ impl CloudBackend for LocalBackend {
         "local"
     }
 
-    async fn lock_state(&self) -> Result<crate::cloud_backend::LockState> {
+    async fn lock_state(&self) -> Result<crate::object_store_backend::LockState> {
         // Filesystem has no immutability concept; always off.
-        Ok(crate::cloud_backend::LockState::Off)
+        Ok(crate::object_store_backend::LockState::Off)
     }
 
     fn supports_legal_hold(&self) -> bool {
@@ -472,19 +494,19 @@ impl CloudBackend for LocalBackend {
     }
 
     async fn set_object_legal_hold(&self, _key: &str, _held: bool) -> Result<()> {
-        Err(crate::CloudError::NotSupported(
+        Err(crate::ObjectStoreError::NotSupported(
             "legal hold is not supported on the local backend (no enforcement primitive)"
                 .to_string(),
         ))
     }
 
     async fn get_object_legal_hold(&self, _key: &str) -> Result<bool> {
-        Err(crate::CloudError::NotSupported(
+        Err(crate::ObjectStoreError::NotSupported(
             "legal hold is not supported on the local backend".to_string(),
         ))
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         Box::new(self.clone())
     }
 }
@@ -562,7 +584,7 @@ mod tests {
         );
     }
 
-    use crate::cloud_config::classify;
+    use crate::object_store_config::classify;
 
     #[test]
     fn key_pattern_prefix_suffix_contains_exact() {
@@ -682,7 +704,7 @@ mod tests {
             .await
             .expect_err("missing source must error");
         // The spawn_blocking copy failure surfaces as an IO error.
-        assert!(matches!(err, CloudError::Io(_)));
+        assert!(matches!(err, ObjectStoreError::Io(_)));
     }
 
     #[tokio::test]
@@ -732,7 +754,7 @@ mod tests {
             .download_chunk("chunks/absent.dat")
             .await
             .expect_err("missing chunk must error");
-        assert!(matches!(err, CloudError::Io(_)));
+        assert!(matches!(err, ObjectStoreError::Io(_)));
     }
 
     #[tokio::test]
@@ -741,7 +763,7 @@ mod tests {
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
         assert_eq!(
             backend.lock_state().await.unwrap(),
-            crate::cloud_backend::LockState::Off
+            crate::object_store_backend::LockState::Off
         );
         assert_eq!(backend.backend_type(), "local");
     }
@@ -755,12 +777,12 @@ mod tests {
             .set_object_legal_hold("chunks/x.dat", true)
             .await
             .expect_err("set legal hold must be unsupported");
-        assert!(matches!(set_err, CloudError::NotSupported(_)));
+        assert!(matches!(set_err, ObjectStoreError::NotSupported(_)));
         let get_err = backend
             .get_object_legal_hold("chunks/x.dat")
             .await
             .expect_err("get legal hold must be unsupported");
-        assert!(matches!(get_err, CloudError::NotSupported(_)));
+        assert!(matches!(get_err, ObjectStoreError::NotSupported(_)));
     }
 
     #[tokio::test]
@@ -776,7 +798,7 @@ mod tests {
     #[test]
     fn injection_plan_from_env_absent_var_is_none() {
         // A var name guaranteed not to be set yields no plan.
-        assert!(InjectionPlan::from_env("THUR_CLOUD_INJECT_FAIL_UNSET_XYZ").is_none());
+        assert!(InjectionPlan::from_env("THUR_STORAGE_INJECT_FAIL_UNSET_XYZ").is_none());
     }
 
     #[test]
@@ -842,7 +864,7 @@ mod tests {
             .download_manifest("manifests/absent.json")
             .await
             .expect_err("missing manifest must error");
-        assert!(matches!(err, CloudError::Io(_)));
+        assert!(matches!(err, ObjectStoreError::Io(_)));
     }
 
     #[tokio::test]

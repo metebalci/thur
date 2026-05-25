@@ -6,15 +6,15 @@
 #
 # thurvsa End-to-End Filesystem Workflow Test (NVMe/TCP + real cloud)
 #
-# Same shape as test-iscsi-fs-cloud.sh, but driven through Linux nvme-cli +
+# Same shape as test-iscsi-fs-storage.sh, but driven through Linux nvme-cli +
 # nvme_tcp instead of open-iscsi. Clones a backend definition from
-# private/cloud-backends.json (or $THURVSA_SOURCE_BACKENDS) so the
+# private/storage-backends.json (or $THURVSA_SOURCE_BACKENDS) so the
 # upload pipeline, HEAD-then-PUT dedup, page-eviction-driven cloud
 # refetch, and SYNC-fenced flush paths actually fire against real
 # cloud through the NVMe/TCP transport.
 #
 # Selection: set THURVSA_TEST_BACKEND to the name of an entry under
-# `backends:` in the source cloud-backends.json. The script copies that
+# `backends:` in the source storage-backends.json. The script copies that
 # entry verbatim into the test config and appends a per-run sub-prefix
 # so test data is isolated and trivially purgeable.
 #
@@ -29,13 +29,13 @@
 # default 8). Cloud round-trips dominate runtime — bigger fixture =
 # longer test = real egress $$$.
 #   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 \
-#     ./vsa/scripts/test-nvme-fs-cloud.sh
+#     ./vsa/scripts/test-nvme-fs-storage.sh
 #
 # Prerequisites:
 #   - nvme-cli         (sudo apt-get install nvme-cli)
 #   - nvme_tcp kernel module (sudo modprobe nvme_tcp)
 #   - e2fsprogs, util-linux, tar (usually present)
-#   - jq (parses private/cloud-backends.json)
+#   - jq (parses private/storage-backends.json)
 #   - Cloud CLI matching the backend type:
 #       s3    -> aws       (sudo apt-get install awscli)
 #       gcs   -> gcloud    (https://cloud.google.com/sdk)
@@ -44,14 +44,14 @@
 #   - Root/sudo access (nvme connect + raw /dev/nvmeXn1 access require root).
 #
 # Usage (invoke from repo root):
-#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-nvme-fs-cloud.sh [OPTIONS]
+#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-nvme-fs-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
 # cloud creds into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
-# AISTOR_*) and your backend entry in `$REPO/private/cloud-backends.json`.
+# AISTOR_*) and your backend entry in `$REPO/private/storage-backends.json`.
 # The script auto-sources thur.env at startup and defaults
-# THURVSA_SOURCE_BACKENDS to private/cloud-backends.json.
+# THURVSA_SOURCE_BACKENDS to private/storage-backends.json.
 #
 # NOTE on sudo: do NOT prefix with sudo — the script self-elevates
 # via `sudo KEY=VAL ... "$0"`, forwarding the cloud-relevant env
@@ -103,8 +103,8 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/cloud-backends.json}"
-TEST_DIR="/tmp/thurvsa-test-nvme-fs-cloud-$$"
+SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.json}"
+TEST_DIR="/tmp/thurvsa-test-nvme-fs-storage-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 NVMETCP_PORT=""
 HTTP_PORT=""
@@ -203,7 +203,7 @@ assign_ports_nvme() {
 }
 
 # ---------------------------------------------------------------------------
-# Backend resolution (cloned from test-iscsi-fs-cloud.sh — same shape, NVMe
+# Backend resolution (cloned from test-iscsi-fs-storage.sh — same shape, NVMe
 # variant has its own copy to keep both scripts self-contained)
 # ---------------------------------------------------------------------------
 
@@ -216,7 +216,7 @@ resolve_backend() {
     fi
     if [[ ! -r "$SOURCE_BACKENDS" ]]; then
         log_error "Cannot read source backends file: $SOURCE_BACKENDS"
-        echo "Override with THURVSA_SOURCE_BACKENDS=<path>/cloud-backends.json"
+        echo "Override with THURVSA_SOURCE_BACKENDS=<path>/storage-backends.json"
         exit 1
     fi
     if ! command -v jq >/dev/null 2>&1; then
@@ -371,7 +371,7 @@ nvmetcp:
 audit:
   enabled: true
 
-cloud:
+storage:
   backends:
     testbackend: $backend_json
 EOFCONFIG
@@ -508,7 +508,7 @@ phase_a_format_mount_extract() {
 phase_b_assert_cloud_objects() {
     log_info "[Phase B] Asserting chunk objects landed in cloud..."
     # Async-upload health gate — same shape as the iSCSI cloud test.
-    # See vsa/scripts/test-iscsi-fs-cloud.sh phase_b for rationale.
+    # See vsa/scripts/test-iscsi-fs-storage.sh phase_b for rationale.
     if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
         log_error "[Phase B] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
         grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'

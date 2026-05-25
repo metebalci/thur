@@ -214,11 +214,11 @@ shared-cli = { path = "../../shared/cli" }
 shared-cli-alerting = { path = "../../shared/cli-alerting" }
 shared-cli-iscsi = { path = "../../shared/cli-iscsi" }
 shared-cli-system = { path = "../../shared/cli-system" }
-# `system cloud benchmark` (daemon-down) reads
-# `<data_dir>/cloud-backends.json` and instantiates a `CloudBackend`
-# without going through the daemon.
-shared-cloud = { path = "../../shared/cloud" }
-shared-cloud-bench = { path = "../../shared/cloud-bench" }
+# `system storage benchmark` (daemon-down) reads
+# `<data_dir>/storage-backends.json` and instantiates an
+# `ObjectStoreBackend` without going through the daemon.
+shared-object-store = { path = "../../shared/object-store" }
+shared-object-store-bench = { path = "../../shared/object-store-bench" }
 shared-crypto = { path = "../../shared/crypto" }
 # Offline `volume key migrate` resolves the old + new keystore
 # backends from <data_dir>/keystore-backends.json and round-trips

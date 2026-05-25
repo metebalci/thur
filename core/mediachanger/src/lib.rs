@@ -35,20 +35,23 @@ pub use core_stream::{
 // `core_mediachanger::legal_hold::*` resolves to the union.
 pub use core_stream::legal_hold as ssc_legal_hold;
 
-// Cloud + compression layer was lifted into the `shared-cloud` crate
-// so the sibling block-storage product (core-block) can consume it
-// without depending on core-mediachanger. Re-export both the modules (so
-// `core_mediachanger::cloud_backend::*` continues to work) and the flat type
-// names downstream callers (thurvtld, thurvtl) historically
-// pulled in via `core_mediachanger::CloudConfig` etc.
-pub use shared_cloud::{
-    AzureBackend, BackendEntry, COMPRESSION_ALGORITHM_DEFAULT, CloudBackend, CloudCheckStep,
-    CloudConfig, CloudConfigError, CloudError, CompressionAlgo, CompressionConfig,
-    DriveCompressionState, FailureKind, GcsBackend, LocalBackend, LockState, RetentionMode,
-    S3Backend, ZSTD_DEFAULT_LEVEL, compress_data, decompress_data, validate_cloud_backend,
+// Storage backends + compression layer were lifted into the
+// `shared-object-store` crate so the sibling block-storage product
+// (core-block) can consume it without depending on core-mediachanger.
+// Re-export both the modules (so `core_mediachanger::object_store_backend::*`
+// continues to work) and the flat type names downstream callers
+// (thurvtld, thurvtl) historically pulled in via
+// `core_mediachanger::ObjectStoreConfig` etc.
+pub use shared_object_store::{
+    AzureBackend, BackendEntry, COMPRESSION_ALGORITHM_DEFAULT, CompressionAlgo, CompressionConfig,
+    DriveCompressionState, FailureKind, GcsBackend, LocalBackend, LockState, ObjectStoreBackend,
+    ObjectStoreCheckStep, ObjectStoreConfig, ObjectStoreConfigError, ObjectStoreError,
+    RetentionMode, S3Backend, ZSTD_DEFAULT_LEVEL, compress_data, decompress_data,
+    validate_object_store_backend,
 };
-pub use shared_cloud::{
-    azure, cloud_backend, cloud_config, cloud_helpers, compression, gcs, local, s3,
+pub use shared_object_store::{
+    azure, compression, gcs, local, object_store_backend, object_store_config,
+    object_store_helpers, s3,
 };
 
 // Telemetry layer was lifted into the `shared-telemetry` crate so the
@@ -81,7 +84,7 @@ pub use shared_audit::{
     read_entries, spawn_writer as spawn_audit_writer, tail_step, verify_chain,
 };
 pub use shared_audit::{audit, audit_channel, audit_ratelimit};
-// Cloud + compression re-exports were lifted to the `shared_cloud` block above.
+// Storage + compression re-exports were lifted to the `shared_object_store` block above.
 pub use daemon_lock::{DaemonLock, check_daemon_not_running, is_daemon_running};
 pub use events::{PositionChangeReason, TapeEvent};
 pub use legal_hold::find_drive_for_loaded_cartridge;

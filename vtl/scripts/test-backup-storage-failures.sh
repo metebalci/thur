@@ -7,7 +7,7 @@
 # Thur VTL Cloud Failure-Path Tests
 #
 # Drives the upload worker through `thurvtld --test` with the
-# `LocalBackend` failure-injection env var (THUR_CLOUD_INJECT_FAIL) set
+# `LocalBackend` failure-injection env var (THUR_STORAGE_INJECT_FAIL) set
 # per sub-test, then greps the daemon log for the expected error-class
 # strings. CI-friendly: no real cloud creds, no sudo, no kernel iSCSI
 # initiator.
@@ -31,7 +31,7 @@
 # code.
 #
 # Usage (invoke from repo root):
-#   ./vtl/scripts/test-backup-cloud-failures.sh [OPTIONS]
+#   ./vtl/scripts/test-backup-storage-failures.sh [OPTIONS]
 #
 # Options:
 #   --release       Use ./target/release/ binaries (default is ./target/debug/)
@@ -44,7 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
 BUILD_PROFILE="debug"
-TEST_DIR="/tmp/test-backup-cloud-failures-$$"
+TEST_DIR="/tmp/test-backup-storage-failures-$$"
 KEEP_DATA=0
 DAEMON_PATH=""
 CLI_PATH=""
@@ -120,7 +120,7 @@ library:
   lto_generation: 8
 license:
   file: "${fixture}/no-such.lic"
-cloud:
+storage:
   backends:
     primary:
       type: local
@@ -131,7 +131,7 @@ EOFCONFIG
     echo "$fixture"
 }
 
-# Run `thurvtld --test` with the given THUR_CLOUD_INJECT_FAIL
+# Run `thurvtld --test` with the given THUR_STORAGE_INJECT_FAIL
 # value. Captures stderr+stdout to ${fixture}/daemon.log. Returns the
 # daemon's exit code (may be non-zero — sub-tests grep the log).
 run_under_injection() {
@@ -139,7 +139,7 @@ run_under_injection() {
     local inject="$2"
     local log="${fixture}/daemon.log"
 
-    THUR_CLOUD_INJECT_FAIL="$inject" \
+    THUR_STORAGE_INJECT_FAIL="$inject" \
         RUST_LOG=info \
         "$DAEMON_PATH" --test --config "${fixture}/config.yaml" \
         > "$log" 2>&1
@@ -149,7 +149,7 @@ run_under_injection() {
 # Sub-test 1: auth failure — assert permanent error landed in log,
 # and no chunk reached the local-backend root.
 test_auth_failure() {
-    log_test "auth failure (THUR_CLOUD_INJECT_FAIL=auth@chunks/*)"
+    log_test "auth failure (THUR_STORAGE_INJECT_FAIL=auth@chunks/*)"
 
     local fixture
     fixture=$(prepare_fixture auth)
@@ -180,7 +180,7 @@ test_auth_failure() {
 # Sub-test 2: network timeout with retry budget — assert retry log
 # lines AND the final give-up line both appear.
 test_network_timeout_with_retry() {
-    log_test "network timeout (THUR_CLOUD_INJECT_FAIL=timeout@chunks/*)"
+    log_test "network timeout (THUR_STORAGE_INJECT_FAIL=timeout@chunks/*)"
 
     local fixture
     fixture=$(prepare_fixture timeout)

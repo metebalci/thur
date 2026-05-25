@@ -39,7 +39,7 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-shared-cloud = { path = "../../shared/cloud" }
+shared-object-store = { path = "../../shared/object-store" }
 # Async runtime for #[tokio::test] cases.
 tokio = { version = "1", features = ["macros", "rt"] }
 # Property-based tests for parse_10 / parse_16 CDB decoders.

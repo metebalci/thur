@@ -14,11 +14,11 @@ use anyhow::{Context, Result};
 use shared_admin_client::AdminClient;
 use shared_admin_proto::JobEvent;
 
-pub async fn cmd_gc(dry_run: bool, cloud: bool) -> Result<()> {
+pub async fn cmd_gc(dry_run: bool, storage: bool) -> Result<()> {
     let client = AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
     let body = serde_json::json!({
         "dry_run": dry_run,
-        "cloud": cloud,
+        "storage": storage,
     });
 
     let exit = client

@@ -17,8 +17,8 @@ use axum::{
     response::IntoResponse,
 };
 use core_mediachanger::{
-    AuditActor, AuditResult, Cartridge, ChunkingMode, CloudBackend, DedupScope,
-    FASTCDC_DEFAULT_AVG, FASTCDC_DEFAULT_MAX, TapeEvent, apply_cartridge_legal_hold,
+    AuditActor, AuditResult, Cartridge, ChunkingMode, DedupScope, FASTCDC_DEFAULT_AVG,
+    FASTCDC_DEFAULT_MAX, ObjectStoreBackend, TapeEvent, apply_cartridge_legal_hold,
     collect_cartridge_keys, find_drive_for_loaded_cartridge, generate_cartridge_uuid,
     read_cartridge_held, read_legal_hold_for_keys,
 };
@@ -1067,7 +1067,7 @@ pub async fn cartridge_create(
     if req.worm {
         let mode = state
             .daemon
-            .cloud_config
+            .storage_config
             .retention_mode_named(&resolved_backend);
         if !mode.requires_lock() {
             return bad_request(format!(
@@ -1359,7 +1359,7 @@ fn parse_chunking_mode(req: &CartridgeCreateRequest) -> Result<(ChunkingMode, St
 /// otherwise auto-pick when exactly one backend is configured; refuse
 /// when 2+ backends are configured without an explicit choice.
 fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<String, String> {
-    let backend_names = state.daemon.cloud_config.backend_names();
+    let backend_names = state.daemon.storage_config.backend_names();
     match (req_backend, backend_names.len()) {
         (Some(name), _) => {
             if !backend_names.iter().any(|n| n == name) {
@@ -1819,13 +1819,16 @@ pub struct LegalHoldKeyState {
 
 /// Resolve a cartridge's bound backend, validate that it supports
 /// legal hold, and enumerate the keys covered. Returns owned values
-/// (`Arc<dyn CloudBackend>`, `CartridgeKeys`) so the handler can
+/// (`Arc<dyn ObjectStoreBackend>`, `CartridgeKeys`) so the handler can
 /// call into `apply_cartridge_legal_hold` etc. without holding `&dyn`
 /// borrows across awaits.
 async fn open_backend_for_cartridge(
     state: Arc<DaemonState>,
     barcode: String,
-) -> anyhow::Result<(Arc<dyn CloudBackend>, core_mediachanger::CartridgeKeys)> {
+) -> anyhow::Result<(
+    Arc<dyn ObjectStoreBackend>,
+    core_mediachanger::CartridgeKeys,
+)> {
     let tapes_root = state.data_dir.join("tapes");
     let manifest_path = tapes_root.join(&barcode).join("manifest.json");
     if !manifest_path.exists() {
@@ -1847,7 +1850,7 @@ async fn open_backend_for_cartridge(
         .to_string();
 
     let backend_box = state
-        .cloud_config
+        .storage_config
         .create_backend_named(&bound_backend)
         .await
         .map_err(|e| anyhow::anyhow!("construct backend '{}': {}", bound_backend, e))?;
@@ -1860,7 +1863,7 @@ async fn open_backend_for_cartridge(
         );
     }
 
-    let backend: Arc<dyn CloudBackend> = Arc::from(backend_box);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::from(backend_box);
     let keys = collect_cartridge_keys(&tapes_root, barcode.clone(), Arc::clone(&backend))
         .await
         .map_err(|e| anyhow::anyhow!("enumerate keys for '{}': {}", barcode, e))?;

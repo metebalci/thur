@@ -3,7 +3,7 @@
 
 //! First-party cloud-backend throughput benchmark engine.
 //!
-//! Drives N parallel `CloudBackend::upload_chunk` / `download_chunk` /
+//! Drives N parallel `ObjectStoreBackend::upload_chunk` / `download_chunk` /
 //! `delete_object` calls through the same SDK + network path the
 //! daemon uses, so the numbers it reports are the actual ceiling the
 //! daemon can reach against a given backend.
@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use shared_cloud::{CloudBackend, CloudConfig};
+use shared_object_store::{ObjectStoreBackend, ObjectStoreConfig};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ impl BenchOptions {
 /// drives upload/download/delete.
 pub struct BenchTarget {
     pub name: String,
-    pub backend: Box<dyn CloudBackend>,
+    pub backend: Box<dyn ObjectStoreBackend>,
 }
 
 /// Top-level error from the bench engine. Per-cell errors are emitted
@@ -95,11 +95,11 @@ pub enum BenchError {
     },
     #[error("backend '{name}': {message}")]
     BackendLookup { name: String, message: String },
-    #[error("instantiate cloud backend '{name}': {source}")]
+    #[error("instantiate storage backend '{name}': {source}")]
     BackendInstantiate {
         name: String,
         #[source]
-        source: shared_cloud::CloudConfigError,
+        source: shared_object_store::ObjectStoreConfigError,
     },
 }
 
@@ -108,7 +108,7 @@ pub enum BenchError {
 ///
 /// Reads the daemon's YAML conffile, validates the requested `backends`
 /// list against the `cloud.backends:` block (empty = every named
-/// backend), constructs one [`CloudBackend`] per name, and hands the
+/// backend), constructs one [`ObjectStoreBackend`] per name, and hands the
 /// lot to [`run`]. Daemon-down: doesn't touch the admin socket so
 /// operators can validate a freshly-configured backend before the
 /// daemon ever opens it. Compression is forced off for the bench so the
@@ -161,11 +161,11 @@ pub async fn run_from_config_path(
 /// Parse the daemon conffile and extract its `cloud:` section. The
 /// rest of the YAML is ignored — the bench engine only cares about the
 /// `cloud.backends:` map.
-fn load_cloud_config(config_path: &Path) -> Result<CloudConfig, BenchError> {
+fn load_cloud_config(config_path: &Path) -> Result<ObjectStoreConfig, BenchError> {
     #[derive(serde::Deserialize)]
     struct CloudOnly {
         #[serde(default)]
-        cloud: CloudConfig,
+        cloud: ObjectStoreConfig,
     }
     let body = std::fs::read_to_string(config_path).map_err(|e| BenchError::LoadConfig {
         path: config_path.to_path_buf(),
@@ -253,7 +253,7 @@ pub async fn run(targets: Vec<BenchTarget>, opts: BenchOptions) -> Result<(), Be
     let mut cell_idx: usize = 0;
     for target in targets {
         let BenchTarget { name, backend } = target;
-        let backend: Arc<dyn CloudBackend> = Arc::from(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::from(backend);
         for &chunk_size_mb in &chunk_sizes {
             for &concurrency in &concurrencies {
                 cell_idx += 1;
@@ -401,7 +401,7 @@ fn print_sweep_preview(
 }
 
 async fn bench_cell(
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
     total_mb: usize,
     chunk_size_mb: usize,
     concurrency: usize,
@@ -539,7 +539,7 @@ async fn bench_cell(
 }
 
 async fn parallel_delete(
-    backend: &Arc<dyn CloudBackend>,
+    backend: &Arc<dyn ObjectStoreBackend>,
     keys: &[String],
     concurrency: usize,
 ) -> Vec<String> {
@@ -584,12 +584,14 @@ fn print_bench_line(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use shared_cloud::{CloudError, CompressionAlgo, LockState, Result as CloudResult};
+    use shared_object_store::{
+        CompressionAlgo, LockState, ObjectStoreError, Result as CloudResult,
+    };
     use std::io::Write;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// In-process `CloudBackend` that records call counts and answers with
+    /// In-process `ObjectStoreBackend` that records call counts and answers with
     /// fixed-size payloads. Only the three methods the bench actually
     /// drives (`upload_chunk`, `download_chunk`, `delete_object`) carry
     /// real impls; the rest of the trait surface is `unreachable!()`
@@ -633,7 +635,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CloudBackend for MockBackend {
+    impl ObjectStoreBackend for MockBackend {
         async fn upload_chunk(
             &self,
             _key: &str,
@@ -641,7 +643,7 @@ mod tests {
         ) -> CloudResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let n = self.uploads.fetch_add(1, Ordering::Relaxed);
             if Some(n) == self.fail_upload_at {
-                return Err(CloudError::Other("mock upload failure".into()));
+                return Err(ObjectStoreError::Other("mock upload failure".into()));
             }
             Ok((data.len() as u64, None, None))
         }
@@ -657,7 +659,7 @@ mod tests {
         async fn download_chunk(&self, _key: &str) -> CloudResult<Vec<u8>> {
             let n = self.downloads.fetch_add(1, Ordering::Relaxed);
             if Some(n) == self.fail_download_at {
-                return Err(CloudError::Other("mock download failure".into()));
+                return Err(ObjectStoreError::Other("mock download failure".into()));
             }
             Ok(vec![0u8; self.download_size])
         }
@@ -703,7 +705,7 @@ mod tests {
             unreachable!("bench never calls get_object_legal_hold")
         }
 
-        fn clone_box(&self) -> Box<dyn CloudBackend> {
+        fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
             // `run` wraps the backend in `Arc::from(Box<_>)` once and
             // clones the Arc thereafter, so the trait's clone_box is
             // never reached in bench code paths.
@@ -954,7 +956,7 @@ mod tests {
             .await
             .expect("run returns Ok despite size mismatch");
 
-        // And the IO-error path: download #2 returns CloudError.
+        // And the IO-error path: download #2 returns ObjectStoreError.
         let io_target = BenchTarget {
             name: "mock-download-io".to_string(),
             backend: Box::new(MockBackend::new(1024 * 1024).with_download_failure(2)),
@@ -971,7 +973,7 @@ mod tests {
         // itself is the unit under test; the bench's own cleanup also
         // exercises it on every cell.
         use std::sync::Arc;
-        let backend: Arc<dyn CloudBackend> = Arc::new(MockBackend::new(0));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MockBackend::new(0));
         let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
         let errors = parallel_delete(&backend, &keys, 4).await;
         assert!(errors.is_empty(), "all-succeed → no errors");

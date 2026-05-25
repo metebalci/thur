@@ -1,5 +1,5 @@
 [package]
-name = "shared-cloud"
+name = "shared-object-store"
 version.workspace = true
 edition = "2024"
 license.workspace = true
@@ -114,4 +114,4 @@ clap = { version = "4.5", features = ["derive"] }
 # `examples/bench.rs` is a thin wrapper around the engine. The CLI
 # subcommands depend on the same crate; keeping it dev-only here
 # avoids pulling it into the daemon's binary.
-shared-cloud-bench = { path = "../cloud-bench" }
+shared-object-store-bench = { path = "../object-store-bench" }

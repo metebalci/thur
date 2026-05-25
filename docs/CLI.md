@@ -14,7 +14,7 @@ cartridge  create / archive / migrate / import / export / list / info / legal-ho
 changer    inventory / move / load / unload [--force]
 drive      status / self-test
 system     gc / verify / stats / daemon-health
-           audit {tail,export,verify,verify-offline,rotate} / cloud {check,benchmark}
+           audit {tail,export,verify,verify-offline,rotate} / storage {check,benchmark}
            regenerate-cert / alerting {list,test}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 config     defaults / systemd-unit / completion
@@ -30,7 +30,7 @@ clap drives both `--help` and the shipped completion scripts.
 
 ```
 volume     create / list / info / destroy / modify / key migrate
-system     cloud benchmark / gc / stats / verify / regenerate-cert / alerting {list,test}
+system     storage benchmark / gc / stats / verify / regenerate-cert / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 nvmetcp    psks {add,remove,disable,enable,rotate,list}
@@ -41,10 +41,10 @@ The `volume` commands (`create`, `list`, `info`, `destroy`, `modify`) are
 daemon-routed only — they talk to `/run/thurvsa/admin.sock` and refuse
 with a clear "start the daemon" message when the socket is unreachable.
 `volume create` resolves `--backend` daemon-side: you may omit it when
-exactly one `cloud.backends:` entry exists. `system cloud benchmark` is
-daemon-down — it parses the YAML conffile's `cloud.backends:` block,
+exactly one `storage.backends:` entry exists. `system storage benchmark` is
+daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
-delete operations via `shared-cloud-bench`. `config` is pure-local.
+delete operations via `shared-object-store-bench`. `config` is pure-local.
 
 The `iscsi` and `nvmetcp` nouns handle credential lifecycle and are
 covered in detail in
@@ -81,10 +81,10 @@ env var. The canonical path is binding for both the daemon
 `<data_dir>/admin.sock`, so daemon-routed commands work without reading
 the 0640 conffile.
 
-- **Daemon-down (partition layout + DR + cloud benchmark + offline
+- **Daemon-down (partition layout + DR + storage benchmark + offline
   key/cert ops):** `library restore`, `library restore-archive`,
   `library partition {list,create,modify,delete}`,
-  `cartridge key {migrate,show}`, `system cloud benchmark`,
+  `cartridge key {migrate,show}`, `system storage benchmark`,
   `system regenerate-cert`.
   Each of these has a specific reason to require the daemon to be
   stopped. (Chassis topology — `num_slots` / `num_drives` /
@@ -93,8 +93,8 @@ the 0640 conffile.
   `library bounds` is a daemon-routed read that surfaces the
   safe-shrink envelope before editing the YAML.)
   `library restore` discovers cartridges in a
-  cloud backend's `manifests/` prefix and seeds the local data directory
-  for cross-region DR. `system cloud benchmark` validates a bucket
+  storage backend's `manifests/` prefix and seeds the local data directory
+  for cross-region DR. `system storage benchmark` validates a bucket
   before the daemon starts. `system regenerate-cert` rewrites the admin
   HTTP self-signed cert and key in place; it refuses while the admin
   socket answers, and the new cert only takes effect after a restart.
@@ -103,8 +103,8 @@ the 0640 conffile.
   half-rewritten file. These
   commands read `thurvtl.yaml` for `data_dir`; `main.rs` calls
   `read_minimal()` only when `Cli::is_daemon_down()` returns true.
-  `library restore` and `system cloud benchmark` additionally parse the
-  `cloud.backends:` block to resolve `--backend NAME`. Run these with
+  `library restore` and `system storage benchmark` additionally parse the
+  `storage.backends:` block to resolve `--backend NAME`. Run these with
   `sudo` on a packaged install so that the 0640 conffile is readable and
   the operator has write access under `data_dir`. The privdrop in
   `vtl/cli/src/privdrop.rs` then drops privileges before any I/O — euid
@@ -118,7 +118,7 @@ the 0640 conffile.
   --force`); `drive status` and `drive self-test`; `library info`,
   `library monitor`, and `library self-test`; the live `system` ops
   (`gc`, `verify`, `stats`, `daemon-health`, `audit
-  {tail,export,verify,rotate}`, `cloud check`, and `alerting`);
+  {tail,export,verify,rotate}`, `storage check`, and `alerting`);
   and all `iscsi` verbs. These commands never read
   `thurvtl.yaml` — the CLI connects to `/run/thurvtl/admin.sock` (or
   `$THURVTL_ADMIN_SOCKET`) directly. Membership in the `thurvtl` group
@@ -171,33 +171,33 @@ can replay the full transcript.
   It is the inverse of GC: rather than asking which chunks are alive, it
   asks whether the chunks the manifests claim to exist are actually
   present, with the right size and within-bounds block records. A cloud
-  sweep is on by default and can be skipped with `--skip-cloud`; when
+  sweep is on by default and can be skipped with `--skip-storage`; when
   active it HEADs every `CloudOnly` and `Both` chunk, every index-page
   object, and the `manifest-latest.json` sentinel. Implementation:
   `core/mediachanger/src/verify.rs`. On VSA the same verb walks each
   volume's `pages.idx` (header integrity + every referenced chunk
-  present in the pool) and runs the same cloud HEAD sweep; the local
-  pool + cloud sweeps are the shared `shared-verify-core`,
+  present in the pool) and runs the same backend HEAD sweep; the local
+  pool + storage sweeps are the shared `shared-verify-core`,
   implementation `core/block/src/verify.rs`.
 
 - **`system stats`** — dedup analytics. Walks `chunks.idx`, groups
   chunks by `(backend, namespace)`, and reports logical bytes, unique
   pool bytes, dedup ratio, per-cartridge exclusive vs shared chunk
-  counts, and a location breakdown. The cloud HEAD-skip rate is exposed
+  counts, and a location breakdown. The backend HEAD-skip rate is exposed
   through Prometheus (`thurvtl_chunk_cloud_head_*_total`) rather than
   being re-walked here, since it is a runtime signal rather than state
   that exists on disk. On VSA the same verb walks each volume's
   `pages.idx` instead, sizes chunks from the local pool, and omits the
-  location breakdown (`pages.idx` records no local/cloud tag); the
+  location breakdown (`pages.idx` records no local/backend tag); the
   dedup math is shared (`shared-dedup-stats`).
 
 ## GC
 
-`system gc [--dry-run] [--cloud]` walks every `manifest.json`, groups
+`system gc [--dry-run] [--storage]` walks every `manifest.json`, groups
 `chunks[].hash` by `(backend, namespace)`, sweeps the local pool and
 every local-scope namespace, and deletes anything not in the live set.
-Orphan namespace directories are reclaimed in the same pass. `--cloud`
-extends the sweep to cloud chunk keys and stale index-page objects (any
+Orphan namespace directories are reclaimed in the same pass. `--storage`
+extends the sweep to backend chunk keys and stale index-page objects (any
 page whose index is >= `index_epoch[label].pages`). Cartridges with no
 local manifest are skipped. Both products expose `system gc` with the
 same flags.

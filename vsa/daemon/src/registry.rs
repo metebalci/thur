@@ -34,7 +34,7 @@ use scsi_sbc::VolumeLookup;
 /// `&self` so the wrapper Arc shared with the SCSI dispatcher
 /// supports live volume create / destroy without a second handle.
 /// (No `Debug` impl — `PageCache` wraps a `VolumeWriter` which
-/// holds an `Arc<dyn CloudBackend>` whose `Debug` print would be
+/// holds an `Arc<dyn ObjectStoreBackend>` whose `Debug` print would be
 /// noisy in logs.)
 #[derive(Default)]
 pub struct VolumeRegistry {
@@ -171,14 +171,14 @@ mod tests {
     use super::*;
     use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
     use core_block::{DedupScope, VolumeManifest, VolumeWriter};
-    use shared_cloud::{CloudBackend, LocalBackend};
+    use shared_object_store::{LocalBackend, ObjectStoreBackend};
     use tempfile::TempDir;
 
     async fn fixture_cache(name: &str, data_dir: &std::path::Path) -> Arc<PageCache> {
         let cloud_root = data_dir.join("cloud");
         std::fs::create_dir_all(&cloud_root).unwrap();
         let backend = LocalBackend::new(&cloud_root).await.unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         VolumeManifest::new(
             name.into(),

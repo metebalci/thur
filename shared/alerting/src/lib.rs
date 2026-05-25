@@ -119,8 +119,8 @@ pub mod record {
             fields.insert("error".into(), serde_json::Value::String(e.into()));
         }
         let message = match outcome {
-            "recovery" => format!("Cloud backend '{backend}' recovered"),
-            _ => format!("Cloud backend '{backend}' unreachable"),
+            "recovery" => format!("Storage backend '{backend}' recovered"),
+            _ => format!("Storage backend '{backend}' unreachable"),
         };
         emit(Alert::new(
             AlertClass::BackendReachability,

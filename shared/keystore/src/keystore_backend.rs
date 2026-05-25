@@ -114,7 +114,7 @@ impl Debug for SecretBytes {
 /// Implementors are reachable through `Arc<dyn KeyStoreBackend>` from
 /// the daemon admin handlers. `clone_box` + the `Clone for Box<dyn ...>`
 /// blanket impl below let callers stash them in the same shape as
-/// `Arc<dyn shared_cloud::CloudBackend>`.
+/// `Arc<dyn shared_object_store::ObjectStoreBackend>`.
 #[async_trait]
 pub trait KeyStoreBackend: Debug + Send + Sync {
     /// Mint a 32-byte secret bound to `wrap_context` and return

@@ -54,7 +54,7 @@ of the two surfaces gets updated.
 ## The process-global handle
 
 Metrics get recorded from deep inside the core — the cartridge code,
-the cloud backends, the iSCSI layer, the pool-budget logic. Threading
+the storage backends, the iSCSI layer, the pool-budget logic. Threading
 a `Telemetry` handle as an argument through all of those call paths
 would be invasive, so instead each daemon installs a **process-global
 handle** at boot, via `shared_telemetry::set_global`. Core call sites
@@ -107,8 +107,8 @@ coherent area of the daemon and the files that instrument it:
 | Subsystem | What you're watching | Source files |
 |---|---|---|
 | `pool` | Disk-cache budget, eviction pressure, backpressure waits | `chunk_store.rs`, `disk_cache.rs` |
-| `cloud` | Per-backend request rates, latencies, error classes | `s3.rs` / `gcs.rs` / `azure.rs` / `local.rs` via `cloud_backend.rs` |
-| `chunk` | Seal rate, dedup hit rate (local + cloud-side via HEAD), upload bytes | `cartridge.rs`, upload worker in daemon |
+| `cloud` | Per-backend request rates, latencies, error classes | `s3.rs` / `gcs.rs` / `azure.rs` / `local.rs` via `object_store_backend.rs` |
+| `chunk` | Seal rate, dedup hit rate (local + storage-side via HEAD), upload bytes | `cartridge.rs`, upload worker in daemon |
 | `iscsi` | Active sessions, per-opcode throughput, data-in/out bytes | `vtl/daemon/src/iscsi/*` |
 | `tape` | Per-cartridge memory-buffer occupancy | `memory_buffer_manager.rs` |
 | `prefetch` | Queue depth, hit/miss counts | `prefetch.rs` |
@@ -128,10 +128,10 @@ operator actually cares about. Substitute the product prefix as needed
   saves relative to the host's logical write volume — the bytes the
   host thinks it wrote, over the unique bytes that actually had to be
   stored.
-- **Cloud upload-skip rate** = `thurvtl_chunk_cloud_head_hits_total /
+- **Storage upload-skip rate** = `thurvtl_chunk_cloud_head_hits_total /
   thurvtl_chunk_cloud_head_probes_total`. Before uploading a chunk the
   daemon issues a HEAD request; if the object is already in the bucket
-  the PUT is skipped. This ratio is that cloud-side dedup signal — how
+  the PUT is skipped. This ratio is that storage-side dedup signal — how
   often a HEAD said "already there."
 - **Pool fill** = `thurvtl_pool_used_bytes / thurvtl_pool_cap_bytes`.
   This is the primary backpressure trigger. The closer it sits to
@@ -139,7 +139,7 @@ operator actually cares about. Substitute the product prefix as needed
 
 The dedup analytics CLI (`thurvtl system stats`) walks
 `chunks.idx` directly when you want per-cartridge breakdowns. The
-cloud HEAD-skip rate, by contrast, is exposed *only* through these
+backend HEAD-skip rate, by contrast, is exposed *only* through these
 counters — it is a runtime signal, not state that exists anywhere on
 disk to be walked.
 
@@ -167,10 +167,10 @@ since the `pool`, `cloud`, and `audit` instrument bodies exist on both.
 thurvtl_pool_used_bytes / thurvtl_pool_cap_bytes > 0.9
 
 # Backpressure waits firing for 5 minutes — host writes are outpacing
-# cloud uploads; backups will see SCSI NOT READY soon if not already.
+# backend uploads; backups will see SCSI NOT READY soon if not already.
 rate(thurvtl_pool_backpressure_waits_total[5m]) > 0
 
-# Permanent cloud errors (Auth / Authz / NotFound / RegionMismatch) —
+# Permanent storage-backend errors (Auth / Authz / NotFound / RegionMismatch) —
 # the retry layer already short-circuits these, so any non-zero rate
 # means broken credentials or config drift.
 rate(thurvtl_cloud_permanent_errors_total[5m]) > 0

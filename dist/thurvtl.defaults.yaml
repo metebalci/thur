@@ -147,18 +147,25 @@ iscsi:
     # 3.x+.
     allowed_algorithms: ["SHA3-256", "SHA-256", "SHA-1", "MD5"]
 
-# Cloud storage. Workspace-wide tuning knobs (compression, upload
+# Storage backends. Workspace-wide tuning knobs (compression, upload
 # concurrency, retention-mode check) plus the named backend
-# definitions under `cloud.backends:`. Each cartridge picks one
+# definitions under `storage.backends:`. Each cartridge picks one
 # backend at create time (`cartridge create --backend NAME`) and is
 # bound to it for life; every chunk upload, manifest backup,
 # prefetch and refetch routes through that backend.
 #
+# "Storage backend" is the umbrella term — local-filesystem, S3, GCS,
+# Azure, and on-prem S3-compatible object stores (AIStore, MinIO,
+# Ceph RGW) all live here. Every backend the daemon currently
+# implements is object-shaped (PUT/GET/HEAD/DELETE on opaque blobs);
+# the "storage" naming leaves room for a future block-shaped backend
+# variant without another rename.
+#
 # See docs/AUTH.md for the per-backend `auth:` block shapes
 # (S3 / GCS / Azure / local).
-cloud:
+storage:
   # Opt out of bucket-immutability validation at startup and in
-  # `cloud check`. When true:
+  # `storage check`. When true:
   #   - lock_state() is never called against any backend.
   #   - Azure backends with retention_mode != none no longer require
   #     subscription_id + resource_group (those fields exist solely
@@ -173,7 +180,7 @@ cloud:
   # Default: false (validation runs; recommended for compliance setups).
   # skip_retention_mode_check: false
 
-  # Cloud-layer compression (S3/GCS/Azure only; ignored for local).
+  # Backend-side compression (S3/GCS/Azure only; ignored for local).
   # Applied per-chunk on upload, post-dedup. Default zstd because
   # chunk-sized inputs (1-128 MiB) amortize the heavier algorithm
   # well; lz4 is faster but compresses less.
@@ -188,7 +195,7 @@ cloud:
     # Maximum concurrent in-flight chunk uploads per backend per
     # cartridge. `0` (default) means "auto-scale": at daemon start,
     # resolve to min(16, available_parallelism * 4). On 4+ core hosts
-    # this caps at 16, which captures most cloud-backend throughput
+    # this caps at 16, which captures most storage-backend throughput
     # while bounding the in-flight memory footprint (N × chunk_size).
     # Operators who want higher concurrency at the cost of memory can
     # set this to an explicit value (e.g. 32). Resolved value + source

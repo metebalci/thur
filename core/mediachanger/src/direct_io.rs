@@ -26,7 +26,9 @@ pub fn open_direct_read<P: AsRef<Path>>(path: P) -> Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_DIRECT)
         .open(path)
-        .map_err(|e| SmcError::CloudError(format!("Failed to open file for direct read: {}", e)))
+        .map_err(|e| {
+            SmcError::ObjectStoreError(format!("Failed to open file for direct read: {}", e))
+        })
 }
 
 /// Open file for Direct I/O writes (O_DIRECT flag)
@@ -37,7 +39,9 @@ pub fn open_direct_write<P: AsRef<Path>>(path: P) -> Result<std::fs::File> {
         .create(true)
         .custom_flags(libc::O_DIRECT)
         .open(path)
-        .map_err(|e| SmcError::CloudError(format!("Failed to open file for direct write: {}", e)))
+        .map_err(|e| {
+            SmcError::ObjectStoreError(format!("Failed to open file for direct write: {}", e))
+        })
 }
 
 /// Fallback for non-Linux platforms (standard I/O)
@@ -46,7 +50,7 @@ pub fn open_direct_read<P: AsRef<Path>>(path: P) -> Result<std::fs::File> {
     OpenOptions::new()
         .read(true)
         .open(path)
-        .map_err(|e| SmcError::CloudError(format!("Failed to open file for read: {}", e)))
+        .map_err(|e| SmcError::ObjectStoreError(format!("Failed to open file for read: {}", e)))
 }
 
 /// Fallback for non-Linux platforms (standard I/O)
@@ -56,7 +60,7 @@ pub fn open_direct_write<P: AsRef<Path>>(path: P) -> Result<std::fs::File> {
         .write(true)
         .create(true)
         .open(path)
-        .map_err(|e| SmcError::CloudError(format!("Failed to open file for write: {}", e)))
+        .map_err(|e| SmcError::ObjectStoreError(format!("Failed to open file for write: {}", e)))
 }
 
 /// Check if a buffer is properly aligned for Direct I/O

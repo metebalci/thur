@@ -182,7 +182,7 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
             },
         )
         .build(),
-        SmcError::CloudError(_) => SenseDataBuilder::new(
+        SmcError::ObjectStoreError(_) => SenseDataBuilder::new(
             SenseKey::HardwareError,
             AdditionalSenseCode {
                 asc: 0x44,

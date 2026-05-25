@@ -14,7 +14,7 @@ use common::create_test_dir;
 use core_mediachanger::cartridge_archive::{ArchiveOptions, run_archive};
 use core_mediachanger::library::restore_archive::{RestoreArchiveOptions, run_restore_archive};
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, CloudBackend, DedupScope, Library, LocalBackend, SmcError,
+    Cartridge, CartridgeOpenMode, DedupScope, Library, LocalBackend, ObjectStoreBackend, SmcError,
 };
 use std::fs;
 use std::path::Path;
@@ -38,7 +38,8 @@ async fn seed(
     dedup: DedupScope,
     n_blocks: usize,
 ) -> Vec<Vec<u8>> {
-    let backend: Box<dyn CloudBackend> = Box::new(LocalBackend::new(bucket).await.expect("be"));
+    let backend: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(bucket).await.expect("be"));
     let mut cart = Cartridge::open_with_cloud_async(
         tapes,
         label,
@@ -90,8 +91,8 @@ async fn archive_then_restore_round_trip() {
     let written = seed(&tapes, &bucket, "TAPE_RT", DedupScope::Global, 3).await;
 
     // Archive.
-    let src: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let tgt: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let src: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let tgt: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let _ = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_RT",
@@ -116,7 +117,8 @@ async fn archive_then_restore_round_trip() {
     }
 
     // Restore.
-    let restore_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let restore_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let report = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,
         backend: restore_be.as_ref(),
@@ -142,7 +144,8 @@ async fn archive_then_restore_round_trip() {
         .expect("seat");
 
     // Re-open the restored cartridge and read every block.
-    let read_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let read_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let mut cart =
         Cartridge::open_with_cloud_async(&tapes, "TAPE_RT", CartridgeOpenMode::Open, Some(read_be))
             .await
@@ -165,8 +168,8 @@ async fn restore_archive_rename_via_as_barcode() {
 
     let written = seed(&tapes, &bucket, "TAPE_ORIG", DedupScope::Global, 2).await;
 
-    let src: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let tgt: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let src: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let tgt: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let _ = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_ORIG",
@@ -182,7 +185,8 @@ async fn restore_archive_rename_via_as_barcode() {
 
     // Source cartridge still exists locally; restore to a fresh
     // barcode so the two coexist.
-    let restore_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let restore_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let report = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,
         backend: restore_be.as_ref(),
@@ -220,7 +224,8 @@ async fn restore_archive_rename_via_as_barcode() {
     assert!(restored["archived_at"].is_string());
 
     // Read every block from the restored cartridge.
-    let read_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let read_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let mut cart = Cartridge::open_with_cloud_async(
         &tapes,
         "TAPE_RESTORED",
@@ -246,8 +251,8 @@ async fn restore_archive_dry_run_writes_nothing() {
     let _library = init_library(work.path());
 
     let _ = seed(&tapes, &bucket, "TAPE_DR", DedupScope::Global, 1).await;
-    let src: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let tgt: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let src: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let tgt: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let _ = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_DR",
@@ -263,7 +268,8 @@ async fn restore_archive_dry_run_writes_nothing() {
 
     fs::remove_dir_all(tapes.join("TAPE_DR")).expect("rm cart");
 
-    let restore_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let restore_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let report = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,
         backend: restore_be.as_ref(),
@@ -291,7 +297,8 @@ async fn restore_archive_refuses_missing_archive() {
     fs::create_dir_all(&bucket).expect("mkdir");
     let _library = init_library(work.path());
 
-    let backend: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let backend: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let err = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,
         backend: backend.as_ref(),
@@ -318,8 +325,8 @@ async fn restore_archive_allow_existing_skips() {
     let _library = init_library(work.path());
 
     let _ = seed(&tapes, &bucket, "TAPE_E", DedupScope::Global, 1).await;
-    let src: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let tgt: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let src: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let tgt: Box<dyn ObjectStoreBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let _ = run_archive(ArchiveOptions {
         tapes_dir: &tapes,
         barcode: "TAPE_E",
@@ -335,7 +342,8 @@ async fn restore_archive_allow_existing_skips() {
 
     // Cartridge still locally present — restore without
     // --allow-existing refuses; with it, skips silently.
-    let restore_be: Box<dyn CloudBackend> = Box::new(LocalBackend::new(&bucket).await.expect("be"));
+    let restore_be: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let err = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,
         backend: restore_be.as_ref(),
@@ -351,7 +359,7 @@ async fn restore_archive_allow_existing_skips() {
     .expect_err("must refuse existing");
     matches!(err, SmcError::InvalidOp(_));
 
-    let restore_be2: Box<dyn CloudBackend> =
+    let restore_be2: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&bucket).await.expect("be"));
     let report = run_restore_archive(RestoreArchiveOptions {
         tapes_dir: &tapes,

@@ -25,7 +25,7 @@
 
 use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
 use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
-use shared_cloud::{CloudBackend, LocalBackend};
+use shared_object_store::{LocalBackend, ObjectStoreBackend};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cloud_root = data_dir.join("local-cloud");
     std::fs::create_dir_all(&cloud_root)?;
     let backend = LocalBackend::new(&cloud_root).await?;
-    let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let total_bytes: usize = total_mb * 1024 * 1024;
     // Volume size = 2 * total_bytes gives headroom; sector-aligned by

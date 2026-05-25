@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Process-local "what's already in the cloud" cache layered over
-//! [`CloudBackend`].
+//! [`ObjectStoreBackend`].
 //!
 //! The cloud is authoritative; the daemon's view of the cloud is a
 //! warm local cache. Once we've confirmed a fact this lifetime — we
@@ -23,11 +23,11 @@
 //! the next caller hits the backend; a HEAD miss is not negative-cached
 //! (could mask a concurrent upload by a co-resident process).
 
-use crate::CloudBackend;
+use crate::ObjectStoreBackend;
 use crate::Result;
-use crate::cloud_backend::LockState;
 use crate::compression::CompressionAlgo;
-use crate::error::CloudError;
+use crate::error::ObjectStoreError;
+use crate::object_store_backend::LockState;
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
@@ -51,10 +51,10 @@ enum CloudState {
         algo: Option<CompressionAlgo>,
     },
     /// A PUT is in flight; subscribers await the same future. The
-    /// payload is `Arc<CloudError>` because `CloudError` is not `Clone`
+    /// payload is `Arc<ObjectStoreError>` because `ObjectStoreError` is not `Clone`
     /// (it carries `std::io::Error`) and `Shared` requires the output
     /// to be `Clone`.
-    InFlight(Shared<BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>>),
+    InFlight(Shared<BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>>),
 }
 
 #[derive(Clone, Copy)]
@@ -64,13 +64,13 @@ struct UploadOutcome {
     algo: Option<CompressionAlgo>,
 }
 
-/// Wrapper around a concrete [`CloudBackend`] that memoizes upload /
+/// Wrapper around a concrete [`ObjectStoreBackend`] that memoizes upload /
 /// presence facts across the daemon's lifetime. Construct via
-/// [`CachingCloudBackend::new`] at registry-population time; every
+/// [`CachingObjectStoreBackend::new`] at registry-population time; every
 /// call site receives a wrapped backend automatically.
 #[derive(Debug)]
-pub struct CachingCloudBackend {
-    inner: Arc<dyn CloudBackend>,
+pub struct CachingObjectStoreBackend {
+    inner: Arc<dyn ObjectStoreBackend>,
     name: String,
     known: Arc<Mutex<HashMap<String, CloudState>>>,
 }
@@ -88,11 +88,11 @@ impl std::fmt::Debug for CloudState {
     }
 }
 
-impl CachingCloudBackend {
+impl CachingObjectStoreBackend {
     /// Wrap an existing backend. The cache map starts empty; call
     /// [`Self::warmup_prefix`] from the daemon at boot to seed
     /// `Probed` entries from a LIST.
-    pub fn new(inner: Box<dyn CloudBackend>, name: impl Into<String>) -> Self {
+    pub fn new(inner: Box<dyn ObjectStoreBackend>, name: impl Into<String>) -> Self {
         Self {
             inner: Arc::from(inner),
             name: name.into(),
@@ -108,7 +108,7 @@ impl CachingCloudBackend {
 }
 
 #[async_trait]
-impl CloudBackend for CachingCloudBackend {
+impl ObjectStoreBackend for CachingObjectStoreBackend {
     async fn upload_chunk(
         &self,
         key: &str,
@@ -120,7 +120,11 @@ impl CloudBackend for CachingCloudBackend {
         enum Action {
             ReturnTuple(u64, Option<u64>, Option<CompressionAlgo>),
             ReturnSynth,
-            Await(Shared<BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>>),
+            Await(
+                Shared<
+                    BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
+                >,
+            ),
             Miss,
         }
         let action = {
@@ -138,18 +142,18 @@ impl CloudBackend for CachingCloudBackend {
         };
         match action {
             Action::ReturnTuple(u, c, a) => {
-                shared_telemetry::record::chunk_cloud_cache_hit(&self.name);
+                shared_telemetry::record::chunk_storage_cache_hit(&self.name);
                 return Ok((u, c, a));
             }
             Action::ReturnSynth => {
-                shared_telemetry::record::chunk_cloud_cache_hit(&self.name);
+                shared_telemetry::record::chunk_storage_cache_hit(&self.name);
                 return Ok((data.len() as u64, None, None));
             }
             Action::Await(waiter) => {
-                shared_telemetry::record::chunk_cloud_cache_inflight_coalesced(&self.name);
+                shared_telemetry::record::chunk_storage_cache_inflight_coalesced(&self.name);
                 return match waiter.await {
                     Ok(o) => Ok((o.uncompressed, o.compressed, o.algo)),
-                    Err(arc_err) => Err(CloudError::Other(arc_err.to_string())),
+                    Err(arc_err) => Err(ObjectStoreError::Other(arc_err.to_string())),
                 };
             }
             Action::Miss => {}
@@ -172,7 +176,7 @@ impl CloudBackend for CachingCloudBackend {
                 .map_err(Arc::new)
         };
         let shared: Shared<
-            BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>,
+            BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
         > = upload_fut.boxed().shared();
 
         // Re-check under the lock — a concurrent caller may have raced
@@ -217,7 +221,7 @@ impl CloudBackend for CachingCloudBackend {
                 if matches!(map.get(key), Some(CloudState::InFlight(_))) {
                     map.remove(key);
                 }
-                Err(CloudError::Other(arc_err.to_string()))
+                Err(ObjectStoreError::Other(arc_err.to_string()))
             }
         }
     }
@@ -229,7 +233,11 @@ impl CloudBackend for CachingCloudBackend {
         // before any await — `MutexGuard` is not `Send`.
         enum Action {
             ReturnSize(u64),
-            Await(Shared<BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>>),
+            Await(
+                Shared<
+                    BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
+                >,
+            ),
             Miss,
         }
         let action = {
@@ -244,14 +252,14 @@ impl CloudBackend for CachingCloudBackend {
         };
         match action {
             Action::ReturnSize(n) => {
-                shared_telemetry::record::chunk_cloud_cache_hit(&self.name);
+                shared_telemetry::record::chunk_storage_cache_hit(&self.name);
                 return Ok(n);
             }
             Action::Await(waiter) => {
-                shared_telemetry::record::chunk_cloud_cache_inflight_coalesced(&self.name);
+                shared_telemetry::record::chunk_storage_cache_inflight_coalesced(&self.name);
                 return match waiter.await {
                     Ok(o) => Ok(o.uncompressed),
-                    Err(arc_err) => Err(CloudError::Other(arc_err.to_string())),
+                    Err(arc_err) => Err(ObjectStoreError::Other(arc_err.to_string())),
                 };
             }
             Action::Miss => {}
@@ -272,7 +280,7 @@ impl CloudBackend for CachingCloudBackend {
                 .map_err(Arc::new)
         };
         let shared: Shared<
-            BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>,
+            BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
         > = upload_fut.boxed().shared();
 
         let waiter = {
@@ -306,7 +314,7 @@ impl CloudBackend for CachingCloudBackend {
                 if matches!(map.get(key), Some(CloudState::InFlight(_))) {
                     map.remove(key);
                 }
-                Err(CloudError::Other(arc_err.to_string()))
+                Err(ObjectStoreError::Other(arc_err.to_string()))
             }
         }
     }
@@ -345,7 +353,11 @@ impl CloudBackend for CachingCloudBackend {
     async fn chunk_exists(&self, key: &str) -> Result<bool> {
         enum HeadAction {
             Hit,
-            Await(Shared<BoxFuture<'static, std::result::Result<UploadOutcome, Arc<CloudError>>>>),
+            Await(
+                Shared<
+                    BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
+                >,
+            ),
             Miss,
         }
         let action = {
@@ -358,11 +370,11 @@ impl CloudBackend for CachingCloudBackend {
         };
         match action {
             HeadAction::Hit => {
-                shared_telemetry::record::chunk_cloud_cache_hit(&self.name);
+                shared_telemetry::record::chunk_storage_cache_hit(&self.name);
                 return Ok(true);
             }
             HeadAction::Await(fut) => {
-                shared_telemetry::record::chunk_cloud_cache_inflight_coalesced(&self.name);
+                shared_telemetry::record::chunk_storage_cache_inflight_coalesced(&self.name);
                 if fut.await.is_ok() {
                     return Ok(true);
                 }
@@ -403,7 +415,7 @@ impl CloudBackend for CachingCloudBackend {
             }
         }
         if seeded > 0 {
-            shared_telemetry::record::chunk_cloud_cache_warmup_seeded(&self.name, seeded as u64);
+            shared_telemetry::record::chunk_storage_cache_warmup_seeded(&self.name, seeded as u64);
         }
         Ok(seeded)
     }
@@ -435,9 +447,9 @@ impl CloudBackend for CachingCloudBackend {
         self.inner.get_object_legal_hold(key).await
     }
 
-    fn clone_box(&self) -> Box<dyn CloudBackend> {
+    fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
         // Cloned wrappers share the same cache map and inner backend
-        // — `Box<dyn CloudBackend>::clone()` callers must observe the
+        // — `Box<dyn ObjectStoreBackend>::clone()` callers must observe the
         // same in-process facts.
         Box::new(Self {
             inner: Arc::clone(&self.inner),
@@ -484,7 +496,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CloudBackend for MockBackend {
+    impl ObjectStoreBackend for MockBackend {
         async fn upload_chunk(
             &self,
             _key: &str,
@@ -496,7 +508,7 @@ mod tests {
             }
             self.c.puts.fetch_add(1, Ordering::SeqCst);
             if self.c.fail_next_upload.swap(false, Ordering::SeqCst) {
-                return Err(CloudError::Other("mock failure".to_string()));
+                return Err(ObjectStoreError::Other("mock failure".to_string()));
             }
             Ok((data.len() as u64, None, None))
         }
@@ -565,15 +577,15 @@ mod tests {
             Ok(false)
         }
 
-        fn clone_box(&self) -> Box<dyn CloudBackend> {
+        fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
             Box::new(Self {
                 c: Arc::clone(&self.c),
             })
         }
     }
 
-    fn wrap(mock: MockBackend) -> CachingCloudBackend {
-        CachingCloudBackend::new(Box::new(mock), "test")
+    fn wrap(mock: MockBackend) -> CachingObjectStoreBackend {
+        CachingObjectStoreBackend::new(Box::new(mock), "test")
     }
 
     #[tokio::test]
@@ -749,7 +761,7 @@ mod tests {
         let (mock, c) = MockBackend::new();
         let cache = wrap(mock);
         cache.upload_chunk("k", b"hi").await.unwrap();
-        let cloned: Box<dyn CloudBackend> = cache.clone_box();
+        let cloned: Box<dyn ObjectStoreBackend> = cache.clone_box();
         assert!(cloned.chunk_exists("k").await.unwrap());
         assert_eq!(
             c.heads.load(Ordering::SeqCst),
@@ -808,7 +820,7 @@ mod tests {
             c: Arc<Counters>,
         }
         #[async_trait]
-        impl CloudBackend for DefaultMock {
+        impl ObjectStoreBackend for DefaultMock {
             async fn upload_chunk(
                 &self,
                 _key: &str,
@@ -853,7 +865,7 @@ mod tests {
             async fn get_object_legal_hold(&self, _: &str) -> Result<bool> {
                 Ok(false)
             }
-            fn clone_box(&self) -> Box<dyn CloudBackend> {
+            fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
                 Box::new(Self {
                     c: Arc::clone(&self.c),
                 })
@@ -921,7 +933,7 @@ mod tests {
             assert_eq!(size, 8192);
         }
         // MockBackend's upload_chunk_zerocopy increments `puts` too.
-        // CachingCloudBackend's singleflight collapses to one inner call.
+        // CachingObjectStoreBackend's singleflight collapses to one inner call.
         assert_eq!(
             c.puts.load(Ordering::SeqCst),
             1,
@@ -936,7 +948,7 @@ mod tests {
         #[derive(Debug)]
         struct ErrZeroMock;
         #[async_trait]
-        impl CloudBackend for ErrZeroMock {
+        impl ObjectStoreBackend for ErrZeroMock {
             async fn upload_chunk(
                 &self,
                 _: &str,
@@ -945,7 +957,7 @@ mod tests {
                 Ok((0, None, None))
             }
             async fn upload_chunk_zerocopy(&self, _: &str, _: &Path) -> Result<u64> {
-                Err(CloudError::Other("zerocopy boom".into()))
+                Err(ObjectStoreError::Other("zerocopy boom".into()))
             }
             async fn download_chunk(&self, _: &str) -> Result<Vec<u8>> {
                 Ok(vec![])
@@ -980,11 +992,11 @@ mod tests {
             async fn get_object_legal_hold(&self, _: &str) -> Result<bool> {
                 Ok(false)
             }
-            fn clone_box(&self) -> Box<dyn CloudBackend> {
+            fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
                 Box::new(Self)
             }
         }
-        let cache = CachingCloudBackend::new(Box::new(ErrZeroMock), "test");
+        let cache = CachingObjectStoreBackend::new(Box::new(ErrZeroMock), "test");
         let (_dir, path) = write_tmp(b"hello");
         // First call errors; the cache must have removed the InFlight
         // entry so a retry sees a fresh Miss (still errors, but goes
@@ -1038,7 +1050,7 @@ mod tests {
         c.head_returns.store(true, Ordering::SeqCst);
         assert!(cache.chunk_exists("p").await.unwrap()); // Probed
         let dbg = format!("{:?}", cache);
-        assert!(dbg.contains("CachingCloudBackend"));
+        assert!(dbg.contains("CachingObjectStoreBackend"));
     }
 
     #[tokio::test]

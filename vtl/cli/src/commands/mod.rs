@@ -3,7 +3,6 @@
 
 pub mod cartridge;
 pub mod cartridge_key;
-pub mod cloud;
 pub mod credentials;
 pub mod drive;
 pub mod gc;
@@ -12,4 +11,5 @@ pub mod library;
 pub mod monitor;
 pub mod self_test;
 pub mod stats;
+pub mod storage;
 pub mod verify;

@@ -155,7 +155,7 @@ struct Config {
     #[serde(default)]
     disk_cache: DiskCacheConfig,
     #[serde(default)]
-    cloud: CloudConfig, // Cloud upload / compression / retention-check knobs (backends live in <data_dir>/cloud-backends.json)
+    storage: ObjectStoreConfig, // Upload / compression / retention-check knobs (backend list lives under `storage.backends:` in YAML)
     #[serde(default)]
     http: Option<HttpConfig>,
     #[serde(default)]
@@ -465,7 +465,7 @@ impl Default for DiskCacheConfig {
 
 // Cloud backend configuration is shared with the CLI in core-mediachanger.
 // Re-exported via aliases here so existing field/var names keep working.
-use core_mediachanger::CloudConfig;
+use core_mediachanger::ObjectStoreConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 struct HttpConfig {
@@ -698,14 +698,17 @@ async fn main() -> Result<()> {
     // operator to migrate the entries rather than silently ignore them.
     let data_dir_path = std::path::PathBuf::from(&cfg.data_dir);
     let config_path_buf = std::path::PathBuf::from(&config_path);
-    shared_cloud::reject_legacy_cloud_backends_json(&data_dir_path, &config_path_buf)
+    shared_object_store::reject_legacy_cloud_backends_json(&data_dir_path, &config_path_buf)
         .map_err(anyhow::Error::msg)?;
     shared_keystore::reject_legacy_keystore_backends_json(&data_dir_path, &config_path_buf)
         .map_err(anyhow::Error::msg)?;
-    cfg.cloud
+    cfg.storage
         .validate_backends()
         .map_err(|e| anyhow::anyhow!("validate cloud.backends in {}: {}", config_path, e))?;
-    info!("cloud: {} backend(s) configured", cfg.cloud.backends.len());
+    info!(
+        "cloud: {} backend(s) configured",
+        cfg.storage.backends.len()
+    );
 
     let iscsi_users_path = data_dir_path.join("iscsi-users.json");
     let iscsi_users_file =
@@ -752,9 +755,9 @@ async fn main() -> Result<()> {
     // first failure so the operator gets a focused error instead of a
     // wall of partial results.
     info!("Validating cloud backend configuration...");
-    for name in cfg.cloud.backend_names() {
+    for name in cfg.storage.backend_names() {
         info!("  -> validating backend '{}'", name);
-        core_mediachanger::validate_cloud_backend(&cfg.cloud, &name, |step| {
+        core_mediachanger::validate_object_store_backend(&cfg.storage, &name, |step| {
             info!("    [pass] {}: {}", step.name, step.detail);
         })
         .await
@@ -769,7 +772,7 @@ async fn main() -> Result<()> {
     // export-and-delete the orphaned cartridge.
     {
         let backend_names: std::collections::HashSet<String> =
-            cfg.cloud.backend_names().into_iter().collect();
+            cfg.storage.backend_names().into_iter().collect();
         let tapes_dir = std::path::Path::new(&cfg.data_dir).join("tapes");
         if tapes_dir.is_dir() {
             for entry in std::fs::read_dir(&tapes_dir)? {
@@ -797,7 +800,7 @@ async fn main() -> Result<()> {
                         .map(String::from)
                         .unwrap_or_else(|| "<unknown>".to_string());
                     return Err(anyhow::anyhow!(
-                        "cartridge '{}' references cloud backend '{}' which is not configured \
+                        "cartridge '{}' references storage backend '{}' which is not configured \
                          in cloud.backends ({}). Either add the backend to thurvtl.yaml or \
                          export and delete the cartridge.",
                         label,
@@ -895,24 +898,27 @@ async fn main() -> Result<()> {
     };
 
     // Log cloud backend configuration. One line per named entry.
-    for name in cfg.cloud.backend_names() {
-        match cfg.cloud.backend_entry(&name) {
+    for name in cfg.storage.backend_names() {
+        match cfg.storage.backend_entry(&name) {
             Ok(core_mediachanger::BackendEntry::S3(s3)) => info!(
-                "Cloud backend '{}': S3 (bucket={} prefix={} region={})",
+                "Storage backend '{}': S3 (bucket={} prefix={} region={})",
                 name, s3.bucket, s3.prefix, s3.region
             ),
             Ok(core_mediachanger::BackendEntry::Gcs(gcs)) => info!(
-                "Cloud backend '{}': GCS (bucket={} prefix={} project={})",
+                "Storage backend '{}': GCS (bucket={} prefix={} project={})",
                 name, gcs.bucket, gcs.prefix, gcs.project_id
             ),
             Ok(core_mediachanger::BackendEntry::Azure(a)) => info!(
-                "Cloud backend '{}': Azure (storage_account={} container={} prefix={})",
+                "Storage backend '{}': Azure (storage_account={} container={} prefix={})",
                 name, a.storage_account, a.container, a.prefix
             ),
             Ok(core_mediachanger::BackendEntry::Local(l)) => {
-                info!("Cloud backend '{}': Local (root_dir={})", name, l.root_dir)
+                info!(
+                    "Storage backend '{}': Local (root_dir={})",
+                    name, l.root_dir
+                )
             }
-            Err(e) => warn!("Cloud backend '{}': {}", name, e),
+            Err(e) => warn!("Storage backend '{}': {}", name, e),
         }
     }
     let enabled = cfg.memory_buffers.read_prefetch_chunks_ahead > 0;
@@ -1170,12 +1176,12 @@ async fn main() -> Result<()> {
         // entries before any of them resolve so the share divisor is
         // stable.
         let resolved: Vec<(String, core_mediachanger::DiskCacheSize, bool)> = cfg
-            .cloud
+            .storage
             .backend_names()
             .into_iter()
             .map(|name| {
                 let override_size = cfg
-                    .cloud
+                    .storage
                     .backend_entry(&name)
                     .ok()
                     .and_then(|e| e.disk_cache_size_gb());
@@ -1384,12 +1390,12 @@ async fn main() -> Result<()> {
     // don't pay the auth round-trip more than once per backend; the
     // SCSI READ prefetch hook resolves cartridges' sticky
     // `manifest.backend` through it on cache miss.
-    let cloud_backends_registry: iscsi::server::CloudBackendRegistry =
+    let cloud_backends_registry: iscsi::server::ObjectStoreRegistry =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let cloud_config_arc = std::sync::Arc::new(cfg.cloud.clone());
+    let storage_config_arc = std::sync::Arc::new(cfg.storage.clone());
     let keystore_config_arc = std::sync::Arc::new(cfg.keystore.clone());
     let backpressure_max_wait =
-        std::time::Duration::from_secs(cfg.cloud.upload.backpressure_max_wait_seconds.into());
+        std::time::Duration::from_secs(cfg.storage.upload.backpressure_max_wait_seconds.into());
 
     let library_arc = std::sync::Arc::new(std::sync::Mutex::new(library));
 
@@ -1405,7 +1411,7 @@ async fn main() -> Result<()> {
         audit_dir: audit_log_dir.clone(),
         audit_ratelimiter: std::sync::Arc::clone(&audit_ratelimiter),
         cloud_backends: std::sync::Arc::clone(&cloud_backends_registry),
-        cloud_config: std::sync::Arc::clone(&cloud_config_arc),
+        storage_config: std::sync::Arc::clone(&storage_config_arc),
         keystore_config: std::sync::Arc::clone(&keystore_config_arc),
         num_drives: lib_drives as usize,
         drive_compression_algorithm: drive_cfg.compression.algorithm,
@@ -1672,11 +1678,11 @@ async fn run_upload_worker(cfg: &Config) -> Result<()> {
 
     // Create S3 backend
     let cloud_backend = cfg
-        .cloud
-        .create_backend_named(&cfg.cloud.backend_names()[0])
+        .storage
+        .create_backend_named(&cfg.storage.backend_names()[0])
         .await?;
 
-    let upload_cfg = &cfg.cloud.upload;
+    let upload_cfg = &cfg.storage.upload;
     let max_concurrent = upload_cfg.max_concurrent;
     let retry_max_attempts = upload_cfg.retry_max_attempts;
 
@@ -1905,7 +1911,7 @@ async fn run_disk_cache_eviction_worker(
     let mut backstop = tokio::time::interval(Duration::from_secs(300));
     backstop.tick().await; // skip immediate first tick at startup
 
-    let backend_names: Vec<String> = cfg.cloud.backend_names();
+    let backend_names: Vec<String> = cfg.storage.backend_names();
 
     loop {
         tokio::select! {
@@ -1931,7 +1937,7 @@ async fn run_disk_cache_eviction_worker(
             .iter()
             .map(|name| {
                 let size = cfg
-                    .cloud
+                    .storage
                     .backend_entry(name)
                     .ok()
                     .and_then(|e| e.disk_cache_size_gb())
@@ -2029,7 +2035,7 @@ async fn run_disk_cache_eviction_worker(
 
             // Build a fresh cloud backend for the eviction pass.
             // Eviction is rare; the construction cost is negligible.
-            let cloud_backend = match cfg.cloud.create_backend_named(cm.backend_name()).await {
+            let cloud_backend = match cfg.storage.create_backend_named(cm.backend_name()).await {
                 Ok(b) => Some(b),
                 Err(e) => {
                     warn!(
@@ -2146,7 +2152,7 @@ mod config_parse_tests {
     fn daemon_parses_defaults_yaml() {
         // Replace the empty `backends:` line with one that has a
         // single local backend, so the required-but-unset map satisfies
-        // CloudConfig's `backends: BTreeMap<...>` field.
+        // ObjectStoreConfig's `backends: BTreeMap<...>` field.
         let raw = defaults_yaml();
         let injected = raw.replace(
             "  backends:\n",

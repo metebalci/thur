@@ -54,7 +54,7 @@ impl std::fmt::Debug for GcpKmsBackend {
 
 impl GcpKmsBackend {
     /// Construct a KMS client + handle bound to one CryptoKey.
-    /// Credential loading mirrors `shared_cloud::gcs::GcsBackend::new`
+    /// Credential loading mirrors `shared_object_store::gcs::GcsBackend::new`
     /// — service-account JSON key file when configured, ADC chain
     /// otherwise (`GOOGLE_APPLICATION_CREDENTIALS` env →
     /// `gcloud auth application-default login` → GCE/GKE metadata

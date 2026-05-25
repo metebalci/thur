@@ -8,25 +8,26 @@
 //! and exercise the same validation steps.
 
 use crate::azure::AzureBackend;
-use crate::cloud_backend::CloudBackend;
 use crate::compression::{
     CompressionAlgo, CompressionConfig as CoreCompressionConfig, ZSTD_DEFAULT_LEVEL,
 };
 use crate::gcs::GcsBackend;
 use crate::local::LocalBackend;
+use crate::object_store_backend::ObjectStoreBackend;
 use crate::s3::S3Backend;
 use serde::Deserialize;
 use shared_pool::DiskCacheSize;
 use std::collections::BTreeMap;
 
-/// Top-level `cloud:` section of `thurvtl.yaml` / `thurvsa.yaml`.
-/// Holds the workspace-wide cloud tuning knobs that apply uniformly
-/// across every backend, plus the named backend definitions themselves
-/// under `cloud.backends:`. Each cartridge (VTL) or volume (VSA) picks
-/// one entry at create time and is bound to it for life.
+/// Top-level `storage:` section of `thurvtl.yaml` / `thurvsa.yaml`.
+/// Holds the workspace-wide storage-backend tuning knobs that apply
+/// uniformly across every backend, plus the named backend definitions
+/// themselves under `storage.backends:`. Each cartridge (VTL) or
+/// volume (VSA) picks one entry at create time and is bound to it for
+/// life.
 ///
 /// ```yaml
-/// cloud:
+/// storage:
 ///   upload: { max_concurrent: 0, retry_max_attempts: 10, ... }
 ///   compression: { algorithm: zstd, level: 3 }
 ///   skip_retention_mode_check: false
@@ -34,7 +35,7 @@ use std::collections::BTreeMap;
 ///     primary: { type: s3, bucket: ..., region: ..., auth: { ... } }
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct CloudConfig {
+pub struct ObjectStoreConfig {
     #[serde(default)]
     pub upload: UploadConfig,
     #[serde(default)]
@@ -44,9 +45,9 @@ pub struct CloudConfig {
     #[serde(default)]
     pub backends: BTreeMap<String, BackendEntry>,
     /// Opt out of bucket immutability validation at startup and in
-    /// `cloud check`. When `true`:
+    /// `storage check`. When `true`:
     ///   - `lock_state()` is never called against any backend, in
-    ///     `validate_cloud_backend` or anywhere else.
+    ///     `validate_object_store_backend` or anywhere else.
     ///   - Azure backends with `retention_mode != none` no longer
     ///     require `subscription_id` and `resource_group` (those
     ///     fields exist solely to address the management-plane
@@ -199,7 +200,7 @@ impl S3Auth {
     /// Read any `_env` variants and return a [`ResolvedS3Auth`]. The
     /// caller should resolve once at config time; the resolved struct
     /// is then passed to [`crate::s3::S3Backend::new`].
-    pub fn resolve(&self) -> CloudConfigResult<ResolvedS3Auth> {
+    pub fn resolve(&self) -> ObjectStoreConfigResult<ResolvedS3Auth> {
         match self {
             S3Auth::Static {
                 access_key_id,
@@ -282,7 +283,7 @@ pub enum ResolvedAzureAuth {
 }
 
 impl AzureAuth {
-    pub fn resolve(&self) -> CloudConfigResult<ResolvedAzureAuth> {
+    pub fn resolve(&self) -> ObjectStoreConfigResult<ResolvedAzureAuth> {
         match self {
             AzureAuth::SasUrl { value } => Ok(ResolvedAzureAuth::SasUrl(value.clone())),
             AzureAuth::SasUrlEnv { env } => Ok(ResolvedAzureAuth::SasUrl(read_env(env)?)),
@@ -308,8 +309,8 @@ impl AzureAuth {
     }
 }
 
-fn read_env(name: &str) -> CloudConfigResult<String> {
-    std::env::var(name).map_err(|_| CloudConfigError::AuthEnvVarMissing(name.to_string()))
+fn read_env(name: &str) -> ObjectStoreConfigResult<String> {
+    std::env::var(name).map_err(|_| ObjectStoreConfigError::AuthEnvVarMissing(name.to_string()))
 }
 
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
@@ -541,13 +542,13 @@ impl Default for CompressionConfigYaml {
     }
 }
 
-impl CloudConfig {
+impl ObjectStoreConfig {
     /// Per-backend invariants. Azure-with-retention requires both
     /// `subscription_id` and `resource_group` so the management-plane
     /// query can address the immutability policy. Skipped when
     /// `self.skip_retention_mode_check` is set — those fields only
     /// exist for the management-plane query.
-    pub fn validate_backends(&self) -> CloudConfigResult<()> {
+    pub fn validate_backends(&self) -> ObjectStoreConfigResult<()> {
         if self.skip_retention_mode_check {
             return Ok(());
         }
@@ -556,7 +557,9 @@ impl CloudConfig {
                 && a.retention_mode.requires_lock()
                 && (a.subscription_id.is_none() || a.resource_group.is_none())
             {
-                return Err(CloudConfigError::AzureRetentionFieldsMissing { name: name.clone() });
+                return Err(ObjectStoreConfigError::AzureRetentionFieldsMissing {
+                    name: name.clone(),
+                });
             }
         }
         Ok(())
@@ -577,22 +580,22 @@ impl CloudConfig {
 
     /// Look up a backend entry by name; structured error if the name
     /// isn't in the configured map.
-    pub fn backend_entry(&self, name: &str) -> CloudConfigResult<&BackendEntry> {
+    pub fn backend_entry(&self, name: &str) -> ObjectStoreConfigResult<&BackendEntry> {
         self.backends
             .get(name)
-            .ok_or_else(|| CloudConfigError::UnknownBackend(name.to_string()))
+            .ok_or_else(|| ObjectStoreConfigError::UnknownBackend(name.to_string()))
     }
 
-    /// Build the `CloudBackend` trait object for the named backend.
+    /// Build the `ObjectStoreBackend` trait object for the named backend.
     /// Loading credentials and contacting the provider happens here.
     /// Compression settings come from `self.compression`.
     pub async fn create_backend_named(
         &self,
         name: &str,
-    ) -> CloudConfigResult<Box<dyn CloudBackend>> {
+    ) -> ObjectStoreConfigResult<Box<dyn ObjectStoreBackend>> {
         let compression = self.compression.to_core();
         let entry = self.backend_entry(name)?;
-        let inner: Box<dyn CloudBackend> = match entry {
+        let inner: Box<dyn ObjectStoreBackend> = match entry {
             BackendEntry::S3(s3) => {
                 let auth = s3.auth.as_ref().map(|a| a.resolve()).transpose()?;
                 let backend = S3Backend::new(
@@ -605,7 +608,7 @@ impl CloudConfig {
                     compression,
                 )
                 .await
-                .map_err(|source| CloudConfigError::BackendInit {
+                .map_err(|source| ObjectStoreConfigError::BackendInit {
                     backend: "S3",
                     source,
                 })?;
@@ -620,7 +623,7 @@ impl CloudConfig {
                     compression,
                 )
                 .await
-                .map_err(|source| CloudConfigError::BackendInit {
+                .map_err(|source| ObjectStoreConfigError::BackendInit {
                     backend: "GCS",
                     source,
                 })?;
@@ -639,7 +642,7 @@ impl CloudConfig {
                     compression,
                 )
                 .await
-                .map_err(|source| CloudConfigError::BackendInit {
+                .map_err(|source| ObjectStoreConfigError::BackendInit {
                     backend: "Azure",
                     source,
                 })?;
@@ -649,7 +652,7 @@ impl CloudConfig {
                 let backend =
                     LocalBackend::new(local.root_dir.clone())
                         .await
-                        .map_err(|source| CloudConfigError::BackendInit {
+                        .map_err(|source| ObjectStoreConfigError::BackendInit {
                             backend: "Local",
                             source,
                         })?;
@@ -657,13 +660,13 @@ impl CloudConfig {
             }
         };
         // Wrap every constructed backend in the meta-cache. Call sites
-        // can't bypass — once the registry hands a Box<dyn CloudBackend>
+        // can't bypass — once the registry hands a Box<dyn ObjectStoreBackend>
         // back, every cloud op rides through the cache. Memoizes
         // upload + positive HEAD facts; singleflights concurrent PUTs
         // to the same key (the GCS-mkfs zero-page collapse). Versioned
         // writes use upload_versioned, which the wrapper passes through
         // and invalidates.
-        Ok(Box::new(crate::caching::CachingCloudBackend::new(
+        Ok(Box::new(crate::caching::CachingObjectStoreBackend::new(
             inner, name,
         )))
     }
@@ -871,17 +874,17 @@ impl FailureKind {
     }
 }
 
-/// Classify a CloudError (typically `CloudError(String)` carrying the raw
+/// Classify a ObjectStoreError (typically `ObjectStoreError(String)` carrying the raw
 /// AWS/GCS SDK message) into a coarse FailureKind via string matching.
-pub fn classify(err: &crate::CloudError) -> FailureKind {
+pub fn classify(err: &crate::ObjectStoreError) -> FailureKind {
     // Structured variants first — the Azure legal-hold path now
-    // distinguishes 412 / 409 from generic CloudError, and they
+    // distinguishes 412 / 409 from generic ObjectStoreError, and they
     // classify deterministically without the string-match dance:
     //   412 Precondition Failed → permanent (Authz-shaped: policy says no)
     //   409 Conflict            → transient (concurrent change; retry helps)
     match err {
-        crate::CloudError::PreconditionFailed(_) => return FailureKind::Authz,
-        crate::CloudError::Conflict(_) => return FailureKind::Other,
+        crate::ObjectStoreError::PreconditionFailed(_) => return FailureKind::Authz,
+        crate::ObjectStoreError::Conflict(_) => return FailureKind::Other,
         _ => {}
     }
     let msg = err.to_string().to_ascii_lowercase();
@@ -989,7 +992,7 @@ pub fn is_retryable(kind: FailureKind) -> bool {
 
 /// Errors returned by cloud config / validation operations.
 #[derive(Debug, thiserror::Error)]
-pub enum CloudConfigError {
+pub enum ObjectStoreConfigError {
     #[error("backend name '{0}' not defined under `cloud.backends:` in the YAML conffile")]
     UnknownBackend(String),
     #[error(
@@ -1009,7 +1012,7 @@ pub enum CloudConfigError {
     BackendInit {
         backend: &'static str,
         #[source]
-        source: crate::CloudError,
+        source: crate::ObjectStoreError,
     },
     #[error(
         "backend '{name}': configured retention_mode is '{configured}' but bucket lock state is '{actual}'. \
@@ -1027,65 +1030,65 @@ pub enum CloudConfigError {
         bucket: String,
         prefix: String,
         #[source]
-        source: crate::CloudError,
+        source: crate::ObjectStoreError,
     },
     #[error("write of test object failed on bucket '{bucket}': {source}")]
     WriteFailed {
         bucket: String,
         #[source]
-        source: crate::CloudError,
+        source: crate::ObjectStoreError,
     },
     #[error("delete of test object failed on bucket '{bucket}': {source}")]
     DeleteFailed {
         bucket: String,
         #[source]
-        source: crate::CloudError,
+        source: crate::ObjectStoreError,
     },
     #[error("lock_state query failed for backend '{name}': {source}")]
     LockStateQueryFailed {
         name: String,
         #[source]
-        source: crate::CloudError,
+        source: crate::ObjectStoreError,
     },
 }
 
-impl CloudConfigError {
+impl ObjectStoreConfigError {
     /// Which validation step did this failure happen on?
     pub fn step(&self) -> &'static str {
         match self {
-            CloudConfigError::UnknownBackend(_)
-            | CloudConfigError::AuthEnvVarMissing(_)
-            | CloudConfigError::AzureRetentionFieldsMissing { .. } => "config",
-            CloudConfigError::BackendInit { .. } => "init",
-            CloudConfigError::ListFailed { .. } => "list",
-            CloudConfigError::WriteFailed { .. } => "write",
-            CloudConfigError::DeleteFailed { .. } => "delete",
-            CloudConfigError::LockStateQueryFailed { .. }
-            | CloudConfigError::RetentionMismatch { .. } => "lock_state",
+            ObjectStoreConfigError::UnknownBackend(_)
+            | ObjectStoreConfigError::AuthEnvVarMissing(_)
+            | ObjectStoreConfigError::AzureRetentionFieldsMissing { .. } => "config",
+            ObjectStoreConfigError::BackendInit { .. } => "init",
+            ObjectStoreConfigError::ListFailed { .. } => "list",
+            ObjectStoreConfigError::WriteFailed { .. } => "write",
+            ObjectStoreConfigError::DeleteFailed { .. } => "delete",
+            ObjectStoreConfigError::LockStateQueryFailed { .. }
+            | ObjectStoreConfigError::RetentionMismatch { .. } => "lock_state",
         }
     }
 
     /// Coarse classification suitable for tailored hints.
     pub fn kind(&self) -> FailureKind {
         match self {
-            CloudConfigError::UnknownBackend(_)
-            | CloudConfigError::AuthEnvVarMissing(_)
-            | CloudConfigError::AzureRetentionFieldsMissing { .. }
-            | CloudConfigError::RetentionMismatch { .. } => FailureKind::Other,
-            CloudConfigError::BackendInit { source, .. }
-            | CloudConfigError::ListFailed { source, .. }
-            | CloudConfigError::WriteFailed { source, .. }
-            | CloudConfigError::DeleteFailed { source, .. }
-            | CloudConfigError::LockStateQueryFailed { source, .. } => classify(source),
+            ObjectStoreConfigError::UnknownBackend(_)
+            | ObjectStoreConfigError::AuthEnvVarMissing(_)
+            | ObjectStoreConfigError::AzureRetentionFieldsMissing { .. }
+            | ObjectStoreConfigError::RetentionMismatch { .. } => FailureKind::Other,
+            ObjectStoreConfigError::BackendInit { source, .. }
+            | ObjectStoreConfigError::ListFailed { source, .. }
+            | ObjectStoreConfigError::WriteFailed { source, .. }
+            | ObjectStoreConfigError::DeleteFailed { source, .. }
+            | ObjectStoreConfigError::LockStateQueryFailed { source, .. } => classify(source),
         }
     }
 }
 
-pub type CloudConfigResult<T> = std::result::Result<T, CloudConfigError>;
+pub type ObjectStoreConfigResult<T> = std::result::Result<T, ObjectStoreConfigError>;
 
 /// Result of one validation step, used so callers can stream pretty output.
 #[derive(Debug, Clone)]
-pub struct CloudCheckStep {
+pub struct ObjectStoreCheckStep {
     pub name: &'static str,
     pub detail: String,
 }
@@ -1099,13 +1102,13 @@ pub struct CloudCheckStep {
 ///
 /// `step_cb` is called after each successful step so callers can render
 /// progress (e.g. CLI prints, daemon `info!` logs).
-pub async fn validate_cloud_backend<F: FnMut(CloudCheckStep)>(
-    cfg: &CloudConfig,
+pub async fn validate_object_store_backend<F: FnMut(ObjectStoreCheckStep)>(
+    cfg: &ObjectStoreConfig,
     name: &str,
     mut step_cb: F,
-) -> CloudConfigResult<()> {
+) -> ObjectStoreConfigResult<()> {
     let backend = cfg.create_backend_named(name).await?;
-    step_cb(CloudCheckStep {
+    step_cb(ObjectStoreCheckStep {
         name: "init",
         detail: format!("backend type: {}", backend.backend_type()),
     });
@@ -1129,13 +1132,16 @@ pub async fn validate_cloud_backend<F: FnMut(CloudCheckStep)>(
 /// (LocalBackend returns `LockState::Off`). Apply the same check
 /// here for symmetry and a clear error. Skipped under
 /// `skip_retention_mode_check`.
-fn validate_local_short_circuit(cfg: &CloudConfig, name: &str) -> CloudConfigResult<bool> {
+fn validate_local_short_circuit(
+    cfg: &ObjectStoreConfig,
+    name: &str,
+) -> ObjectStoreConfigResult<bool> {
     if cfg.backend_entry(name)?.backend_type() != "local" {
         return Ok(false);
     }
     let configured = cfg.retention_mode_named(name);
     if !cfg.skip_retention_mode_check && configured.requires_lock() {
-        return Err(CloudConfigError::RetentionMismatch {
+        return Err(ObjectStoreConfigError::RetentionMismatch {
             name: name.to_string(),
             configured: configured.label(),
             actual: "off",
@@ -1173,15 +1179,15 @@ fn validate_local_short_circuit(cfg: &CloudConfig, name: &str) -> CloudConfigRes
 /// operators who care about the safety net grant the IAM and get
 /// hard verification. Mismatches that DO get verified are still
 /// fatal.
-async fn check_retention_state<F: FnMut(CloudCheckStep)>(
-    backend: &dyn crate::cloud_backend::CloudBackend,
-    cfg: &CloudConfig,
+async fn check_retention_state<F: FnMut(ObjectStoreCheckStep)>(
+    backend: &dyn crate::object_store_backend::ObjectStoreBackend,
+    cfg: &ObjectStoreConfig,
     name: &str,
     configured: RetentionMode,
     step_cb: &mut F,
-) -> CloudConfigResult<()> {
+) -> ObjectStoreConfigResult<()> {
     if cfg.skip_retention_mode_check {
-        step_cb(CloudCheckStep {
+        step_cb(ObjectStoreCheckStep {
             name: "lock_state",
             detail: format!(
                 "retention_mode '{}' — bucket lock state check disabled \
@@ -1197,15 +1203,16 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
             let configured_label = configured.label();
             let mismatch = !matches!(
                 (configured, actual),
-                (RetentionMode::None, crate::cloud_backend::LockState::Off)
-                    | (
-                        RetentionMode::Governance,
-                        crate::cloud_backend::LockState::Governance { .. }
-                    )
-                    | (
-                        RetentionMode::Compliance,
-                        crate::cloud_backend::LockState::Compliance { .. }
-                    )
+                (
+                    RetentionMode::None,
+                    crate::object_store_backend::LockState::Off
+                ) | (
+                    RetentionMode::Governance,
+                    crate::object_store_backend::LockState::Governance { .. }
+                ) | (
+                    RetentionMode::Compliance,
+                    crate::object_store_backend::LockState::Compliance { .. }
+                )
             );
             if mismatch {
                 // Provider-aware vocabulary. "Object Lock" on AWS,
@@ -1230,14 +1237,14 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
                          backend at a bucket without {}.",
                         policy_term, policy_term
                     ),
-                    (RetentionMode::Governance, crate::cloud_backend::LockState::Off) => {
+                    (RetentionMode::Governance, crate::object_store_backend::LockState::Off) => {
                         format!(
                             "Bucket has no {}. Configure a default retention period in mutable / \
                          GOVERNANCE / unlocked mode, or remove retention_mode from this backend.",
                             policy_term
                         )
                     }
-                    (RetentionMode::Compliance, crate::cloud_backend::LockState::Off) => {
+                    (RetentionMode::Compliance, crate::object_store_backend::LockState::Off) => {
                         format!(
                             "Bucket has no {}. Configure a default retention period in irrevocable / \
                          COMPLIANCE / locked mode, or remove retention_mode.",
@@ -1246,7 +1253,7 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
                     }
                     (
                         RetentionMode::Governance,
-                        crate::cloud_backend::LockState::Compliance { .. },
+                        crate::object_store_backend::LockState::Compliance { .. },
                     ) => format!(
                         "Bucket {} is irrevocable / locked / COMPLIANCE. Update retention_mode \
                          to 'compliance', or reconfigure the bucket.",
@@ -1254,7 +1261,7 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
                     ),
                     (
                         RetentionMode::Compliance,
-                        crate::cloud_backend::LockState::Governance { .. },
+                        crate::object_store_backend::LockState::Governance { .. },
                     ) => format!(
                         "Bucket {} is mutable / unlocked / GOVERNANCE. For compliance you need \
                          an irrevocable lock — reconfigure the bucket, or downgrade \
@@ -1266,19 +1273,19 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
                         policy_term
                     ),
                 };
-                // CloudConfigError::RetentionMismatch carries `hint` as
+                // ObjectStoreConfigError::RetentionMismatch carries `hint` as
                 // `&'static str`. Leak the formatted string — this is
                 // a fatal startup error and the process is about to
                 // terminate, so the leak is bounded.
                 let hint: &'static str = Box::leak(hint_owned.into_boxed_str());
-                return Err(CloudConfigError::RetentionMismatch {
+                return Err(ObjectStoreConfigError::RetentionMismatch {
                     name: name.to_string(),
                     configured: configured_label,
                     actual: actual_label,
                     hint,
                 });
             }
-            step_cb(CloudCheckStep {
+            step_cb(ObjectStoreCheckStep {
                 name: "lock_state",
                 detail: format!(
                     "retention_mode '{}' matches bucket lock state '{}'",
@@ -1294,7 +1301,7 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
                 configured.label(),
                 source
             );
-            step_cb(CloudCheckStep {
+            step_cb(ObjectStoreCheckStep {
                 name: "lock_state",
                 detail: format!(
                     "retention_mode '{}' — bucket lock state could not be queried (insufficient \
@@ -1321,13 +1328,13 @@ async fn check_retention_state<F: FnMut(CloudCheckStep)>(
 /// since we can't tell whether the bucket is actually locked without
 /// querying — better to assume it might be and skip the probe than
 /// to leave undeletable test objects behind.
-async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
-    backend: &dyn crate::cloud_backend::CloudBackend,
-    cfg: &CloudConfig,
+async fn probe_data_plane<F: FnMut(ObjectStoreCheckStep)>(
+    backend: &dyn crate::object_store_backend::ObjectStoreBackend,
+    cfg: &ObjectStoreConfig,
     name: &str,
     configured: RetentionMode,
     step_cb: &mut F,
-) -> CloudConfigResult<()> {
+) -> ObjectStoreConfigResult<()> {
     let bucket = cfg.target_label_named(name).unwrap_or_default();
     // S3Backend / GcsBackend prepend their configured prefix internally,
     // so we must pass RELATIVE paths here, not the full key with prefix.
@@ -1339,15 +1346,16 @@ async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
 
     // 1. List — proves auth + bucket existence + list permission + reachability.
     // List under the configured prefix itself (no extra subdir).
-    let listed = backend
-        .list_objects("")
-        .await
-        .map_err(|source| CloudConfigError::ListFailed {
-            bucket: bucket.clone(),
-            prefix: display_prefix.clone(),
-            source,
-        })?;
-    step_cb(CloudCheckStep {
+    let listed =
+        backend
+            .list_objects("")
+            .await
+            .map_err(|source| ObjectStoreConfigError::ListFailed {
+                bucket: bucket.clone(),
+                prefix: display_prefix.clone(),
+                source,
+            })?;
+    step_cb(ObjectStoreCheckStep {
         name: "list",
         detail: format!(
             "bucket '{}' reachable ({} objects under '{}')",
@@ -1358,7 +1366,7 @@ async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
     });
 
     if configured.requires_lock() {
-        step_cb(CloudCheckStep {
+        step_cb(ObjectStoreCheckStep {
             name: "skip_probe",
             detail: format!(
                 "bucket '{}' is locked (retention_mode={}); skipping write/delete probe",
@@ -1373,11 +1381,11 @@ async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
     backend
         .upload_manifest(test_key_rel, "{\"test\": true}")
         .await
-        .map_err(|source| CloudConfigError::WriteFailed {
+        .map_err(|source| ObjectStoreConfigError::WriteFailed {
             bucket: bucket.clone(),
             source,
         })?;
-    step_cb(CloudCheckStep {
+    step_cb(ObjectStoreCheckStep {
         name: "write",
         detail: format!("uploaded test object '{}'", display_key),
     });
@@ -1386,11 +1394,11 @@ async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
     backend
         .delete_object(test_key_rel)
         .await
-        .map_err(|source| CloudConfigError::DeleteFailed {
+        .map_err(|source| ObjectStoreConfigError::DeleteFailed {
             bucket: bucket.clone(),
             source,
         })?;
-    step_cb(CloudCheckStep {
+    step_cb(ObjectStoreCheckStep {
         name: "delete",
         detail: format!("deleted test object '{}'", display_key),
     });
@@ -1402,14 +1410,14 @@ async fn probe_data_plane<F: FnMut(CloudCheckStep)>(
 mod tests {
     use super::*;
 
-    /// Parse a YAML snippet into the full CloudConfig.
-    fn parse(s: &str) -> CloudConfig {
+    /// Parse a YAML snippet into the full ObjectStoreConfig.
+    fn parse(s: &str) -> ObjectStoreConfig {
         serde_yaml::from_str(s).expect("cloud config parses")
     }
 
     /// Alias retained for tests that only exercise the
     /// upload/compression/skip-flag side without a backends block.
-    fn parse_cfg(yaml: &str) -> CloudConfig {
+    fn parse_cfg(yaml: &str) -> ObjectStoreConfig {
         serde_yaml::from_str(yaml).expect("cloud config parses")
     }
 
@@ -1549,7 +1557,7 @@ backends:
         };
         let err = s3.auth.as_ref().unwrap().resolve().unwrap_err();
         assert!(
-            matches!(err, CloudConfigError::AuthEnvVarMissing(ref n) if n == "THUR_TEST_DEFINITELY_UNSET_X1")
+            matches!(err, ObjectStoreConfigError::AuthEnvVarMissing(ref n) if n == "THUR_TEST_DEFINITELY_UNSET_X1")
         );
     }
 
@@ -1663,7 +1671,7 @@ backends:
         // `deny_unknown_fields` on the auth enum means typos (e.g.
         // `access_key` vs `access_key_id`) fail at parse time
         // instead of silently failing later.
-        let err = serde_yaml::from_str::<CloudConfig>(
+        let err = serde_yaml::from_str::<ObjectStoreConfig>(
             r#"
 backends:
   primary:
@@ -1707,7 +1715,7 @@ backends:
         );
         cfg.validate_backends().unwrap();
         let err = cfg.backend_entry("does-not-exist").unwrap_err();
-        assert!(matches!(err, CloudConfigError::UnknownBackend(_)));
+        assert!(matches!(err, ObjectStoreConfigError::UnknownBackend(_)));
     }
 
     #[test]
@@ -1782,13 +1790,13 @@ backends:
             .expect_err("should require Azure fields");
         assert!(matches!(
             err,
-            CloudConfigError::AzureRetentionFieldsMissing { .. }
+            ObjectStoreConfigError::AzureRetentionFieldsMissing { .. }
         ));
 
         // With the flag on, the same backends validate — the fields
         // only matter for the management-plane query, which is now
         // disabled.
-        let cfg_skipped = CloudConfig {
+        let cfg_skipped = ObjectStoreConfig {
             skip_retention_mode_check: true,
             ..cfg.clone()
         };
@@ -1817,7 +1825,7 @@ backends:
             .expect_err("Azure retention without sub/rg must error");
         assert!(matches!(
             err,
-            CloudConfigError::AzureRetentionFieldsMissing { .. }
+            ObjectStoreConfigError::AzureRetentionFieldsMissing { .. }
         ));
     }
 
@@ -1937,53 +1945,53 @@ backends:
 
     #[test]
     fn classify_recognizes_auth_credentials() {
-        let err = crate::CloudError::Other("InvalidAccessKeyId: not found".to_string());
+        let err = crate::ObjectStoreError::Other("InvalidAccessKeyId: not found".to_string());
         assert_eq!(classify(&err), FailureKind::Auth);
         assert!(!is_retryable(FailureKind::Auth));
     }
 
     #[test]
     fn classify_recognizes_expired_token_as_auth() {
-        let err = crate::CloudError::Other("ExpiredToken: please refresh".to_string());
+        let err = crate::ObjectStoreError::Other("ExpiredToken: please refresh".to_string());
         assert_eq!(classify(&err), FailureKind::Auth);
     }
 
     #[test]
     fn classify_recognizes_authz_via_access_denied() {
-        let err = crate::CloudError::Other("AccessDenied: bucket policy refused".to_string());
+        let err = crate::ObjectStoreError::Other("AccessDenied: bucket policy refused".to_string());
         assert_eq!(classify(&err), FailureKind::Authz);
         assert!(!is_retryable(FailureKind::Authz));
     }
 
     #[test]
     fn classify_recognizes_authz_via_403() {
-        let err = crate::CloudError::Other("HTTP 403 Forbidden".to_string());
+        let err = crate::ObjectStoreError::Other("HTTP 403 Forbidden".to_string());
         assert_eq!(classify(&err), FailureKind::Authz);
     }
 
     #[test]
     fn classify_recognizes_not_found_via_no_such_bucket() {
-        let err = crate::CloudError::Other("NoSuchBucket: my-bucket".to_string());
+        let err = crate::ObjectStoreError::Other("NoSuchBucket: my-bucket".to_string());
         assert_eq!(classify(&err), FailureKind::NotFound);
         assert!(!is_retryable(FailureKind::NotFound));
     }
 
     #[test]
     fn classify_recognizes_not_found_via_404() {
-        let err = crate::CloudError::Other("HTTP 404 not found".to_string());
+        let err = crate::ObjectStoreError::Other("HTTP 404 not found".to_string());
         assert_eq!(classify(&err), FailureKind::NotFound);
     }
 
     #[test]
     fn classify_recognizes_region_mismatch() {
-        let err = crate::CloudError::Other("PermanentRedirect: wrong region".to_string());
+        let err = crate::ObjectStoreError::Other("PermanentRedirect: wrong region".to_string());
         assert_eq!(classify(&err), FailureKind::RegionMismatch);
         assert!(!is_retryable(FailureKind::RegionMismatch));
     }
 
     #[test]
     fn classify_recognizes_network_via_no_such_host() {
-        let err = crate::CloudError::Other(
+        let err = crate::ObjectStoreError::Other(
             "dispatch failure (io: error performing request): no such host".to_string(),
         );
         assert_eq!(classify(&err), FailureKind::Network);
@@ -1992,8 +2000,9 @@ backends:
 
     #[test]
     fn classify_recognizes_timeout_via_dispatch_timeout() {
-        let err =
-            crate::CloudError::Other("dispatch failure (timeout: request timed out)".to_string());
+        let err = crate::ObjectStoreError::Other(
+            "dispatch failure (timeout: request timed out)".to_string(),
+        );
         assert_eq!(classify(&err), FailureKind::Timeout);
         assert!(is_retryable(FailureKind::Timeout));
     }
@@ -2001,7 +2010,7 @@ backends:
     #[test]
     fn classify_precondition_failed_is_authz_permanent() {
         // 412 from Azure's legal-hold path: policy says no — permanent.
-        let err = crate::CloudError::PreconditionFailed("Object locked".to_string());
+        let err = crate::ObjectStoreError::PreconditionFailed("Object locked".to_string());
         assert_eq!(classify(&err), FailureKind::Authz);
         assert!(!is_retryable(FailureKind::Authz));
     }
@@ -2010,14 +2019,14 @@ backends:
     fn classify_conflict_is_retryable_other() {
         // 409 from concurrent metadata mutation: another writer
         // changed state under us — retry helps.
-        let err = crate::CloudError::Conflict("concurrent update".to_string());
+        let err = crate::ObjectStoreError::Conflict("concurrent update".to_string());
         assert_eq!(classify(&err), FailureKind::Other);
         assert!(is_retryable(FailureKind::Other));
     }
 
     #[test]
     fn classify_unrecognized_falls_through_to_other() {
-        let err = crate::CloudError::Other("a brand new sdk error nobody mapped".to_string());
+        let err = crate::ObjectStoreError::Other("a brand new sdk error nobody mapped".to_string());
         assert_eq!(classify(&err), FailureKind::Other);
         assert!(is_retryable(FailureKind::Other));
     }
@@ -2038,7 +2047,7 @@ backends:
             "ThrottlingException: rate exceeded",
             "RequestLimitExceeded: TPS limit hit",
         ] {
-            let err = crate::CloudError::Other(variant.to_string());
+            let err = crate::ObjectStoreError::Other(variant.to_string());
             assert_eq!(classify(&err), FailureKind::Other, "variant={variant}");
             assert!(is_retryable(classify(&err)), "variant={variant}");
         }
@@ -2054,7 +2063,7 @@ backends:
             "Bad Gateway (502)",
             "Gateway Timeout (504)",
         ] {
-            let err = crate::CloudError::Other(variant.to_string());
+            let err = crate::ObjectStoreError::Other(variant.to_string());
             let kind = classify(&err);
             assert!(
                 matches!(kind, FailureKind::Other | FailureKind::Timeout),
@@ -2064,16 +2073,16 @@ backends:
         }
     }
 
-    // ----- validate_cloud_backend pinning tests --------------------
+    // ----- validate_object_store_backend pinning tests --------------------
     //
     // These exercise the externally-observable shape of
-    // validate_cloud_backend against a LocalBackend; the
+    // validate_object_store_backend against a LocalBackend; the
     // bidirectional retention check + data-plane probe (the bulk of
     // the function) require a real S3/GCS/Azure target and are
     // covered by integration scripts. The local fast-path is exactly
     // what the upcoming split has to preserve verbatim.
 
-    fn local_cloud_config(root_dir: &std::path::Path) -> CloudConfig {
+    fn local_store_config(root_dir: &std::path::Path) -> ObjectStoreConfig {
         let mut backends_map = std::collections::BTreeMap::new();
         backends_map.insert(
             "archive".to_string(),
@@ -2082,18 +2091,18 @@ backends:
                 disk_cache_size_gb: None,
             }),
         );
-        CloudConfig {
+        ObjectStoreConfig {
             backends: backends_map,
-            ..CloudConfig::default()
+            ..ObjectStoreConfig::default()
         }
     }
 
     #[tokio::test]
     async fn validate_local_backend_emits_only_init_step() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(temp.path());
+        let cfg = local_store_config(temp.path());
         let mut steps: Vec<String> = Vec::new();
-        validate_cloud_backend(&cfg, "archive", |s| {
+        validate_object_store_backend(&cfg, "archive", |s| {
             steps.push(s.name.to_string());
         })
         .await
@@ -2106,12 +2115,12 @@ backends:
     #[tokio::test]
     async fn validate_local_backend_with_skip_retention_check_still_oks() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = CloudConfig {
+        let cfg = ObjectStoreConfig {
             skip_retention_mode_check: true,
-            ..local_cloud_config(temp.path())
+            ..local_store_config(temp.path())
         };
         let mut steps: Vec<String> = Vec::new();
-        validate_cloud_backend(&cfg, "archive", |s| {
+        validate_object_store_backend(&cfg, "archive", |s| {
             steps.push(s.name.to_string());
         })
         .await
@@ -2157,12 +2166,12 @@ backends:
     #[tokio::test]
     async fn validate_unknown_backend_name_errors() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(temp.path());
-        let err = validate_cloud_backend(&cfg, "does-not-exist", |_s| {})
+        let cfg = local_store_config(temp.path());
+        let err = validate_object_store_backend(&cfg, "does-not-exist", |_s| {})
             .await
             .expect_err("unknown backend name must error");
         assert!(
-            matches!(err, CloudConfigError::UnknownBackend(ref n) if n == "does-not-exist"),
+            matches!(err, ObjectStoreConfigError::UnknownBackend(ref n) if n == "does-not-exist"),
             "expected UnknownBackend, got: {:?}",
             err
         );
@@ -2195,53 +2204,53 @@ backends:
         assert_eq!(FailureKind::RegionMismatch.label(), "REGION");
     }
 
-    // ----- CloudConfigError::step / kind ---------------------------
+    // ----- ObjectStoreConfigError::step / kind ---------------------------
 
     #[test]
-    fn cloud_config_error_step_and_kind() {
-        let unknown = CloudConfigError::UnknownBackend("x".to_string());
+    fn object_store_config_error_step_and_kind() {
+        let unknown = ObjectStoreConfigError::UnknownBackend("x".to_string());
         assert_eq!(unknown.step(), "config");
         assert_eq!(unknown.kind(), FailureKind::Other);
 
-        let auth_missing = CloudConfigError::AuthEnvVarMissing("VAR".to_string());
+        let auth_missing = ObjectStoreConfigError::AuthEnvVarMissing("VAR".to_string());
         assert_eq!(auth_missing.step(), "config");
         assert_eq!(auth_missing.kind(), FailureKind::Other);
 
-        let init = CloudConfigError::BackendInit {
+        let init = ObjectStoreConfigError::BackendInit {
             backend: "S3",
-            source: crate::CloudError::Other("AccessDenied".to_string()),
+            source: crate::ObjectStoreError::Other("AccessDenied".to_string()),
         };
         assert_eq!(init.step(), "init");
         assert_eq!(init.kind(), FailureKind::Authz);
 
-        let listed = CloudConfigError::ListFailed {
+        let listed = ObjectStoreConfigError::ListFailed {
             bucket: "b".to_string(),
             prefix: "p".to_string(),
-            source: crate::CloudError::Other("NoSuchBucket".to_string()),
+            source: crate::ObjectStoreError::Other("NoSuchBucket".to_string()),
         };
         assert_eq!(listed.step(), "list");
         assert_eq!(listed.kind(), FailureKind::NotFound);
 
-        let wrote = CloudConfigError::WriteFailed {
+        let wrote = ObjectStoreConfigError::WriteFailed {
             bucket: "b".to_string(),
-            source: crate::CloudError::Other("boom".to_string()),
+            source: crate::ObjectStoreError::Other("boom".to_string()),
         };
         assert_eq!(wrote.step(), "write");
 
-        let deleted = CloudConfigError::DeleteFailed {
+        let deleted = ObjectStoreConfigError::DeleteFailed {
             bucket: "b".to_string(),
-            source: crate::CloudError::Other("boom".to_string()),
+            source: crate::ObjectStoreError::Other("boom".to_string()),
         };
         assert_eq!(deleted.step(), "delete");
 
-        let lock = CloudConfigError::LockStateQueryFailed {
+        let lock = ObjectStoreConfigError::LockStateQueryFailed {
             name: "n".to_string(),
-            source: crate::CloudError::Other("InvalidAccessKeyId".to_string()),
+            source: crate::ObjectStoreError::Other("InvalidAccessKeyId".to_string()),
         };
         assert_eq!(lock.step(), "lock_state");
         assert_eq!(lock.kind(), FailureKind::Auth);
 
-        let mismatch = CloudConfigError::RetentionMismatch {
+        let mismatch = ObjectStoreConfigError::RetentionMismatch {
             name: "n".to_string(),
             configured: "compliance",
             actual: "off",
@@ -2312,7 +2321,7 @@ backends:
     #[tokio::test]
     async fn create_backend_named_builds_local_backend() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(temp.path());
+        let cfg = local_store_config(temp.path());
         let backend = cfg
             .create_backend_named("archive")
             .await
@@ -2323,18 +2332,18 @@ backends:
     #[tokio::test]
     async fn create_backend_named_unknown_errors() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(temp.path());
+        let cfg = local_store_config(temp.path());
         let err = cfg
             .create_backend_named("nope")
             .await
             .expect_err("unknown backend must error");
-        assert!(matches!(err, CloudConfigError::UnknownBackend(_)));
+        assert!(matches!(err, ObjectStoreConfigError::UnknownBackend(_)));
     }
 
     #[test]
     fn target_label_for_local_is_root_dir() {
         let temp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(temp.path());
+        let cfg = local_store_config(temp.path());
         assert_eq!(
             cfg.target_label_named("archive").unwrap(),
             temp.path().to_string_lossy()
@@ -2348,7 +2357,7 @@ backends:
     // ----- check_retention_state + probe_data_plane ---------------
     //
     // These are private to the module but reachable from the test
-    // submodule. The public `validate_cloud_backend` short-circuits
+    // submodule. The public `validate_object_store_backend` short-circuits
     // for Local backends, so end-to-end calls don't exercise either
     // function — these tests drive them directly with a real
     // `LocalBackend` (success path: `RetentionMode::None` matches
@@ -2356,7 +2365,7 @@ backends:
     // disk) and with a fake-lock-state wrapper for the mismatch
     // arms `LocalBackend` can't produce on its own.
 
-    use crate::cloud_backend::LockState as LS;
+    use crate::object_store_backend::LockState as LS;
     use std::path::Path;
 
     /// Wraps `LocalBackend` but returns a caller-supplied `LockState`
@@ -2368,7 +2377,7 @@ backends:
         fake: LS,
     }
     #[async_trait::async_trait]
-    impl CloudBackend for FakeLockBackend {
+    impl ObjectStoreBackend for FakeLockBackend {
         async fn upload_chunk(
             &self,
             k: &str,
@@ -2416,7 +2425,7 @@ backends:
         async fn get_object_legal_hold(&self, k: &str) -> crate::Result<bool> {
             self.inner.get_object_legal_hold(k).await
         }
-        fn clone_box(&self) -> Box<dyn CloudBackend> {
+        fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
             Box::new(Self {
                 inner: self.inner.clone(),
                 fake: self.fake,
@@ -2430,7 +2439,7 @@ backends:
             .expect("LocalBackend constructs")
     }
 
-    fn s3_cloud_config_for_hint_term() -> CloudConfig {
+    fn s3_store_config_for_hint_term() -> ObjectStoreConfig {
         // An S3 entry is enough for `backend_entry(name).backend_type()`
         // to return "s3", which steers the hint formatter into the
         // "Object Lock" branch. We never actually touch this backend.
@@ -2446,7 +2455,7 @@ backends:
         )
     }
 
-    fn azure_cloud_config_for_hint_term() -> CloudConfig {
+    fn azure_store_config_for_hint_term() -> ObjectStoreConfig {
         parse_cfg(
             r#"
 backends:
@@ -2462,7 +2471,7 @@ backends:
     #[tokio::test]
     async fn check_retention_state_none_matches_off_succeeds() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(tmp.path());
+        let cfg = local_store_config(tmp.path());
         let backend = local_backend(tmp.path()).await;
         let mut steps: Vec<String> = Vec::new();
         check_retention_state(&backend, &cfg, "archive", RetentionMode::None, &mut |s| {
@@ -2476,9 +2485,9 @@ backends:
     #[tokio::test]
     async fn check_retention_state_skip_flag_emits_only_note() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = CloudConfig {
+        let cfg = ObjectStoreConfig {
             skip_retention_mode_check: true,
-            ..local_cloud_config(tmp.path())
+            ..local_store_config(tmp.path())
         };
         let backend = local_backend(tmp.path()).await;
         let mut details: Vec<String> = Vec::new();
@@ -2500,7 +2509,7 @@ backends:
     #[tokio::test]
     async fn check_retention_state_governance_vs_off_local_hint() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(tmp.path());
+        let cfg = local_store_config(tmp.path());
         let backend = local_backend(tmp.path()).await;
         let err = check_retention_state(
             &backend,
@@ -2511,13 +2520,16 @@ backends:
         )
         .await
         .expect_err("Governance requires a locked bucket");
-        assert!(matches!(err, CloudConfigError::RetentionMismatch { .. }));
+        assert!(matches!(
+            err,
+            ObjectStoreConfigError::RetentionMismatch { .. }
+        ));
     }
 
     #[tokio::test]
     async fn check_retention_state_compliance_vs_off_with_s3_hint_term() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = s3_cloud_config_for_hint_term();
+        let cfg = s3_store_config_for_hint_term();
         let backend = local_backend(tmp.path()).await;
         let err = check_retention_state(
             &backend,
@@ -2528,7 +2540,7 @@ backends:
         )
         .await
         .expect_err("Compliance requires a locked bucket");
-        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+        if let ObjectStoreConfigError::RetentionMismatch { hint, .. } = err {
             assert!(hint.contains("Object Lock"), "hint = {hint}");
         } else {
             panic!("expected RetentionMismatch");
@@ -2538,7 +2550,7 @@ backends:
     #[tokio::test]
     async fn check_retention_state_none_vs_locked_azure_hint_term() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = azure_cloud_config_for_hint_term();
+        let cfg = azure_store_config_for_hint_term();
         let backend = FakeLockBackend {
             inner: local_backend(tmp.path()).await,
             fake: LS::Compliance { default_days: 30 },
@@ -2547,7 +2559,7 @@ backends:
             check_retention_state(&backend, &cfg, "archive", RetentionMode::None, &mut |_| {})
                 .await
                 .expect_err("None vs locked bucket is a mismatch");
-        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+        if let ObjectStoreConfigError::RetentionMismatch { hint, .. } = err {
             assert!(
                 hint.contains("immutability policy"),
                 "azure hint term, got {hint}",
@@ -2560,7 +2572,7 @@ backends:
     #[tokio::test]
     async fn check_retention_state_governance_vs_compliance_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = s3_cloud_config_for_hint_term();
+        let cfg = s3_store_config_for_hint_term();
         let backend = FakeLockBackend {
             inner: local_backend(tmp.path()).await,
             fake: LS::Compliance { default_days: 7 },
@@ -2574,7 +2586,7 @@ backends:
         )
         .await
         .expect_err("Governance vs Compliance must mismatch");
-        if let CloudConfigError::RetentionMismatch { hint, .. } = err {
+        if let ObjectStoreConfigError::RetentionMismatch { hint, .. } = err {
             assert!(hint.contains("compliance"), "hint = {hint}");
         } else {
             panic!();
@@ -2584,7 +2596,7 @@ backends:
     #[tokio::test]
     async fn check_retention_state_compliance_vs_governance_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = s3_cloud_config_for_hint_term();
+        let cfg = s3_store_config_for_hint_term();
         let backend = FakeLockBackend {
             inner: local_backend(tmp.path()).await,
             fake: LS::Governance { default_days: 7 },
@@ -2598,13 +2610,16 @@ backends:
         )
         .await
         .expect_err("Compliance vs Governance must mismatch");
-        assert!(matches!(err, CloudConfigError::RetentionMismatch { .. }));
+        assert!(matches!(
+            err,
+            ObjectStoreConfigError::RetentionMismatch { .. }
+        ));
     }
 
     #[tokio::test]
     async fn check_retention_state_governance_matches_governance() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = s3_cloud_config_for_hint_term();
+        let cfg = s3_store_config_for_hint_term();
         let backend = FakeLockBackend {
             inner: local_backend(tmp.path()).await,
             fake: LS::Governance { default_days: 7 },
@@ -2626,7 +2641,7 @@ backends:
     #[tokio::test]
     async fn probe_data_plane_local_round_trip_lists_writes_deletes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(tmp.path());
+        let cfg = local_store_config(tmp.path());
         let backend = local_backend(tmp.path()).await;
         let mut steps: Vec<String> = Vec::new();
         probe_data_plane(&backend, &cfg, "archive", RetentionMode::None, &mut |s| {
@@ -2647,7 +2662,7 @@ backends:
     #[tokio::test]
     async fn probe_data_plane_skips_write_delete_for_locked_bucket() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = local_cloud_config(tmp.path());
+        let cfg = local_store_config(tmp.path());
         let backend = local_backend(tmp.path()).await;
         let mut steps: Vec<String> = Vec::new();
         probe_data_plane(

@@ -286,11 +286,11 @@ enum SystemAction {
         #[arg(long)]
         dry_run: bool,
 
-        /// Also delete orphan objects from the cloud bucket.
+        /// Also delete orphan objects from the storage backend.
         ///
         /// Skipped by default — local cleanup is the common case.
         #[arg(long)]
-        cloud: bool,
+        storage: bool,
     },
 
     /// Audit-chain operations.
@@ -299,10 +299,10 @@ enum SystemAction {
         action: AuditAction,
     },
 
-    /// Cloud-backend operations.
-    Cloud {
+    /// Storage-backend operations.
+    Storage {
         #[command(subcommand)]
-        action: CloudAction,
+        action: StorageAction,
     },
 
     /// Dedup ratio, per-cartridge contribution, HEAD-skip rate.
@@ -333,18 +333,18 @@ enum SystemAction {
     ///
     /// Daemon-routed. Streams a per-second snapshot over the admin
     /// socket: uptime, cartridges loaded, drives busy, iSCSI sessions,
-    /// per-backend pool used/cap + backpressure, per-backend cloud
+    /// per-backend pool used/cap + backpressure, per-backend storage
     /// PUT/GET rate over the last 60s, audit events over the last 5m.
     Monitor,
 
     /// Library-wide consistency check.
     Verify {
-        /// Skip the cloud sweep (local-only audit).
+        /// Skip the storage-backend sweep (local-only audit).
         ///
-        /// Cloud is the default — verifying without it leaves
-        /// cold-bucket DR untested.
+        /// The storage sweep is the default — verifying without it
+        /// leaves cold-bucket DR untested.
         #[arg(long)]
-        skip_cloud: bool,
+        skip_storage: bool,
 
         /// Per-cartridge breakdown (partitions, every error/warning).
         #[arg(long)]
@@ -465,23 +465,23 @@ enum AuditAction {
 }
 
 #[derive(Subcommand)]
-enum CloudAction {
-    /// Check cloud connectivity, auth, and read/write/delete.
+enum StorageAction {
+    /// Check storage-backend connectivity, auth, and read/write/delete.
     ///
     /// Always allowed — does not require the daemon to be stopped.
     Check,
 
-    /// First-party cloud-backend throughput benchmark (daemon-down).
+    /// First-party storage-backend throughput benchmark (daemon-down).
     ///
     /// Drives parallel upload / download / delete against the named
-    /// backend(s) defined under `cloud.backends:` in the YAML conffile
-    /// and prints parseable `[BENCH]` lines. Issues real cloud API
+    /// backend(s) defined under `storage.backends:` in the YAML conffile
+    /// and prints parseable `[BENCH]` lines. Issues real backend API
     /// calls and transfers real bytes — runs against the operator's
     /// bucket, so expect non-zero cost on metered backends.
     Benchmark {
         /// Backend name to benchmark. Repeatable.
         ///
-        /// Defaults to every backend defined under `cloud.backends:`
+        /// Defaults to every backend defined under `storage.backends:`
         /// in the YAML conffile (lexicographic order).
         #[arg(long = "backend")]
         backends: Vec<String>,

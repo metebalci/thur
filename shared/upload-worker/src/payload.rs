@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use shared_cloud::{CompressionAlgo, DedupScope};
+use shared_object_store::{CompressionAlgo, DedupScope};
 
 /// One chunk's worth of "ready to upload" state, decoupled from the
 /// owning cartridge / volume so the daemon's upload worker can hand
@@ -31,9 +31,9 @@ pub struct PendingUpload {
     /// be present until the upload completes.
     pub local_path: PathBuf,
     /// Cloud key (already namespaced per [`DedupScope`] by the
-    /// caller — pool's `cloud_key` / `cloud_key_for` helpers do this).
+    /// caller — pool's `object_key` / `object_key_for` helpers do this).
     /// The uploader doesn't reinterpret it; it just PUTs there.
-    pub cloud_key: String,
+    pub object_key: String,
     /// Source's dedup scope. Under [`DedupScope::Global`] the
     /// uploader does a cloud-side HEAD probe to skip the PUT on a
     /// sibling-cartridge / sibling-volume dedup hit. Under
@@ -60,8 +60,8 @@ pub struct UploadOutcome {
     /// Echoed from [`PendingUpload::item_id`] so the caller can
     /// match outcomes back to index records without a side map.
     pub item_id: u64,
-    /// Echoed from [`PendingUpload::cloud_key`].
-    pub cloud_key: String,
+    /// Echoed from [`PendingUpload::object_key`].
+    pub object_key: String,
     /// True iff cross-namespace dedup fired (cloud HEAD hit under
     /// `Global`) and no PUT was performed. In that case
     /// `put_compression` is unset — the existing object's compression

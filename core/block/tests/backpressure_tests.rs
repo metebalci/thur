@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
 use core_block::{DedupScope, UploaderError, VolumeManifest, VolumeWriter};
-use shared_cloud::{CloudBackend, LocalBackend};
+use shared_object_store::{LocalBackend, ObjectStoreBackend};
 use shared_pool::PoolBudget;
 use tempfile::TempDir;
 
@@ -42,7 +42,7 @@ async fn fixture(budget: Arc<PoolBudget>, deadline: Duration) -> (TempDir, Arc<V
     let cloud_root = data_dir.join("cloud");
     std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
     let backend = LocalBackend::new(&cloud_root).await.expect("local backend");
-    let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let name = "vol-bp";
     VolumeManifest::new(

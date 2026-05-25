@@ -11,7 +11,7 @@
 use std::future::Future;
 
 use futures::stream::{self, StreamExt};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use tracing::{debug, warn};
 
 use crate::inert::upload_chunk_inert;
@@ -35,7 +35,7 @@ use crate::payload::{PendingUpload, UploadOutcome};
 /// not its siblings.
 ///
 /// Single attempt per payload — the per-backend retry inside
-/// [`shared_cloud::CloudBackend`] implementations already runs the
+/// [`shared_object_store::ObjectStoreBackend`] implementations already runs the
 /// configured jittered exponential retries with classify-and-fail-fast
 /// on permanent errors. Per-chunk failures are isolated: a returned
 /// `Err` from `upload_chunk_inert` is logged and the outcome is
@@ -46,7 +46,7 @@ use crate::payload::{PendingUpload, UploadOutcome};
 /// `disk_cache_evict_notify.notify_one()` — moved into the
 /// `on_complete` closure the daemon passes in).
 pub async fn run_upload_pipeline<F, Fut>(
-    cloud_backend: &dyn CloudBackend,
+    cloud_backend: &dyn ObjectStoreBackend,
     label: &str,
     payloads: Vec<PendingUpload>,
     max_concurrent: usize,
@@ -126,7 +126,7 @@ mod tests {
     use crate::payload::PendingUpload;
     use crate::pipeline::run_upload_pipeline;
     use crate::test_support::MockBackend;
-    use shared_cloud::DedupScope;
+    use shared_object_store::DedupScope;
 
     fn make_payload(item_id: u64, dir: &Path) -> PendingUpload {
         let local = dir.join(format!("{}.dat", item_id));
@@ -135,7 +135,7 @@ mod tests {
             item_id,
             hash: format!("{:02x}", item_id).repeat(32),
             local_path: local,
-            cloud_key: format!("chunks/{}/v.dat", item_id),
+            object_key: format!("chunks/{}/v.dat", item_id),
             dedup: DedupScope::Local,
             backend_name: "primary".into(),
         }

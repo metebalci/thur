@@ -72,7 +72,7 @@ pub struct AwsKmsBackendConfig {
     pub auth: Option<AwsKmsAuth>,
 }
 
-/// AWS KMS auth. Mirrors `shared_cloud::S3Auth` shape — Env variants
+/// AWS KMS auth. Mirrors `shared_object_store::S3Auth` shape — Env variants
 /// are the production posture; `Static` is for dev / single-host
 /// installs where putting the secret in the JSON is acceptable;
 /// `Profile` picks a named profile from `~/.aws/credentials`.
@@ -557,7 +557,7 @@ impl KeystoreYamlConfig {
     }
 
     /// True iff exactly one backend is configured. Mirrors
-    /// `CloudConfig::is_single_backend` — the daemon uses this
+    /// `ObjectStoreConfig::is_single_backend` — the daemon uses this
     /// to decide whether `--keystore NAME` is optional.
     pub fn is_single_backend(&self) -> bool {
         self.backends.len() == 1

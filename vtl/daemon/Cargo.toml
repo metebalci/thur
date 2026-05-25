@@ -24,7 +24,7 @@ shared-admin-proto = { path = "../../shared/admin-proto" }
 shared-alerting = { path = "../../shared/alerting", features = ["http"] }
 shared-audit = { path = "../../shared/audit" }
 shared-admin-server = { path = "../../shared/admin-server" }
-shared-cloud = { path = "../../shared/cloud" }
+shared-object-store = { path = "../../shared/object-store" }
 shared-dedup-stats = { path = "../../shared/dedup-stats" }
 shared-health = { path = "../../shared/health" }
 shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }

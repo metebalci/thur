@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::state::DaemonState;
 use core_mediachanger::chunk_index::ChunkIndexFile;
-use core_mediachanger::{ChunkStore, CloudBackend};
+use core_mediachanger::{ChunkStore, ObjectStoreBackend};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 
@@ -28,7 +28,7 @@ pub struct GcParams {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
-    pub cloud: bool,
+    pub storage: bool,
 }
 
 /// Per-(backend, namespace) live-hash bucket.
@@ -84,7 +84,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     // Phase 2 — per-backend sweeps.
     let mut total_freed: u64 = 0;
     let mut local_summary: Vec<serde_json::Value> = Vec::new();
-    let backend_names = state.cloud_config.backend_names();
+    let backend_names = state.storage_config.backend_names();
     for backend_name in &backend_names {
         emitter
             .info(format!("=== Backend: {} ===", backend_name))
@@ -119,10 +119,10 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             }
         }
 
-        if params.cloud {
-            if let Err(e) = run_cloud_gc(
+        if params.storage {
+            if let Err(e) = run_storage_gc(
                 &emitter,
-                &state.cloud_config,
+                &state.storage_config,
                 backend_name,
                 &live,
                 params.dry_run,
@@ -135,7 +135,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             }
             if let Err(e) = run_cloud_index_pages_gc(
                 &emitter,
-                &state.cloud_config,
+                &state.storage_config,
                 backend_name,
                 &live_pages,
                 params.dry_run,
@@ -152,7 +152,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
         }
         emitter.info("").await;
     }
-    if !params.cloud {
+    if !params.storage {
         emitter
             .info("(Skipping cloud GC — re-run with cloud:true to clean buckets too.)")
             .await;
@@ -173,7 +173,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
 
     let result = serde_json::json!({
         "dry_run": params.dry_run,
-        "cloud": params.cloud,
+        "cloud": params.storage,
         "bytes_freed_local": total_freed,
         "backends": local_summary,
     });
@@ -189,7 +189,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             "gc.run",
             actor,
             serde_json::json!({
-                "cloud": params.cloud,
+                "cloud": params.storage,
                 "bytes_freed_local": total_freed,
                 "backends": backend_names,
             }),
@@ -423,9 +423,9 @@ fn remove_empty_pool_dir(pool_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn run_cloud_gc(
+async fn run_storage_gc(
     emitter: &JobEmitter,
-    cfg: &core_mediachanger::CloudConfig,
+    cfg: &core_mediachanger::ObjectStoreConfig,
     backend_name: &str,
     live: &LiveSet,
     dry_run: bool,
@@ -518,7 +518,7 @@ fn is_two_hex(s: &str) -> bool {
 
 async fn run_cloud_index_pages_gc(
     emitter: &JobEmitter,
-    cfg: &core_mediachanger::CloudConfig,
+    cfg: &core_mediachanger::ObjectStoreConfig,
     backend_name: &str,
     live_pages: &LiveIndexPages,
     dry_run: bool,
@@ -543,7 +543,7 @@ async fn run_cloud_index_pages_gc(
 
 async fn sweep_index_pages(
     emitter: &JobEmitter,
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
     scoped: &[(&String, &HashMap<String, u32>)],
     dry_run: bool,
 ) -> anyhow::Result<(usize, usize)> {
@@ -656,23 +656,23 @@ mod tests {
     fn gc_params_default_is_all_false() {
         let p = GcParams::default();
         assert!(!p.dry_run);
-        assert!(!p.cloud);
+        assert!(!p.storage);
     }
 
     #[test]
     fn gc_params_empty_json_uses_defaults() {
         let p: GcParams = serde_json::from_value(serde_json::json!({})).expect("empty body");
         assert!(!p.dry_run);
-        assert!(!p.cloud);
+        assert!(!p.storage);
     }
 
     #[test]
     fn gc_params_parses_explicit_flags() {
         let p: GcParams =
-            serde_json::from_value(serde_json::json!({"dry_run": true, "cloud": true}))
+            serde_json::from_value(serde_json::json!({"dry_run": true, "storage": true}))
                 .expect("explicit body");
         assert!(p.dry_run);
-        assert!(p.cloud);
+        assert!(p.storage);
     }
 
     #[test]

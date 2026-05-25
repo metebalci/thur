@@ -107,7 +107,7 @@ pub struct TelemetryConfig {
 #[derive(Default)]
 pub struct LiveStats {
     /// Per-cloud-backend cumulative counters.
-    cloud: Mutex<HashMap<String, Arc<CloudCounters>>>,
+    storage: Mutex<HashMap<String, Arc<StorageCounters>>>,
     /// Per-pool-backend cumulative counters + an instantaneous waiter
     /// gauge.
     pool: Mutex<HashMap<String, Arc<PoolCounters>>>,
@@ -116,7 +116,7 @@ pub struct LiveStats {
 }
 
 #[derive(Default)]
-pub struct CloudCounters {
+pub struct StorageCounters {
     pub put_ops: AtomicU64,
     pub get_ops: AtomicU64,
     pub put_bytes: AtomicU64,
@@ -137,13 +137,13 @@ pub struct PoolCounters {
 /// JSON payload. All numeric; no atomics.
 #[derive(Default, Clone, Debug)]
 pub struct LiveStatsSnapshot {
-    pub cloud: HashMap<String, CloudSnapshot>,
+    pub storage: HashMap<String, StorageSnapshot>,
     pub pool: HashMap<String, PoolSnapshot>,
     pub audit_entries_total: u64,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
-pub struct CloudSnapshot {
+pub struct StorageSnapshot {
     pub put_ops: u64,
     pub get_ops: u64,
     pub put_bytes: u64,
@@ -158,8 +158,8 @@ pub struct PoolSnapshot {
 }
 
 impl LiveStats {
-    fn cloud_for(&self, backend: &str) -> Arc<CloudCounters> {
-        let mut map = self.cloud.lock().expect("LiveStats cloud mutex poisoned");
+    fn storage_for(&self, backend: &str) -> Arc<StorageCounters> {
+        let mut map = self.storage.lock().expect("LiveStats cloud mutex poisoned");
         Arc::clone(map.entry(backend.to_string()).or_default())
     }
 
@@ -168,12 +168,12 @@ impl LiveStats {
         Arc::clone(map.entry(backend.to_string()).or_default())
     }
 
-    /// Mirror of [`Telemetry::cloud_record_request`]. `op` is one of
+    /// Mirror of [`Telemetry::storage_record_request`]. `op` is one of
     /// `put`/`get`/`head`/`delete`; bytes are credited only on the
     /// successful put/get paths so `put_bytes` + `get_bytes` track the
-    /// `outcome="ok"` slice of `cloud_bytes_total`.
-    pub fn record_cloud_op(&self, backend: &str, op: &str, outcome: &str, bytes: u64) {
-        let c = self.cloud_for(backend);
+    /// `outcome="ok"` slice of `storage_bytes_total`.
+    pub fn record_storage_op(&self, backend: &str, op: &str, outcome: &str, bytes: u64) {
+        let c = self.storage_for(backend);
         if outcome == "error" {
             c.errors.fetch_add(1, Ordering::Relaxed);
         }
@@ -226,10 +226,10 @@ impl LiveStats {
     /// two backend-keyed mutexes briefly to clone the per-backend
     /// `Arc`s, then drops the locks and reads atomics outside.
     pub fn snapshot(&self) -> LiveStatsSnapshot {
-        let cloud_pairs: Vec<(String, Arc<CloudCounters>)> = self
-            .cloud
+        let storage_pairs: Vec<(String, Arc<StorageCounters>)> = self
+            .storage
             .lock()
-            .expect("LiveStats cloud mutex poisoned")
+            .expect("LiveStats storage mutex poisoned")
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
@@ -241,7 +241,7 @@ impl LiveStats {
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
         LiveStatsSnapshot {
-            cloud: cloud_pairs
+            storage: storage_pairs
                 .into_iter()
                 .map(|(k, v)| (k, v.snapshot()))
                 .collect(),
@@ -254,9 +254,9 @@ impl LiveStats {
     }
 }
 
-impl CloudCounters {
-    fn snapshot(&self) -> CloudSnapshot {
-        CloudSnapshot {
+impl StorageCounters {
+    fn snapshot(&self) -> StorageSnapshot {
+        StorageSnapshot {
             put_ops: self.put_ops.load(Ordering::Relaxed),
             get_ops: self.get_ops.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
@@ -319,11 +319,11 @@ struct TelemetryInner {
     scsi_xcopy_segments_total: Counter<u64>,
 
     // ── cloud (per-backend op latency / bytes / errors) ──
-    cloud_requests_total: Counter<u64>,
-    cloud_request_seconds: Histogram<f64>,
-    cloud_bytes_total: Counter<u64>,
-    cloud_retries_total: Counter<u64>,
-    cloud_permanent_errors_total: Counter<u64>,
+    storage_requests_total: Counter<u64>,
+    storage_request_seconds: Histogram<f64>,
+    storage_bytes_total: Counter<u64>,
+    storage_retries_total: Counter<u64>,
+    storage_permanent_errors_total: Counter<u64>,
 
     // ── chunk lifecycle ──
     chunk_seals_total: Counter<u64>,
@@ -331,11 +331,11 @@ struct TelemetryInner {
     chunk_logical_bytes_total: Counter<u64>,
     chunk_unique_bytes_total: Counter<u64>,
     chunk_bytes_uploaded_total: Counter<u64>,
-    chunk_cloud_head_probes_total: Counter<u64>,
-    chunk_cloud_head_hits_total: Counter<u64>,
-    chunk_cloud_cache_hits_total: Counter<u64>,
-    chunk_cloud_cache_inflight_coalesced_total: Counter<u64>,
-    chunk_cloud_cache_warmup_seeded_total: Counter<u64>,
+    chunk_storage_head_probes_total: Counter<u64>,
+    chunk_storage_head_hits_total: Counter<u64>,
+    chunk_storage_cache_hits_total: Counter<u64>,
+    chunk_storage_cache_inflight_coalesced_total: Counter<u64>,
+    chunk_storage_cache_warmup_seeded_total: Counter<u64>,
 
     // ── iSCSI ──
     iscsi_sessions_active: Gauge<i64>,
@@ -525,7 +525,7 @@ impl Telemetry {
 
     /// cloud.* — `op` is one of `put`/`get`/`head`/`delete`,
     /// `outcome` is `ok`/`error`.
-    pub fn cloud_record_request(
+    pub fn storage_record_request(
         &self,
         backend: &str,
         op: &str,
@@ -538,18 +538,18 @@ impl Telemetry {
             KeyValue::new("op", op.to_string()),
             KeyValue::new("outcome", outcome.to_string()),
         ];
-        self.inner.cloud_requests_total.add(1, &kv);
-        self.inner.cloud_request_seconds.record(seconds, &kv);
+        self.inner.storage_requests_total.add(1, &kv);
+        self.inner.storage_request_seconds.record(seconds, &kv);
         if bytes > 0 {
-            self.inner.cloud_bytes_total.add(bytes, &kv);
+            self.inner.storage_bytes_total.add(bytes, &kv);
         }
         self.inner
             .live_stats
-            .record_cloud_op(backend, op, outcome, bytes);
+            .record_storage_op(backend, op, outcome, bytes);
     }
 
-    pub fn cloud_inc_retry(&self, backend: &str, class: &str) {
-        self.inner.cloud_retries_total.add(
+    pub fn storage_inc_retry(&self, backend: &str, class: &str) {
+        self.inner.storage_retries_total.add(
             1,
             &[
                 KeyValue::new("backend", backend.to_string()),
@@ -558,8 +558,8 @@ impl Telemetry {
         );
     }
 
-    pub fn cloud_inc_permanent_error(&self, backend: &str, class: &str) {
-        self.inner.cloud_permanent_errors_total.add(
+    pub fn storage_inc_permanent_error(&self, backend: &str, class: &str) {
+        self.inner.storage_permanent_errors_total.add(
             1,
             &[
                 KeyValue::new("backend", backend.to_string()),
@@ -624,20 +624,20 @@ impl Telemetry {
 
     /// Cloud-side HEAD-before-PUT probes (Global scope only — Local
     /// scope namespaces by barcode so the HEAD is guaranteed to miss
-    /// and is skipped). Pair with `chunk_cloud_head_hits_total` for
+    /// and is skipped). Pair with `chunk_storage_head_hits_total` for
     /// the upload-skip rate.
-    pub fn chunk_inc_cloud_head_probe(&self, backend: &str) {
+    pub fn chunk_inc_storage_head_probe(&self, backend: &str) {
         self.inner
-            .chunk_cloud_head_probes_total
+            .chunk_storage_head_probes_total
             .add(1, &[KeyValue::new("backend", backend.to_string())]);
     }
 
     /// Cloud-side HEAD probes that found the object already present —
     /// upload was skipped. The complement of (probes - hits) is the
     /// PUTs the daemon actually issued.
-    pub fn chunk_inc_cloud_head_hit(&self, backend: &str) {
+    pub fn chunk_inc_storage_head_hit(&self, backend: &str) {
         self.inner
-            .chunk_cloud_head_hits_total
+            .chunk_storage_head_hits_total
             .add(1, &[KeyValue::new("backend", backend.to_string())]);
     }
 
@@ -645,9 +645,9 @@ impl Telemetry {
     /// — no backend round-trip. Pair with the `head_probes` /
     /// `head_hits` counters above for a full breakdown of how the
     /// daemon's "is X already in cloud?" decisions get answered.
-    pub fn chunk_inc_cloud_cache_hit(&self, backend: &str) {
+    pub fn chunk_inc_storage_cache_hit(&self, backend: &str) {
         self.inner
-            .chunk_cloud_cache_hits_total
+            .chunk_storage_cache_hits_total
             .add(1, &[KeyValue::new("backend", backend.to_string())]);
     }
 
@@ -655,18 +655,18 @@ impl Telemetry {
     /// singleflight future instead of issuing its own PUT. This is
     /// the GCS-mkfs zero-page-burst collapse counter; should track
     /// the number of duplicate writes that the cache absorbed.
-    pub fn chunk_inc_cloud_cache_inflight_coalesced(&self, backend: &str) {
+    pub fn chunk_inc_storage_cache_inflight_coalesced(&self, backend: &str) {
         self.inner
-            .chunk_cloud_cache_inflight_coalesced_total
+            .chunk_storage_cache_inflight_coalesced_total
             .add(1, &[KeyValue::new("backend", backend.to_string())]);
     }
 
     /// Meta-cache warmup populated this many `Probed` entries from a
     /// LIST at boot / first registry insertion. One per key inserted
     /// (not per LIST call) so an operator can see cache fill rate.
-    pub fn chunk_add_cloud_cache_warmup_seeded(&self, backend: &str, n: u64) {
+    pub fn chunk_add_storage_cache_warmup_seeded(&self, backend: &str, n: u64) {
         self.inner
-            .chunk_cloud_cache_warmup_seeded_total
+            .chunk_storage_cache_warmup_seeded_total
             .add(n, &[KeyValue::new("backend", backend.to_string())]);
     }
 
@@ -834,26 +834,26 @@ impl TelemetryInner {
                 .build(),
 
             // cloud
-            cloud_requests_total: meter
-                .u64_counter(name("cloud_requests_total"))
+            storage_requests_total: meter
+                .u64_counter(name("storage_requests_total"))
                 .with_description("Cloud requests by backend/op/outcome")
                 .build(),
-            cloud_request_seconds: meter
-                .f64_histogram(name("cloud_request"))
+            storage_request_seconds: meter
+                .f64_histogram(name("storage_request"))
                 .with_description("Cloud request latency by backend/op/outcome")
                 .with_unit("s")
                 .build(),
-            cloud_bytes_total: meter
-                .u64_counter(name("cloud_transferred"))
+            storage_bytes_total: meter
+                .u64_counter(name("storage_transferred"))
                 .with_description("Cloud bytes transferred by backend/op/outcome")
                 .with_unit("By")
                 .build(),
-            cloud_retries_total: meter
-                .u64_counter(name("cloud_retries_total"))
+            storage_retries_total: meter
+                .u64_counter(name("storage_retries_total"))
                 .with_description("Cloud retry attempts by backend/error class")
                 .build(),
-            cloud_permanent_errors_total: meter
-                .u64_counter(name("cloud_permanent_errors_total"))
+            storage_permanent_errors_total: meter
+                .u64_counter(name("storage_permanent_errors_total"))
                 .with_description("Permanent cloud errors that bypassed retry")
                 .build(),
 
@@ -883,28 +883,28 @@ impl TelemetryInner {
                 .with_description("Chunk bytes successfully PUT to cloud")
                 .with_unit("By")
                 .build(),
-            chunk_cloud_head_probes_total: meter
-                .u64_counter(name("chunk_cloud_head_probes_total"))
+            chunk_storage_head_probes_total: meter
+                .u64_counter(name("chunk_storage_head_probes_total"))
                 .with_description("Cloud-side HEAD-before-PUT probes (Global scope)")
                 .build(),
-            chunk_cloud_head_hits_total: meter
-                .u64_counter(name("chunk_cloud_head_hits_total"))
+            chunk_storage_head_hits_total: meter
+                .u64_counter(name("chunk_storage_head_hits_total"))
                 .with_description("Cloud HEAD probes that found the object already present")
                 .build(),
-            chunk_cloud_cache_hits_total: meter
-                .u64_counter(name("chunk_cloud_cache_hits_total"))
+            chunk_storage_cache_hits_total: meter
+                .u64_counter(name("chunk_storage_cache_hits_total"))
                 .with_description(
                     "Meta-cache hits — lookup served from Probed/Uploaded entry without backend round-trip",
                 )
                 .build(),
-            chunk_cloud_cache_inflight_coalesced_total: meter
-                .u64_counter(name("chunk_cloud_cache_inflight_coalesced_total"))
+            chunk_storage_cache_inflight_coalesced_total: meter
+                .u64_counter(name("chunk_storage_cache_inflight_coalesced_total"))
                 .with_description(
                     "Concurrent uploads that joined an in-flight singleflight instead of issuing a duplicate PUT",
                 )
                 .build(),
-            chunk_cloud_cache_warmup_seeded_total: meter
-                .u64_counter(name("chunk_cloud_cache_warmup_seeded_total"))
+            chunk_storage_cache_warmup_seeded_total: meter
+                .u64_counter(name("chunk_storage_cache_warmup_seeded_total"))
                 .with_description(
                     "Cache entries seeded from a LIST at boot / first registry insertion",
                 )
@@ -1163,19 +1163,19 @@ pub mod record {
             t.scsi_xcopy_inc_segment(path);
         }
     }
-    pub fn cloud_request(backend: &str, op: &str, outcome: &str, bytes: u64, seconds: f64) {
+    pub fn storage_request(backend: &str, op: &str, outcome: &str, bytes: u64, seconds: f64) {
         if let Some(t) = global() {
-            t.cloud_record_request(backend, op, outcome, bytes, seconds);
+            t.storage_record_request(backend, op, outcome, bytes, seconds);
         }
     }
-    pub fn cloud_retry(backend: &str, class: &str) {
+    pub fn storage_retry(backend: &str, class: &str) {
         if let Some(t) = global() {
-            t.cloud_inc_retry(backend, class);
+            t.storage_inc_retry(backend, class);
         }
     }
-    pub fn cloud_permanent_error(backend: &str, class: &str) {
+    pub fn storage_permanent_error(backend: &str, class: &str) {
         if let Some(t) = global() {
-            t.cloud_inc_permanent_error(backend, class);
+            t.storage_inc_permanent_error(backend, class);
         }
     }
     pub fn chunk_seal(backend: &str, scope: &str) {
@@ -1203,29 +1203,29 @@ pub mod record {
             t.chunk_add_unique_bytes(backend, scope, bytes);
         }
     }
-    pub fn chunk_cloud_head_probe(backend: &str) {
+    pub fn chunk_storage_head_probe(backend: &str) {
         if let Some(t) = global() {
-            t.chunk_inc_cloud_head_probe(backend);
+            t.chunk_inc_storage_head_probe(backend);
         }
     }
-    pub fn chunk_cloud_head_hit(backend: &str) {
+    pub fn chunk_storage_head_hit(backend: &str) {
         if let Some(t) = global() {
-            t.chunk_inc_cloud_head_hit(backend);
+            t.chunk_inc_storage_head_hit(backend);
         }
     }
-    pub fn chunk_cloud_cache_hit(backend: &str) {
+    pub fn chunk_storage_cache_hit(backend: &str) {
         if let Some(t) = global() {
-            t.chunk_inc_cloud_cache_hit(backend);
+            t.chunk_inc_storage_cache_hit(backend);
         }
     }
-    pub fn chunk_cloud_cache_inflight_coalesced(backend: &str) {
+    pub fn chunk_storage_cache_inflight_coalesced(backend: &str) {
         if let Some(t) = global() {
-            t.chunk_inc_cloud_cache_inflight_coalesced(backend);
+            t.chunk_inc_storage_cache_inflight_coalesced(backend);
         }
     }
-    pub fn chunk_cloud_cache_warmup_seeded(backend: &str, n: u64) {
+    pub fn chunk_storage_cache_warmup_seeded(backend: &str, n: u64) {
         if let Some(t) = global() {
-            t.chunk_add_cloud_cache_warmup_seeded(backend, n);
+            t.chunk_add_storage_cache_warmup_seeded(backend, n);
         }
     }
     pub fn iscsi_sessions_active(n: i64) {
@@ -1306,15 +1306,15 @@ mod tests {
         // dump after at least one observation.
         t.pool_set_used("primary", 0);
         t.pool_set_cap("primary", 1024);
-        t.cloud_record_request("primary", "put", "ok", 1024, 0.05);
+        t.storage_record_request("primary", "put", "ok", 1024, 0.05);
         t.chunk_inc_seal("primary", "global");
         t.chunk_add_logical_bytes("primary", "global", 8 * 1024 * 1024);
         t.chunk_add_unique_bytes("primary", "global", 8 * 1024 * 1024);
-        t.chunk_inc_cloud_head_probe("primary");
-        t.chunk_inc_cloud_head_hit("primary");
-        t.chunk_inc_cloud_cache_hit("primary");
-        t.chunk_inc_cloud_cache_inflight_coalesced("primary");
-        t.chunk_add_cloud_cache_warmup_seeded("primary", 42);
+        t.chunk_inc_storage_head_probe("primary");
+        t.chunk_inc_storage_head_hit("primary");
+        t.chunk_inc_storage_cache_hit("primary");
+        t.chunk_inc_storage_cache_inflight_coalesced("primary");
+        t.chunk_add_storage_cache_warmup_seeded("primary", 42);
         t.iscsi_set_sessions_active(0);
         t.audit_inc_entry("daemon.start");
         t.cache_inc_eviction("vol1", "dirty");
@@ -1322,15 +1322,15 @@ mod tests {
         for needle in [
             "thur_pool_used_bytes",
             "thur_pool_cap_bytes",
-            "thur_cloud_requests_total",
+            "thur_storage_requests_total",
             "thur_chunk_seals_total",
             "thur_chunk_logical_bytes",
             "thur_chunk_unique_bytes",
-            "thur_chunk_cloud_head_probes_total",
-            "thur_chunk_cloud_head_hits_total",
-            "thur_chunk_cloud_cache_hits_total",
-            "thur_chunk_cloud_cache_inflight_coalesced_total",
-            "thur_chunk_cloud_cache_warmup_seeded_total",
+            "thur_chunk_storage_head_probes_total",
+            "thur_chunk_storage_head_hits_total",
+            "thur_chunk_storage_cache_hits_total",
+            "thur_chunk_storage_cache_inflight_coalesced_total",
+            "thur_chunk_storage_cache_warmup_seeded_total",
             "thur_cache_evictions_total",
             "thur_iscsi_sessions_active",
             "thur_audit_entries_total",
@@ -1345,9 +1345,9 @@ mod tests {
     #[test]
     fn telemetry_export_compat_shim() {
         let t = Telemetry::noop();
-        t.cloud_inc_retry("primary", "Network");
+        t.storage_inc_retry("primary", "Network");
         let s = t.export();
-        assert!(s.contains("thur_cloud_retries_total"));
+        assert!(s.contains("thur_storage_retries_total"));
     }
 
     #[test]

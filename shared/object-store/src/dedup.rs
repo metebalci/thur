@@ -54,7 +54,7 @@ impl DedupScope {
 
     /// `None` for `Global` (shared pool), `Some(label)` for `Local`
     /// (per-namespace). Matches the namespace argument on
-    /// `ChunkPool::new_namespaced` and `ChunkPool::cloud_key_for`.
+    /// `ChunkPool::new_namespaced` and `ChunkPool::object_key_for`.
     pub fn namespace(self, label: &str) -> Option<&str> {
         match self {
             Self::Global => None,

@@ -412,7 +412,7 @@ pub async fn cmd_info(identifier: &str, json: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // legal-hold — thin daemon-call wrappers
 //
-// The daemon owns the cloud handle (lazy-initialized via cloud_config),
+// The daemon owns the cloud handle (lazy-initialized via storage_config),
 // applies the per-object hold using the same core-mediachanger helpers
 // the CLI used to call directly, refuses if the cartridge is loaded,
 // and emits the audit entry. CLI work is just: serialize request,

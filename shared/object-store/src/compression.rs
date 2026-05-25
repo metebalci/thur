@@ -22,7 +22,7 @@
 //! compress; compression must therefore run *first*. See
 //! `cartridge.rs::write_data`.
 
-use crate::{CloudError, Result};
+use crate::{ObjectStoreError, Result};
 use serde::{Deserialize, Serialize};
 
 /// Algorithm code reported in Mode Page 0x0F (Data Compression). 0x00 is
@@ -196,7 +196,7 @@ impl Default for CompressionConfig {
 
 /// Compress `data` using `algo`. `level` only applies to
 /// `CompressionAlgo::Zstd`. Selecting `Sldc` returns
-/// `CloudError::Compression` — the variant is reserved in the
+/// `ObjectStoreError::Compression` — the variant is reserved in the
 /// enum but we don't yet ship an implementation.
 pub fn compress_data(algo: CompressionAlgo, data: &[u8], level: i32) -> Result<Vec<u8>> {
     match algo {
@@ -204,14 +204,14 @@ pub fn compress_data(algo: CompressionAlgo, data: &[u8], level: i32) -> Result<V
             |mut enc| {
                 use std::io::Write;
                 enc.write_all(data)
-                    .map_err(|e| CloudError::Compression(format!("lz4 write: {}", e)))?;
+                    .map_err(|e| ObjectStoreError::Compression(format!("lz4 write: {}", e)))?;
                 enc.finish()
-                    .map_err(|e| CloudError::Compression(format!("lz4 finish: {}", e)))
+                    .map_err(|e| ObjectStoreError::Compression(format!("lz4 finish: {}", e)))
             },
         )?),
         CompressionAlgo::Zstd => zstd::encode_all(data, level)
-            .map_err(|e| CloudError::Compression(format!("zstd encode: {}", e))),
-        CompressionAlgo::Sldc => Err(CloudError::Compression(
+            .map_err(|e| ObjectStoreError::Compression(format!("zstd encode: {}", e))),
+        CompressionAlgo::Sldc => Err(ObjectStoreError::Compression(
             "sldc compression not yet implemented (ECMA-321 codec stub — \
              reserved in the schema, no encoder shipped). Pick lz4 or \
              zstd instead, or wait for the SLDC codec to land."
@@ -222,7 +222,7 @@ pub fn compress_data(algo: CompressionAlgo, data: &[u8], level: i32) -> Result<V
 
 /// Decompress bytes produced by `algo`. Caller must know the algorithm
 /// from the manifest (`BlockIndex.compression` / `ChunkMeta.compression`).
-/// Selecting `Sldc` returns `CloudError::Compression` for the same
+/// Selecting `Sldc` returns `ObjectStoreError::Compression` for the same
 /// reason as `compress_data`.
 pub fn decompress_data(algo: CompressionAlgo, data: &[u8]) -> Result<Vec<u8>> {
     match algo {
@@ -231,12 +231,12 @@ pub fn decompress_data(algo: CompressionAlgo, data: &[u8]) -> Result<Vec<u8>> {
             let mut dec = lz4_flex::frame::FrameDecoder::new(data);
             let mut out = Vec::new();
             dec.read_to_end(&mut out)
-                .map_err(|e| CloudError::Compression(format!("lz4 decode: {}", e)))?;
+                .map_err(|e| ObjectStoreError::Compression(format!("lz4 decode: {}", e)))?;
             Ok(out)
         }
         CompressionAlgo::Zstd => zstd::decode_all(data)
-            .map_err(|e| CloudError::Compression(format!("zstd decode: {}", e))),
-        CompressionAlgo::Sldc => Err(CloudError::Compression(
+            .map_err(|e| ObjectStoreError::Compression(format!("zstd decode: {}", e))),
+        CompressionAlgo::Sldc => Err(ObjectStoreError::Compression(
             "sldc decompression not yet implemented (ECMA-321 codec stub). \
              Any chunks tagged sldc in the manifest cannot be read with \
              this build."
@@ -336,9 +336,9 @@ mod tests {
     #[test]
     fn sldc_compress_and_decompress_are_unimplemented() {
         let c = compress_data(CompressionAlgo::Sldc, b"data", 3);
-        assert!(matches!(c, Err(CloudError::Compression(_))));
+        assert!(matches!(c, Err(ObjectStoreError::Compression(_))));
         let d = decompress_data(CompressionAlgo::Sldc, b"data");
-        assert!(matches!(d, Err(CloudError::Compression(_))));
+        assert!(matches!(d, Err(ObjectStoreError::Compression(_))));
     }
 
     #[test]

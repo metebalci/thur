@@ -11,7 +11,7 @@
 //! - **LU0 (medium changer)**: parse `library.json` + `inventory.json`,
 //!   confirm every barcode in inventory has a readable
 //!   `tapes/<barcode>/manifest.json`, and run the full
-//!   `validate_cloud_backend` probe (auth + write + delete) against
+//!   `validate_object_store_backend` probe (auth + write + delete) against
 //!   every named entry in `cloud.backends`. Mirrors the operator-side
 //!   `thurvtl system cloud check`.
 //! - **LU1+ (sequential-access drive)**: if a cartridge is loaded,
@@ -31,18 +31,18 @@ pub use scsi_ssc::diagnostics::{DiagnosticEntry, DiagnosticStore, run_drive_diag
 use std::path::Path;
 use std::sync::Arc;
 
-use core_mediachanger::{CloudConfig, validate_cloud_backend};
+use core_mediachanger::{ObjectStoreConfig, validate_object_store_backend};
 use scsi_ssc::drive_manager::DriveManager;
 
 /// LU0 self-test. Walks `<data_dir>/library/library.json` +
 /// `inventory.json`, confirms every barcode in inventory has a
 /// readable `manifest.json`, and runs the full
-/// `validate_cloud_backend` probe against every named cloud backend.
+/// `validate_object_store_backend` probe against every named cloud backend.
 /// Returns the first failure as a `DiagnosticEntry::fail` so
 /// SEND DIAGNOSTIC can surface CHECK CONDITION immediately.
 pub async fn run_library_diagnostic(
     data_dir: &Path,
-    cloud_config: &CloudConfig,
+    storage_config: &ObjectStoreConfig,
 ) -> DiagnosticEntry {
     let library_dir = data_dir.join("library");
     let library_json = library_dir.join("library.json");
@@ -109,9 +109,9 @@ pub async fn run_library_diagnostic(
         }
     }
 
-    for name in cloud_config.backend_names() {
-        if let Err(e) = validate_cloud_backend(cloud_config, &name, |_| {}).await {
-            return DiagnosticEntry::fail(format!("cloud backend '{}': {}", name, e));
+    for name in storage_config.backend_names() {
+        if let Err(e) = validate_object_store_backend(storage_config, &name, |_| {}).await {
+            return DiagnosticEntry::fail(format!("storage backend '{}': {}", name, e));
         }
     }
 
@@ -126,12 +126,12 @@ pub async fn run_library_diagnostic(
 pub async fn run_and_record(
     lun: u8,
     drive_manager: &Arc<DriveManager>,
-    cloud_config: &Arc<CloudConfig>,
+    storage_config: &Arc<ObjectStoreConfig>,
     data_dir: &Path,
     store: &Arc<DiagnosticStore>,
 ) {
     let entry = if lun == 0 {
-        run_library_diagnostic(data_dir, cloud_config).await
+        run_library_diagnostic(data_dir, storage_config).await
     } else {
         let drive_id = (lun - 1) as usize;
         let dm = Arc::clone(drive_manager);
@@ -162,18 +162,18 @@ pub async fn run_and_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_mediachanger::CloudConfig;
+    use core_mediachanger::ObjectStoreConfig;
 
-    /// A `CloudConfig` with no named backends — the library
+    /// A `ObjectStoreConfig` with no named backends — the library
     /// diagnostic skips the cloud-probe loop entirely.
-    fn empty_cloud_config() -> CloudConfig {
-        CloudConfig::default()
+    fn empty_storage_config() -> ObjectStoreConfig {
+        ObjectStoreConfig::default()
     }
 
     #[tokio::test]
     async fn library_diagnostic_fails_on_missing_library_json() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(!entry.passed);
         assert!(entry.detail.contains("library.json"));
     }
@@ -184,7 +184,7 @@ mod tests {
         let lib = dir.path().join("library");
         std::fs::create_dir_all(&lib).expect("mkdir library");
         std::fs::write(lib.join("library.json"), "{not valid json").expect("write");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(!entry.passed);
         assert!(entry.detail.contains("parse failed"));
     }
@@ -195,7 +195,7 @@ mod tests {
         let lib = dir.path().join("library");
         std::fs::create_dir_all(&lib).expect("mkdir library");
         std::fs::write(lib.join("library.json"), "{}").expect("write lib");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(!entry.passed);
         assert!(entry.detail.contains("inventory.json"));
     }
@@ -211,7 +211,7 @@ mod tests {
             r#"{"storage_slots":[],"mail_slots":[],"drives":[]}"#,
         )
         .expect("write inv");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(entry.passed, "detail: {}", entry.detail);
     }
 
@@ -226,7 +226,7 @@ mod tests {
             r#"{"storage_slots":[{"barcode":"TAPE001"}],"mail_slots":[],"drives":[]}"#,
         )
         .expect("write inv");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(!entry.passed);
         assert!(entry.detail.contains("TAPE001"));
         assert!(entry.detail.contains("manifest.json"));
@@ -250,7 +250,7 @@ mod tests {
             r#"{"barcode":"TAPE001"}"#,
         )
         .expect("write manifest");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(entry.passed, "detail: {}", entry.detail);
     }
 
@@ -267,7 +267,7 @@ mod tests {
             r#"{"storage_slots":[{"barcode":""}],"mail_slots":[],"drives":[]}"#,
         )
         .expect("write inv");
-        let entry = run_library_diagnostic(dir.path(), &empty_cloud_config()).await;
+        let entry = run_library_diagnostic(dir.path(), &empty_storage_config()).await;
         assert!(entry.passed, "detail: {}", entry.detail);
     }
 }

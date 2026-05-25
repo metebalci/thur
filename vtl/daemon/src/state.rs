@@ -18,7 +18,8 @@
 //! DiagnosticStore) and the `Arc` wrapping.
 
 use core_mediachanger::{
-    AuditChannel, AuditRateLimiter, CloudConfig, CompressionAlgo, Library, PoolBudget, TapeEvent,
+    AuditChannel, AuditRateLimiter, CompressionAlgo, Library, ObjectStoreConfig, PoolBudget,
+    TapeEvent,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use tokio::sync::broadcast;
 
 use crate::diagnostics::DiagnosticStore;
 use crate::iscsi::drive_manager::DriveManager;
-use crate::iscsi::server::CloudBackendRegistry;
+use crate::iscsi::server::ObjectStoreRegistry;
 use crate::iscsi::session::SessionManager;
 use crate::iscsi::unit_attention::UnitAttentionTracker;
 use scsi_smc::changer::ElementAddressConfig;
@@ -62,14 +63,14 @@ pub struct DaemonStateConfig {
     /// to know where the files live to read them out of band.
     pub audit_dir: PathBuf,
     pub audit_ratelimiter: Arc<AuditRateLimiter>,
-    /// Runtime registry of constructed `Arc<dyn CloudBackend>`
-    /// instances (one per name in `cloud_config.backends`). Built at
-    /// boot from `cloud_config`.
-    pub cloud_backends: CloudBackendRegistry,
+    /// Runtime registry of constructed `Arc<dyn ObjectStoreBackend>`
+    /// instances (one per name in `storage_config.backends`). Built at
+    /// boot from `storage_config`.
+    pub cloud_backends: ObjectStoreRegistry,
     /// Full `cloud:` section of the YAML conffile — tuning knobs plus
     /// the named backend definitions under `cloud.backends:`. Distinct
     /// from `cloud_backends` (the runtime registry above).
-    pub cloud_config: Arc<CloudConfig>,
+    pub storage_config: Arc<ObjectStoreConfig>,
     /// Full `keystore:` section of the YAML conffile — the named
     /// `keystore.backends:` map. Used by the cartridge-create admin
     /// handler to resolve the at-rest keystore backend, and by
@@ -108,12 +109,12 @@ pub struct DaemonState {
     /// (CHAP failures, MOVE MEDIUM refusals). One instance shared by
     /// every emission site that opts in; lifecycle events bypass it.
     pub audit_ratelimiter: Arc<AuditRateLimiter>,
-    /// Runtime registry of constructed `Arc<dyn CloudBackend>`
-    /// instances (one per name in `cloud_config.backends`).
-    pub cloud_backends: CloudBackendRegistry,
+    /// Runtime registry of constructed `Arc<dyn ObjectStoreBackend>`
+    /// instances (one per name in `storage_config.backends`).
+    pub cloud_backends: ObjectStoreRegistry,
     /// Full `cloud:` section of the YAML conffile — tuning knobs plus
     /// the named backend definitions under `cloud.backends:`.
-    pub cloud_config: Arc<CloudConfig>,
+    pub storage_config: Arc<ObjectStoreConfig>,
     /// Full `keystore:` section of the YAML conffile (named
     /// `keystore.backends:` map). Read at boot, shared via Arc with
     /// admin handlers (`cartridge_create` for the at-rest wrap
@@ -176,7 +177,7 @@ impl DaemonState {
             audit_dir: cfg.audit_dir,
             audit_ratelimiter: cfg.audit_ratelimiter,
             cloud_backends: cfg.cloud_backends,
-            cloud_config: cfg.cloud_config,
+            storage_config: cfg.storage_config,
             keystore_config: cfg.keystore_config,
             diagnostic_store: Arc::new(DiagnosticStore::new()),
             jobs: Arc::new(JobRegistry::new()),
@@ -232,7 +233,7 @@ mod tests {
             audit_dir: dir.path().join("audit"),
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
-            cloud_config: Arc::new(CloudConfig::default()),
+            storage_config: Arc::new(ObjectStoreConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 3,
             drive_compression_algorithm: CompressionAlgo::Lz4,

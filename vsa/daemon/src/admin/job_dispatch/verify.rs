@@ -19,7 +19,7 @@ use crate::admin::handlers::AdminState;
 #[derive(Debug, Deserialize, Default)]
 pub struct VerifyParams {
     #[serde(default)]
-    pub skip_cloud: bool,
+    pub skip_storage: bool,
     #[serde(default)]
     pub volumes: Vec<String>,
 }
@@ -40,7 +40,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
     };
     let data_dir = state.data_dir.clone();
 
-    if params.skip_cloud {
+    if params.skip_storage {
         emitter
             .info(format!(
                 "Verifying volumes at {} (cloud sweep skipped)",
@@ -72,7 +72,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             };
         finish(&emitter, report).await;
     } else {
-        let cloud_cfg = state.cloud.as_ref().clone();
+        let cloud_cfg = state.storage.as_ref().clone();
         emitter
             .info(format!(
                 "Verifying volumes at {} (cloud HEAD sweep enabled)",
@@ -130,25 +130,25 @@ mod tests {
     fn verify_params_default_when_body_empty() {
         let params: VerifyParams =
             serde_json::from_value(serde_json::json!({})).expect("empty body deserializes");
-        assert!(!params.skip_cloud);
+        assert!(!params.skip_storage);
         assert!(params.volumes.is_empty());
     }
 
     #[test]
     fn verify_params_round_trip_full_body() {
         let params: VerifyParams = serde_json::from_value(serde_json::json!({
-            "skip_cloud": true,
+            "skip_storage": true,
             "volumes": ["vol-a", "vol-b"],
         }))
         .expect("full body deserializes");
-        assert!(params.skip_cloud);
+        assert!(params.skip_storage);
         assert_eq!(params.volumes, vec!["vol-a", "vol-b"]);
     }
 
     #[test]
     fn verify_params_default_impl_matches_empty_body() {
         let from_default = VerifyParams::default();
-        assert!(!from_default.skip_cloud);
+        assert!(!from_default.skip_storage);
         assert!(from_default.volumes.is_empty());
     }
 
@@ -156,7 +156,7 @@ mod tests {
     fn verify_params_rejects_wrong_type() {
         // `skip_cloud` is a bool — a string must fail to deserialize.
         let bad = serde_json::from_value::<VerifyParams>(serde_json::json!({
-            "skip_cloud": "yes",
+            "skip_storage": "yes",
         }));
         assert!(bad.is_err());
     }

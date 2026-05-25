@@ -230,7 +230,7 @@ nvmetcp:
 
 audit:
   enabled: true
-cloud:
+storage:
   backends:
     primary:
       type: local

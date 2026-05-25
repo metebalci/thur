@@ -19,6 +19,6 @@ workspace = true
 
 [dependencies]
 shared-pool = { path = "../pool" }
-shared-cloud = { path = "../cloud" }
+shared-object-store = { path = "../object-store" }
 
 futures = "0.3"

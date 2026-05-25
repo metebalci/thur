@@ -24,14 +24,14 @@ use shared_admin_client::AdminClient;
 use shared_admin_proto::JobEvent;
 
 pub async fn cmd_verify(
-    skip_cloud: bool,
+    skip_storage: bool,
     verbose: bool,
     json: bool,
     barcodes: Vec<String>,
 ) -> Result<u8> {
     let client = AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
     let body = serde_json::json!({
-        "skip_cloud": skip_cloud,
+        "skip_storage": skip_storage,
         "barcodes": barcodes,
     });
 
@@ -145,7 +145,7 @@ fn print_human(r: &VerifyReport, verbose: bool) {
                 c.local_chunks_size_mismatch
             );
         }
-        if let Some(missing) = c.cloud_chunks_missing
+        if let Some(missing) = c.storage_chunks_missing
             && missing > 0
         {
             println!("      missing from cloud: {}", missing);
@@ -209,9 +209,9 @@ fn print_human(r: &VerifyReport, verbose: bool) {
             p.shared_orphan_bytes,
             p.namespaces.len(),
         );
-        if let Some(cp) = &p.cloud {
+        if let Some(cp) = &p.storage {
             println!(
-                "      cloud: chunk_objects={} chunk_orphans={} index_page_orphans={}",
+                "      storage: chunk_objects={} chunk_orphans={} index_page_orphans={}",
                 cp.chunk_objects, cp.chunk_orphans, cp.index_page_orphans
             );
         }
@@ -287,7 +287,7 @@ mod tests {
                 "partitions": [],
                 "local_chunks_missing": 0,
                 "local_chunks_size_mismatch": 0,
-                "cloud_chunks_missing": null,
+                "storage_chunks_missing": null,
                 "cloud_index_pages_missing": null,
                 "cloud_sentinel_present": null,
                 "errors": ["e1", "e2", "e3", "e4"],

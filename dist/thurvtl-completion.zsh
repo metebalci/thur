@@ -908,7 +908,7 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--dry-run[Show what would be deleted without actually deleting]' \
-'--cloud[Also delete orphan objects from the cloud bucket]' \
+'--storage[Also delete orphan objects from the storage backend]' \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -1036,7 +1036,7 @@ esac
     ;;
 esac
 ;;
-(cloud)
+(storage)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -1044,15 +1044,15 @@ _arguments "${_arguments_options[@]}" : \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-":: :_thurvtl__subcmd__system__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvtl__subcmd__system__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvtl-system-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvtl-system-storage-command-$line[1]:"
         case $line[1] in
             (check)
 _arguments "${_arguments_options[@]}" : \
@@ -1084,7 +1084,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvtl__subcmd__system__subcmd__cloud__subcmd__help_commands" \
+":: :_thurvtl__subcmd__system__subcmd__storage__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -1092,7 +1092,7 @@ _arguments "${_arguments_options[@]}" : \
     (help)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvtl-system-cloud-help-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvtl-system-storage-help-command-$line[1]:"
         case $line[1] in
             (check)
 _arguments "${_arguments_options[@]}" : \
@@ -1151,7 +1151,7 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--skip-cloud[Skip the cloud sweep (local-only audit)]' \
+'--skip-storage[Skip the storage-backend sweep (local-only audit)]' \
 '--verbose[Per-cartridge breakdown (partitions, every error/warning)]' \
 '--json[Emit the full report as JSON for CI / automation]' \
 '--copyright[Print the copyright + license notice and exit]' \
@@ -1295,17 +1295,17 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
-(cloud)
+(storage)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvtl__subcmd__system__subcmd__help__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvtl__subcmd__system__subcmd__help__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvtl-system-help-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvtl-system-help-storage-command-$line[1]:"
         case $line[1] in
             (check)
 _arguments "${_arguments_options[@]}" : \
@@ -2086,17 +2086,17 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
-(cloud)
+(storage)
 _arguments "${_arguments_options[@]}" : \
-":: :_thurvtl__subcmd__help__subcmd__system__subcmd__cloud_commands" \
-"*::: :->cloud" \
+":: :_thurvtl__subcmd__help__subcmd__system__subcmd__storage_commands" \
+"*::: :->storage" \
 && ret=0
 
     case $state in
-    (cloud)
+    (storage)
         words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:thurvtl-help-system-cloud-command-$line[1]:"
+        curcontext="${curcontext%:*:*}:thurvtl-help-system-storage-command-$line[1]:"
         case $line[1] in
             (check)
 _arguments "${_arguments_options[@]}" : \
@@ -3044,7 +3044,7 @@ _thurvtl__subcmd__help__subcmd__system_commands() {
     local commands; commands=(
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'audit:Audit-chain operations' \
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -3108,24 +3108,6 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__audit__subcmd__verify-offline_co
     local commands; commands=()
     _describe -t commands 'thurvtl help system audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__cloud_commands] )) ||
-_thurvtl__subcmd__help__subcmd__system__subcmd__cloud_commands() {
-    local commands; commands=(
-'check:Check cloud connectivity, auth, and read/write/delete' \
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-    )
-    _describe -t commands 'thurvtl help system cloud commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvtl__subcmd__help__subcmd__system__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl help system cloud benchmark commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__cloud__subcmd__check_commands] )) ||
-_thurvtl__subcmd__help__subcmd__system__subcmd__cloud__subcmd__check_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl help system cloud check commands' commands "$@"
-}
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__daemon-health_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -3150,6 +3132,24 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvtl__subcmd__help__subcmd__system__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system stats commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__storage_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__storage_commands() {
+    local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+    )
+    _describe -t commands 'thurvtl help system storage commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system storage check commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands() {
@@ -3586,7 +3586,7 @@ _thurvtl__subcmd__system_commands() {
     local commands; commands=(
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'audit:Audit-chain operations' \
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -3719,49 +3719,6 @@ _thurvtl__subcmd__system__subcmd__audit__subcmd__verify-offline_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud_commands() {
-    local commands; commands=(
-'check:Check cloud connectivity, auth, and read/write/delete' \
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-'help:Print this message or the help of the given subcommand(s)' \
-    )
-    _describe -t commands 'thurvtl system cloud commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system cloud benchmark commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__check_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__check_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system cloud check commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__help_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__help_commands() {
-    local commands; commands=(
-'check:Check cloud connectivity, auth, and read/write/delete' \
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-'help:Print this message or the help of the given subcommand(s)' \
-    )
-    _describe -t commands 'thurvtl system cloud help commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__benchmark_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system cloud help benchmark commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__check_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__check_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system cloud help check commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__help_commands] )) ||
-_thurvtl__subcmd__system__subcmd__cloud__subcmd__help__subcmd__help_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system cloud help help commands' commands "$@"
-}
 (( $+functions[_thurvtl__subcmd__system__subcmd__daemon-health_commands] )) ||
 _thurvtl__subcmd__system__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -3777,7 +3734,7 @@ _thurvtl__subcmd__system__subcmd__help_commands() {
     local commands; commands=(
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'audit:Audit-chain operations' \
-'cloud:Cloud-backend operations' \
+'storage:Storage-backend operations' \
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -3842,24 +3799,6 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__audit__subcmd__verify-offline_co
     local commands; commands=()
     _describe -t commands 'thurvtl system help audit verify-offline commands' commands "$@"
 }
-(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__cloud_commands] )) ||
-_thurvtl__subcmd__system__subcmd__help__subcmd__cloud_commands() {
-    local commands; commands=(
-'check:Check cloud connectivity, auth, and read/write/delete' \
-'benchmark:First-party cloud-backend throughput benchmark (daemon-down)' \
-    )
-    _describe -t commands 'thurvtl system help cloud commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__cloud__subcmd__benchmark_commands] )) ||
-_thurvtl__subcmd__system__subcmd__help__subcmd__cloud__subcmd__benchmark_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system help cloud benchmark commands' commands "$@"
-}
-(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__cloud__subcmd__check_commands] )) ||
-_thurvtl__subcmd__system__subcmd__help__subcmd__cloud__subcmd__check_commands() {
-    local commands; commands=()
-    _describe -t commands 'thurvtl system help cloud check commands' commands "$@"
-}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__daemon-health_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__daemon-health_commands() {
     local commands; commands=()
@@ -3890,6 +3829,24 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help stats commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__storage_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__storage_commands() {
+    local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+    )
+    _describe -t commands 'thurvtl system help storage commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help storage check commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands() {
     local commands; commands=()
@@ -3909,6 +3866,49 @@ _thurvtl__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvtl__subcmd__system__subcmd__stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system stats commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage_commands() {
+    local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvtl system storage commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__benchmark_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__check_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system storage check commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__help_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__help_commands() {
+    local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
+'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvtl system storage help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system storage help benchmark commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__check_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system storage help check commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands] )) ||
+_thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system storage help help commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__verify_commands() {

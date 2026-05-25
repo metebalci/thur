@@ -3,7 +3,7 @@
 
 //! Keystore-backend error model.
 //!
-//! Mirrors `shared_cloud::FailureKind` / `is_retryable` shape so the
+//! Mirrors `shared_object_store::FailureKind` / `is_retryable` shape so the
 //! daemon can apply the same fail-fast posture against permanent
 //! errors (`Auth` / `Authz` / `NotFound`) and only burn retry budget
 //! on transient classes (`Network` / `Timeout` / `Other`).
@@ -18,7 +18,7 @@ use thiserror::Error;
 /// `InvalidHex`) preserve the local on-disk keystore's diagnostic
 /// surface from the pre-trait days. The transport variants
 /// (`Network` / `Timeout` / `Auth` / `Authz` / `NotFound`) parallel
-/// `shared_cloud::FailureKind` so admin handlers can classify and
+/// `shared_object_store::FailureKind` so admin handlers can classify and
 /// retry uniformly across keystore + cloud paths.
 #[derive(Error, Debug)]
 pub enum KeyStoreError {
@@ -76,7 +76,7 @@ pub enum KeyStoreError {
 }
 
 /// Coarse classification of a [`KeyStoreError`]. Mirrors
-/// `shared_cloud::FailureKind` semantically so daemon handlers can
+/// `shared_object_store::FailureKind` semantically so daemon handlers can
 /// route both error families through the same retry / hint logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyStoreFailureKind {

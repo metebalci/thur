@@ -21,7 +21,7 @@ use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
 use core_block::{
     DedupScope, PageCache, SyncAfter, UploadState, UploadTask, VolumeManifest, VolumeWriter,
 };
-use shared_cloud::{CloudBackend, LocalBackend};
+use shared_object_store::{LocalBackend, ObjectStoreBackend};
 use shared_upload_worker::upload_chunk_inert;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -35,7 +35,7 @@ const PAGE: usize = DEFAULT_PAGE_SIZE_BYTES as usize;
 async fn fixture() -> (
     TempDir,
     Arc<VolumeWriter>,
-    Arc<dyn CloudBackend>,
+    Arc<dyn ObjectStoreBackend>,
     mpsc::Receiver<UploadTask>,
 ) {
     let tmp = TempDir::new().expect("tempdir");
@@ -43,7 +43,7 @@ async fn fixture() -> (
     let cloud_root = data_dir.join("cloud");
     std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
     let backend = LocalBackend::new(&cloud_root).await.expect("local backend");
-    let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let name = "vol-async";
     VolumeManifest::new(
@@ -75,7 +75,7 @@ async fn fixture() -> (
 async fn drive_worker(
     mut rx: mpsc::Receiver<UploadTask>,
     writer: Arc<VolumeWriter>,
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
 ) {
     while let Some(task) = rx.recv().await {
         let outcome = upload_chunk_inert(&*backend, &task.payload)
@@ -272,7 +272,7 @@ async fn set_sync_after_persists_across_reopen() {
     let data_dir = tmp.path().to_path_buf();
     let name = writer.manifest().name.clone();
 
-    assert_eq!(writer.sync_after(), SyncAfter::Cloud);
+    assert_eq!(writer.sync_after(), SyncAfter::Storage);
     writer
         .set_sync_after(SyncAfter::Memory)
         .expect("flip to memory");
@@ -312,7 +312,7 @@ async fn pending_upload_payload_round_trips_via_writer() {
         .manifest()
         .pool_namespace()
         .expect("local volume has a namespace");
-    assert!(payload.cloud_key.contains(&ns));
+    assert!(payload.object_key.contains(&ns));
     // Local pool path exists.
     assert!(payload.local_path.is_file());
 

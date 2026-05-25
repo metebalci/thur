@@ -145,7 +145,7 @@ http:
   listen: "127.0.0.1:$HTTP_PORT"
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
-cloud:
+storage:
   backends:
     local:
       type: local

@@ -45,7 +45,7 @@ guarantees that the single resulting binary will run on all of them without
 per-distro builds.
 
 OpenSSL is vendored — statically linked via `features = ["vendored"]` in
-`shared/cloud` and `shared/keystore` — so the binary carries no runtime
+`shared/object-store` and `shared/keystore` — so the binary carries no runtime
 `libssl` dependency. This sidesteps the `libssl1.1` vs `libssl3` split
 that would otherwise require separate binaries for older and newer distro
 generations.

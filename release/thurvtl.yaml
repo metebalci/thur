@@ -31,16 +31,19 @@ library:
   num_drives: 3
   lto_generation: 8
 
-# Cloud backends live under `cloud.backends:` below. Pick the
+# Storage backends live under `storage.backends:` below. Pick the
 # provider you need (local | s3 | gcs | azure), uncomment that block,
 # fill in the values. Each cartridge binds to one named backend at
 # create time via `--backend NAME`; multiple entries are allowed for
 # multi-tier deployments (hot S3 + cold GCS, etc.).
 #
-# See /usr/share/doc/thurvtl/AUTH.md (or docs/AUTH.md in
-# source) for the per-provider `auth:` block schema in detail.
+# "Storage backend" is the umbrella term — local-filesystem and any
+# S3-compatible object store (AWS S3, GCS, Azure Blob, AIStore,
+# MinIO, Ceph RGW, …) all live here. See /usr/share/doc/thurvtl/AUTH.md
+# (or docs/AUTH.md in source) for the per-provider `auth:` block
+# schema in detail.
 #
-# cloud:
+# storage:
 #   compression: { algorithm: zstd, level: 3 }
 #   upload: { max_concurrent: 0 }
 #
@@ -48,7 +51,7 @@ library:
 #
 #     local-example:
 #       type: local
-#       root_dir: /var/lib/thurvtl/cloud-local        # any local path
+#       root_dir: /var/lib/thurvtl/storage-local      # any local path
 #
 #     s3-example:
 #       type: s3

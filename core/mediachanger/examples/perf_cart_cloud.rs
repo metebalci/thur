@@ -28,7 +28,7 @@
 
 use bytes::Bytes;
 use core_mediachanger::{Cartridge, ChunkingMode, DedupScope, upload_chunk_inert};
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -106,12 +106,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let body = std::fs::read_to_string(&config_path)?;
     #[derive(serde::Deserialize)]
-    struct CloudOnly {
+    struct StorageOnly {
         #[serde(default)]
-        cloud: CloudConfig,
+        storage: ObjectStoreConfig,
     }
-    let cfg: CloudOnly = serde_yaml::from_str(&body)?;
-    let backend = cfg.cloud.create_backend_named(&backend_name).await?;
+    let cfg: StorageOnly = serde_yaml::from_str(&body)?;
+    let backend = cfg.storage.create_backend_named(&backend_name).await?;
 
     let mut cart = Cartridge::create_with_chunking(
         &tapes_dir,

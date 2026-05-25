@@ -20,7 +20,7 @@
 
 use crate::cartridge::{Cartridge, CartridgeOpenMode};
 use crate::errors::Result;
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -77,7 +77,7 @@ impl RestoreReport {
 /// are returned — index-page-only entries (torn upload, in-progress
 /// new cartridge) are skipped silently. Result is sorted
 /// lexicographically.
-pub async fn discover_cloud_cartridges(backend: &dyn CloudBackend) -> Result<Vec<String>> {
+pub async fn discover_cloud_cartridges(backend: &dyn ObjectStoreBackend) -> Result<Vec<String>> {
     let keys = backend.list_objects("manifests/").await?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for key in keys {
@@ -111,7 +111,7 @@ fn parse_sentinel_barcode(key: &str) -> Option<String> {
 /// outcome. Caller decides exit status from `report.failures()`.
 pub async fn run_restore(
     tapes_dir: &Path,
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
     backend_name: &str,
     barcode_filter: &[String],
     allow_existing: bool,
@@ -192,7 +192,7 @@ pub async fn run_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_cloud::LocalBackend;
+    use shared_object_store::LocalBackend;
     use std::fs;
     use tempfile::TempDir;
 

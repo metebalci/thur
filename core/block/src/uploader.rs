@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use shared_cloud::{CloudBackend, CloudError};
+use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
 use shared_pool::{BackpressureError, PoolBudget};
 use shared_upload_worker::{PendingUpload, UploadOutcome, upload_chunk_inert};
 use thiserror::Error;
@@ -187,7 +187,7 @@ pub enum UploaderError {
     Volume(#[from] VolumeError),
 
     #[error("cloud: {0}")]
-    Cloud(#[from] CloudError),
+    Cloud(#[from] ObjectStoreError),
 
     #[error("upload-worker: {0}")]
     UploadWorker(#[from] shared_upload_worker::UploadInertError),
@@ -303,7 +303,7 @@ pub struct VolumeWriter {
     /// a pool chunk; until then every chunk stays evictable
     /// (steady-state LocalOnly window is short).
     upload_index: UploadIndexFile,
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
     /// AES-256 data key when this volume is encrypted at rest.
     /// Loaded from the daemon's keystore at
     /// `<data_dir>/keys/<uuid_hex>.key` and passed in via
@@ -377,7 +377,7 @@ impl VolumeWriter {
     pub fn open(
         data_dir: &Path,
         name: &str,
-        backend: Arc<dyn CloudBackend>,
+        backend: Arc<dyn ObjectStoreBackend>,
     ) -> Result<Self, UploaderError> {
         Self::open_inner(data_dir, name, backend, None)
     }
@@ -393,7 +393,7 @@ impl VolumeWriter {
     pub fn open_with_key(
         data_dir: &Path,
         name: &str,
-        backend: Arc<dyn CloudBackend>,
+        backend: Arc<dyn ObjectStoreBackend>,
         key: [u8; KEY_LEN],
     ) -> Result<Self, UploaderError> {
         Self::open_inner(data_dir, name, backend, Some(key))
@@ -402,7 +402,7 @@ impl VolumeWriter {
     fn open_inner(
         data_dir: &Path,
         name: &str,
-        backend: Arc<dyn CloudBackend>,
+        backend: Arc<dyn ObjectStoreBackend>,
         key: Option<[u8; KEY_LEN]>,
     ) -> Result<Self, UploaderError> {
         let manifest = VolumeManifest::load(data_dir, name)?;
@@ -517,7 +517,7 @@ impl VolumeWriter {
         let hash_hex = hex::encode(hash);
         Ok(Some(PendingUpload {
             item_id: u64::from(page_id),
-            cloud_key: self.pool.cloud_key(&hash_hex),
+            object_key: self.pool.object_key(&hash_hex),
             local_path: self.pool.store_path(&hash_hex),
             hash: hash_hex,
             dedup: self.manifest.dedup_scope,
@@ -724,13 +724,13 @@ impl VolumeWriter {
         let hash_bytes = decode_hash(&hash_hex)?;
 
         // Build the shared upload payload once — both the async and
-        // inline dispatch paths use it. `cloud_key` derivation is
+        // inline dispatch paths use it. `object_key` derivation is
         // namespace-aware (per `DedupScope`).
         let payload_obj = PendingUpload {
             item_id: u64::from(page_id),
             hash: hash_hex.clone(),
             local_path: self.pool.store_path(&hash_hex),
-            cloud_key: self.pool.cloud_key(&hash_hex),
+            object_key: self.pool.object_key(&hash_hex),
             dedup: self.manifest.dedup_scope,
             backend_name: self.manifest.backend.clone(),
         };
@@ -869,8 +869,8 @@ impl VolumeWriter {
         let (payload, cloud_bytes) = if self.pool.exists(&hash_hex) {
             (self.pool.read_bytes(&hash_hex)?, 0u64)
         } else {
-            let cloud_key = self.pool.cloud_key(&hash_hex);
-            let bytes = self.backend.download_chunk(&cloud_key).await?;
+            let object_key = self.pool.object_key(&hash_hex);
+            let bytes = self.backend.download_chunk(&object_key).await?;
             let cloud_bytes = bytes.len() as u64;
             self.pool.insert_verified_bytes(&hash_hex, &bytes)?;
             (bytes, cloud_bytes)
@@ -921,19 +921,19 @@ fn decode_hash(hash_hex: &str) -> Result<ChunkHash, UploaderError> {
 mod tests {
     use super::*;
     use crate::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES, DedupScope};
-    use shared_cloud::LocalBackend;
+    use shared_object_store::LocalBackend;
     use tempfile::TempDir;
 
     /// Stand up a 4 MiB volume with the given dedup scope and a
     /// LocalBackend rooted at `<tmp>/cloud`. Returns
     /// (data_dir, volume_name, backend).
-    async fn fixture(scope: DedupScope) -> (TempDir, String, Arc<dyn CloudBackend>) {
+    async fn fixture(scope: DedupScope) -> (TempDir, String, Arc<dyn ObjectStoreBackend>) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let cloud_root = data_dir.join("cloud");
         std::fs::create_dir_all(&cloud_root).unwrap();
         let backend = LocalBackend::new(&cloud_root).await.unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         let name = "vol1".to_string();
         VolumeManifest::new(
@@ -980,8 +980,8 @@ mod tests {
         // Index records it, pool has it, cloud has it.
         assert!(writer.page_index().get(7).unwrap().is_some());
         assert!(writer.pool().exists(&outcome.hash_hex));
-        let cloud_key = writer.pool().cloud_key(&outcome.hash_hex);
-        assert!(backend.chunk_exists(&cloud_key).await.unwrap());
+        let object_key = writer.pool().object_key(&outcome.hash_hex);
+        assert!(backend.chunk_exists(&object_key).await.unwrap());
     }
 
     #[tokio::test]
@@ -1093,13 +1093,13 @@ mod tests {
     /// into `open_with_key`.
     async fn encrypted_fixture(
         scope: DedupScope,
-    ) -> (TempDir, String, Arc<dyn CloudBackend>, [u8; KEY_LEN]) {
+    ) -> (TempDir, String, Arc<dyn ObjectStoreBackend>, [u8; KEY_LEN]) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let cloud_root = data_dir.join("cloud");
         std::fs::create_dir_all(&cloud_root).unwrap();
         let backend = LocalBackend::new(&cloud_root).await.unwrap();
-        let backend: Arc<dyn CloudBackend> = Arc::new(backend);
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         let name = "vol-enc".to_string();
         VolumeManifest::new(

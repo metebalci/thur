@@ -30,4 +30,4 @@ tokio = { version = "1", features = ["sync", "rt"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
-shared-cloud = { path = "../../shared/cloud" }
+shared-object-store = { path = "../../shared/object-store" }

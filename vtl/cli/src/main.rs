@@ -76,15 +76,15 @@ impl Cli {
         ) {
             return true;
         }
-        // `system cloud benchmark` reads <data_dir>/cloud-backends.json
-        // directly and contacts the cloud SDKs — no admin socket
-        // round-trip. Lets operators validate a backend pre-
-        // daemon-start.
+        // `system storage benchmark` reads the YAML `storage.backends:`
+        // block directly and contacts the backend SDKs — no admin
+        // socket round-trip. Lets operators validate a backend
+        // pre-daemon-start.
         if matches!(
             self.command,
             Commands::System {
-                action: SystemAction::Cloud {
-                    action: CloudAction::Benchmark { .. }
+                action: SystemAction::Storage {
+                    action: StorageAction::Benchmark { .. }
                 }
             }
         ) {
@@ -465,14 +465,14 @@ async fn main() -> Result<()> {
             },
         },
         Commands::System { action } => match action {
-            SystemAction::Gc { dry_run, cloud } => {
-                commands::gc::cmd_gc(dry_run, cloud).await?;
+            SystemAction::Gc { dry_run, storage } => {
+                commands::gc::cmd_gc(dry_run, storage).await?;
             }
-            SystemAction::Cloud { action } => match action {
-                CloudAction::Check => {
-                    commands::cloud::cmd_check().await?;
+            SystemAction::Storage { action } => match action {
+                StorageAction::Check => {
+                    commands::storage::cmd_check().await?;
                 }
-                CloudAction::Benchmark {
+                StorageAction::Benchmark {
                     backends,
                     total_gb,
                     chunk_size_mb,
@@ -482,7 +482,7 @@ async fn main() -> Result<()> {
                     skip_download,
                     yes,
                 } => {
-                    commands::cloud::cmd_benchmark(
+                    commands::storage::cmd_benchmark(
                         &config_path,
                         backends,
                         total_gb,
@@ -508,13 +508,13 @@ async fn main() -> Result<()> {
                 std::process::exit(i32::from(code));
             }
             SystemAction::Verify {
-                skip_cloud,
+                skip_storage,
                 verbose,
                 json,
                 barcodes,
             } => {
                 let code =
-                    commands::verify::cmd_verify(skip_cloud, verbose, json, barcodes).await?;
+                    commands::verify::cmd_verify(skip_storage, verbose, json, barcodes).await?;
                 std::process::exit(i32::from(code));
             }
             SystemAction::RegenerateCert => {
@@ -742,8 +742,8 @@ mod cli_parse_tests {
     }
 
     #[test]
-    fn cloud_benchmark_is_daemon_down() {
-        let cli = parse(["thurvtl", "system", "cloud", "benchmark"]);
+    fn storage_benchmark_is_daemon_down() {
+        let cli = parse(["thurvtl", "system", "storage", "benchmark"]);
         assert!(cli.is_daemon_down());
     }
 

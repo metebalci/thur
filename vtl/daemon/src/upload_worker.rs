@@ -24,14 +24,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, ChunkUploadOutcome, CloudBackend, PendingUploadPayload,
+    Cartridge, CartridgeOpenMode, ChunkUploadOutcome, ObjectStoreBackend, PendingUploadPayload,
 };
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 use shared_upload_worker::run_upload_pipeline;
 
 use crate::{Config, memory_buffer_manager, read_cartridge_backend};
 
-type BackendRegistry = HashMap<String, Box<dyn CloudBackend>>;
+type BackendRegistry = HashMap<String, Box<dyn ObjectStoreBackend>>;
 
 pub(crate) async fn run_event_driven_upload_worker(
     cfg: &Config,
@@ -45,11 +45,11 @@ pub(crate) async fn run_event_driven_upload_worker(
     // daemon (no upload requests) cheap.
     let mut registry: BackendRegistry = HashMap::new();
 
-    let upload_cfg = &cfg.cloud.upload;
+    let upload_cfg = &cfg.storage.upload;
     let (max_concurrent, max_concurrent_source) = upload_cfg.resolve_max_concurrent();
 
     // Note: `retry_max_attempts` from the config governs the
-    // *per-backend* retry budget inside `cloud_helpers::retry_async`
+    // *per-backend* retry budget inside `object_store_helpers::retry_async`
     // (already classify-and-fail-fast on permanent errors, jittered
     // backoff on transient ones). Pre-Batch-F this worker layered a
     // second retry loop on top of every `upload_chunk_inert` call, so
@@ -78,7 +78,7 @@ pub(crate) async fn run_event_driven_upload_worker(
         );
 
         let Some(cloud_backend) =
-            resolve_backend(cfg, &request, &cfg.cloud, &mut registry, &tapes_root).await
+            resolve_backend(cfg, &request, &cfg.storage, &mut registry, &tapes_root).await
         else {
             continue;
         };
@@ -146,10 +146,10 @@ pub(crate) async fn run_event_driven_upload_worker(
 async fn resolve_backend<'a>(
     _cfg: &Config,
     request: &memory_buffer_manager::UploadRequest,
-    cloud_config: &CloudConfig,
+    storage_config: &ObjectStoreConfig,
     registry: &'a mut BackendRegistry,
     tapes_root: &Path,
-) -> Option<&'a dyn CloudBackend> {
+) -> Option<&'a dyn ObjectStoreBackend> {
     let backend_name = match read_cartridge_backend(tapes_root, &request.tape_id) {
         Some(name) => name,
         None => {
@@ -162,7 +162,7 @@ async fn resolve_backend<'a>(
     };
 
     if !registry.contains_key(&backend_name) {
-        match cloud_config.create_backend_named(&backend_name).await {
+        match storage_config.create_backend_named(&backend_name).await {
             Ok(b) => {
                 // Cache warmup: spawn a LIST chunks/ that seeds the
                 // wrapper's cache with `Probed` entries. Clone shares
@@ -170,7 +170,7 @@ async fn resolve_backend<'a>(
                 // the backend the registry holds. Non-blocking — a
                 // LIST failure leaves the cache cold; next write does
                 // a real HEAD/PUT.
-                let warmup: Box<dyn CloudBackend> = b.clone();
+                let warmup: Box<dyn ObjectStoreBackend> = b.clone();
                 let warmup_name = backend_name.clone();
                 tokio::spawn(async move {
                     match warmup.warmup_prefix("chunks/").await {
@@ -214,11 +214,11 @@ async fn resolve_backend<'a>(
 /// applied serially. Reopening per task tripped on `create_new(staging)`
 /// for the trailing chunk that `resume_or_create_active` allocates
 /// whenever all chunks are sealed (issue surfaced 2026-05-03 by
-/// `test-backup-cloud.sh`).
+/// `test-backup-storage.sh`).
 async fn open_cart_and_hold_flag(
     tapes_root: &Path,
     tape_id: &str,
-    cloud_backend: &dyn CloudBackend,
+    cloud_backend: &dyn ObjectStoreBackend,
 ) -> Option<(Cartridge, bool)> {
     let cart = match Cartridge::open_with_cloud(
         tapes_root,
@@ -241,7 +241,7 @@ async fn open_cart_and_hold_flag(
     // yet because nothing has ever been uploaded for this cartridge,
     // or the backend does not support hold — local) is treated as
     // "not held" and logged at debug.
-    let backend_arc: Arc<dyn CloudBackend> = Arc::from(cloud_backend.clone_box());
+    let backend_arc: Arc<dyn ObjectStoreBackend> = Arc::from(cloud_backend.clone_box());
     let auto_hold = match core_mediachanger::read_cartridge_held(backend_arc, tape_id.to_string())
         .await
     {
@@ -272,7 +272,7 @@ async fn open_cart_and_hold_flag(
 /// signal behind its batchmates — the hook fires per-task before
 /// the outcome is yielded into the result vector.
 async fn vtl_post_upload_hook(
-    cloud_backend: &dyn CloudBackend,
+    cloud_backend: &dyn ObjectStoreBackend,
     tape_id: &str,
     auto_hold: bool,
     disk_cache_evict_notify: &Arc<Notify>,
@@ -280,12 +280,12 @@ async fn vtl_post_upload_hook(
 ) {
     if auto_hold
         && let Err(e) = cloud_backend
-            .set_object_legal_hold(&outcome.cloud_key, true)
+            .set_object_legal_hold(&outcome.object_key, true)
             .await
     {
         warn!(
             "Auto-hold: failed to apply legal hold to chunk {} ({}) for {}: {}",
-            outcome.item_id, outcome.cloud_key, tape_id, e
+            outcome.item_id, outcome.object_key, tape_id, e
         );
     }
     disk_cache_evict_notify.notify_one();
@@ -304,7 +304,7 @@ async fn vtl_post_upload_hook(
 async fn apply_outcomes_and_backup_manifest(
     cart: &mut Cartridge,
     outcomes: &[ChunkUploadOutcome],
-    cloud_backend: &dyn CloudBackend,
+    cloud_backend: &dyn ObjectStoreBackend,
     tape_id: &str,
     auto_hold: bool,
 ) {
@@ -358,4 +358,4 @@ async fn apply_outcomes_and_backup_manifest(
 // `shared/upload-worker/src/pipeline.rs` alongside the function it
 // guards. Tape-side glue (cartridge open, hook wiring,
 // apply_outcomes_and_backup_manifest) is covered by the
-// `vtl/scripts/test-backup-cloud.sh` end-to-end run.
+// `vtl/scripts/test-backup-storage.sh` end-to-end run.

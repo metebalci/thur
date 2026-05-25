@@ -20,7 +20,7 @@ use shared_admin_server::{JobEmitter, JobEvent};
 #[derive(Debug, Deserialize, Default)]
 pub struct VerifyParams {
     #[serde(default)]
-    pub skip_cloud: bool,
+    pub skip_storage: bool,
     #[serde(default)]
     pub barcodes: Vec<String>,
 }
@@ -45,7 +45,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     // for other admin requests + iSCSI traffic.
     let data_dir = state.data_dir.clone();
 
-    if params.skip_cloud {
+    if params.skip_storage {
         emitter
             .info(format!(
                 "Verifying library at {} (cloud sweep skipped)",
@@ -76,7 +76,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             };
         finish(&emitter, report).await;
     } else {
-        let cloud_cfg = state.cloud_config.as_ref().clone();
+        let cloud_cfg = state.storage_config.as_ref().clone();
         emitter
             .info(format!(
                 "Verifying library at {} (cloud HEAD sweep enabled)",
@@ -133,23 +133,23 @@ mod tests {
     #[test]
     fn verify_params_default() {
         let p = VerifyParams::default();
-        assert!(!p.skip_cloud);
+        assert!(!p.skip_storage);
         assert!(p.barcodes.is_empty());
     }
 
     #[test]
     fn verify_params_empty_json_uses_defaults() {
         let p: VerifyParams = serde_json::from_value(serde_json::json!({})).expect("empty body");
-        assert!(!p.skip_cloud);
+        assert!(!p.skip_storage);
         assert!(p.barcodes.is_empty());
     }
 
     #[test]
     fn verify_params_parses_skip_cloud_and_barcodes() {
         let p: VerifyParams =
-            serde_json::from_value(serde_json::json!({"skip_cloud": true, "barcodes": ["A", "B"]}))
+            serde_json::from_value(serde_json::json!({"skip_storage": true, "barcodes": ["A", "B"]}))
                 .expect("explicit body");
-        assert!(p.skip_cloud);
+        assert!(p.skip_storage);
         assert_eq!(p.barcodes, vec!["A".to_string(), "B".to_string()]);
     }
 

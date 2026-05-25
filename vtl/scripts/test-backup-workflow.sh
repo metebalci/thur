@@ -207,7 +207,7 @@ iscsi:
 disk_cache:
   disk_free_min_gb: 0
 
-cloud:
+storage:
   backends:
     local:
       type: local

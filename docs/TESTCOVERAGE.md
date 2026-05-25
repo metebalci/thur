@@ -4,7 +4,7 @@ Thur's automated testing is **two-tier**:
 
 - **Unit + integration tests** — ~2,000 per-crate Rust tests run by
   `cargo test`. These cover the storage engines, the SCSI / NVMe
-  command sets, dedup, crypto, and the cloud chunk pool — the
+  command sets, dedup, crypto, and the backend chunk pool — the
   correctness-critical logic.
 - **End-to-end conformance suites** — shell suites under `vtl/scripts/`
   and `vsa/scripts/` that drive a *running daemon* over real iSCSI /
@@ -67,8 +67,8 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-cli-alerting` | 57% | shared | `system alerting` CLI — reached via the CLIs + scripts |
 | `shared-cli-iscsi` | 56% | shared | `iscsi users` / `target` CLI — reached via the CLIs + scripts |
 | `shared-cli-system` | 61% | shared | `system` CLI verbs — reached via the CLIs + scripts |
-| `shared-cloud` | 84% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
-| `shared-cloud-bench` | 90% | shared | cloud benchmark engine — driven by a `MockCloudBackend` in-crate |
+| `shared-object-store` | 84% | **critical** | S3 / GCS / Azure / Local backends, retry, compression |
+| `shared-object-store-bench` | 90% | shared | storage benchmark engine — driven by a `MockCloudBackend` in-crate |
 | `shared-crypto` | 95% | **critical** | AES-256-GCM encrypt / decrypt, IV derivation |
 | `shared-dedup-stats` | 100% | **control-plane critical** | dedup exclusive / shared byte split |
 | `shared-health` | 100% | shared | `/health` liveness handler |
@@ -77,8 +77,8 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-naming` | 94% | shared | per-product identity strings |
 | `shared-pool` | 91% | **critical** | content-addressed chunk pool, insertion, GC iteration, budget |
 | `shared-telemetry` | 66% | shared | OpenTelemetry instrument plumbing |
-| `shared-upload-worker` | 89% | **control-plane critical** | cloud-upload PUT + HEAD-probe primitive |
-| `shared-verify-core` | 85% | **control-plane critical** | pool + cloud verify sweeps — exercised via the `core-*` verify tests |
+| `shared-upload-worker` | 89% | **control-plane critical** | backend-upload PUT + HEAD-probe primitive |
+| `shared-verify-core` | 85% | **control-plane critical** | pool + storage verify sweeps — exercised via the `core-*` verify tests |
 
 ### `scsi/` — SCSI command sets
 
@@ -140,13 +140,13 @@ reviewed-trivial paths in `scripts/coverage-exempt.txt` (pure re-export
 
 | Tier | Crates | Floor |
 |---|---|---|
-| Critical — data-path | `core/*`, `scsi/*`, `nvme/*`, `shared/crypto`, `shared/pool`, `shared/iscsi`, `shared/audit`, `shared/keystore`, `shared/cloud` | 80% |
+| Critical — data-path | `core/*`, `scsi/*`, `nvme/*`, `shared/crypto`, `shared/pool`, `shared/iscsi`, `shared/audit`, `shared/keystore`, `shared/object-store` | 80% |
 | Critical — control-plane | `shared/admin-server`, `shared/verify-core`, `shared/upload-worker`, `shared/dedup-stats` | 80% |
 | Standard — shared | all other `shared/*` crates | 50% |
 | Products | `vtl/daemon`, `vtl/cli`, `vsa/daemon`, `vsa/cli` | 30% |
 
 The two critical tiers are split by failure mode, not by criticality
-level: **data-path** bugs corrupt or lose on-disk / cloud data
+level: **data-path** bugs corrupt or lose on-disk / backend data
 silently; **control-plane** bugs cause silent operational failures
 (admin socket down, integrity check skipped, alert never fires) or
 unrecoverable backups. Both tiers carry the same 80% floor.
@@ -160,12 +160,12 @@ needs sudo for the kernel-initiator suites and takes 10-20 minutes.
 ### Structural sub-floor exceptions
 
 The three SDK-bound files we couldn't reach via `wiremock` —
-`shared/cloud/src/gcs.rs`, `shared/keystore/src/gcpkms.rs`,
+`shared/object-store/src/gcs.rs`, `shared/keystore/src/gcpkms.rs`,
 `shared/keystore/src/azurekv.rs` — are now mocked at the
 trait-seam boundary. Each backend struct holds an
 `Arc<dyn *Api>` (`GcsApi` / `GcpKmsApi` / `AzureKvApi`); the only
 SDK-touching code lives in sibling `*_api.rs` files exercised by
-`vsa/scripts/test-iscsi-fs-cloud.sh` (GCS) and
+`vsa/scripts/test-iscsi-fs-storage.sh` (GCS) and
 `vsa/scripts/test-keystore.sh` (KMS / KV). The three target files
 sit at 93-95% per-file; the SDK adapter siblings sit at 36-66%
 without dragging either crate below its 80% floor.
@@ -190,9 +190,9 @@ full backup / filesystem round-trip.
 | `test-iscsi-conformance.sh` | iSCSI login / CHAP / transport conformance |
 | `test-scsi-conformance.sh` | SMC-3 + SSC-4 SCSI command conformance |
 | `test-backup-workflow.sh` | end-to-end backup + restore (local backend) |
-| `test-backup-cloud.sh` | end-to-end backup + restore (real cloud backend) |
-| `test-backup-cloud-failures.sh` | cloud failure-path handling |
-| `test-backup-cloud-resume.sh` | boot-time orphan-upload recovery |
+| `test-backup-storage.sh` | end-to-end backup + restore (real storage backend) |
+| `test-backup-storage-failures.sh` | backend failure-path handling |
+| `test-backup-storage-resume.sh` | boot-time orphan-upload recovery |
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-chunk-seal.sh` | kill -9 mid tape stream → restart → acked blocks survive |
 | `test-many-cartridge-lifecycle.sh` | soak: create/list/stats N cartridges (THURVTL_SOAK=1) |
@@ -209,10 +209,10 @@ full backup / filesystem round-trip.
 | `test-scsi-conformance.sh` | SBC-3 SCSI command conformance |
 | `test-nvmetcp-conformance.sh` | NVMe/TCP transport + NVM Command Set conformance |
 | `test-iscsi-fs-workflow.sh` | filesystem round-trip over iSCSI (local backend) |
-| `test-iscsi-fs-cloud.sh` | filesystem round-trip over iSCSI (real cloud backend) |
+| `test-iscsi-fs-storage.sh` | filesystem round-trip over iSCSI (real storage backend) |
 | `test-nvme-fs-workflow.sh` | filesystem round-trip over NVMe/TCP (local backend) |
-| `test-nvme-fs-cloud.sh` | filesystem round-trip over NVMe/TCP (real cloud backend) |
-| `test-fs-cloud-failures.sh` | cloud failure-path handling |
+| `test-nvme-fs-storage.sh` | filesystem round-trip over NVMe/TCP (real storage backend) |
+| `test-fs-storage-failures.sh` | backend failure-path handling |
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-page-flush.sh` | kill -9 after host fsync → restart → every byte survives |
 | `test-iscsi-multi-initiator.sh` | two initiators + PR matrix, RESERVATION CONFLICT sense |
@@ -232,7 +232,7 @@ thurvtld --test    # cartridge / library / S3 / prefetch / upload-worker
 thurvsad --test    # volume bring-up / data-path / SYNCHRONIZE CACHE / sparse-page
 ```
 
-It is a fast confidence check that the core read / write / cloud paths
+It is a fast confidence check that the core read / write / backend paths
 work on the host — useful right after install or in a constrained
 environment where the full shell suites can't run.
 

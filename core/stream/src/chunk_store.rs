@@ -8,7 +8,7 @@
 //! `ChunkStore` is now a type alias for `shared_pool::ChunkPool`,
 //! so existing internal call sites
 //! (`crate::chunk_store::ChunkStore::new`,
-//! `core_mediachanger::ChunkStore::cloud_key_for`, …) resolve unchanged.
+//! `core_mediachanger::ChunkStore::object_key_for`, …) resolve unchanged.
 //!
 //! `From<ChunkPoolError> for SmcError` lives in
 //! [`crate::errors`] so the historical `?` propagation through

@@ -234,7 +234,7 @@ http:
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
   target_iqn: "$TARGET_IQN"
-cloud:
+storage:
   backends:
     local:
       type: local

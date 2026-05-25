@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use shared_admin_server::{JobRegistry, PeerCred};
 use shared_audit::{AuditActor, AuditChannel, AuditResult};
-use shared_cloud::{CloudBackend, CloudConfig};
 use shared_keystore::{DekSource, KeyStoreBackend, KeystoreYamlConfig, SecretBytes};
+use shared_object_store::{ObjectStoreBackend, ObjectStoreConfig};
 use shared_pool::PoolBudget;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
@@ -56,9 +56,9 @@ use crate::registry::VolumeRegistry;
 #[derive(Clone)]
 pub struct AdminState {
     pub data_dir: PathBuf,
-    pub cloud: Arc<CloudConfig>,
+    pub storage: Arc<ObjectStoreConfig>,
     pub registry: Arc<VolumeRegistry>,
-    pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn CloudBackend>>>>,
+    pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     pub audit: Option<AuditChannel>,
     /// Audit-log directory (`<data_dir>/audit` or the `audit.dir`
     /// override). The `system.audit.*` job handlers read JSONL files
@@ -149,7 +149,7 @@ impl shared_admin_monitor::MonitorState for AdminState {
 
 impl AdminState {
     /// Resolve `--keystore NAME` (or absence) into a live backend
-    /// handle. Mirrors `shared_cloud::is_single_backend` inference.
+    /// handle. Mirrors `shared_object_store::is_single_backend` inference.
     /// Lazily instantiates the backend the first time it's
     /// referenced and caches the result for subsequent calls.
     pub async fn resolve_keystore_backend(
@@ -278,7 +278,7 @@ pub async fn info(
 /// otherwise auto-pick when exactly one backend is configured; refuse
 /// when 2+ backends are configured without an explicit choice.
 fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<String, String> {
-    let backend_names = state.cloud.backend_names();
+    let backend_names = state.storage.backend_names();
     match (req_backend, backend_names.len()) {
         (Some(name), _) => {
             if !backend_names.iter().any(|n| n == name) {
@@ -331,7 +331,7 @@ pub async fn create(
 
     // Look up the pool budget for the resolved backend. The boot
     // path makes the same invariant assumption (every backend in
-    // cloud_config has a budget in pool_budgets, built side-by-side
+    // storage_config has a budget in pool_budgets, built side-by-side
     // in main.rs); refuse the create fast if it's somehow missing
     // rather than carrying half-wired state into VolumeWriter.
     let pool_budget = state.pool_budgets.get(&backend).cloned().ok_or_else(|| {
@@ -625,7 +625,7 @@ pub async fn create(
     // UploadConfig). The source string is intentionally discarded —
     // it's already logged once at boot; per-volume log lines would be
     // noise.
-    let (max_concurrent_flushes, _) = state.cloud.upload.resolve_max_concurrent();
+    let (max_concurrent_flushes, _) = state.storage.upload.resolve_max_concurrent();
     let cache = PageCache::with_budget_and_concurrency(
         writer,
         core_block::DEFAULT_CACHE_BUDGET_BYTES,
@@ -897,14 +897,14 @@ pub struct SetSyncAfterRequest {
     pub mode: String,
 }
 
-/// Lookup or instantiate the `Arc<dyn CloudBackend>` for `name`.
+/// Lookup or instantiate the `Arc<dyn ObjectStoreBackend>` for `name`.
 /// The cache is populated at boot from `discovery.rs`; this helper
 /// exists so admin-side creates against a never-before-used backend
 /// pay the SDK construction cost exactly once.
 async fn get_or_init_backend(
     state: &AdminState,
     name: &str,
-) -> anyhow::Result<Arc<dyn CloudBackend>> {
+) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
     {
         let cache = state.backends.lock().await;
         if let Some(existing) = cache.get(name) {
@@ -912,11 +912,11 @@ async fn get_or_init_backend(
         }
     }
     let boxed = state
-        .cloud
+        .storage
         .create_backend_named(name)
         .await
         .map_err(|e| anyhow::anyhow!("instantiate backend '{}': {}", name, e))?;
-    let arc: Arc<dyn CloudBackend> = Arc::from(boxed);
+    let arc: Arc<dyn ObjectStoreBackend> = Arc::from(boxed);
     let mut cache = state.backends.lock().await;
     cache.insert(name.to_string(), Arc::clone(&arc));
     Ok(arc)

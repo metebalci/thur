@@ -35,7 +35,7 @@
 
 use crate::errors::{Result, SmcError};
 use serde::Deserialize;
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 /// Subset of `manifest.json` we need to enumerate cloud keys without
 /// pulling in the whole `Cartridge` machinery (which would drag in a
-/// `CloudBackend` and a runtime). Backend-flat: pool keys are
+/// `ObjectStoreBackend` and a runtime). Backend-flat: pool keys are
 /// `chunks/<aa>/<bb>/<hash>.dat`; the manifest backups live under
 /// `manifests/<label>/manifest-{latest,TIMESTAMP}.json`.
 #[derive(Debug, Deserialize)]
@@ -113,14 +113,14 @@ pub struct CartridgeKeys {
 /// The sentinel (`manifest-latest.json`) is split out from `others`
 /// so callers can sequence apply/clear in the right order.
 ///
-/// Takes `Arc<dyn CloudBackend>` by value so callers don't have to
+/// Takes `Arc<dyn ObjectStoreBackend>` by value so callers don't have to
 /// hold a borrow across the `list_objects` await — borrows of
-/// `&dyn CloudBackend` across awaits trip the rustc HRTB-Send check
+/// `&dyn ObjectStoreBackend` across awaits trip the rustc HRTB-Send check
 /// when the future flows through axum's `Handler` trait machinery.
 pub async fn collect_cartridge_keys(
     tapes_dir: &Path,
     barcode: String,
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
 ) -> Result<CartridgeKeys> {
     use crate::chunk_store::ChunkStore;
 
@@ -138,7 +138,7 @@ pub async fn collect_cartridge_keys(
         .filter_map(|c| {
             c.hash
                 .as_ref()
-                .map(|h| ChunkStore::cloud_key_for(cartridge_namespace, h))
+                .map(|h| ChunkStore::object_key_for(cartridge_namespace, h))
         })
         .collect();
 
@@ -164,7 +164,7 @@ pub async fn collect_cartridge_keys(
 /// Apply `held` to every `keys` entry on `backend`, with bounded
 /// concurrency. Returns the per-key tally.
 pub async fn apply_legal_hold_to_keys(
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
     keys: Vec<String>,
     held: bool,
     concurrency: usize,
@@ -209,7 +209,7 @@ pub async fn apply_legal_hold_to_keys(
 /// after every other key succeeds; it's only cleared first when
 /// `held == false`.
 pub async fn apply_cartridge_legal_hold(
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
     keys: &CartridgeKeys,
     held: bool,
     concurrency: usize,
@@ -268,7 +268,10 @@ pub async fn apply_cartridge_legal_hold(
 /// cartridge is held, `Ok(false)` if not, `Err(...)` on IO/permission
 /// problems. This is the canonical "is X held?" question — one round
 /// trip, no sampling.
-pub async fn read_cartridge_held(backend: Arc<dyn CloudBackend>, barcode: String) -> Result<bool> {
+pub async fn read_cartridge_held(
+    backend: Arc<dyn ObjectStoreBackend>,
+    barcode: String,
+) -> Result<bool> {
     let key = manifest_latest_sentinel_key(&barcode);
     Ok(backend.get_object_legal_hold(&key).await?)
 }
@@ -277,7 +280,7 @@ pub async fn read_cartridge_held(backend: Arc<dyn CloudBackend>, barcode: String
 /// `legal-hold status --full` to verify each chunk + backup matches
 /// what the sentinel says.
 pub async fn read_legal_hold_for_keys(
-    backend: Arc<dyn CloudBackend>,
+    backend: Arc<dyn ObjectStoreBackend>,
     keys: Vec<String>,
     concurrency: usize,
 ) -> Vec<(String, Result<bool>)> {
@@ -305,12 +308,12 @@ pub async fn read_legal_hold_for_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared_cloud::{CloudBackend, CloudError, LockState};
+    use shared_object_store::{LockState, ObjectStoreBackend, ObjectStoreError};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// In-memory `CloudBackend` mock. `LocalBackend` returns
+    /// In-memory `ObjectStoreBackend` mock. `LocalBackend` returns
     /// `NotSupported` for the legal-hold ops, so the legal-hold module
     /// can only be exercised against a backend that implements them —
     /// this mock keeps the hold flags in a `HashMap` and replays a
@@ -342,41 +345,48 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CloudBackend for HoldMock {
+    impl ObjectStoreBackend for HoldMock {
         async fn upload_chunk(
             &self,
             _key: &str,
             data: &[u8],
-        ) -> shared_cloud::Result<(u64, Option<u64>, Option<shared_cloud::CompressionAlgo>)>
-        {
+        ) -> shared_object_store::Result<(
+            u64,
+            Option<u64>,
+            Option<shared_object_store::CompressionAlgo>,
+        )> {
             Ok((data.len() as u64, None, None))
         }
         async fn upload_chunk_zerocopy(
             &self,
             _key: &str,
             _path: &Path,
-        ) -> shared_cloud::Result<u64> {
+        ) -> shared_object_store::Result<u64> {
             Ok(0)
         }
-        async fn download_chunk(&self, _key: &str) -> shared_cloud::Result<Vec<u8>> {
+        async fn download_chunk(&self, _key: &str) -> shared_object_store::Result<Vec<u8>> {
             Ok(Vec::new())
         }
         async fn download_chunks_parallel(
             &self,
             _keys: &[String],
-        ) -> shared_cloud::Result<Vec<Vec<u8>>> {
+        ) -> shared_object_store::Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
-        async fn upload_manifest(&self, _key: &str, _json: &str) -> shared_cloud::Result<()> {
+        async fn upload_manifest(
+            &self,
+            _key: &str,
+            _json: &str,
+        ) -> shared_object_store::Result<()> {
             Ok(())
         }
-        async fn download_manifest(&self, _key: &str) -> shared_cloud::Result<String> {
+        async fn download_manifest(&self, _key: &str) -> shared_object_store::Result<String> {
             Ok(String::new())
         }
-        async fn chunk_exists(&self, _key: &str) -> shared_cloud::Result<bool> {
+        async fn chunk_exists(&self, _key: &str) -> shared_object_store::Result<bool> {
             Ok(false)
         }
-        async fn list_objects(&self, prefix: &str) -> shared_cloud::Result<Vec<String>> {
+        async fn list_objects(&self, prefix: &str) -> shared_object_store::Result<Vec<String>> {
             Ok(self
                 .listing
                 .iter()
@@ -384,18 +394,22 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn delete_object(&self, _key: &str) -> shared_cloud::Result<()> {
+        async fn delete_object(&self, _key: &str) -> shared_object_store::Result<()> {
             Ok(())
         }
         fn backend_type(&self) -> &'static str {
             "mock"
         }
-        async fn lock_state(&self) -> shared_cloud::Result<LockState> {
+        async fn lock_state(&self) -> shared_object_store::Result<LockState> {
             Ok(LockState::Off)
         }
-        async fn set_object_legal_hold(&self, key: &str, held: bool) -> shared_cloud::Result<()> {
+        async fn set_object_legal_hold(
+            &self,
+            key: &str,
+            held: bool,
+        ) -> shared_object_store::Result<()> {
             if self.fail {
-                return Err(CloudError::NotSupported("mock failure".to_string()));
+                return Err(ObjectStoreError::NotSupported("mock failure".to_string()));
             }
             self.holds
                 .lock()
@@ -403,9 +417,9 @@ mod tests {
                 .insert(key.to_string(), held);
             Ok(())
         }
-        async fn get_object_legal_hold(&self, key: &str) -> shared_cloud::Result<bool> {
+        async fn get_object_legal_hold(&self, key: &str) -> shared_object_store::Result<bool> {
             if self.fail {
-                return Err(CloudError::NotSupported("mock failure".to_string()));
+                return Err(ObjectStoreError::NotSupported("mock failure".to_string()));
             }
             Ok(self
                 .holds
@@ -415,12 +429,12 @@ mod tests {
                 .copied()
                 .unwrap_or(false))
         }
-        fn clone_box(&self) -> Box<dyn CloudBackend> {
+        fn clone_box(&self) -> Box<dyn ObjectStoreBackend> {
             Box::new(self.clone())
         }
     }
 
-    fn backend(mock: HoldMock) -> Arc<dyn CloudBackend> {
+    fn backend(mock: HoldMock) -> Arc<dyn ObjectStoreBackend> {
         Arc::new(mock)
     }
 

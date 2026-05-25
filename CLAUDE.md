@@ -7,7 +7,7 @@ index.
 
 ## Project Overview
 
-Two sibling Rust products on a shared cloud chunk pool, packaged separately
+Two sibling Rust products on a shared backend chunk pool, packaged separately
 and co-resident on the same host:
 
 - **Thur VTL** (working name `thurvtl`) — Virtual Tape Library presenting
@@ -21,7 +21,7 @@ and co-resident on the same host:
   Topology bounds; one Import/Export element is reported, hardwired,
   for backup-software compat — the operator-visible
   `cartridge import` / `cartridge export` CLI works against storage
-  slots directly), cloud tiering (S3 / GCS / Azure / Local).
+  slots directly), storage tiering (S3 / GCS / Azure / Local).
   Single-tape-drive deployments declare
   `library: { num_slots: 1, num_drives: 1, lto_generation: 8 }` in
   the YAML conffile.
@@ -102,7 +102,7 @@ on-disk paths group by purpose.
   helpers (`parse_grace`, `resolve_password`, `require_daemon`) but
   keep their product-specific lifecycle in
   `vsa/cli/src/credentials.rs`.
-- `shared/cloud` (`shared-cloud`) — `CloudBackend` trait + S3 / GCS /
+- `shared/object-store` (`shared-object-store`) — `ObjectStoreBackend` trait + S3 / GCS /
   Azure / Local impls, retry, compression primitives.
 - `shared/crypto` (`shared-crypto`) — AES-256-GCM primitives
   (`encrypt_block` / `decrypt_block`), IV derivation (`derive_iv`),
@@ -131,7 +131,7 @@ on-disk paths group by purpose.
   `kmip` (KMIP 1.4+ AES-GCM Encrypt/Decrypt over hand-rolled TTLV
   + mTLS — no upstream KMIP crate; talks to Thales / Entrust /
   Fortanix / Utimaco / Vault Enterprise KMIP / IBM SKLM / PyKMIP).
-  Tagged-enum config + auth resolution mirrors `shared-cloud`.
+  Tagged-enum config + auth resolution mirrors `shared-object-store`.
   Wrapped DEK lives in the volume manifest's `encryption.wrapped_dek`
   for non-local backends; local keeps the sidecar as the storage.
   Schema in [`docs/AUTH.md`](docs/AUTH.md) §
@@ -149,8 +149,8 @@ on-disk paths group by purpose.
   mode / report-luns / PR primitives, canonical `ScsiRequest` /
   `ScsiResponse`).
 - `shared/pool` (`shared-pool`) — content-addressed chunk pool
-  (insertion APIs, namespace, cloud-key derivation, GC iter).
-- `shared/upload-worker` (`shared-upload-worker`) — cloud-upload
+  (insertion APIs, namespace, object-key derivation, GC iter).
+- `shared/upload-worker` (`shared-upload-worker`) — storage-upload
   pipeline scaffold lifted out of VTL: `PendingUpload` /
   `UploadOutcome` payload types, the stateless
   `upload_chunk_inert(backend, &PendingUpload)` PUT-plus-HEAD-probe
@@ -165,10 +165,11 @@ on-disk paths group by purpose.
   (`PendingUploadPayload`, `ChunkUploadOutcome`) for call-site
   continuity.
 - `shared/verify-core` (`shared-verify-core`) — cross-product
-  chunk-pool + cloud verification sweeps for `system verify`. A
-  product implements the `VerifyTarget` trait (its live chunk set +
-  per-entity cloud expectations); `sweep_local_pool` runs the local
-  orphan scan and `sweep_cloud` the bounded cloud HEAD storm. The
+  chunk-pool + storage-backend verification sweeps for `system
+  verify`. A product implements the `VerifyTarget` trait (its live
+  chunk set + per-entity storage expectations); `sweep_local_pool`
+  runs the local orphan scan and `sweep_storage` the bounded backend
+  HEAD storm. The
   tape library/partition checks and the block page-table integrity
   check stay per-product, as does each product's `VerifyReport`
   shape; only the two pool sweeps are shared.
@@ -249,10 +250,12 @@ adapter layers between products are in
 ## Architecture (high-level)
 
 - **Storage** — cartridges (Thur VTL) / volumes (Thur VSA) reduce to
-  content-addressed chunks in a per-backend pool. Local + cloud tiers; cloud
-  is source of truth, disk is warm cache. Refcount-aware eviction.
+  content-addressed chunks in a per-backend pool. The storage backend
+  (local-filesystem, S3, GCS, Azure, AIStore / MinIO / Ceph RGW) is the
+  source of truth; the on-host disk is a warm cache. Refcount-aware
+  eviction.
   Each backend gets its own `disk_cache.size_gb` cap (YAML default,
-  optionally overridden per entry under `cloud.backends:` via
+  optionally overridden per entry under `storage.backends:` via
   `disk_cache_size_gb`), shared across that backend's pool +
   local-scope namespaces. Cartridge dir layout in
   [`docs/STORAGE.md`](docs/STORAGE.md); dedup details in
@@ -268,7 +271,7 @@ adapter layers between products are in
   workers; chunk-seal is gated at the staging-rename boundary
   ([`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md)). Thur VSA
   runs a per-volume `PageCache` (write-back + RMW) backed by a
-  `VolumeWriter` pool/cloud pipeline; page-seal is gated before
+  `VolumeWriter` pool/storage pipeline; page-seal is gated before
   `pool.insert_bytes`, eviction is per-volume `lru.idx`-driven
   ([`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md)).
   SYNCHRONIZE CACHE is a real fence on VSA.
@@ -281,7 +284,7 @@ adapter layers between products are in
   [`docs/AUDIT.md`](docs/AUDIT.md); schema +
   rate-limited-rollup shape in
   [`docs/SPEC.md`](docs/SPEC.md) § Audit Log.
-- **Cloud retries** — S3/GCS/Azure classify errors and **fail fast on
+- **Backend retries** — S3/GCS/Azure classify errors and **fail fast on
   permanent errors** (`Auth` / `Authz` / `NotFound` / `RegionMismatch`);
   only `Network` / `Timeout` / `Other` (5xx, throttling, unclassified)
   consume the backoff budget. A revoked credential surfaces in seconds.
@@ -341,7 +344,7 @@ thurvtld --test    # in-process smoke (cartridge/library/S3/prefetch/…)
 ```
 
 Production install paths (`.deb` / `.rpm`) and recipes are in
-[`README.md`](README.md). Cloud-credentials wiring (per-backend `auth:`
+[`README.md`](README.md). Storage credentials wiring (per-backend `auth:`
 blocks, default chains, the per-product `<product>.env` daemon env
 file) in [`docs/AUTH.md`](docs/AUTH.md). Release-cut flow + glibc-floor
 strategy + OpenSSL vendoring in
@@ -450,7 +453,7 @@ restore` / `library restore-archive`), and pure-local config commands
 are **daemon-down**. Chassis topology (`num_slots`, `num_drives`,
 `lto_generation`) is YAML-declared and reconciled by the daemon at
 start; there's no imperative chassis-mutation verb. Long-running
-ops (`gc` / `verify` / `stats` / `cloud check` / self-tests) ride a two-step
+ops (`gc` / `verify` / `stats` / `storage check` / self-tests) ride a two-step
 job protocol on the same socket. Full split, admin socket discovery, sudo
 / privdrop behavior, and the job protocol in
 [`docs/CLI.md`](docs/CLI.md).
@@ -459,13 +462,13 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
-- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-cloud}.sh`
-- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-cloud,fs-cloud-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-cloud}.sh`
+- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage}.sh`
+- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage}.sh`
 
-Run from the repo root; flags `--release`, `--keep-data`. Cloud variants
+Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
 entry in the conffile; refuses `retention_mode != none`.
-`test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-cloud.sh`
+`test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
 and exercises wrap / unwrap / migrate against any backend type
@@ -505,7 +508,7 @@ root (CLAUDE.md must, for auto-loading).
 - Wire-level reference:
   [`docs/SPEC.md`](docs/SPEC.md) — SCSI opcodes, VPD / mode /
   log pages, manifest schema, library / inventory schema, chunk-pool
-  layout, cloud object-key shape, iSCSI / LTO emulation IDs, telemetry
+  layout, backend object-key shape, iSCSI / LTO emulation IDs, telemetry
   inventory. Update in lockstep with the code.
 - Workspace + CLI references:
   [`docs/WORKSPACE.md`](docs/WORKSPACE.md),
@@ -537,7 +540,7 @@ padding, CmdSN / StatSN, 128 KiB segments).
   [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
   Wire-level
   surface changes (SCSI opcodes / VPD / mode / log pages, manifest schema,
-  library / inventory schema, on-disk chunk-pool layout, cloud object-key
+  library / inventory schema, on-disk chunk-pool layout, backend object-key
   shape, iSCSI / LTO emulation IDs) MUST also update
   [`docs/SPEC.md`](docs/SPEC.md) — it is the external
   technical reference and must stay in sync with the code.

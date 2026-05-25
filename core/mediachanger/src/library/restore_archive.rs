@@ -34,7 +34,7 @@ use std::path::Path;
 
 use core_stream::ChunkStore;
 use core_stream::chunk_index::{ChunkIndexFile, LocationTag};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 
 use crate::errors::{Result, SmcError};
 
@@ -43,7 +43,7 @@ pub struct RestoreArchiveOptions<'a> {
     pub tapes_dir: &'a Path,
     /// Backend handle. The archive lives on this backend; the
     /// restored cartridge will be bound to its name.
-    pub backend: &'a dyn CloudBackend,
+    pub backend: &'a dyn ObjectStoreBackend,
     pub backend_name: &'a str,
     /// Source barcode the archive was created under.
     pub barcode: &'a str,
@@ -219,9 +219,9 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .collect();
     for key in &partition_keys {
         let body = opts.backend.download_chunk(key).await.map_err(cloud_err)?;
-        let filename = key
-            .strip_prefix(&archive_prefix)
-            .ok_or_else(|| SmcError::CloudError("listed key missing archive prefix".to_string()))?;
+        let filename = key.strip_prefix(&archive_prefix).ok_or_else(|| {
+            SmcError::ObjectStoreError("listed key missing archive prefix".to_string())
+        })?;
         write_atomic(&cart_root.join(filename), &body)?;
         report.index_files_downloaded += 1;
     }
@@ -289,8 +289,8 @@ fn validate_barcode(barcode: &str) -> Result<()> {
     Ok(())
 }
 
-fn cloud_err(e: shared_cloud::CloudError) -> SmcError {
-    SmcError::CloudError(e.to_string())
+fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+    SmcError::ObjectStoreError(e.to_string())
 }
 
 /// Atomic temp+rename write; mirrors the cartridge module's

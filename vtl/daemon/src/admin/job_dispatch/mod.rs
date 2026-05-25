@@ -117,7 +117,7 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_mediachanger::{AuditRateLimiter, CloudConfig};
+    use core_mediachanger::{AuditRateLimiter, ObjectStoreConfig};
     use scsi_smc::changer::ElementAddressConfig;
     use shared_admin_server::JobRegistry;
     use std::collections::HashMap;
@@ -157,7 +157,7 @@ mod tests {
             audit_dir: dir.join("audit"),
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
-            cloud_config: Arc::new(CloudConfig::default()),
+            storage_config: Arc::new(ObjectStoreConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 1,
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,

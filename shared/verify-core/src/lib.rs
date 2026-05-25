@@ -26,7 +26,7 @@ use std::fs;
 use std::path::Path;
 
 use futures::stream::StreamExt;
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use shared_pool::ChunkPool;
 
 /// Concurrency for the cloud-sweep HEAD storm. Matches the upload
@@ -255,10 +255,10 @@ fn sweep_pool_chunks(
 /// Sweep one backend's cloud bucket: HEAD every chunk each entity
 /// bound to `backend_name` expects, then list `chunks/` to count
 /// orphan objects.
-pub async fn sweep_cloud(
+pub async fn sweep_storage(
     target: &dyn VerifyTarget,
     backend_name: &str,
-    backend: &dyn CloudBackend,
+    backend: &dyn ObjectStoreBackend,
 ) -> CloudChunkSweep {
     let entities: Vec<CloudEntity> = target
         .cloud_entities()
@@ -275,7 +275,7 @@ pub async fn sweep_cloud(
             .iter()
             .map(|h| {
                 (
-                    ChunkPool::cloud_key_for(ent.namespace.as_deref(), h),
+                    ChunkPool::object_key_for(ent.namespace.as_deref(), h),
                     h.clone(),
                 )
             })

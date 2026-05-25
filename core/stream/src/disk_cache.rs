@@ -6,7 +6,7 @@ use crate::chunk_index::{ChunkIndexFile, LocationTag};
 use crate::chunk_store::ChunkStore;
 use crate::errors::Result;
 use crate::lru_index::LruIndexFile;
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use shared_pool::PoolBudget;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -190,7 +190,7 @@ impl DiskCacheManager {
     /// Returns the number of bytes freed
     pub async fn evict_lru_chunks(
         &mut self,
-        cloud_backend: Option<&dyn CloudBackend>,
+        cloud_backend: Option<&dyn ObjectStoreBackend>,
     ) -> Result<u64> {
         if self.current_bytes <= self.cache_bytes {
             debug!(

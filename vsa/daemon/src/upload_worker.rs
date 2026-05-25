@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use core_block::{PageCache, UploadState, UploadTask};
-use shared_cloud::CloudBackend;
+use shared_object_store::ObjectStoreBackend;
 use shared_upload_worker::upload_chunk_inert;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
@@ -78,7 +78,7 @@ pub fn upload_channel() -> (mpsc::Sender<UploadTask>, mpsc::Receiver<UploadTask>
 pub async fn run_upload_worker(
     mut rx: mpsc::Receiver<UploadTask>,
     registry: Arc<VolumeRegistry>,
-    backends: Arc<Mutex<BTreeMap<String, Arc<dyn CloudBackend>>>>,
+    backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     max_concurrent: usize,
 ) -> Result<()> {
     let concurrency = max_concurrent.max(1);
@@ -116,7 +116,7 @@ pub async fn run_upload_worker(
 /// next write or boot-time scan re-enqueues.
 async fn run_one_task(
     task: UploadTask,
-    backends: &Arc<Mutex<BTreeMap<String, Arc<dyn CloudBackend>>>>,
+    backends: &Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     registry: &VolumeRegistry,
 ) {
     // Share the same map AdminState holds so backends instantiated by
@@ -155,7 +155,7 @@ async fn run_one_task(
         Err(e) => {
             warn!(
                 "upload worker: PUT failed for volume '{}' page {} ({}): {}",
-                task.volume_name, item_id, task.payload.cloud_key, e
+                task.volume_name, item_id, task.payload.object_key, e
             );
             return;
         }

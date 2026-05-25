@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use shared_admin_client::AdminClient;
-use shared_admin_monitor::{CloudEntry, MonitorSnapshot, PoolEntry, ProductSnapshot};
+use shared_admin_monitor::{MonitorSnapshot, PoolEntry, ProductSnapshot, StorageEntry};
 use shared_admin_proto::JobEvent;
 use shared_naming::ProductIdentity;
 
@@ -138,7 +138,7 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
     }
     out.push('\n');
 
-    // Cloud block — diff against the snapshot from ≥60 s ago.
+    // Storage block — diff against the snapshot from ≥60 s ago.
     let baseline_60s = baseline_at_least(history, WINDOW_60S);
     let history_secs = history.len().saturating_sub(1);
     let history_note = if history_secs < WINDOW_60S {
@@ -146,12 +146,12 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
     } else {
         String::new()
     };
-    out.push_str(&format!("Cloud (last 60s){}\n", history_note));
-    if current.cloud.is_empty() {
-        out.push_str("  (no cloud activity since boot)\n");
+    out.push_str(&format!("Storage (last 60s){}\n", history_note));
+    if current.storage.is_empty() {
+        out.push_str("  (no storage activity since boot)\n");
     } else {
-        for c in &current.cloud {
-            out.push_str(&format!("  {}\n", render_cloud_row(c, baseline_60s)));
+        for c in &current.storage {
+            out.push_str(&format!("  {}\n", render_storage_row(c, baseline_60s)));
         }
     }
     out.push('\n');
@@ -207,15 +207,15 @@ fn render_pool_row(p: &PoolEntry, first_in_group: bool) -> String {
     }
 }
 
-fn render_cloud_row(c: &CloudEntry, baseline: Option<&MonitorSnapshot>) -> String {
+fn render_storage_row(c: &StorageEntry, baseline: Option<&MonitorSnapshot>) -> String {
     // Pull the per-backend baseline entry; if the backend appeared
     // after the baseline tick, we have no prior reading and the row
     // reports the cumulative-since-boot delta (effectively
     // "everything we've seen").
     let base = baseline
-        .and_then(|s| s.cloud.iter().find(|b| b.backend == c.backend))
+        .and_then(|s| s.storage.iter().find(|b| b.backend == c.backend))
         .cloned()
-        .unwrap_or_else(|| CloudEntry {
+        .unwrap_or_else(|| StorageEntry {
             backend: c.backend.clone(),
             put_ops_total: 0,
             get_ops_total: 0,
@@ -276,7 +276,7 @@ mod tests {
                 sessions_active: 0,
             },
             pool: vec![],
-            cloud: vec![],
+            storage: vec![],
             audit: AuditEntry {
                 entries_total: audit_total,
             },

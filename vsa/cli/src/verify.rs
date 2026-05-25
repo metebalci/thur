@@ -21,14 +21,14 @@ use shared_admin_client::AdminClient;
 use shared_admin_proto::JobEvent;
 
 pub async fn cmd_verify(
-    skip_cloud: bool,
+    skip_storage: bool,
     verbose: bool,
     json: bool,
     volumes: Vec<String>,
 ) -> Result<u8> {
     let client = AdminClient::auto_discover(&shared_naming::DISK);
     let body = serde_json::json!({
-        "skip_cloud": skip_cloud,
+        "skip_storage": skip_storage,
         "volumes": volumes,
     });
 
@@ -88,10 +88,10 @@ fn print_human(r: &VolumeVerifyReport, verbose: bool) {
         if v.local_chunks_missing > 0 {
             println!("      missing from local pool: {}", v.local_chunks_missing);
         }
-        if let Some(missing) = v.cloud_chunks_missing
+        if let Some(missing) = v.storage_chunks_missing
             && missing > 0
         {
-            println!("      missing from cloud: {}", missing);
+            println!("      missing from storage: {}", missing);
         }
         if verbose {
             for e in &v.errors {
@@ -124,9 +124,9 @@ fn print_human(r: &VolumeVerifyReport, verbose: bool) {
             p.shared_orphan_bytes,
             p.namespaces.len(),
         );
-        if let Some(cp) = &p.cloud {
+        if let Some(cp) = &p.storage {
             println!(
-                "      cloud: chunk_objects={} chunk_orphans={}",
+                "      storage: chunk_objects={} chunk_orphans={}",
                 cp.chunk_objects, cp.chunk_orphans
             );
         }
@@ -164,7 +164,7 @@ fn print_human(r: &VolumeVerifyReport, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_block::verify::{CloudReport, NamespaceReport, PoolReport, VolumeReport};
+    use core_block::verify::{NamespaceReport, PoolReport, StorageReport, VolumeReport};
 
     /// A clean, empty report renders the header + result lines without
     /// touching any error/warning branch.
@@ -190,7 +190,7 @@ mod tests {
             pages_idx_ok: false,
             allocated_pages: 12,
             local_chunks_missing: 3,
-            cloud_chunks_missing: Some(2),
+            storage_chunks_missing: Some(2),
             ..Default::default()
         };
         // More than three errors so the "... N more" branch fires.
@@ -212,7 +212,7 @@ mod tests {
             }],
             orphan_namespace_dirs: vec!["stale-ns".into()],
             gc_hints: vec!["run gc to reclaim 4096 bytes".into()],
-            cloud: Some(CloudReport {
+            storage: Some(StorageReport {
                 chunk_objects: 200,
                 chunk_orphans: 5,
             }),

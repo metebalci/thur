@@ -22,7 +22,7 @@ pool under `<data_dir>/chunks/`:
 `<hash>` is the full BLAKE3 hash of the chunk's on-disk bytes; `<aa>`
 and `<bb>` are its first two and next two hex chars (65 536-way
 fanout). `<namespace>` is the cartridge barcode (VTL) or the volume
-UUID hex (VSA). The **cloud key** is
+UUID hex (VSA). The **object key** is
 `chunks/[<namespace>/]<aa>/<bb>/<hash>.dat` — the per-backend bucket
 and optional prefix already isolate keys across backends, so the cloud
 key carries no `<backend>` segment. Pool layout, the `local` /
@@ -46,7 +46,7 @@ retention-locked backend untouched and lets out-of-band identity edits
 A cartridge is a directory under `<data_dir>/tapes/<barcode>/`:
 
 - **`manifest.json`** — creation-frozen identity: chunking mode, UUID,
-  capacity, sticky `backend` (the bound `cloud.backends` entry),
+  capacity, sticky `backend` (the bound `storage.backends` entry),
   sticky `worm: bool`, sticky `dedup` scope. Written once at
   `cartridge create`; the hot path never rewrites it. Only
   `cartridge migrate` (rewrites `backend`) and archive provenance
@@ -70,7 +70,7 @@ A cartridge is a directory under `<data_dir>/tapes/<barcode>/`:
 - **`lru.idx`** — local-only LRU sidecar.
 - **`blocks-p<N>.idx`** — per-partition fixed-record block index.
 - **`<file>.dirty`** sidecars — 1 MiB-page bitmap + monotonic epoch
-  driving delta cloud uploads (`dirty_pages.rs`). One per `chunks.idx`
+  driving delta backend uploads (`dirty_pages.rs`). One per `chunks.idx`
   and per `blocks-p<N>.idx`.
 - **`.staging/`** — the active unsealed chunk only.
 
@@ -109,7 +109,7 @@ stored explicitly). Magic `NVCI`. Carries:
   chunk can never exceed 4 GiB.
 - raw 32-byte BLAKE3 `hash`.
 - flags byte packing `hash_present` / `uploaded` / `location`
-  (LocalOnly|CloudOnly|Both) / cloud-side `compression`.
+  (LocalOnly|CloudOnly|Both) / storage-side `compression`.
 
 `hash` is `Some(hex)` once sealed into the pool, `None` while in
 `.staging/`. Every per-chunk mutation (mark uploaded, transition
@@ -127,7 +127,7 @@ One fixed 8-byte record per chunk_id (u64 LE epoch seconds),
 positional and mirrored 1:1 with `chunks.idx`. Magic `TVLI`. Holds
 last-accessed timestamps for disk-cache LRU eviction — split out of
 `chunks.idx` so the read path's `touch` doesn't dirty
-cloud-replicated metadata pages.
+storage-replicated metadata pages.
 
 **Local-only**: never has a `.dirty` sidecar, never enumerated by
 `index_backup`, never restored on cold-bucket DR. A fresh host
@@ -163,9 +163,9 @@ how big to grow each file.
 Without this layer a cold-bucket restore can fetch chunks but can't
 map LBA → chunk_id → hash. With it,
 `Cartridge::open_with_cloud_async` in Open mode allows the cartridge
-directory to be entirely missing locally as long as a cloud backend is
+directory to be entirely missing locally as long as a storage backend is
 configured, and rebuilds `chunks.idx` + `blocks-p<N>.idx` from the
-cloud copy before opening them.
+backend copy before opening them.
 
 ## LTFS partitioning
 
@@ -190,14 +190,14 @@ failure mode — none redundant with another.
 | LBP CRC32C  | per host LBA, wire  | every READ if `LBP_R=1`             | host ↔ target in-flight corruption               | computed fresh, not stored     |
 | AES-GCM tag | per block, at-rest  | every block read if encrypted       | at-rest tampering of ciphertext                  | inline in chunk file           |
 | Codec CRC   | per chunk, at-rest  | every block read if compressed      | lz4 / zstd structural corruption                 | inline in codec frame          |
-| BLAKE3      | per chunk, at-rest  | **at cloud-download time only**     | cloud bit-rot / wrong-bytes-for-hash             | filename is the hash (implicit) |
+| BLAKE3      | per chunk, at-rest  | **at backend-download time only**     | backend bit-rot / wrong-bytes-for-hash             | filename is the hash (implicit) |
 
 LBP is wire-only (host ↔ target), fresh-computed per READ, gone after
 the response. BLAKE3 runs once per cloud download via
 `ChunkPool::insert_verified_bytes`; the pool refuses bytes that don't
 match the expected content address — so plaintext-uncompressed
 cartridges (which otherwise lack any at-rest integrity check) and the
-VSA block product both get the same cloud-corruption guard.
+VSA block product both get the same backend-corruption guard.
 
 GCM and codec checks fire on every block read regardless of the cloud
 path. A chunk corrupted by anything other than this daemon (manual
@@ -282,9 +282,9 @@ and the SYNCHRONIZE CACHE durability fence are in
 ## Integrity
 
 The BLAKE3 content-address check applies to VSA exactly as to VTL: a
-cloud-fetched chunk is admitted to the pool only through
+backend-fetched chunk is admitted to the pool only through
 `ChunkPool::insert_verified_bytes`, which recomputes the hash and
-refuses non-matching bytes — the cloud bit-rot / wrong-bytes guard. On
+refuses non-matching bytes — the backend bit-rot / wrong-bytes guard. On
 an encrypted volume the per-page AES-256-GCM tag additionally catches
 at-rest tampering of the ciphertext on every page read. A verification
 failure surfaces to the host as a per-page MEDIUM ERROR — the same way

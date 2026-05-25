@@ -34,13 +34,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use core_mediachanger::{AuditChannel, AuditRateLimiter, CloudConfig, Library, TapeEvent};
+use core_mediachanger::{AuditChannel, AuditRateLimiter, Library, ObjectStoreConfig, TapeEvent};
 use shared_iscsi::{ScsiHandler, ScsiRequest, ScsiResponse, ScsiStatus};
 use tokio::sync::broadcast;
 
 use super::drive_manager::DriveManager;
 use super::protocol::{self, Pdu, ScsiResp};
-use super::server::CloudBackendRegistry;
+use super::server::ObjectStoreRegistry;
 use super::unit_attention::UnitAttentionTracker;
 use crate::diagnostics::DiagnosticStore;
 use scsi_smc::changer::{ElementAddressConfig, ElementType};
@@ -58,8 +58,8 @@ pub struct IscsiLibraryHandler {
     pub(crate) data_dir: PathBuf,
     pub(crate) audit_log: Option<AuditChannel>,
     pub(crate) audit_ratelimiter: Arc<AuditRateLimiter>,
-    pub(crate) cloud_backends: CloudBackendRegistry,
-    pub(crate) cloud_config: Arc<CloudConfig>,
+    pub(crate) cloud_backends: ObjectStoreRegistry,
+    pub(crate) storage_config: Arc<ObjectStoreConfig>,
     pub(crate) diagnostic_store: Arc<DiagnosticStore>,
     /// iSCSI target IQN advertised in Login / SendTargets. Resolved
     /// at boot from `iscsi.target_iqn`.
@@ -126,7 +126,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 drive_id,
                 tsih,
                 &self.cloud_backends,
-                &self.cloud_config,
+                &self.storage_config,
             )
             .await
             {
@@ -147,7 +147,7 @@ impl ScsiHandler for IscsiLibraryHandler {
             crate::diagnostics::run_and_record(
                 pdu_lun,
                 &self.drive_manager,
-                &self.cloud_config,
+                &self.storage_config,
                 &self.data_dir,
                 &self.diagnostic_store,
             )
@@ -243,7 +243,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         {
             let held = protocol::read_legal_hold_at_load(
                 &self.cloud_backends,
-                &self.cloud_config,
+                &self.storage_config,
                 &backend_name,
                 &barcode,
             )

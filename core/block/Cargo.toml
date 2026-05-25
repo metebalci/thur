@@ -19,12 +19,12 @@ thiserror = "1"
 # but depending directly avoids pulling rand into core-block.
 getrandom = "0.3"
 
-# Step 3b: chunk-pool sealing + cloud upload pipeline. blake3 hashes
+# Step 3b: chunk-pool sealing + storage upload pipeline. blake3 hashes
 # every page on the write path; tracing surfaces dedup-hit / upload
-# decisions at debug level. shared-cloud carries the CloudBackend
-# trait + S3/GCS/Azure/Local impls — path-dep is fine, the surface
-# is already extracted and stable.
-shared-cloud = { path = "../../shared/cloud" }
+# decisions at debug level. shared-object-store carries the
+# ObjectStoreBackend trait + S3/GCS/Azure/Local impls — path-dep is
+# fine, the surface is already extracted and stable.
+shared-object-store = { path = "../../shared/object-store" }
 shared-pool = { path = "../../shared/pool" }
 # Local pool + cloud HEAD verification sweeps, shared with the tape
 # product; `verify.rs` adds the block page-table integrity check.

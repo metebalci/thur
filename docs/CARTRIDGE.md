@@ -34,7 +34,7 @@ would overflow its width, or there aren't enough free slots.
 
 ### `--backend NAME`
 
-Binds the cartridge to a named entry in `cloud.backends`. Required
+Binds the cartridge to a named entry in `storage.backends`. Required
 when ≥2 backends are configured; optional (and inferred) with exactly
 one. The chosen name is sticky for life — every chunk upload, manifest
 backup, prefetch, and refetch routes through this backend.
@@ -57,7 +57,7 @@ OVERWRITE are refused outright. Sticky for life.
 
 The chosen backend must have `retention_mode: governance` (mutable) or
 `retention_mode: compliance` (irrevocable) — the bucket-level Object
-Lock / retention policy enforces WORM cloud-side.
+Lock / retention policy enforces WORM storage-side.
 
 Enforcement layers:
 
@@ -129,7 +129,7 @@ boot-time check uses (`s3:GetBucketObjectLockConfiguration`, or
 — see § Legal hold → Permissions.
 
 If the environment can't grant the management-plane read, set
-`cloud.skip_retention_mode_check: true` to skip the boot-time
+`storage.skip_retention_mode_check: true` to skip the boot-time
 lock-state probe. `retention_mode` still parses and `--worm` still
 refuses `retention_mode: none` backends, but you lose the safety net
 that catches "declared WORM, never actually locked the bucket" — so
@@ -145,7 +145,7 @@ wrapper over the cloud provider's per-object hold primitive:
 - Azure `Set Blob Legal Hold` (raw REST — `azure_storage_blobs`
   doesn't expose it)
 
-The cloud bucket is the source of truth for which keys are held; the
+The storage backend is the source of truth for which keys are held; the
 daemon keeps no on-disk "is held" flag in the manifest. `set` walks
 every chunk + manifest backup + index page the cartridge references on
 its bound backend and applies the primitive.
@@ -170,7 +170,7 @@ Implementation: `core/stream/src/legal_hold.rs` (orchestration —
 `apply_cartridge_legal_hold`, `read_cartridge_held`,
 `manifest_latest_sentinel_key`) + `find_drive_for_loaded_cartridge` in
 `core/mediachanger/src/legal_hold.rs` + per-backend
-`set_object_legal_hold` / `get_object_legal_hold` on `CloudBackend`.
+`set_object_legal_hold` / `get_object_legal_hold` on `ObjectStoreBackend`.
 
 ### Host-visible write-protect
 
@@ -198,7 +198,7 @@ cartridge is currently in any drive. The CLI reads
 from drive N first" message; the audit log records the refusal.
 
 WORM semantics are unchanged: hold on a WORM cartridge is allowed
-(cloud-side preservation past Object Lock retention is a real use
+(storage-side preservation past Object Lock retention is a real use
 case), but the WORM SCSI gate fires first so the volatile legal-hold
 flag never reaches the write path on WORM.
 

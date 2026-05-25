@@ -222,9 +222,9 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
     info!("=== S3 SMOKE TEST START ===");
 
     // Create cloud backend
-    let cloud_backend: Box<dyn core_mediachanger::CloudBackend> = cfg
-        .cloud
-        .create_backend_named(&cfg.cloud.backend_names()[0])
+    let cloud_backend: Box<dyn core_mediachanger::ObjectStoreBackend> = cfg
+        .storage
+        .create_backend_named(&cfg.storage.backend_names()[0])
         .await?;
 
     let cart_root = PathBuf::from(&cfg.data_dir).join("tapes");
@@ -427,8 +427,8 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
 
     // Create S3 backend
     let cloud_backend = Arc::new(
-        cfg.cloud
-            .create_backend_named(&cfg.cloud.backend_names()[0])
+        cfg.storage
+            .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
     );
 
@@ -572,11 +572,11 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
 
     // Create S3 backend
     let cloud_backend = cfg
-        .cloud
-        .create_backend_named(&cfg.cloud.backend_names()[0])
+        .storage
+        .create_backend_named(&cfg.storage.backend_names()[0])
         .await?;
 
-    let upload_cfg = &cfg.cloud.upload;
+    let upload_cfg = &cfg.storage.upload;
     let max_concurrent = upload_cfg.max_concurrent;
 
     let cart_root = PathBuf::from(&cfg.data_dir).join("tapes");
@@ -737,8 +737,8 @@ pub(crate) async fn run_upload_worker_smoke_test(cfg: &Config) -> Result<()> {
 
     info!("=== UPLOAD WORKER SMOKE TEST START ===");
 
-    let backend_name = cfg.cloud.backend_names()[0].clone();
-    let cloud_backend = cfg.cloud.create_backend_named(&backend_name).await?;
+    let backend_name = cfg.storage.backend_names()[0].clone();
+    let cloud_backend = cfg.storage.create_backend_named(&backend_name).await?;
 
     let cart_root = PathBuf::from(&cfg.data_dir).join("tapes");
     tokio::fs::create_dir_all(&cart_root).await?;
@@ -853,8 +853,8 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
     info!("=== PERFORMANCE BENCHMARKS START ===");
 
     let cloud_backend = Arc::new(
-        cfg.cloud
-            .create_backend_named(&cfg.cloud.backend_names()[0])
+        cfg.storage
+            .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
     );
 
@@ -1022,8 +1022,8 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
     info!("=== FAILURE SCENARIO TESTS START ===");
 
     let cloud_backend = Arc::new(
-        cfg.cloud
-            .create_backend_named(&cfg.cloud.backend_names()[0])
+        cfg.storage
+            .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
     );
 
@@ -1111,8 +1111,8 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
     info!("--- Test 2: Compression Roundtrip ---");
 
     let compression_enabled = !matches!(
-        cfg.cloud.compression.algorithm,
-        core_mediachanger::cloud_config::CompressionAlgoYaml::None
+        cfg.storage.compression.algorithm,
+        core_mediachanger::object_store_config::CompressionAlgoYaml::None
     );
     if compression_enabled {
         let tape_label = "COMPRESSTEST001";

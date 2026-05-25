@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use shared_cloud::CloudConfig;
+use shared_object_store::ObjectStoreConfig;
 use shared_verify_core::{CloudEntity, LiveChunkSet, VerifyTarget};
 
 use crate::chunk_pool::ChunkPool;
@@ -91,7 +91,7 @@ pub struct VolumeReport {
     pub local_chunks_missing: u64,
     /// Chunks absent from the cloud bucket on HEAD. `None` when the
     /// cloud sweep was skipped.
-    pub cloud_chunks_missing: Option<u64>,
+    pub storage_chunks_missing: Option<u64>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -106,7 +106,7 @@ pub struct PoolReport {
     pub orphan_namespace_dirs: Vec<String>,
     pub gc_hints: Vec<String>,
     /// Cloud-side counters. `None` when the cloud sweep was skipped.
-    pub cloud: Option<CloudReport>,
+    pub storage: Option<StorageReport>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -120,7 +120,7 @@ pub struct NamespaceReport {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct CloudReport {
+pub struct StorageReport {
     /// Total chunk objects under `chunks/`.
     pub chunk_objects: u64,
     /// Chunk objects no live volume references.
@@ -184,7 +184,7 @@ pub fn verify_local(
 pub async fn verify_with_cloud(
     data_dir: &Path,
     scope: &VerifyScope,
-    cloud_cfg: &CloudConfig,
+    cloud_cfg: &ObjectStoreConfig,
 ) -> Result<VolumeVerifyReport, VolumeError> {
     let (mut report, target) = verify_inner(data_dir, scope)?;
     cloud_sweep(&mut report, &target, cloud_cfg).await;
@@ -360,7 +360,7 @@ fn pool_report_from_sweep(sweep: shared_verify_core::PoolSweep) -> PoolReport {
 async fn cloud_sweep(
     report: &mut VolumeVerifyReport,
     target: &BlockVerifyTarget,
-    cloud_cfg: &CloudConfig,
+    cloud_cfg: &ObjectStoreConfig,
 ) {
     let backends: HashSet<String> = target.entities.iter().map(|e| e.backend.clone()).collect();
 
@@ -388,7 +388,7 @@ async fn cloud_sweep(
             Err(e) => {
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
                     pr.errors.push(format!(
-                        "cloud backend '{}' open failed: {}",
+                        "storage backend '{}' open failed: {}",
                         backend_name, e
                     ));
                 }
@@ -396,7 +396,7 @@ async fn cloud_sweep(
             }
         };
 
-        let sweep = shared_verify_core::sweep_cloud(target, &backend_name, &*backend).await;
+        let sweep = shared_verify_core::sweep_storage(target, &backend_name, &*backend).await;
         if let Some(e) = &sweep.list_error
             && let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name)
         {
@@ -405,7 +405,7 @@ async fn cloud_sweep(
 
         for ent in &sweep.per_entity {
             if let Some(vr) = report.volumes.iter_mut().find(|v| v.volume == ent.label) {
-                vr.cloud_chunks_missing = Some(ent.chunks_missing);
+                vr.storage_chunks_missing = Some(ent.chunks_missing);
                 for hf in &ent.head_errors {
                     vr.warnings.push(format!(
                         "cloud HEAD failed for chunk {}: {}",
@@ -423,17 +423,17 @@ async fn cloud_sweep(
         }
 
         if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
-            let cloud = CloudReport {
+            let storage_rep = StorageReport {
                 chunk_objects: sweep.chunk_objects,
                 chunk_orphans: sweep.chunk_orphans,
             };
-            if cloud.chunk_orphans > 0 {
+            if storage_rep.chunk_orphans > 0 {
                 pr.gc_hints.push(format!(
-                    "cloud has {} orphan chunk object(s) — `system gc --cloud` would free them",
-                    cloud.chunk_orphans
+                    "storage backend has {} orphan chunk object(s) — `system gc --storage` would free them",
+                    storage_rep.chunk_orphans
                 ));
             }
-            pr.cloud = Some(cloud);
+            pr.storage = Some(storage_rep);
         }
     }
 }

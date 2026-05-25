@@ -14,7 +14,9 @@ mod common;
 use bytes::Bytes;
 use common::create_test_dir;
 use core_mediachanger::library::restore::run_restore;
-use core_mediachanger::{Cartridge, CartridgeOpenMode, CloudBackend, DedupScope, LocalBackend};
+use core_mediachanger::{
+    Cartridge, CartridgeOpenMode, DedupScope, LocalBackend, ObjectStoreBackend,
+};
 use std::fs;
 
 /// Create a cartridge bound to the test LocalBackend, write `n_blocks`
@@ -22,7 +24,7 @@ use std::fs;
 /// the cartridge. Returns the data so callers can verify reads later.
 async fn seed_cartridge(
     tapes: &std::path::Path,
-    backend: Box<dyn CloudBackend>,
+    backend: Box<dyn ObjectStoreBackend>,
     label: &str,
     n_blocks: usize,
 ) -> Vec<Vec<u8>> {
@@ -69,7 +71,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     fs::create_dir_all(&source_tapes).unwrap();
     let mut originals = Vec::new();
     for label in &["TAPE_A", "TAPE_B", "TAPE_C"] {
-        let backend: Box<dyn CloudBackend> =
+        let backend: Box<dyn ObjectStoreBackend> =
             Box::new(LocalBackend::new(&backend_dir).await.unwrap());
         let bytes = seed_cartridge(&source_tapes, backend, label, 4).await;
         originals.push((label.to_string(), bytes));
@@ -84,7 +86,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     // cartridges and the restore should reconstruct each one.
     let target_tapes = work.path().join("target_tapes");
     fs::create_dir_all(&target_tapes).unwrap();
-    let restore_backend: Box<dyn CloudBackend> =
+    let restore_backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&backend_dir).await.unwrap());
 
     let report = run_restore(
@@ -133,7 +135,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     // restored metadata + the chunk-pool refs in cloud are sufficient
     // for the cartridge to serve reads.
     for (label, original) in &originals {
-        let backend: Box<dyn CloudBackend> =
+        let backend: Box<dyn ObjectStoreBackend> =
             Box::new(LocalBackend::new(&backend_dir).await.unwrap());
         let mut cart = Cartridge::open_with_cloud_async(
             &target_tapes,
@@ -172,7 +174,7 @@ async fn run_restore_filter_only_attempts_selected() {
     let source_tapes = work.path().join("source_tapes");
     fs::create_dir_all(&source_tapes).unwrap();
     for label in &["TAPE_KEEP", "TAPE_DROP"] {
-        let backend: Box<dyn CloudBackend> =
+        let backend: Box<dyn ObjectStoreBackend> =
             Box::new(LocalBackend::new(&backend_dir).await.unwrap());
         seed_cartridge(&source_tapes, backend, label, 2).await;
     }
@@ -180,7 +182,7 @@ async fn run_restore_filter_only_attempts_selected() {
 
     let target_tapes = work.path().join("target_tapes");
     fs::create_dir_all(&target_tapes).unwrap();
-    let restore_backend: Box<dyn CloudBackend> =
+    let restore_backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&backend_dir).await.unwrap());
 
     let report = run_restore(
