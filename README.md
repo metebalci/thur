@@ -262,11 +262,14 @@ sudo systemctl status thurvtld
 sudo journalctl -u thurvtld -f
 ```
 
-Each daemon runs an iSCSI target (port 3260) and an HTTP metrics
-server (port 9090) in a single process. For co-resident installs,
-override one of each port in YAML. Persist systemd customizations
-through `sudo systemctl edit <unit>` so package upgrades don't
-clobber them.
+Each daemon runs a storage target and an HTTP metrics server
+(port 9090) in a single process. Thur VTL serves iSCSI on port 3260;
+Thur VSA serves iSCSI on port 3260 by default, or NVMe/TCP on port
+4420 if `transport: nvmetcp` is set in `thurvsa.yaml` (one listener
+binds, not both). For co-resident installs, override the shared ports
+in YAML so the two daemons don't clash. Persist systemd
+customizations through `sudo systemctl edit <unit>` so package
+upgrades don't clobber them.
 
 # Using Thur VTL
 
@@ -369,6 +372,15 @@ sudo parted -s /dev/sdb mklabel gpt mkpart primary ext4 0% 100%
 sudo mkfs.ext4 /dev/sdb1
 sudo mkdir -p /mnt/myvol
 sudo mount /dev/sdb1 /mnt/myvol
+```
+
+If you destroy and recreate a volume, the kernel keeps the old
+partition table cached and the new contents won't show up in
+`lsblk` / `/proc/partitions`. Force a re-read on the affected block
+device:
+
+```bash
+sudo blockdev --rereadpt /dev/sdb        # or /dev/nvme0n1
 ```
 
 # Documentation
