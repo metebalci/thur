@@ -125,19 +125,22 @@ pub struct MemoryBufferManager {
 }
 
 impl MemoryBufferManager {
-    /// Create a new MemoryBufferManager
+    /// Create a new MemoryBufferManager. `write_buffer_limit` and
+    /// `read_buffer_limit` are per-tape byte counts already resolved
+    /// out of `memory_buffers_size::MemoryBuffersSize::resolve_bytes`
+    /// by the caller — auto vs explicit decisions and the host-RAM
+    /// safety check both live in `main.rs` so this constructor stays
+    /// a pure byte sink.
     pub fn new(
         event_rx: broadcast::Receiver<TapeEvent>,
-        write_buffer_gb: u64,
-        read_buffer_gb: u64,
+        write_buffer_limit: u64,
+        read_buffer_limit: u64,
         upload_tx: mpsc::Sender<UploadRequest>,
         prefetch_tx: mpsc::Sender<PrefetchRequest>,
     ) -> Self {
-        let write_buffer_limit = write_buffer_gb * 1024 * 1024 * 1024;
-        let read_buffer_limit = read_buffer_gb * 1024 * 1024 * 1024;
         info!(
-            "MemoryBufferManager created (write_buffer={} GB, read_buffer={} GB per tape)",
-            write_buffer_gb, read_buffer_gb
+            "MemoryBufferManager created (write_buffer={} bytes, read_buffer={} bytes per tape)",
+            write_buffer_limit, read_buffer_limit
         );
         Self {
             event_rx,
@@ -581,7 +584,11 @@ mod tests {
         let (_event_tx, event_rx) = broadcast::channel(16);
         let (upload_tx, upload_rx) = mpsc::channel(8);
         let (prefetch_tx, prefetch_rx) = mpsc::channel(8);
-        let mgr = MemoryBufferManager::new(event_rx, 1, 1, upload_tx, prefetch_tx);
+        // 1 GiB each — large enough that the test writes (≤ ~10 KiB)
+        // never hit the buffer-full watermark, matching the pre-2026-05
+        // GB-based ctor that passed (1, 1) GB.
+        let one_gib = 1024 * 1024 * 1024;
+        let mgr = MemoryBufferManager::new(event_rx, one_gib, one_gib, upload_tx, prefetch_tx);
         (mgr, upload_rx, prefetch_rx)
     }
 

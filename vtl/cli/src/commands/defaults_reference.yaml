@@ -38,17 +38,50 @@
 
 # Per-tape RAM-staged memory buffers. Distinct from `disk_cache`
 # below — these are scratch the daemon keeps alive between iSCSI ops,
-# not the on-disk chunk pool.
+# not the on-disk chunk pool. Under `auto` (the default) the daemon
+# reads /proc/meminfo MemTotal once at boot, budgets
+# `auto_host_fraction_pct` of host RAM across `library.num_drives`,
+# splits 2:1 between write and read, and clamps each field to
+# `[auto_min_gb_per_tape, auto_max_gb_per_tape]`. The resolved total
+# footprint ((write + read) * num_drives) is then safety-checked
+# against `safety_max_host_fraction_pct` of MemTotal and the daemon
+# refuses to start if exceeded. Resolution is one-shot at boot;
+# changing host RAM, drive count, or these knobs needs a restart.
 memory_buffers:
-  # Per-tape write-buffer size in GB (RAM stage for tape writes
-  # before cloud upload).
-  write_gb_per_tape: 10
-  # Per-tape read-buffer size in GB (RAM stage for prefetched
-  # chunks from cloud).
-  read_gb_per_tape: 5
+  # Per-tape write-buffer size (RAM stage for tape writes before
+  # backend upload). Two shapes:
+  #   - integer (GB) pins the per-tape buffer (operator chose; auto
+  #     bounds ignored).
+  #   - `auto` (default) — sizes against MemTotal at boot, takes 2/3
+  #     of the per-tape auto budget, clamped by
+  #     `auto_min_gb_per_tape` / `auto_max_gb_per_tape`.
+  write_gb_per_tape: auto
+  # Per-tape read-buffer size (RAM stage for prefetched chunks).
+  # Same shape as `write_gb_per_tape`. Under `auto`, takes 1/3 of
+  # the per-tape auto budget (preserving the historical 2:1
+  # write:read ratio).
+  read_gb_per_tape: auto
   # Chunks to prefetch ahead during sequential reads (0 disables;
   # 1-3 typical).
   read_prefetch_chunks_ahead: 2
+  # Fraction (percent) of MemTotal that the auto-resolver budgets
+  # for ALL memory_buffers. Honored only when at least one field is
+  # `auto`. Range 1-100.
+  auto_host_fraction_pct: 50
+  # Fraction (percent) of MemTotal that the resolved total
+  # memory_buffers footprint ((write + read) * num_drives) is not
+  # allowed to exceed. Applies to both auto and explicit resolutions
+  # — catches operator overrides that overcommit. Daemon refuses to
+  # start if exceeded. Range 1-100.
+  safety_max_host_fraction_pct: 75
+  # Floor (GB) for the per-tape auto-resolved value. Honored only
+  # when the field is `auto`; explicit values ignore it.
+  auto_min_gb_per_tape: 1
+  # Ceiling (GB) for the per-tape auto-resolved value. Honored only
+  # when the field is `auto`. Caps the auto budget on hosts with
+  # hundreds of GB of RAM and few drives, where more per-tape RAM
+  # rarely improves throughput.
+  auto_max_gb_per_tape: 32
 
 # Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
 # applied per cloud backend. Independent of per-tape memory_buffers

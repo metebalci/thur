@@ -88,11 +88,28 @@ The memory-buffer pool is per-tape RAM that the daemon keeps alive
 between iSCSI operations, used for write staging and read prefetch. It
 is entirely separate from the on-disk `disk_cache`.
 
+`write_gb_per_tape` and `read_gb_per_tape` each accept either an
+integer GB count or the literal `"auto"`. Under `auto` (the default),
+the daemon reads `/proc/meminfo MemTotal` once at boot, budgets
+`auto_host_fraction_pct%` of host RAM across `library.num_drives`,
+splits the per-drive share 2:1 between write and read (preserving the
+historical 10 GB / 5 GB ratio), and clamps each field to
+`[auto_min_gb_per_tape, auto_max_gb_per_tape]`. The resolved total
+footprint, `(write + read) × num_drives`, is then checked against
+`safety_max_host_fraction_pct%` of `MemTotal`; the daemon refuses to
+start if exceeded — that's how an explicit operator override that
+overcommits a small host is caught. Resolution is one-shot at boot;
+changing host RAM, drive count, or these knobs needs a restart.
+
 | Key | Default | Description |
 |---|---|---|
-| `memory_buffers.write_gb_per_tape` | `10` | Per-tape write-buffer size (GB) staged before backend upload. |
-| `memory_buffers.read_gb_per_tape` | `5` | Per-tape read-buffer size (GB) for prefetched chunks. |
+| `memory_buffers.write_gb_per_tape` | `auto` | Per-tape write-buffer size. Integer GB pins the value; `auto` resolves against `MemTotal` and takes 2/3 of the per-drive auto budget. |
+| `memory_buffers.read_gb_per_tape` | `auto` | Per-tape read-buffer size. Same shape; under `auto`, takes 1/3 of the per-drive auto budget. |
 | `memory_buffers.read_prefetch_chunks_ahead` | `2` | Chunks prefetched ahead during sequential reads (0 disables; 1–3 typical). |
+| `memory_buffers.auto_host_fraction_pct` | `50` | Fraction of `MemTotal` budgeted across all memory_buffers under `auto`. Range 1–100. |
+| `memory_buffers.safety_max_host_fraction_pct` | `75` | Fraction of `MemTotal` the resolved total footprint must not exceed. Applies to both auto and explicit values; daemon refuses to start if exceeded. Range 1–100. |
+| `memory_buffers.auto_min_gb_per_tape` | `1` | Floor (GB) for the per-tape auto-resolved value. Ignored for explicit GB. |
+| `memory_buffers.auto_max_gb_per_tape` | `32` | Ceiling (GB) for the per-tape auto-resolved value. Ignored for explicit GB. |
 
 ### `disk_cache`
 

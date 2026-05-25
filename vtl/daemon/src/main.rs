@@ -8,6 +8,7 @@ mod diagnostics;
 mod http;
 mod iscsi;
 mod memory_buffer_manager;
+mod memory_buffers_size;
 mod smoke;
 mod state;
 mod upload_recovery;
@@ -327,38 +328,78 @@ impl OtlpFileConfig {
 /// shared on-disk chunk pool). Tune these up if a single tape's
 /// working set is large (sequential streams with deep prefetch) and
 /// you have RAM to spare.
+///
+/// `write_gb_per_tape` / `read_gb_per_tape` each accept either an
+/// integer GB count or the literal `"auto"`. Under `auto` the
+/// daemon reads `/proc/meminfo MemTotal` once at boot, divides
+/// `auto_host_fraction_pct` of host RAM across `library.num_drives`,
+/// splits 2:1 between write and read, and clamps each field to
+/// `[auto_min_gb_per_tape, auto_max_gb_per_tape]`. Total resolved
+/// footprint (`(write + read) × num_drives`) is then safety-checked
+/// against `safety_max_host_fraction_pct` of MemTotal and the
+/// daemon refuses to start if exceeded.
 #[derive(Debug, Deserialize, Clone)]
 struct MemoryBuffersConfig {
-    /// Write-staging buffer size per tape, in GB. Holds bytes
-    /// between iSCSI WRITE and chunk seal.
-    #[serde(default = "default_write_gb_per_tape")]
-    write_gb_per_tape: u64,
-    /// Read-prefetch buffer size per tape, in GB. Caches chunks
-    /// fetched ahead of the current read position.
-    #[serde(default = "default_read_gb_per_tape")]
-    read_gb_per_tape: u64,
+    /// Write-staging buffer size per tape. Integer GB or `"auto"`.
+    #[serde(default)]
+    write_gb_per_tape: memory_buffers_size::MemoryBuffersSize,
+    /// Read-prefetch buffer size per tape. Integer GB or `"auto"`.
+    #[serde(default)]
+    read_gb_per_tape: memory_buffers_size::MemoryBuffersSize,
     /// How many chunks ahead of the current read LBA the prefetcher
     /// pulls. 0 disables prefetch; 1-3 typical.
     #[serde(default = "default_read_prefetch_chunks_ahead")]
     read_prefetch_chunks_ahead: u32,
+    /// Fraction (percent) of `/proc/meminfo MemTotal` that the
+    /// auto-resolver budgets for **all** memory_buffers. Honored
+    /// only when at least one field is `auto`; explicit GB values
+    /// don't consult this knob. Range 1-100.
+    #[serde(default = "default_auto_host_fraction_pct")]
+    auto_host_fraction_pct: u64,
+    /// Fraction (percent) of `MemTotal` that the resolved total
+    /// memory_buffers footprint (`(write + read) × num_drives`) is
+    /// not allowed to exceed. Applies to both auto- and explicit-
+    /// resolved fields — catches operator overrides that overcommit.
+    /// The daemon refuses to start if exceeded. Range 1-100.
+    #[serde(default = "default_safety_max_host_fraction_pct")]
+    safety_max_host_fraction_pct: u64,
+    /// Floor (GB) for the per-tape auto-resolved value. Honored
+    /// only when the field is `auto`; explicit values ignore it.
+    #[serde(default = "default_auto_min_gb_per_tape")]
+    auto_min_gb_per_tape: u64,
+    /// Ceiling (GB) for the per-tape auto-resolved value. Honored
+    /// only when the field is `auto`. Caps the auto budget on
+    /// hosts with hundreds of GB of RAM and few drives.
+    #[serde(default = "default_auto_max_gb_per_tape")]
+    auto_max_gb_per_tape: u64,
 }
 
-fn default_write_gb_per_tape() -> u64 {
-    10
-}
-fn default_read_gb_per_tape() -> u64 {
-    5
-}
 fn default_read_prefetch_chunks_ahead() -> u32 {
     2
+}
+fn default_auto_host_fraction_pct() -> u64 {
+    50
+}
+fn default_safety_max_host_fraction_pct() -> u64 {
+    75
+}
+fn default_auto_min_gb_per_tape() -> u64 {
+    1
+}
+fn default_auto_max_gb_per_tape() -> u64 {
+    32
 }
 
 impl Default for MemoryBuffersConfig {
     fn default() -> Self {
         Self {
-            write_gb_per_tape: default_write_gb_per_tape(),
-            read_gb_per_tape: default_read_gb_per_tape(),
+            write_gb_per_tape: memory_buffers_size::MemoryBuffersSize::default(),
+            read_gb_per_tape: memory_buffers_size::MemoryBuffersSize::default(),
             read_prefetch_chunks_ahead: default_read_prefetch_chunks_ahead(),
+            auto_host_fraction_pct: default_auto_host_fraction_pct(),
+            safety_max_host_fraction_pct: default_safety_max_host_fraction_pct(),
+            auto_min_gb_per_tape: default_auto_min_gb_per_tape(),
+            auto_max_gb_per_tape: default_auto_max_gb_per_tape(),
         }
     }
 }
@@ -670,10 +711,17 @@ async fn main() -> Result<()> {
 
     info!("thurvtl starting...");
     info!("data_dir: {}", cfg.data_dir);
+    let fmt_mem = |v: memory_buffers_size::MemoryBuffersSize| match v {
+        memory_buffers_size::MemoryBuffersSize::Auto => format!(
+            "auto (min {} GiB, max {} GiB per tape)",
+            cfg.memory_buffers.auto_min_gb_per_tape, cfg.memory_buffers.auto_max_gb_per_tape,
+        ),
+        memory_buffers_size::MemoryBuffersSize::Explicit(n) => format!("{n} GiB"),
+    };
     info!(
-        "write memory buffer per tape: {} GiB, read memory buffer per tape: {} GiB, per-backend disk cache default: {}",
-        cfg.memory_buffers.write_gb_per_tape,
-        cfg.memory_buffers.read_gb_per_tape,
+        "write memory buffer per tape: {}, read memory buffer per tape: {}, per-backend disk cache default: {}",
+        fmt_mem(cfg.memory_buffers.write_gb_per_tape),
+        fmt_mem(cfg.memory_buffers.read_gb_per_tape),
         match cfg.disk_cache.size_gb {
             core_mediachanger::DiskCacheSize::Auto => format!(
                 "auto (min {} GiB, max {} GiB)",
@@ -1296,17 +1344,92 @@ async fn main() -> Result<()> {
         }))
     };
 
+    // 🔸 Resolve per-tape memory buffers against host RAM + drive
+    // count. Each field is either an explicit GB integer or `auto`;
+    // auto sizes against `/proc/meminfo MemTotal` once at boot,
+    // splitting `auto_host_fraction_pct` of host RAM across drives
+    // and then 2:1 between write and read. Resolution is one-shot
+    // (no mid-run resize), matching how `upload.max_concurrent`
+    // resolves at start; full design is in issue #27.
+    let host_mem_bytes = memory_buffers_size::read_host_mem_bytes();
+    let bounds = memory_buffers_size::MemoryBuffersBounds {
+        min_gb: cfg.memory_buffers.auto_min_gb_per_tape,
+        max_gb: cfg.memory_buffers.auto_max_gb_per_tape,
+    };
+    let num_drives_u32 = library.drives().len() as u32;
+    let write_buffer_limit = cfg.memory_buffers.write_gb_per_tape.resolve_bytes(
+        host_mem_bytes,
+        num_drives_u32,
+        cfg.memory_buffers.auto_host_fraction_pct,
+        memory_buffers_size::AUTO_WRITE_SHARE_NUM,
+        memory_buffers_size::AUTO_WRITE_SHARE_DEN,
+        bounds,
+    );
+    let read_buffer_limit = cfg.memory_buffers.read_gb_per_tape.resolve_bytes(
+        host_mem_bytes,
+        num_drives_u32,
+        cfg.memory_buffers.auto_host_fraction_pct,
+        memory_buffers_size::AUTO_READ_SHARE_NUM,
+        memory_buffers_size::AUTO_READ_SHARE_DEN,
+        bounds,
+    );
+    let bytes_per_gib = 1024u64 * 1024 * 1024;
+    let write_source = if cfg.memory_buffers.write_gb_per_tape.is_auto() {
+        "auto-detected from /proc/meminfo"
+    } else {
+        "operator override"
+    };
+    let read_source = if cfg.memory_buffers.read_gb_per_tape.is_auto() {
+        "auto-detected from /proc/meminfo"
+    } else {
+        "operator override"
+    };
+    info!(
+        "memory_buffers resolved: write={} GiB ({}), read={} GiB ({}); host_mem={} GiB, drives={}",
+        write_buffer_limit / bytes_per_gib,
+        write_source,
+        read_buffer_limit / bytes_per_gib,
+        read_source,
+        host_mem_bytes / bytes_per_gib,
+        num_drives_u32,
+    );
+
+    // Safety check: the resolved per-drive total times num_drives
+    // must not exceed safety_max_host_fraction_pct of MemTotal.
+    // Auto resolution can't exceed this by construction (auto fraction
+    // <= safety fraction in default config), so this catches explicit
+    // operator overrides that overcommit on a small host.
+    if host_mem_bytes > 0 {
+        let total_footprint =
+            (write_buffer_limit + read_buffer_limit).saturating_mul(num_drives_u32.max(1) as u64);
+        let safety_fraction = cfg.memory_buffers.safety_max_host_fraction_pct.min(100);
+        let safety_limit = host_mem_bytes.saturating_mul(safety_fraction) / 100;
+        if total_footprint > safety_limit {
+            anyhow::bail!(
+                "memory_buffers total footprint ({} GiB = (write {} + read {}) GiB * {} drives) \
+                 exceeds safety_max_host_fraction_pct={}% of host RAM ({} GiB of {} GiB). \
+                 Lower memory_buffers.write_gb_per_tape / read_gb_per_tape, raise \
+                 memory_buffers.safety_max_host_fraction_pct, or switch to `auto`.",
+                total_footprint / bytes_per_gib,
+                write_buffer_limit / bytes_per_gib,
+                read_buffer_limit / bytes_per_gib,
+                num_drives_u32,
+                safety_fraction,
+                safety_limit / bytes_per_gib,
+                host_mem_bytes / bytes_per_gib,
+            );
+        }
+    }
+
     // 🔸 Start MemoryBufferManager (Phase 3: Per-Tape Buffer Tracking, Phase 4: Event-Driven Uploads, Phase 5: Event-Driven Prefetch)
-    let write_buffer_gb = cfg.memory_buffers.write_gb_per_tape;
-    let read_buffer_gb = cfg.memory_buffers.read_gb_per_tape;
     // Clone the upload sender before passing it into the manager so the
     // boot-time orphan-upload scan can dispatch directly to the same
     // worker mpsc without going through the manager's event loop.
     let upload_tx_for_recovery = upload_tx.clone();
     let memory_buffer_manager = MemoryBufferManager::new(
         event_rx,
-        write_buffer_gb,
-        read_buffer_gb,
+        write_buffer_limit,
+        read_buffer_limit,
         upload_tx,
         prefetch_tx,
     );
@@ -2173,13 +2296,31 @@ mod config_parse_tests {
         assert_eq!(cfg.data_dir, "/srv/thur");
         assert_eq!(cfg.audit.retention_days, default_audit_retention_days());
         assert!(cfg.audit.compress_rotated);
+        // Both buffer sizes default to `auto` — the daemon resolves
+        // them against /proc/meminfo at boot.
         assert_eq!(
             cfg.memory_buffers.write_gb_per_tape,
-            default_write_gb_per_tape()
+            memory_buffers_size::MemoryBuffersSize::Auto
         );
         assert_eq!(
             cfg.memory_buffers.read_gb_per_tape,
-            default_read_gb_per_tape()
+            memory_buffers_size::MemoryBuffersSize::Auto
+        );
+        assert_eq!(
+            cfg.memory_buffers.auto_host_fraction_pct,
+            default_auto_host_fraction_pct()
+        );
+        assert_eq!(
+            cfg.memory_buffers.safety_max_host_fraction_pct,
+            default_safety_max_host_fraction_pct()
+        );
+        assert_eq!(
+            cfg.memory_buffers.auto_min_gb_per_tape,
+            default_auto_min_gb_per_tape()
+        );
+        assert_eq!(
+            cfg.memory_buffers.auto_max_gb_per_tape,
+            default_auto_max_gb_per_tape()
         );
         // The optional sections default to absent.
         assert!(cfg.iscsi.is_none());
