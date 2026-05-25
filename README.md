@@ -13,10 +13,10 @@ in front of it. The capacity a host can address is set by the cloud
 bucket, not the local disk: a modest cache machine can front a dataset
 many times its own size.
 
-Stored data is deduplicated in a shared content-addressed chunk pool.
-Every chunk is keyed by its BLAKE3 hash, with no central index or
-database, so identical bytes from any source — across every volume and
-cartridge on a backend — are stored exactly once.
+Furthermore, stored data is deduplicated in a shared content-addressed
+chunk pool. Every chunk is keyed by its BLAKE3 hash, with no central
+index or database, so identical bytes from any source — across every
+volume and cartridge on a backend — are stored exactly once.
 
 The two products share that chunk pool, the dedup layer, and the
 cloud-tiering machinery, but they present different device types over
