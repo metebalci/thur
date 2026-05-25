@@ -373,13 +373,18 @@ sudo mount /dev/sdb1 /mnt/myvol
 
 # Documentation
 
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source,
-  the test suite, running a daemon from the build tree.
-- [`CLAUDE.md`](CLAUDE.md) — architecture orientation and repo map.
-- Roadmap and open work — tracked as
-  [GitHub issues](https://github.com/metebalci/thur/issues).
-- [`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md) — per-crate line
-  coverage and the end-to-end suite catalogue.
+**Operations:** [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
+[`docs/CLI.md`](docs/CLI.md),
+[`docs/AUTH.md`](docs/AUTH.md),
+[`docs/AUDIT.md`](docs/AUDIT.md),
+[`docs/TELEMETRY.md`](docs/TELEMETRY.md),
+[`docs/ALERTING.md`](docs/ALERTING.md),
+[`docs/RELEASING.md`](docs/RELEASING.md).
+
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) catalogues every
+configuration file and YAML key; the same per-key reference is what
+`<product> config defaults` prints, checked in under
+[`dist/`](dist/).
 
 **Conformance** — per-spec coverage tables plus the behavioral model:
 
@@ -400,18 +405,28 @@ sudo mount /dev/sdb1 /mnt/myvol
   [`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md),
   [`docs/NVMETCP.md`](docs/NVMETCP.md).
 
-**Operations:** [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
-[`docs/CLI.md`](docs/CLI.md),
-[`docs/AUTH.md`](docs/AUTH.md),
-[`docs/AUDIT.md`](docs/AUDIT.md),
-[`docs/TELEMETRY.md`](docs/TELEMETRY.md),
-[`docs/ALERTING.md`](docs/ALERTING.md),
-[`docs/RELEASING.md`](docs/RELEASING.md).
+**Development:**
 
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) catalogues every
-configuration file and YAML key; the same per-key reference is what
-`<product> config defaults` prints, checked in under
-[`dist/`](dist/).
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source,
+  the test suite, running a daemon from the build tree.
+- [`CLAUDE.md`](CLAUDE.md) — architecture orientation and repo map.
+- [`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md) — per-crate line
+  coverage and the end-to-end suite catalogue.
+- Roadmap and open work — tracked as
+  [GitHub issues](https://github.com/metebalci/thur/issues).
+
+# Contributing
+
+The project does not accept pull requests. Bug reports, feature
+ideas, and questions are welcome as
+[GitHub issues](https://github.com/metebalci/thur/issues), but no
+commitment is made about whether or when any given request will be
+implemented.
+
+# Commercial Support
+
+For commercial support or paid development work, get in touch:
+[info@metebalci.com](mailto:info@metebalci.com).
 
 # License
 
