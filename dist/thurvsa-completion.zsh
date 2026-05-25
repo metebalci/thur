@@ -55,7 +55,7 @@ _arguments "${_arguments_options[@]}" : \
 '--size=[Logical volume size, e.g. \`1T\`, \`500G\`, \`4096\`]:SIZE:_default' \
 '--backend=[Storage backend name to bind this volume to]:BACKEND:_default' \
 '--page-size=[Page size — chunk unit for backend upload + disk cache]:PAGE_SIZE:_default' \
-'--dedup=[Dedup scope\: \`local\` (default) or \`global\`]:DEDUP:(local global)' \
+'--dedup=[Dedup scope\: \`global\` (default) or \`local\`]:DEDUP:(local global)' \
 '--key-file=[Supply the at-rest DEK from PATH instead of minting one]:PATH:_files' \
 '--keystore=[Keystore backend that wraps this volume'\''s DEK]:NAME:_default' \
 '--dek-source=[Where the DEK is minted (requires --encrypt)]:DEK_SOURCE:(daemon backend)' \

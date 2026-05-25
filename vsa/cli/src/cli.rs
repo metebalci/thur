@@ -350,8 +350,8 @@ enum VolumeAction {
         #[arg(long, default_value = "64K")]
         page_size: String,
 
-        /// Dedup scope: `local` (default) or `global`.
-        #[arg(long, value_parser = ["local", "global"], default_value = "local")]
+        /// Dedup scope: `global` (default) or `local`.
+        #[arg(long, value_parser = ["local", "global"], default_value = "global")]
         dedup: String,
 
         /// Mark the volume Write-Once-Read-Many.
@@ -847,7 +847,7 @@ mod cli_tests {
         assert_eq!(size, "1T");
         // Defaults straight off the clap attributes.
         assert_eq!(page_size, "64K");
-        assert_eq!(dedup, "local");
+        assert_eq!(dedup, "global");
         assert!(!worm);
         assert_eq!(sync_after, "storage");
         assert!(lun.is_none());

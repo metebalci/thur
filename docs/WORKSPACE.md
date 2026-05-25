@@ -394,7 +394,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **core-block** — SBC-3 direct-access (block) device-type core,
   consumed by `vsa-daemon`. Per-volume page table (sparse `page_id →
   chunk_hash` map), 4 KiB sectors, default 64 KiB page,
-  thin-provisioned, Local dedup scope by default.
+  thin-provisioned, Global dedup scope by default.
 
 ### core-block layout
 

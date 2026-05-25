@@ -345,19 +345,22 @@ thurvsa volume create NAME [--dedup local|global]
 
 VSA uses the same `shared_object_store::DedupScope` as VTL, recorded in the
 manifest's `dedup_scope` field and sticky for the volume's lifetime. The
-CLI default is **`local`** — the opposite of VTL — and the `local`
+CLI default is **`global`** — matching VTL — and the `local`
 namespace is the volume UUID hex. Using the UUID as the namespace is
 deliberate: a `volume destroy` followed by a recreate under the same name
 mints a fresh UUID, so the new volume never inherits the destroyed one's
 namespace or its orphan chunks.
 
-VSA defaults to `local` because cross-volume page dedup hits are mostly
-coincidental for block workloads. The obvious candidates — boot sectors,
-partition tables, and filesystem superblocks at low LBAs — differ per
-volume, so the storage savings rarely justify the coupling a shared pool
-introduces. Operators with a workload that genuinely shares page-aligned
-content across volumes (for example, many volumes cloned from one golden
-image) can opt into `global` to collapse that shared content.
+VSA defaults to `global` because the dominant block workload — many VMs
+or containers cloned from a shared golden image — has large runs of
+identical page-aligned content (base OS, shared libraries, package
+caches) that cross-volume dedup collapses into one pool copy per chunk.
+Operators who want a volume isolated from the shared pool (so a single
+chunk is never pinned by another volume, and orphan reclamation is
+strictly per-volume) can pass `--dedup local` at create time; the
+fresh-install case where boot sectors, partition tables, and filesystem
+superblocks differ per volume is the workload where that isolation
+costs little.
 
 ## Volume encryption × dedup
 
