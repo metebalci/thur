@@ -254,7 +254,14 @@ THUR_GPG_KEY_ID=<fingerprint> release/release.sh --sign
 #    published tag yet) before re-running release.sh.
 
 # 6. Tag, push, and publish to GitHub Releases. ghrelease.sh creates
-#    the signed tag v0.2.0 on HEAD (tag message is a bare stub),
+#    the signed tag v0.2.0 on the commit the artifacts were built
+#    from — it extracts each .deb / .rpm, reads the short SHA every
+#    binary embeds via `--version`, and tags that commit (not HEAD).
+#    A follow-up commit between release.sh and ghrelease.sh (a docs
+#    tweak, a CHANGELOG add) is fine: the tag stays pinned to the
+#    build. All artifacts must agree on the SHA, none may be
+#    `-dirty`, and the SHA must be an ancestor of HEAD so the branch
+#    push publishes it. Tag message is a bare stub by default;
 #    pushes branch + tag to origin, and uploads release-artifacts/*
 #    (.deb / .rpm + .asc) as the release assets. The GitHub Release
 #    body is left empty by default; pass -m "summary" / -F notes.md

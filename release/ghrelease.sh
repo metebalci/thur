@@ -9,9 +9,16 @@
 # built (and signed) the artifacts into release-artifacts/ and AFTER you
 # have smoke-tested them. It performs the tag -> push -> publish steps:
 #
-#   1. Creates a signed git tag `v<version>` on HEAD. The version is read
-#      from the root Cargo.toml — the same field release.sh stamps onto
-#      the artifact filenames — so the tag cannot drift from the build.
+#   1. Creates a signed git tag `v<version>` on the commit the artifacts
+#      were built from. The version is read from the root Cargo.toml (the
+#      same field release.sh stamps onto the artifact filenames). The
+#      *commit* is the short SHA embedded in every release binary by
+#      build.rs (THUR{VTL,VSA}_VERSION -> clap `--version`), read back
+#      out by extracting each .deb / .rpm and running `--version`. So if
+#      you committed something new (a docs tweak, a follow-up bump) after
+#      release.sh, the tag still lands on the build, not HEAD. All four
+#      binaries must agree on the SHA, none may be `-dirty`, and the SHA
+#      must be reachable from HEAD (so the branch push publishes it).
 #   2. Pushes the current branch and the tag to `origin`.
 #   3. Creates the GitHub Release for the tag and uploads everything in
 #      release-artifacts/ (.deb / .rpm + any .asc signatures).
@@ -188,6 +195,88 @@ else
     SIG_NOTE="ABSENT (unsigned)"
 fi
 
+# ---- read the embedded SHA out of the artifact binaries ----
+# Every release binary embeds its build-time short SHA via build.rs
+# (THUR{VTL,VSA}_VERSION -> clap version). Extract each .deb / .rpm,
+# run --version, and tag *that* commit — not HEAD. release.sh refuses
+# dirty trees, so the SHA is meaningful; we still reject `-dirty` here
+# in case the operator passed --allow-dirty.
+command -v dpkg-deb >/dev/null 2>&1 || {
+    echo "error: dpkg-deb not on PATH — install 'dpkg' to extract .deb artifacts." >&2; exit 1; }
+command -v rpm2cpio >/dev/null 2>&1 || {
+    echo "error: rpm2cpio not on PATH — install 'rpm' to extract .rpm artifacts." >&2; exit 1; }
+command -v cpio >/dev/null 2>&1 || {
+    echo "error: cpio not on PATH — install 'cpio' to extract .rpm artifacts." >&2; exit 1; }
+
+EXTRACT_DIR=$(mktemp -d /tmp/thur-ghrelease.XXXXXX)
+trap 'rm -rf "$EXTRACT_DIR"' EXIT
+
+declare -A ARTIFACT_SHA
+for f in "${ASSETS[@]}"; do
+    case "$f" in *.asc) continue ;; esac
+    name="${f##*/}"
+    sub="$EXTRACT_DIR/$name"
+    mkdir -p "$sub"
+    case "$f" in
+        *.deb) dpkg-deb -x "$f" "$sub" ;;
+        *.rpm) (cd "$sub" && rpm2cpio "$f" | cpio -idm --quiet) ;;
+    esac
+
+    shopt -s nullglob
+    BINS=("$sub"/usr/bin/*)
+    shopt -u nullglob
+    [ ${#BINS[@]} -gt 0 ] || {
+        echo "error: $name contains no usr/bin/ binaries (extracted to $sub)" >&2; exit 1; }
+
+    for bin in "${BINS[@]}"; do
+        [ -x "$bin" ] || continue
+        if ! VER_OUT=$("$bin" --version 2>/dev/null); then
+            echo "error: $bin --version failed — host glibc older than the build floor?" >&2
+            exit 1
+        fi
+        # Format: "<name> <crate-ver> (<sha>[-dirty])"
+        if [[ "$VER_OUT" =~ \(([0-9a-f]+)(-dirty)?\)[[:space:]]*$ ]]; then
+            sha="${BASH_REMATCH[1]}"
+            if [ -n "${BASH_REMATCH[2]}" ]; then
+                echo "error: $name was built from a dirty tree ($VER_OUT) — refusing to tag." >&2
+                exit 1
+            fi
+            ARTIFACT_SHA["${bin##*/}@$name"]="$sha"
+        else
+            echo "error: could not parse SHA from '$VER_OUT' ($bin)" >&2
+            exit 1
+        fi
+    done
+done
+
+[ ${#ARTIFACT_SHA[@]} -gt 0 ] || {
+    echo "error: no binaries found in $OUT_DIR/ to read embedded SHAs from." >&2; exit 1; }
+
+UNIQUE_SHAS=$(printf '%s\n' "${ARTIFACT_SHA[@]}" | sort -u)
+if [ "$(printf '%s\n' "$UNIQUE_SHAS" | wc -l)" -gt 1 ]; then
+    echo "error: artifacts disagree on embedded SHA — mixed-build $OUT_DIR/?" >&2
+    for k in "${!ARTIFACT_SHA[@]}"; do
+        echo "       $k -> ${ARTIFACT_SHA[$k]}" >&2
+    done
+    echo "       re-run release/release.sh on a clean $OUT_DIR/." >&2
+    exit 1
+fi
+EMBEDDED_SHA="$UNIQUE_SHAS"
+
+# Resolve the short SHA to a full one and confirm it's reachable from
+# HEAD. The branch push below publishes HEAD's history; a tag on a
+# commit outside that history would be orphaned at origin.
+if ! TAG_TARGET_SHA=$(git rev-parse "${EMBEDDED_SHA}^{commit}" 2>/dev/null); then
+    echo "error: embedded SHA $EMBEDDED_SHA not found in this checkout — fetch first?" >&2
+    exit 1
+fi
+HEAD_SHA=$(git rev-parse HEAD)
+if ! git merge-base --is-ancestor "$TAG_TARGET_SHA" "$HEAD_SHA"; then
+    echo "error: embedded SHA $EMBEDDED_SHA is not an ancestor of HEAD ($BRANCH @ ${HEAD_SHA:0:9})." >&2
+    echo "       pushing $BRANCH would not publish the tagged commit. Check out a branch that contains it." >&2
+    exit 1
+fi
+
 # ---- refuse to clobber an existing release ----
 if gh release view "$TAG" >/dev/null 2>&1; then
     echo "error: a GitHub Release for $TAG already exists." >&2
@@ -196,14 +285,13 @@ if gh release view "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Reuse an existing local tag only if it already points at HEAD (a
-# previous run that failed after tagging); otherwise refuse.
-HEAD_SHA=$(git rev-parse HEAD)
+# Reuse an existing local tag only if it already points at the artifact
+# commit (a previous run that failed after tagging); otherwise refuse.
 TAG_EXISTS=0
 if EXISTING=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}" 2>/dev/null); then
-    if [ "$EXISTING" != "$HEAD_SHA" ]; then
-        echo "error: tag $TAG already exists at ${EXISTING:0:9}, not HEAD (${HEAD_SHA:0:9})." >&2
-        echo "       delete it (git tag -d $TAG) or check out the right commit." >&2
+    if [ "$EXISTING" != "$TAG_TARGET_SHA" ]; then
+        echo "error: tag $TAG already exists at ${EXISTING:0:9}, not the artifact commit (${TAG_TARGET_SHA:0:9})." >&2
+        echo "       delete it (git tag -d $TAG) or rebuild artifacts at the right commit." >&2
         exit 1
     fi
     TAG_EXISTS=1
@@ -216,31 +304,35 @@ fi
 # --generate-notes (commits since the last tag).
 CUSTOM_MSG=0
 if [ "$TAG_EXISTS" -eq 1 ]; then
-    echo "==> reusing existing tag $TAG (already at HEAD)"
+    echo "==> reusing existing tag $TAG (already at the artifact commit)"
     # An existing tag's message is whatever it was when first created;
     # honor it as authoritative.
     CUSTOM_MSG=1
 elif [ -n "$TAG_MSG" ]; then
-    git tag -s "$TAG" -m "$TAG_MSG"
+    git tag -s "$TAG" -m "$TAG_MSG" "$TAG_TARGET_SHA"
     CUSTOM_MSG=1
 elif [ -n "$TAG_MSG_FILE" ]; then
-    git tag -s "$TAG" -F "$TAG_MSG_FILE"
+    git tag -s "$TAG" -F "$TAG_MSG_FILE" "$TAG_TARGET_SHA"
     CUSTOM_MSG=1
 elif [ "$EDIT_MSG" -eq 1 ]; then
-    git tag -s "$TAG"            # opens $EDITOR for the release notes
+    git tag -s "$TAG" "$TAG_TARGET_SHA"  # opens $EDITOR for the release notes
     CUSTOM_MSG=1
 else
     # No override: the tag name already says v<version>, so the message
     # is a stub. The release body comes from --generate-notes below.
-    git tag -s "$TAG" -m "$TAG"
+    git tag -s "$TAG" -m "$TAG" "$TAG_TARGET_SHA"
 fi
 
 # ---- summary + confirmation ----
 echo
 echo "  Repository  : $(git remote get-url origin)"
-echo "  Branch      : $BRANCH"
-echo "  Commit      : ${HEAD_SHA:0:9}  $(git log -1 --format='%s')"
-echo "  Tag         : $TAG  (signed)"
+if [ "$TAG_TARGET_SHA" = "$HEAD_SHA" ]; then
+    echo "  Branch      : $BRANCH (HEAD ${HEAD_SHA:0:9})"
+else
+    echo "  Branch      : $BRANCH (HEAD ${HEAD_SHA:0:9}, $(git rev-list --count "$TAG_TARGET_SHA..$HEAD_SHA") commit(s) past artifact)"
+fi
+echo "  Commit      : ${TAG_TARGET_SHA:0:9}  $(git log -1 --format='%s' "$TAG_TARGET_SHA")"
+echo "  Tag         : $TAG  (signed, at artifact commit)"
 echo "  Pre-release : $PRERELEASE_NOTE"
 echo "  Signatures  : $SIG_NOTE"
 echo "  Assets      : ${#ASSETS[@]} file(s)"
