@@ -462,7 +462,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
-- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,monte-carlo}.sh`
+- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,backup-bareos,monte-carlo}.sh`
 - `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
@@ -474,6 +474,13 @@ prereqs — VSA does file ops over ext4, VTL does tape record ops.
 Reproduce with `--seed N` (printed at start), `--quick` for ~30 s
 smoke (200 ops) vs the ~5 min default (3000 ops). VSA also accepts
 `--backend NAME` / `THURVSA_TEST_BACKEND`.
+`test-backup-bareos.sh` (VTL only) drives a real Bareos director/SD/FD
+in podman (built on the fly from an inline `Containerfile`, debian:12 +
+bareos-21 + SQLite catalog) against a 2-drive / 6-cartridge chassis,
+runs a seeded random number of small backup jobs with Bareos Max
+Concurrent Jobs = 2 so both drives engage, restores every job and diffs
+the restored tree byte-for-byte. `--seed N` reproduces; `--quick` for 4
+jobs (default 8). Requires `podman`.
 `test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
