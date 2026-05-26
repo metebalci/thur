@@ -463,7 +463,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
 - `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,backup-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo}.sh`
+- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo,fs-postgres}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
@@ -484,6 +484,16 @@ runs a seeded random number of small backup jobs with Bareos Max
 Concurrent Jobs = 2 so both drives engage, restores every job and diffs
 the restored tree byte-for-byte. `--seed N` reproduces; `--quick` for 4
 jobs (default 8). Requires `podman`.
+`test-fs-postgres.sh` (VSA only) is the block-storage counterpart: a
+real PostgreSQL container (debian:12 + postgresql) on top of an ext4
+mount on a thurvsa volume, exercises WAL fsync ordering, mixed
+sequential heap inserts + random index updates, and transactional
+crash recovery. Bootstraps `pgbench -i -s S`, runs concurrent OLTP,
+then `podman kill --signal=KILL` mid-workload, fscks the volume,
+restarts postgres, and re-checks the TPC-B sum invariant after WAL
+replay. `--seed N` picks scale / concurrency / runtime in bounded
+buckets; `--quick` locks scale=1, T=30 s for ~1 min total. Accepts
+`--transport iscsi|nvmetcp` (default `iscsi`). Requires `podman`.
 `test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
