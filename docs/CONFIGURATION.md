@@ -129,6 +129,7 @@ rather than failing it.
 | `disk_cache.localonly_soft_watermark_pct` | `80` | Soft watermark (% of `size_gb`); crossing it logs a warning. |
 | `disk_cache.disk_free_min_gb` | `5` | Reserve free filesystem space (GB) below which seals also backpressure regardless of pool occupancy. `0` disables. |
 | `disk_cache.recent_seal_pin_seconds` | `0` | Pin chunks touched within this many seconds against LRU eviction (counters verify-after-write churn). `0` = pure LRU. Default may change before RC/GA. |
+| `disk_cache.ghost_ring_size` | `100000` | Per-backend bounded ring of recently-evicted chunk hashes (~100 B/entry → ~10 MB/backend at the default). On every cache miss the chunk hash is looked up in the ring; if found, `now - evicted_at` is bucketed into the `cache_miss_after_eviction_seconds` histogram so operators can see whether their cache is undersized. Measurement-only — never affects cache replacement. `0` disables. |
 | `disk_cache.backpressure_max_wait_seconds` | `30` | Max seconds a page-seal parks before surfacing SBC-3 NOT READY + ASC/ASCQ 0x04/0x07. **VSA only.** |
 | `disk_cache.eviction_interval_seconds` | `300` | How often the eviction worker re-scans and trims each backend's pool. **VSA only.** |
 

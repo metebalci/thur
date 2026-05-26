@@ -2068,6 +2068,7 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | pool | `pool_backpressure_waits_total` | Counter<u64> | — | `backend` |
 | pool | `pool_backpressure_wait` | Histogram<f64> | s | `backend` |
 | cache | `cache_evictions_total` | Counter<u64> | — | `volume`, `outcome` (VSA only) |
+| cache | `cache_miss_after_eviction_seconds` | Histogram<f64> | s | `backend` (explicit log-uniform buckets: 1, 2, 4, 8, 16, 32, 64, 128, 256, +Inf) |
 | scsi_xcopy | `scsi_xcopy_total` | Counter<u64> | — | `outcome` ∈ {`success`,`reject`,`error`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_bytes_total` | Counter<u64> | By | `path` ∈ {`fast`,`slow`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_segments_total` | Counter<u64> | — | `path` ∈ {`fast`,`slow`} (VSA only) |

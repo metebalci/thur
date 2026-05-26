@@ -327,6 +327,46 @@ by the volume of write+read activity inside the window, so a tight budget under
 sustained load can see "all candidates pinned" warnings. The 0 default is
 validated before RC/GA against a workload trace (see `ROADMAP.md`).
 
+### Ghost-list telemetry — `cache_miss_after_eviction_seconds`
+
+Sizing the cache and choosing a value for `recent_seal_pin_seconds`
+both come down to the same question: *of the cache misses operators
+see, how recently were those chunks evicted?* If most are evicted
+within the last few seconds, the cache is undersized by that window
+and either a bigger `size_gb` or a non-zero `recent_seal_pin_seconds`
+would have caught them. If most are evicted minutes or hours ago,
+the misses are organic — a bigger cache wouldn't help cost-effectively.
+
+A per-backend **ghost list** answers this question without storing any
+per-chunk state. The eviction worker maintains a bounded ring of
+recently-evicted `(chunk_hash, evicted_at_unix)` tuples. On every
+cache miss that triggers a backend GET, the read path consults the
+ring; if the hash is found, `now - evicted_at` is recorded into the
+`thurv{tl,sa}_cache_miss_after_eviction_seconds` histogram, labelled by
+backend. The ring is measurement-only — it never participates in
+cache replacement decisions (no ARC), so its only failure mode is
+losing telemetry resolution.
+
+Ring capacity is `disk_cache.ghost_ring_size` (default 100,000 per
+backend, ~10 MB at ~100 B/entry). Under sustained heavy eviction the
+ring's effective time window narrows to "the last N evictions" rather
+than "the last 256 s"; that case piles overwhelming signal into the
+low buckets anyway, so the lost tail is not actionable.
+
+The histogram's buckets are explicit and log-uniform: `1, 2, 4, 8,
+16, 32, 64, 128, 256, +Inf` seconds. Reading it:
+
+- **Mass below 60 s** → cache undersized by roughly that window.
+  Either bump `disk_cache.size_gb` to give LRU headroom, or set
+  `disk_cache.recent_seal_pin_seconds` to that value (the temporal
+  guarantee equivalent, at the cost of backpressuring writes when
+  the pin can't free).
+- **Mass past 256 s** → organic misses; a bigger cache won't help.
+- **`+Inf` bucket dominates** → the ring is too small for the
+  current eviction rate, or the workload genuinely re-reads
+  long-cold data. Check eviction throughput before bumping
+  `ghost_ring_size`.
+
 ## `lru.idx` sidecar
 
 Per-volume `<volume_dir>/lru.idx` — sparse 8-byte-per-`page_id` file
@@ -458,3 +498,9 @@ Same per-backend instruments as VTL, prefixed `thurvsa_*` (sourced from
   events.
 - `thurvsa_pool_backpressure_wait_seconds{backend}` — histogram of wait
   durations (seconds).
+- `thurvsa_cache_miss_after_eviction_seconds{backend}` — histogram of
+  `now - evicted_at` for cache misses whose chunk had been recently
+  evicted from this backend's pool. Drives `disk_cache.size_gb` and
+  `disk_cache.recent_seal_pin_seconds` sizing. Explicit log-uniform
+  buckets `1, 2, 4, 8, 16, 32, 64, 128, 256, +Inf`. See § *Ghost-list
+  telemetry* above.
