@@ -440,19 +440,6 @@ configuration file and YAML key; the same per-key reference is what
 - Roadmap and open work — tracked as
   [GitHub issues](https://github.com/metebalci/thur/issues).
 
-# Contributing
-
-The project does not accept pull requests. Bug reports, feature
-ideas, and questions are welcome as
-[GitHub issues](https://github.com/metebalci/thur/issues), but no
-commitment is made about whether or when any given request will be
-implemented.
-
-# Commercial Support
-
-For commercial support or paid development work, get in touch:
-[info@metebalci.com](mailto:info@metebalci.com).
-
 # License
 
 Copyright (c) 2026 Mete Balci
