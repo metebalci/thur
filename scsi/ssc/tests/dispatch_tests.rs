@@ -987,6 +987,73 @@ fn space_16_filemarks_one_succeeds() {
     ));
 }
 
+/// SPACE(6) FILEMARKS that hits EOD before counting all requested
+/// filemarks must terminate with CHECK CONDITION + BLANK_CHECK + ASC
+/// 00/05 (EOD detected), and the INFORMATION field must carry
+/// (count − moved) so the host can correct its tape-position tracking.
+/// This is the SSC-5 §7.5 residual-on-CC rule.
+///
+/// Regression for #33: Linux's slow MTEOM path emits
+/// `SPACE FILEMARKS count=0x7FFFFF`; before this fix we returned GOOD,
+/// so the kernel's `drv_file += 0x7FFFFF` left bareos believing the tape
+/// held 8 388 607 files — which it then catalogued and warned about
+/// on every subsequent open.
+#[test]
+fn space_6_filemarks_past_eod_returns_residual() {
+    let fx = Fixture::new();
+    // Empty cartridge — zero filemarks. Ask for the max positive 24-bit
+    // count that Linux's slow MTEOM uses: 0x7FFFFF (8 388 607).
+    let mut c = cdb(0x11);
+    c[1] = 0x01; // filemarks
+    c[2] = 0x7F;
+    c[3] = 0xFF;
+    c[4] = 0xFF;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_6(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.as_ref().expect("CHECK CONDITION carries sense");
+    assert_eq!(sense[2] & 0x0F, 0x08, "sense key BLANK_CHECK");
+    assert_eq!(sense[12], 0x00, "ASC EOD detected (00/05)");
+    assert_eq!(sense[13], 0x05);
+    assert_eq!(sense[0] & 0x80, 0x80, "INFORMATION VALID bit set");
+    let info = u32::from_be_bytes([sense[3], sense[4], sense[5], sense[6]]);
+    assert_eq!(info, 0x7F_FFFF, "INFORMATION = count − moved (=count, moved=0)");
+}
+
+/// SPACE(16) sister-test for the same residual rule, exercising the
+/// 8-byte count path. LTO-7+ uses the 16-byte form when counts exceed
+/// 24 bits; the residual semantics are identical.
+#[test]
+fn space_16_filemarks_past_eod_returns_residual() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x91);
+    c[1] = 0x01;
+    // count = 5 (low byte of 8-byte BE)
+    c[11] = 5;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.as_ref().expect("CHECK CONDITION carries sense");
+    assert_eq!(sense[2] & 0x0F, 0x08, "sense key BLANK_CHECK");
+    let info = u32::from_be_bytes([sense[3], sense[4], sense[5], sense[6]]);
+    assert_eq!(info, 5, "INFORMATION = count − moved (=5, moved=0)");
+}
+
+/// SPACE(6) FILEMARKS with count=0 stays GOOD — no demarcations were
+/// requested, so no residual is owed even when nothing was crossed.
+#[test]
+fn space_6_filemarks_zero_count_is_good() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x11);
+    c[1] = 0x01;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_6(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+}
+
 /// SPACE(16) on changer LUN: per impl, returns Good unconditionally.
 #[test]
 fn space_16_on_changer_lun_is_a_noop() {

@@ -441,28 +441,42 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     };
     match drive_manager.with_drive(drive_id, tsih, |cart| {
         let old_lba = cart.head_lba();
-        match code {
-            0x00 => {
-                cart.space_records(count as i64);
-            }
-            0x01 => {
-                cart.space_filemarks(count as i64);
-            }
-            0x03 => {
-                cart.space_to_eod();
-            }
-            _ => {}
-        }
-        Ok((cart.label().to_string(), old_lba, cart.head_lba()))
+        let moved = match code {
+            0x00 => cart.space_records(count as i64),
+            0x01 => cart.space_filemarks(count as i64),
+            0x03 => { cart.space_to_eod(); count as i64 }
+            _ => 0,
+        };
+        Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))
     }) {
-        Ok((tape_id, old_lba, new_lba)) => {
-            // Emit HeadPositionChanged event
+        Ok((tape_id, old_lba, new_lba, moved)) => {
             let _ = event_tx.send(TapeEvent::HeadPositionChanged {
                 tape_id,
                 old_lba,
                 new_lba,
                 reason: core_mediachanger::PositionChangeReason::Space,
             });
+            // SPACE residual (SSC-5 §7.5). If fewer demarcations were
+            // traversed than requested, terminate with CHECK CONDITION
+            // and report (count − moved) in INFORMATION so the host's
+            // tape-position tracking (Linux st: `drv_file += count` on
+            // success, `drv_file -= residual` on CC) can compute the
+            // real position. Without this, e.g. Linux's slow MTEOM path
+            // emits SPACE FILEMARKS count=0x7FFFFF and our success
+            // response makes the kernel believe 8388607 filemarks were
+            // crossed — surfaces in bareos as the spurious
+            // "files mismatch! Volume=8388607" diagnostic (issue #33).
+            // EOD code (0x03) has no residual concept.
+            if (code == 0x00 || code == 0x01) && (moved as i32) != count {
+                let residual = count.wrapping_sub(moved as i32) as u32;
+                let sense = scsi::sense::SenseDataBuilder::new(
+                    scsi::sense::SenseKey::BlankCheck,
+                    scsi::sense::ASC_EOD_DETECTED,
+                )
+                .with_information(residual)
+                .build();
+                return Ok(ScsiResp::check_condition_with_sense(sense));
+            }
             Ok(ScsiResp::good())
         }
         Err(e) => {
@@ -491,27 +505,33 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     ]);
     match drive_manager.with_drive(drive_id, tsih, |cart| {
         let old_lba = cart.head_lba();
-        match code {
-            0x00 => {
-                cart.space_records(count);
-            }
-            0x01 => {
-                cart.space_filemarks(count);
-            }
-            0x03 => {
-                cart.space_to_eod();
-            }
-            _ => {}
-        }
-        Ok((cart.label().to_string(), old_lba, cart.head_lba()))
+        let moved = match code {
+            0x00 => cart.space_records(count),
+            0x01 => cart.space_filemarks(count),
+            0x03 => { cart.space_to_eod(); count }
+            _ => 0,
+        };
+        Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))
     }) {
-        Ok((tape_id, old_lba, new_lba)) => {
+        Ok((tape_id, old_lba, new_lba, moved)) => {
             let _ = event_tx.send(TapeEvent::HeadPositionChanged {
                 tape_id,
                 old_lba,
                 new_lba,
                 reason: core_mediachanger::PositionChangeReason::Space,
             });
+            // Same residual semantics as SPACE(6) — see commentary
+            // there for the bareos / Linux-st context.
+            if (code == 0x00 || code == 0x01) && moved != count {
+                let residual = (count.wrapping_sub(moved) & 0xFFFF_FFFF) as u32;
+                let sense = scsi::sense::SenseDataBuilder::new(
+                    scsi::sense::SenseKey::BlankCheck,
+                    scsi::sense::ASC_EOD_DETECTED,
+                )
+                .with_information(residual)
+                .build();
+                return Ok(ScsiResp::check_condition_with_sense(sense));
+            }
             Ok(ScsiResp::good())
         }
         Err(e) => {

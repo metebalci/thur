@@ -2646,26 +2646,34 @@ impl Cartridge {
         } else {
             // backward
             let mut lba: i64 = self.head_lba as i64 - 1; // start checking previous block
+            let mut last_fm_lba: i64 = -1;
             while lba >= 0 && moved > n {
                 // n is negative, e.g. -2; we count down
                 if let Some(bi) = self.try_block_at(part_idx, lba as u64)
                     && bi.kind == BlockKindSerde::Filemark
                 {
                     moved -= 1; // moving "one filemark backward"
+                    last_fm_lba = lba;
                 }
                 lba -= 1;
             }
-            // After moving backward over |moved| filemarks, position at
-            // block **after** that filemark, i.e. (lba+1)+1 = lba+2;
-            // clamp to [0..next_lba]. If `moved == 0` (no filemark
-            // crossed — e.g. backward space at BOT), leave head_lba
-            // alone: the old code computed `(lba + 2).max(0) as u64`
-            // which advanced head from 0 to 1 in that case.
             if moved == 0 {
                 return moved;
             }
+            // SSC-4 §7.5: after a backward SPACE FILEMARKS, the logical
+            // position is "immediately before the |count|-th filemark in
+            // the direction of motion" — i.e. AT the filemark itself, not
+            // the block beyond it. Putting head_lba at the FM means a
+            // subsequent forward SPACE FILEMARKS 1 re-crosses the same
+            // FM and lands at the first record of the current file — the
+            // exact round-trip bareos's reposition logic relies on
+            // ("back 1, forward 1" to re-enter the current file).
+            // Before this fix, we set head to (FM + 1), so the forward
+            // round-trip crossed the NEXT filemark instead, landing in
+            // the WRONG file and producing the empty-restore symptom
+            // surfaced by issue #33's restore-and-diff phase.
             let part_next = self.next_lba_of(part_idx);
-            let mut new_head = (lba + 2).max(0) as u64;
+            let mut new_head = last_fm_lba.max(0) as u64;
             if new_head > part_next {
                 new_head = part_next;
             }
