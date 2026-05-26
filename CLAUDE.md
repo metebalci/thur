@@ -469,11 +469,14 @@ Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variant
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
 entry in the conffile; refuses `retention_mode != none`.
 `test-monte-carlo.sh` (both products) runs seeded random op sequences
-with a boundary-biased size distribution and lazy iSCSI/mount/load
+with a boundary-biased size distribution and lazy transport/mount/load
 prereqs — VSA does file ops over ext4, VTL does tape record ops.
 Reproduce with `--seed N` (printed at start), `--quick` for ~30 s
 smoke (200 ops) vs the ~5 min default (3000 ops). VSA also accepts
-`--backend NAME` / `THURVSA_TEST_BACKEND`.
+`--backend NAME` / `THURVSA_TEST_BACKEND` and `--transport iscsi|nvmetcp`
+(default `iscsi`) — the op generator, content model, and verification
+are transport-agnostic; only the login / device-discovery /
+logout-cycle primitives branch.
 `test-backup-bareos.sh` (VTL only) drives a real Bareos director/SD/FD
 in podman (built on the fly from an inline `Containerfile`, debian:12 +
 bareos-21 + SQLite catalog) against a 2-drive / 6-cartridge chassis,

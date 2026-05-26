@@ -7,9 +7,12 @@
 # thurvsa Monte Carlo Random-Op Test
 #
 # Runs N seeded random operations against an ext4 filesystem mounted on
-# a thurvsa volume over iSCSI. Op mix is weighted to bias file ops and
-# sample iSCSI / mount churn at lower rates — `umount_cycle` and
-# `iscsi_logout_cycle` tear the lower layer down; the next file op
+# a thurvsa volume. The transport (iSCSI or NVMe/TCP) is selectable via
+# --transport; the op generator, content model, and verification are
+# transport-agnostic — only the login / device-discovery / logout-cycle
+# primitives branch. Op mix is weighted to bias file ops and sample
+# transport / mount churn at lower rates — `umount_cycle` and
+# `transport_logout_cycle` tear the lower layer down; the next file op
 # lazily brings it back. That exposes the daemon to "user opens session,
 # does ops, logs out, comes back later, does more ops" workloads that
 # the deterministic scripted tests don't reach.
@@ -41,8 +44,11 @@
 # is overridden per-run so test data is isolated and purged on cleanup.
 #
 # Prerequisites:
-#   - sg3-utils, open-iscsi, lsscsi, e2fsprogs, util-linux, openssl
-#   - iscsid running  (sudo systemctl enable --now iscsid)
+#   - e2fsprogs, util-linux, openssl
+#   - iSCSI mode:  sg3-utils, open-iscsi, lsscsi; iscsid running
+#                  (sudo systemctl enable --now iscsid)
+#   - NVMe/TCP mode: nvme-cli; nvme_tcp kernel module
+#                    (sudo modprobe nvme_tcp)
 #   - Root/sudo access
 #   - For non-local backends: yq, the matching backend CLI, valid credentials
 #
@@ -55,12 +61,14 @@
 #   --seed N              Reproduce a prior run (default: pick from /dev/urandom)
 #   --quick               200 ops, ~30 MB residual (default: 3000 ops, ~500 MB)
 #   --ops N               Override op count
+#   --transport T         iscsi (default) or nvmetcp
 #   --backend NAME        Use named backend entry (same as THURVSA_TEST_BACKEND)
 #   --release             Use ./target/release/ binaries
 #   --daemon-path PATH    Override thurvsad path
 #   --cli-path PATH       Override thurvsa path
 #   --keep-data           Don't clean up test data directory
-#   --iscsi-port PORT     Override iSCSI port
+#   --iscsi-port PORT     Override iSCSI port (iscsi mode only)
+#   --nvmetcp-port PORT   Override NVMe/TCP port (nvmetcp mode only)
 #   --http-port PORT      Override HTTP port
 #
 
@@ -101,12 +109,18 @@ DAEMON_PATH=""
 CLI_PATH=""
 TEST_DIR="/tmp/thurvsa-monte-carlo-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
+TRANSPORT="iscsi"
 ISCSI_PORT=""
+NVMETCP_PORT=""
 HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
+SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
+HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-monte-carlo-test"
 KEEP_DATA=0
 DAEMON_PID=""
 ISCSI_CONNECTED=0
+NVME_CONNECTED=0
+NVME_DEVICE=""
 MOUNT_POINT="${TEST_DIR}/mnt"
 VOLUME_NAME="vol-mc"
 VOLUME_SIZE_MIB=1024
@@ -120,9 +134,9 @@ TEST_PREFIX=""
 RW_DEVICE=""
 RW_SG_DEVICE=""
 
-# Mount/iSCSI lazy state. Both start "down" and the first file op brings
-# them up.
-ISCSI_UP=0
+# Mount/transport lazy state. Both start "down" and the first file op
+# brings them up.
+TRANSPORT_UP=0
 MOUNT_UP=0
 
 # In-memory file model. FILE_VERSIONS[path]=int (0 = deleted/never-existed),
@@ -138,12 +152,14 @@ while [[ $# -gt 0 ]]; do
         --seed) SEED="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --ops) OPS="$2"; shift 2 ;;
+        --transport) TRANSPORT="$2"; shift 2 ;;
         --backend) BACKEND_NAME="$2"; shift 2 ;;
         --release) BUILD_PROFILE="release"; shift ;;
         --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --keep-data) KEEP_DATA=1; shift ;;
         --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
+        --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
         --http-port) HTTP_PORT="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -156,6 +172,11 @@ if [[ $QUICK -eq 1 ]]; then
 else
     : "${OPS:=3000}"
 fi
+
+case "$TRANSPORT" in
+    iscsi|nvmetcp) ;;
+    *) echo "Unknown --transport '$TRANSPORT' (expected iscsi or nvmetcp)"; exit 1 ;;
+esac
 
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
@@ -171,6 +192,9 @@ cleanup() {
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+    fi
+    if [[ $NVME_CONNECTED -eq 1 ]]; then
+        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
     fi
 
     if [[ -n "$DAEMON_PID" ]]; then
@@ -195,7 +219,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
+    log_info "Checking prerequisites (build profile: $BUILD_PROFILE, transport: $TRANSPORT)..."
     local missing=()
     local hints=()
     local build_cmd="cargo build --profile dev"
@@ -224,6 +248,7 @@ check_prerequisites() {
     declare -A HINTS=(
         [iscsiadm]="sudo apt-get install open-iscsi"
         [lsscsi]="sudo apt-get install lsscsi"
+        [nvme]="sudo apt-get install nvme-cli"
         [mkfs.ext4]="sudo apt-get install e2fsprogs"
         [mount]="(util-linux — usually present)"
         [umount]="(util-linux — usually present)"
@@ -232,7 +257,13 @@ check_prerequisites() {
         [systemctl]="(systemd — usually present)"
         [cmp]="(diffutils — usually present)"
     )
-    for tool in iscsiadm lsscsi mkfs.ext4 mount umount openssl curl systemctl cmp; do
+    local tools=(mkfs.ext4 mount umount openssl curl systemctl cmp)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        tools+=(iscsiadm lsscsi)
+    else
+        tools+=(nvme)
+    fi
+    for tool in "${tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
             hints+=("  - $tool: ${HINTS[$tool]}")
@@ -243,19 +274,49 @@ check_prerequisites() {
         hints+=("  - yq: sudo apt-get install yq  (needed to read $SOURCE_BACKENDS)")
     fi
 
+    if [[ "$TRANSPORT" == "nvmetcp" ]]; then
+        if ! lsmod | grep -q '^nvme_tcp\b' && ! modinfo nvme_tcp >/dev/null 2>&1; then
+            missing+=("nvme_tcp kernel module")
+            hints+=("  - nvme_tcp: sudo modprobe nvme_tcp (kernel >= 5.0 required)")
+        fi
+    fi
+
     if (( ${#missing[@]} > 0 )); then
         log_error "Missing prerequisites: ${missing[*]}"
         printf '%s\n' "${hints[@]}"
         exit 1
     fi
 
-    if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
-        log_error "iscsid (open-iscsi) service is not running."
-        echo "Start it with: sudo systemctl enable --now iscsid open-iscsi"
-        exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
+            log_error "iscsid (open-iscsi) service is not running."
+            echo "Start it with: sudo systemctl enable --now iscsid open-iscsi"
+            exit 1
+        fi
+    else
+        if ! lsmod | grep -q '^nvme_tcp\b'; then
+            log_info "Loading nvme_tcp kernel module"
+            modprobe nvme_tcp || { log_error "Failed to load nvme_tcp"; exit 1; }
+        fi
     fi
 
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
+}
+
+# Pick transport+http ports. Mirrors test-helpers.sh assign_ports but
+# the transport port var name depends on TRANSPORT.
+assign_ports_mc() {
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        [[ -z "$ISCSI_PORT" ]] && ISCSI_PORT=$(pick_free_port)
+    else
+        [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(pick_free_port)
+    fi
+    [[ -z "$HTTP_PORT" ]] && HTTP_PORT=$(pick_free_port)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "Using iSCSI port $ISCSI_PORT, HTTP port $HTTP_PORT"
+    else
+        log_info "Using NVMe/TCP port $NVMETCP_PORT, HTTP port $HTTP_PORT"
+    fi
 }
 
 # Build the test conffile. If BACKEND_NAME is empty, declare just an
@@ -265,6 +326,12 @@ check_prerequisites() {
 create_test_config() {
     log_info "Creating test configuration..."
     mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
+    local transport_block
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        transport_block=$'iscsi:\n  listen: "127.0.0.1:'"$ISCSI_PORT"'"'
+    else
+        transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
+    fi
     if [[ -z "$BACKEND_NAME" ]]; then
         BACKEND_NAME="local"
         BACKEND_TYPE="local"
@@ -272,8 +339,7 @@ create_test_config() {
 data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
+$transport_block
 storage:
   backends:
     local:
@@ -324,8 +390,7 @@ EOFCONFIG
 data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
+$transport_block
 storage:
   backends:
     $BACKEND_NAME:
@@ -336,15 +401,21 @@ EOFCONFIG
 
 start_daemon() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting thurvsad..."
+    log_info "Starting thurvsad ($TRANSPORT)..."
+    local probe_port
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        probe_port="$ISCSI_PORT"
+    else
+        probe_port="$NVMETCP_PORT"
+    fi
     RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
     DAEMON_PID=$!
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            log_info "Daemon ready (PID $DAEMON_PID)"
+    for _ in {1..60}; do
+        if ss -tln 2>/dev/null | grep -q ":$probe_port\b"; then
+            log_info "Daemon ready (PID $DAEMON_PID, port $probe_port)"
             return 0
         fi
-        sleep 1
+        sleep 0.5
     done
     log_error "Daemon did not become ready"
     tail -30 "${TEST_DIR}/daemon.log"
@@ -361,16 +432,14 @@ ensure_volume() {
         --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" >/dev/null
 }
 
-# Bring iSCSI session up. Idempotent — does nothing if already up.
-iscsi_login() {
-    if [[ $ISCSI_UP -eq 1 ]]; then return 0; fi
+# Bring iSCSI session up + resolve /dev/sdN. Idempotent.
+_iscsi_login() {
     iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null 2>&1 || true
     if ! iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null 2>&1; then
         log_error "iscsi login failed"
         return 1
     fi
     ISCSI_CONNECTED=1
-    # Give the kernel a moment to enumerate the new LUN.
     sleep 2
     local row
     for _ in 1 2 3 4 5; do
@@ -382,29 +451,97 @@ iscsi_login() {
     RW_DEVICE=$(echo "$row" | awk '{print $(NF-1)}')
     RW_SG_DEVICE=$(echo "$row" | awk '{print $NF}')
     [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; return 1; }
-    ISCSI_UP=1
 }
 
-iscsi_logout() {
-    if [[ $ISCSI_UP -eq 0 ]]; then return 0; fi
-    # Must umount before logging out.
+_iscsi_logout() {
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete >/dev/null 2>&1 || true
+    ISCSI_CONNECTED=0
+    RW_SG_DEVICE=""
+}
+
+# Bring NVMe/TCP session up + resolve /dev/nvmeXn1. Idempotent.
+_nvme_login() {
+    if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
+            -n "$SUBNQN" --hostnqn "$HOST_NQN" \
+            > "$TEST_DIR/nvme-connect.log" 2>&1; then
+        log_error "nvme connect failed"
+        cat "$TEST_DIR/nvme-connect.log"
+        return 1
+    fi
+    NVME_CONNECTED=1
+    NVME_DEVICE=$(nvme list-subsys -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+target = '$SUBNQN'
+def walk(d):
+    if isinstance(d, dict):
+        if d.get('NQN') == target:
+            for p in d.get('Paths', []):
+                if 'Name' in p:
+                    return p['Name']
+        for v in d.values():
+            r = walk(v)
+            if r:
+                return r
+    elif isinstance(d, list):
+        for v in d:
+            r = walk(v)
+            if r:
+                return r
+    return None
+name = walk(data)
+print(name or '')
+" 2>/dev/null)
+    if [[ -z "$NVME_DEVICE" ]]; then
+        NVME_DEVICE=$(ls -1 /dev/nvme*n1 2>/dev/null \
+            | sort -V | tail -1 | xargs -n1 basename | sed 's/n1$//')
+    fi
+    [[ -n "$NVME_DEVICE" ]] || { log_error "could not locate the connected NVMe controller"; return 1; }
+    RW_DEVICE="/dev/${NVME_DEVICE}n1"
+    [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; return 1; }
+}
+
+_nvme_logout() {
+    nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+    NVME_CONNECTED=0
+    NVME_DEVICE=""
+    # Give the kernel a moment to tear down /dev/nvmeXn1.
+    sleep 1
+}
+
+# Transport-agnostic wrappers. Idempotent.
+transport_login() {
+    if [[ $TRANSPORT_UP -eq 1 ]]; then return 0; fi
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        _iscsi_login || return 1
+    else
+        _nvme_login || return 1
+    fi
+    TRANSPORT_UP=1
+}
+
+transport_logout() {
+    if [[ $TRANSPORT_UP -eq 0 ]]; then return 0; fi
+    # Must umount before tearing the lower layer down.
     if [[ $MOUNT_UP -eq 1 ]]; then
         umount "$MOUNT_POINT" 2>/dev/null || true
         MOUNT_UP=0
     fi
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete >/dev/null 2>&1 || true
-    ISCSI_UP=0
-    ISCSI_CONNECTED=0
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        _iscsi_logout
+    else
+        _nvme_logout
+    fi
+    TRANSPORT_UP=0
     RW_DEVICE=""
-    RW_SG_DEVICE=""
 }
 
 # mkfs on first call, mount on every call after. Idempotent on
 # already-mounted.
 EXT4_MADE=0
 ensure_mounted() {
-    iscsi_login || return 1
+    transport_login || return 1
     if [[ $MOUNT_UP -eq 1 ]]; then return 0; fi
     if [[ $EXT4_MADE -eq 0 ]]; then
         log_info "mkfs.ext4 on $RW_DEVICE (first mount)"
@@ -637,13 +774,13 @@ op_umount_cycle() {
     mc_log_op umount_cycle
 }
 
-op_iscsi_logout_cycle() {
-    if [[ $ISCSI_UP -eq 0 ]]; then
-        mc_log_op iscsi_logout_cycle status=already_logged_out
+op_transport_logout_cycle() {
+    if [[ $TRANSPORT_UP -eq 0 ]]; then
+        mc_log_op transport_logout_cycle transport="$TRANSPORT" status=already_logged_out
         return 0
     fi
-    iscsi_logout
-    mc_log_op iscsi_logout_cycle
+    transport_logout
+    mc_log_op transport_logout_cycle transport="$TRANSPORT"
 }
 
 # ---------------------------------------------------------------------------
@@ -659,20 +796,20 @@ run_ops() {
         op=$(mc_pick_weighted op \
             "22:write_new" "14:overwrite" "14:append" "24:read_verify" \
             "8:delete" "4:truncate" "4:sync" \
-            "6:umount_cycle" "4:iscsi_logout_cycle")
+            "6:umount_cycle" "4:transport_logout_cycle")
         case "$op" in
-            write_new)            op_write_new || return 1 ;;
-            overwrite)            op_overwrite || return 1 ;;
-            append)               op_append || return 1 ;;
-            read_verify)          op_read_verify || return 1 ;;
-            delete)               op_delete || return 1 ;;
-            truncate)             op_truncate || return 1 ;;
-            sync)                 op_sync || return 1 ;;
-            umount_cycle)         op_umount_cycle || return 1 ;;
-            iscsi_logout_cycle)   op_iscsi_logout_cycle || return 1 ;;
+            write_new)                op_write_new || return 1 ;;
+            overwrite)                op_overwrite || return 1 ;;
+            append)                   op_append || return 1 ;;
+            read_verify)              op_read_verify || return 1 ;;
+            delete)                   op_delete || return 1 ;;
+            truncate)                 op_truncate || return 1 ;;
+            sync)                     op_sync || return 1 ;;
+            umount_cycle)             op_umount_cycle || return 1 ;;
+            transport_logout_cycle)   op_transport_logout_cycle || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
-            log_info "[$MC_OP_INDEX/$n] alive=${#ALIVE_PATHS[@]} mount=$MOUNT_UP iscsi=$ISCSI_UP"
+            log_info "[$MC_OP_INDEX/$n] alive=${#ALIVE_PATHS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
         fi
     done
 }
@@ -709,14 +846,14 @@ main() {
     echo ""
 
     check_prerequisites
-    assign_ports
+    assign_ports_mc
     create_test_config
     start_daemon
     ensure_volume
 
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
 
-    log_info "Running $OPS random ops (volume=${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME/$BACKEND_TYPE)"
+    log_info "Running $OPS random ops (transport=$TRANSPORT, volume=${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME/$BACKEND_TYPE)"
     if ! run_ops "$OPS"; then
         log_fail "Op loop aborted on failure"
         exit 1
@@ -733,7 +870,7 @@ main() {
     echo "========================================"
     echo "Final state:"
     echo "  alive files: ${#ALIVE_PATHS[@]}"
-    echo "  reusable reproducer: --seed $MC_SEED --ops $OPS"
+    echo "  reusable reproducer: --seed $MC_SEED --ops $OPS --transport $TRANSPORT"
     echo "  op log: $TEST_DIR/ops.log"
     exit 0
 }
