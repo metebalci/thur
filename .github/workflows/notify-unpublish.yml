@@ -1,54 +1,38 @@
-name: notify thur.metebalci.com on release/tag deletion
+name: notify thur.metebalci.com on release deletion
 
 # Bridge workflow — symmetric counterpart to notify-publish.yml. Fires
 # a repository_dispatch at metebalci/thur.metebalci.com so its
 # unpublish.yml can remove the artifacts for a recalled tag from the
 # apt/yum tree and regenerate the channel indices.
 #
-# Triggers on either lifecycle event:
-#   release:deleted   — release object removed (tag may still exist)
-#   delete (tag)      — git tag deleted (release may already be gone)
-# Both can fire from a single user action depending on order; the
-# downstream operation must be idempotent (deleting an already-gone
-# artifact is a no-op).
+# Triggers on release:deleted only. Tag deletion alone is intentionally
+# not a recall signal — a stray `git push --delete origin vX.Y.Z` would
+# otherwise yank packages from the public channel. Recalls go through
+# the deliberate "Delete release" UI/API path.
 #
 # Channel routing matches notify-publish.yml exactly:
 #   vN.M.P (no pre-release suffix)         -> stable channel
 #   vN.M.P-anything (alpha/beta/rc/...)    -> unstable channel
-# Non-version tags (anything not matching v<semver>) are skipped.
-#
-# Deletion is destructive — users who already ran `apt update` against
-# the channel and pinned the version will keep working, but new
-# installs and unpinned upgrades stop resolving once unpublish runs.
-# Use sparingly; for a botched release prefer cutting a new tag.
+# Non-version tags are skipped.
 #
 # Requires the same PUBLISH_DISPATCH_TOKEN secret as notify-publish.yml.
 
 on:
   release:
     types: [deleted]
-  delete:
 
 permissions:
   contents: read
 
 jobs:
   dispatch:
-    if: ${{ github.event_name == 'release' || github.event.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve deleted tag and channel
+      - name: Resolve channel from deleted release tag
         id: route
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          DELETED_REF: ${{ github.event.ref }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ "$EVENT_NAME" = "release" ]; then
-            TAG="$RELEASE_TAG"
-          else
-            TAG="$DELETED_REF"
-          fi
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
             echo "Ignoring non-version tag: $TAG"
             echo "skip=true" >> "$GITHUB_OUTPUT"
