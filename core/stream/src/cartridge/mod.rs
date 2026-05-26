@@ -98,6 +98,14 @@ pub struct CartridgeOpenOptions {
     /// only manipulate pool bytes by hash (upload worker, GC) and
     /// never touch `write_data` / `read_block`.
     at_rest_open_dek: Option<[u8; shared_crypto::KEY_LEN]>,
+    /// Mark this open as a non-owning "view" handle. The upload worker
+    /// (and any other caller that opens a cartridge while a primary
+    /// drive-side handle is loaded) reads chunk metadata and applies
+    /// upload outcomes, but must not run drop-time cleanup against the
+    /// trailing staging chunk — the drive owns that. With this set,
+    /// `Cartridge::drop` skips `flush_and_seal` and `runtime.persist`.
+    /// The drive-side handle's drop still owns those.
+    view_only: bool,
 }
 
 /// At-rest encryption parameters supplied by the daemon at create
@@ -163,6 +171,18 @@ impl CartridgeOpenOptions {
     /// backend before calling open.
     pub fn with_dek_for_open(mut self, dek: [u8; shared_crypto::KEY_LEN]) -> Self {
         self.at_rest_open_dek = Some(dek);
+        self
+    }
+
+    /// Mark this open as a non-owning "view" handle (upload worker, GC,
+    /// any out-of-band reader). The resulting [`Cartridge`] reads chunk
+    /// metadata and may apply upload outcomes via
+    /// `apply_chunk_upload_outcome`, but its `Drop` skips
+    /// `flush_and_seal` and `runtime.persist` so it never deletes the
+    /// trailing staging chunk the drive-side primary handle is using.
+    /// See issue #28 for the data-loss path this guards against.
+    pub fn with_view_only(mut self) -> Self {
+        self.view_only = true;
         self
     }
 
@@ -689,6 +709,13 @@ pub struct Cartridge {
     /// the staging chunk before pool insertion; the read seam reads
     /// it to decide whether to decrypt the fetched chunk.
     pub(super) at_rest_dek: Option<[u8; shared_crypto::KEY_LEN]>,
+    /// Non-owning view handle (set by
+    /// [`CartridgeOpenOptions::with_view_only`]). When `true`,
+    /// `Drop::drop` skips `flush_and_seal` and `runtime.persist` so
+    /// the upload worker / GC / out-of-band readers can't yank the
+    /// trailing staging chunk out from under the drive-side primary
+    /// handle that owns it (issue #28).
+    is_view_handle: bool,
 }
 
 /// Given an open manifest plus the active staging chunk, resolve the
@@ -890,6 +917,7 @@ impl Cartridge {
                     runtime,
                     opts.cloud_backend,
                     opts.at_rest_open_dek,
+                    opts.view_only,
                 )
             }
         }
@@ -974,6 +1002,7 @@ impl Cartridge {
                     runtime,
                     opts.cloud_backend,
                     opts.at_rest_open_dek,
+                    opts.view_only,
                 )
             }
         }
@@ -1153,6 +1182,7 @@ impl Cartridge {
             sealed_bytes: 0,
             early_warning_reported: false,
             at_rest_dek,
+            is_view_handle: false,
         };
         // Write manifest.json first (identity), then runtime.json. Both
         // atomic; on failure of either the caller (open_with) rolls
@@ -1173,6 +1203,7 @@ impl Cartridge {
         runtime: Runtime,
         cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
         at_rest_dek: Option<[u8; shared_crypto::KEY_LEN]>,
+        view_only: bool,
     ) -> Result<Self> {
         if m.backend.is_empty() {
             return Err(SmcError::InvalidOp(
@@ -1228,6 +1259,7 @@ impl Cartridge {
             sealed_bytes,
             early_warning_reported: false,
             at_rest_dek,
+            is_view_handle: view_only,
         })
     }
 
@@ -3020,6 +3052,20 @@ pub use shared_upload_worker::upload_chunk_inert;
 
 impl Drop for Cartridge {
     fn drop(&mut self) {
+        // View handles (upload worker, GC, any out-of-band reader
+        // opened while a drive-side primary handle holds the
+        // cartridge loaded) must not touch the trailing staging
+        // chunk on drop. The empty-chunk branch of `flush_and_seal`
+        // unlinks `.staging/chunk-<id>.dat` and truncates the
+        // chunk_index slot — yanking the staging file out from
+        // under the primary's open `cur_file` and surfacing as a
+        // post-write ENOENT on the next read (issue #28). Runtime
+        // sidecar persist is skipped too: the primary owns those
+        // counters and would clobber its in-flight updates.
+        if self.is_view_handle {
+            return;
+        }
+
         // Best-effort: seal (or clean up, if empty) the trailing staging
         // chunk so the on-disk state matches what's reachable via the
         // manifest. Failures are logged but never panic — Drop must not

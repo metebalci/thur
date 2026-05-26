@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, ChunkUploadOutcome, ObjectStoreBackend, PendingUploadPayload,
+    Cartridge, CartridgeOpenMode, CartridgeOpenOptions, ChunkUploadOutcome, ObjectStoreBackend,
+    PendingUploadPayload,
 };
 use shared_object_store::ObjectStoreConfig;
 use shared_upload_worker::run_upload_pipeline;
@@ -215,16 +216,25 @@ async fn resolve_backend<'a>(
 /// for the trailing chunk that `resume_or_create_active` allocates
 /// whenever all chunks are sealed (issue surfaced 2026-05-03 by
 /// `test-backup-storage.sh`).
+///
+/// View-only handle: the drive-side primary owns the trailing staging
+/// chunk. Without `with_view_only`, this handle's `Drop` would call
+/// `flush_and_seal` → unlink the staging file the drive is still
+/// writing to and truncate the chunk_index slot the block-index already
+/// references. Subsequent reads then ENOENT (issue #28). The flag tells
+/// `Cartridge::drop` to skip `flush_and_seal` and `runtime.persist`.
 async fn open_cart_and_hold_flag(
     tapes_root: &Path,
     tape_id: &str,
     cloud_backend: &dyn ObjectStoreBackend,
 ) -> Option<(Cartridge, bool)> {
-    let cart = match Cartridge::open_with_cloud(
+    let cart = match Cartridge::open_with(
         tapes_root,
         tape_id,
         CartridgeOpenMode::Open,
-        Some(cloud_backend.clone_box()),
+        CartridgeOpenOptions::new()
+            .with_cloud(Some(cloud_backend.clone_box()))
+            .with_view_only(),
     ) {
         Ok(c) => c,
         Err(e) => {

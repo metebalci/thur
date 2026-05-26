@@ -664,4 +664,103 @@ mod tests {
         assert!(cart.referenced_chunk_hashes().is_empty());
         assert_eq!(cart.next_lba(), 0);
     }
+
+    /// Regression test for issue #28: a view-only handle (upload
+    /// worker / GC) opened while a drive-side primary holds the
+    /// cartridge loaded must NOT delete the trailing empty staging
+    /// chunk on drop. Without `with_view_only`, the secondary's drop
+    /// runs `flush_and_seal` → unlinks `.staging/chunk-<id>.dat` and
+    /// truncates the chunk_index slot the primary's `cur_file` is
+    /// still appending to, surfacing on the next READ as
+    /// `HardwareError` / ENOENT.
+    #[test]
+    fn view_only_handle_drop_does_not_delete_trailing_staging() {
+        use super::super::{CartridgeOpenMode, CartridgeOpenOptions};
+
+        let tmp = TempDir::new().unwrap();
+        let tapes = tmp.path().join("tapes");
+
+        // Step 1: create the cartridge, write enough to seal chunk 0,
+        // then drop so flush_and_seal lands the trailing chunk in the
+        // pool. Mirrors a load_cycle's unload boundary.
+        {
+            let mut cart = Cartridge::create_with_chunking(
+                &tapes,
+                "VIEW28",
+                ChunkingMode::Fixed {
+                    size_bytes: 64 * 1024,
+                },
+                8,
+                "primary",
+                false,
+                DedupScope::Global,
+            )
+            .expect("create");
+            cart.write_data(Bytes::from(vec![0xABu8; 96 * 1024]))
+                .expect("write_data");
+            // Drop runs flush_and_seal → chunk 0 sealed (hash=Some).
+        }
+
+        // Step 2: reopen as the drive-side primary. resume_or_create_active
+        // sees chunk 0 sealed, takes the "All chunks sealed" branch,
+        // and allocates chunk 1 (empty staging, hash=None).
+        let mut primary = Cartridge::open_with(
+            &tapes,
+            "VIEW28",
+            CartridgeOpenMode::Open,
+            CartridgeOpenOptions::new(),
+        )
+        .expect("open primary");
+        let trailing_id = primary.cur_chunk_id;
+        let staging = staging_path(&primary.root, trailing_id);
+        assert!(
+            staging.exists(),
+            "primary must have created the staging file"
+        );
+        let chunks_idx_path = primary.root.join("chunks.idx");
+        let chunks_idx_len_before = fs::metadata(&chunks_idx_path)
+            .expect("chunks.idx metadata")
+            .len();
+        assert_eq!(primary.cur_chunk.size, 0);
+        assert!(primary.cur_chunk.hash.is_none());
+
+        // Step 3: open the same cartridge as a view-only handle (mirrors
+        // the upload worker's secondary open). Drop it.
+        {
+            let view = Cartridge::open_with(
+                &tapes,
+                "VIEW28",
+                CartridgeOpenMode::Open,
+                CartridgeOpenOptions::new().with_view_only(),
+            )
+            .expect("open view-only");
+            // Sanity: view sees the same trailing chunk.
+            assert_eq!(view.cur_chunk_id, trailing_id);
+            assert!(view.cur_chunk.hash.is_none());
+            // view drops here.
+        }
+
+        // Step 4: the staging file and the chunk_index slot must
+        // survive the view's drop.
+        assert!(
+            staging.exists(),
+            "view-only handle's drop must not unlink the trailing staging file"
+        );
+        let chunks_idx_len_after = fs::metadata(&chunks_idx_path).unwrap().len();
+        assert_eq!(
+            chunks_idx_len_before, chunks_idx_len_after,
+            "view-only handle's drop must not truncate chunks.idx"
+        );
+
+        // Step 5: the primary can still write to the trailing chunk
+        // and read it back. Pre-fix: this write went to an unlinked
+        // inode; the read tripped `HardwareError`.
+        primary
+            .write_data(Bytes::from(vec![0xCDu8; 4096]))
+            .expect("primary write after view drop");
+        let blk = primary
+            .read_block(primary.next_lba() - 1)
+            .expect("primary read after view drop");
+        assert_eq!(blk.data.len(), 4096);
+    }
 }
