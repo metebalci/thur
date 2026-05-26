@@ -62,8 +62,10 @@
 
 pub mod budget;
 pub mod disk_cache_size;
+pub mod ghost;
 pub use budget::{BackpressureError, PoolBudget};
 pub use disk_cache_size::{DiskCacheBounds, DiskCacheSize};
+pub use ghost::{GhostHash, GhostList};
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
