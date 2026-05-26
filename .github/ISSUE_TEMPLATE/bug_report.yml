@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a bug in Thur VTL or Thur VSA
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Please fill in the
+        fields below — they make triage much faster.
+
+        **Security vulnerabilities do not belong here.** Use the
+        repository's **Security** tab → **Report a vulnerability** to
+        open a private advisory instead.
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      description: Which product is affected?
+      options:
+        - Thur VTL
+        - Thur VSA
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `thurvtl --version` or `thurvsa --version`.
+      placeholder: "e.g. 0.4.2 (a1b2c3d)"
+    validations:
+      required: true
+  - type: textarea
+    id: deployment
+    attributes:
+      label: Deployment
+      description: |
+        Transport (iSCSI / NVMe-TCP), storage backend in use (S3 / GCS
+        / Azure / local / S3-compatible — name the provider), and host
+        OS + version.
+      placeholder: |
+        Transport: iSCSI
+        Backend: S3 (AWS)
+        Host OS: Ubuntu 26.04
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        Minimal steps to reproduce, what you expected, and what
+        happened instead. Logs from `journalctl -u thurvtld` /
+        `thurvsad` around the failure window help a lot.
+    validations:
+      required: true

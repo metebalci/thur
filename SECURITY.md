@@ -72,8 +72,7 @@ Out of scope:
 ## Current security posture
 
 - This is **alpha software**. It has not had an independent security
-  audit; that audit is a tracked prerequisite for the 1.0 GA release
-  (see [`ROADMAP.md`](ROADMAP.md)).
+  audit; one will be planned after the 1.0 GA release.
 - The admin **HTTP endpoint** (`/metrics`, `/health`, default port
   9090) is **unauthenticated by design** and intended only for a
   local Prometheus scrape. Do not expose it to untrusted networks;
