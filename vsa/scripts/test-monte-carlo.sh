@@ -64,13 +64,35 @@
 #   --http-port PORT      Override HTTP port
 #
 
-if [[ $EUID -ne 0 ]]; then
-    echo "[INFO] Re-executing under sudo..."
-    exec sudo "$0" "$@"
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Auto-load maintainer-private storage credentials before self-elevation
+# so they're in scope to forward across sudo. Same convention as
+# test-iscsi-fs-storage.sh.
+if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_DIR}/private/thur.env"
+    set +a
+fi
+
+# Self-elevate via sudo, forwarding backend-relevant env vars as
+# explicit KEY=VAL pairs. `sudo -E` is silently ignored on sudo-rs
+# (Ubuntu 26.04+); explicit forwarding is the only portable path.
+if [[ $EUID -ne 0 ]]; then
+    forward=()
+    for v in $(compgen -A variable); do
+        case "$v" in
+            AWS_*|GOOGLE_*|GCS_*|AZURE_*|AISTOR_*|WASABI_*|MINIO_*|THURVSA_*)
+                [[ -n "${!v}" ]] && forward+=("$v=${!v}")
+                ;;
+        esac
+    done
+    echo "[INFO] Re-executing under sudo with ${#forward[@]} env vars forwarded..."
+    exec sudo "${forward[@]}" "$0" "$@"
+fi
+
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 
@@ -334,9 +356,9 @@ ensure_volume() {
         log_info "Volume $VOLUME_NAME already present"
         return 0
     fi
-    log_info "Creating $VOLUME_NAME (${VOLUME_SIZE_MIB} MiB, dedup=$BACKEND_NAME)..."
+    log_info "Creating $VOLUME_NAME (${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME)..."
     "$CLI_PATH" --config "$TEST_CONFIG" volume create "$VOLUME_NAME" \
-        --size "${VOLUME_SIZE_MIB}M" --dedup "$BACKEND_NAME" >/dev/null
+        --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" >/dev/null
 }
 
 # Bring iSCSI session up. Idempotent — does nothing if already up.

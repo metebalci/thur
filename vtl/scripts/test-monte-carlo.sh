@@ -25,10 +25,17 @@
 # interesting boundary is the FastCDC ~64 KiB chunk, not the page,
 # but the same bucket layout catches both surfaces.
 #
+# Backend selection: defaults to an inline local backend. Set
+# THURVTL_TEST_BACKEND=<name> (or --backend <name>) to pick an entry
+# from a backends YAML (defaulting to private/storage-backends.yaml,
+# override via THURVTL_SOURCE_BACKENDS). The named backend's `prefix`
+# is overridden per-run so test data is isolated and purged on cleanup.
+#
 # Prerequisites:
 #   - mtx, mt-st, sg3-utils, open-iscsi, lsscsi, openssl
 #   - iscsid running (sudo systemctl enable --now iscsid)
 #   - Root/sudo access
+#   - For non-local backends: yq, the matching backend CLI, valid credentials
 #
 # Usage:
 #   ./vtl/scripts/test-monte-carlo.sh [OPTIONS]
@@ -37,6 +44,7 @@
 #   --seed N              Reproduce a prior run
 #   --quick               200 ops (default: 3000)
 #   --ops N               Override op count
+#   --backend NAME        Use named backend entry (same as THURVTL_TEST_BACKEND)
 #   --release             Use ./target/release/ binaries
 #   --daemon-path PATH    Override thurvtld path
 #   --cli-path PATH       Override thurvtl path
@@ -45,13 +53,35 @@
 #   --http-port PORT      Override HTTP port
 #
 
-if [[ $EUID -ne 0 ]]; then
-    echo "[INFO] Re-executing under sudo..."
-    exec sudo "$0" "$@"
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Auto-load maintainer-private storage credentials before self-elevation
+# so they're in scope to forward across sudo. Same convention as
+# test-backup-storage.sh.
+if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_DIR}/private/thur.env"
+    set +a
+fi
+
+# Self-elevate via sudo, forwarding backend-relevant env vars as
+# explicit KEY=VAL pairs. `sudo -E` is silently ignored on sudo-rs
+# (Ubuntu 26.04+); explicit forwarding is the only portable path.
+if [[ $EUID -ne 0 ]]; then
+    forward=()
+    for v in $(compgen -A variable); do
+        case "$v" in
+            AWS_*|GOOGLE_*|GCS_*|AZURE_*|AISTOR_*|WASABI_*|MINIO_*|THURVTL_*)
+                [[ -n "${!v}" ]] && forward+=("$v=${!v}")
+                ;;
+        esac
+    done
+    echo "[INFO] Re-executing under sudo with ${#forward[@]} env vars forwarded..."
+    exec sudo "${forward[@]}" "$0" "$@"
+fi
+
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 
@@ -72,6 +102,10 @@ OPS=""
 CHANGER_DEVICE=""
 TAPE_DEVICE=""
 NOREWIND_DEVICE=""
+BACKEND_NAME="${THURVTL_TEST_BACKEND:-}"
+SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
+BACKEND_TYPE=""
+TEST_PREFIX=""
 
 # Chassis: 4 cartridges in slots 1..4, 1 drive in element 0, 1 IE element.
 CARTS=(MC01L8 MC02L8 MC03L8 MC04L8)
@@ -99,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --seed) SEED="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --ops) OPS="$2"; shift 2 ;;
+        --backend) BACKEND_NAME="$2"; shift 2 ;;
         --release) BUILD_PROFILE="release"; shift ;;
         --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
         --cli-path) CLI_PATH="$2"; shift 2 ;;
@@ -126,6 +161,9 @@ cleanup() {
     if [[ -n "$DAEMON_PID" ]]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BACKEND_NAME" && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then
+        storage_purge_test_prefix 2>/dev/null || true
     fi
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
@@ -176,6 +214,10 @@ check_prerequisites() {
             missing+=("$tool"); hints+=("  - $tool: ${HINTS[$tool]}")
         fi
     done
+    if [[ -n "$BACKEND_NAME" ]] && ! command -v yq >/dev/null 2>&1; then
+        missing+=("yq")
+        hints+=("  - yq: sudo apt-get install yq  (needed to read $SOURCE_BACKENDS)")
+    fi
     if (( ${#missing[@]} > 0 )); then
         log_error "Missing prerequisites: ${missing[*]}"
         printf '%s\n' "${hints[@]}"
@@ -197,7 +239,10 @@ create_test_config() {
     if [[ -n "$SUDO_USER" ]]; then
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
     fi
-    cat > "$TEST_CONFIG" <<EOFCONFIG
+    if [[ -z "$BACKEND_NAME" ]]; then
+        BACKEND_NAME="local"
+        BACKEND_TYPE="local"
+        cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
 library:
@@ -227,6 +272,76 @@ keystore:
   backends:
     local: { type: local }
 EOFCONFIG
+        log_info "Backend: inline local at $TEST_DIR/local-backend"
+        return 0
+    fi
+
+    if [[ ! -r "$SOURCE_BACKENDS" ]]; then
+        log_error "Backend source YAML not found or unreadable: $SOURCE_BACKENDS"
+        echo "Set THURVTL_SOURCE_BACKENDS=<path>/backends.yaml or use --backend without setting one."
+        exit 1
+    fi
+    local exists
+    exists=$(yq -r ".storage.backends.\"$BACKEND_NAME\" // \"__missing__\"" "$SOURCE_BACKENDS")
+    if [[ "$exists" == "__missing__" ]]; then
+        log_error "Backend '$BACKEND_NAME' not found in $SOURCE_BACKENDS"
+        echo "Available:"
+        yq -r '.storage.backends | keys[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
+        exit 1
+    fi
+    BACKEND_TYPE=$(yq -r ".storage.backends.\"$BACKEND_NAME\".type" "$SOURCE_BACKENDS")
+    local retention
+    retention=$(yq -r ".storage.backends.\"$BACKEND_NAME\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+    if [[ "$retention" != "none" ]]; then
+        log_error "Backend '$BACKEND_NAME' has retention_mode='$retention' — refusing (test would create undeletable junk)."
+        exit 1
+    fi
+    TEST_PREFIX="monte-carlo/run-$$/$(date +%s)/"
+
+    # Globals for the storage_purge_test_prefix helper.
+    BACKEND_BUCKET=$(yq -r ".storage.backends.\"$BACKEND_NAME\".bucket // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$BACKEND_NAME\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_REGION=$(yq -r ".storage.backends.\"$BACKEND_NAME\".region // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$BACKEND_NAME\".storage_account // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$BACKEND_NAME\".container // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_AUTH_AKID_ENV=$(yq -r "(.storage.backends.\"$BACKEND_NAME\".auth.access_key_id_env // \"\")" "$SOURCE_BACKENDS")
+    BACKEND_AUTH_SECRET_ENV=$(yq -r "(.storage.backends.\"$BACKEND_NAME\".auth.secret_access_key_env // \"\")" "$SOURCE_BACKENDS")
+
+    local backend_yaml
+    backend_yaml=$(yq -y \
+        ".storage.backends.\"$BACKEND_NAME\" + { prefix: \"$TEST_PREFIX\" }" \
+        "$SOURCE_BACKENDS" | sed 's/^/      /')
+
+    cat > "$TEST_CONFIG" <<EOFCONFIG
+data_dir: "$TEST_DIR/data"
+
+library:
+  num_slots: $NUM_SLOTS
+  num_drives: $NUM_DRIVES
+  lto_generation: 8
+
+http:
+  listen: "127.0.0.1:$HTTP_PORT"
+
+iscsi:
+  listen: "127.0.0.1:$ISCSI_PORT"
+  target_iqn: "$TARGET_IQN"
+
+# /tmp is often tmpfs with little headroom — disable the free-floor
+# so chunk-seals aren't blocked by try_reserve.
+disk_cache:
+  disk_free_min_gb: 0
+
+storage:
+  backends:
+    $BACKEND_NAME:
+$backend_yaml
+
+keystore:
+  backends:
+    local: { type: local }
+EOFCONFIG
+    log_info "Backend: $BACKEND_NAME (type=$BACKEND_TYPE, prefix=$TEST_PREFIX)"
 }
 
 start_daemon() {
@@ -249,8 +364,9 @@ start_daemon() {
 create_cartridges() {
     local c
     for c in "${CARTS[@]}"; do
-        log_info "Creating cartridge $c..."
-        if ! "$CLI_PATH" --config "$TEST_CONFIG" cartridge create "$c" --lto-generation 8 >/dev/null 2>&1; then
+        log_info "Creating cartridge $c on backend $BACKEND_NAME..."
+        if ! "$CLI_PATH" --config "$TEST_CONFIG" cartridge create "$c" \
+            --lto-generation 8 --backend "$BACKEND_NAME" >/dev/null 2>&1; then
             log_error "cartridge create $c failed"
             tail -20 "${TEST_DIR}/daemon.log"
             exit 1
