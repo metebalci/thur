@@ -856,4 +856,39 @@ mod tests {
         let mut other = DiskCacheManager::new(tmp.path().to_path_buf(), "archive", 1 << 20);
         assert_eq!(other.calculate_usage().expect("usage"), 0);
     }
+
+    /// `hex_to_blake3` is the only failure-surfaceable helper on the
+    /// eviction path — its `None` return is what suppresses the ghost
+    /// list insert if a candidate hash is malformed. Confirm the
+    /// happy path round-trips and the error path stays silent.
+    #[test]
+    fn hex_to_blake3_round_trips_and_rejects_garbage() {
+        let canonical = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = hex_to_blake3(canonical).expect("valid hex");
+        assert_eq!(&bytes[..4], &[0x00, 0x11, 0x22, 0x33]);
+        assert_eq!(&bytes[28..], &[0xcc, 0xdd, 0xee, 0xff]);
+
+        // Wrong length, non-hex chars, empty — all return None and the
+        // caller treats that as "skip the ghost-list insert" (the
+        // eviction itself still happens).
+        assert!(hex_to_blake3("").is_none());
+        assert!(hex_to_blake3("abc").is_none());
+        assert!(hex_to_blake3("xx112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").is_none());
+    }
+
+    /// Setter wiring contract: a fresh manager starts with no ghost
+    /// list; `set_ghost_list` retains the `Arc`. The full
+    /// evict-then-lookup integration is covered by the VSA-side
+    /// counterpart in `core/block/src/disk_cache.rs` — the eviction
+    /// path is the same shape (decode hex, `gl.insert(...)`) so a
+    /// regression here would also surface there.
+    #[test]
+    fn set_ghost_list_is_plumbed() {
+        use std::sync::Arc;
+        let mut cache = DiskCacheManager::new(PathBuf::from("/tmp"), "primary", 1024 * 1024);
+        assert!(cache.ghost_list.is_none());
+        let gl = Arc::new(shared_pool::GhostList::new("primary", 64));
+        cache.set_ghost_list(gl);
+        assert!(cache.ghost_list.is_some());
+    }
 }

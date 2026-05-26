@@ -911,4 +911,46 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(ns_pool.exists(&shared_hash));
     }
+
+    /// End-to-end: an `evict_lru_chunks` pass that actually unlinks a
+    /// chunk must populate the wired ghost list with that chunk's
+    /// hash. This is the seam the cache-miss read path will later
+    /// query.
+    #[test]
+    fn eviction_populates_ghost_list() {
+        use crate::page_index::PageIndex;
+        use shared_pool::GhostList;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+
+        let ns_pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (evictable_hash, _) = ns_pool.insert_bytes(&[0x42; 4096]).unwrap();
+
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let hash_bytes: [u8; 32] = hex::decode(&evictable_hash).unwrap().try_into().unwrap();
+        pages.set(0, &hash_bytes).unwrap();
+
+        let gl = Arc::new(GhostList::new("primary", 1024));
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 0);
+        mgr.set_ghost_list(gl.clone());
+        mgr.calculate_usage().unwrap();
+        let freed = mgr.evict_lru_chunks().unwrap();
+        assert_eq!(freed, 4096, "chunk should have been evicted");
+        // Same hash bytes the cache-miss path would compute from the
+        // page_index entry — lookup must hit.
+        assert!(
+            gl.lookup(&hash_bytes, now_unix_secs() + 1).is_some(),
+            "ghost list should carry the evicted chunk"
+        );
+    }
 }
