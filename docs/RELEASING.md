@@ -289,7 +289,13 @@ new HEAD. Don't re-use the tag from the broken commit.
 To retract a published release: delete the GitHub Release and its
 remote tag (`gh release delete v0.2.0 --cleanup-tag --yes`), drop
 the local tag (`git tag -d v0.2.0`), then bump the version forward
-and cut a new one. Don't reuse a version number.
+and cut a new one. Don't reuse a version number. Deleting the
+Release also fires the `notify-unpublish.yml` bridge (see §
+Package repository) and auto-removes the matching `.deb` / `.rpm`
+from the apt + yum channel — provided the bridge workflow file
+was already present on the release's tag commit. For releases cut
+before the bridge existed, run `unpublish.yml` over in
+`thur.metebalci.com` manually to clean the channel.
 
 ## Package repository
 
@@ -323,6 +329,17 @@ with the routed channel — `vN.M.P` lands in `stable`,
 `vN.M.P-anything` lands in `unstable`. Both channels accumulate, so
 operators can pin against a specific tag rather than always taking the
 latest.
+
+Recalls run the same bridge in reverse. A companion
+`notify-unpublish.yml` workflow listens for `release.deleted` events
+here and fires `repository_dispatch` at `thur.metebalci.com`'s
+`unpublish.yml`, which scrubs the matching `.deb` / `.rpm` from the
+channel and re-signs the indices. The bridge intentionally ignores
+bare tag deletions — a stray `git push --delete` shouldn't be able to
+yank a published version. GitHub runs the unpublish workflow against
+the release tag's commit (not `main` HEAD), so releases cut before
+this bridge existed need a manual `workflow_dispatch` over in
+`thur.metebalci.com` to clean the channel.
 
 The target audience is expected to pin versions, validate in staging, and
 deploy in change windows — not to `apt upgrade` storage software blindly.
