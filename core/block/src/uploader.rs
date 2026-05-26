@@ -355,6 +355,12 @@ pub struct VolumeWriter {
     /// dispatch, telemetry) can read the live value without
     /// holding the `VolumeWriter`.
     sync_after: Arc<AtomicU8>,
+    /// Per-backend ghost list of recently-evicted chunk hashes. When
+    /// set, the cache-miss path in `read_page` consults it before
+    /// each backend GET and records the eviction age into the
+    /// `cache_miss_after_eviction` histogram. None for CLI / test
+    /// paths; the daemon calls `set_ghost_list` after open.
+    ghost_list: Option<Arc<shared_pool::GhostList>>,
 }
 
 impl Drop for VolumeWriter {
@@ -456,6 +462,7 @@ impl VolumeWriter {
             upload_sender: None,
             pending_uploads: PendingUploads::new(),
             sync_after,
+            ghost_list: None,
         })
     }
 
@@ -476,6 +483,17 @@ impl VolumeWriter {
     pub fn with_pool_budget(mut self, budget: Arc<PoolBudget>, deadline: Duration) -> Self {
         self.pool_budget = budget;
         self.backpressure_deadline = deadline;
+        self
+    }
+
+    /// Wire the per-backend ghost list. The `read_page` miss site
+    /// consults it on every backend GET to bucket eviction-to-refetch
+    /// ages into the `cache_miss_after_eviction` histogram. Mirrors
+    /// the `set_ghost_list` on `DiskCacheManager` — the same `Arc`
+    /// flows through both so the read side reads what the eviction
+    /// side wrote.
+    pub fn with_ghost_list(mut self, gl: Arc<shared_pool::GhostList>) -> Self {
+        self.ghost_list = Some(gl);
         self
     }
 
@@ -875,6 +893,14 @@ impl VolumeWriter {
         let (payload, cloud_bytes) = if self.pool.exists(&hash_hex) {
             (self.pool.read_bytes(&hash_hex)?, 0u64)
         } else {
+            if let Some(gl) = self.ghost_list.as_ref() {
+                if let Some(age) = gl.lookup(&hash, now_unix_secs()) {
+                    shared_telemetry::record::cache_miss_after_eviction(
+                        gl.backend(),
+                        age as f64,
+                    );
+                }
+            }
             let object_key = self.pool.object_key(&hash_hex);
             let bytes = self.backend.download_chunk(&object_key).await?;
             let cloud_bytes = bytes.len() as u64;

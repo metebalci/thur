@@ -80,6 +80,7 @@ pub struct DaemonStateConfig {
     pub drive_compression_algorithm: CompressionAlgo,
     pub drive_compression_zstd_level: i32,
     pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
+    pub ghost_lists: HashMap<String, Arc<core_mediachanger::GhostList>>,
     pub backpressure_max_wait: Duration,
 }
 
@@ -150,6 +151,7 @@ impl DaemonState {
                 cfg.drive_compression_zstd_level,
             );
             dm.set_pool_budgets(cfg.pool_budgets, cfg.backpressure_max_wait);
+            dm.set_ghost_lists(cfg.ghost_lists);
             // Capture the library-wide drive LTO generation so
             // load_cartridge can gate on cartridge generation at
             // runtime (higher-gen cartridge into lower-gen drive
@@ -239,6 +241,7 @@ mod tests {
             drive_compression_algorithm: CompressionAlgo::Lz4,
             drive_compression_zstd_level: 3,
             pool_budgets: HashMap::new(),
+            ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
         };
 

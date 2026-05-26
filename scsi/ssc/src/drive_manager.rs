@@ -6,7 +6,7 @@
 use core_mediachanger::errors::SmcError;
 use core_mediachanger::{
     Cartridge, CartridgeOpenMode, CompressionAlgo, DriveCompressionState, DrivePageStore,
-    DriveState, LibraryDriveState, PoolBudget,
+    DriveState, GhostList, LibraryDriveState, PoolBudget,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,11 @@ pub struct DriveManager {
     /// Empty map (and `backpressure_deadline = 60 s`) is the test /
     /// non-daemon default.
     pool_budgets: HashMap<String, Arc<PoolBudget>>,
+    /// Per-backend ghost lists, keyed by `cloud.backends` entry name.
+    /// Wired into every cartridge at load time so the cache-miss
+    /// read path can record `cache_miss_after_eviction` histogram
+    /// entries.
+    ghost_lists: HashMap<String, Arc<GhostList>>,
     /// Maximum time a chunk-seal blocks on the budget before
     /// surfacing `Backpressured` (mapped to SCSI NOT READY). Mirrors
     /// `upload.backpressure_max_wait_seconds` in the daemon config.
@@ -189,6 +194,7 @@ impl DriveManager {
             drive_compression_algorithm,
             drive_compression_zstd_level,
             pool_budgets: HashMap::new(),
+            ghost_lists: HashMap::new(),
             backpressure_deadline: Duration::from_secs(60),
             state_file,
             library_lto_generation: 0,
@@ -240,6 +246,14 @@ impl DriveManager {
     ) {
         self.pool_budgets = pool_budgets;
         self.backpressure_deadline = backpressure_deadline;
+    }
+
+    /// Wire per-backend ghost lists into this manager. Called once at
+    /// daemon startup; every subsequent `load_cartridge` will set the
+    /// matching ghost list on the loaded cartridge so the read path's
+    /// cache-miss site can record histogram entries.
+    pub fn set_ghost_lists(&mut self, ghost_lists: HashMap<String, Arc<GhostList>>) {
+        self.ghost_lists = ghost_lists;
     }
 
     /// Lock a single drive's mutex. Returns `InvalidDrive` if the id
@@ -573,6 +587,9 @@ impl DriveManager {
         // tests / partial setups behave sanely.
         if let Some(budget) = self.pool_budgets.get(cartridge.backend()) {
             cartridge.set_pool_budget(budget.clone(), self.backpressure_deadline);
+        }
+        if let Some(gl) = self.ghost_lists.get(cartridge.backend()) {
+            cartridge.set_ghost_list(gl.clone());
         }
 
         drive.cartridge = Some(cartridge);

@@ -124,4 +124,4 @@ pub use core_stream::legal_hold::{
 pub use core_stream::mode_state::{DrivePageStore, SavedDrivePage};
 pub use core_stream::prefetch::{ChunkLocationInfo, PrefetchConfig, PrefetchManager};
 pub use core_stream::tape::{Block, BlockKind, Filemark};
-pub use core_stream::{BackpressureError, DiskCacheBounds, DiskCacheSize, PoolBudget};
+pub use core_stream::{BackpressureError, DiskCacheBounds, DiskCacheSize, GhostList, PoolBudget};

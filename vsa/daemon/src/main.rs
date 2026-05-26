@@ -336,6 +336,25 @@ async fn main() -> Result<()> {
         );
         map
     };
+
+    // Per-backend ghost lists, parallel to pool_budgets. Drives the
+    // cache_miss_after_eviction histogram via the read-path miss site
+    // in `VolumeWriter::read_page` and the eviction-unlink site in
+    // `DiskCacheManager`.
+    let ghost_lists: std::collections::HashMap<String, Arc<shared_pool::GhostList>> = {
+        let mut map = std::collections::HashMap::new();
+        for name in cfg.storage.backend_names() {
+            map.insert(
+                name.clone(),
+                Arc::new(shared_pool::GhostList::new(
+                    name,
+                    cfg.disk_cache.ghost_ring_size,
+                )),
+            );
+        }
+        map
+    };
+
     let backpressure_deadline =
         std::time::Duration::from_secs(cfg.disk_cache.backpressure_max_wait_seconds);
 
@@ -355,6 +374,7 @@ async fn main() -> Result<()> {
         &cfg.keystore,
         max_concurrent_flushes,
         &pool_budgets,
+        &ghost_lists,
         backpressure_deadline,
         Some(upload_tx.clone()),
     )
@@ -636,6 +656,7 @@ async fn main() -> Result<()> {
     let eviction_worker_handle = {
         let data_dir = data_dir.clone();
         let pool_budgets = pool_budgets.clone();
+        let ghost_lists = ghost_lists.clone();
         let interval_secs = cfg.disk_cache.eviction_interval_seconds.max(1);
         let recent_seal_pin_seconds = cfg.disk_cache.recent_seal_pin_seconds;
         let default_size = cfg.disk_cache.size_gb;
@@ -646,6 +667,7 @@ async fn main() -> Result<()> {
             run_disk_cache_eviction_worker(
                 data_dir,
                 pool_budgets,
+                ghost_lists,
                 backend_names,
                 std::time::Duration::from_secs(interval_secs),
                 recent_seal_pin_seconds,
@@ -818,6 +840,7 @@ async fn wait_for_shutdown() -> Result<()> {
 async fn run_disk_cache_eviction_worker(
     data_dir: std::path::PathBuf,
     pool_budgets: std::collections::HashMap<String, Arc<shared_pool::PoolBudget>>,
+    ghost_lists: std::collections::HashMap<String, Arc<shared_pool::GhostList>>,
     backend_names: Vec<String>,
     interval: std::time::Duration,
     recent_seal_pin_seconds: u64,
@@ -879,6 +902,9 @@ async fn run_disk_cache_eviction_worker(
             let cap = budget.cap_bytes();
             let mut cm = DiskCacheManager::new(data_dir.clone(), name, cap);
             cm.set_pool_budget(budget.clone());
+            if let Some(gl) = ghost_lists.get(name) {
+                cm.set_ghost_list(gl.clone());
+            }
             cm.set_recent_seal_pin_seconds(recent_seal_pin_seconds);
             let used = match cm.calculate_usage() {
                 Ok(u) => u,

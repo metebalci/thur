@@ -57,5 +57,5 @@ pub use legal_hold::{
 };
 pub use mode_state::{DrivePageStore, SavedDrivePage};
 pub use prefetch::{ChunkLocationInfo, PrefetchConfig, PrefetchManager};
-pub use shared_pool::{BackpressureError, DiskCacheBounds, DiskCacheSize, PoolBudget};
+pub use shared_pool::{BackpressureError, DiskCacheBounds, DiskCacheSize, GhostList, PoolBudget};
 pub use tape::{Block, BlockKind, Filemark};

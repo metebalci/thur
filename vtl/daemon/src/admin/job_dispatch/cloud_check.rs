@@ -180,6 +180,7 @@ mod tests {
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,
             drive_compression_zstd_level: 3,
             pool_budgets: HashMap::new(),
+            ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
         };
         Arc::new(DaemonState::new(cfg))

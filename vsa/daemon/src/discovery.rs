@@ -57,6 +57,7 @@ pub async fn discover_and_register(
     keystore_config: &KeystoreYamlConfig,
     max_concurrent_flushes: usize,
     pool_budgets: &HashMap<String, Arc<PoolBudget>>,
+    ghost_lists: &HashMap<String, Arc<shared_pool::GhostList>>,
     backpressure_deadline: Duration,
     upload_sender: Option<mpsc::Sender<UploadTask>>,
 ) -> Result<(
@@ -238,6 +239,7 @@ pub async fn discover_and_register(
             .get(&m.backend)
             .cloned()
             .unwrap_or_else(|| Arc::new(PoolBudget::unbounded(data_dir.to_path_buf())));
+        let ghost_list = ghost_lists.get(&m.backend).cloned();
         let writer = if let Some(enc) = m.encryption.as_ref() {
             let ks = keystores
                 .get(&enc.keystore_backend)
@@ -269,6 +271,9 @@ pub async fn discover_and_register(
             let mut w = VolumeWriter::open_with_key(data_dir, &m.name, backend, *secret.as_bytes())
                 .with_context(|| format!("open encrypted volume writer for '{}'", m.name))?
                 .with_pool_budget(pool_budget, backpressure_deadline);
+            if let Some(gl) = ghost_list.clone() {
+                w = w.with_ghost_list(gl);
+            }
             if let Some(s) = upload_sender.clone() {
                 w = w.with_upload_sender(s);
             }
@@ -277,6 +282,9 @@ pub async fn discover_and_register(
             let mut w = VolumeWriter::open(data_dir, &m.name, backend)
                 .with_context(|| format!("open volume writer for '{}'", m.name))?
                 .with_pool_budget(pool_budget, backpressure_deadline);
+            if let Some(gl) = ghost_list.clone() {
+                w = w.with_ghost_list(gl);
+            }
             if let Some(s) = upload_sender.clone() {
                 w = w.with_upload_sender(s);
             }
@@ -375,6 +383,7 @@ backends:
             &local_keystore_backends(),
             1,
             &HashMap::new(),
+            &HashMap::new(),
             Duration::from_secs(30),
             None,
         )
@@ -400,6 +409,7 @@ backends:
             &cfg,
             &local_keystore_backends(),
             1,
+            &HashMap::new(),
             &HashMap::new(),
             Duration::from_secs(30),
             None,
@@ -428,6 +438,7 @@ backends:
             &cfg,
             &local_keystore_backends(),
             1,
+            &HashMap::new(),
             &HashMap::new(),
             Duration::from_secs(30),
             None,
@@ -477,6 +488,7 @@ backends:
             &cfg,
             &local_keystore_backends(),
             1,
+            &HashMap::new(),
             &HashMap::new(),
             Duration::from_secs(30),
             None,
@@ -533,6 +545,7 @@ backends:
             &local_keystore_backends(),
             1,
             &HashMap::new(),
+            &HashMap::new(),
             Duration::from_secs(30),
             None,
         )
@@ -570,6 +583,7 @@ backends:
             &local_keystore_backends(),
             1,
             &HashMap::new(),
+            &HashMap::new(),
             Duration::from_secs(30),
             None,
         )
@@ -599,6 +613,7 @@ backends:
             &cfg,
             &local_keystore_backends(),
             1,
+            &HashMap::new(),
             &HashMap::new(),
             Duration::from_secs(30),
             None,

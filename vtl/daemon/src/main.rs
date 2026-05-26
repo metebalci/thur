@@ -460,6 +460,16 @@ struct DiskCacheConfig {
     /// the RC/GA validation task.
     #[serde(default = "default_recent_seal_pin_seconds")]
     recent_seal_pin_seconds: u64,
+
+    /// Per-backend ghost-list ring size. Each entry is ~100 B
+    /// (32 B BLAKE3 + 8 B timestamp + HashMap overhead); the default
+    /// 100,000 sets each backend's ring to roughly 10 MB. The ring
+    /// drives the `cache_miss_after_eviction_seconds` histogram — on
+    /// every cache miss the chunk hash is looked up against the ring
+    /// to bucket "how long ago was this evicted?" Set to `0` to
+    /// disable the ring (no histogram observations).
+    #[serde(default = "default_ghost_ring_size")]
+    ghost_ring_size: usize,
 }
 
 impl DiskCacheConfig {
@@ -491,6 +501,10 @@ fn default_recent_seal_pin_seconds() -> u64 {
     0
 }
 
+fn default_ghost_ring_size() -> usize {
+    100_000
+}
+
 impl Default for DiskCacheConfig {
     fn default() -> Self {
         Self {
@@ -500,6 +514,7 @@ impl Default for DiskCacheConfig {
             localonly_soft_watermark_pct: default_localonly_soft_watermark_pct(),
             disk_free_min_gb: default_disk_free_min_gb(),
             recent_seal_pin_seconds: default_recent_seal_pin_seconds(),
+            ghost_ring_size: default_ghost_ring_size(),
         }
     }
 }
@@ -1286,6 +1301,24 @@ async fn main() -> Result<()> {
         map
     };
 
+    // 🔸 Build per-backend ghost lists used by the cache-miss
+    // telemetry path (cache_miss_after_eviction_seconds histogram).
+    // One Arc<GhostList> per backend, parallel to pool_budgets.
+    // Capacity comes from disk_cache.ghost_ring_size; 0 disables.
+    let ghost_lists: std::collections::HashMap<String, Arc<core_mediachanger::GhostList>> = {
+        let mut map = std::collections::HashMap::new();
+        for name in cfg.storage.backend_names() {
+            map.insert(
+                name.clone(),
+                Arc::new(core_mediachanger::GhostList::new(
+                    name,
+                    cfg.disk_cache.ghost_ring_size,
+                )),
+            );
+        }
+        map
+    };
+
     // 🔸 Start event-driven upload worker (Phase 4: Event-Driven Uploads)
     info!("Starting event-driven cloud upload worker");
     let cfg_clone = cfg.clone();
@@ -1313,11 +1346,13 @@ async fn main() -> Result<()> {
     let cfg_clone = cfg.clone();
     let disk_cache_evict_notify_worker = Arc::clone(&disk_cache_evict_notify);
     let pool_budgets_for_eviction = pool_budgets.clone();
+    let ghost_lists_for_eviction = ghost_lists.clone();
     let disk_cache_worker_handle = tokio::spawn(async move {
         run_disk_cache_eviction_worker(
             &cfg_clone,
             disk_cache_evict_notify_worker,
             pool_budgets_for_eviction,
+            ghost_lists_for_eviction,
         )
         .await;
     });
@@ -1540,6 +1575,7 @@ async fn main() -> Result<()> {
         drive_compression_algorithm: drive_cfg.compression.algorithm,
         drive_compression_zstd_level: drive_cfg.compression.zstd_level,
         pool_budgets: pool_budgets.clone(),
+        ghost_lists: ghost_lists.clone(),
         backpressure_max_wait,
     }));
 
@@ -2019,6 +2055,7 @@ async fn run_disk_cache_eviction_worker(
     cfg: &Config,
     notify: Arc<tokio::sync::Notify>,
     pool_budgets: std::collections::HashMap<String, Arc<core_mediachanger::PoolBudget>>,
+    ghost_lists: std::collections::HashMap<String, Arc<core_mediachanger::GhostList>>,
 ) {
     use core_mediachanger::DiskCacheManager;
     use std::path::PathBuf;
@@ -2107,6 +2144,9 @@ async fn run_disk_cache_eviction_worker(
                 let mut cm = DiskCacheManager::new(data_dir.clone(), name, cap);
                 if let Some(budget) = pool_budgets.get(name) {
                     cm.set_pool_budget(budget.clone());
+                }
+                if let Some(gl) = ghost_lists.get(name) {
+                    cm.set_ghost_list(gl.clone());
                 }
                 cm.set_recent_seal_pin_seconds(cfg.disk_cache.recent_seal_pin_seconds);
                 cm

@@ -716,6 +716,12 @@ pub struct Cartridge {
     /// trailing staging chunk out from under the drive-side primary
     /// handle that owns it (issue #28).
     is_view_handle: bool,
+    /// Per-backend ghost list of recently-evicted chunk hashes. When
+    /// set, the cache-miss path consults it before each backend GET
+    /// and records the eviction age (now - evicted_at) into the
+    /// `cache_miss_after_eviction` histogram. None for CLI / test
+    /// paths; the daemon calls `set_ghost_list` after open.
+    ghost_list: Option<Arc<shared_pool::GhostList>>,
 }
 
 /// Given an open manifest plus the active staging chunk, resolve the
@@ -1183,6 +1189,7 @@ impl Cartridge {
             early_warning_reported: false,
             at_rest_dek,
             is_view_handle: false,
+            ghost_list: None,
         };
         // Write manifest.json first (identity), then runtime.json. Both
         // atomic; on failure of either the caller (open_with) rolls
@@ -1260,6 +1267,7 @@ impl Cartridge {
             early_warning_reported: false,
             at_rest_dek,
             is_view_handle: view_only,
+            ghost_list: None,
         })
     }
 
@@ -1983,6 +1991,17 @@ impl Cartridge {
                 chunk_id,
                 &hash[..8]
             );
+            if let Some(gl) = self.ghost_list.as_ref() {
+                let mut hash_bytes = [0u8; 32];
+                if hex::decode_to_slice(&hash, &mut hash_bytes).is_ok() {
+                    if let Some(age) = gl.lookup(&hash_bytes, now_timestamp()) {
+                        shared_telemetry::record::cache_miss_after_eviction(
+                            gl.backend(),
+                            age as f64,
+                        );
+                    }
+                }
+            }
             let data = backend.download_chunk(&object_key).await?;
 
             // Hand the BLAKE3 verify + atomic tmp+rename to
@@ -2685,6 +2704,16 @@ impl Cartridge {
     pub fn set_pool_budget(&mut self, budget: Arc<PoolBudget>, deadline: std::time::Duration) {
         self.pool_budget = budget;
         self.backpressure_deadline = deadline;
+    }
+
+    /// Wire the per-backend ghost list. The cache-miss path consults it
+    /// on every backend GET to bucket eviction-to-refetch ages into the
+    /// `cache_miss_after_eviction` histogram. Mirrors the
+    /// `set_ghost_list` on `DiskCacheManager` — the same `Arc` flows
+    /// through both so the read side reads what the eviction side
+    /// wrote.
+    pub fn set_ghost_list(&mut self, gl: Arc<shared_pool::GhostList>) {
+        self.ghost_list = Some(gl);
     }
 
     /// Trigger prefetch after a read operation

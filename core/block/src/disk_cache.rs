@@ -125,6 +125,12 @@ pub struct DiskCacheManager {
     /// candidate. See [`Self::set_recent_seal_pin_seconds`]. `0`
     /// (the default) disables the pin.
     recent_seal_pin_seconds: u64,
+    /// Per-backend ghost list of recently-evicted chunk hashes. When
+    /// set, every successful unlink calls `insert` with the chunk's
+    /// hash + the current wall-clock; the read-path miss site reads
+    /// this same list to bucket re-fetch ages into the
+    /// `cache_miss_after_eviction` histogram. None for tests.
+    ghost_list: Option<Arc<shared_pool::GhostList>>,
 }
 
 /// A sealed pool chunk eligible for eviction. `namespace` selects
@@ -154,6 +160,7 @@ impl DiskCacheManager {
             current_bytes: 0,
             pool_budget: None,
             recent_seal_pin_seconds: 0,
+            ghost_list: None,
         }
     }
 
@@ -177,6 +184,13 @@ impl DiskCacheManager {
     /// from `vsa/daemon`.
     pub fn set_recent_seal_pin_seconds(&mut self, seconds: u64) {
         self.recent_seal_pin_seconds = seconds;
+    }
+
+    /// Wire the per-backend ghost list. Every successful unlink in
+    /// `evict_lru_chunks` will insert the evicted chunk's hash so the
+    /// read-path miss site can bucket re-fetch ages.
+    pub fn set_ghost_list(&mut self, gl: Arc<shared_pool::GhostList>) {
+        self.ghost_list = Some(gl);
     }
 
     /// Backend name this manager is scoped to.
@@ -334,6 +348,11 @@ impl DiskCacheManager {
                     freed += c.size;
                     if let Some(budget) = self.pool_budget.as_ref() {
                         budget.release(c.size, c.namespace.as_deref());
+                    }
+                    if let Some(gl) = self.ghost_list.as_ref() {
+                        if let Some(hash_bytes) = hex_to_blake3(&c.hash) {
+                            gl.insert(hash_bytes, now_unix_secs());
+                        }
                     }
                     debug!(
                         "Evicted chunk {}.. ({} B, ns {:?}) from backend '{}'",
@@ -547,6 +566,15 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Decode a 64-character BLAKE3 hex string into the 32-byte ghost-list
+/// key shape. Returns `None` on any malformed input — caller treats
+/// that as "skip the ghost-list insert" (the eviction still happens).
+fn hex_to_blake3(hex_str: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex_str, &mut out).ok()?;
+    Some(out)
 }
 
 /// Lightweight summary of a volume manifest for cache scans —

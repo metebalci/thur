@@ -144,6 +144,16 @@ disk_cache:
   # (pure LRU); the default may change before RC/GA after a
   # workload-trace validation pass — see ROADMAP.md.
   recent_seal_pin_seconds: 0
+  # Per-backend "ghost list" ring size. Each entry is ~100 bytes
+  # (32 B BLAKE3 hash + 8 B timestamp + HashMap overhead), so the
+  # default 100,000 sets each backend's ring to roughly 10 MB. The
+  # ring tracks recently-evicted chunk hashes; on every cache miss
+  # the chunk hash is looked up against the ring and the eviction
+  # age (now - evicted_at) is bucketed into the
+  # cache_miss_after_eviction_seconds histogram. Mass in the low
+  # buckets means cache undersized; mass in the high buckets means
+  # organic miss workload. Set to 0 to disable.
+  ghost_ring_size: 100000
 
 # HTTP server (health, metrics). Endpoints under http.listen:
 #   /health   - Health check (JSON; daemon, version, volume_count)

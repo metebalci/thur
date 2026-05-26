@@ -150,6 +150,16 @@ pub struct DiskCacheSettings {
     /// the RC/GA validation task.
     #[serde(default = "default_recent_seal_pin_seconds")]
     pub recent_seal_pin_seconds: u64,
+
+    /// Per-backend ghost-list ring size. Each entry is ~100 B
+    /// (32 B BLAKE3 + 8 B timestamp + HashMap overhead); the default
+    /// 100,000 sets each backend's ring to roughly 10 MB. The ring
+    /// drives the `cache_miss_after_eviction_seconds` histogram — on
+    /// every cache miss the chunk hash is looked up against the ring
+    /// to bucket "how long ago was this evicted?" Set to `0` to
+    /// disable the ring (no histogram observations).
+    #[serde(default = "default_ghost_ring_size")]
+    pub ghost_ring_size: usize,
 }
 
 fn default_min_size_gb() -> u64 {
@@ -180,6 +190,10 @@ fn default_recent_seal_pin_seconds() -> u64 {
     0
 }
 
+fn default_ghost_ring_size() -> usize {
+    100_000
+}
+
 impl Default for DiskCacheSettings {
     fn default() -> Self {
         Self {
@@ -191,6 +205,7 @@ impl Default for DiskCacheSettings {
             backpressure_max_wait_seconds: default_backpressure_max_wait_seconds(),
             eviction_interval_seconds: default_eviction_interval_seconds(),
             recent_seal_pin_seconds: default_recent_seal_pin_seconds(),
+            ghost_ring_size: default_ghost_ring_size(),
         }
     }
 }
