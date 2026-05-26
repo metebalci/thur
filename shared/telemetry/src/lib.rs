@@ -303,6 +303,12 @@ struct TelemetryInner {
 
     // ── cache (VSA per-volume page cache) ──
     cache_evictions_total: Counter<u64>,
+    /// Distribution of `now - evicted_at` for cache misses whose chunk
+    /// had been recently evicted from this backend's pool. Mass in the
+    /// low buckets → cache undersized by that window; mass past 256 s
+    /// → organic miss, bigger cache won't help. Bucket boundaries are
+    /// explicit (log-uniform) rather than OTel's defaults.
+    cache_miss_after_eviction_seconds: Histogram<f64>,
 
     // ── SCSI EXTENDED COPY (VSA VAAI XCOPY) ──
     /// One increment per EXTENDED COPY command, labeled
@@ -494,6 +500,16 @@ impl Telemetry {
                 KeyValue::new("outcome", outcome.to_string()),
             ],
         );
+    }
+
+    /// Record a cache miss whose chunk had been recently evicted from
+    /// `backend`'s pool. `seconds` is `now - evicted_at` from the
+    /// ghost list. A miss with no ghost-list hit is silent — it
+    /// either predates the ring or is a chunk we never cached at all.
+    pub fn cache_record_miss_after_eviction(&self, backend: &str, seconds: f64) {
+        self.inner
+            .cache_miss_after_eviction_seconds
+            .record(seconds, &[KeyValue::new("backend", backend.to_string())]);
     }
 
     /// scsi_xcopy.* — one increment per EXTENDED COPY command.
@@ -816,6 +832,16 @@ impl TelemetryInner {
                 .with_description(
                     "VSA per-volume page-cache evictions, labeled clean vs dirty (dirty = required a cloud flush)",
                 )
+                .build(),
+            cache_miss_after_eviction_seconds: meter
+                .f64_histogram(name("cache_miss_after_eviction"))
+                .with_description(
+                    "Age (now - evicted_at) of cache misses whose chunk was recently evicted from this backend's pool. Drives operator sizing of disk_cache.size_gb.",
+                )
+                .with_unit("s")
+                .with_boundaries(vec![
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0,
+                ])
                 .build(),
 
             // SCSI EXTENDED COPY (VAAI XCOPY)
@@ -1148,6 +1174,11 @@ pub mod record {
             t.cache_inc_eviction(volume, outcome);
         }
     }
+    pub fn cache_miss_after_eviction(backend: &str, seconds: f64) {
+        if let Some(t) = global() {
+            t.cache_record_miss_after_eviction(backend, seconds);
+        }
+    }
     pub fn scsi_xcopy(outcome: &str) {
         if let Some(t) = global() {
             t.scsi_xcopy_inc(outcome);
@@ -1318,6 +1349,7 @@ mod tests {
         t.iscsi_set_sessions_active(0);
         t.audit_inc_entry("daemon.start");
         t.cache_inc_eviction("vol1", "dirty");
+        t.cache_record_miss_after_eviction("primary", 12.5);
         let dump = t.export_prometheus();
         for needle in [
             "thur_pool_used_bytes",
@@ -1332,6 +1364,7 @@ mod tests {
             "thur_chunk_storage_cache_inflight_coalesced_total",
             "thur_chunk_storage_cache_warmup_seeded_total",
             "thur_cache_evictions_total",
+            "thur_cache_miss_after_eviction_seconds",
             "thur_iscsi_sessions_active",
             "thur_audit_entries_total",
         ] {
