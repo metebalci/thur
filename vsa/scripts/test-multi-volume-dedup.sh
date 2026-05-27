@@ -36,26 +36,23 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 TEST_DIR="/tmp/thurvsa-multi-vol-$$"
-KEEP_DATA=0
-DAEMON_PATH=""
-CLI_PATH=""
 NUM_VOLUMES=20
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release)   BUILD_PROFILE="release"; shift ;;
-        --keep-data) KEEP_DATA=1; shift ;;
         --num-volumes) NUM_VOLUMES="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
-
-DAEMON_PID=""
-HTTP_PORT=""
-ISCSI_PORT=""
 
 cleanup() {
     standard_cleanup

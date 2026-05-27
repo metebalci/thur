@@ -65,32 +65,28 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
-DAEMON_PATH=""
-CLI_PATH=""
 TEST_DIR="/tmp/thurvsa-test-proto-nvmetcp-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 NVMETCP_PORT=""
-HTTP_PORT=""
 SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
 HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-conformance-test"
-KEEP_DATA=0
-DAEMON_PID=""
 NVME_DEVICE=""
 USE_TLS=0
 TLS_KEY_STR=""
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release) BUILD_PROFILE="release"; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        --keep-data) KEEP_DATA=1; shift ;;
         --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
-        --http-port) HTTP_PORT="$2"; shift 2 ;;
         --tls) USE_TLS=1; shift ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
 

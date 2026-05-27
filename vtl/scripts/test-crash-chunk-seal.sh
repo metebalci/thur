@@ -43,15 +43,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 TEST_DIR="/tmp/thurvtl-test-crash-chunk-seal-$$"
-KEEP_DATA=0
-DAEMON_PATH=""
-CLI_PATH=""
-ISCSI_PORT=""
-HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
-DAEMON_PID=""
 ISCSI_CONNECTED=0
 CHANGER_DEVICE=""
 NOREWIND_DEVICE=""
@@ -59,18 +52,8 @@ CART_LABEL="tape-crash"
 FIXTURE_DIR=""
 FIXTURE_TAR=""
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --release)   BUILD_PROFILE="release"; shift ;;
-        --keep-data) KEEP_DATA=1; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
-        --http-port) HTTP_PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
+init_common_daemon_args
+parse_common_daemon_args "$@"
 
 cleanup() {
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then

@@ -145,6 +145,89 @@ standard_cleanup() {
     fi
 }
 
+# -----------------------------------------------------------------------
+# Common-flag argument parsing — lifted from the 30+ lines of identical
+# `while/case` boilerplate at the top of every test script.
+#
+# Common flags:
+#   --release             switch to ./target/release/ binaries
+#   --daemon-path PATH    override daemon binary
+#   --cli-path PATH       override CLI binary
+#   --keep-data           don't rm -rf $TEST_DIR on exit
+#   --iscsi-port PORT     override iSCSI listen port
+#   --http-port  PORT     override HTTP listen port
+#   -h | --help           print the script header comment block + exit 0
+#
+# Scripts come in two shapes:
+#
+# (a) ONLY common flags — replace the whole arg block with:
+#         init_common_daemon_args
+#         parse_common_daemon_args "$@"
+#
+# (b) Common flags + script-specific flags — keep the while/case, put
+#     script-specific arms first, delegate the default arm:
+#         init_common_daemon_args
+#         while [[ $# -gt 0 ]]; do
+#             case "$1" in
+#                 --seed)  SEED="$2"; shift 2 ;;
+#                 --quick) QUICK=1;   shift ;;
+#                 *)
+#                     if parse_common_daemon_arg "$@"; then
+#                         shift "$_CONSUMED_ARGS"
+#                     else
+#                         echo "Unknown option: $1" >&2; exit 1
+#                     fi
+#                     ;;
+#             esac
+#         done
+# -----------------------------------------------------------------------
+
+# Initialize the seven common arg variables to their defaults if unset.
+# Idempotent. Call before the arg loop; explicit per-script assignments
+# (e.g. KEEP_DATA=0 at the top of the script) become redundant after.
+init_common_daemon_args() {
+    : "${BUILD_PROFILE:=debug}"
+    : "${DAEMON_PATH:=}"
+    : "${CLI_PATH:=}"
+    : "${ISCSI_PORT:=}"
+    : "${HTTP_PORT:=}"
+    : "${KEEP_DATA:=0}"
+    : "${DAEMON_PID:=}"
+}
+
+# Try to consume one common daemon flag. Sets $_CONSUMED_ARGS to the
+# number of positional args consumed (1 for boolean flags, 2 for value
+# flags); returns 0 on match, 1 on unknown. -h/--help prints the script
+# header comment block (lines 2 to first blank-comment-line) and exits 0.
+parse_common_daemon_arg() {
+    case "$1" in
+        --release)     BUILD_PROFILE="release"; _CONSUMED_ARGS=1 ;;
+        --daemon-path) DAEMON_PATH="$2";        _CONSUMED_ARGS=2 ;;
+        --cli-path)    CLI_PATH="$2";           _CONSUMED_ARGS=2 ;;
+        --keep-data)   KEEP_DATA=1;             _CONSUMED_ARGS=1 ;;
+        --iscsi-port)  ISCSI_PORT="$2";         _CONSUMED_ARGS=2 ;;
+        --http-port)   HTTP_PORT="$2";          _CONSUMED_ARGS=2 ;;
+        -h|--help)     sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)             return 1 ;;
+    esac
+    return 0
+}
+
+# Drive the entire arg loop for scripts that accept ONLY common flags.
+# Unknown flag -> "Unknown option: X" + exit 1. Scripts with extra
+# flags keep their own while/case loop and call parse_common_daemon_arg
+# from the default arm — see the (b) example in the header above.
+parse_common_daemon_args() {
+    while [[ $# -gt 0 ]]; do
+        if parse_common_daemon_arg "$@"; then
+            shift "$_CONSUMED_ARGS"
+        else
+            echo "Unknown option: $1" >&2
+            exit 1
+        fi
+    done
+}
+
 # Poll a log file for an extended regex match until it appears or the
 # timeout elapses. Returns 0 if matched, 1 on timeout. Both args
 # required; useful for the storage-failure tests that assert specific

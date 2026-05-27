@@ -108,9 +108,6 @@ fi
 
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
-DAEMON_PATH=""
-CLI_PATH=""
 # Storage backend definitions live in `<data_dir>/storage-backends.json`
 # (daemon-owned). The script extracts the chosen entry from
 # $SOURCE_BACKENDS and embeds it under `testbackend` inside the
@@ -197,13 +194,9 @@ case "$FIXTURE_DEDUP" in
     *) echo "[ERROR] THURVTL_FIXTURE_DEDUP must be 0 or 1, got '$FIXTURE_DEDUP'"; exit 1 ;;
 esac
 TEST_CONFIG="${TEST_DIR}/config.yaml"
-ISCSI_PORT=""
-HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
-KEEP_DATA=0
 KEEP_ISCSI=0
 KEEP_STORAGE=0
-DAEMON_PID=""
 ISCSI_CONNECTED=0
 CHANGER_DEVICE=""
 TAPE_DEVICE=""
@@ -220,18 +213,19 @@ ORIG_PREFIX=""
 TEST_PREFIX=""
 RUN_ID=""
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release) BUILD_PROFILE="release"; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        --keep-data) KEEP_DATA=1; shift ;;
         --keep-iscsi) KEEP_ISCSI=1; shift ;;
         --keep-storage) KEEP_STORAGE=1; shift ;;
-        --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
-        --http-port) HTTP_PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
 

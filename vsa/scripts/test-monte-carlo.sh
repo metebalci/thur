@@ -104,20 +104,13 @@ fi
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 
-BUILD_PROFILE="debug"
-DAEMON_PATH=""
-CLI_PATH=""
 TEST_DIR="/tmp/thurvsa-monte-carlo-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TRANSPORT="iscsi"
-ISCSI_PORT=""
 NVMETCP_PORT=""
-HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
 SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
 HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-monte-carlo-test"
-KEEP_DATA=0
-DAEMON_PID=""
 ISCSI_CONNECTED=0
 NVME_CONNECTED=0
 NVME_DEVICE=""
@@ -147,6 +140,7 @@ declare -A FILE_SIZES
 declare -a ALIVE_PATHS
 NEXT_PATH_INDEX=1
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
         --seed) SEED="$2"; shift 2 ;;
@@ -154,15 +148,15 @@ while [[ $# -gt 0 ]]; do
         --ops) OPS="$2"; shift 2 ;;
         --transport) TRANSPORT="$2"; shift 2 ;;
         --backend) BACKEND_NAME="$2"; shift 2 ;;
-        --release) BUILD_PROFILE="release"; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        --keep-data) KEEP_DATA=1; shift ;;
-        --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
         --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
-        --http-port) HTTP_PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
 

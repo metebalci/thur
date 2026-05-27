@@ -31,27 +31,11 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 TEST_DIR="/tmp/thurvtl-test-crash-audit-$$"
-KEEP_DATA=0
-DAEMON_PATH=""
-CLI_PATH=""
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --release)   BUILD_PROFILE="release"; shift ;;
-        --keep-data) KEEP_DATA=1; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
-
-DAEMON_PID=""
 TEST_CONFIG=""
-HTTP_PORT=""
-ISCSI_PORT=""
+
+init_common_daemon_args
+parse_common_daemon_args "$@"
 
 cleanup() {
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then

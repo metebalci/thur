@@ -101,24 +101,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
-DAEMON_PATH=""
-CLI_PATH=""
 ONLY_ROW=""
-KEEP_DATA=0
 KEEP_STORAGE=0
 SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release) BUILD_PROFILE="release"; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
         --only) ONLY_ROW="$2"; shift 2 ;;
-        --keep-data) KEEP_DATA=1; shift ;;
         --keep-storage) KEEP_STORAGE=1; shift ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
 

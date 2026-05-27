@@ -46,28 +46,15 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 TEST_DIR="/tmp/thurvsa-multi-init-$$"
-KEEP_DATA=0
-DAEMON_PATH=""
-CLI_PATH=""
-ISCSI_PORT=""
-HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
-DAEMON_PID=""
 IFACE_A="thurvsa-test-host-a-$$"
 IFACE_B="thurvsa-test-host-b-$$"
 INIT_A_NAME="iqn.2025-test.com.metebalci:host-a"
 INIT_B_NAME="iqn.2025-test.com.metebalci:host-b"
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --release)   BUILD_PROFILE="release"; shift ;;
-        --keep-data) KEEP_DATA=1; shift ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
+init_common_daemon_args
+parse_common_daemon_args "$@"
 
 # Build a per-test iface record bound to a specific InitiatorName.
 # open-iscsi stores these under /var/lib/iscsi/ifaces/<name> and

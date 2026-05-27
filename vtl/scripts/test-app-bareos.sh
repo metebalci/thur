@@ -67,18 +67,11 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 
-BUILD_PROFILE="debug"
-DAEMON_PATH=""
-CLI_PATH=""
 TEST_DIR="/tmp/test-app-bareos-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
-ISCSI_PORT=""
-HTTP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
-KEEP_DATA=0
 KEEP_ISCSI=0
 KEEP_CONTAINER=0
-DAEMON_PID=""
 ISCSI_CONNECTED=0
 SEED=""
 QUICK=0
@@ -104,21 +97,22 @@ BAREOS_MON_PASS=""
 declare -A JOB_BACKUP_ID   # bareos jobid for backup of job i
 declare -A JOB_RESTORE_OK  # 1 if restore-and-diff succeeded for job i
 
+init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
         --seed) SEED="$2"; shift 2 ;;
         --jobs) JOBS="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
-        --release) BUILD_PROFILE="release"; shift ;;
-        --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
-        --cli-path) CLI_PATH="$2"; shift 2 ;;
-        --keep-data) KEEP_DATA=1; shift ;;
         --keep-iscsi) KEEP_ISCSI=1; shift ;;
         --keep-container) KEEP_CONTAINER=1; shift ;;
-        --iscsi-port) ISCSI_PORT="$2"; shift 2 ;;
-        --http-port) HTTP_PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *)
+            if parse_common_daemon_arg "$@"; then
+                shift "$_CONSUMED_ARGS"
+            else
+                echo "Unknown option: $1" >&2
+                exit 1
+            fi
+            ;;
     esac
 done
 
