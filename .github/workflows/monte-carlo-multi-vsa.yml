@@ -1,0 +1,51 @@
+name: monte-carlo-multi-vsa
+
+# Multi-initiator companion to nightly-monte-carlo-vsa. Two distinct
+# iSCSI initiator IQNs concurrently drive their own pair of volumes
+# against a single thurvsad daemon (4 volumes total, 2/initiator).
+# Exercises per-volume PageCache isolation, write-back ordering, and
+# multi-LUN-per-session SCSI dispatch under concurrent host traffic.
+# Manual-only for now because VSA's iface plumbing needs further
+# validation on a hosted CI runner — flip to a `schedule:` once a
+# few manual passes prove out.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monte-carlo-multi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: apt prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs util-linux sg3-utils open-iscsi lsscsi openssl curl
+
+      - name: start iscsid
+        run: sudo systemctl enable --now iscsid
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: build release binaries
+        run: cargo build --release -p vsa-daemon -p vsa-cli
+
+      - name: run monte-carlo (multi-initiator)
+        run: ./vsa/scripts/test-monte-carlo-multi.sh --release
+
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monte-carlo-multi-vsa-${{ github.run_id }}
+          path: |
+            /tmp/thurvsa-monte-carlo-multi-*/ops*.log
+            /tmp/thurvsa-monte-carlo-multi-*/daemon.log
+          retention-days: 30
+          if-no-files-found: ignore

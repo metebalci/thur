@@ -1,0 +1,53 @@
+name: monte-carlo-multi-vtl
+
+# Multi-initiator companion to nightly-monte-carlo-vtl. Two distinct
+# iSCSI initiator IQNs concurrently drive disjoint drive sets against
+# a single thurvtl daemon (4 drives, 6 carts). Manual-only for now
+# because vtl-daemon's scsi_ssc::drive_manager grants drive locks
+# per-session at INQUIRY time and holds them until session close,
+# so the kernel's post-login LUN probe causes one initiator to
+# capture all drives — see the script header for the full note. The
+# workflow is wired up and ready to flip to a nightly schedule once
+# the daemon supports per-cartridge / per-partition session
+# admission or a per-command lock model.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monte-carlo-multi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: apt prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mtx mt-st sg3-utils open-iscsi lsscsi openssl curl
+
+      - name: start iscsid
+        run: sudo systemctl enable --now iscsid
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: build release binaries
+        run: cargo build --release -p vtl-daemon -p vtl-cli
+
+      - name: run monte-carlo (multi-initiator)
+        run: ./vtl/scripts/test-monte-carlo-multi.sh --release
+
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monte-carlo-multi-vtl-${{ github.run_id }}
+          path: |
+            /tmp/thurvtl-monte-carlo-multi-*/ops*.log
+            /tmp/thurvtl-monte-carlo-multi-*/daemon.log
+          retention-days: 30
+          if-no-files-found: ignore
