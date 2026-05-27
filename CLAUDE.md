@@ -463,7 +463,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
 - `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,backup-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo,fs-postgres}.sh`
+- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo,fs-postgres,fs-vm}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
@@ -494,6 +494,22 @@ restarts postgres, and re-checks the TPC-B sum invariant after WAL
 replay. `--seed N` picks scale / concurrency / runtime in bounded
 buckets; `--quick` locks scale=1, T=30 s for ~1 min total. Accepts
 `--transport iscsi|nvmetcp` (default `iscsi`). Requires `podman`.
+`test-fs-vm.sh` (VSA only) is the "OS-as-workload" counterpart of
+`test-fs-postgres.sh`: boots a real Ubuntu 26.04 LTS minimal cloud
+image (q35 + OVMF UEFI, TCG — no KVM needed) directly from a thurvsa
+volume. cloud-init's `runcmd` writes a seed-derived fixture under
+`/var/test-fixture/`, fsyncs, and powers off; the host then mounts
+the root partition read-only and verifies every file hashes to its
+host-precomputed expected value. Phase C re-boots with a fresh
+`instance-id`, SIGKILL the qemu process mid-write to simulate host
+hard-reset, mounts on the host (kernel triggers ext4 journal replay),
+runs `fsck.ext4 -fn`, and re-verifies the Phase B fixture survived.
+`--seed N` reproduces fixture file count + sizes (boundary-biased);
+`--quick` skips Phase C (~3 min vs ~7 min default). Accepts
+`--transport iscsi|nvmetcp` (default `iscsi`). Requires `qemu-system-x86`,
+`qemu-utils`, `ovmf`, `cloud-image-utils`. First run fetches the cloud
+image (~408 MB) under `/var/cache/thur/cloud-images/`; subsequent runs
+reuse the cache.
 `test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
