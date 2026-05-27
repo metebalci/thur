@@ -706,10 +706,74 @@ op_truncate() {
     mc_log_op truncate path="$path" old="$cur" new="$new_size" v="${FILE_VERSIONS[$path]}"
 }
 
+# Grow path for truncate. truncate -s LARGER creates a sparse hole at
+# [cur..new_size); we then overwrite that range with the next slice of
+# the file's CTR keystream so the model stays "all file bytes are
+# CTR(v) of (seed, path, v)" — same invariant as op_append. The grow
+# syscall is exercised on the way up; the trailing write makes the
+# read-side check stay trivial.
+op_truncate_extend() {
+    ensure_mounted || return 1
+    local path
+    path=$(pick_existing_path) || { mc_log_op truncate_extend status=no_files; return 0; }
+    local cur=${FILE_SIZES[$path]}
+    local v=${FILE_VERSIONS[$path]}
+    local delta
+    delta=$(mc_pick_size_boundary_biased "truncate-extend-delta")
+    (( delta > 16777216 )) && delta=16777216
+    local new_size=$(( cur + delta ))
+    if ! truncate -s "$new_size" "$MOUNT_POINT$path" 2>/dev/null; then
+        mc_log_op truncate_extend path="$path" old="$cur" new="$new_size" status=enospc
+        return 0
+    fi
+    # Regenerate the full expected stream, then dd just the [cur..new_size)
+    # tail back into the file.
+    local full="$TEST_DIR/scratch.full"
+    regen_expected "$path" "$v" "$new_size" "$full"
+    if ! dd if="$full" of="$MOUNT_POINT$path" \
+            bs=4096 iflag=skip_bytes oflag=seek_bytes conv=notrunc \
+            skip="$cur" seek="$cur" status=none 2>/dev/null; then
+        # The truncate succeeded but the tail-write didn't — likely the
+        # sparse-to-allocated promotion hit ENOSPC. Roll the model back
+        # to the pre-op size so subsequent verify reads the unchanged
+        # prefix correctly; the on-disk file is now larger but
+        # zero-filled in the tail, which would otherwise mismatch CTR.
+        truncate -s "$cur" "$MOUNT_POINT$path" 2>/dev/null || true
+        mc_log_op truncate_extend path="$path" old="$cur" new="$new_size" status=enospc_tail
+        return 0
+    fi
+    FILE_SIZES[$path]=$new_size
+    # version unchanged — CTR keystream prefix property
+    mc_log_op truncate_extend path="$path" old="$cur" new="$new_size" v="$v"
+}
+
 op_sync() {
     ensure_mounted || return 1
     sync
     mc_log_op sync
+}
+
+# Per-file fdatasync. Distinct from op_sync (which is the process-wide
+# sync(2)): this targets one file's FD and lands as a SCSI SYNCHRONIZE
+# CACHE / NVMe Flush bounded to that file's pages. Exercises the
+# per-file fence claim from the daemon's volume fsync mode.
+op_fdatasync_one() {
+    ensure_mounted || return 1
+    local path
+    path=$(pick_existing_path) || { mc_log_op fdatasync_one status=no_files; return 0; }
+    if ! python3 -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fdatasync(fd)
+finally:
+    os.close(fd)
+' "$MOUNT_POINT$path" 2>/dev/null; then
+        log_error "fdatasync_one: failed at $path"
+        mc_dump_failure
+        return 1
+    fi
+    mc_log_op fdatasync_one path="$path"
 }
 
 op_umount_cycle() {
@@ -736,16 +800,22 @@ op_transport_logout_cycle() {
 # Main op loop.
 # ---------------------------------------------------------------------------
 
+# Weights for the random op picker. Must sum to 100; mc_assert_weights
+# at startup enforces that. truncate_extend / fdatasync_one are low-rate
+# correctness-shape ops, not throughput drivers.
+OP_WEIGHTS=(
+    "22:write_new" "14:overwrite" "14:append" "18:read_verify"
+    "8:delete" "4:truncate" "3:truncate_extend" "4:sync" "3:fdatasync_one"
+    "6:umount_cycle" "4:transport_logout_cycle"
+)
+
 run_ops() {
     local n="$1"
     local op
     local progress_every=$(( n / 20 ))
     (( progress_every < 1 )) && progress_every=1
     for (( MC_OP_INDEX=1; MC_OP_INDEX<=n; MC_OP_INDEX++ )); do
-        op=$(mc_pick_weighted op \
-            "22:write_new" "14:overwrite" "14:append" "24:read_verify" \
-            "8:delete" "4:truncate" "4:sync" \
-            "6:umount_cycle" "4:transport_logout_cycle")
+        op=$(mc_pick_weighted op "${OP_WEIGHTS[@]}")
         case "$op" in
             write_new)                op_write_new || return 1 ;;
             overwrite)                op_overwrite || return 1 ;;
@@ -753,12 +823,14 @@ run_ops() {
             read_verify)              op_read_verify || return 1 ;;
             delete)                   op_delete || return 1 ;;
             truncate)                 op_truncate || return 1 ;;
+            truncate_extend)          op_truncate_extend || return 1 ;;
             sync)                     op_sync || return 1 ;;
+            fdatasync_one)            op_fdatasync_one || return 1 ;;
             umount_cycle)             op_umount_cycle || return 1 ;;
             transport_logout_cycle)   op_transport_logout_cycle || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
-            log_info "[$MC_OP_INDEX/$n] alive=${#ALIVE_PATHS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
+            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED alive=${#ALIVE_PATHS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
         fi
     done
 }
@@ -800,6 +872,7 @@ main() {
     start_daemon
     ensure_volume
 
+    mc_assert_weights "op" "${OP_WEIGHTS[@]}"
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
 
     log_info "Running $OPS random ops (transport=$TRANSPORT, volume=${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME/$BACKEND_TYPE)"
@@ -821,6 +894,8 @@ main() {
     echo "  alive files: ${#ALIVE_PATHS[@]}"
     echo "  reusable reproducer: --seed $MC_SEED --ops $OPS --transport $TRANSPORT"
     echo "  op log: $TEST_DIR/ops.log"
+    echo ""
+    mc_op_stats_dump
     exit 0
 }
 

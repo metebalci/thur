@@ -15,7 +15,7 @@
 
 # Initialize MC_SEED from --seed N or by drawing from /dev/urandom.
 # Caller passes through whatever was on the command line; empty means
-# "pick fresh". Sets globals MC_SEED, MC_OP_INDEX, MC_OP_LOG.
+# "pick fresh". Sets globals MC_SEED, MC_OP_INDEX, MC_OP_LOG, MC_OP_STATS.
 mc_seed_init() {
     local cli_seed="$1"
     local log_path="$2"
@@ -28,6 +28,7 @@ mc_seed_init() {
     MC_OP_INDEX=0
     MC_OP_LOG="$log_path"
     : > "$MC_OP_LOG"
+    mc_op_stats_init
     echo ""
     echo "========================================"
     echo "Monte Carlo seed: $MC_SEED"
@@ -57,6 +58,25 @@ mc_rng_u32() {
     # is 64-bit signed so the modulo is safe.
     local n=$((16#${hex:0:8}))
     echo $(( n % mod ))
+}
+
+# Validate that a list of `weight:name` pairs sums to 100. Call once at
+# startup with the exact same list the harness will pass to
+# mc_pick_weighted. Fails fast with a clear message on drift — this is
+# the guard that catches a freshly-added op handler that the picker
+# forgot to weight (the bug class that left VTL's filemark ops as dead
+# code for months).
+mc_assert_weights() {
+    local tag="$1"; shift
+    local sum=0 pair
+    for pair in "$@"; do
+        sum=$(( sum + ${pair%%:*} ))
+    done
+    if (( sum != 100 )); then
+        echo "mc_assert_weights[$tag]: weights sum to $sum, expected 100" >&2
+        echo "  pairs: $*" >&2
+        exit 1
+    fi
 }
 
 # Weighted picker. Caller passes pairs as `weight:name weight:name ...`.
@@ -157,13 +177,59 @@ mc_content_to() {
         | head -c "$size" > "$out_path"
 }
 
+# Per-op + per-status counter, keyed "op|status". `status` defaults to
+# "ok" when mc_log_op isn't passed an explicit `status=...` field.
+# Initialized by mc_seed_init; bumped by mc_log_op; dumped at run end
+# and inside mc_dump_failure so failed runs surface the same coverage
+# stats as successful ones.
+declare -A MC_OP_STATS
+
+mc_op_stats_init() {
+    MC_OP_STATS=()
+}
+
+mc_op_stats_incr() {
+    local op="$1" status="${2:-ok}"
+    local key="${op}|${status}"
+    MC_OP_STATS[$key]=$(( ${MC_OP_STATS[$key]:-0} + 1 ))
+}
+
+# Print one line per (op, status) bucket, sorted. Output:
+#   Op statistics:
+#     changer_move|ok = 87
+#     read_verify|no_records = 12
+#     read_verify|ok = 138
+#     ...
+# Redirected to caller-supplied stream (default stdout).
+mc_op_stats_dump() {
+    local stream="${1:-/dev/stdout}"
+    {
+        echo "Op statistics (op|status = count):"
+        local key
+        for key in $(printf '%s\n' "${!MC_OP_STATS[@]}" | sort); do
+            printf '  %s = %d\n' "$key" "${MC_OP_STATS[$key]}"
+        done
+    } > "$stream"
+}
+
 # Append one structured log line. Caller-supplied free-form fields
 # follow op-name; we don't enforce a schema so each script can record
-# what's natural (path / size / position / etc).
+# what's natural (path / size / position / etc). If a `status=` field
+# appears in the kv pairs, the counter is bumped under that status;
+# otherwise the bucket is "ok".
 #
 # Format:  [N] op=OPNAME k1=v1 k2=v2 ...
 mc_log_op() {
     local op="$1"; shift
+    local status="ok"
+    local kv
+    for kv in "$@"; do
+        if [[ "$kv" == status=* ]]; then
+            status="${kv#status=}"
+        fi
+    done
+    mc_op_stats_incr "$op" "$status"
+
     printf '[%d] op=%s' "$MC_OP_INDEX" "$op" >> "$MC_OP_LOG"
     for kv in "$@"; do
         printf ' %s' "$kv" >> "$MC_OP_LOG"
@@ -171,10 +237,10 @@ mc_log_op() {
     printf '\n' >> "$MC_OP_LOG"
 }
 
-# Dump the last N op-log lines + the seed banner to stderr. Called from
-# the harness on any verification failure; the goal is that the user can
-# copy-paste a reproducer command line from the failure output without
-# scrolling.
+# Dump the last N op-log lines + the seed banner + per-op stats to
+# stderr. Called from the harness on any verification failure; the goal
+# is that the user can copy-paste a reproducer command line and see
+# coverage skew from the failure output without scrolling.
 mc_dump_failure() {
     local tail_n="${1:-50}"
     echo "" >&2
@@ -184,5 +250,7 @@ mc_dump_failure() {
     echo "Op log: $MC_OP_LOG" >&2
     echo "Last $tail_n ops:" >&2
     tail -n "$tail_n" "$MC_OP_LOG" | sed 's/^/  /' >&2
+    echo "" >&2
+    mc_op_stats_dump /dev/stderr
     echo "================================================================" >&2
 }

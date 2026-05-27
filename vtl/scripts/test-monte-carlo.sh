@@ -764,32 +764,41 @@ op_write_filemarks_sync() {
 # Main op loop
 # ---------------------------------------------------------------------------
 
+# Weights for the random op picker. Must sum to 100; mc_assert_weights
+# at startup enforces that. write_filemark / write_filemarks_sync are
+# rare on purpose — they're correctness-shape ops, not throughput drivers.
+OP_WEIGHTS=(
+    "29:write_record" "39:read_verify"
+    "5:rewind"
+    "10:load_cycle" "5:iscsi_logout_cycle"
+    "3:import_export" "3:changer_move"
+    "4:write_filemark" "2:write_filemarks_sync"
+)
+
 run_ops() {
     local n="$1"
     local op
     local progress_every=$(( n / 20 ))
     (( progress_every < 1 )) && progress_every=1
     for (( MC_OP_INDEX=1; MC_OP_INDEX<=n; MC_OP_INDEX++ )); do
-        op=$(mc_pick_weighted op \
-            "35:write_record" "39:read_verify" \
-            "5:rewind" \
-            "10:load_cycle" "5:iscsi_logout_cycle" \
-            "3:import_export" "3:changer_move")
+        op=$(mc_pick_weighted op "${OP_WEIGHTS[@]}")
         case "$op" in
-            write_record)         op_write_record || return 1 ;;
-            read_verify)          op_read_verify || return 1 ;;
-            rewind)               op_rewind || return 1 ;;
-            load_cycle)           op_load_cycle || return 1 ;;
-            iscsi_logout_cycle)   op_iscsi_logout_cycle || return 1 ;;
-            import_export)        op_import_export || return 1 ;;
-            changer_move)         op_changer_move || return 1 ;;
+            write_record)           op_write_record || return 1 ;;
+            read_verify)            op_read_verify || return 1 ;;
+            rewind)                 op_rewind || return 1 ;;
+            load_cycle)             op_load_cycle || return 1 ;;
+            iscsi_logout_cycle)     op_iscsi_logout_cycle || return 1 ;;
+            import_export)          op_import_export || return 1 ;;
+            changer_move)           op_changer_move || return 1 ;;
+            write_filemark)         op_write_filemark || return 1 ;;
+            write_filemarks_sync)   op_write_filemarks_sync || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
             local total=0
             for c in "${CARTS[@]}"; do
                 total=$(( total + $(record_count "$c") ))
             done
-            log_info "[$MC_OP_INDEX/$n] loaded=${LOADED_CART:-<empty>} iscsi=$ISCSI_UP total_records=$total"
+            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED loaded=${LOADED_CART:-<empty>} iscsi=$ISCSI_UP total_records=$total"
         fi
     done
 }
@@ -861,6 +870,7 @@ main() {
     start_daemon
     create_cartridges
 
+    mc_assert_weights "op" "${OP_WEIGHTS[@]}"
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
 
     log_info "Running $OPS random ops (${#CARTS[@]} carts, $NUM_DRIVES drive)"
@@ -885,6 +895,8 @@ main() {
     done
     echo "  reusable reproducer: --seed $MC_SEED --ops $OPS"
     echo "  op log: $TEST_DIR/ops.log"
+    echo ""
+    mc_op_stats_dump
     exit 0
 }
 

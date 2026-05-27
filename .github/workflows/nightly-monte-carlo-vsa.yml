@@ -38,3 +38,17 @@ jobs:
 
       - name: run monte-carlo
         run: ./vsa/scripts/test-monte-carlo.sh --release
+
+      # Preserve the op log + daemon log on failure so the seed printed
+      # in the run output can be reproduced + the daemon-side cause is
+      # available without re-running.
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monte-carlo-vsa-${{ github.run_id }}
+          path: |
+            /tmp/thurvsa-monte-carlo-*/ops.log
+            /tmp/thurvsa-monte-carlo-*/daemon.log
+          retention-days: 30
+          if-no-files-found: ignore
