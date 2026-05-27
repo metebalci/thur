@@ -1,0 +1,40 @@
+name: nightly-monte-carlo-vsa
+
+# Seeded random-op test driving ext4 on a thurvsa volume over iSCSI.
+# Each run picks a fresh seed from /dev/urandom, prints it on start,
+# and any failure is reproducible via --seed N — running nightly grows
+# the seed corpus over time. ~5 min wall-clock default (3000 ops).
+# Transport fixed to iSCSI for now; NVMe/TCP would be a second matrix
+# entry once it's stable on hosted runners.
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monte-carlo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: apt prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs util-linux sg3-utils open-iscsi lsscsi openssl curl
+
+      - name: start iscsid
+        run: sudo systemctl enable --now iscsid
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: build release binaries
+        run: cargo build --release -p vsa-daemon -p vsa-cli
+
+      - name: run monte-carlo
+        run: ./vsa/scripts/test-monte-carlo.sh --release
