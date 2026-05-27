@@ -6,9 +6,12 @@
 #
 # thurvtl Monte Carlo Random-Op Test
 #
-# Runs N seeded random operations against a small VTL chassis (1 drive,
-# 4 cartridges, 1 IE element). Op mix is weighted to bias drive data-path
-# ops and sample changer / iSCSI churn at low rates. Tape semantics:
+# Runs N seeded random operations against a small VTL chassis (3 drives,
+# 8 cartridges, 12 storage slots, 1 IE element). Each data-path op picks
+# a random drive, so the same op stream sweeps multi-drive load/unload
+# coordination and per-drive concurrent SCSI dispatch. Op mix is weighted
+# to bias drive data-path ops and sample changer / iSCSI churn at low
+# rates. Tape semantics:
 # every write appends at EOD (the harness issues `mt eod` before each
 # write so picks of `space_back` mid-test don't accidentally truncate),
 # every read_verify rewinds and replays the cartridge's known record
@@ -93,21 +96,40 @@ SEED=""
 QUICK=0
 OPS=""
 CHANGER_DEVICE=""
-TAPE_DEVICE=""
-NOREWIND_DEVICE=""
 BACKEND_NAME="${THURVTL_TEST_BACKEND:-}"
 SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 BACKEND_TYPE=""
 TEST_PREFIX=""
 
-# Chassis: 4 cartridges in slots 1..4, 1 drive in element 0, 1 IE element.
-CARTS=(MC01L8 MC02L8 MC03L8 MC04L8)
-NUM_SLOTS=8
-NUM_DRIVES=1
+# Chassis: 8 cartridges across 12 storage slots, 3 drives, 1 IE element.
+# 8 carts vs 3 drives leaves ≥5 carts free in storage at any time, so the
+# random drive picker never starves on a load.
+CARTS=(MC01L8 MC02L8 MC03L8 MC04L8 MC05L8 MC06L8 MC07L8 MC08L8)
+NUM_SLOTS=12
+NUM_DRIVES=3
 
-# Lazy state. Both start "down" and the first drive op brings them up.
+# Auth wrapper. THURVTL_TEST_AUTH=chap enables CHAP — the conffile
+# carries auth.method: CHAP, a per-run user/secret is added via
+# `thurvtl iscsi users add` after daemon start, and iscsi_login sets
+# node.session.auth credentials before --login. Default: none.
+AUTH_MODE="${THURVTL_TEST_AUTH:-none}"
+case "$AUTH_MODE" in
+    none|chap) ;;
+    *) echo "Unsupported THURVTL_TEST_AUTH='$AUTH_MODE' (expected none|chap)" >&2; exit 1 ;;
+esac
+CHAP_USER="mc-user-$$"
+CHAP_PASS="mc-secret-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
+
+# Lazy state. iSCSI starts down; the first drive op brings it up.
 ISCSI_UP=0
-LOADED_CART=""
+
+# Per-drive state, keyed by drive index 0..NUM_DRIVES-1.
+# DRIVE_LOADED is the cached barcode loaded in each drive (refreshed
+# from the daemon by ensure_loaded). DRIVE_TAPE_DEV / DRIVE_NST_DEV are
+# the /dev/stN and /dev/nstN paths discovered from lsscsi at login.
+declare -a DRIVE_LOADED=()
+declare -a DRIVE_TAPE_DEV=()
+declare -a DRIVE_NST_DEV=()
 
 # Per-cartridge append-only record list. RECORDS[barcode] = newline-
 # separated entries "R:idx:size" (record) or "F:idx:0" (filemark). idx
@@ -229,6 +251,8 @@ create_test_config() {
     if [[ -n "$SUDO_USER" ]]; then
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
     fi
+    local auth_block=""
+    [[ "$AUTH_MODE" == "chap" ]] && auth_block=$'  auth:\n    method: CHAP'
     if [[ -z "$BACKEND_NAME" ]]; then
         BACKEND_NAME="local"
         BACKEND_TYPE="local"
@@ -246,6 +270,7 @@ http:
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
   target_iqn: "$TARGET_IQN"
+$auth_block
 
 # /tmp is often tmpfs with little headroom — disable the free-floor
 # so chunk-seals aren't blocked by try_reserve.
@@ -316,6 +341,7 @@ http:
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
   target_iqn: "$TARGET_IQN"
+$auth_block
 
 # /tmp is often tmpfs with little headroom — disable the free-floor
 # so chunk-seals aren't blocked by try_reserve.
@@ -339,6 +365,23 @@ start_daemon() {
     DAEMON_LOG_MODE=append start_thur_daemon
 }
 
+# If THURVTL_TEST_AUTH=chap, provision one CHAP user the harness then
+# uses for every iSCSI login. Idempotent: a second call after
+# op_daemon_restart sees the user already present and skips.
+setup_chap_user() {
+    [[ "$AUTH_MODE" != "chap" ]] && return 0
+    if "$CLI_PATH" --config "$TEST_CONFIG" iscsi users list 2>/dev/null | grep -q "$CHAP_USER"; then
+        return 0
+    fi
+    log_info "Adding CHAP user $CHAP_USER..."
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER" \
+            --password "$CHAP_PASS" >/dev/null 2>&1; then
+        log_error "Failed to add CHAP user $CHAP_USER"
+        tail -20 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
+}
+
 create_cartridges() {
     local c
     for c in "${CARTS[@]}"; do
@@ -354,21 +397,61 @@ create_cartridges() {
 
 iscsi_login() {
     if [[ $ISCSI_UP -eq 1 ]]; then return 0; fi
-    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null 2>&1 || true
-    if ! iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null 2>&1; then
-        log_error "iscsi login failed"
+    # Under CHAP, discovery itself requires authentication. Stash creds
+    # on the discoverydb entry first so SendTargets succeeds; the node
+    # entries inherit discovery CHAP, then we still set node.session.*
+    # below so a session-level retry keeps working too.
+    if [[ "$AUTH_MODE" == "chap" ]]; then
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -o new >/dev/null 2>&1 || true
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.authmethod -v CHAP >/dev/null 2>&1
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.username -v "$CHAP_USER" >/dev/null 2>&1
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.password -v "$CHAP_PASS" >/dev/null 2>&1
+    fi
+    local disc_out
+    if ! disc_out=$(iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" --discover 2>&1); then
+        log_error "iscsi discovery failed: $disc_out"
+        return 1
+    fi
+    if [[ "$AUTH_MODE" == "chap" ]]; then
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.authmethod -v CHAP >/dev/null 2>&1
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.username -v "$CHAP_USER" >/dev/null 2>&1
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.password -v "$CHAP_PASS" >/dev/null 2>&1
+    fi
+    local login_out
+    if ! login_out=$(iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login 2>&1); then
+        log_error "iscsi login failed: $login_out"
         return 1
     fi
     ISCSI_CONNECTED=1
     sleep 3
     CHANGER_DEVICE=$(lsscsi -g | awk '/mediumx/{print $NF}' | head -1)
     [[ -n "$CHANGER_DEVICE" ]] || { log_error "Changer device not found"; lsscsi -g; return 1; }
-    TAPE_DEVICE=$(lsscsi | awk '/tape/{print $NF}' | head -1)
-    [[ -n "$TAPE_DEVICE" ]] || { log_error "Tape device not found"; lsscsi; return 1; }
-    NOREWIND_DEVICE=$(echo "$TAPE_DEVICE" | sed 's|/dev/st|/dev/nst|')
-    # Warm up: clear pending UA from login.
+    # lsscsi sorts by H:C:I:L; LUN 1..N maps to drive_id 0..N-1 per
+    # vtl/daemon/src/iscsi/handler.rs, so the iteration order here lines
+    # up with drive index without extra parsing.
+    local tape_devs=()
+    mapfile -t tape_devs < <(lsscsi | awk '/tape/{print $NF}')
+    if (( ${#tape_devs[@]} < NUM_DRIVES )); then
+        log_error "Found ${#tape_devs[@]} tape device(s), expected $NUM_DRIVES"
+        lsscsi
+        return 1
+    fi
+    local di
+    for (( di=0; di<NUM_DRIVES; di++ )); do
+        DRIVE_TAPE_DEV[$di]="${tape_devs[$di]}"
+        DRIVE_NST_DEV[$di]=$(echo "${tape_devs[$di]}" | sed 's|/dev/st|/dev/nst|')
+    done
+    # Warm up: clear pending UA from login across changer + every drive.
     mtx -f "$CHANGER_DEVICE" status >/dev/null 2>&1 || true
-    mt -f "$NOREWIND_DEVICE" status >/dev/null 2>&1 || true
+    for (( di=0; di<NUM_DRIVES; di++ )); do
+        mt -f "${DRIVE_NST_DEV[$di]}" status >/dev/null 2>&1 || true
+    done
     ISCSI_UP=1
 }
 
@@ -377,29 +460,53 @@ iscsi_logout() {
     iscsi_logout_and_delete
     ISCSI_UP=0
     CHANGER_DEVICE=""
-    TAPE_DEVICE=""
-    NOREWIND_DEVICE=""
-    # Do NOT clear LOADED_CART — iSCSI logout doesn't unload the
+    DRIVE_TAPE_DEV=()
+    DRIVE_NST_DEV=()
+    # Do NOT clear DRIVE_LOADED — iSCSI logout doesn't unload the
     # physical cart; the daemon's drive state persists across sessions.
     # On re-login, ensure_loaded re-syncs from the daemon anyway.
 }
 
-# Ask the daemon which cart is loaded in drive 0 right now. Returns the
-# barcode on stdout, or empty if no cart is loaded. Authoritative — use
-# this in preference to the shell-side LOADED_CART when accuracy
-# matters (i.e. across any path that might have changed drive state
-# without our notice).
-daemon_loaded_cart() {
+# Ask the daemon which cart is loaded in the given drive right now.
+# Returns the barcode on stdout, or empty if no cart is loaded.
+# Authoritative — use this in preference to the shell-side
+# DRIVE_LOADED cache when accuracy matters (i.e. across any path that
+# might have changed drive state without our notice).
+daemon_loaded_in_drive() {
+    local drive_idx="$1"
     "$CLI_PATH" --config "$TEST_CONFIG" cartridge list --json 2>/dev/null \
         | python3 -c "
 import sys, json
+di = $drive_idx
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 for c in d.get('cartridges', []):
-    if c.get('location') == 'drive':
+    if c.get('location') == 'drive' and int(c.get('slot_id', -1)) == di:
         print(c.get('barcode', ''))
+        break
+"
+}
+
+# Find which drive currently holds barcode $1, or empty if it isn't
+# loaded in any drive. Used by ensure_loaded to detect carts that need
+# to be unloaded from a different drive before we can load them here.
+daemon_drive_of_cart() {
+    local bc="$1"
+    "$CLI_PATH" --config "$TEST_CONFIG" cartridge list --json 2>/dev/null \
+        | python3 -c "
+import sys, json
+bc = '$bc'
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for c in d.get('cartridges', []):
+    if c.get('barcode') == bc and c.get('location') == 'drive':
+        sid = c.get('slot_id')
+        if sid is not None:
+            print(int(sid))
         break
 "
 }
@@ -440,37 +547,61 @@ any_empty_slot() {
         }'
 }
 
-# Ensure some cartridge is loaded in drive 0. Resync from the daemon
-# first — shell-side LOADED_CART can drift across iSCSI logout/login or
-# external state churn. If $want is passed, that specific barcode ends
-# up loaded; otherwise any cart will do (the picker preserves what's
-# already loaded if there is one).
+# Ensure a cartridge is loaded in drive $drive_idx. Resync from the
+# daemon first — the shell-side DRIVE_LOADED cache can drift across
+# iSCSI logout/login or external state churn. If $want is passed, that
+# specific barcode ends up loaded in $drive_idx; otherwise any cart
+# will do (the picker preserves what's already loaded if there is one).
+#
+# Multi-drive coordination: if $want is currently loaded in a *different*
+# drive, that drive is unloaded first before we load $want here. A cart
+# can be in at most one drive at a time, so the same-cart-in-two-drives
+# race is impossible.
 ensure_loaded() {
     iscsi_login || return 1
     local want="$1"
-    LOADED_CART=$(daemon_loaded_cart)
-    if [[ -z "$want" && -n "$LOADED_CART" ]]; then
+    local drive_idx="${2:-0}"
+    DRIVE_LOADED[$drive_idx]=$(daemon_loaded_in_drive "$drive_idx")
+    local current="${DRIVE_LOADED[$drive_idx]}"
+    if [[ -z "$want" && -n "$current" ]]; then
         return 0
     fi
-    if [[ -n "$want" && "$LOADED_CART" == "$want" ]]; then
+    if [[ -n "$want" && "$current" == "$want" ]]; then
         return 0
     fi
-    # Need to change carts.
-    if [[ -n "$LOADED_CART" ]]; then
-        # Make sure we're not mid-position (writes-in-flight). Rewind
-        # before unload to avoid a partial-write surprise.
-        mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || true
+    # If $want is loaded in some other drive, unload it from there first.
+    if [[ -n "$want" ]]; then
+        local other
+        other=$(daemon_drive_of_cart "$want")
+        if [[ -n "$other" && "$other" != "$drive_idx" ]]; then
+            mt -f "${DRIVE_NST_DEV[$other]}" rewind >/dev/null 2>&1 || true
+            local origin
+            origin=$(any_empty_slot)
+            [[ -z "$origin" ]] && origin=1
+            if ! mtx -f "$CHANGER_DEVICE" unload "$origin" "$other" >/dev/null 2>&1; then
+                log_error "ensure_loaded: unload of $want from drive $other failed"
+                return 1
+            fi
+            DRIVE_LOADED[$other]=""
+        fi
+    fi
+    # Unload whatever's in our target drive (if anything) so we can load
+    # the new cart.
+    if [[ -n "$current" ]]; then
+        # Rewind before unload to avoid a partial-write surprise.
+        mt -f "${DRIVE_NST_DEV[$drive_idx]}" rewind >/dev/null 2>&1 || true
         local origin
         origin=$(any_empty_slot)
         [[ -z "$origin" ]] && origin=1
-        if ! mtx -f "$CHANGER_DEVICE" unload "$origin" 0 >/dev/null 2>&1; then
-            log_error "ensure_loaded: unload of $LOADED_CART to slot $origin failed"
+        if ! mtx -f "$CHANGER_DEVICE" unload "$origin" "$drive_idx" >/dev/null 2>&1; then
+            log_error "ensure_loaded: unload of $current from drive $drive_idx to slot $origin failed"
             return 1
         fi
-        LOADED_CART=""
+        DRIVE_LOADED[$drive_idx]=""
     fi
     # Pick a slot to load from. If $want is set, find its slot; else
-    # pick deterministically.
+    # pick deterministically among carts that aren't loaded in any
+    # other drive.
     local target_bc target_slot
     if [[ -n "$want" ]]; then
         target_bc="$want"
@@ -481,44 +612,62 @@ ensure_loaded() {
             return 1
         fi
     else
-        local idx
-        idx=$(mc_rng_u32 "load-pick" "${#CARTS[@]}")
-        target_bc="${CARTS[$idx]}"
-        target_slot=$(slot_of_cart "$target_bc")
+        # Build the exclusion set: carts currently in any drive.
+        local loaded_set=" " di
+        for (( di=0; di<NUM_DRIVES; di++ )); do
+            [[ -n "${DRIVE_LOADED[$di]}" ]] && loaded_set+="${DRIVE_LOADED[$di]} "
+        done
+        local idx tries=0 max_tries="${#CARTS[@]}"
+        while (( tries < max_tries )); do
+            idx=$(mc_rng_u32 "load-pick-$tries" "${#CARTS[@]}")
+            target_bc="${CARTS[$idx]}"
+            if [[ "$loaded_set" != *" $target_bc "* ]]; then
+                target_slot=$(slot_of_cart "$target_bc")
+                [[ -n "$target_slot" ]] && break
+            fi
+            tries=$(( tries + 1 ))
+            target_bc=""
+            target_slot=""
+        done
         if [[ -z "$target_slot" ]]; then
-            # Cart may have been left in some odd state (e.g. exported).
-            # Fall through to first cart with a known slot.
+            # Fallback: linear scan for any cart in storage not loaded
+            # elsewhere.
+            local cand
             for cand in "${CARTS[@]}"; do
-                target_slot=$(slot_of_cart "$cand")
-                if [[ -n "$target_slot" ]]; then
-                    target_bc="$cand"
-                    break
+                if [[ "$loaded_set" != *" $cand "* ]]; then
+                    target_slot=$(slot_of_cart "$cand")
+                    if [[ -n "$target_slot" ]]; then
+                        target_bc="$cand"
+                        break
+                    fi
                 fi
             done
         fi
-        [[ -n "$target_slot" ]] || { log_error "ensure_loaded: no cart available in any slot"; return 1; }
+        [[ -n "$target_slot" ]] || { log_error "ensure_loaded: no cart available for drive $drive_idx"; return 1; }
     fi
-    if ! mtx -f "$CHANGER_DEVICE" load "$target_slot" 0 >/dev/null 2>&1; then
-        log_error "ensure_loaded: load of $target_bc from slot $target_slot failed"
+    if ! mtx -f "$CHANGER_DEVICE" load "$target_slot" "$drive_idx" >/dev/null 2>&1; then
+        log_error "ensure_loaded: load of $target_bc from slot $target_slot into drive $drive_idx failed"
         return 1
     fi
-    LOADED_CART="$target_bc"
+    DRIVE_LOADED[$drive_idx]="$target_bc"
 }
 
-# Position at end-of-data so every write_record appends. We use
-# rewind+fsr(N) rather than `mt eod`: the underlying filemark-on-READ
-# bug (#25) that made `mt eod` corrupt the next write has been fixed,
-# but rewind+fsr is still the more predictable form — each fsr block
-# is a single LBA step, and the kernel/daemon agree on what those
-# LBAs are regardless of how many filemarks sit on the medium.
+# Position drive $drive_idx at end-of-data so every write_record
+# appends. We use rewind+fsr(N) rather than `mt eod`: the underlying
+# filemark-on-READ bug (#25) that made `mt eod` corrupt the next write
+# has been fixed, but rewind+fsr is still the more predictable form —
+# each fsr block is a single LBA step, and the kernel/daemon agree on
+# what those LBAs are regardless of how many filemarks sit on the medium.
 seek_eod() {
-    local bc="$LOADED_CART"
+    local drive_idx="$1"
+    local bc="${DRIVE_LOADED[$drive_idx]}"
     [[ -z "$bc" ]] && return 0
-    mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1
+    local nst="${DRIVE_NST_DEV[$drive_idx]}"
+    mt -f "$nst" rewind >/dev/null 2>&1
     local n
     n=$(record_count "$bc")
     if (( n > 0 )); then
-        mt -f "$NOREWIND_DEVICE" fsr "$n" >/dev/null 2>&1
+        mt -f "$nst" fsr "$n" >/dev/null 2>&1
     fi
 }
 
@@ -535,9 +684,11 @@ record_count() {
 # ---------------------------------------------------------------------------
 
 op_write_record() {
-    ensure_loaded || return 1
-    seek_eod
-    local bc="$LOADED_CART"
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    seek_eod "$drive_idx"
+    local bc="${DRIVE_LOADED[$drive_idx]}"
     local idx="${NEXT_REC_IDX[$bc]}"
     local size
     size=$(mc_pick_size_boundary_biased "size-write")
@@ -548,14 +699,14 @@ op_write_record() {
     local tmp="$TEST_DIR/scratch.rec"
     mc_content_to "$bc" "$idx" "$size" "$tmp"
     # dd to /dev/nstN writes one record per dd invocation.
-    if ! dd if="$tmp" of="$NOREWIND_DEVICE" bs="$size" count=1 status=none 2>/dev/null; then
-        log_error "write_record: dd failed (bc=$bc idx=$idx size=$size)"
+    if ! dd if="$tmp" of="${DRIVE_NST_DEV[$drive_idx]}" bs="$size" count=1 status=none 2>/dev/null; then
+        log_error "write_record: dd failed (drive=$drive_idx bc=$bc idx=$idx size=$size)"
         mc_dump_failure
         return 1
     fi
     push_record "$bc" "R:$idx:$size"
     NEXT_REC_IDX[$bc]=$(( idx + 1 ))
-    mc_log_op write_record cart="$bc" idx="$idx" size="$size"
+    mc_log_op write_record drive="$drive_idx" cart="$bc" idx="$idx" size="$size"
 }
 
 op_read_verify() {
@@ -571,8 +722,11 @@ op_read_verify() {
     local pick_idx
     pick_idx=$(mc_rng_u32 "verify-cart" "${#candidates[@]}")
     bc="${candidates[$pick_idx]}"
-    ensure_loaded "$bc" || return 1
-    mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || { log_error "read_verify: rewind failed"; return 1; }
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "$bc" "$drive_idx" || return 1
+    local nst="${DRIVE_NST_DEV[$drive_idx]}"
+    mt -f "$nst" rewind >/dev/null 2>&1 || { log_error "read_verify: rewind failed (drive=$drive_idx)"; return 1; }
     # Replay every record/filemark on the cart in order.
     local entry kind idx size expected="$TEST_DIR/scratch.expect" actual="$TEST_DIR/scratch.actual"
     local n_records=0 n_filemarks=0
@@ -588,8 +742,8 @@ op_read_verify() {
                 # one record off the tape (kernel returns short read on
                 # SCSI variable-block READ; bs sets the buffer cap).
                 mc_content_to "$bc" "$idx" "$size" "$expected"
-                if ! dd if="$NOREWIND_DEVICE" of="$actual" bs="$size" count=1 status=none 2>/dev/null; then
-                    log_error "read_verify: dd read failed (bc=$bc idx=$idx size=$size)"
+                if ! dd if="$nst" of="$actual" bs="$size" count=1 status=none 2>/dev/null; then
+                    log_error "read_verify: dd read failed (drive=$drive_idx bc=$bc idx=$idx size=$size)"
                     mc_dump_failure
                     return 1
                 fi
@@ -615,12 +769,12 @@ op_read_verify() {
                 # way; we don't try to read across it because the SCSI
                 # READ will already have returned 0-length on the prior
                 # block, leaving us positioned just before the FM.
-                mt -f "$NOREWIND_DEVICE" fsf 1 >/dev/null 2>&1 || true
+                mt -f "$nst" fsf 1 >/dev/null 2>&1 || true
                 n_filemarks=$(( n_filemarks + 1 ))
                 ;;
         esac
     done <<< "${RECORDS[$bc]}"
-    mc_log_op read_verify cart="$bc" records="$n_records" filemarks="$n_filemarks"
+    mc_log_op read_verify drive="$drive_idx" cart="$bc" records="$n_records" filemarks="$n_filemarks"
 }
 
 # space_fwd/space_back ops are intentionally absent. The daemon's tape
@@ -632,42 +786,49 @@ op_read_verify() {
 # more pointedly. Keep this harness focused on data correctness.
 
 op_write_filemark() {
-    ensure_loaded || return 1
-    seek_eod
-    local bc="$LOADED_CART"
-    if ! mt -f "$NOREWIND_DEVICE" weof 1 >/dev/null 2>&1; then
-        log_error "write_filemark: weof failed on $bc"
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    seek_eod "$drive_idx"
+    local bc="${DRIVE_LOADED[$drive_idx]}"
+    if ! mt -f "${DRIVE_NST_DEV[$drive_idx]}" weof 1 >/dev/null 2>&1; then
+        log_error "write_filemark: weof failed (drive=$drive_idx bc=$bc)"
         mc_dump_failure
         return 1
     fi
     push_record "$bc" "F:0:0"
-    mc_log_op write_filemark cart="$bc"
+    mc_log_op write_filemark drive="$drive_idx" cart="$bc"
 }
 
 op_rewind() {
-    ensure_loaded || return 1
-    mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || true
-    mc_log_op rewind cart="$LOADED_CART"
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    mt -f "${DRIVE_NST_DEV[$drive_idx]}" rewind >/dev/null 2>&1 || true
+    mc_log_op rewind drive="$drive_idx" cart="${DRIVE_LOADED[$drive_idx]}"
 }
 
 op_load_cycle() {
     iscsi_login || return 1
-    # Unload current, pick a different cart, leave LOADED_CART empty so
-    # the next data-path op lazily loads.
-    if [[ -n "$LOADED_CART" ]]; then
-        mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || true
-        local origin prev="$LOADED_CART"
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    # Re-sync from the daemon in case state drifted since the last op.
+    DRIVE_LOADED[$drive_idx]=$(daemon_loaded_in_drive "$drive_idx")
+    local prev="${DRIVE_LOADED[$drive_idx]}"
+    if [[ -n "$prev" ]]; then
+        mt -f "${DRIVE_NST_DEV[$drive_idx]}" rewind >/dev/null 2>&1 || true
+        local origin
         origin=$(any_empty_slot)
         [[ -z "$origin" ]] && origin=1
-        if ! mtx -f "$CHANGER_DEVICE" unload "$origin" 0 >/dev/null 2>&1; then
-            log_error "load_cycle: unload failed (cart=$prev origin=$origin)"
+        if ! mtx -f "$CHANGER_DEVICE" unload "$origin" "$drive_idx" >/dev/null 2>&1; then
+            log_error "load_cycle: unload failed (drive=$drive_idx cart=$prev origin=$origin)"
             mc_dump_failure
             return 1
         fi
-        LOADED_CART=""
-        mc_log_op load_cycle prev="$prev"
+        DRIVE_LOADED[$drive_idx]=""
+        mc_log_op load_cycle drive="$drive_idx" prev="$prev"
     else
-        mc_log_op load_cycle status=already_empty
+        mc_log_op load_cycle drive="$drive_idx" status=already_empty
     fi
 }
 
@@ -680,15 +841,21 @@ op_iscsi_logout_cycle() {
     mc_log_op iscsi_logout_cycle
 }
 
-# Export the currently-loaded cartridge (or any cart in a slot) to the
-# import/export element, then re-import it. Round-trip — cart ends up
-# back in storage (slot reassignment may happen).
+# Export an in-storage cartridge to the import/export element, then
+# re-import it. Round-trip — cart ends up back in storage (slot
+# reassignment may happen). Skips any cart loaded in a drive (would
+# need an unload dance) and falls back to the slot_of_cart check so
+# carts left in odd states (e.g. mid-export) don't trip us up.
 op_import_export() {
     iscsi_login || return 1
-    # Don't try to export a loaded cart — would need an unload dance.
     local victim_bc victim_slot=""
+    local c di in_drive
     for c in "${CARTS[@]}"; do
-        if [[ "$c" == "$LOADED_CART" ]]; then continue; fi
+        in_drive=0
+        for (( di=0; di<NUM_DRIVES; di++ )); do
+            if [[ "${DRIVE_LOADED[$di]}" == "$c" ]]; then in_drive=1; break; fi
+        done
+        (( in_drive == 1 )) && continue
         victim_slot=$(slot_of_cart "$c")
         if [[ -n "$victim_slot" ]]; then victim_bc="$c"; break; fi
     done
@@ -721,12 +888,12 @@ op_changer_move() {
     # Read the slot map fresh.
     local status_out
     status_out=$(mtx -f "$CHANGER_DEVICE" status 2>/dev/null)
-    # Pick the first Full storage slot and the first Empty one. The
-    # loaded cart is in Data Transfer Element 0 — not in any Storage
-    # Element — so there's no risk of trying to move it out from under
-    # ourselves via this op. mtx output carries no barcodes (no
-    # VolumeTag descriptors from this READ ELEMENT STATUS), so we don't
-    # bother trying to identify which cart is moving.
+    # Pick the first Full storage slot and the first Empty one. Loaded
+    # carts live in Data Transfer Elements 0..N-1 — not in any Storage
+    # Element — so there's no risk of trying to move a loaded cart out
+    # from under ourselves via this op. mtx output carries no barcodes
+    # (no VolumeTag descriptors from this READ ELEMENT STATUS), so we
+    # don't bother trying to identify which cart is moving.
     local from_slot to_slot
     from_slot=$(echo "$status_out" | awk '/Storage Element [0-9]+:Full/ { for (i=1;i<=NF;i++) if ($i == "Element") { print $(i+1); exit } }')
     to_slot=$(echo "$status_out" | awk '/Storage Element [0-9]+:Empty/ { for (i=1;i<=NF;i++) if ($i == "Element") { print $(i+1); exit } }')
@@ -743,13 +910,15 @@ op_changer_move() {
 }
 
 op_write_filemarks_sync() {
-    ensure_loaded || return 1
-    seek_eod
-    local bc="$LOADED_CART"
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    seek_eod "$drive_idx"
+    local bc="${DRIVE_LOADED[$drive_idx]}"
     local n
     n=$(( $(mc_rng_u32 "fm-sync" 3) + 2 ))   # 2..4
-    if ! mt -f "$NOREWIND_DEVICE" weof "$n" >/dev/null 2>&1; then
-        log_error "write_filemarks_sync: weof $n failed on $bc"
+    if ! mt -f "${DRIVE_NST_DEV[$drive_idx]}" weof "$n" >/dev/null 2>&1; then
+        log_error "write_filemarks_sync: weof $n failed (drive=$drive_idx bc=$bc)"
         mc_dump_failure
         return 1
     fi
@@ -757,7 +926,40 @@ op_write_filemarks_sync() {
     for (( i=0; i<n; i++ )); do
         push_record "$bc" "F:0:0"
     done
-    mc_log_op write_filemarks_sync cart="$bc" n="$n"
+    mc_log_op write_filemarks_sync drive="$drive_idx" cart="$bc" n="$n"
+}
+
+# Stop and restart the daemon. The daemon handles SIGTERM by abort()
+# rather than running its flush path, so we cleanly unload every loaded
+# cart first — that triggers MemoryBufferManager::on_cartridge_unloaded,
+# which flushes in-memory chunk buffers into the upload pipeline. On
+# restart, scan_and_enqueue_orphans (vtl/daemon/src/upload_recovery.rs)
+# replays any sealed-but-unuploaded chunks so the next read_verify
+# finds the data intact. ISCSI_UP / DRIVE_LOADED reset so the next
+# data-path op lazily re-establishes via iscsi_login + ensure_loaded.
+op_daemon_restart() {
+    iscsi_login || return 1
+    local di
+    for (( di=0; di<NUM_DRIVES; di++ )); do
+        DRIVE_LOADED[$di]=$(daemon_loaded_in_drive "$di")
+        if [[ -n "${DRIVE_LOADED[$di]}" ]]; then
+            mt -f "${DRIVE_NST_DEV[$di]}" rewind >/dev/null 2>&1 || true
+            local origin
+            origin=$(any_empty_slot)
+            [[ -z "$origin" ]] && origin=1
+            if ! mtx -f "$CHANGER_DEVICE" unload "$origin" "$di" >/dev/null 2>&1; then
+                log_error "daemon_restart: unload of ${DRIVE_LOADED[$di]} from drive $di failed"
+                mc_dump_failure
+                return 1
+            fi
+            DRIVE_LOADED[$di]=""
+        fi
+    done
+    iscsi_logout
+    stop_thur_daemon
+    sleep 0.2
+    DAEMON_LOG_MODE=append start_thur_daemon
+    mc_log_op daemon_restart
 }
 
 # ---------------------------------------------------------------------------
@@ -768,11 +970,12 @@ op_write_filemarks_sync() {
 # at startup enforces that. write_filemark / write_filemarks_sync are
 # rare on purpose — they're correctness-shape ops, not throughput drivers.
 OP_WEIGHTS=(
-    "29:write_record" "39:read_verify"
+    "29:write_record" "37:read_verify"
     "5:rewind"
     "10:load_cycle" "5:iscsi_logout_cycle"
     "3:import_export" "3:changer_move"
     "4:write_filemark" "2:write_filemarks_sync"
+    "2:daemon_restart"
 )
 
 run_ops() {
@@ -792,28 +995,36 @@ run_ops() {
             changer_move)           op_changer_move || return 1 ;;
             write_filemark)         op_write_filemark || return 1 ;;
             write_filemarks_sync)   op_write_filemarks_sync || return 1 ;;
+            daemon_restart)         op_daemon_restart || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
-            local total=0
+            local total=0 c di drive_summary=""
             for c in "${CARTS[@]}"; do
                 total=$(( total + $(record_count "$c") ))
             done
-            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED loaded=${LOADED_CART:-<empty>} iscsi=$ISCSI_UP total_records=$total"
+            for (( di=0; di<NUM_DRIVES; di++ )); do
+                drive_summary+="d${di}=${DRIVE_LOADED[$di]:-<empty>} "
+            done
+            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED ${drive_summary}iscsi=$ISCSI_UP total_records=$total"
         fi
     done
 }
 
 # Final verification — replay every cart from BOT and compare every
 # record. Catches drift the in-loop read_verify rate didn't sweep.
+# Always uses drive 0 for verification — the choice is arbitrary, but
+# fixed-drive verify gives a predictable failure signature; per-drive
+# verify is already exercised inside run_ops via the random picker.
 final_verify_all() {
     iscsi_login || return 1
-    log_info "Final verify of all cartridges..."
+    log_info "Final verify of all cartridges (drive 0)..."
     local c entry kind idx size expected="$TEST_DIR/scratch.expect" actual="$TEST_DIR/scratch.actual"
     local total_records=0 total_carts=0
+    local nst="${DRIVE_NST_DEV[0]}"
     for c in "${CARTS[@]}"; do
         [[ -z "${RECORDS[$c]}" ]] && continue
-        ensure_loaded "$c" || return 1
-        mt -f "$NOREWIND_DEVICE" rewind >/dev/null 2>&1 || { log_error "final_verify: rewind failed for $c"; return 1; }
+        ensure_loaded "$c" 0 || return 1
+        mt -f "$nst" rewind >/dev/null 2>&1 || { log_error "final_verify: rewind failed for $c"; return 1; }
         local cart_records=0
         while IFS= read -r entry; do
             [[ -z "$entry" ]] && continue
@@ -824,7 +1035,7 @@ final_verify_all() {
             case "$kind" in
                 R)
                     mc_content_to "$c" "$idx" "$size" "$expected"
-                    if ! dd if="$NOREWIND_DEVICE" of="$actual" bs="$size" count=1 status=none 2>/dev/null; then
+                    if ! dd if="$nst" of="$actual" bs="$size" count=1 status=none 2>/dev/null; then
                         log_error "final_verify: dd read failed (bc=$c idx=$idx size=$size)"
                         mc_dump_failure
                         return 1
@@ -847,7 +1058,7 @@ final_verify_all() {
                     cart_records=$(( cart_records + 1 ))
                     ;;
                 F)
-                    mt -f "$NOREWIND_DEVICE" fsf 1 >/dev/null 2>&1 || true
+                    mt -f "$nst" fsf 1 >/dev/null 2>&1 || true
                     ;;
             esac
         done <<< "${RECORDS[$c]}"
@@ -868,12 +1079,13 @@ main() {
     assign_ports
     create_test_config
     start_daemon
+    setup_chap_user
     create_cartridges
 
     mc_assert_weights "op" "${OP_WEIGHTS[@]}"
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
 
-    log_info "Running $OPS random ops (${#CARTS[@]} carts, $NUM_DRIVES drive)"
+    log_info "Running $OPS random ops (${#CARTS[@]} carts, $NUM_DRIVES drives)"
     if ! run_ops "$OPS"; then
         log_fail "Op loop aborted on failure"
         exit 1
