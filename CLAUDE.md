@@ -463,7 +463,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
 - `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,scsi-conformance,fs-iscsi,fs-iscsi-storage,fs-nvmetcp,fs-nvmetcp-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
+- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
@@ -510,7 +510,7 @@ runs `fsck.ext4 -fn`, and re-verifies the Phase B fixture survived.
 `qemu-utils`, `ovmf`, `cloud-image-utils`. First run fetches the cloud
 image (~408 MB) under `/var/cache/thur/cloud-images/`; subsequent runs
 reuse the cache.
-`test-keystore.sh` is the keystore-backend counterpart of `test-fs-iscsi-storage.sh`
+`test-keystore.sh` is the keystore-backend counterpart of `test-fs-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
 and exercises wrap / unwrap / migrate against any backend type

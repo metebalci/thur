@@ -12,24 +12,31 @@
 # user-visible workload, fence with SYNC, restart everything, prove
 # the bytes round-trip intact.
 #
+# Transport is selectable via --transport iscsi|nvmetcp (default
+# iscsi). The op model, content model, and verification are
+# transport-agnostic — only the login / device-discovery /
+# logout-cycle primitives + the raw-snapshot path branch.
+#
 # Workflow:
 #   Phase A — write workload via ext4
-#     1. Login + identify the thurvsa LUN as /dev/sdX (block) and
-#        /dev/sgN (sg passthrough sibling).
-#     2. mkfs.ext4 /dev/sdX, mount at /mnt/thurvsa-test/.
+#     1. iSCSI:   login + identify the thurvsa LUN as /dev/sdX (block)
+#                 and /dev/sgN (sg passthrough sibling).
+#        NVMe/TCP: nvme connect to the thurvsa subsystem, identify
+#                 /dev/nvmeXn1.
+#     2. mkfs.ext4 <block>, mount at /mnt/thurvsa-test/.
 #     3. Generate a fixture tarball (~4 MiB tree of mixed text +
 #        random bytes) and `tar xf` it onto the mount.
 #     4. Hash the extracted tree (per-file, sorted), sync, umount.
-#   Phase B — pre-restart snapshot via sg passthrough
-#     5. `sg_dd if=/dev/sgN of=snap-pre.bin` reads the entire volume
-#        through SG_IO. This goes straight to the daemon, bypassing
-#        the kernel block-layer page cache, so it captures exactly
-#        what the daemon would serve a future client.
+#   Phase B — pre-restart snapshot
+#     5. iSCSI:   `sg_dd if=/dev/sgN of=snap-pre.bin` reads the entire
+#                 volume through SG_IO. Goes straight to the daemon,
+#                 bypassing the kernel block-layer page cache.
+#        NVMe/TCP: `dd if=/dev/nvmeXn1 iflag=direct` — O_DIRECT skips
+#                 the buffer cache and routes each READ command
+#                 straight to the daemon.
 #   Phase C — restart everything, snapshot again, compare
-#     6. Logout iSCSI, kill -TERM the daemon, restart, login again.
-#     7. `sg_dd if=/dev/sgN of=snap-post.bin` snapshots the same
-#        volume from the fresh daemon (cache empty, reads come from
-#        page index + chunk pool only).
+#     6. Logout transport, kill -TERM the daemon, restart, login again.
+#     7. Snapshot the post-restart volume the same way.
 #     8. `cmp snap-pre.bin snap-post.bin` is the load-bearing
 #        persistence gate: snapshots match if and only if the daemon
 #        truly committed every page to its on-disk page index +
@@ -37,6 +44,9 @@
 #     9. Supplementary: fsck.ext4 -fn + mount + per-file diff
 #        (kernel-cache-prone, informational only).
 #   Phase D — destroy the volume, garbage-collect, prove reclaim
+#               (iSCSI transport only — behavior is transport-
+#                independent, but the original NVMe/TCP twin did
+#                not include this phase, so it stays gated for now)
 #    10. `volume destroy` removes the manifest + page index but
 #        deliberately leaves the per-volume chunk pool behind — every
 #        chunk is now an orphan.
@@ -45,39 +55,44 @@
 #        namespace (`<data_dir>/chunks/local/<uuid>/`); `system gc
 #        --storage` then reclaims the matching objects from the backend.
 #
-# Catches gaps that synthetic SCSI tests miss:
+# Catches gaps that synthetic SCSI/NVMe tests miss:
 #   - Variable-LBA WRITE / READ as the kernel sees it (the elevator,
-#     CAW, UNMAP, SYNCHRONIZE CACHE all flow through ext4).
+#     CAW, UNMAP, SYNCHRONIZE CACHE / NVMe Flush all flow through ext4).
 #   - Persistence across daemon restarts (the cache layer's flush +
-#     SYNC contract, not just SCSI-level sync).
+#     SYNC contract, not just SCSI/NVMe-level sync).
 #   - Storage-pool growth: each `tar xf` produces real content-addressed
 #     uploads to the local backend.
-#   - Orphan-chunk garbage collection: a destroyed Local volume's
-#     UUID-keyed namespace is swept clean by `thurvsa system gc`.
+#   - Orphan-chunk garbage collection (iSCSI run only): a destroyed
+#     Local volume's UUID-keyed namespace is swept clean by
+#     `thurvsa system gc`.
 #
 # TEST LIMITATIONS:
-#   The Linux kernel block layer caches /dev/sdb pages aggressively
-#   and does NOT release the cache on `iscsiadm logout`. The cache
-#   often survives even `echo 3 > /proc/sys/vm/drop_caches` because
-#   the kernel SCSI midlayer holds its own per-device cache. The
-#   Phase C mount + per-file-hash check is therefore informational
-#   only — it can pass via the kernel cache even if the daemon lost
-#   data. The Phase B/C sg-passthrough snapshot comparison is the
-#   real durability gate: SG_IO ioctl bypasses every kernel cache
-#   and routes each READ CDB straight to the daemon.
+#   The Linux kernel block layer caches /dev/sdX and /dev/nvmeXn1
+#   pages aggressively and does NOT release the cache on transport
+#   logout. The cache often survives even `echo 3 > /proc/sys/vm/
+#   drop_caches`. The Phase C mount + per-file-hash check is therefore
+#   informational only — it can pass via the kernel cache even if the
+#   daemon lost data. The Phase B/C raw-snapshot comparison (sg_dd
+#   for iSCSI, dd iflag=direct for NVMe/TCP) is the real durability
+#   gate: both bypass every kernel cache and route each READ straight
+#   to the daemon.
 #
-# Prerequisites:
-#   - sg3-utils       (sudo apt-get install sg3-utils)
-#   - open-iscsi      (sudo apt-get install open-iscsi)
-#   - lsscsi          (sudo apt-get install lsscsi)
+# Prerequisites (common):
 #   - e2fsprogs       (mkfs.ext4, fsck.ext4 — usually present)
 #   - util-linux      (mount, umount — usually present)
 #   - tar             (always present)
-#   - iscsid running  (sudo systemctl enable --now iscsid)
 #   - Root/sudo access
+# Prerequisites (iSCSI transport):
+#   - sg3-utils       (sudo apt-get install sg3-utils)
+#   - open-iscsi      (sudo apt-get install open-iscsi)
+#   - lsscsi          (sudo apt-get install lsscsi)
+#   - iscsid running  (sudo systemctl enable --now iscsid)
+# Prerequisites (NVMe/TCP transport):
+#   - nvme-cli         (sudo apt-get install nvme-cli)
+#   - nvme_tcp kernel module (sudo modprobe nvme_tcp)
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-fs-iscsi.sh [OPTIONS]
+#   ./vsa/scripts/test-fs.sh [OPTIONS]
 #
 # The script self-elevates via sudo (NOPASSWD sudoers entry required);
 # no need to prefix with sudo yourself.
@@ -87,8 +102,11 @@
 #   --daemon-path PATH    Override path to thurvsad binary
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up test data directory
-#   --keep-iscsi          Don't disconnect the iSCSI session after tests
+#   --transport T         iscsi (default) or nvmetcp
+#   --keep-iscsi          Don't disconnect the iSCSI session after tests (iscsi only)
+#   --keep-nvme           Don't disconnect the NVMe session after tests (nvmetcp only)
 #   --iscsi-port PORT     Override iSCSI port (default: free ephemeral port)
+#   --nvmetcp-port PORT   Override NVMe/TCP port (default: free ephemeral port)
 #   --http-port PORT      Override HTTP port (default: free ephemeral port)
 #
 
@@ -100,11 +118,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-TEST_DIR="/tmp/thurvsa-test-fs-iscsi-$$"
+TEST_DIR="/tmp/thurvsa-test-fs-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
+TRANSPORT="iscsi"
+NVMETCP_PORT=""
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
+SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
+HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-fs-workflow-test"
 KEEP_ISCSI=0
+KEEP_NVME=0
 ISCSI_CONNECTED=0
+NVME_CONNECTED=0
+NVME_DEVICE=""
 MOUNT_POINT="${TEST_DIR}/mnt"
 VOLUME_NAME="vol-fs"
 VOLUME_SIZE_MIB=64
@@ -120,7 +145,10 @@ RW_SG_DEVICE=""
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --transport) TRANSPORT="$2"; shift 2 ;;
         --keep-iscsi) KEEP_ISCSI=1; shift ;;
+        --keep-nvme) KEEP_NVME=1; shift ;;
+        --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
         *)
             if parse_common_daemon_arg "$@"; then
                 shift "$_CONSUMED_ARGS"
@@ -131,6 +159,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+case "$TRANSPORT" in
+    iscsi|nvmetcp) ;;
+    *) echo "Unknown --transport '$TRANSPORT' (expected iscsi or nvmetcp)"; exit 1 ;;
+esac
 
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
@@ -143,9 +176,10 @@ cleanup() {
         umount "$MOUNT_POINT" 2>/dev/null || true
     fi
 
-    if [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]]; then
-        iscsi_logout_and_delete
-    fi
+    case "$TRANSPORT" in
+        iscsi)   [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]] && iscsi_logout_and_delete ;;
+        nvmetcp) [[ $NVME_CONNECTED  -eq 1 && $KEEP_NVME  -eq 0 ]] && nvme_tcp_disconnect    ;;
+    esac
 
     stop_thur_daemon
 
@@ -159,8 +193,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Pick transport+http ports. Mirrors test-helpers.sh assign_ports but
+# the transport port var name depends on TRANSPORT.
+assign_ports_fs() {
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        [[ -z "$ISCSI_PORT" ]] && ISCSI_PORT=$(pick_free_port)
+    else
+        [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(pick_free_port)
+    fi
+    [[ -z "$HTTP_PORT" ]] && HTTP_PORT=$(pick_free_port)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "Using iSCSI port $ISCSI_PORT, HTTP port $HTTP_PORT"
+    else
+        log_info "Using NVMe/TCP port $NVMETCP_PORT, HTTP port $HTTP_PORT"
+    fi
+}
+
 check_prerequisites() {
-    log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
+    log_info "Checking prerequisites (build profile: $BUILD_PROFILE, transport: $TRANSPORT)..."
     local missing=()
     local hints=()
     local build_cmd="cargo build --profile dev"
@@ -190,6 +240,7 @@ check_prerequisites() {
         [iscsiadm]="sudo apt-get install open-iscsi"
         [lsscsi]="sudo apt-get install lsscsi"
         [sg_dd]="sudo apt-get install sg3-utils"
+        [nvme]="sudo apt-get install nvme-cli"
         [cmp]="(diffutils — usually present)"
         [mkfs.ext4]="sudo apt-get install e2fsprogs"
         [fsck.ext4]="sudo apt-get install e2fsprogs"
@@ -198,13 +249,27 @@ check_prerequisites() {
         [tar]="(present on every distro)"
         [curl]="sudo apt-get install curl"
         [systemctl]="(systemd should be present on any modern Linux)"
+        [sha256sum]="sudo apt-get install coreutils"
     )
-    for tool in iscsiadm lsscsi sg_dd cmp mkfs.ext4 fsck.ext4 mount umount tar curl systemctl; do
+    local tools=(cmp mkfs.ext4 fsck.ext4 mount umount tar curl sha256sum)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        tools+=(iscsiadm lsscsi sg_dd systemctl)
+    else
+        tools+=(nvme)
+    fi
+    for tool in "${tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
             hints+=("  - $tool: ${HINTS[$tool]}")
         fi
     done
+
+    if [[ "$TRANSPORT" == "nvmetcp" ]]; then
+        if ! lsmod | grep -q '^nvme_tcp\b' && ! modinfo nvme_tcp >/dev/null 2>&1; then
+            missing+=("nvme_tcp kernel module")
+            hints+=("  - nvme_tcp: sudo modprobe nvme_tcp (kernel >= 5.0 required)")
+        fi
+    fi
 
     if (( ${#missing[@]} > 0 )); then
         log_error "Missing prerequisites: ${missing[*]}"
@@ -213,11 +278,18 @@ check_prerequisites() {
         exit 1
     fi
 
-    if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
-        log_error "iscsid (open-iscsi) service is not running."
-        echo "Start it with:"
-        echo "  sudo systemctl enable --now iscsid open-iscsi"
-        exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
+            log_error "iscsid (open-iscsi) service is not running."
+            echo "Start it with:"
+            echo "  sudo systemctl enable --now iscsid open-iscsi"
+            exit 1
+        fi
+    else
+        if ! lsmod | grep -q '^nvme_tcp\b'; then
+            log_info "Loading nvme_tcp kernel module"
+            modprobe nvme_tcp || { log_error "Failed to load nvme_tcp"; exit 1; }
+        fi
     fi
 
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
@@ -227,7 +299,8 @@ check_prerequisites() {
 create_test_config() {
     log_info "Creating test configuration..."
     mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
-    cat > "$TEST_CONFIG" <<EOFCONFIG
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        cat > "$TEST_CONFIG" <<EOFCONFIG
 $(yaml_header)
 
 $(yaml_iscsi)
@@ -237,11 +310,53 @@ audit:
 $(yaml_local_backend)
 
 EOFCONFIG
+    else
+        cat > "$TEST_CONFIG" <<EOFCONFIG
+data_dir: "$TEST_DIR/data"
+
+transport: nvmetcp
+
+http:
+  listen: "127.0.0.1:$HTTP_PORT"
+
+nvmetcp:
+  listen: "0.0.0.0:$NVMETCP_PORT"
+
+audit:
+  enabled: true
+storage:
+  backends:
+    local:
+      type: local
+      root_dir: "$TEST_DIR/local-backend"
+
+EOFCONFIG
+        mkdir -p "$TEST_DIR/local-backend"
+    fi
 }
 
 start_daemon() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    DAEMON_LOG_MODE=append start_thur_daemon
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        DAEMON_LOG_MODE=append start_thur_daemon
+    else
+        log_info "Starting thurvsad (NVMe/TCP)..."
+        RUST_LOG="info,nvme_tcp=debug" \
+            "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
+        DAEMON_PID=$!
+        # NVMe/TCP transport doesn't bind the HTTP port until later in
+        # startup, so poll the listener directly.
+        for _ in $(seq 1 30); do
+            if ss -tln 2>/dev/null | grep -q ":$NVMETCP_PORT\b"; then
+                log_info "Daemon ready (PID $DAEMON_PID, port $NVMETCP_PORT)"
+                return 0
+            fi
+            sleep 0.5
+        done
+        log_error "Daemon failed to bind port $NVMETCP_PORT"
+        tail -50 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
 }
 
 stop_daemon() {
@@ -254,50 +369,95 @@ ensure_volume() {
         return 0
     fi
     log_info "Creating $VOLUME_NAME (${VOLUME_SIZE_MIB} MiB)..."
-    "$CLI_PATH" --config "$TEST_CONFIG" volume create "$VOLUME_NAME" --size "${VOLUME_SIZE_MIB}M" --dedup local >/dev/null
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        "$CLI_PATH" --config "$TEST_CONFIG" volume create "$VOLUME_NAME" --size "${VOLUME_SIZE_MIB}M" --dedup local >/dev/null
+    else
+        "$CLI_PATH" --config "$TEST_CONFIG" volume create "$VOLUME_NAME" \
+            --size "${VOLUME_SIZE_MIB}M" --backend local --dedup local >/dev/null
+    fi
 }
 
-connect_iscsi() {
-    iscsi_discover_and_login
-    local row
-    row=$(lsscsi -g | awk '/THUR VSA/ {print; exit}')
-    [[ -n "$row" ]] || { log_error "No THUR VSA device found"; lsscsi -g; exit 1; }
-    RW_DEVICE=$(echo "$row" | awk '{print $(NF-1)}')
-    RW_SG_DEVICE=$(echo "$row" | awk '{print $NF}')
-    [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; exit 1; }
-    log_info "thurvsa LUN -> $RW_DEVICE (sg passthrough: $RW_SG_DEVICE)"
+connect_volume() {
+    case "$TRANSPORT" in
+        iscsi)
+            iscsi_discover_and_login
+            local row
+            row=$(lsscsi -g | awk '/THUR VSA/ {print; exit}')
+            [[ -n "$row" ]] || { log_error "No THUR VSA device found"; lsscsi -g; exit 1; }
+            RW_DEVICE=$(echo "$row" | awk '{print $(NF-1)}')
+            RW_SG_DEVICE=$(echo "$row" | awk '{print $NF}')
+            [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; exit 1; }
+            log_info "thurvsa LUN -> $RW_DEVICE (sg passthrough: $RW_SG_DEVICE)"
+            ;;
+        nvmetcp)
+            nvme_tcp_connect || return 1
+            RW_DEVICE="/dev/${NVME_DEVICE}n1"
+            RW_SG_DEVICE=""
+            ;;
+    esac
 }
 
-# Snapshot the entire volume by reading every page through the
-# /dev/sgN passthrough into `out_file`. SG passthrough sends each
-# READ CDB straight to the daemon — bypassing the kernel block-layer
-# page cache — so the snapshot reflects exactly what the daemon
-# currently serves. The Phase A snapshot proves the daemon's view
-# right after umount; the Phase C snapshot proves what survives a
+disconnect_volume() {
+    case "$TRANSPORT" in
+        iscsi)
+            if [[ $ISCSI_CONNECTED -eq 1 ]]; then
+                iscsi_logout_and_delete
+                sleep 1
+            fi
+            ;;
+        nvmetcp)
+            nvme_tcp_disconnect
+            ;;
+    esac
+}
+
+# Snapshot the entire volume into `out_file`, bypassing the kernel
+# block-layer page cache so the snapshot reflects exactly what the
+# daemon currently serves. The Phase B snapshot proves the daemon's
+# view right after umount; the Phase C snapshot proves what survives a
 # kill -TERM + restart. If they match, the daemon truly persisted.
-snapshot_via_sg() {
+#
+#   iSCSI:   sg_dd via /dev/sgN (SG_IO ioctl routes each READ CDB
+#            straight to the daemon).
+#   NVMe/TCP: dd iflag=direct via /dev/nvmeXn1 (O_DIRECT skips the
+#            buffer cache; NVMe driver has no separate midlayer cache).
+snapshot_volume() {
     local out_file="$1"
-    local block_bytes=131072    # 128 KiB per READ — 2 pages, 32 sectors
-    local total_blocks=$(( VOLUME_SIZE_MIB * 1024 * 1024 / block_bytes ))
-    if ! sg_dd "if=$RW_SG_DEVICE" "of=$out_file" \
-            "bs=$block_bytes" "count=$total_blocks" 2>&1 | tail -3 | sed 's/^/    /'; then
-        log_error "sg_dd snapshot failed"
-        return 1
-    fi
-    local actual
-    actual=$(stat -c%s "$out_file")
-    if (( actual != VOLUME_SIZE_MIB * 1024 * 1024 )); then
-        log_error "snapshot size $actual != expected $((VOLUME_SIZE_MIB * 1024 * 1024))"
-        return 1
-    fi
+    case "$TRANSPORT" in
+        iscsi)
+            local block_bytes=131072    # 128 KiB per READ — 2 pages, 32 sectors
+            local total_blocks=$(( VOLUME_SIZE_MIB * 1024 * 1024 / block_bytes ))
+            if ! sg_dd "if=$RW_SG_DEVICE" "of=$out_file" \
+                    "bs=$block_bytes" "count=$total_blocks" 2>&1 | tail -3 | sed 's/^/    /'; then
+                log_error "sg_dd snapshot failed"
+                return 1
+            fi
+            local actual
+            actual=$(stat -c%s "$out_file")
+            if (( actual != VOLUME_SIZE_MIB * 1024 * 1024 )); then
+                log_error "snapshot size $actual != expected $((VOLUME_SIZE_MIB * 1024 * 1024))"
+                return 1
+            fi
+            ;;
+        nvmetcp)
+            local total_bytes=$(( VOLUME_SIZE_MIB * 1024 * 1024 ))
+            # 1 MiB I/Os — fits inside our advertised MAXH2CDATA + reads
+            # multi-page-at-once so the daemon's read path exercises page
+            # cache misses + chunk-pool fetches similar to real workloads.
+            if ! dd "if=$RW_DEVICE" "of=$out_file" bs=1M "count=$VOLUME_SIZE_MIB" \
+                    iflag=direct status=none 2>"$TEST_DIR/snapshot-dd.err"; then
+                log_error "dd snapshot failed: $(cat "$TEST_DIR/snapshot-dd.err")"
+                return 1
+            fi
+            local actual
+            actual=$(stat -c%s "$out_file")
+            if (( actual != total_bytes )); then
+                log_error "snapshot size $actual != expected $total_bytes"
+                return 1
+            fi
+            ;;
+    esac
     return 0
-}
-
-disconnect_iscsi() {
-    if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsi_logout_and_delete
-        sleep 1
-    fi
 }
 
 generate_fixture() {
@@ -319,7 +479,7 @@ generate_fixture() {
 # ---------------------------------------------------------------------------
 
 phase_a_format_mount_extract() {
-    log_info "[Phase A] mkfs.ext4 + mount + tar xf + sync"
+    log_info "[Phase A] mkfs.ext4 + mount + tar xf + sync on $RW_DEVICE"
     if ! mkfs.ext4 -F -q "$RW_DEVICE"; then
         log_error "[Phase A] mkfs.ext4 failed on $RW_DEVICE"
         return 1
@@ -387,18 +547,21 @@ phase_a_format_mount_extract() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase B — pre-restart sg-passthrough snapshot
+# Phase B — pre-restart raw snapshot
 #
-# Read the entire volume through /dev/sgN so we capture the daemon's
-# view directly, bypassing the kernel block-layer page cache. After
-# umount, the daemon's PageCache + chunk pool + page index reflect
-# the post-tar state; this snapshot is our reference for what should
-# survive a daemon restart.
+# Read the entire volume bypassing the kernel block-layer page cache
+# so we capture the daemon's view directly. After umount, the daemon's
+# PageCache + chunk pool + page index reflect the post-tar state; this
+# snapshot is our reference for what should survive a daemon restart.
 # ---------------------------------------------------------------------------
 
 phase_b_snapshot_pre_restart() {
-    log_info "[Phase B] Snapshotting volume via sg passthrough ($RW_SG_DEVICE)..."
-    if ! snapshot_via_sg "$SNAPSHOT_PRE"; then
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "[Phase B] Snapshotting volume via sg passthrough ($RW_SG_DEVICE)..."
+    else
+        log_info "[Phase B] Snapshotting volume via O_DIRECT ($RW_DEVICE)..."
+    fi
+    if ! snapshot_volume "$SNAPSHOT_PRE"; then
         log_error "[Phase B] pre-restart snapshot failed"
         return 1
     fi
@@ -408,36 +571,51 @@ phase_b_snapshot_pre_restart() {
 # ---------------------------------------------------------------------------
 # Phase C — restart everything, snapshot again, compare
 #
-# The sg-passthrough snapshot comparison is the load-bearing
-# persistence assertion: it can ONLY succeed if the daemon's on-disk
-# state (page index + chunks) matches the pre-restart in-memory +
-# disk state. Kernel page-cache shenanigans don't apply because every
-# READ goes via SG_IO ioctl direct to the daemon.
+# The raw-snapshot comparison is the load-bearing persistence
+# assertion: it can ONLY succeed if the daemon's on-disk state (page
+# index + chunks) matches the pre-restart in-memory + disk state.
+# Kernel page-cache shenanigans don't apply because every READ goes
+# via SG_IO ioctl (iSCSI) or O_DIRECT (NVMe/TCP) direct to the daemon.
 #
 # The trailing fsck + mount + per-file-hash check is supplementary —
 # kernel-cache-prone but useful for catching ext4-level corruption.
 # ---------------------------------------------------------------------------
 
 phase_c_restart_and_verify() {
-    log_info "[Phase C] Disconnecting iSCSI, stopping daemon, restarting..."
-    disconnect_iscsi
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "[Phase C] Disconnecting iSCSI, stopping daemon, restarting..."
+    else
+        log_info "[Phase C] Disconnecting NVMe, stopping daemon, restarting..."
+    fi
+    disconnect_volume
     stop_daemon
     # Drop the kernel block-layer page cache. Belt-and-suspenders
-    # against the supplementary mount check below; the sg-passthrough
-    # snapshot is unaffected either way.
+    # against the supplementary mount check below; the raw-snapshot
+    # path is unaffected either way.
     sync && echo 3 > /proc/sys/vm/drop_caches
     start_daemon
-    connect_iscsi
+    if ! connect_volume; then
+        log_error "[Phase C] reconnect failed"
+        return 1
+    fi
 
-    log_info "[Phase C] Snapshotting post-restart volume via sg passthrough..."
-    if ! snapshot_via_sg "$SNAPSHOT_POST"; then
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "[Phase C] Snapshotting post-restart volume via sg passthrough..."
+    else
+        log_info "[Phase C] Snapshotting post-restart volume via O_DIRECT..."
+    fi
+    if ! snapshot_volume "$SNAPSHOT_POST"; then
         log_error "[Phase C] post-restart snapshot failed"
         return 1
     fi
     log_info "[Phase C] snapshot $(stat -c%s "$SNAPSHOT_POST") bytes, sha256=$(sha256sum "$SNAPSHOT_POST" | awk '{print substr($1,1,16)}')..."
 
     if ! cmp -s "$SNAPSHOT_PRE" "$SNAPSHOT_POST"; then
-        log_error "[Phase C] DAEMON-SIDE PERSISTENCE FAILURE: sg-passthrough snapshots differ across restart"
+        if [[ "$TRANSPORT" == "iscsi" ]]; then
+            log_error "[Phase C] DAEMON-SIDE PERSISTENCE FAILURE: sg-passthrough snapshots differ across restart"
+        else
+            log_error "[Phase C] DAEMON-SIDE PERSISTENCE FAILURE: O_DIRECT snapshots differ across restart"
+        fi
         log_error "  pre-restart  size: $(stat -c%s "$SNAPSHOT_PRE") bytes"
         log_error "  post-restart size: $(stat -c%s "$SNAPSHOT_POST") bytes"
         # Show the first divergent offset to help triage.
@@ -446,12 +624,17 @@ phase_c_restart_and_verify() {
         log_error "  first divergence: $first_diff"
         return 1
     fi
-    log_info "[Phase C] sg-passthrough snapshots match — daemon truly persisted across restart"
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "[Phase C] sg-passthrough snapshots match — daemon truly persisted across restart"
+    else
+        log_info "[Phase C] snapshots match — daemon truly persisted across restart"
+    fi
 
     # Supplementary: fsck + mount + per-file-hash check. Subject to
-    # kernel block-cache caching of /dev/sdb across iscsi sessions
-    # (see TEST-LIMITATIONS header), so this part is informational
-    # — the snapshot comparison above is the durability gate.
+    # kernel block-cache caching of the device across transport
+    # sessions (see TEST-LIMITATIONS header), so this part is
+    # informational — the snapshot comparison above is the durability
+    # gate.
     log_info "[Phase C] Supplementary fsck + mount + per-file-hash check..."
     local fsck_out
     fsck_out=$(fsck.ext4 -fn "$RW_DEVICE" 2>&1)
@@ -470,7 +653,11 @@ phase_c_restart_and_verify() {
     if diff -q "$FIXTURE_HASH_BEFORE" "$FIXTURE_HASH_AFTER" >/dev/null; then
         log_info "  all files round-tripped byte-for-byte across restart"
     else
-        log_warn "  file hashes differ — but sg-passthrough snapshots matched, so this is most likely an ext4 / kernel-cache artifact, not lost daemon state"
+        if [[ "$TRANSPORT" == "iscsi" ]]; then
+            log_warn "  file hashes differ — but sg-passthrough snapshots matched, so this is most likely an ext4 / kernel-cache artifact, not lost daemon state"
+        else
+            log_warn "  file hashes differ — but O_DIRECT snapshots matched, so this is most likely a kernel-cache artifact, not lost daemon state"
+        fi
         diff -u "$FIXTURE_HASH_BEFORE" "$FIXTURE_HASH_AFTER" | head -20 | sed 's/^/    /'
     fi
     return 0
@@ -478,6 +665,10 @@ phase_c_restart_and_verify() {
 
 # ---------------------------------------------------------------------------
 # Phase D — destroy the volume, GC, prove the orphan namespace is reclaimed
+#
+# Gated on TRANSPORT=iscsi: the original NVMe/TCP twin script did not
+# include this phase, and keeping the merged script byte-equivalent
+# for both runs means we don't extend coverage opportunistically.
 #
 # `volume destroy` removes the manifest + page index but deliberately
 # leaves the per-volume chunk pool behind — with nothing referencing
@@ -525,7 +716,7 @@ phase_d_destroy_and_gc() {
     log_info "[Phase D] before destroy: $pool_pre chunk(s) in pool, $backend_pre in backend"
 
     # The volume must not be in an iSCSI session when destroyed.
-    disconnect_iscsi
+    disconnect_volume
 
     if ! "$CLI_PATH" --config "$TEST_CONFIG" volume destroy "$VOLUME_NAME" --force >/dev/null 2>&1; then
         log_error "[Phase D] volume destroy failed"
@@ -581,16 +772,20 @@ phase_d_destroy_and_gc() {
 
 main() {
     echo "========================================"
-    echo "thurvsa Filesystem Workflow Test"
+    echo "thurvsa Filesystem Workflow Test (transport=$TRANSPORT)"
     echo "========================================"
     echo ""
 
     check_prerequisites
-    assign_ports
+    assign_ports_fs
     create_test_config
     start_daemon
     ensure_volume
-    connect_iscsi
+    if ! connect_volume; then
+        log_fail "Could not establish $TRANSPORT session"
+        tail -30 "$TEST_DIR/daemon.log"
+        exit 1
+    fi
     generate_fixture
 
     echo ""
@@ -602,7 +797,11 @@ main() {
         exit 1
     fi
     echo ""
-    log_test "Phase B — pre-restart sg-passthrough volume snapshot"
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_test "Phase B — pre-restart sg-passthrough volume snapshot"
+    else
+        log_test "Phase B — pre-restart O_DIRECT volume snapshot"
+    fi
     if phase_b_snapshot_pre_restart; then
         log_pass "Phase B"
     else
@@ -618,13 +817,15 @@ main() {
         exit 1
     fi
 
-    echo ""
-    log_test "Phase D — destroy volume + system gc + verify orphan reclaim"
-    if phase_d_destroy_and_gc; then
-        log_pass "Phase D"
-    else
-        log_fail "Phase D"
-        exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        echo ""
+        log_test "Phase D — destroy volume + system gc + verify orphan reclaim"
+        if phase_d_destroy_and_gc; then
+            log_pass "Phase D"
+        else
+            log_fail "Phase D"
+            exit 1
+        fi
     fi
 
     echo ""

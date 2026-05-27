@@ -4,17 +4,21 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# thurvsa End-to-End Filesystem Workflow Test (NVMe/TCP + storage backend)
+# thurvsa End-to-End Filesystem Workflow Test (real storage backend)
 #
-# Same shape as test-fs-iscsi-storage.sh, but driven through Linux nvme-cli +
-# nvme_tcp instead of open-iscsi. Clones a backend definition from
-# private/storage-backends.json (or $THURVSA_SOURCE_BACKENDS) so the
-# upload pipeline, HEAD-then-PUT dedup, page-eviction-driven storage
-# refetch, and SYNC-fenced flush paths actually fire against a real
-# storage backend through the NVMe/TCP transport.
+# Same shape as test-fs.sh, but instead of pointing at the
+# `local` backend, this clones a backend definition from
+# /etc/thurvsa/thurvsa.yaml so the upload pipeline, HEAD-then-PUT
+# dedup, page-eviction-driven storage refetch, and SYNC-fenced flush
+# paths actually fire against a real storage backend.
+#
+# Transport is selectable via --transport iscsi|nvmetcp (default
+# iscsi). Op model, backend resolution, and verification are
+# transport-agnostic; only the login / device-discovery /
+# logout-cycle primitives branch.
 #
 # Selection: set THURVSA_TEST_BACKEND to the name of an entry under
-# `backends:` in the source storage-backends.json. The script copies that
+# `storage.backends:` in /etc/thurvsa/thurvsa.yaml. The script copies that
 # entry verbatim into the test config and appends a per-run sub-prefix
 # so test data is isolated and trivially purgeable.
 #
@@ -28,44 +32,53 @@
 # Stress / scale: bump the fixture via THURVSA_FIXTURE_MB (env, MiB,
 # default 8). Storage round-trips dominate runtime — bigger fixture =
 # longer test = real egress $$$.
-#   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 \
-#     ./vsa/scripts/test-fs-nvmetcp-storage.sh
+#   THURVSA_TEST_BACKEND=primary THURVSA_FIXTURE_MB=128 ./vsa/scripts/test-fs-storage.sh
 #
-# Prerequisites:
-#   - nvme-cli         (sudo apt-get install nvme-cli)
-#   - nvme_tcp kernel module (sudo modprobe nvme_tcp)
-#   - e2fsprogs, util-linux, tar (usually present)
-#   - jq (parses private/storage-backends.json)
+# Prerequisites (common):
+#   - e2fsprogs, util-linux, tar
+#   - yq (kislyuk/yq — the jq-based Python wrapper; uses jq syntax)
 #   - Backend CLI matching the backend type:
-#       s3    -> aws       (sudo apt-get install awscli)
+#       s3    -> aws       (sudo apt-get install awscli  OR  pip install awscli)
 #       gcs   -> gcloud    (https://cloud.google.com/sdk)
 #       azure -> az        (https://learn.microsoft.com/cli/azure/install-azure-cli)
 #   - Storage credentials in env (same chain the daemon uses).
-#   - Root/sudo access (nvme connect + raw /dev/nvmeXn1 access require root).
+#   - Root/sudo access.
+# Prerequisites (iSCSI transport):
+#   - sg3-utils, open-iscsi, lsscsi
+# Prerequisites (NVMe/TCP transport):
+#   - nvme-cli
+#   - nvme_tcp kernel module (sudo modprobe nvme_tcp)
 #
 # Usage (invoke from repo root):
-#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-fs-nvmetcp-storage.sh [OPTIONS]
+#   THURVSA_TEST_BACKEND=primary ./vsa/scripts/test-fs-storage.sh [OPTIONS]
 #
 # NOTE on credentials: from a fresh checkout, drop your maintainer
 # storage credentials into `$REPO/private/thur.env` (KEY=VAL per line,
 # AWS_* / GOOGLE_* / AZURE_* / per-backend `auth: env` names like
-# AISTOR_*) and your backend entry in `$REPO/private/storage-backends.json`.
+# AISTOR_*) and your backend entry in `$REPO/private/storage-backends.yaml`.
 # The script auto-sources thur.env at startup and defaults
-# THURVSA_SOURCE_BACKENDS to private/storage-backends.json.
+# THURVSA_SOURCE_BACKENDS to private/storage-backends.yaml, so you
+# don't need either piece installed under /etc or /var/lib — every
+# read happens out of the repo, every write under /tmp.
 #
 # NOTE on sudo: do NOT prefix with sudo — the script self-elevates
 # via `sudo KEY=VAL ... "$0"`, forwarding the backend-relevant env
 # vars one by one (sudo-rs on Ubuntu 26.04+ silently ignores `-E`
-# regardless of the SETENV sudoers tag).
+# regardless of the SETENV sudoers tag, so explicit pass-through is
+# the only portable path). If you must run as root directly, set the
+# env vars in root's shell first.
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: debug)
+#   --release             Use ./target/release/ binaries (default: ./target/debug/)
 #   --daemon-path PATH    Override path to thurvsad binary
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up local test data directory
-#   --keep-nvme           Don't disconnect NVMe session after tests
-#   --keep-storage          Don't purge the test sub-prefix from the bucket
-#   --nvmetcp-port PORT   Override NVMe/TCP port (default: free ephemeral port)
+#   --transport T         iscsi (default) or nvmetcp
+#   --keep-iscsi          Don't disconnect iSCSI session after tests (iscsi only)
+#   --keep-nvme           Don't disconnect NVMe session after tests (nvmetcp only)
+#   --keep-storage        Don't purge the test sub-prefix from the bucket
+#   --iscsi-port PORT     Override iSCSI port (iscsi only)
+#   --nvmetcp-port PORT   Override NVMe/TCP port (nvmetcp only)
 #   --http-port PORT      Override HTTP port (default: free ephemeral port)
 #
 
@@ -73,8 +86,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Auto-load maintainer-private storage credentials if the file exists.
-# Must run BEFORE self-elevation so the env is populated when sudo
-# forwards it.
+# `set -a` auto-exports every KEY=VAL so the subsequent `sudo -E`
+# carries them across; `set +a` restores normal scoping. Skipped on
+# packaged installs (no private/ dir) — operators put credentials in
+# /etc/thurvsa/thurvsa.env there, picked up by the systemd unit. This
+# block has to run BEFORE self-elevation so the env is populated
+# when sudo -E forwards it.
 if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set -a
     # shellcheck disable=SC1091
@@ -82,9 +99,13 @@ if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set +a
 fi
 
-# Self-elevate via sudo, forwarding backend-relevant env vars as
-# explicit `KEY=VAL` pairs. `sudo -E` is silently ignored on sudo-rs
-# (Ubuntu 26.04+); explicit forwarding is the only portable path.
+# Self-elevate via sudo, forwarding the backend-relevant env vars as
+# explicit `KEY=VAL` pairs. `sudo -E` looks tempting but is silently
+# ignored on sudo-rs (Ubuntu 26.04+) regardless of the SETENV tag
+# in sudoers; explicit forwarding is the only portable path. Pattern-
+# based so a new per-backend `auth: env` prefix (AISTOR_, WASABI_,
+# etc.) auto-forwards — only a wholly new credential prefix needs a
+# one-word `case` addition below.
 if [[ $EUID -ne 0 ]]; then
     forward=()
     for v in $(compgen -A variable); do
@@ -100,27 +121,47 @@ fi
 
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.json}"
-TEST_DIR="/tmp/thurvsa-test-fs-nvmetcp-storage-$$"
+# Storage backend definitions live in `<data_dir>/storage-backends.json`
+# (daemon-owned). The script extracts the chosen entry from
+# $SOURCE_BACKENDS and embeds it under `testbackend` inside the
+# generated test config. Default points at the maintainer-private
+# `private/storage-backends.yaml` so running from a fresh checkout
+# requires no host-side setup; override with THURVSA_SOURCE_BACKENDS
+# to point at a packaged install path (e.g. /var/lib/thurvsa/...).
+#
+# The daemon's *own* YAML config (data_dir, ports, IQN tuning) is
+# generated fresh under $TEST_DIR/config.yaml — the script never
+# reads /etc/thurvsa/thurvsa.yaml. So everything below the
+# storage-backends.yaml read happens entirely under /tmp.
+SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
+TEST_DIR="/tmp/thurvsa-test-fs-storage-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
+TRANSPORT="iscsi"
 NVMETCP_PORT=""
+TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
 SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
 HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-fs-cloud-test"
+KEEP_ISCSI=0
 KEEP_NVME=0
 KEEP_STORAGE=0
+ISCSI_CONNECTED=0
 NVME_CONNECTED=0
 NVME_DEVICE=""
 MOUNT_POINT="${TEST_DIR}/mnt"
 VOLUME_NAME="vol-cloud"
 FIXTURE_MB="${THURVSA_FIXTURE_MB:-8}"
 if (( FIXTURE_MB < 8 )); then FIXTURE_MB=8; fi
+# Volume size headroom over the fixture: ~3x so ext4 metadata + journal
+# + the tar stream all fit comfortably without forcing the test to
+# stress the volume cap.
 VOLUME_SIZE_MIB=$(( FIXTURE_MB * 3 + 16 ))
 FIXTURE_DIR="${TEST_DIR}/fixture"
 FIXTURE_TAR="${TEST_DIR}/fixture.tar"
 FIXTURE_HASH_BEFORE="${TEST_DIR}/fixture-hash-before.txt"
 FIXTURE_HASH_AFTER="${TEST_DIR}/fixture-hash-after.txt"
+RW_DEVICE=""
+RW_SG_DEVICE=""
 
-YQ_FLAVOR=""
 BACKEND_TYPE=""
 BACKEND_BUCKET=""
 BACKEND_ENDPOINT=""
@@ -136,6 +177,8 @@ RUN_ID=""
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --transport) TRANSPORT="$2"; shift 2 ;;
+        --keep-iscsi) KEEP_ISCSI=1; shift ;;
         --keep-nvme) KEEP_NVME=1; shift ;;
         --keep-storage) KEEP_STORAGE=1; shift ;;
         --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
@@ -150,8 +193,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$TRANSPORT" in
+    iscsi|nvmetcp) ;;
+    *) echo "Unknown --transport '$TRANSPORT' (expected iscsi or nvmetcp)"; exit 1 ;;
+esac
+
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
+
+# ---------------------------------------------------------------------------
+# Storage helpers are sourced from scripts/lib/test-helpers.sh (storage_list /
+# storage_wait_for_key / verify_storage_creds / storage_purge_test_prefix /
+# storage_cli_for_type). Lifted in 2026-05-13.
+# ---------------------------------------------------------------------------
 
 cleanup() {
     local rc=$?
@@ -161,9 +215,10 @@ cleanup() {
         umount "$MOUNT_POINT" 2>/dev/null || true
     fi
 
-    if [[ $NVME_CONNECTED -eq 1 && $KEEP_NVME -eq 0 ]]; then
-        nvme_tcp_disconnect
-    fi
+    case "$TRANSPORT" in
+        iscsi)   [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]] && iscsi_logout_and_delete ;;
+        nvmetcp) [[ $NVME_CONNECTED  -eq 1 && $KEEP_NVME  -eq 0 ]] && nvme_tcp_disconnect    ;;
+    esac
 
     stop_thur_daemon
 
@@ -184,19 +239,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
-}
-
-assign_ports_nvme() {
-    [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(free_port)
-    [[ -z "$HTTP_PORT"    ]] && HTTP_PORT=$(free_port)
-    log_info "Using NVMe/TCP port $NVMETCP_PORT, HTTP port $HTTP_PORT"
+# Pick transport+http ports. Mirrors test-helpers.sh assign_ports but
+# the transport port var name depends on TRANSPORT.
+assign_ports_fs() {
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        [[ -z "$ISCSI_PORT" ]] && ISCSI_PORT=$(pick_free_port)
+    else
+        [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(pick_free_port)
+    fi
+    [[ -z "$HTTP_PORT" ]] && HTTP_PORT=$(pick_free_port)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "Using iSCSI port $ISCSI_PORT, HTTP port $HTTP_PORT"
+    else
+        log_info "Using NVMe/TCP port $NVMETCP_PORT, HTTP port $HTTP_PORT"
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# Backend resolution (cloned from test-fs-iscsi-storage.sh — same shape, NVMe
-# variant has its own copy to keep both scripts self-contained)
+# Backend resolution
 # ---------------------------------------------------------------------------
 
 resolve_backend() {
@@ -208,43 +268,48 @@ resolve_backend() {
     fi
     if [[ ! -r "$SOURCE_BACKENDS" ]]; then
         log_error "Cannot read source backends file: $SOURCE_BACKENDS"
-        echo "Override with THURVSA_SOURCE_BACKENDS=<path>/storage-backends.json"
+        echo "Override with THURVSA_SOURCE_BACKENDS=<path>/storage-backends.yaml"
         exit 1
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        log_error "jq is required to parse $SOURCE_BACKENDS"
+    if ! command -v yq >/dev/null 2>&1; then
+        log_error "yq is required to parse $SOURCE_BACKENDS"
         exit 1
     fi
 
     local exists
-    exists=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
+    exists=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\" // \"__missing__\"" "$SOURCE_BACKENDS")
     if [[ "$exists" == "__missing__" || "$exists" == "null" ]]; then
         log_error "Backend '$THURVSA_TEST_BACKEND' not found in $SOURCE_BACKENDS"
         echo "Available backends:"
-        jq -r '.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
+        yq -r '.storage.backends | keys | .[]' "$SOURCE_BACKENDS" 2>/dev/null | sed 's/^/  - /'
         exit 1
     fi
 
-    BACKEND_TYPE=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
-    BACKEND_BUCKET=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ENDPOINT=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_REGION=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_ACCOUNT=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_CONTAINER=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
-    ORIG_PREFIX=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
-    BACKEND_AUTH_AKID_ENV=$(jq -r "
-        .backends.\"$THURVSA_TEST_BACKEND\".auth
+    BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
+    BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_REGION=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".region // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_ACCOUNT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".storage_account // \"\"" "$SOURCE_BACKENDS")
+    BACKEND_CONTAINER=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".container // \"\"" "$SOURCE_BACKENDS")
+    ORIG_PREFIX=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".prefix // \"\"" "$SOURCE_BACKENDS")
+    # If the backend has `auth: { type: env, ... }` carrying explicit
+    # env-var names, capture them so the cred probe and cleanup target
+    # the same credentials the daemon will use. See VTL twin script
+    # for the full rationale (mixing real-AWS with MinIO/AIStor in one
+    # daemon needs explicit per-backend auth on the non-AWS one).
+    BACKEND_AUTH_AKID_ENV=$(yq -r "
+        .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
         | select(.type == \"env\") | .access_key_id_env // \"\"
     " "$SOURCE_BACKENDS")
-    BACKEND_AUTH_SECRET_ENV=$(jq -r "
-        .backends.\"$THURVSA_TEST_BACKEND\".auth
+    BACKEND_AUTH_SECRET_ENV=$(yq -r "
+        .storage.backends.\"$THURVSA_TEST_BACKEND\".auth
         | select(.type == \"env\") | .secret_access_key_env // \"\"
     " "$SOURCE_BACKENDS")
     local retention
-    retention=$(jq -r ".backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
+    retention=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
 
     if [[ "$BACKEND_TYPE" == "local" ]]; then
-        log_error "Backend '$THURVSA_TEST_BACKEND' has type 'local' — use test-fs-nvmetcp.sh for local-backend coverage."
+        log_error "Backend '$THURVSA_TEST_BACKEND' has type 'local' — use test-fs.sh for local-backend coverage."
         exit 1
     fi
     if [[ "$retention" != "none" ]]; then
@@ -267,7 +332,7 @@ resolve_backend() {
 }
 
 check_prerequisites() {
-    log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
+    log_info "Checking prerequisites (build profile: $BUILD_PROFILE, transport: $TRANSPORT)..."
     local missing=()
     local hints=()
     local build_cmd="cargo build --profile dev"
@@ -294,6 +359,8 @@ check_prerequisites() {
     fi
 
     declare -A HINTS=(
+        [iscsiadm]="sudo apt-get install open-iscsi"
+        [lsscsi]="sudo apt-get install lsscsi"
         [nvme]="sudo apt-get install nvme-cli"
         [mkfs.ext4]="sudo apt-get install e2fsprogs"
         [fsck.ext4]="sudo apt-get install e2fsprogs"
@@ -301,19 +368,27 @@ check_prerequisites() {
         [umount]="(util-linux — usually present)"
         [tar]="(present on every distro)"
         [curl]="sudo apt-get install curl"
-        [jq]="sudo apt-get install jq"
+        [yq]="sudo apt-get install yq  OR  pip install yq  (kislyuk/yq — the jq-based wrapper)"
         [sha256sum]="sudo apt-get install coreutils"
     )
-    for tool in nvme mkfs.ext4 fsck.ext4 mount umount tar curl jq sha256sum; do
+    local tools=(mkfs.ext4 fsck.ext4 mount umount tar curl yq sha256sum)
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        tools+=(iscsiadm lsscsi)
+    else
+        tools+=(nvme)
+    fi
+    for tool in "${tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
             hints+=("  - $tool: ${HINTS[$tool]}")
         fi
     done
 
-    if ! lsmod | grep -q '^nvme_tcp\b' && ! modinfo nvme_tcp >/dev/null 2>&1; then
-        missing+=("nvme_tcp kernel module")
-        hints+=("  - nvme_tcp: sudo modprobe nvme_tcp (kernel >= 5.0 required)")
+    if [[ "$TRANSPORT" == "nvmetcp" ]]; then
+        if ! lsmod | grep -q '^nvme_tcp\b' && ! modinfo nvme_tcp >/dev/null 2>&1; then
+            missing+=("nvme_tcp kernel module")
+            hints+=("  - nvme_tcp: sudo modprobe nvme_tcp (kernel >= 5.0 required)")
+        fi
     fi
 
     local cli; cli=$(storage_cli_for_type)
@@ -333,9 +408,17 @@ check_prerequisites() {
         exit 1
     fi
 
-    if ! lsmod | grep -q '^nvme_tcp\b'; then
-        log_info "Loading nvme_tcp kernel module"
-        modprobe nvme_tcp || { log_error "Failed to load nvme_tcp"; exit 1; }
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
+            log_error "iscsid (open-iscsi) service is not running."
+            echo "Start it with: sudo systemctl enable --now iscsid open-iscsi"
+            exit 1
+        fi
+    else
+        if ! lsmod | grep -q '^nvme_tcp\b'; then
+            log_info "Loading nvme_tcp kernel module"
+            modprobe nvme_tcp || { log_error "Failed to load nvme_tcp"; exit 1; }
+        fi
     fi
 
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
@@ -346,10 +429,23 @@ create_test_config() {
     mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
 
     local backend_json
-    backend_json=$(jq -c \
-        ".backends.\"$THURVSA_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
+    backend_json=$(yq -c \
+        ".storage.backends.\"$THURVSA_TEST_BACKEND\" + { prefix: \"$TEST_PREFIX\" }" \
         "$SOURCE_BACKENDS")
-    cat > "$TEST_CONFIG" <<EOFCONFIG
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        cat > "$TEST_CONFIG" <<EOFCONFIG
+data_dir: "$TEST_DIR/data"
+http:
+  listen: "127.0.0.1:$HTTP_PORT"
+$(yaml_iscsi)
+audit:
+  enabled: true
+storage:
+  backends:
+    testbackend: $backend_json
+EOFCONFIG
+    else
+        cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
 transport: nvmetcp
@@ -367,6 +463,7 @@ storage:
   backends:
     testbackend: $backend_json
 EOFCONFIG
+    fi
 
     if ! grep -q '^data_dir:' "$TEST_CONFIG"; then
         log_error "Generated test config is missing data_dir:"
@@ -377,20 +474,24 @@ EOFCONFIG
 
 start_daemon() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting thurvsad (NVMe/TCP)..."
-    RUST_LOG="info,nvme_tcp=debug" \
-        "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in $(seq 1 30); do
-        if ss -tln 2>/dev/null | grep -q ":$NVMETCP_PORT\b"; then
-            log_info "Daemon ready (PID $DAEMON_PID, port $NVMETCP_PORT)"
-            return 0
-        fi
-        sleep 0.5
-    done
-    log_error "Daemon failed to bind port $NVMETCP_PORT"
-    tail -30 "${TEST_DIR}/daemon.log"
-    exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        DAEMON_LOG_MODE=append start_thur_daemon
+    else
+        log_info "Starting thurvsad (NVMe/TCP)..."
+        RUST_LOG="info,nvme_tcp=debug" \
+            "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
+        DAEMON_PID=$!
+        for _ in $(seq 1 30); do
+            if ss -tln 2>/dev/null | grep -q ":$NVMETCP_PORT\b"; then
+                log_info "Daemon ready (PID $DAEMON_PID, port $NVMETCP_PORT)"
+                return 0
+            fi
+            sleep 0.5
+        done
+        log_error "Daemon failed to bind port $NVMETCP_PORT"
+        tail -30 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
 }
 
 stop_daemon() {
@@ -407,12 +508,36 @@ ensure_volume() {
         --size "${VOLUME_SIZE_MIB}M" --backend testbackend --dedup local >/dev/null
 }
 
-connect_nvme() {
-    nvme_tcp_connect
+connect_volume() {
+    case "$TRANSPORT" in
+        iscsi)
+            iscsi_discover_and_login
+            local row
+            row=$(lsscsi -g | awk '/THUR VSA/ {print; exit}')
+            [[ -n "$row" ]] || { log_error "No THUR VSA device found"; lsscsi -g; exit 1; }
+            RW_DEVICE=$(echo "$row" | awk '{print $(NF-1)}')
+            [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; exit 1; }
+            log_info "thurvsa LUN -> $RW_DEVICE"
+            ;;
+        nvmetcp)
+            nvme_tcp_connect || return 1
+            RW_DEVICE="/dev/${NVME_DEVICE}n1"
+            ;;
+    esac
 }
 
-disconnect_nvme() {
-    nvme_tcp_disconnect
+disconnect_volume() {
+    case "$TRANSPORT" in
+        iscsi)
+            if [[ $ISCSI_CONNECTED -eq 1 ]]; then
+                iscsi_logout_and_delete
+                sleep 1
+            fi
+            ;;
+        nvmetcp)
+            nvme_tcp_disconnect
+            ;;
+    esac
 }
 
 generate_fixture() {
@@ -431,14 +556,17 @@ generate_fixture() {
     log_info "Fixture tar at $FIXTURE_TAR ($(stat -c%s "$FIXTURE_TAR") bytes)"
 }
 
+# ---------------------------------------------------------------------------
+# Phase A — write workload
+# ---------------------------------------------------------------------------
+
 phase_a_format_mount_extract() {
-    local block="/dev/${NVME_DEVICE}n1"
-    log_info "[Phase A] mkfs.ext4 + mount + tar xf + sync on $block"
-    if ! mkfs.ext4 -F -q "$block"; then
-        log_error "[Phase A] mkfs.ext4 failed on $block"
+    log_info "[Phase A] mkfs.ext4 + mount + tar xf + sync on $RW_DEVICE"
+    if ! mkfs.ext4 -F -q "$RW_DEVICE"; then
+        log_error "[Phase A] mkfs.ext4 failed on $RW_DEVICE"
         return 1
     fi
-    mount "$block" "$MOUNT_POINT"
+    mount "$RW_DEVICE" "$MOUNT_POINT"
     tar -xf "$FIXTURE_TAR" -C "$MOUNT_POINT"
     sync
     (cd "$MOUNT_POINT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$FIXTURE_HASH_BEFORE"
@@ -449,13 +577,20 @@ phase_a_format_mount_extract() {
 
 phase_b_assert_storage_objects() {
     log_info "[Phase B] Asserting chunk objects landed in storage..."
-    # Async-upload health gate — same shape as the iSCSI storage test.
-    # See vsa/scripts/test-fs-iscsi-storage.sh phase_b for rationale.
+    # Async-upload health gate. Catches the upload-worker-snapshot
+    # regression where a backend instantiated by runtime `volume
+    # create` is invisible to the worker, every PUT silently no-op's
+    # into LocalOnly, and storage_list below still returns >=1 only
+    # because the crash-recovery scan replays LocalOnly markers on the
+    # NEXT daemon start. Asserting on the warn line catches it before
+    # phase C masks it.
     if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
         log_error "[Phase B] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
         grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'
         return 1
     fi
+    # backend_bytes_written must track host writes — a flat counter
+    # means uploads no-op'd. Read via admin socket (live cache).
     local info_json host_bw backend_bw
     info_json=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$VOLUME_NAME" --json 2>/dev/null) || {
         log_error "[Phase B] volume info '$VOLUME_NAME' failed"
@@ -472,37 +607,57 @@ phase_b_assert_storage_objects() {
         log_error "[Phase B] backend_bytes_written=$backend_bw with host_bytes_written=$host_bw — uploads silently dropped"
         return 1
     fi
-    # SYNCHRONIZE CACHE / NVMe Flush on umount drains in-flight
-    # uploads, but the storage bucket may take a beat to be listable.
-    # storage_wait_for_key blocks until at least one object shows up.
-    if ! storage_wait_for_key "" 60; then
-        log_error "[Phase B] No objects appeared under ${BACKEND_BUCKET}/${TEST_PREFIX} within 60s"
-        return 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        local count
+        count=$(storage_list "" | wc -l)
+        if (( count < 1 )); then
+            log_error "[Phase B] No objects found under ${BACKEND_BUCKET}/${TEST_PREFIX}"
+            return 1
+        fi
+        log_info "[Phase B] Found $count object(s) under test prefix"
+    else
+        # SYNCHRONIZE CACHE / NVMe Flush on umount drains in-flight
+        # uploads, but the storage bucket may take a beat to be listable.
+        # storage_wait_for_key blocks until at least one object shows up.
+        if ! storage_wait_for_key "" 60; then
+            log_error "[Phase B] No objects appeared under ${BACKEND_BUCKET}/${TEST_PREFIX} within 60s"
+            return 1
+        fi
+        local count
+        count=$(storage_list "" | wc -l)
+        log_info "[Phase B] Found $count object(s) under test prefix"
     fi
-    local count
-    count=$(storage_list "" | wc -l)
-    log_info "[Phase B] Found $count object(s) under test prefix"
     return 0
 }
 
 phase_c_restart_and_verify() {
-    log_info "[Phase C] Disconnecting NVMe, stopping daemon, restarting..."
-    disconnect_nvme
-    stop_daemon
-    sync && echo 3 > /proc/sys/vm/drop_caches
-    start_daemon
-    if ! connect_nvme; then
-        log_error "[Phase C] reconnect failed"
-        return 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_info "[Phase C] Disconnecting iSCSI, stopping daemon, restarting..."
+        disconnect_volume
+        stop_daemon
+        start_daemon
+        if ! connect_volume; then
+            log_error "[Phase C] reconnect failed"
+            return 1
+        fi
+    else
+        log_info "[Phase C] Disconnecting NVMe, stopping daemon, restarting..."
+        disconnect_volume
+        stop_daemon
+        sync && echo 3 > /proc/sys/vm/drop_caches
+        start_daemon
+        if ! connect_volume; then
+            log_error "[Phase C] reconnect failed"
+            return 1
+        fi
     fi
 
-    local block="/dev/${NVME_DEVICE}n1"
     log_info "[Phase C] fsck.ext4 -fn (must be clean)"
-    if ! fsck.ext4 -fn "$block"; then
-        log_error "fsck.ext4 reported inconsistency on $block"
+    if ! fsck.ext4 -fn "$RW_DEVICE"; then
+        log_error "fsck.ext4 reported inconsistency on $RW_DEVICE"
         return 1
     fi
-    mount "$block" "$MOUNT_POINT"
+    mount "$RW_DEVICE" "$MOUNT_POINT"
     (cd "$MOUNT_POINT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$FIXTURE_HASH_AFTER"
     umount "$MOUNT_POINT"
     if diff -q "$FIXTURE_HASH_BEFORE" "$FIXTURE_HASH_AFTER" >/dev/null; then
@@ -516,7 +671,7 @@ phase_c_restart_and_verify() {
 
 main() {
     echo "========================================"
-    echo "thurvsa Filesystem Workflow Test (NVMe/TCP + storage backend)"
+    echo "thurvsa Filesystem Workflow Test (transport=$TRANSPORT, real storage backend)"
     echo "========================================"
     echo ""
 
@@ -529,12 +684,12 @@ main() {
         echo "  THURVSA_TEST_BACKEND=$THURVSA_TEST_BACKEND $0 $*"
         exit 1
     }
-    assign_ports_nvme
+    assign_ports_fs
     create_test_config
     start_daemon
     ensure_volume
-    if ! connect_nvme; then
-        log_fail "Could not establish NVMe/TCP session"
+    if ! connect_volume; then
+        log_fail "Could not establish $TRANSPORT session"
         tail -30 "$TEST_DIR/daemon.log"
         exit 1
     fi
@@ -547,7 +702,11 @@ main() {
     log_test "Phase B — assert chunk objects landed in storage"
     if phase_b_assert_storage_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
     echo ""
-    log_test "Phase C — restart daemon + NVMe reconnect + fsck + diff hashes"
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        log_test "Phase C — restart daemon + iSCSI + fsck + diff hashes"
+    else
+        log_test "Phase C — restart daemon + NVMe reconnect + fsck + diff hashes"
+    fi
     if phase_c_restart_and_verify; then log_pass "Phase C"; else log_fail "Phase C"; exit 1; fi
 
     echo ""

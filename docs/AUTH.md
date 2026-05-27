@@ -924,7 +924,7 @@ exit 1 with the resolved fingerprint named in the error.
 ### Testing a keystore backend end-to-end
 
 `vsa/scripts/test-keystore.sh` is the keystore counterpart of
-`test-fs-iscsi-storage.sh`. Pick one entry from a
+`test-fs-storage.sh`. Pick one entry from a
 `keystore-backends.yaml` source file and the script runs three phases
 against it: **wrap** (volume create stamps the manifest), **unwrap**
 (a daemon restart makes discovery re-open the volume), and **migrate**

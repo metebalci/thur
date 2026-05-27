@@ -77,7 +77,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Auto-load maintainer-private storage credentials before self-elevation
 # so they're in scope to forward across sudo. Same convention as
-# test-fs-iscsi-storage.sh.
+# test-fs-storage.sh.
 if [[ -r "${REPO_DIR}/private/thur.env" ]]; then
     set -a
     # shellcheck disable=SC1091

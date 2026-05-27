@@ -14,7 +14,7 @@
 //!
 //! Trade-off: a malformed JSON / header bug in the SDK adapter layer
 //! won't surface from `cargo test`. Those failure modes are caught
-//! by the env-gated `vsa/scripts/test-fs-iscsi-storage.sh` rig that
+//! by the env-gated `vsa/scripts/test-fs-storage.sh` rig that
 //! runs against a real GCS bucket — same coverage we had before.
 
 use async_trait::async_trait;

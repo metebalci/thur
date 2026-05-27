@@ -20,8 +20,7 @@
 # Companions:
 #   - test-proto-iscsi.sh — iSCSI protocol layer (login + INQUIRY) via libiscsi
 #   - test-scsi-conformance.sh  — full SBC conformance via sg3_utils (sudo)
-#   - test-fs-iscsi.sh — end-to-end mkfs+mount+tar over iSCSI (sudo)
-#   - test-fs-nvmetcp.sh  — end-to-end mkfs+mount+tar over NVMe/TCP (sudo)
+#   - test-fs.sh — end-to-end mkfs+mount+tar (sudo; --transport iscsi|nvmetcp)
 #
 # Usage (invoke from repo root):
 #   ./vsa/scripts/test-smoke.sh [OPTIONS]

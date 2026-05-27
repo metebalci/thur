@@ -165,7 +165,7 @@ The three SDK-bound files we couldn't reach via `wiremock` —
 trait-seam boundary. Each backend struct holds an
 `Arc<dyn *Api>` (`GcsApi` / `GcpKmsApi` / `AzureKvApi`); the only
 SDK-touching code lives in sibling `*_api.rs` files exercised by
-`vsa/scripts/test-fs-iscsi-storage.sh` (GCS) and
+`vsa/scripts/test-fs-storage.sh` (GCS) and
 `vsa/scripts/test-keystore.sh` (KMS / KV). The three target files
 sit at 93-95% per-file; the SDK adapter siblings sit at 36-66%
 without dragging either crate below its 80% floor.
@@ -208,10 +208,8 @@ full backup / filesystem round-trip.
 | `test-proto-iscsi.sh` | iSCSI login / CHAP / transport conformance |
 | `test-scsi-conformance.sh` | SBC-3 SCSI command conformance |
 | `test-proto-nvmetcp.sh` | NVMe/TCP transport + NVM Command Set conformance |
-| `test-fs-iscsi.sh` | filesystem round-trip over iSCSI (local backend) |
-| `test-fs-iscsi-storage.sh` | filesystem round-trip over iSCSI (real storage backend) |
-| `test-fs-nvmetcp.sh` | filesystem round-trip over NVMe/TCP (local backend) |
-| `test-fs-nvmetcp-storage.sh` | filesystem round-trip over NVMe/TCP (real storage backend) |
+| `test-fs.sh` | filesystem round-trip (local backend); transport-agnostic (`--transport iscsi\|nvmetcp`) |
+| `test-fs-storage.sh` | filesystem round-trip (real storage backend); transport-agnostic (`--transport iscsi\|nvmetcp`) |
 | `test-fs-storage-failures.sh` | backend failure-path handling |
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-page-flush.sh` | kill -9 after host fsync → restart → every byte survives |

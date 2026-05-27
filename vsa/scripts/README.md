@@ -27,10 +27,8 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-proto-nvmetcp.sh` | NVMe/TCP host round-trip (handshake, identify, properties, I/O, disconnect). |
 | `test-scsi-conformance.sh` | Per-CDB SBC-3 compliance (INQUIRY, READ/WRITE, CAW, UNMAP, persistent reservations). |
 | `test-iscsi-multi-pdu-readin.sh` | iSCSI Data-In chunking when a single READ-16 response exceeds MaxRecvDataSegmentLength. |
-| `test-fs-iscsi.sh` | ext4 durability + daemon-restart persistence over iSCSI. |
-| `test-fs-nvmetcp.sh` | NVMe/TCP variant of `test-fs-iscsi`. |
-| `test-fs-iscsi-storage.sh` | `test-fs-iscsi` + real S3/GCS/Azure backend — upload pipeline, dedup, refetch. |
-| `test-fs-nvmetcp-storage.sh` | NVMe/TCP variant of `test-fs-iscsi-storage`. |
+| `test-fs.sh` | ext4 durability + daemon-restart persistence; transport-agnostic (`--transport iscsi\|nvmetcp`). |
+| `test-fs-storage.sh` | `test-fs` + real S3/GCS/Azure backend — upload pipeline, dedup, refetch; transport-agnostic (`--transport iscsi\|nvmetcp`). |
 | `test-fs-storage-failures.sh` | Backend failure injection (auth, timeout, throttling) via the daemon's test-mode hooks. |
 | `test-app-postgres.sh` | PostgreSQL OLTP + TPC-B invariant survives SIGKILL + WAL replay. |
 | `test-app-vm.sh` | Ubuntu 26.04 guest boots from a VSA volume; cloud-init fixture survives clean shutdown and crash-replay. |

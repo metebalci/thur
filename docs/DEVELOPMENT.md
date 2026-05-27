@@ -51,7 +51,7 @@ coordinates. Override paths with `THURV{TL,SA}_SOURCE_BACKENDS` /
 backend per run with `THURV{TL,SA}_TEST_BACKEND=<name>` matching an entry
 in the YAML. All non-real-backend tests (`test-smoke.sh`,
 `test-*-conformance.sh`, `test-backup-workflow.sh`,
-`test-fs-iscsi.sh`, `test-fs-nvmetcp.sh`) run against an
+`test-fs.sh`) run against an
 inline local backend and need no `private/` setup.
 
 The release-cut process is in [`RELEASING.md`](RELEASING.md); the

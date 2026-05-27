@@ -139,12 +139,12 @@ integrated_report() {
         "THURVTL_SOAK=1 vtl/scripts/test-lifecycle-many-cartridges.sh"
     )
     local sudo_set=(
-        "vsa/scripts/test-fs-iscsi.sh"
+        "vsa/scripts/test-fs.sh"
         "vsa/scripts/test-scsi-conformance.sh"
         "vtl/scripts/test-scsi-conformance.sh"
         "vtl/scripts/test-backup-workflow.sh"
         "vsa/scripts/test-proto-nvmetcp.sh"
-        "vsa/scripts/test-fs-nvmetcp.sh"
+        "vsa/scripts/test-fs.sh --transport nvmetcp"
         "vsa/scripts/test-crash-page-flush.sh"
         "vtl/scripts/test-crash-chunk-seal.sh"
     )
@@ -159,7 +159,9 @@ integrated_report() {
     done
     for s in "${sudo_set[@]}"; do
         echo "  - sudo $s" >&2
-        sudo LLVM_PROFILE_FILE="$shell_profraw_pattern" ./"$s" >/dev/null 2>&1 || true
+        # $s may carry trailing flags (e.g. "test-fs.sh --transport nvmetcp"),
+        # so split via word-splitting rather than quoting as one path.
+        sudo LLVM_PROFILE_FILE="$shell_profraw_pattern" ./$s >/dev/null 2>&1 || true
     done
     set -e
 
