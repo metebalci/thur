@@ -200,21 +200,13 @@ create_test_config() {
     log_info "Creating test configuration..."
     mkdir -p "$TEST_DIR/data/volumes"
     cat > "$TEST_CONFIG" <<EOFCONFIG
-data_dir: "$TEST_DIR/data"
+$(yaml_header)
 
-http:
-  listen: "127.0.0.1:$HTTP_PORT"
-
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
+$(yaml_iscsi)
 
 audit:
   enabled: true
-storage:
-  backends:
-    local:
-      type: local
-      root_dir: "$TEST_DIR/local-backend"
+$(yaml_local_backend)
 
 EOFCONFIG
 }

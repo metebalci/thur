@@ -86,23 +86,14 @@ create_test_config() {
     cat > "$TEST_CONFIG" << EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
-library:
-  num_slots: 40
-  num_drives: 2
-  lto_generation: 8
+$(yaml_vtl_library 40 2 8)
 
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  target_iqn: "$TARGET_IQN"
+$(yaml_iscsi "$TARGET_IQN")
 
-storage:
-  backends:
-    local:
-      type: local
-      root_dir: "$TEST_DIR/local-backend"
+$(yaml_local_backend)
 
 keystore:
   backends:

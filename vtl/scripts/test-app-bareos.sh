@@ -206,30 +206,18 @@ create_test_config() {
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
     fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
-data_dir: "$TEST_DIR/data"
+$(yaml_header)
 
-library:
-  num_slots: $NUM_SLOTS
-  num_drives: $NUM_DRIVES
-  lto_generation: 8
+$(yaml_vtl_library "$NUM_SLOTS" "$NUM_DRIVES" 8)
 
-http:
-  listen: "127.0.0.1:$HTTP_PORT"
-
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  target_iqn: "$TARGET_IQN"
+$(yaml_iscsi "$TARGET_IQN")
 
 # /tmp is often tmpfs with little headroom — disable the free-floor so
 # chunk-seals aren't blocked by try_reserve. Same as test-monte-carlo.sh.
 disk_cache:
   disk_free_min_gb: 0
 
-storage:
-  backends:
-    local:
-      type: local
-      root_dir: "$TEST_DIR/local-backend"
+$(yaml_local_backend)
 
 keystore:
   backends:

@@ -365,8 +365,7 @@ create_test_config() {
 data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
+$(yaml_iscsi)
 audit:
   enabled: true
 storage:

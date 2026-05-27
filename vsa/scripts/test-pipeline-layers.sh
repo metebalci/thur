@@ -193,9 +193,7 @@ make_config() {
 data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  target_iqn: "$TARGET_IQN"
+$(yaml_iscsi "$TARGET_IQN")
 disk_cache:
   disk_free_min_gb: 0
 storage:

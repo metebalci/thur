@@ -228,6 +228,80 @@ parse_common_daemon_args() {
     done
 }
 
+# -----------------------------------------------------------------------
+# Conffile YAML section emitters — each prints one stanza to stdout.
+# Compose into the test conffile via command substitution inside one
+# heredoc:
+#
+#   cat > "$TEST_CONFIG" <<EOF
+#   $(yaml_header)
+#
+#   $(yaml_vtl_library 40 2 8)
+#
+#   $(yaml_iscsi "$TARGET_IQN")
+#
+#   $(yaml_local_backend)
+#
+#   keystore:
+#     backends:
+#       local: { type: local }
+#   EOF
+#
+# Bash strips the trailing newline from $() output, so the blank lines
+# between stanzas come from the heredoc itself — adjust the blank-line
+# layout in the heredoc, not in the helpers.
+#
+# All helpers read $TEST_DIR / $HTTP_PORT / $ISCSI_PORT from the
+# enclosing script. Keep the helpers minimal — anything that isn't
+# emitted by literally every test stays in the per-script heredoc.
+# -----------------------------------------------------------------------
+
+# Universal pair: data_dir + http.listen.
+yaml_header() {
+    cat <<EOFY
+data_dir: "$TEST_DIR/data"
+
+http:
+  listen: "127.0.0.1:$HTTP_PORT"
+EOFY
+}
+
+# iscsi.listen + optional target_iqn (omitted if no arg given).
+yaml_iscsi() {
+    local target_iqn="${1:-}"
+    echo "iscsi:"
+    echo "  listen: \"127.0.0.1:$ISCSI_PORT\""
+    [[ -n "$target_iqn" ]] && echo "  target_iqn: \"$target_iqn\""
+}
+
+# VTL chassis topology declaration. Args: num_slots, num_drives,
+# lto_generation (defaults 40 / 2 / 8 — the common test shape).
+yaml_vtl_library() {
+    local slots="${1:-40}"
+    local drives="${2:-2}"
+    local lto="${3:-8}"
+    cat <<EOFY
+library:
+  num_slots: $slots
+  num_drives: $drives
+  lto_generation: $lto
+EOFY
+}
+
+# Single-backend "storage:" stanza pointing at the in-tree local
+# backend. Default-named "local"; pass a name override for scripts
+# that want a different key (some tests use "primary" / "testbackend").
+yaml_local_backend() {
+    local name="${1:-local}"
+    cat <<EOFY
+storage:
+  backends:
+    $name:
+      type: local
+      root_dir: "$TEST_DIR/local-backend"
+EOFY
+}
+
 # Poll a log file for an extended regex match until it appears or the
 # timeout elapses. Returns 0 if matched, 1 on timeout. Both args
 # required; useful for the storage-failure tests that assert specific

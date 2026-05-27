@@ -449,15 +449,10 @@ create_test_config() {
         "$SOURCE_BACKENDS")
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
-library:
-  num_slots: 10
-  num_drives: 2
-  lto_generation: 8
+$(yaml_vtl_library 10 2 8)
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  target_iqn: "$TARGET_IQN"
+$(yaml_iscsi "$TARGET_IQN")
 disk_cache:
   disk_free_min_gb: 0
 storage:

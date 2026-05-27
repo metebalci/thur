@@ -177,19 +177,11 @@ create_test_config() {
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
     fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
-data_dir: "$TEST_DIR/data"
+$(yaml_header)
 
-library:
-  num_slots: 10
-  num_drives: 2
-  lto_generation: 8
+$(yaml_vtl_library 10 2 8)
 
-http:
-  listen: "127.0.0.1:$HTTP_PORT"
-
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  target_iqn: "$TARGET_IQN"
+$(yaml_iscsi "$TARGET_IQN")
 
 # Test data_dir is under /tmp, which is commonly a small tmpfs on dev
 # boxes — the production-default 5 GB free-floor would block every
@@ -197,11 +189,7 @@ iscsi:
 disk_cache:
   disk_free_min_gb: 0
 
-storage:
-  backends:
-    local:
-      type: local
-      root_dir: "$TEST_DIR/local-backend"
+$(yaml_local_backend)
 
 keystore:
   backends:
