@@ -6,16 +6,19 @@
 #
 # thurvsa Monte Carlo Random-Op Test
 #
-# Runs N seeded random operations against an ext4 filesystem mounted on
-# a thurvsa volume. The transport (iSCSI or NVMe/TCP) is selectable via
-# --transport; the op generator, content model, and verification are
-# transport-agnostic — only the login / device-discovery / logout-cycle
-# primitives branch. Op mix is weighted to bias file ops and sample
-# transport / mount churn at lower rates — `umount_cycle` and
-# `transport_logout_cycle` tear the lower layer down; the next file op
-# lazily brings it back. That exposes the daemon to "user opens session,
-# does ops, logs out, comes back later, does more ops" workloads that
-# the deterministic scripted tests don't reach.
+# Runs N seeded random operations against ext4 filesystems mounted on
+# two thurvsa volumes (vol-mc + vol-mc-b). Each op picks a random volume
+# and a random parent directory (root or any existing dir), so the same
+# op stream sweeps per-volume PageCache isolation, multi-LUN-per-session
+# SCSI dispatch, and a two-level directory layout. The transport (iSCSI
+# or NVMe/TCP) is selectable via --transport; the op generator, content
+# model, and verification are transport-agnostic — only the login /
+# device-discovery / logout-cycle primitives branch. Op mix is weighted
+# to bias file ops and sample transport / mount churn at lower rates —
+# `umount_cycle` and `transport_logout_cycle` tear the lower layer down;
+# the next file op lazily brings it back. That exposes the daemon to
+# "user opens session, does ops, logs out, comes back later, does more
+# ops" workloads that the deterministic scripted tests don't reach.
 #
 # Size distribution is boundary-biased: most random tests draw uniformly
 # and end up clustered in "multi-chunk" sizes, never touching the
@@ -114,31 +117,61 @@ HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-monte-carlo-test"
 ISCSI_CONNECTED=0
 NVME_CONNECTED=0
 NVME_DEVICE=""
-MOUNT_POINT="${TEST_DIR}/mnt"
-VOLUME_NAME="vol-mc"
+
+# Two-volume setup: vol-mc + vol-mc-b, each its own LUN/namespace,
+# ext4-formatted and mounted under TEST_DIR/mnt-<name>. The path
+# generator picks one of MOUNT_POINTS per op so the same op stream
+# sweeps per-volume PageCache isolation, per-volume SYNCHRONIZE CACHE
+# fencing, and multi-LUN-per-session SCSI dispatch.
+VOLUME_NAMES=("vol-mc" "vol-mc-b")
+declare -a MOUNT_POINTS=()
+declare -a RW_DEVICES=()
+declare -a EXT4_MADE=()
+RW_SG_DEVICE=""
+
 VOLUME_SIZE_MIB=1024
 SEED=""
 QUICK=0
 OPS=""
 BACKEND_NAME="${THURVSA_TEST_BACKEND:-}"
+
+# Auth wrapper. THURVSA_TEST_AUTH=chap enables iSCSI CHAP — the conffile
+# carries auth.method: CHAP, a per-run user/secret is added via
+# `thurvsa iscsi users add` after daemon start, and iscsi_login sets
+# node.session.auth credentials before --login. NVMe-TCP PSK is not
+# wired here yet (would need PSK material + nvme connect TLS args);
+# CHAP applies to iSCSI transport only.
+AUTH_MODE="${THURVSA_TEST_AUTH:-none}"
+case "$AUTH_MODE" in
+    none|chap) ;;
+    *) echo "Unsupported THURVSA_TEST_AUTH='$AUTH_MODE' (expected none|chap)" >&2; exit 1 ;;
+esac
+CHAP_USER="mc-user-$$"
+CHAP_PASS="mc-secret-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
 SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends.yaml}"
 BACKEND_TYPE=""
 TEST_PREFIX=""
-RW_DEVICE=""
-RW_SG_DEVICE=""
 
 # Mount/transport lazy state. Both start "down" and the first file op
-# brings them up.
+# brings them up. MOUNT_UP is binary across all volumes — the harness
+# mounts/umounts as a unit so the model stays simple.
 TRANSPORT_UP=0
 MOUNT_UP=0
 
-# In-memory file model. FILE_VERSIONS[path]=int (0 = deleted/never-existed),
-# FILE_SIZES[path]=bytes. ALIVE_PATHS is the index for "pick an existing
-# file", rebuilt on delete.
+# In-memory file model. Keys are absolute paths (under one of the
+# MOUNT_POINTS), so the model is volume-agnostic. FILE_VERSIONS[path]=int
+# (0 = deleted/never-existed), FILE_SIZES[path]=bytes,
+# CONTENT_KEY[path]=opaque-string used as the AES-CTR keystream key (set
+# = path on create; preserved across op_rename so content survives the move).
+# ALIVE_PATHS is the index for "pick an existing file", rebuilt on delete.
+# ALIVE_DIRS parallels it for directories.
 declare -A FILE_VERSIONS
 declare -A FILE_SIZES
+declare -A CONTENT_KEY
 declare -a ALIVE_PATHS
+declare -a ALIVE_DIRS
 NEXT_PATH_INDEX=1
+NEXT_DIR_INDEX=1
 
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
@@ -172,6 +205,11 @@ case "$TRANSPORT" in
     *) echo "Unknown --transport '$TRANSPORT' (expected iscsi or nvmetcp)"; exit 1 ;;
 esac
 
+if [[ "$AUTH_MODE" == "chap" && "$TRANSPORT" == "nvmetcp" ]]; then
+    echo "THURVSA_TEST_AUTH=chap is iSCSI-only (NVMe-TCP PSK is not yet wired)" >&2
+    exit 1
+fi
+
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
@@ -179,9 +217,12 @@ cleanup() {
     local rc=$?
     log_info "Cleaning up..."
 
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        umount "$MOUNT_POINT" 2>/dev/null || true
-    fi
+    local mp
+    for mp in "${MOUNT_POINTS[@]}"; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            umount "$mp" 2>/dev/null || true
+        fi
+    done
 
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
         iscsi_logout_and_delete
@@ -315,10 +356,21 @@ assign_ports_mc() {
 # isolation, and inject it.
 create_test_config() {
     log_info "Creating test configuration..."
-    mkdir -p "$TEST_DIR/data/volumes" "$MOUNT_POINT"
+    mkdir -p "$TEST_DIR/data/volumes"
+    local name mp
+    for name in "${VOLUME_NAMES[@]}"; do
+        mp="${TEST_DIR}/mnt-${name}"
+        mkdir -p "$mp"
+        MOUNT_POINTS+=("$mp")
+        EXT4_MADE+=(0)
+        RW_DEVICES+=("")
+    done
     local transport_block
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         transport_block=$'iscsi:\n  listen: "127.0.0.1:'"$ISCSI_PORT"'"'
+        if [[ "$AUTH_MODE" == "chap" ]]; then
+            transport_block+=$'\n  auth:\n    method: CHAP'
+        fi
     else
         transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
     fi
@@ -412,35 +464,92 @@ start_daemon() {
     exit 1
 }
 
-ensure_volume() {
-    if "$CLI_PATH" --config "$TEST_CONFIG" volume list 2>/dev/null | grep -q "$VOLUME_NAME"; then
-        log_info "Volume $VOLUME_NAME already present"
-        return 0
-    fi
-    log_info "Creating $VOLUME_NAME (${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME)..."
-    "$CLI_PATH" --config "$TEST_CONFIG" volume create "$VOLUME_NAME" \
-        --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" >/dev/null
+ensure_volumes() {
+    local existing name
+    existing=$("$CLI_PATH" --config "$TEST_CONFIG" volume list 2>/dev/null || true)
+    for name in "${VOLUME_NAMES[@]}"; do
+        if echo "$existing" | grep -q "$name"; then
+            log_info "Volume $name already present"
+            continue
+        fi
+        log_info "Creating $name (${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME)..."
+        "$CLI_PATH" --config "$TEST_CONFIG" volume create "$name" \
+            --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" >/dev/null
+    done
 }
 
-# Bring iSCSI session up + resolve /dev/sdN. Idempotent.
+# If THURVSA_TEST_AUTH=chap, provision one CHAP user the harness then
+# uses for every iSCSI login. Idempotent: a second call after
+# op_daemon_restart sees the user already present and skips.
+setup_chap_user() {
+    [[ "$AUTH_MODE" != "chap" ]] && return 0
+    if "$CLI_PATH" --config "$TEST_CONFIG" iscsi users list 2>/dev/null | grep -q "$CHAP_USER"; then
+        return 0
+    fi
+    log_info "Adding CHAP user $CHAP_USER..."
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER" \
+            --password "$CHAP_PASS" >/dev/null 2>&1; then
+        log_error "Failed to add CHAP user $CHAP_USER"
+        tail -20 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
+}
+
+# Bring iSCSI session up + resolve one /dev/sdN per volume in LUN
+# order. Idempotent. Volume create order = LUN order (registry assigns
+# monotonic LUNs), and lsscsi sorts by [H:C:I:L], so the row order
+# matches MOUNT_POINTS / VOLUME_NAMES exactly.
 _iscsi_login() {
-    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null 2>&1 || true
+    # Under CHAP, SendTargets discovery itself needs auth — stash creds
+    # on the discoverydb entry first.
+    if [[ "$AUTH_MODE" == "chap" ]]; then
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -o new >/dev/null 2>&1 || true
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.authmethod -v CHAP >/dev/null 2>&1
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.username -v "$CHAP_USER" >/dev/null 2>&1
+        iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" \
+            -o update -n discovery.sendtargets.auth.password -v "$CHAP_PASS" >/dev/null 2>&1
+    fi
+    if ! iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" --discover >/dev/null 2>&1; then
+        log_error "iscsi discovery failed"
+        return 1
+    fi
+    if [[ "$AUTH_MODE" == "chap" ]]; then
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.authmethod -v CHAP >/dev/null 2>&1
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.username -v "$CHAP_USER" >/dev/null 2>&1
+        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
+            --op update -n node.session.auth.password -v "$CHAP_PASS" >/dev/null 2>&1
+    fi
     if ! iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null 2>&1; then
         log_error "iscsi login failed"
         return 1
     fi
     ISCSI_CONNECTED=1
     sleep 2
-    local row
+    local rows i n=${#VOLUME_NAMES[@]}
     for _ in 1 2 3 4 5; do
-        row=$(lsscsi -g | awk '/THUR VSA/ {print; exit}')
-        [[ -n "$row" ]] && break
+        rows=$(lsscsi -g | awk '/THUR VSA/ {print}')
+        if (( $(echo "$rows" | grep -c .) >= n )); then break; fi
         sleep 1
     done
-    [[ -n "$row" ]] || { log_error "iscsi login OK but no THUR VSA device appeared"; lsscsi -g; return 1; }
-    RW_DEVICE=$(echo "$row" | awk '{print $(NF-1)}')
-    RW_SG_DEVICE=$(echo "$row" | awk '{print $NF}')
-    [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; return 1; }
+    if (( $(echo "$rows" | grep -c .) < n )); then
+        log_error "iscsi login OK but only $(echo "$rows" | grep -c .) THUR VSA devices appeared (expected $n)"
+        lsscsi -g
+        return 1
+    fi
+    for (( i=0; i<n; i++ )); do
+        local row dev
+        row=$(echo "$rows" | sed -n "$((i+1))p")
+        dev=$(echo "$row" | awk '{print $(NF-1)}')
+        [[ -b "$dev" ]] || { log_error "$dev is not a block device"; return 1; }
+        RW_DEVICES[$i]="$dev"
+    done
+    # Take the first row's sg path for any SCSI-level utilities; not
+    # used in the data path.
+    RW_SG_DEVICE=$(echo "$rows" | head -1 | awk '{print $NF}')
 }
 
 _iscsi_logout() {
@@ -448,10 +557,23 @@ _iscsi_logout() {
     RW_SG_DEVICE=""
 }
 
-# Bring NVMe/TCP session up + resolve /dev/nvmeXn1. Idempotent.
+# Bring NVMe/TCP session up + resolve one /dev/nvmeXn<NSID> per volume.
+# NSID = LUN + 1 per the daemon's mapping, so namespace order matches
+# volume creation order. Idempotent.
 _nvme_login() {
     nvme_tcp_connect || return 1
-    RW_DEVICE="/dev/${NVME_DEVICE}n1"
+    local i n=${#VOLUME_NAMES[@]}
+    for (( i=0; i<n; i++ )); do
+        local dev="/dev/${NVME_DEVICE}n$(( i + 1 ))"
+        # The nvme connect attaches every advertised namespace
+        # synchronously; the device nodes can lag by a tick.
+        for _ in 1 2 3 4 5; do
+            [[ -b "$dev" ]] && break
+            sleep 0.5
+        done
+        [[ -b "$dev" ]] || { log_error "$dev did not appear after nvme connect"; return 1; }
+        RW_DEVICES[$i]="$dev"
+    done
 }
 
 _nvme_logout() {
@@ -472,9 +594,12 @@ transport_login() {
 
 transport_logout() {
     if [[ $TRANSPORT_UP -eq 0 ]]; then return 0; fi
-    # Must umount before tearing the lower layer down.
+    # Must umount every volume before tearing the lower layer down.
     if [[ $MOUNT_UP -eq 1 ]]; then
-        umount "$MOUNT_POINT" 2>/dev/null || true
+        local mp
+        for mp in "${MOUNT_POINTS[@]}"; do
+            umount "$mp" 2>/dev/null || true
+        done
         MOUNT_UP=0
     fi
     if [[ "$TRANSPORT" == "iscsi" ]]; then
@@ -483,57 +608,118 @@ transport_logout() {
         _nvme_logout
     fi
     TRANSPORT_UP=0
-    RW_DEVICE=""
+    local i
+    for (( i=0; i<${#RW_DEVICES[@]}; i++ )); do
+        RW_DEVICES[$i]=""
+    done
 }
 
-# mkfs on first call, mount on every call after. Idempotent on
-# already-mounted.
-EXT4_MADE=0
+# mkfs per volume on first call; mount every volume on every call
+# thereafter. Idempotent on already-mounted.
 ensure_mounted() {
     transport_login || return 1
     if [[ $MOUNT_UP -eq 1 ]]; then return 0; fi
-    if [[ $EXT4_MADE -eq 0 ]]; then
-        log_info "mkfs.ext4 on $RW_DEVICE (first mount)"
-        if ! mkfs.ext4 -F -q "$RW_DEVICE" >/dev/null 2>&1; then
-            log_error "mkfs.ext4 failed on $RW_DEVICE"
+    local i n=${#VOLUME_NAMES[@]}
+    for (( i=0; i<n; i++ )); do
+        local dev="${RW_DEVICES[$i]}" mp="${MOUNT_POINTS[$i]}"
+        if [[ "${EXT4_MADE[$i]}" -eq 0 ]]; then
+            log_info "mkfs.ext4 on $dev (first mount for ${VOLUME_NAMES[$i]})"
+            if ! mkfs.ext4 -F -q "$dev" >/dev/null 2>&1; then
+                log_error "mkfs.ext4 failed on $dev"
+                return 1
+            fi
+            EXT4_MADE[$i]=1
+        fi
+        if ! mount "$dev" "$mp" 2>/dev/null; then
+            log_error "mount $dev -> $mp failed"
             return 1
         fi
-        EXT4_MADE=1
-    fi
-    if ! mount "$RW_DEVICE" "$MOUNT_POINT" 2>/dev/null; then
-        log_error "mount $RW_DEVICE failed"
-        return 1
-    fi
+    done
     MOUNT_UP=1
 }
 
 umount_only() {
     if [[ $MOUNT_UP -eq 0 ]]; then return 0; fi
     sync
-    if ! umount "$MOUNT_POINT" 2>/dev/null; then
-        log_error "umount failed"
-        return 1
-    fi
+    local mp rc=0
+    for mp in "${MOUNT_POINTS[@]}"; do
+        if ! umount "$mp" 2>/dev/null; then
+            log_error "umount $mp failed"
+            rc=1
+        fi
+    done
+    if (( rc != 0 )); then return 1; fi
     MOUNT_UP=0
 }
 
-# Path generator. Two-step pattern (mutate global, then printf -v) so the
-# increment doesn't get lost in a $(new_path) subshell. Flat paths under
-# the mount root — no subdir to mkdir.
+# Pick a mount root from MOUNT_POINTS deterministically per op.
+pick_mount_root() {
+    local n=${#MOUNT_POINTS[@]}
+    local idx
+    idx=$(mc_rng_u32 "pick-mount" "$n")
+    echo "${MOUNT_POINTS[$idx]}"
+}
+
+# Pick a parent directory for a new file/dir. With probability ~20%
+# returns the mount root itself; otherwise picks among existing dirs
+# under that root. Emits the chosen parent to stdout.
+pick_parent_under() {
+    local root="$1"
+    local matching=() d
+    for d in "${ALIVE_DIRS[@]}"; do
+        if [[ "$d" == "$root"/* ]]; then
+            matching+=("$d")
+        fi
+    done
+    local n=${#matching[@]}
+    if (( n == 0 )); then
+        echo "$root"
+        return
+    fi
+    local roll
+    roll=$(mc_rng_u32 "use-root" 100)
+    if (( roll < 20 )); then
+        echo "$root"
+    else
+        local idx
+        idx=$(mc_rng_u32 "pick-dir" "$n")
+        echo "${matching[$idx]}"
+    fi
+}
+
+# Path generator. Two-step pattern (mutate global, then printf -v) so
+# the increment doesn't get lost in a $(new_path) subshell. Two-level
+# scheme: <mount_root>/d-NN/f-NNNNN, or <mount_root>/f-NNNNN if the
+# picker lands on the root. Volume + parent-dir selection runs through
+# the same RNG keys so the layout is reproducible under --seed.
 new_path() {
     NEXT_PATH_INDEX=$(( NEXT_PATH_INDEX + 1 ))
-    printf -v NEW_PATH '/%05d' "$NEXT_PATH_INDEX"
+    local mount_root parent
+    mount_root=$(pick_mount_root)
+    parent=$(pick_parent_under "$mount_root")
+    printf -v NEW_PATH '%s/f-%05d' "$parent" "$NEXT_PATH_INDEX"
 }
 
 # Rebuild ALIVE_PATHS from FILE_VERSIONS. Called after delete.
 rebuild_alive_paths() {
-    local new=()
+    local new=() p
     for p in "${ALIVE_PATHS[@]}"; do
         if (( ${FILE_VERSIONS[$p]:-0} > 0 )); then
             new+=("$p")
         fi
     done
     ALIVE_PATHS=("${new[@]}")
+}
+
+# Drop one entry from ALIVE_DIRS by exact match. Order is preserved
+# for everything else; called from op_rmdir after a successful rmdir(2).
+drop_alive_dir() {
+    local target="$1"
+    local new=() d
+    for d in "${ALIVE_DIRS[@]}"; do
+        [[ "$d" == "$target" ]] || new+=("$d")
+    done
+    ALIVE_DIRS=("${new[@]}")
 }
 
 # Pick one of ALIVE_PATHS, deterministically from MC_SEED + MC_OP_INDEX.
@@ -547,10 +733,13 @@ pick_existing_path() {
 }
 
 # Regenerate the expected content for (path, version, size) into $1.
-# Pure function — does not touch the mount.
+# The content key is CONTENT_KEY[path] (set = path on create, preserved
+# across op_rename so a moved file's bytes don't have to be rewritten),
+# falling back to the path itself for backwards compat.
 regen_expected() {
     local path="$1" version="$2" size="$3" out="$4"
-    mc_content_to "$path" "$version" "$size" "$out"
+    local key="${CONTENT_KEY[$path]:-$path}"
+    mc_content_to "$key" "$version" "$size" "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -561,11 +750,14 @@ op_write_new() {
     ensure_mounted || return 1
     new_path
     local path="$NEW_PATH" size
+    # CONTENT_KEY is set to the path at creation; subsequent ops use it
+    # so renamed files keep their content key.
+    CONTENT_KEY[$path]="$path"
     size=$(mc_pick_size_boundary_biased "size-write-new")
     local tmp="$TEST_DIR/scratch"
     regen_expected "$path" 1 "$size" "$tmp"
     local cp_err
-    if ! cp_err=$(cp "$tmp" "$MOUNT_POINT$path" 2>&1); then
+    if ! cp_err=$(cp "$tmp" "$path" 2>&1); then
         # Only ENOSPC is "expected": volume residual filled. For that,
         # nuke a random alive file and retry once. Any other error is
         # a real bug — bail loudly so we don't paper over it.
@@ -575,11 +767,13 @@ op_write_new() {
             return 1
         fi
         local victim
-        victim=$(pick_existing_path) || { mc_log_op write_new path="$path" size="$size" status=enospc_no_victim; return 0; }
-        rm -f "$MOUNT_POINT$victim"
+        victim=$(pick_existing_path) || { unset 'CONTENT_KEY[$path]'; mc_log_op write_new path="$path" size="$size" status=enospc_no_victim; return 0; }
+        rm -f "$victim"
         FILE_VERSIONS[$victim]=0
+        unset 'CONTENT_KEY[$victim]'
         rebuild_alive_paths
-        if ! cp "$tmp" "$MOUNT_POINT$path" 2>/dev/null; then
+        if ! cp "$tmp" "$path" 2>/dev/null; then
+            unset 'CONTENT_KEY[$path]'
             mc_log_op write_new path="$path" size="$size" status=enospc_after_evict victim="$victim"
             return 0
         fi
@@ -599,7 +793,7 @@ op_overwrite() {
     size=$(mc_pick_size_boundary_biased "size-overwrite")
     local tmp="$TEST_DIR/scratch"
     regen_expected "$path" "$new_v" "$size" "$tmp"
-    if ! cp "$tmp" "$MOUNT_POINT$path" 2>/dev/null; then
+    if ! cp "$tmp" "$path" 2>/dev/null; then
         mc_log_op overwrite path="$path" size="$size" v="$new_v" status=enospc
         return 0
     fi
@@ -635,7 +829,7 @@ op_append() {
         mc_dump_failure
         return 1
     fi
-    if ! cat "$tail_only" >> "$MOUNT_POINT$path" 2>/dev/null; then
+    if ! cat "$tail_only" >> "$path" 2>/dev/null; then
         mc_log_op append path="$path" delta="$delta" new_size="$new_size" status=enospc
         return 0
     fi
@@ -651,7 +845,7 @@ op_read_verify() {
     local v=${FILE_VERSIONS[$path]}
     local size=${FILE_SIZES[$path]}
     local actual_size
-    actual_size=$(stat -c%s "$MOUNT_POINT$path" 2>/dev/null || echo "missing")
+    actual_size=$(stat -c%s "$path" 2>/dev/null || echo "missing")
     if [[ "$actual_size" != "$size" ]]; then
         log_error "read_verify: stat size mismatch at $path: model=$size actual=$actual_size v=$v"
         mc_dump_failure
@@ -659,10 +853,10 @@ op_read_verify() {
     fi
     local tmp="$TEST_DIR/scratch.expect"
     regen_expected "$path" "$v" "$size" "$tmp"
-    if ! cmp -s "$MOUNT_POINT$path" "$tmp"; then
+    if ! cmp -s "$path" "$tmp"; then
         log_error "read_verify: content mismatch at $path (v=$v size=$size)"
         local first_diff
-        first_diff=$(cmp "$MOUNT_POINT$path" "$tmp" 2>&1 | head -1)
+        first_diff=$(cmp "$path" "$tmp" 2>&1 | head -1)
         log_error "  first divergence: $first_diff"
         mc_dump_failure
         return 1
@@ -674,13 +868,14 @@ op_delete() {
     ensure_mounted || return 1
     local path
     path=$(pick_existing_path) || { mc_log_op delete status=no_files; return 0; }
-    if ! rm -f "$MOUNT_POINT$path" 2>/dev/null; then
+    if ! rm -f "$path" 2>/dev/null; then
         log_error "delete: rm failed at $path"
         mc_dump_failure
         return 1
     fi
     FILE_VERSIONS[$path]=0
     unset 'FILE_SIZES[$path]'
+    unset 'CONTENT_KEY[$path]'
     rebuild_alive_paths
     mc_log_op delete path="$path"
 }
@@ -696,7 +891,7 @@ op_truncate() {
     fi
     local new_size
     new_size=$(mc_rng_u32 "truncate-size" "$cur")
-    if ! truncate -s "$new_size" "$MOUNT_POINT$path" 2>/dev/null; then
+    if ! truncate -s "$new_size" "$path" 2>/dev/null; then
         log_error "truncate: failed at $path new=$new_size"
         mc_dump_failure
         return 1
@@ -722,7 +917,7 @@ op_truncate_extend() {
     delta=$(mc_pick_size_boundary_biased "truncate-extend-delta")
     (( delta > 16777216 )) && delta=16777216
     local new_size=$(( cur + delta ))
-    if ! truncate -s "$new_size" "$MOUNT_POINT$path" 2>/dev/null; then
+    if ! truncate -s "$new_size" "$path" 2>/dev/null; then
         mc_log_op truncate_extend path="$path" old="$cur" new="$new_size" status=enospc
         return 0
     fi
@@ -730,7 +925,7 @@ op_truncate_extend() {
     # tail back into the file.
     local full="$TEST_DIR/scratch.full"
     regen_expected "$path" "$v" "$new_size" "$full"
-    if ! dd if="$full" of="$MOUNT_POINT$path" \
+    if ! dd if="$full" of="$path" \
             bs=4096 iflag=skip_bytes oflag=seek_bytes conv=notrunc \
             skip="$cur" seek="$cur" status=none 2>/dev/null; then
         # The truncate succeeded but the tail-write didn't — likely the
@@ -738,7 +933,7 @@ op_truncate_extend() {
         # to the pre-op size so subsequent verify reads the unchanged
         # prefix correctly; the on-disk file is now larger but
         # zero-filled in the tail, which would otherwise mismatch CTR.
-        truncate -s "$cur" "$MOUNT_POINT$path" 2>/dev/null || true
+        truncate -s "$cur" "$path" 2>/dev/null || true
         mc_log_op truncate_extend path="$path" old="$cur" new="$new_size" status=enospc_tail
         return 0
     fi
@@ -768,7 +963,7 @@ try:
     os.fdatasync(fd)
 finally:
     os.close(fd)
-' "$MOUNT_POINT$path" 2>/dev/null; then
+' "$path" 2>/dev/null; then
         log_error "fdatasync_one: failed at $path"
         mc_dump_failure
         return 1
@@ -796,17 +991,190 @@ op_transport_logout_cycle() {
     mc_log_op transport_logout_cycle transport="$TRANSPORT"
 }
 
+# Stop and restart the daemon. sync(2) before stop forces the ext4
+# journal and dirty pages out via SYNCHRONIZE CACHE / NVMe Flush so the
+# daemon's per-volume PageCache flushes pending pages into the chunk
+# pool before SIGTERM. umount + transport logout follow so the kernel
+# doesn't keep half-broken sessions around. On restart the daemon
+# re-discovers volumes from <data_dir>/volumes/ and the next file op
+# lazily re-establishes via ensure_mounted -> transport_login.
+op_daemon_restart() {
+    if [[ $MOUNT_UP -eq 1 ]]; then
+        sync || true
+        local mp
+        for mp in "${MOUNT_POINTS[@]}"; do
+            umount "$mp" 2>/dev/null || true
+        done
+        MOUNT_UP=0
+    fi
+    if [[ $TRANSPORT_UP -eq 1 ]]; then
+        if [[ "$TRANSPORT" == "iscsi" ]]; then
+            _iscsi_logout
+        else
+            _nvme_logout
+        fi
+        TRANSPORT_UP=0
+        local i
+        for (( i=0; i<${#RW_DEVICES[@]}; i++ )); do
+            RW_DEVICES[$i]=""
+        done
+    fi
+    stop_thur_daemon
+    sleep 0.2
+    start_daemon
+    mc_log_op daemon_restart
+}
+
+# Create a fresh directory under a random volume's random parent (the
+# mount root, or any existing dir under it). The new dir joins
+# ALIVE_DIRS so subsequent new_path / op_mkdir picks can nest into it.
+op_mkdir() {
+    ensure_mounted || return 1
+    NEXT_DIR_INDEX=$(( NEXT_DIR_INDEX + 1 ))
+    local mount_root parent dir
+    mount_root=$(pick_mount_root)
+    parent=$(pick_parent_under "$mount_root")
+    printf -v dir '%s/d-%05d' "$parent" "$NEXT_DIR_INDEX"
+    if ! mkdir "$dir" 2>/dev/null; then
+        log_error "mkdir: failed at $dir"
+        mc_dump_failure
+        return 1
+    fi
+    ALIVE_DIRS+=("$dir")
+    mc_log_op mkdir path="$dir"
+}
+
+# Remove an empty dir. Picks a random dir from ALIVE_DIRS and scans
+# forward until one rmdirs cleanly (most dirs in our scheme end up
+# non-empty quickly). all_nonempty is logged as a soft status when
+# every dir refuses the call.
+op_rmdir() {
+    ensure_mounted || return 1
+    local n=${#ALIVE_DIRS[@]}
+    if (( n == 0 )); then
+        mc_log_op rmdir status=no_dirs
+        return 0
+    fi
+    local pick
+    pick=$(mc_rng_u32 "pick-rmdir" "$n")
+    local i d
+    for (( i=0; i<n; i++ )); do
+        d="${ALIVE_DIRS[$(( (pick + i) % n ))]}"
+        if rmdir "$d" 2>/dev/null; then
+            drop_alive_dir "$d"
+            mc_log_op rmdir path="$d"
+            return 0
+        fi
+    done
+    mc_log_op rmdir status=all_nonempty
+}
+
+# Rename a file to a new (volume-local) path. Always within the same
+# volume so the kernel does rename(2) (atomic), never a cross-fs
+# copy+unlink. CONTENT_KEY[dst] inherits from src so the file's content
+# survives the move without a rewrite.
+op_rename() {
+    ensure_mounted || return 1
+    local src
+    src=$(pick_existing_path) || { mc_log_op rename status=no_files; return 0; }
+    NEXT_PATH_INDEX=$(( NEXT_PATH_INDEX + 1 ))
+    local src_mount mp parent dst
+    for mp in "${MOUNT_POINTS[@]}"; do
+        if [[ "$src" == "$mp"/* ]]; then src_mount="$mp"; break; fi
+    done
+    [[ -z "$src_mount" ]] && { mc_log_op rename src="$src" status=mount_unknown; return 0; }
+    parent=$(pick_parent_under "$src_mount")
+    printf -v dst '%s/f-%05d' "$parent" "$NEXT_PATH_INDEX"
+    if [[ "$dst" == "$src" ]]; then
+        # printf collision (extremely rare since NEXT_PATH_INDEX is monotonic).
+        mc_log_op rename src="$src" status=same_path
+        return 0
+    fi
+    if ! mv "$src" "$dst" 2>/dev/null; then
+        mc_log_op rename src="$src" dst="$dst" status=mv_failed
+        return 0
+    fi
+    FILE_VERSIONS[$dst]="${FILE_VERSIONS[$src]}"
+    FILE_SIZES[$dst]="${FILE_SIZES[$src]}"
+    CONTENT_KEY[$dst]="${CONTENT_KEY[$src]:-$src}"
+    FILE_VERSIONS[$src]=0
+    unset 'FILE_SIZES[$src]'
+    unset 'CONTENT_KEY[$src]'
+    local new=() p
+    for p in "${ALIVE_PATHS[@]}"; do
+        [[ "$p" == "$src" ]] && continue
+        new+=("$p")
+    done
+    new+=("$dst")
+    ALIVE_PATHS=("${new[@]}")
+    mc_log_op rename src="$src" dst="$dst"
+}
+
+# Mid-file overwrite. Picks a 4 KiB-aligned offset and a
+# boundary-biased length, then issues a single dd seek=off conv=notrunc
+# write to land as a SCSI WRITE at a specific mid-file LBA range. The
+# model side bumps version and rewrites the rest of the file from the
+# new keystream — per plan, we accept the full-rewrite cost rather than
+# carry a per-segment version map. The mid-file dd is the actual codepath
+# exercise; the cp reconciles the model.
+op_write_at_offset() {
+    ensure_mounted || return 1
+    local path
+    path=$(pick_existing_path) || { mc_log_op write_at_offset status=no_files; return 0; }
+    local cur=${FILE_SIZES[$path]}
+    if (( cur < 8192 )); then
+        mc_log_op write_at_offset path="$path" status=too_small cur="$cur"
+        return 0
+    fi
+    local v=${FILE_VERSIONS[$path]} new_v=$(( v + 1 ))
+    # 4 KiB-aligned offset strictly inside the file.
+    local raw_off
+    raw_off=$(mc_rng_u32 "wao-offset" "$cur")
+    local off=$(( raw_off / 4096 * 4096 ))
+    (( off + 4096 > cur )) && off=$(( ((cur - 4096) / 4096) * 4096 ))
+    (( off < 0 )) && off=0
+    local raw_len
+    raw_len=$(mc_pick_size_boundary_biased "wao-len")
+    local remaining=$(( cur - off ))
+    local len=$(( raw_len < remaining ? raw_len : remaining ))
+    local full="$TEST_DIR/scratch.full"
+    regen_expected "$path" "$new_v" "$cur" "$full"
+    local slice="$TEST_DIR/scratch.slice"
+    if ! dd if="$full" of="$slice" bs="$len" count=1 iflag=skip_bytes \
+            skip="$off" status=none 2>/dev/null; then
+        log_error "write_at_offset: slice extraction failed (off=$off len=$len cur=$cur)"
+        mc_dump_failure
+        return 1
+    fi
+    if ! dd if="$slice" of="$path" bs="$len" count=1 \
+            oflag=seek_bytes conv=notrunc seek="$off" status=none 2>/dev/null; then
+        mc_log_op write_at_offset path="$path" off="$off" len="$len" status=enospc_slice
+        return 0
+    fi
+    if ! cp "$full" "$path" 2>/dev/null; then
+        log_error "write_at_offset: full-rewrite reconcile failed at $path"
+        mc_dump_failure
+        return 1
+    fi
+    FILE_VERSIONS[$path]=$new_v
+    mc_log_op write_at_offset path="$path" off="$off" len="$len" v="$new_v"
+}
+
 # ---------------------------------------------------------------------------
 # Main op loop.
 # ---------------------------------------------------------------------------
 
 # Weights for the random op picker. Must sum to 100; mc_assert_weights
-# at startup enforces that. truncate_extend / fdatasync_one are low-rate
-# correctness-shape ops, not throughput drivers.
+# at startup enforces that. truncate_extend / fdatasync_one / mkdir /
+# rmdir / rename / write_at_offset are low-rate correctness-shape ops,
+# not throughput drivers.
 OP_WEIGHTS=(
-    "22:write_new" "14:overwrite" "14:append" "18:read_verify"
-    "8:delete" "4:truncate" "3:truncate_extend" "4:sync" "3:fdatasync_one"
+    "17:write_new" "12:overwrite" "11:append" "16:read_verify"
+    "5:write_at_offset" "6:delete" "3:truncate" "3:truncate_extend"
+    "4:sync" "3:fdatasync_one"
+    "3:mkdir" "2:rmdir" "3:rename"
     "6:umount_cycle" "4:transport_logout_cycle"
+    "2:daemon_restart"
 )
 
 run_ops() {
@@ -820,17 +1188,22 @@ run_ops() {
             write_new)                op_write_new || return 1 ;;
             overwrite)                op_overwrite || return 1 ;;
             append)                   op_append || return 1 ;;
+            write_at_offset)          op_write_at_offset || return 1 ;;
             read_verify)              op_read_verify || return 1 ;;
             delete)                   op_delete || return 1 ;;
             truncate)                 op_truncate || return 1 ;;
             truncate_extend)          op_truncate_extend || return 1 ;;
             sync)                     op_sync || return 1 ;;
             fdatasync_one)            op_fdatasync_one || return 1 ;;
+            mkdir)                    op_mkdir || return 1 ;;
+            rmdir)                    op_rmdir || return 1 ;;
+            rename)                   op_rename || return 1 ;;
             umount_cycle)             op_umount_cycle || return 1 ;;
             transport_logout_cycle)   op_transport_logout_cycle || return 1 ;;
+            daemon_restart)           op_daemon_restart || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
-            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED alive=${#ALIVE_PATHS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
+            log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED alive=${#ALIVE_PATHS[@]} dirs=${#ALIVE_DIRS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
         fi
     done
 }
@@ -847,10 +1220,10 @@ final_verify_all() {
         v=${FILE_VERSIONS[$p]}
         size=${FILE_SIZES[$p]}
         regen_expected "$p" "$v" "$size" "$tmp"
-        if ! cmp -s "$MOUNT_POINT$p" "$tmp"; then
+        if ! cmp -s "$p" "$tmp"; then
             log_error "final_verify: content mismatch at $p (v=$v size=$size)"
             local first_diff
-            first_diff=$(cmp "$MOUNT_POINT$p" "$tmp" 2>&1 | head -1)
+            first_diff=$(cmp "$p" "$tmp" 2>&1 | head -1)
             log_error "  first divergence: $first_diff"
             mc_dump_failure
             return 1
@@ -870,12 +1243,13 @@ main() {
     assign_ports_mc
     create_test_config
     start_daemon
-    ensure_volume
+    setup_chap_user
+    ensure_volumes
 
     mc_assert_weights "op" "${OP_WEIGHTS[@]}"
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
 
-    log_info "Running $OPS random ops (transport=$TRANSPORT, volume=${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME/$BACKEND_TYPE)"
+    log_info "Running $OPS random ops (transport=$TRANSPORT, volumes=${#VOLUME_NAMES[@]} x ${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME/$BACKEND_TYPE)"
     if ! run_ops "$OPS"; then
         log_fail "Op loop aborted on failure"
         exit 1
