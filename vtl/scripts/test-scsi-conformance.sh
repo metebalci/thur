@@ -11,7 +11,7 @@
 # Linux kernel iSCSI initiator. This is the per-CDB conformance net.
 #
 # For iSCSI protocol-layer regressions (Login bookkeeping, CmdSN/StatSN), see
-# test-iscsi-conformance.sh — that one is no-sudo and uses libiscsi.
+# test-proto-iscsi.sh — that one is no-sudo and uses libiscsi.
 #
 # Coverage map (see CLAUDE.md "Quick reference for memory" for daemon source):
 #   SPC (shared):

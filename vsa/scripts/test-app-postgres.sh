@@ -10,7 +10,7 @@
 # gaps that the synthetic / filesystem tests miss: fsync ordering under
 # WAL, mixed sequential heap inserts plus random index updates,
 # transactional crash recovery. This is the VSA counterpart to
-# vtl/scripts/test-backup-bareos.sh — a real program driving the storage
+# vtl/scripts/test-app-bareos.sh — a real program driving the storage
 # with non-trivial workload, plus a verifiable post-condition.
 #
 # Workflow:
@@ -21,7 +21,7 @@
 #     3. mkfs.ext4 + mount at $TEST_DIR/mnt.
 #     4. Build small postgres container (debian:12 + postgresql) from an
 #        inline Containerfile; cached after first build by Containerfile
-#        fingerprint, same pattern as test-backup-bareos.sh.
+#        fingerprint, same pattern as test-app-bareos.sh.
 #     5. Start container: initdb the cluster onto the mounted volume,
 #        start postgres in the foreground.
 #   Phase B — pgbench init + initial invariant
@@ -68,7 +68,7 @@
 #   - Root/sudo access (self-elevates via NOPASSWD sudoers)
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-fs-postgres.sh [OPTIONS]
+#   ./vsa/scripts/test-app-postgres.sh [OPTIONS]
 #
 # Options:
 #   --seed N              Reproduce a prior run
@@ -102,7 +102,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/test-fs-postgres-$$"
+TEST_DIR="/tmp/test-app-postgres-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TRANSPORT="iscsi"
 ISCSI_PORT=""
@@ -433,7 +433,7 @@ pick_workload_params() {
 
 # Build (or reuse) the postgres container image. Tag carries the
 # Containerfile fingerprint so any edit busts the cache without manual
-# pruning — same pattern as test-backup-bareos.sh.
+# pruning — same pattern as test-app-bareos.sh.
 build_postgres_image() {
     log_info "Preparing postgres container image..."
     local containerfile="$TEST_DIR/Containerfile.postgres"

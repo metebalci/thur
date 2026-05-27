@@ -4,41 +4,34 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# thurvsa iSCSI Conformance Test
+# Thur VTL iSCSI Conformance Test
 #
-# Verifies the iSCSI protocol layer (login, CmdSN/StatSN bookkeeping,
-# header digests) against thurvsad using libiscsi's userspace
-# client. libiscsi is stricter than the Linux kernel iSCSI initiator
-# about RFC 3720/7143 sequencing — bugs the kernel quietly works
-# around (e.g. an off-by-one in the Login Response's ExpCmdSN) cause
-# libiscsi to silently drop subsequent SCSI PDUs. This script is the
-# early-warning regression net for protocol-layer changes that the
-# tape-side counterpart (vtl/scripts/test-iscsi-conformance.sh)
-# also guards.
+# Verifies the iSCSI protocol layer (login, CmdSN/StatSN bookkeeping, header
+# digests) using libiscsi's userspace client. Userspace libiscsi is stricter
+# than the Linux kernel iSCSI initiator about RFC 3720/7143 sequencing — bugs
+# the kernel quietly works around (e.g. an off-by-one in the Login Response's
+# ExpCmdSN) cause libiscsi to silently drop subsequent SCSI PDUs. So this
+# script is the early-warning regression net for protocol-layer changes.
 #
-# This is NOT a SCSI-command conformance suite. iscsi-test-cu's tests
-# are mostly SBC and would be in scope here, but the SBC opcode
-# coverage net lives in test-scsi-conformance.sh against the kernel
-# initiator + sg3_utils (sudo).
-#
-# Two volumes are created so REPORT LUNS has something to walk:
-#   - LUN 0: 16 MiB,  Local dedup
-#   - LUN 1: 32 MiB, Global dedup
+# This is NOT a SCSI-command conformance suite. iscsi-test-cu's tests are
+# almost all SBC (block device); they don't apply to tape (SSC) or changer
+# (SMC), so we don't run them. For SCSI command coverage see
+# test-scsi-conformance.sh (sg3_utils-based, sudo).
 #
 # Prerequisites:
 #   - libiscsi-bin    (Debian/Ubuntu: sudo apt-get install libiscsi-bin)
 #                     Provides the iscsi-inq binary.
-#   - thurvsad and thurvsa (built or on PATH)
+#   - thurvtld and thurvtl (built or on PATH)
 #
 # No sudo / no kernel iSCSI initiator required.
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-iscsi-conformance.sh [OPTIONS]
+#   ./vtl/scripts/test-proto-iscsi.sh [OPTIONS]
 #
 # Options:
 #   --release             Use ./target/release/ binaries (default: ./target/debug/)
-#   --daemon-path PATH    Override path to thurvsad binary
-#   --cli-path PATH       Override path to thurvsa binary
+#   --daemon-path PATH    Override path to thurvtld binary
+#   --cli-path PATH       Override path to thurvtl binary
 #   --keep-data           Don't clean up test data directory
 #   --iscsi-port PORT     Override iSCSI port (default: free ephemeral port)
 #   --http-port PORT      Override HTTP port (default: free ephemeral port)
@@ -49,17 +42,19 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
+# Configuration
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/thurvsa-test-iscsi-conformance-$$"
+TEST_DIR="/tmp/test-proto-iscsi-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 ISCSI_PORT=""
 HTTP_PORT=""
-TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
+TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
 KEEP_DATA=0
 DAEMON_PID=""
 
+# Parse args
 while [[ $# -gt 0 ]]; do
     case $1 in
         --release) BUILD_PROFILE="release"; shift ;;
@@ -97,23 +92,23 @@ check_prerequisites() {
     local build_cmd="cargo build --profile dev"
     [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
 
-    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-    : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
+    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvtld}"
+    : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvtl}"
 
     if [[ ! -x "$DAEMON_PATH" ]]; then
-        if command -v thurvsad >/dev/null 2>&1; then
-            DAEMON_PATH=$(command -v thurvsad)
+        if command -v thurvtld >/dev/null 2>&1; then
+            DAEMON_PATH=$(command -v thurvtld)
         else
-            missing+=("thurvsad")
-            hints+=("  - thurvsad: $build_cmd (or pass --daemon-path PATH)")
+            missing+=("thurvtld")
+            hints+=("  - thurvtld: $build_cmd (or pass --daemon-path PATH)")
         fi
     fi
     if [[ ! -x "$CLI_PATH" ]]; then
-        if command -v thurvsa >/dev/null 2>&1; then
-            CLI_PATH=$(command -v thurvsa)
+        if command -v thurvtl >/dev/null 2>&1; then
+            CLI_PATH=$(command -v thurvtl)
         else
-            missing+=("thurvsa")
-            hints+=("  - thurvsa: $build_cmd (or pass --cli-path PATH)")
+            missing+=("thurvtl")
+            hints+=("  - thurvtl: $build_cmd (or pass --cli-path PATH)")
         fi
     fi
 
@@ -138,18 +133,28 @@ check_prerequisites() {
 
 create_test_config() {
     log_info "Creating test configuration..."
-    mkdir -p "$TEST_DIR/data/volumes"
+    mkdir -p "$TEST_DIR"
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
+
+library:
+  num_slots: 40
+  num_drives: 2
+  lto_generation: 8
+
+# Force Community mode so a host-installed license at /etc/thurvtl/license.lic
+# can't influence test behavior. Pointing license.file at a nonexistent path
+# disables the default search paths and triggers the Missing-license fallback
+# to Community.
+license:
+  file: "$TEST_DIR/no-such.lic"
 
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
-
-audit:
-  enabled: true
+  target_iqn: "$TARGET_IQN"
 storage:
   backends:
     local:
@@ -157,11 +162,12 @@ storage:
       root_dir: "$TEST_DIR/local-backend"
 
 EOFCONFIG
+    mkdir -p "$TEST_DIR/data"
 }
 
 start_daemon() {
-    export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting thurvsad..."
+    export THURVTL_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
+    log_info "Starting Thur VTL daemon..."
     RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" > "${TEST_DIR}/daemon.log" 2>&1 &
     DAEMON_PID=$!
     for _ in {1..30}; do
@@ -176,12 +182,6 @@ start_daemon() {
     exit 1
 }
 
-create_volumes() {
-    log_info "Creating two volumes for the conformance assertions..."
-    "$CLI_PATH" --config "$TEST_CONFIG" volume create vol-a --size 16M --dedup local  >/dev/null
-    "$CLI_PATH" --config "$TEST_CONFIG" volume create vol-b --size 32M --dedup global >/dev/null
-}
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -189,52 +189,23 @@ create_volumes() {
 PASSED=0
 FAILED=0
 
-# iscsi-inq performs login + INQUIRY; success exercises the full login
-# state machine including CmdSN/StatSN bookkeeping. A regression in
-# the daemon's Login Response (e.g. wrong ExpCmdSN, wrong Status-Class,
-# missing transit bit) will surface here as a hang or non-zero exit.
+# iscsi-inq performs login + INQUIRY; success exercises the full login state
+# machine including CmdSN/StatSN bookkeeping. A regression in the daemon's
+# Login Response (e.g. wrong ExpCmdSN, wrong Status-Class, missing transit bit)
+# will surface here as a hang or non-zero exit.
 test_inquiry() {
     local lun="$1"
-    local logfile="$2"
+    local expected_pdt="$2"
+    local logfile="$3"
     if ! timeout 10 iscsi-inq "iscsi://127.0.0.1:$ISCSI_PORT/$TARGET_IQN/$lun" \
             > "$logfile" 2>&1; then
         log_error "iscsi-inq LUN $lun failed (see $logfile)"
         return 1
     fi
-    # libiscsi versions print the PDT one of three ways. Either is fine.
-    # Identity (2026-05-11): vendor `MB`, product `THUR VSA`.
-    if grep -qE "Peripheral Device Type:DIRECT_ACCESS(_BLOCK_DEVICE)?\b|Peripheral Device Type:DISK\b|Vendor:MB\b|Product:THUR VSA\b" \
-            "$logfile"; then
-        return 0
+    if ! grep -q "Peripheral Device Type:$expected_pdt" "$logfile"; then
+        log_error "iscsi-inq LUN $lun: did not report $expected_pdt (see $logfile)"
+        return 1
     fi
-    log_error "iscsi-inq LUN $lun: did not look like a thurvsa block LUN (see $logfile)"
-    return 1
-}
-
-# Issue an INQUIRY against an unmapped LUN. SAM-5 mandates the
-# "no LUN" pattern (peripheral qualifier 0b011 + type 0x1F = 0x7F)
-# rather than CHECK CONDITION — initiators rely on it to walk the LUN
-# map without raising spurious sense.
-test_inquiry_unmapped_lun() {
-    local logfile="$1"
-    if ! timeout 10 iscsi-inq "iscsi://127.0.0.1:$ISCSI_PORT/$TARGET_IQN/7" \
-            > "$logfile" 2>&1; then
-        # iscsi-inq exits non-zero on CHECK CONDITION; PDT 0x7F should
-        # NOT be a CHECK CONDITION. Some libiscsi-bin versions exit 0
-        # and print the PDT raw.
-        # Either way, what we DON'T want is "Sense Key:" / "ASC:"
-        # decode in the output — that means the daemon raised sense
-        # against a LUN probe.
-        if grep -qE "Sense Key|ASC:" "$logfile"; then
-            log_error "Unmapped-LUN INQUIRY raised SCSI sense (see $logfile)"
-            return 1
-        fi
-    fi
-    if grep -qE "Peripheral Qualifier:[[:space:]]*3|Peripheral Device Type:[[:space:]]*0x1f|UNKNOWN" "$logfile"; then
-        return 0
-    fi
-    # Fallback: as long as the connection completed without sense, treat
-    # the surface as compliant — the qualifier formatting varies wildly.
     return 0
 }
 
@@ -253,7 +224,7 @@ run_test() {
 
 main() {
     echo "========================================"
-    echo "thurvsa iSCSI Conformance Test"
+    echo "Thur VTL iSCSI Conformance Test"
     echo "========================================"
     echo "Verifying iSCSI protocol layer (login + CmdSN/StatSN bookkeeping)"
     echo "via libiscsi's strict userspace client."
@@ -263,15 +234,12 @@ main() {
     assign_ports
     create_test_config
     start_daemon
-    create_volumes
 
     echo ""
-    run_test "iscsi-inq INQUIRY (LUN 0 / vol-a)" \
-        test_inquiry 0 "${TEST_DIR}/inquiry-lun0.log"
-    run_test "iscsi-inq INQUIRY (LUN 1 / vol-b)" \
-        test_inquiry 1 "${TEST_DIR}/inquiry-lun1.log"
-    run_test "iscsi-inq INQUIRY against unmapped LUN 7 (no SCSI sense)" \
-        test_inquiry_unmapped_lun "${TEST_DIR}/inquiry-lun7.log"
+    run_test "iscsi-inq INQUIRY (changer LUN 0 -> MEDIA_CHANGER)" \
+        test_inquiry 0 "MEDIA_CHANGER" "${TEST_DIR}/inquiry-changer.log"
+    run_test "iscsi-inq INQUIRY (drive LUN 1 -> SEQUENTIAL_ACCESS)" \
+        test_inquiry 1 "SEQUENTIAL_ACCESS" "${TEST_DIR}/inquiry-drive-1.log"
 
     echo "========================================"
     echo "Test Summary"

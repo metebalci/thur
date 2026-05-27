@@ -18,10 +18,10 @@
 # per-test Unix socket under /tmp.
 #
 # Companions:
-#   - test-iscsi-conformance.sh — iSCSI protocol layer (login + INQUIRY) via libiscsi
+#   - test-proto-iscsi.sh — iSCSI protocol layer (login + INQUIRY) via libiscsi
 #   - test-scsi-conformance.sh  — full SBC conformance via sg3_utils (sudo)
-#   - test-iscsi-fs-workflow.sh — end-to-end mkfs+mount+tar over iSCSI (sudo)
-#   - test-nvme-fs-workflow.sh  — end-to-end mkfs+mount+tar over NVMe/TCP (sudo)
+#   - test-fs-iscsi.sh — end-to-end mkfs+mount+tar over iSCSI (sudo)
+#   - test-fs-nvmetcp.sh  — end-to-end mkfs+mount+tar over NVMe/TCP (sudo)
 #
 # Usage (invoke from repo root):
 #   ./vsa/scripts/test-smoke.sh [OPTIONS]

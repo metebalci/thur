@@ -20,7 +20,7 @@
 #   6. Stop the server on exit (success OR failure).
 #
 # Usage (from repo root):
-#   ./vsa/scripts/test-kmip-pykmip.sh [--release]
+#   ./vsa/scripts/test-keystore-kmip.sh [--release]
 #
 # Re-running is cheap: the venv + certs survive, only the pykmip.db
 # is wiped so each run starts with a clean KEK set.

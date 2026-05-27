@@ -14,7 +14,7 @@
 # userspace iscsi-ls.
 #
 # Companions:
-#   - test-iscsi-conformance.sh — iSCSI protocol layer (login + INQUIRY) via libiscsi
+#   - test-proto-iscsi.sh — iSCSI protocol layer (login + INQUIRY) via libiscsi
 #   - test-scsi-conformance.sh  — full SCSI/SSC/SMC conformance via sg3_utils (sudo)
 #   - test-backup-workflow.sh   — end-to-end tar+mtx backup/restore (sudo)
 #

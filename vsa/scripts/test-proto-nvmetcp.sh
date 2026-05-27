@@ -35,7 +35,7 @@
 #     to enter your password.
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-nvmetcp-conformance.sh [OPTIONS]
+#   ./vsa/scripts/test-proto-nvmetcp.sh [OPTIONS]
 #
 # Options:
 #   --release             Use ./target/release/ binaries (default: debug)
@@ -68,7 +68,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/thurvsa-test-nvmetcp-conformance-$$"
+TEST_DIR="/tmp/thurvsa-test-proto-nvmetcp-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 NVMETCP_PORT=""
 HTTP_PORT=""

@@ -26,7 +26,7 @@
 #     start and replays into the chain
 #
 # Usage (invoke from repo root):
-#   ./vtl/scripts/test-dr-restore.sh [OPTIONS]
+#   ./vtl/scripts/test-lifecycle-dr-restore.sh [OPTIONS]
 #
 # Options:
 #   --release             Use ./target/release/ binaries (default is ./target/debug/)
@@ -43,7 +43,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/test-dr-restore-$$"
+TEST_DIR="/tmp/test-lifecycle-dr-restore-$$"
 KEEP_DATA=0
 DAEMON_PID=""
 HTTP_PORT=""

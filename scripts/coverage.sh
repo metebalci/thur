@@ -127,8 +127,8 @@ integrated_report() {
     local no_sudo=(
         "vsa/scripts/test-smoke.sh"
         "vtl/scripts/test-smoke.sh"
-        "vsa/scripts/test-iscsi-conformance.sh"
-        "vtl/scripts/test-iscsi-conformance.sh"
+        "vsa/scripts/test-proto-iscsi.sh"
+        "vtl/scripts/test-proto-iscsi.sh"
         "vsa/scripts/test-crash-audit-append.sh"
         "vtl/scripts/test-crash-audit-append.sh"
         "vtl/scripts/test-backup-storage-resume.sh"
@@ -136,15 +136,15 @@ integrated_report() {
     )
     local soak=(
         "THURVSA_SOAK=1 vsa/scripts/test-multi-volume-dedup.sh"
-        "THURVTL_SOAK=1 vtl/scripts/test-many-cartridge-lifecycle.sh"
+        "THURVTL_SOAK=1 vtl/scripts/test-lifecycle-many-cartridges.sh"
     )
     local sudo_set=(
-        "vsa/scripts/test-iscsi-fs-workflow.sh"
+        "vsa/scripts/test-fs-iscsi.sh"
         "vsa/scripts/test-scsi-conformance.sh"
         "vtl/scripts/test-scsi-conformance.sh"
         "vtl/scripts/test-backup-workflow.sh"
-        "vsa/scripts/test-nvmetcp-conformance.sh"
-        "vsa/scripts/test-nvme-fs-workflow.sh"
+        "vsa/scripts/test-proto-nvmetcp.sh"
+        "vsa/scripts/test-fs-nvmetcp.sh"
         "vsa/scripts/test-crash-page-flush.sh"
         "vtl/scripts/test-crash-chunk-seal.sh"
     )

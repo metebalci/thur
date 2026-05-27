@@ -462,8 +462,8 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
-- `vtl/scripts/test-{smoke,iscsi-conformance,scsi-conformance,backup-workflow,backup-storage,backup-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,iscsi-conformance,scsi-conformance,iscsi-fs-workflow,iscsi-fs-storage,fs-storage-failures,keystore,nvmetcp-conformance,nvme-fs-workflow,nvme-fs-storage,monte-carlo,fs-postgres,fs-vm}.sh`
+- `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
+- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,scsi-conformance,fs-iscsi,fs-iscsi-storage,fs-nvmetcp,fs-nvmetcp-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
 
 Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
@@ -477,14 +477,14 @@ smoke (200 ops) vs the ~5 min default (3000 ops). VSA also accepts
 (default `iscsi`) — the op generator, content model, and verification
 are transport-agnostic; only the login / device-discovery /
 logout-cycle primitives branch.
-`test-backup-bareos.sh` (VTL only) drives a real Bareos director/SD/FD
+`test-app-bareos.sh` (VTL only) drives a real Bareos director/SD/FD
 in podman (built on the fly from an inline `Containerfile`, debian:12 +
 bareos-21 + SQLite catalog) against a 2-drive / 6-cartridge chassis,
 runs a seeded random number of small backup jobs with Bareos Max
 Concurrent Jobs = 2 so both drives engage, restores every job and diffs
 the restored tree byte-for-byte. `--seed N` reproduces; `--quick` for 4
 jobs (default 8). Requires `podman`.
-`test-fs-postgres.sh` (VSA only) is the block-storage counterpart: a
+`test-app-postgres.sh` (VSA only) is the block-storage counterpart: a
 real PostgreSQL container (debian:12 + postgresql) on top of an ext4
 mount on a thurvsa volume, exercises WAL fsync ordering, mixed
 sequential heap inserts + random index updates, and transactional
@@ -494,8 +494,8 @@ restarts postgres, and re-checks the TPC-B sum invariant after WAL
 replay. `--seed N` picks scale / concurrency / runtime in bounded
 buckets; `--quick` locks scale=1, T=30 s for ~1 min total. Accepts
 `--transport iscsi|nvmetcp` (default `iscsi`). Requires `podman`.
-`test-fs-vm.sh` (VSA only) is the "OS-as-workload" counterpart of
-`test-fs-postgres.sh`: boots a real Ubuntu 26.04 LTS minimal cloud
+`test-app-vm.sh` (VSA only) is the "OS-as-workload" counterpart of
+`test-app-postgres.sh`: boots a real Ubuntu 26.04 LTS minimal cloud
 image (q35 + OVMF UEFI, TCG — no KVM needed) directly from a thurvsa
 volume. cloud-init's `runcmd` writes a seed-derived fixture under
 `/var/test-fixture/`, fsyncs, and powers off; the host then mounts
@@ -510,7 +510,7 @@ runs `fsck.ext4 -fn`, and re-verifies the Phase B fixture survived.
 `qemu-utils`, `ovmf`, `cloud-image-utils`. First run fetches the cloud
 image (~408 MB) under `/var/cache/thur/cloud-images/`; subsequent runs
 reuse the cache.
-`test-keystore.sh` is the keystore-backend counterpart of `test-iscsi-fs-storage.sh`
+`test-keystore.sh` is the keystore-backend counterpart of `test-fs-iscsi-storage.sh`
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
 and exercises wrap / unwrap / migrate against any backend type

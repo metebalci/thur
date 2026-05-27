@@ -24,7 +24,7 @@ breakdown, the methodology, and the suite catalogue.
 
 A handful of scripts under `vtl/scripts/` and `vsa/scripts/` (the
 `test-*-storage.sh` and `test-fs-storage-failures.sh` suites, plus
-`test-pipeline-layers.sh`, `test-cartridge-migrate.sh`, `test-keystore.sh`,
+`test-pipeline-layers.sh`, `test-lifecycle-cartridge-migrate.sh`, `test-keystore.sh`,
 and `test-monte-carlo.sh` against a non-local backend) exercise real
 S3 / GCS / Azure / AIStor / MinIO connections end-to-end. They need:
 
@@ -51,7 +51,7 @@ coordinates. Override paths with `THURV{TL,SA}_SOURCE_BACKENDS` /
 backend per run with `THURV{TL,SA}_TEST_BACKEND=<name>` matching an entry
 in the YAML. All non-real-backend tests (`test-smoke.sh`,
 `test-*-conformance.sh`, `test-backup-workflow.sh`,
-`test-iscsi-fs-workflow.sh`, `test-nvme-fs-workflow.sh`) run against an
+`test-fs-iscsi.sh`, `test-fs-nvmetcp.sh`) run against an
 inline local backend and need no `private/` setup.
 
 The release-cut process is in [`RELEASING.md`](RELEASING.md); the

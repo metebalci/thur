@@ -257,7 +257,7 @@ Two layers, in increasing order of prerequisites:
   Property Get / Set / Disconnect, SUBNQN admission, term-req on
   protocol violations, SUCCESS-bit folding. Run via
   `cargo test -p nvme-tcp`. No sudo, no kernel module.
-- **`vsa/scripts/test-nvmetcp-conformance.sh`** — live stack test
+- **`vsa/scripts/test-proto-nvmetcp.sh`** — live stack test
   driven by Linux `nvme-cli`. Self-elevates via sudo, loads
   `nvme_tcp` if needed, brings the daemon up with
   `transport: nvmetcp` on a free ephemeral port, runs

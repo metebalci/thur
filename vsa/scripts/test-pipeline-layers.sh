@@ -24,14 +24,14 @@
 #
 # Per-keystore wrap/unwrap coverage (awskms / vault / azurekv /
 # gcpkms / etc.) lives in vsa/scripts/test-keystore.sh — same shape
-# as test-iscsi-fs-storage.sh: pick a backend by name from a source
+# as test-fs-iscsi-storage.sh: pick a backend by name from a source
 # JSON file (operator-local `private/keystore-backends.json`) and
 # splice into `keystore.backends:` of the YAML test config. Out of
 # scope here so the matrix run stays focused on the storage /
 # pipeline layers.
 #
 # Defaults to aistor-none for LAN iteration. Same cred-handling
-# conventions as test-iscsi-fs-storage.sh.
+# conventions as test-fs-iscsi-storage.sh.
 #
 # Usage (invoke from repo root):
 #   THURVSA_TEST_BACKEND=aistor-none ./vsa/scripts/test-pipeline-layers.sh [OPTIONS]
@@ -108,7 +108,7 @@ fi
 
 # Backends config is YAML under `storage.backends.<name>` (mirrors what
 # every other storage-backed VSA suite reads). yq is needed at the same
-# version contract as test-iscsi-fs-storage.sh.
+# version contract as test-fs-iscsi-storage.sh.
 BACKEND_TYPE=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".type" "$SOURCE_BACKENDS")
 BACKEND_BUCKET=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".bucket // \"\"" "$SOURCE_BACKENDS")
 BACKEND_ENDPOINT=$(yq -r ".storage.backends.\"$THURVSA_TEST_BACKEND\".endpoint_url // \"\"" "$SOURCE_BACKENDS")
@@ -379,7 +379,7 @@ row_bring_up() {
 # Row 1: baseline. Create volume, mkfs+mount+write+umount, no
 # special assertion beyond "everything completes cleanly". The
 # byte-equality check is heavy here (read-back across reboot);
-# matching test-iscsi-fs-storage.sh's full Phase C is overkill for the
+# matching test-fs-iscsi-storage.sh's full Phase C is overkill for the
 # matrix.
 row_baseline() {
     log_test "row 1: baseline (dedup=local, encrypt=off, storage=none)"

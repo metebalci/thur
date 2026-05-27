@@ -38,7 +38,7 @@
 #   - Root/sudo access (self-elevates via NOPASSWD sudoers)
 #
 # Usage:
-#   ./vtl/scripts/test-backup-bareos.sh [OPTIONS]
+#   ./vtl/scripts/test-app-bareos.sh [OPTIONS]
 #
 # Options:
 #   --seed N              Reproduce a prior run
@@ -70,7 +70,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/test-backup-bareos-$$"
+TEST_DIR="/tmp/test-app-bareos-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 ISCSI_PORT=""
 HTTP_PORT=""

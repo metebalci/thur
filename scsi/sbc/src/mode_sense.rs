@@ -194,7 +194,7 @@ fn build_pages(page_code: u8, subpage_code: u8, pc: PageControl) -> Result<Vec<u
 /// Without WCE=1 the Linux block layer (and any other compliant
 /// initiator) elides the SYNCHRONIZE CACHE on `sync(1)` / `umount`
 /// — bytes go to cache, host proceeds, daemon dies, data lost.
-/// Bug surfaced via `vsa/scripts/test-iscsi-fs-workflow.sh`: tar xf 28
+/// Bug surfaced via `vsa/scripts/test-fs-iscsi.sh`: tar xf 28
 /// files, umount, restart daemon, mount → only `lost+found`. With
 /// WCE=1, umount issues SYNCHRONIZE CACHE 16 (LBA 0, NUM 0 = whole
 /// medium); thurvsa's `cache.synchronize_bytes` flushes every dirty

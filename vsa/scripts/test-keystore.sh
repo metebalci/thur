@@ -6,7 +6,7 @@
 #
 # thurvsa keystore round-trip test (per-backend integration)
 #
-# Same shape as test-iscsi-fs-storage.sh, but the moving part is the keystore
+# Same shape as test-fs-iscsi-storage.sh, but the moving part is the keystore
 # backend instead of the storage backend. Pick a keystore entry by name
 # and the script exercises:
 #
@@ -20,7 +20,7 @@
 #      verifies the migrated volume re-opens cleanly.
 #
 # No iSCSI, no mkfs, no fixture: that's already covered by
-# test-iscsi-fs-storage.sh / test-pipeline-layers.sh row 3. This script is
+# test-fs-iscsi-storage.sh / test-pipeline-layers.sh row 3. This script is
 # narrowly the wrap/unwrap exercise so the per-backend run is fast
 # and credential-light.
 #
@@ -67,7 +67,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Auto-load maintainer-private storage credentials if the file exists.
-# Same convention as test-iscsi-fs-storage.sh: anything KEY=VAL in thur.env
+# Same convention as test-fs-iscsi-storage.sh: anything KEY=VAL in thur.env
 # becomes exported for the daemon (which inherits our env). Skipped
 # on packaged installs — operators put creds in /etc/thurvsa/thurvsa.env
 # there, picked up by the systemd unit.

@@ -6,7 +6,7 @@
 #
 # thurvsa End-to-End Filesystem Workflow Test (NVMe/TCP)
 #
-# NVMe/TCP twin of test-iscsi-fs-workflow.sh — same three-phase persistence
+# NVMe/TCP twin of test-fs-iscsi.sh — same three-phase persistence
 # proof, same Linux-filesystem workload, but driven through Linux
 # `nvme-cli` + `nvme_tcp` kernel module instead of `open-iscsi`. Proves
 # thurvsa behaves like an ordinary NVMe namespace under a real
@@ -55,7 +55,7 @@
 #   - Root/sudo access (nvme connect + raw /dev/nvmeXn1 access require root)
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-nvme-fs-workflow.sh [OPTIONS]
+#   ./vsa/scripts/test-fs-nvmetcp.sh [OPTIONS]
 #
 # The script self-elevates via sudo (NOPASSWD sudoers entry required).
 #
@@ -80,7 +80,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/thurvsa-test-nvme-fs-workflow-$$"
+TEST_DIR="/tmp/thurvsa-test-fs-nvmetcp-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 NVMETCP_PORT=""
 HTTP_PORT=""
@@ -423,7 +423,7 @@ phase_a_format_mount_extract() {
     log_info "[Phase A] umounted cleanly"
 
     # Async-upload health gate — same shape as the iSCSI workflow.
-    # See vsa/scripts/test-iscsi-fs-workflow.sh phase_a for rationale.
+    # See vsa/scripts/test-fs-iscsi.sh phase_a for rationale.
     if grep -qE "backend '[^']+' unknown" "${TEST_DIR}/daemon.log"; then
         log_error "[Phase A] upload-worker logged 'backend unknown' — async upload path is dropping PUTs"
         grep -E "backend '[^']+' unknown" "${TEST_DIR}/daemon.log" | head -5 | sed 's/^/    /'

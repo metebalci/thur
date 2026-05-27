@@ -11,7 +11,7 @@
 # postgres tests miss: mixed-I/O OS workload, boot-time fs mounts,
 # systemd journal writes under realistic block alignments,
 # package-extraction patterns. The VSA counterpart to
-# vtl/scripts/test-backup-bareos.sh in the "realistic block consumer"
+# vtl/scripts/test-app-bareos.sh in the "realistic block consumer"
 # lane: postgres covers DB workloads, this covers OS-as-workload.
 #
 # Workflow:
@@ -65,7 +65,7 @@
 #   - Root/sudo access (self-elevates via NOPASSWD sudoers)
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-fs-vm.sh [OPTIONS]
+#   ./vsa/scripts/test-app-vm.sh [OPTIONS]
 #
 # Options:
 #   --seed N              Reproduce a prior run
@@ -98,7 +98,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/test-fs-vm-$$"
+TEST_DIR="/tmp/test-app-vm-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TRANSPORT="iscsi"
 ISCSI_PORT=""

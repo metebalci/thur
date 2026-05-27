@@ -31,10 +31,10 @@
 #
 # Why ext4 + tar and not raw `dd` to /dev/sdX: ext4 mirrors the
 # production workload and is the same pattern
-# `test-iscsi-fs-workflow.sh` uses to assert the daemon's reads
+# `test-fs-iscsi.sh` uses to assert the daemon's reads
 # round-trip through ordinary host I/O. The raw-IO multi-sector
 # round-trip path is covered separately by
-# `test-sbc-multi-sector-rw.sh` (sg_dd bs=4096 bpt=1024 → 4 MiB
+# `test-iscsi-multi-pdu-readin.sh` (sg_dd bs=4096 bpt=1024 → 4 MiB
 # READ-16 commands, exercising the iSCSI transport's Data-In
 # chunking against the initiator's MaxRecvDataSegmentLength).
 #
@@ -155,7 +155,7 @@ EOFCONFIG
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
 
     # Generate a ~4 MiB tree of mixed text + random bytes (mirrors
-    # `test-iscsi-fs-workflow.sh`'s fixture so the data exercised by
+    # `test-fs-iscsi.sh`'s fixture so the data exercised by
     # the workload looks like real backup content).
     for i in $(seq 1 8); do
         dd if=/dev/urandom of="${FIXTURE_DIR}/blob-$i.bin" bs=512K count=1 status=none

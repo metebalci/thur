@@ -23,7 +23,7 @@
 #     expected on-bucket layout
 #
 # Usage (invoke from repo root):
-#   ./vtl/scripts/test-cartridge-migrate.sh [OPTIONS]
+#   ./vtl/scripts/test-lifecycle-cartridge-migrate.sh [OPTIONS]
 #
 # Options:
 #   --release             Use ./target/release/ binaries (default debug)
@@ -40,7 +40,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/test-cartridge-migrate-$$"
+TEST_DIR="/tmp/test-lifecycle-cartridge-migrate-$$"
 KEEP_DATA=0
 DAEMON_PID=""
 HTTP_PORT=""

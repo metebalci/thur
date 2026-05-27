@@ -4,16 +4,23 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VSA SBC Multi-Sector Raw Read/Write Test
+# Thur VSA iSCSI Multi-PDU Data-In Test
 #
-# Reproduces the open ROADMAP.md FIXES entry: a single iSCSI Data-In
-# PDU larger than the initiator-declared MaxRecvDataSegmentLength
-# tears the connection. The Linux iSCSI initiator drops the link on
+# Regression guard for the iSCSI Data-In chunking path. A single
+# Data-In PDU larger than the initiator-declared MaxRecvDataSegmentLength
+# violates RFC 7143 §11.7; the Linux iSCSI initiator drops the link on
 # the spec violation, retries, drops again — sg_read sees mass short
-# transfers and the kernel logs EPIPE storms. Root cause: the iSCSI
-# transport used to emit one Data-In PDU per SCSI READ regardless of
-# size; the fix chunks the response at the peer's MRDSL, stamping
-# DataSN / BufferOffset / F-bit / S-bit per RFC 7143 §11.7.
+# transfers and the kernel logs EPIPE storms. This script issues a
+# single SCSI READ-16 large enough to force the daemon onto the
+# multi-PDU path (each PDU carrying sequential DataSN / monotonic
+# BufferOffset / F-bit | S-bit only on the final PDU); a control
+# sub-test repeats at bpt=1 so a green control + red multi-sector
+# unambiguously fingers the chunking code.
+#
+# Filesystem-level harnesses (monte-carlo, fs-iscsi) don't exercise
+# this — the kernel block layer splits filesystem I/O into ≤max_sectors_kb
+# SCSI commands well below MRDSL. Only a raw sg_dd READ-16 with a
+# large bpt triggers the multi-PDU response shape.
 #
 # Workflow:
 #   1. Create a fresh volume.
@@ -55,7 +62,7 @@
 #   - Root / sudo NOPASSWD
 #
 # Usage (invoke from repo root; self-elevates via sudo):
-#   ./vsa/scripts/test-sbc-multi-sector-rw.sh [--release] [--keep-data]
+#   ./vsa/scripts/test-iscsi-multi-pdu-readin.sh [--release] [--keep-data]
 #
 
 if [[ $EUID -ne 0 ]]; then
@@ -69,7 +76,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
 BUILD_PROFILE="debug"
-TEST_DIR="/tmp/thurvsa-test-sbc-multi-sector-rw-$$"
+TEST_DIR="/tmp/thurvsa-test-iscsi-multi-pdu-readin-$$"
 KEEP_DATA=0
 DAEMON_PATH=""
 CLI_PATH=""

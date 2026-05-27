@@ -77,7 +77,7 @@
 #   - Root/sudo access
 #
 # Usage (invoke from repo root):
-#   ./vsa/scripts/test-iscsi-fs-workflow.sh [OPTIONS]
+#   ./vsa/scripts/test-fs-iscsi.sh [OPTIONS]
 #
 # The script self-elevates via sudo (NOPASSWD sudoers entry required);
 # no need to prefix with sudo yourself.
@@ -103,7 +103,7 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
-TEST_DIR="/tmp/thurvsa-test-iscsi-fs-workflow-$$"
+TEST_DIR="/tmp/thurvsa-test-fs-iscsi-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 ISCSI_PORT=""
 HTTP_PORT=""

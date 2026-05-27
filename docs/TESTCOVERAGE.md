@@ -165,7 +165,7 @@ The three SDK-bound files we couldn't reach via `wiremock` —
 trait-seam boundary. Each backend struct holds an
 `Arc<dyn *Api>` (`GcsApi` / `GcpKmsApi` / `AzureKvApi`); the only
 SDK-touching code lives in sibling `*_api.rs` files exercised by
-`vsa/scripts/test-iscsi-fs-storage.sh` (GCS) and
+`vsa/scripts/test-fs-iscsi-storage.sh` (GCS) and
 `vsa/scripts/test-keystore.sh` (KMS / KV). The three target files
 sit at 93-95% per-file; the SDK adapter siblings sit at 36-66%
 without dragging either crate below its 80% floor.
@@ -187,7 +187,7 @@ full backup / filesystem round-trip.
 | Script | Covers |
 |---|---|
 | `test-smoke.sh` | basic end-to-end bring-up |
-| `test-iscsi-conformance.sh` | iSCSI login / CHAP / transport conformance |
+| `test-proto-iscsi.sh` | iSCSI login / CHAP / transport conformance |
 | `test-scsi-conformance.sh` | SMC-3 + SSC-4 SCSI command conformance |
 | `test-backup-workflow.sh` | end-to-end backup + restore (local backend) |
 | `test-backup-storage.sh` | end-to-end backup + restore (real storage backend) |
@@ -195,9 +195,9 @@ full backup / filesystem round-trip.
 | `test-backup-storage-resume.sh` | boot-time orphan-upload recovery |
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-chunk-seal.sh` | kill -9 mid tape stream → restart → acked blocks survive |
-| `test-many-cartridge-lifecycle.sh` | soak: create/list/stats N cartridges (THURVTL_SOAK=1) |
-| `test-cartridge-migrate.sh` | cartridge migrate + archive between backends |
-| `test-dr-restore.sh` | cross-region disaster-recovery restore |
+| `test-lifecycle-many-cartridges.sh` | soak: create/list/stats N cartridges (THURVTL_SOAK=1) |
+| `test-lifecycle-cartridge-migrate.sh` | cartridge migrate + archive between backends |
+| `test-lifecycle-dr-restore.sh` | cross-region disaster-recovery restore |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
 
 ### Thur VSA — `vsa/scripts/`
@@ -205,20 +205,20 @@ full backup / filesystem round-trip.
 | Script | Covers |
 |---|---|
 | `test-smoke.sh` | basic end-to-end bring-up |
-| `test-iscsi-conformance.sh` | iSCSI login / CHAP / transport conformance |
+| `test-proto-iscsi.sh` | iSCSI login / CHAP / transport conformance |
 | `test-scsi-conformance.sh` | SBC-3 SCSI command conformance |
-| `test-nvmetcp-conformance.sh` | NVMe/TCP transport + NVM Command Set conformance |
-| `test-iscsi-fs-workflow.sh` | filesystem round-trip over iSCSI (local backend) |
-| `test-iscsi-fs-storage.sh` | filesystem round-trip over iSCSI (real storage backend) |
-| `test-nvme-fs-workflow.sh` | filesystem round-trip over NVMe/TCP (local backend) |
-| `test-nvme-fs-storage.sh` | filesystem round-trip over NVMe/TCP (real storage backend) |
+| `test-proto-nvmetcp.sh` | NVMe/TCP transport + NVM Command Set conformance |
+| `test-fs-iscsi.sh` | filesystem round-trip over iSCSI (local backend) |
+| `test-fs-iscsi-storage.sh` | filesystem round-trip over iSCSI (real storage backend) |
+| `test-fs-nvmetcp.sh` | filesystem round-trip over NVMe/TCP (local backend) |
+| `test-fs-nvmetcp-storage.sh` | filesystem round-trip over NVMe/TCP (real storage backend) |
 | `test-fs-storage-failures.sh` | backend failure-path handling |
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-page-flush.sh` | kill -9 after host fsync → restart → every byte survives |
-| `test-iscsi-multi-initiator.sh` | two initiators + PR matrix, RESERVATION CONFLICT sense |
+| `test-multi-initiator.sh` | two initiators + PR matrix, RESERVATION CONFLICT sense |
 | `test-multi-volume-dedup.sh` | soak: create/list/stats/gc N volumes (THURVSA_SOAK=1) |
 | `test-keystore.sh` | DEK keystore wrap / unwrap / migrate per backend |
-| `test-kmip-pykmip.sh` | `kmip` keystore backend against a local PyKMIP server |
+| `test-keystore-kmip.sh` | `kmip` keystore backend against a local PyKMIP server |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
 
 ## In-process self-test
