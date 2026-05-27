@@ -162,7 +162,7 @@ cleanup() {
     fi
 
     if [[ $NVME_CONNECTED -eq 1 && $KEEP_NVME -eq 0 ]]; then
-        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+        nvme_tcp_disconnect
     fi
 
     stop_thur_daemon
@@ -408,57 +408,11 @@ ensure_volume() {
 }
 
 connect_nvme() {
-    log_info "Connecting via nvme-cli..."
-    if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
-        -n "$SUBNQN" --hostnqn "$HOST_NQN" \
-        > "$TEST_DIR/nvme-connect.log" 2>&1; then
-        log_error "nvme connect failed"
-        cat "$TEST_DIR/nvme-connect.log"
-        return 1
-    fi
-    NVME_CONNECTED=1
-    NVME_DEVICE=$(nvme list-subsys -o json 2>/dev/null | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-target = '$SUBNQN'
-def walk(d):
-    if isinstance(d, dict):
-        if d.get('NQN') == target:
-            for p in d.get('Paths', []):
-                if 'Name' in p:
-                    return p['Name']
-        for v in d.values():
-            r = walk(v)
-            if r:
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = walk(v)
-            if r:
-                return r
-    return None
-name = walk(data)
-print(name or '')
-" 2>/dev/null)
-    if [[ -z "$NVME_DEVICE" ]]; then
-        NVME_DEVICE=$(ls -1 /dev/nvme*n1 2>/dev/null \
-            | sort -V | tail -1 | xargs -n1 basename | sed 's/n1$//')
-    fi
-    if [[ -z "$NVME_DEVICE" ]]; then
-        log_error "Could not locate the connected NVMe controller"
-        return 1
-    fi
-    local block="/dev/${NVME_DEVICE}n1"
-    [[ -b "$block" ]] || { log_error "$block is not a block device"; return 1; }
-    log_info "thurvsa namespace -> $block"
+    nvme_tcp_connect
 }
 
 disconnect_nvme() {
-    if [[ $NVME_CONNECTED -eq 1 ]]; then
-        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
-        NVME_CONNECTED=0
-        sleep 1
-    fi
+    nvme_tcp_disconnect
 }
 
 generate_fixture() {

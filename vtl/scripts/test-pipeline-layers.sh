@@ -200,9 +200,7 @@ row_dir_setup() {
 row_dir_cleanup() {
     stop_thur_daemon
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
-        ISCSI_CONNECTED=0
+        iscsi_logout_and_delete
     fi
     if [[ $KEEP_STORAGE -eq 0 ]]; then
         storage_purge_test_prefix

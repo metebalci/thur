@@ -89,8 +89,7 @@ parse_common_daemon_args "$@"
 
 cleanup() {
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -144,10 +143,7 @@ start_daemon() {
 }
 
 login_iscsi() {
-    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null
-    ISCSI_CONNECTED=1
-    sleep 3
+    iscsi_discover_and_login
     local row
     row=$(lsscsi -g | awk '/THUR VSA/ {print; exit}')
     [[ -n "$row" ]] || { log_error "No THUR VSA device found"; lsscsi -g; return 1; }

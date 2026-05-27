@@ -184,11 +184,10 @@ cleanup() {
     fi
 
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     if [[ $NVME_CONNECTED -eq 1 ]]; then
-        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+        nvme_tcp_disconnect
     fi
 
     stop_thur_daemon
@@ -445,60 +444,19 @@ _iscsi_login() {
 }
 
 _iscsi_logout() {
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete >/dev/null 2>&1 || true
-    ISCSI_CONNECTED=0
+    iscsi_logout_and_delete
     RW_SG_DEVICE=""
 }
 
 # Bring NVMe/TCP session up + resolve /dev/nvmeXn1. Idempotent.
 _nvme_login() {
-    if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
-            -n "$SUBNQN" --hostnqn "$HOST_NQN" \
-            > "$TEST_DIR/nvme-connect.log" 2>&1; then
-        log_error "nvme connect failed"
-        cat "$TEST_DIR/nvme-connect.log"
-        return 1
-    fi
-    NVME_CONNECTED=1
-    NVME_DEVICE=$(nvme list-subsys -o json 2>/dev/null | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-target = '$SUBNQN'
-def walk(d):
-    if isinstance(d, dict):
-        if d.get('NQN') == target:
-            for p in d.get('Paths', []):
-                if 'Name' in p:
-                    return p['Name']
-        for v in d.values():
-            r = walk(v)
-            if r:
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = walk(v)
-            if r:
-                return r
-    return None
-name = walk(data)
-print(name or '')
-" 2>/dev/null)
-    if [[ -z "$NVME_DEVICE" ]]; then
-        NVME_DEVICE=$(ls -1 /dev/nvme*n1 2>/dev/null \
-            | sort -V | tail -1 | xargs -n1 basename | sed 's/n1$//')
-    fi
-    [[ -n "$NVME_DEVICE" ]] || { log_error "could not locate the connected NVMe controller"; return 1; }
+    nvme_tcp_connect || return 1
     RW_DEVICE="/dev/${NVME_DEVICE}n1"
-    [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; return 1; }
 }
 
 _nvme_logout() {
-    nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
-    NVME_CONNECTED=0
+    nvme_tcp_disconnect
     NVME_DEVICE=""
-    # Give the kernel a moment to tear down /dev/nvmeXn1.
-    sleep 1
 }
 
 # Transport-agnostic wrappers. Idempotent.

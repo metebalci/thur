@@ -130,8 +130,7 @@ cleanup() {
         podman rm -f "$BAREOS_CONTAINER" >/dev/null 2>&1 || true
     fi
     if [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then

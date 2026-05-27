@@ -83,8 +83,7 @@ cleanup() {
 
     if [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]]; then
         log_info "Disconnecting iSCSI session..."
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
 
     stop_thur_daemon
@@ -226,11 +225,7 @@ start_daemon() {
 }
 
 connect_iscsi() {
-    log_info "Connecting to iSCSI target..."
-    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null
-    ISCSI_CONNECTED=1
-    sleep 3  # let kernel settle and create /dev/stN nodes
+    iscsi_discover_and_login
 
     CHANGER_DEVICE=$(lsscsi -g | awk '/mediumx/{print $NF}' | head -1)
     [[ -n "$CHANGER_DEVICE" ]] || { log_error "Changer device not found"; lsscsi -g; exit 1; }

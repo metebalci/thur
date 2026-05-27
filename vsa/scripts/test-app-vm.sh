@@ -194,11 +194,10 @@ cleanup() {
         LOOP_DEVICE=""
     fi
     if [[ $ISCSI_CONNECTED -eq 1 && $KEEP_ISCSI -eq 0 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     if [[ $NVME_CONNECTED -eq 1 && $KEEP_NVME -eq 0 ]]; then
-        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+        nvme_tcp_disconnect
     fi
     stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
@@ -437,19 +436,8 @@ connect_iscsi() {
 }
 
 connect_nvme() {
-    if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
-            -n "$SUBNQN" --hostnqn "$HOST_NQN" \
-            > "$TEST_DIR/nvme-connect.log" 2>&1; then
-        log_error "nvme connect failed"
-        cat "$TEST_DIR/nvme-connect.log"
-        exit 1
-    fi
-    NVME_CONNECTED=1
-    sleep 1
-    NVME_DEVICE=$(ls -1 /dev/nvme*n1 2>/dev/null | sort -V | tail -1 | xargs -n1 basename | sed 's/n1$//')
-    [[ -n "$NVME_DEVICE" ]] || { log_error "could not locate the connected NVMe controller"; exit 1; }
+    nvme_tcp_connect || exit 1
     RW_DEVICE="/dev/${NVME_DEVICE}n1"
-    [[ -b "$RW_DEVICE" ]] || { log_error "$RW_DEVICE is not a block device"; exit 1; }
     log_info "thurvsa namespace -> $RW_DEVICE"
 }
 

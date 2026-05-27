@@ -302,6 +302,104 @@ storage:
 EOFY
 }
 
+# -----------------------------------------------------------------------
+# Transport login/logout helpers — the discover-and-login (iSCSI) and
+# connect-and-locate-namespace (NVMe/TCP) flows are nearly identical
+# across every test that exercises the data path. The device-find
+# step (lsscsi → /dev/sdN, sg passthrough lookup) varies per script
+# and stays in the caller.
+# -----------------------------------------------------------------------
+
+# Discover and log in to the iSCSI target running at $ISCSI_PORT on
+# 127.0.0.1 with IQN $TARGET_IQN. Sets ISCSI_CONNECTED=1 and sleeps 3
+# to let the kernel publish /dev/sdN nodes; the caller then picks the
+# specific device out of `lsscsi`.
+iscsi_discover_and_login() {
+    log_info "Connecting to iSCSI target..."
+    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null
+    ISCSI_CONNECTED=1
+    sleep 3
+}
+
+# Log out and delete the iSCSI node for $TARGET_IQN @ $ISCSI_PORT.
+# Idempotent — safe to call from a cleanup trap whether or not login
+# succeeded.
+iscsi_logout_and_delete() {
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete  >/dev/null 2>&1 || true
+    ISCSI_CONNECTED=0
+}
+
+# Connect to the NVMe/TCP subsystem on 127.0.0.1:$NVMETCP_PORT,
+# locate the controller name via `nvme list-subsys -o json` (with a
+# /dev/nvme*n1 fallback for older nvme-cli builds), and set
+# NVME_DEVICE (e.g. "nvme0") + NVME_CONNECTED=1. The caller's
+# namespace device path is then "/dev/${NVME_DEVICE}n1".
+#
+# Reads:  $NVMETCP_PORT, $SUBNQN, $HOST_NQN, $TEST_DIR
+# Writes: $NVME_DEVICE, $NVME_CONNECTED
+nvme_tcp_connect() {
+    log_info "Connecting via nvme-cli..."
+    if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
+        -n "$SUBNQN" --hostnqn "$HOST_NQN" \
+        > "$TEST_DIR/nvme-connect.log" 2>&1; then
+        log_error "nvme connect failed"
+        cat "$TEST_DIR/nvme-connect.log"
+        return 1
+    fi
+    NVME_CONNECTED=1
+    # `nvme list-subsys` json shape varies across distros — walk both
+    # the old (Subsystems→Paths) and new (top-level Paths) layouts.
+    NVME_DEVICE=$(nvme list-subsys -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+target = '$SUBNQN'
+def walk(d):
+    if isinstance(d, dict):
+        if d.get('NQN') == target:
+            for p in d.get('Paths', []):
+                if 'Name' in p:
+                    return p['Name']
+        for v in d.values():
+            r = walk(v)
+            if r:
+                return r
+    elif isinstance(d, list):
+        for v in d:
+            r = walk(v)
+            if r:
+                return r
+    return None
+name = walk(data)
+print(name or '')
+" 2>/dev/null)
+    if [[ -z "$NVME_DEVICE" ]]; then
+        # Fallback: pick the newest /dev/nvme*n1 — the one we just
+        # created should be the highest-numbered.
+        NVME_DEVICE=$(ls -1 /dev/nvme*n1 2>/dev/null \
+            | sort -V | tail -1 | xargs -n1 basename | sed 's/n1$//')
+    fi
+    if [[ -z "$NVME_DEVICE" ]]; then
+        log_error "Could not locate the connected NVMe controller"
+        return 1
+    fi
+    local block="/dev/${NVME_DEVICE}n1"
+    [[ -b "$block" ]] || { log_error "$block is not a block device"; return 1; }
+    log_info "thurvsa namespace -> $block"
+}
+
+# Disconnect from the NVMe/TCP subsystem $SUBNQN. Idempotent — safe
+# from a cleanup trap whether or not nvme_tcp_connect ran.
+nvme_tcp_disconnect() {
+    if [[ "${NVME_CONNECTED:-0}" -eq 1 ]]; then
+        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+        NVME_CONNECTED=0
+        # Give the kernel a moment to tear down /dev/nvmeXn1.
+        sleep 1
+    fi
+}
+
 # Poll a log file for an extended regex match until it appears or the
 # timeout elapses. Returns 0 if matched, 1 on timeout. Both args
 # required; useful for the storage-failure tests that assert specific

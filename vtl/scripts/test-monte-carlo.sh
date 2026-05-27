@@ -149,8 +149,7 @@ cleanup() {
     local rc=$?
     log_info "Cleaning up..."
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     stop_thur_daemon
     if [[ -n "$BACKEND_NAME" && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then
@@ -375,10 +374,8 @@ iscsi_login() {
 
 iscsi_logout() {
     if [[ $ISCSI_UP -eq 0 ]]; then return 0; fi
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete >/dev/null 2>&1 || true
+    iscsi_logout_and_delete
     ISCSI_UP=0
-    ISCSI_CONNECTED=0
     CHANGER_DEVICE=""
     TAPE_DEVICE=""
     NOREWIND_DEVICE=""

@@ -57,8 +57,7 @@ parse_common_daemon_args "$@"
 
 cleanup() {
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
+        iscsi_logout_and_delete
     fi
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
         kill -KILL "$DAEMON_PID" 2>/dev/null || true
@@ -135,10 +134,7 @@ kill_daemon_hard() {
 }
 
 login_iscsi() {
-    iscsiadm -m discovery -t sendtargets -p "127.0.0.1:$ISCSI_PORT" >/dev/null
-    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --login >/dev/null
-    ISCSI_CONNECTED=1
-    sleep 3
+    iscsi_discover_and_login
     CHANGER_DEVICE=$(lsscsi -g | awk '/mediumx/{print $NF}' | head -1)
     [[ -n "$CHANGER_DEVICE" ]] || { log_error "No changer device"; lsscsi -g; return 1; }
     local tape_dev
@@ -153,9 +149,7 @@ login_iscsi() {
 
 logout_iscsi() {
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout >/dev/null 2>&1 || true
-        iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete >/dev/null 2>&1 || true
-        ISCSI_CONNECTED=0
+        iscsi_logout_and_delete
         sleep 1
     fi
 }
