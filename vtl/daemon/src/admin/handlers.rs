@@ -564,21 +564,28 @@ fn audit_append(
     }
 }
 
-/// Broadcast a Unit Attention to every active iSCSI session on
-/// every drive LUN. Mirrors the iSCSI MOVE MEDIUM path so admin
-/// moves don't leave host sessions with a stale view of the
-/// inventory. Best-effort — UA queue mutex poisoned just gets
-/// logged, not propagated.
-fn broadcast_inventory_changed(state: &DaemonState) {
+/// Queue MEDIUM MAY HAVE CHANGED on the drive LUNs whose cartridge
+/// just changed. Mirrors the iSCSI MOVE MEDIUM path. Empty slice =
+/// no drive's cartridge changed (slot-to-slot move) so nothing is
+/// queued. Broadcasting across every drive LUN would preempt the
+/// host's next command on unrelated drives, and a host that ignores
+/// the resulting CHECK CONDITION (e.g. `mt rewind 2>/dev/null`)
+/// would never reset the daemon-side head position — surfaces as
+/// issue #37 (stale filemark in the block index between writes).
+/// Best-effort: UA queue mutex poisoned just gets logged.
+fn raise_medium_may_have_changed(state: &DaemonState, drive_ids: &[u32]) {
+    if drive_ids.is_empty() {
+        return;
+    }
     let ua = match state.ua_tracker.lock() {
         Ok(g) => g,
         Err(_) => {
-            warn!("UA tracker mutex poisoned, skipping inventory-changed broadcast");
+            warn!("UA tracker mutex poisoned, skipping medium-may-have-changed broadcast");
             return;
         }
     };
-    let drive_count = state.element_config.data_transfer_count as u8;
-    for drive_lun in 1..=drive_count {
+    for drive_id in drive_ids {
+        let drive_lun = (*drive_id as u8) + 1;
         ua.add_ua_all_sessions(drive_lun, UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED);
     }
 }
@@ -631,7 +638,8 @@ pub async fn changer_move(
 
     match result {
         Ok(barcode) => {
-            broadcast_inventory_changed(&state.daemon);
+            // Slot-to-slot move; no drive's cartridge changed.
+            raise_medium_may_have_changed(&state.daemon, &[]);
             audit_append(
                 &state.daemon,
                 "changer.move",
@@ -736,7 +744,8 @@ pub async fn changer_load(
                     drive_num: req.drive as u8,
                 });
             }
-            broadcast_inventory_changed(&state.daemon);
+            // Only the destination drive's cartridge changed.
+            raise_medium_may_have_changed(&state.daemon, &[req.drive]);
             audit_append(
                 &state.daemon,
                 "changer.load",
@@ -912,7 +921,8 @@ pub async fn changer_unload(
                     drive_num: req.drive as u8,
                 });
             }
-            broadcast_inventory_changed(&state.daemon);
+            // Only the source drive's cartridge changed.
+            raise_medium_may_have_changed(&state.daemon, &[req.drive]);
             audit_append(
                 &state.daemon,
                 "changer.unload",

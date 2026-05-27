@@ -304,6 +304,47 @@ fn test_read_beyond_eod() {
 }
 
 #[test]
+fn test_rewrite_after_space_truncates_trailing_filemark() {
+    // The monte-carlo harness's seek_eod pattern: rewind, space N
+    // records to land on the trailing filemark left by the kernel's
+    // auto-FM-on-close, then write again. truncate_from_head must
+    // drop that filemark so the next write lands at the harness-
+    // visible LBA, not past the orphan FM. Asserting this at the
+    // cartridge layer pins the truncate contract that issue #37
+    // ultimately relied on; the higher-layer SCSI fix lives in
+    // scsi-smc and is covered by its own dispatch tests.
+    let dir = create_test_dir();
+    let mut cart = create_test_cartridge(&dir, "MC02L8");
+
+    let small = vec![0xAA_u8; 347_200];
+    for i in 0..7u64 {
+        cart.rewind();
+        cart.space_records(i as i64);
+        cart.write_data(Bytes::from(small.clone())).unwrap();
+        cart.write_filemark().unwrap();
+    }
+    assert_eq!(cart.next_lba(), 8);
+
+    cart.rewind();
+    cart.space_records(7);
+    assert_eq!(cart.position(), 7);
+    let big = vec![0xBB_u8; 4_194_304];
+    cart.write_data(Bytes::from(big.clone())).unwrap();
+    cart.write_filemark().unwrap();
+
+    assert_eq!(cart.next_lba(), 9);
+    cart.rewind();
+    for i in 0..8u64 {
+        let blk = cart.read_next().unwrap();
+        assert_eq!(blk.kind, BlockKind::Data, "LBA {} should be Data", i);
+        let expected_len = if i < 7 { small.len() } else { big.len() };
+        assert_eq!(blk.data.len(), expected_len, "LBA {} length", i);
+    }
+    let trailing = cart.read_next().unwrap();
+    assert_eq!(trailing.kind, BlockKind::Filemark);
+}
+
+#[test]
 fn test_create_test_helper_binds_to_primary_backend() {
     // The shared test helper creates cartridges bound to the
     // "primary" backend; downstream tests that don't care about

@@ -223,7 +223,12 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
   is exactly the behavior backup software depends on: after a
   MOVE/EXCHANGE MEDIUM it expects `0x06/0x28/0x00` (MEDIUM MAY HAVE
   CHANGED) and uses it as the cue to re-read inquiry data and element
-  status.
+  status. MEDIUM MAY HAVE CHANGED is queued only on the drive LUN(s)
+  whose cartridge actually changed (source drive on unload,
+  destination drive on load) — never on uninvolved drives, since the
+  UA preempts the host's next command on that LUN and a host that
+  ignores the resulting CHECK CONDITION would never reset the
+  daemon-side head position.
 - **Error → sense mapping.** When a handler returns a `Thur VTLError`,
   it is routed through `error_to_sense`. The point is to give the host
   a sense code that actually describes what went wrong — WORM,

@@ -340,18 +340,43 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
                 }
             }
 
-            // Generate Unit Attention for affected drives (conservative).
+            // MEDIUM MAY HAVE CHANGED is delivered only to the drive
+            // LUN(s) whose cartridge actually changed: the source
+            // drive on an unload, the destination drive on a load.
+            // Earlier code broadcast the UA across every drive LUN,
+            // which preempted unrelated drives' next command — when
+            // the host's positioning sequence (e.g. `mt rewind 2>&1`)
+            // ignored that CHECK CONDITION, the drive's daemon-side
+            // head_lba never got reset, and a follow-up SPACE BLOCKS
+            // landed at the wrong LBA, leaving stale filemarks in
+            // the block index (issue #37).
             let ua = ua_tracker
                 .lock()
                 .map_err(|_| anyhow!("UA tracker mutex poisoned"))?;
-            for drive_lun in 1..=element_config.data_transfer_count as u8 {
+            let mut affected_drives: Vec<u32> = Vec::new();
+            if matches!(source_type, Some(changer::ElementType::DataTransfer))
+                && let Some(id) = element_config.address_to_drive_id(source_address)
+            {
+                affected_drives.push(id);
+            }
+            if matches!(dest_type, Some(changer::ElementType::DataTransfer))
+                && let Some(id) = element_config.address_to_drive_id(destination_address)
+                && !affected_drives.contains(&id)
+            {
+                affected_drives.push(id);
+            }
+            for drive_id in &affected_drives {
+                let drive_lun = (*drive_id as u8) + 1;
                 ua.add_ua(
                     tsih,
                     drive_lun,
                     unit_attention::UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED,
                 );
             }
-            tracing::info!("MOVE MEDIUM completed, generated UA for drives");
+            tracing::info!(
+                "MOVE MEDIUM completed, generated UA for drives {:?}",
+                affected_drives
+            );
             audit_append(
                 audit_log,
                 audit_ratelimiter,
@@ -428,6 +453,9 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let second_dest_address = u16::from_be_bytes([cdb[8], cdb[9]]);
     let invert1 = (cdb[10] & 0x01) != 0;
     let invert2 = (cdb[10] & 0x02) != 0;
+    let source_type = element_config.element_type_from_address(source_address);
+    let first_dest_type = element_config.element_type_from_address(first_dest_address);
+    let second_dest_type = element_config.element_type_from_address(second_dest_address);
 
     tracing::info!(
         "EXCHANGE MEDIUM: transport={}, src={}, dst1={}, dst2={}",
@@ -506,10 +534,29 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         tracing::warn!("EXCHANGE MEDIUM step 2 (src->dst1): {}", e);
         return Ok(ScsiResp::check_condition());
     }
+    // EXCHANGE MEDIUM moves three cartridges across three elements;
+    // raise MEDIUM MAY HAVE CHANGED only on the drive LUN(s) that
+    // participated in the swap. Broadcasting across every drive LUN
+    // races the host's positioning sequence on unrelated drives (see
+    // handle_move_medium for the full rationale + issue #37).
     let ua = ua_tracker
         .lock()
         .map_err(|_| anyhow!("UA tracker mutex poisoned"))?;
-    for drive_lun in 1..=element_config.data_transfer_count as u8 {
+    let mut affected_drives: Vec<u32> = Vec::new();
+    for (addr, kind) in [
+        (source_address, source_type),
+        (first_dest_address, first_dest_type),
+        (second_dest_address, second_dest_type),
+    ] {
+        if matches!(kind, Some(changer::ElementType::DataTransfer))
+            && let Some(id) = element_config.address_to_drive_id(addr)
+            && !affected_drives.contains(&id)
+        {
+            affected_drives.push(id);
+        }
+    }
+    for drive_id in &affected_drives {
+        let drive_lun = (*drive_id as u8) + 1;
         ua.add_ua(
             tsih,
             drive_lun,

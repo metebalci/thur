@@ -19,7 +19,7 @@ use scsi_ssc::diagnostics::DiagnosticStore;
 use scsi_ssc::dispatch::{Pdu, ScsiCtx, ScsiResp, ScsiStatus};
 use scsi_ssc::drive_manager::DriveManager;
 use shared_audit::AuditRateLimiter;
-use shared_iscsi::unit_attention::UnitAttentionTracker;
+use shared_iscsi::unit_attention::{UnitAttentionCode, UnitAttentionTracker};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
@@ -294,6 +294,86 @@ fn exchange_medium_with_empty_slots_is_refused() {
     let mut ctx = fx.ctx(&mut pdu, c, 0);
     let resp = handlers::handle_exchange_medium(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition);
+}
+
+#[test]
+fn move_medium_raises_ua_only_on_affected_drives() {
+    // Regression for issue #37: MEDIUM MAY HAVE CHANGED must be
+    // queued only on the drive LUN(s) whose cartridge actually
+    // changed. Broadcasting across every drive LUN (the prior
+    // "conservative" behavior) preempted the host's next command
+    // on unrelated drives — when the host's positioning sequence
+    // ignored the resulting CHECK CONDITION, the daemon-side
+    // head_lba never reset and follow-up writes landed at the
+    // wrong LBA.
+    let fx = Fixture::new(8, 2, 2);
+    let slot_id = {
+        let mut lib = fx.library.lock().unwrap();
+        lib.add_or_create_tape("TAPE01", "primary").unwrap()
+    };
+    let mut c = cdb(0xA5);
+    // Load slot -> drive 0 (DRIVE_BASE).
+    c[4..6].copy_from_slice(&(STORAGE_BASE + slot_id as u16).to_be_bytes());
+    c[6..8].copy_from_slice(&DRIVE_BASE.to_be_bytes());
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx(&mut pdu, c, 0);
+    assert_eq!(
+        handlers::handle_move_medium(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    let ua = fx.ua.lock().unwrap();
+    // Drive 0 (LUN 1) is the destination — it gained a cartridge.
+    let drive_0_ua = ua.check_and_pop_ua(1, 1);
+    assert_eq!(drive_0_ua, Some(UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED));
+    // Drive 1 (LUN 2) is uninvolved — it must NOT receive the UA.
+    // The bug was that every drive LUN got the UA regardless.
+    assert!(
+        ua.check_and_pop_ua(1, 2).is_none(),
+        "uninvolved drive 1 (LUN 2) must not receive MEDIUM MAY HAVE CHANGED",
+    );
+    // The changer LUN (0) is not a drive — UA tracking only applies
+    // to drive LUNs, but check anyway that we didn't accidentally
+    // queue one.
+    assert!(ua.check_and_pop_ua(1, 0).is_none());
+}
+
+#[test]
+fn move_medium_slot_to_slot_raises_no_drive_ua() {
+    // Slot-to-slot moves don't change any drive's cartridge, so
+    // no drive LUN should receive MEDIUM MAY HAVE CHANGED.
+    let fx = Fixture::new(8, 2, 2);
+    let (a, b) = {
+        let mut lib = fx.library.lock().unwrap();
+        let a = lib.add_or_create_tape("TAPE_A", "primary").unwrap();
+        // Find an empty target slot — add_or_create_tape lands the
+        // first cart at the first free slot; pick a different free
+        // slot for the destination.
+        let b = lib
+            .storage_slots()
+            .iter()
+            .find(|s| !s.occupied)
+            .map(|s| s.id)
+            .expect("at least one free slot");
+        (a, b)
+    };
+    let mut c = cdb(0xA5);
+    c[4..6].copy_from_slice(&(STORAGE_BASE + a as u16).to_be_bytes());
+    c[6..8].copy_from_slice(&(STORAGE_BASE + b as u16).to_be_bytes());
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx(&mut pdu, c, 0);
+    assert_eq!(
+        handlers::handle_move_medium(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    let ua = fx.ua.lock().unwrap();
+    for lun in 0..=2 {
+        assert!(
+            ua.check_and_pop_ua(1, lun).is_none(),
+            "no drive's cartridge changed, LUN {lun} must not receive UA",
+        );
+    }
 }
 
 #[test]
