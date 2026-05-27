@@ -438,8 +438,6 @@ data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 $(yaml_iscsi)
-audit:
-  enabled: true
 storage:
   backends:
     testbackend: $backend_json
@@ -455,9 +453,6 @@ http:
 
 nvmetcp:
   listen: "0.0.0.0:$NVMETCP_PORT"
-
-audit:
-  enabled: true
 
 storage:
   backends:

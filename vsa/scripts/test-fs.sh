@@ -305,8 +305,6 @@ $(yaml_header)
 
 $(yaml_iscsi)
 
-audit:
-  enabled: true
 $(yaml_local_backend)
 
 EOFCONFIG
@@ -322,8 +320,6 @@ http:
 nvmetcp:
   listen: "0.0.0.0:$NVMETCP_PORT"
 
-audit:
-  enabled: true
 storage:
   backends:
     local:

@@ -220,8 +220,6 @@ http:
 nvmetcp:
   listen: "0.0.0.0:$NVMETCP_PORT"$tls_block
 
-audit:
-  enabled: true
 storage:
   backends:
     primary:

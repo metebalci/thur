@@ -82,9 +82,6 @@ $(yaml_header)
 
 $(yaml_iscsi)
 
-audit:
-  enabled: true
-
 $(yaml_local_backend)
 EOFCONFIG
 
