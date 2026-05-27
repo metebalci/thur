@@ -125,11 +125,7 @@ cleanup() {
         log_info "Disconnecting NVMe subsystem $SUBNQN"
         nvme disconnect -n "$SUBNQN" 2>/dev/null || true
     fi
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
     else

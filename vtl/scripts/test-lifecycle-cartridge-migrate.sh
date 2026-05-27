@@ -65,32 +65,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 cleanup() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    if [[ $KEEP_DATA -eq 0 ]]; then
-        rm -rf "$TEST_DIR"
-    else
-        log_info "Keeping test directory: $TEST_DIR"
-    fi
+    standard_cleanup
 }
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
     log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
-    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvtld}"
-    : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvtl}"
-    local build_cmd="cargo build --profile dev"
-    [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
-    if [[ ! -f "$DAEMON_PATH" ]]; then
-        log_error "Daemon not found at: $DAEMON_PATH ; build with: $build_cmd"
-        exit 1
-    fi
-    if [[ ! -f "$CLI_PATH" ]]; then
-        log_error "CLI not found at: $CLI_PATH ; build with: $build_cmd"
-        exit 1
-    fi
+    require_daemon_binaries thurvtl
     if ! command -v curl &> /dev/null; then
         log_error "curl not found"
         exit 1
@@ -143,25 +124,11 @@ start_daemon() {
     local config_path="$1"
     local data_dir="$2"
     export THURVTL_ADMIN_SOCKET="${data_dir}/admin.sock"
-    RUST_LOG=warn "$DAEMON_PATH" --config "$config_path" > "${data_dir}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for i in {1..30}; do
-        if curl -s "http://127.0.0.1:$HTTP_PORT/health" > /dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-    done
-    log_error "Daemon did not become ready"
-    tail -20 "${data_dir}/daemon.log" >&2
-    return 1
+    TEST_CONFIG="$config_path" DAEMON_LOG="${data_dir}/daemon.log" RUST_LOG=warn start_thur_daemon
 }
 
 stop_daemon() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-        DAEMON_PID=""
-    fi
+    stop_thur_daemon
 }
 
 # Bring a fresh data dir up: write config, init library, start daemon,

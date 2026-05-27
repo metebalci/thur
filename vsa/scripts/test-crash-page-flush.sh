@@ -90,9 +90,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-
 cleanup() {
     if [[ -n "$MOUNT_POINT" ]] && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         umount "$MOUNT_POINT" 2>/dev/null || true
@@ -124,8 +121,7 @@ check_prerequisites() {
         log_error "iscsid (open-iscsi) service not running"
         exit 1
     fi
-    [[ -x "$DAEMON_PATH" ]] || { log_error "Daemon missing at $DAEMON_PATH"; exit 1; }
-    [[ -x "$CLI_PATH" ]] || { log_error "CLI missing at $CLI_PATH"; exit 1; }
+    require_daemon_binaries thurvsa
 }
 
 prepare_fixture() {
@@ -164,17 +160,7 @@ EOFCONFIG
 }
 
 start_daemon() {
-    RUST_LOG=info "$DAEMON_PATH" --config "${TEST_DIR}/config.yaml" >> "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.5
-    done
-    log_error "Daemon did not become ready"
-    tail -30 "${TEST_DIR}/daemon.log"
-    return 1
+    TEST_CONFIG="${TEST_DIR}/config.yaml" DAEMON_LOG_MODE=append start_thur_daemon
 }
 
 kill_daemon_hard() {

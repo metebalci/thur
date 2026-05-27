@@ -53,29 +53,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-
 DAEMON_PID=""
 HTTP_PORT=""
 ISCSI_PORT=""
 
 cleanup() {
-    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    if [[ $KEEP_DATA -eq 0 ]]; then
-        rm -rf "$TEST_DIR"
-    else
-        log_info "Keeping test directory: $TEST_DIR"
-    fi
+    standard_cleanup
 }
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    [[ -x "$DAEMON_PATH" ]] || { log_error "Missing $DAEMON_PATH"; exit 1; }
-    [[ -x "$CLI_PATH" ]] || { log_error "Missing $CLI_PATH"; exit 1; }
+    require_daemon_binaries thurvsa
     command -v curl >/dev/null || { log_error "curl required"; exit 1; }
 }
 
@@ -96,15 +84,7 @@ storage:
       root_dir: "${TEST_DIR}/local-backend"
 EOFCONFIG
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    RUST_LOG=warn "$DAEMON_PATH" --config "${TEST_DIR}/config.yaml" > "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1 && return 0
-        sleep 0.5
-    done
-    log_error "daemon did not become ready"
-    tail -20 "${TEST_DIR}/daemon.log" >&2
-    return 1
+    TEST_CONFIG="${TEST_DIR}/config.yaml" RUST_LOG=warn start_thur_daemon
 }
 
 test_creates_n_volumes_without_lun_collision() {

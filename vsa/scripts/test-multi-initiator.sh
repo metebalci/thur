@@ -69,9 +69,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-
 # Build a per-test iface record bound to a specific InitiatorName.
 # open-iscsi stores these under /var/lib/iscsi/ifaces/<name> and
 # evaluates `iface.initiatorname` at login, so two sessions opened
@@ -94,10 +91,7 @@ cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" --op delete 2>/dev/null || true
         delete_iface "$iface"
     done
-    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
     else
@@ -117,8 +111,7 @@ check_prerequisites() {
         log_error "/etc/iscsi/initiatorname.iscsi missing — open-iscsi not initialised"
         exit 1
     }
-    [[ -x "$DAEMON_PATH" ]] || { log_error "Missing $DAEMON_PATH"; exit 1; }
-    [[ -x "$CLI_PATH" ]] || { log_error "Missing $CLI_PATH"; exit 1; }
+    require_daemon_binaries thurvsa
 }
 
 start_daemon() {
@@ -138,15 +131,7 @@ storage:
       root_dir: "${TEST_DIR}/local-backend"
 EOFCONFIG
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    RUST_LOG=info "$DAEMON_PATH" --config "${TEST_DIR}/config.yaml" > "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1 && return 0
-        sleep 0.5
-    done
-    log_error "daemon did not become ready"
-    tail -20 "${TEST_DIR}/daemon.log"
-    return 1
+    TEST_CONFIG="${TEST_DIR}/config.yaml" start_thur_daemon
 }
 
 # Login through a specific iface and return the resulting /dev/sgN

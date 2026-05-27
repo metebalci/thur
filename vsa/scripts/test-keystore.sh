@@ -125,10 +125,7 @@ done
 
 cleanup() {
     local rc=$?
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
     else
@@ -169,20 +166,7 @@ resolve_keystore() {
 }
 
 check_prerequisites() {
-    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-    : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-    local build_cmd="cargo build"
-    [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
-    if [[ ! -x "$DAEMON_PATH" ]]; then
-        log_error "thurvsad binary not found at $DAEMON_PATH"
-        echo "Build first: $build_cmd  (or pass --daemon-path PATH)"
-        exit 1
-    fi
-    if [[ ! -x "$CLI_PATH" ]]; then
-        log_error "thurvsa binary not found at $CLI_PATH"
-        echo "Build first: $build_cmd  (or pass --cli-path PATH)"
-        exit 1
-    fi
+    require_daemon_binaries thurvsa
     log_info "Binaries:          daemon=$DAEMON_PATH, cli=$CLI_PATH"
 }
 
@@ -246,11 +230,7 @@ start_daemon() {
 }
 
 stop_daemon() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-        DAEMON_PID=""
-    fi
+    stop_thur_daemon
 }
 
 manifest_path() {

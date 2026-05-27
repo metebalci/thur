@@ -50,6 +50,101 @@ assign_ports() {
     log_info "Using iSCSI port $ISCSI_PORT, HTTP port $HTTP_PORT"
 }
 
+# -----------------------------------------------------------------------
+# Daemon lifecycle helpers — lifted from the ~80-LOC prologue that used
+# to live near the top of every test script (check_prerequisites +
+# start_daemon + cleanup).
+#
+# Convention: each test script sets BUILD_PROFILE (debug | release),
+# optionally DAEMON_PATH / CLI_PATH overrides, TEST_DIR, TEST_CONFIG,
+# HTTP_PORT, KEEP_DATA — then calls require_daemon_binaries +
+# start_thur_daemon, and arranges its cleanup trap to call
+# standard_cleanup (or stop_thur_daemon + a custom rm).
+# -----------------------------------------------------------------------
+
+# Resolve $DAEMON_PATH / $CLI_PATH from $BUILD_PROFILE if not already
+# set, and verify both files exist. Caller passes the product short
+# name (`thurvtl` | `thurvsa`); the daemon binary is `${product}d`, the
+# CLI is `${product}`.
+require_daemon_binaries() {
+    local product="$1"
+    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/${product}d}"
+    : "${CLI_PATH:=./target/$BUILD_PROFILE/${product}}"
+    local build_cmd="cargo build --profile dev"
+    [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
+    if [[ ! -f "$DAEMON_PATH" ]]; then
+        log_error "Daemon not found at: $DAEMON_PATH"
+        log_error "Build with: $build_cmd"
+        exit 1
+    fi
+    if [[ ! -f "$CLI_PATH" ]]; then
+        log_error "CLI not found at: $CLI_PATH"
+        log_error "Build with: $build_cmd"
+        exit 1
+    fi
+}
+
+# Start the daemon in the background, capture its PID into $DAEMON_PID,
+# poll /health until ready or 30s timeout. On timeout dumps the last 30
+# lines of the daemon log and exits 1.
+#
+# Reads:   $DAEMON_PATH, $TEST_CONFIG, $HTTP_PORT
+#          $DAEMON_LOG          (default $TEST_DIR/daemon.log)
+#          $DAEMON_LOG_MODE     ("truncate" | "append"; default truncate)
+#          $RUST_LOG            (default "info")
+# Writes:  $DAEMON_PID
+#
+# Scripts that restart the daemon multiple times set DAEMON_LOG_MODE=
+# append so every restart's output lands in the same file. The default
+# truncates on each start, matching the original per-script copies.
+start_thur_daemon() {
+    local log_path="${DAEMON_LOG:-${TEST_DIR}/daemon.log}"
+    log_info "Starting daemon..."
+    if [[ "${DAEMON_LOG_MODE:-truncate}" == "append" ]]; then
+        RUST_LOG="${RUST_LOG:-info}" "$DAEMON_PATH" --config "$TEST_CONFIG" >> "$log_path" 2>&1 &
+    else
+        RUST_LOG="${RUST_LOG:-info}" "$DAEMON_PATH" --config "$TEST_CONFIG" > "$log_path" 2>&1 &
+    fi
+    DAEMON_PID=$!
+    local i
+    for i in {1..30}; do
+        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
+            log_info "Daemon ready (PID $DAEMON_PID)"
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "Daemon did not become ready in time"
+    log_error "Last 30 lines of daemon log:"
+    tail -30 "$log_path"
+    exit 1
+}
+
+# Stop the running daemon. Idempotent — safe from a cleanup trap that
+# fires before start_thur_daemon ran (DAEMON_PID empty), or after it
+# already ran (caller cleared the var manually).
+stop_thur_daemon() {
+    if [[ -n "${DAEMON_PID:-}" ]]; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+        DAEMON_PID=""
+    fi
+}
+
+# Standard cleanup body: stop daemon, remove $TEST_DIR unless KEEP_DATA=1.
+# Scripts with extra cleanup (umount, iscsi logout, podman rm) put the
+# extra steps in their own cleanup() and call this at the end.
+standard_cleanup() {
+    log_info "Cleaning up..."
+    stop_thur_daemon
+    if [[ "${KEEP_DATA:-0}" -eq 0 ]]; then
+        log_info "Removing test directory: $TEST_DIR"
+        rm -rf "$TEST_DIR"
+    else
+        log_info "Keeping test directory: $TEST_DIR"
+    fi
+}
+
 # Poll a log file for an extended regex match until it appears or the
 # timeout elapses. Returns 0 if matched, 1 on timeout. Both args
 # required; useful for the storage-failure tests that assert specific

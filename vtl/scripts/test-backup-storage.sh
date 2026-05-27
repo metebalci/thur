@@ -254,11 +254,7 @@ cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
     fi
 
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
 
     if [[ $KEEP_STORAGE -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
         log_info "Purging storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
@@ -503,24 +499,11 @@ create_cartridges() {
 
 start_daemon() {
     export THURVTL_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting daemon..."
-    RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" > "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null && { log_info "Daemon ready"; return 0; }
-        sleep 1
-    done
-    log_error "Daemon did not become ready"
-    tail -30 "${TEST_DIR}/daemon.log"
-    exit 1
+    start_thur_daemon
 }
 
 stop_daemon() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-        DAEMON_PID=""
-    fi
+    stop_thur_daemon
 }
 
 connect_iscsi() {

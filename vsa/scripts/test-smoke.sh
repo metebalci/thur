@@ -66,38 +66,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 cleanup() {
-    log_info "Cleaning up..."
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    if [[ $KEEP_DATA -eq 0 ]]; then
-        log_info "Removing test directory: $TEST_DIR"
-        rm -rf "$TEST_DIR"
-    else
-        log_info "Keeping test directory: $TEST_DIR"
-    fi
+    standard_cleanup
 }
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
     log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
 
-    : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-    : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-    local build_cmd="cargo build --profile dev"
-    [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
-    if [[ ! -f "$DAEMON_PATH" ]]; then
-        log_error "Daemon not found at: $DAEMON_PATH"
-        log_error "Build with: $build_cmd"
-        exit 1
-    fi
-    if [[ ! -f "$CLI_PATH" ]]; then
-        log_error "CLI not found at: $CLI_PATH"
-        log_error "Build with: $build_cmd"
-        exit 1
-    fi
+    require_daemon_binaries thurvsa
 
     if ! command -v iscsi-inq &>/dev/null; then
         log_error "iscsi-inq not found. Install with: sudo apt-get install libiscsi-bin"
@@ -143,30 +119,11 @@ EOFCONFIG
 }
 
 start_daemon() {
-    log_info "Starting thurvsad..."
-
     # Per-test admin socket so we don't need write access to /run/thurvsa/.
     # Both daemon and CLI honor THURVSA_ADMIN_SOCKET; export once for
     # downstream CLI invocations.
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-
-    RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" > "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    log_info "Daemon started (PID: $DAEMON_PID)"
-
-    log_info "Waiting for daemon to be ready..."
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            log_info "Daemon is ready"
-            return 0
-        fi
-        sleep 1
-    done
-
-    log_error "Daemon did not become ready in time"
-    log_error "Last 20 lines of daemon log:"
-    tail -20 "${TEST_DIR}/daemon.log"
-    exit 1
+    start_thur_daemon
 }
 
 # ---------------------------------------------------------------------------

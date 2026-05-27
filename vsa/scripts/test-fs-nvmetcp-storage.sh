@@ -169,11 +169,7 @@ cleanup() {
         nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
     fi
 
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
 
     if [[ $KEEP_STORAGE -eq 0 && -n "$BACKEND_TYPE" && -n "$TEST_PREFIX" ]]; then
         log_info "Purging storage test prefix: ${BACKEND_BUCKET:-?}/${TEST_PREFIX}"
@@ -402,11 +398,7 @@ start_daemon() {
 }
 
 stop_daemon() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-        DAEMON_PID=""
-    fi
+    stop_thur_daemon
 }
 
 ensure_volume() {

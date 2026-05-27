@@ -122,11 +122,7 @@ cleanup() {
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true
     fi
 
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
 
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
@@ -231,19 +227,7 @@ EOFCONFIG
 
 start_daemon() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting thurvsad..."
-    RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            log_info "Daemon ready (PID $DAEMON_PID)"
-            return 0
-        fi
-        sleep 1
-    done
-    log_error "Daemon did not become ready"
-    tail -30 "${TEST_DIR}/daemon.log"
-    exit 1
+    DAEMON_LOG_MODE=append start_thur_daemon
 }
 
 create_volumes() {

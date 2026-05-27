@@ -57,9 +57,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvtld}"
-: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvtl}"
-
 DAEMON_PID=""
 
 cleanup() {
@@ -81,14 +78,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    if [[ ! -x "$DAEMON_PATH" ]]; then
-        log_error "Daemon not found at: $DAEMON_PATH (build with: cargo build [--release])"
-        exit 1
-    fi
-    if [[ ! -x "$CLI_PATH" ]]; then
-        log_error "CLI not found at: $CLI_PATH (build with: cargo build [--release])"
-        exit 1
-    fi
+    require_daemon_binaries thurvtl
 }
 
 prepare_fixture() {

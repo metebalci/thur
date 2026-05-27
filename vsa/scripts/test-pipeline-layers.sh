@@ -93,14 +93,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvsad"
-[[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvsa"
 [[ -z "${THURVSA_TEST_BACKEND:-}" ]] && THURVSA_TEST_BACKEND="aistor-none"
 
-if [[ ! -x "$DAEMON_PATH" || ! -x "$CLI_PATH" ]]; then
-    log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH) binary. Run: cargo build${BUILD_PROFILE:+ --release}"
-    exit 1
-fi
+require_daemon_binaries thurvsa
 if [[ ! -r "$SOURCE_BACKENDS" ]]; then
     log_error "Cannot read backends file: $SOURCE_BACKENDS"
     exit 1
@@ -169,12 +164,7 @@ row_dir_cleanup() {
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         umount "$MOUNT_POINT" 2>/dev/null || true
     fi
-    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        log_info "row cleanup: stopping daemon (PID $DAEMON_PID)"
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-        DAEMON_PID=""
-    fi
+    stop_thur_daemon
     if [[ $ISCSI_CONNECTED -eq 1 ]]; then
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --logout 2>/dev/null || true
         iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --op delete 2>/dev/null || true

@@ -72,16 +72,7 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
 
 cleanup() {
-    if [[ -n "$DAEMON_PID" ]]; then
-        log_info "Stopping daemon (PID: $DAEMON_PID)"
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    if [[ $KEEP_DATA -eq 0 ]]; then
-        rm -rf "$TEST_DIR"
-    else
-        log_info "Keeping test directory: $TEST_DIR"
-    fi
+    standard_cleanup
 }
 trap cleanup EXIT INT TERM
 
@@ -167,19 +158,7 @@ EOFCONFIG
 
 start_daemon() {
     export THURVTL_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting Thur VTL daemon..."
-    RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" > "${TEST_DIR}/daemon.log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            log_info "Daemon is ready"
-            return 0
-        fi
-        sleep 1
-    done
-    log_error "Daemon did not become ready"
-    tail -30 "${TEST_DIR}/daemon.log"
-    exit 1
+    start_thur_daemon
 }
 
 # ---------------------------------------------------------------------------

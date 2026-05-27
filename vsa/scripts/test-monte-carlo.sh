@@ -197,10 +197,7 @@ cleanup() {
         nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
     fi
 
-    if [[ -n "$DAEMON_PID" ]]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    stop_thur_daemon
 
     # Purge backend test prefix if we wrote to a real backend.
     if [[ -n "$BACKEND_NAME" && "$BACKEND_TYPE" != "local" && -n "$TEST_PREFIX" ]]; then

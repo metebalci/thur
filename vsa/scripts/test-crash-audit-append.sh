@@ -58,9 +58,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
-: "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
-
 DAEMON_PID=""
 TEST_CONFIG=""
 HTTP_PORT=""
@@ -80,14 +77,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    if [[ ! -x "$DAEMON_PATH" ]]; then
-        log_error "Daemon not found at: $DAEMON_PATH (build with: cargo build)"
-        exit 1
-    fi
-    if [[ ! -x "$CLI_PATH" ]]; then
-        log_error "CLI not found at: $CLI_PATH (build with: cargo build)"
-        exit 1
-    fi
+    require_daemon_binaries thurvsa
 }
 
 prepare_fixture() {
@@ -116,18 +106,7 @@ EOFCONFIG
 }
 
 start_daemon() {
-    local log="${TEST_DIR}/daemon-$1.log"
-    RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" > "$log" 2>&1 &
-    DAEMON_PID=$!
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.5
-    done
-    log_error "Daemon did not become ready (log $log)"
-    tail -30 "$log" >&2
-    return 1
+    DAEMON_LOG="${TEST_DIR}/daemon-$1.log" start_thur_daemon
 }
 
 kill_daemon_hard() {
