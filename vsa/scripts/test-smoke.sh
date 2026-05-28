@@ -26,7 +26,7 @@
 #   ./vsa/scripts/test-smoke.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: ./target/debug/)
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Path to thurvsad binary (overrides default)
 #   --cli-path PATH       Path to thurvsa binary (overrides default)
 #   --keep-data           Don't clean up test data directory

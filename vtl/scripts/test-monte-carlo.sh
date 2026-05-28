@@ -48,7 +48,7 @@
 #   --quick               200 ops (default: 3000)
 #   --ops N               Override op count
 #   --backend NAME        Use named backend entry (same as THURVTL_TEST_BACKEND)
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override thurvtld path
 #   --cli-path PATH       Override thurvtl path
 #   --keep-data           Don't clean up test data directory

@@ -37,7 +37,7 @@ jobs:
         run: cargo build --release -p vsa-daemon -p vsa-cli
 
       - name: run monte-carlo
-        run: ./vsa/scripts/test-monte-carlo.sh --release
+        run: ./vsa/scripts/test-monte-carlo.sh
 
       # Preserve the op log + daemon log on failure so the seed printed
       # in the run output can be reproduced + the daemon-side cause is

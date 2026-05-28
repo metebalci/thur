@@ -30,7 +30,7 @@
 #   - Root / sudo NOPASSWD
 #
 # Usage (invoke from repo root; self-elevates via sudo):
-#   ./vtl/scripts/test-crash-chunk-seal.sh [--release] [--keep-data]
+#   ./vtl/scripts/test-crash-chunk-seal.sh [--debug] [--keep-data]
 #
 
 if [[ $EUID -ne 0 ]]; then

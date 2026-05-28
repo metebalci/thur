@@ -20,7 +20,7 @@
 # Gated behind `THURVTL_SOAK=1` — run-on-demand only.
 #
 # Usage (invoke from repo root):
-#   THURVTL_SOAK=1 ./vtl/scripts/test-lifecycle-many-cartridges.sh [--release]
+#   THURVTL_SOAK=1 ./vtl/scripts/test-lifecycle-many-cartridges.sh [--debug]
 #
 
 set -u

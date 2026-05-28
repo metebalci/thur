@@ -23,7 +23,7 @@
 # dir; audit-generating ops are admin-socket cartridge create/destroy.
 #
 # Usage:
-#   ./vtl/scripts/test-crash-audit-append.sh [--release] [--keep-data]
+#   ./vtl/scripts/test-crash-audit-append.sh [--debug] [--keep-data]
 #
 
 set -u

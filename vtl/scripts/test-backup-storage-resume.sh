@@ -28,7 +28,7 @@
 #   ./vtl/scripts/test-backup-storage-resume.sh [OPTIONS]
 #
 # Options:
-#   --release       Use ./target/release/ binaries (default is ./target/debug/)
+#   --debug         Use ./target/debug/ binaries (default is ./target/release/)
 #   --keep-data     Don't clean up the test data dir on exit
 #
 

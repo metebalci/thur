@@ -40,7 +40,7 @@ jobs:
         run: cargo build --release -p vsa-daemon -p vsa-cli
 
       - name: run monte-carlo (multi-initiator)
-        run: ./vsa/scripts/test-monte-carlo-multi.sh --release
+        run: ./vsa/scripts/test-monte-carlo-multi.sh
 
       - name: upload artifacts on failure
         if: failure()

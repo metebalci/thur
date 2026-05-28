@@ -29,7 +29,7 @@
 #   ./vsa/scripts/test-crash-audit-append.sh [OPTIONS]
 #
 # Options:
-#   --release       Use ./target/release/ binaries (default ./target/debug/)
+#   --debug         Use ./target/debug/ binaries (default ./target/release/)
 #   --keep-data     Don't clean up the test data dir on exit
 #
 

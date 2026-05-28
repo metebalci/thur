@@ -71,7 +71,7 @@
 #   --seed N              Reproduce a prior run
 #   --quick               Skip Phase C (~1 min total)
 #   --transport T         iscsi (default) or nvmetcp
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override thurvsad
 #   --cli-path PATH       Override thurvsa
 #   --keep-data           Don't clean up test data directory

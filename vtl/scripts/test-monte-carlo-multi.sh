@@ -56,7 +56,7 @@
 #   --seed N              Reproduce a prior run (default: pick from /dev/urandom)
 #   --quick               150 ops/initiator (default: 1000 ops/initiator)
 #   --ops N               Override per-initiator op count
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override thurvtld path
 #   --cli-path PATH       Override thurvtl path
 #   --keep-data           Don't clean up test data directory

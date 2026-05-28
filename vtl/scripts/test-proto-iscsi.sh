@@ -29,7 +29,7 @@
 #   ./vtl/scripts/test-proto-iscsi.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: ./target/debug/)
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override path to thurvtld binary
 #   --cli-path PATH       Override path to thurvtl binary
 #   --keep-data           Don't clean up test data directory

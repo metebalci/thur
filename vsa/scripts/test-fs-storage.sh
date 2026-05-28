@@ -69,7 +69,7 @@
 # env vars in root's shell first.
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: ./target/debug/)
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override path to thurvsad binary
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up local test data directory

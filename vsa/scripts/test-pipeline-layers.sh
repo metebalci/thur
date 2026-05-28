@@ -37,7 +37,7 @@
 #   THURVSA_TEST_BACKEND=aistor-none ./vsa/scripts/test-pipeline-layers.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Path to thurvsad binary
 #   --cli-path PATH       Path to thurvsa binary
 #   --only ROW            Run a single row (1..5)

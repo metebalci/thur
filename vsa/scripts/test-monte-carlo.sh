@@ -66,7 +66,7 @@
 #   --ops N               Override op count
 #   --transport T         iscsi (default) or nvmetcp
 #   --backend NAME        Use named backend entry (same as THURVSA_TEST_BACKEND)
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override thurvsad path
 #   --cli-path PATH       Override thurvsa path
 #   --keep-data           Don't clean up test data directory

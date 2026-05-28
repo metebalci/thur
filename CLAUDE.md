@@ -479,7 +479,9 @@ Two product-prefixed sets, in increasing order of prereqs / coverage:
 - `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
 - `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
 
-Run from the repo root; flags `--release`, `--keep-data`. Remote-backend variants
+Run from the repo root; flags `--debug`, `--keep-data` (release is the
+default — debug builds are 5-10x slower, only useful when iterating on a
+failing case). Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
 entry in the conffile; refuses `retention_mode != none`.
 `test-monte-carlo.sh` (both products) runs seeded random op sequences

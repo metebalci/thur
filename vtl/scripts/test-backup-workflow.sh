@@ -31,7 +31,7 @@
 # need to prefix with sudo yourself.
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default is ./target/debug/)
+#   --debug               Use ./target/debug/ binaries (default is ./target/release/)
 #   --daemon-path PATH    Path to thurvtld binary (overrides default)
 #   --cli-path PATH       Path to thurvtl binary (overrides default)
 #   --keep-data           Don't clean up test data directory

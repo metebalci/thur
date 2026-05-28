@@ -44,7 +44,7 @@
 #   --seed N              Reproduce a prior run
 #   --jobs N              Override backup-job count (default 8)
 #   --quick               4 jobs (~3 min total wall clock)
-#   --release             Use ./target/release/ binaries
+#   --debug               Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path PATH    Override thurvtld
 #   --cli-path PATH       Override thurvtl
 #   --keep-data           Don't clean up test data directory

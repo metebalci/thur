@@ -56,7 +56,7 @@
 # Override the source path with THURVSA_SOURCE_KEYSTORES.
 #
 # Options:
-#   --release         Use ./target/release/ binaries (default: ./target/debug/)
+#   --debug           Use ./target/debug/ binaries (default: ./target/release/)
 #   --daemon-path P   Override path to thurvsad binary
 #   --cli-path P      Override path to thurvsa binary
 #   --keep-data       Don't clean up local test data directory

@@ -26,7 +26,7 @@
 #   ./vtl/scripts/test-lifecycle-cartridge-migrate.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default debug)
+#   --debug               Use ./target/debug/ binaries (default: release)
 #   --daemon-path PATH    Path to thurvtld binary
 #   --cli-path PATH       Path to thurvtl binary
 #   --keep-data           Don't clean up test data directory

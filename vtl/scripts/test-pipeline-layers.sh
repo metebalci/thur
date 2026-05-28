@@ -64,7 +64,7 @@
 #   THURVTL_TEST_BACKEND=aistor-none ./vtl/scripts/test-pipeline-layers.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: debug)
+#   --debug               Use ./target/debug/ binaries (default: release)
 #   --daemon-path PATH    Path to thurvtld binary
 #   --cli-path PATH       Path to thurvtl binary
 #   --only ROW            Run a single row (1..5); omit to run all 5

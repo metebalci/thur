@@ -45,7 +45,7 @@
 #   - Root / sudo NOPASSWD
 #
 # Usage (invoke from repo root; self-elevates via sudo):
-#   ./vsa/scripts/test-crash-page-flush.sh [--release] [--keep-data]
+#   ./vsa/scripts/test-crash-page-flush.sh [--debug] [--keep-data]
 #
 
 if [[ $EUID -ne 0 ]]; then

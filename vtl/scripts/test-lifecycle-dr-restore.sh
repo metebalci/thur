@@ -29,7 +29,7 @@
 #   ./vtl/scripts/test-lifecycle-dr-restore.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default is ./target/debug/)
+#   --debug               Use ./target/debug/ binaries (default is ./target/release/)
 #   --daemon-path PATH    Path to thurvtld binary
 #   --cli-path PATH       Path to thurvtl binary
 #   --keep-data           Don't clean up test data directory

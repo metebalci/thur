@@ -70,8 +70,8 @@ require_daemon_binaries() {
     local product="$1"
     : "${DAEMON_PATH:=./target/$BUILD_PROFILE/${product}d}"
     : "${CLI_PATH:=./target/$BUILD_PROFILE/${product}}"
-    local build_cmd="cargo build --profile dev"
-    [[ "$BUILD_PROFILE" == "release" ]] && build_cmd="cargo build --release"
+    local build_cmd="cargo build --release"
+    [[ "$BUILD_PROFILE" == "debug" ]] && build_cmd="cargo build --profile dev"
     if [[ ! -f "$DAEMON_PATH" ]]; then
         log_error "Daemon not found at: $DAEMON_PATH"
         log_error "Build with: $build_cmd"
@@ -150,7 +150,14 @@ standard_cleanup() {
 # `while/case` boilerplate at the top of every test script.
 #
 # Common flags:
-#   --release             switch to ./target/release/ binaries
+#   --debug               switch to ./target/debug/ binaries (the default
+#                         is ./target/release/ — debug builds are 5-10x
+#                         slower and only useful when actively iterating
+#                         on a failing case where backtraces / unoptimized
+#                         step-through help)
+#   --release             accepted as a no-op (now the default); kept
+#                         for one release cycle so muscle memory and any
+#                         out-of-tree CI scripts keep working
 #   --daemon-path PATH    override daemon binary
 #   --cli-path PATH       override CLI binary
 #   --keep-data           don't rm -rf $TEST_DIR on exit
@@ -186,7 +193,7 @@ standard_cleanup() {
 # Idempotent. Call before the arg loop; explicit per-script assignments
 # (e.g. KEEP_DATA=0 at the top of the script) become redundant after.
 init_common_daemon_args() {
-    : "${BUILD_PROFILE:=debug}"
+    : "${BUILD_PROFILE:=release}"
     : "${DAEMON_PATH:=}"
     : "${CLI_PATH:=}"
     : "${ISCSI_PORT:=}"
@@ -201,6 +208,7 @@ init_common_daemon_args() {
 # header comment block (lines 2 to first blank-comment-line) and exits 0.
 parse_common_daemon_arg() {
     case "$1" in
+        --debug)       BUILD_PROFILE="debug";   _CONSUMED_ARGS=1 ;;
         --release)     BUILD_PROFILE="release"; _CONSUMED_ARGS=1 ;;
         --daemon-path) DAEMON_PATH="$2";        _CONSUMED_ARGS=2 ;;
         --cli-path)    CLI_PATH="$2";           _CONSUMED_ARGS=2 ;;

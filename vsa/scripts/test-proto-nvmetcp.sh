@@ -38,7 +38,7 @@
 #   ./vsa/scripts/test-proto-nvmetcp.sh [OPTIONS]
 #
 # Options:
-#   --release             Use ./target/release/ binaries (default: debug)
+#   --debug               Use ./target/debug/ binaries (default: release)
 #   --daemon-path PATH    Override path to thurvsad binary
 #   --cli-path PATH       Override path to thurvsa binary
 #   --keep-data           Don't clean up test data directory

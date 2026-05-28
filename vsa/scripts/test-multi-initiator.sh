@@ -33,7 +33,7 @@
 # exclusivity was a no-op).
 #
 # Usage (invoke from repo root; self-elevates via sudo):
-#   ./vsa/scripts/test-multi-initiator.sh [--release] [--keep-data]
+#   ./vsa/scripts/test-multi-initiator.sh [--debug] [--keep-data]
 #
 
 if [[ $EUID -ne 0 ]]; then

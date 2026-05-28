@@ -62,7 +62,7 @@
 #   - Root / sudo NOPASSWD
 #
 # Usage (invoke from repo root; self-elevates via sudo):
-#   ./vsa/scripts/test-iscsi-multi-pdu-readin.sh [--release] [--keep-data]
+#   ./vsa/scripts/test-iscsi-multi-pdu-readin.sh [--debug] [--keep-data]
 #
 
 if [[ $EUID -ne 0 ]]; then

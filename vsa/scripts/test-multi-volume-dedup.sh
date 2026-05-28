@@ -23,7 +23,7 @@
 # default CI cycle. Run-on-demand only.
 #
 # Usage (invoke from repo root):
-#   THURVSA_SOAK=1 ./vsa/scripts/test-multi-volume-dedup.sh [--release] [--keep-data]
+#   THURVSA_SOAK=1 ./vsa/scripts/test-multi-volume-dedup.sh [--debug] [--keep-data]
 #
 
 set -u
