@@ -425,6 +425,8 @@ async fn main() -> Result<()> {
                     name,
                     storage_start,
                     storage_end,
+                    mail_start,
+                    mail_end,
                     drives,
                 } => {
                     commands::library::cmd_partition_create(
@@ -433,6 +435,8 @@ async fn main() -> Result<()> {
                         name,
                         storage_start,
                         storage_end,
+                        mail_start,
+                        mail_end,
                         drives,
                     )
                     .await?;
@@ -441,6 +445,8 @@ async fn main() -> Result<()> {
                     name,
                     storage_start,
                     storage_end,
+                    mail_start,
+                    mail_end,
                     drives,
                 } => {
                     commands::library::cmd_partition_modify(
@@ -449,6 +455,8 @@ async fn main() -> Result<()> {
                         name,
                         storage_start,
                         storage_end,
+                        mail_start,
+                        mail_end,
                         drives,
                     )
                     .await?;
@@ -1127,6 +1135,10 @@ mod cli_parse_tests {
             "0",
             "--storage-end",
             "20",
+            "--mail-start",
+            "0",
+            "--mail-end",
+            "1",
             "--drives",
             "0,1,2",
         ]);
@@ -1138,11 +1150,45 @@ mod cli_parse_tests {
                         ref name,
                         storage_start: 0,
                         storage_end: 20,
+                        mail_start: 0,
+                        mail_end: 1,
                         ref drives,
                         ..
                     },
                 },
             } if name == "p1" && *drives == [0, 1, 2]
+        ));
+    }
+
+    #[test]
+    fn partition_create_defaults_mail_to_empty() {
+        // Mail-slot flags are optional; omitting them yields the empty
+        // range [0, 0). Used by the second-and-later partition when
+        // partition 1 already claims the mail slot.
+        let cli = parse([
+            "thurvtl",
+            "library",
+            "partition",
+            "create",
+            "p2",
+            "--storage-start",
+            "20",
+            "--storage-end",
+            "40",
+            "--drives",
+            "3",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                action: LibraryAction::Partition {
+                    action: PartitionAction::Create {
+                        mail_start: 0,
+                        mail_end: 0,
+                        ..
+                    },
+                },
+            }
         ));
     }
 }

@@ -6,39 +6,29 @@
 #
 # thurvtl Monte Carlo Multi-Initiator Test
 #
-# KNOWN LIMITATION: this harness currently fails because the daemon's
-# scsi_ssc::drive_manager acquires a per-session drive lock at first
-# SCSI access (INQUIRY at iSCSI login) and holds it until session
-# close (release_session_locks fires from the close path). The
-# kernel iSCSI initiator probes ALL LUNs after --login, so whichever
-# of A or B logs in first grabs locks on every drive and the other
-# initiator's writes all return 'drive N is reserved by another
-# session' (sense key Reservation Conflict). Genuine multi-initiator
-# concurrent ops need either:
-#   (a) per-cartridge / per-partition session admission (the daemon's
-#       logical partitions design), or
-#   (b) a lock model that grants per-command rather than per-session.
-# The harness + workflow ship as the skeleton for when (a) or (b)
-# lands; the workflow is manual-only (no schedule:) until then.
-#
 # Sibling to vtl/scripts/test-monte-carlo.sh. Spins up a single
 # thurvtl daemon (4 drives, 8 slots, 6 carts) and runs two concurrent
 # op streams from two distinct iSCSI initiator IQNs. Each initiator
-# is pinned to a disjoint drive set + cart set:
+# is pinned to a disjoint drive set + cart set via logical partitions
+# + per-CHAP-user partition admission — fixes #38:
 #
-#   Initiator A: iqn.2025-10.com.metebalci:mc-init-a
-#       drives = [0, 1]
-#       carts  = [MC01L8, MC02L8, MC03L8]
+#   Partition "left"
+#     storage slots [0, 3)   mail slot [0, 1)   drives [0, 1]
+#     CHAP user mc-init-a → partition left
+#     Cartridges MC01L8, MC02L8, MC03L8 (auto-placed in slots 0,1,2)
 #
-#   Initiator B: iqn.2025-10.com.metebalci:mc-init-b
-#       drives = [2, 3]
-#       carts  = [MC04L8, MC05L8, MC06L8]
+#   Partition "right"
+#     storage slots [3, 8)   mail slot [1, 1)   drives [2, 3]
+#     CHAP user mc-init-b → partition right
+#     Cartridges MC04L8, MC05L8, MC06L8 (auto-placed in slots 3,4,5;
+#     slots 6 and 7 stay empty for load_cycle headroom)
 #
-# The pinning makes the two streams non-interfering at the
-# application layer; the daemon's per-drive locking + concurrent SCSI
-# dispatch is what we're actually exercising. Both streams hit the
-# shared changer (mtx load / unload / move), which the daemon must
-# serialize.
+# Without the partition fence, the kernel iSCSI initiator's all-LUNs
+# INQUIRY at --login captures every drive on whichever session logs
+# in first; with the fence, sessions only address — and lock — drives
+# their CHAP user's partition owns, so the two streams hold disjoint
+# subsets. Both streams still hit the shared changer (mtx load /
+# unload / move), which the daemon serializes.
 #
 # Op mix: write_record / read_verify / rewind / load_cycle. Filemarks,
 # changer_move, and import_export are skipped here — they're well
@@ -96,17 +86,26 @@ CHANGER_DEVICE_A=""
 CHANGER_DEVICE_B=""
 
 # Chassis: 4 drives, 8 storage slots, 6 carts split 3/3 between the
-# two initiators.
+# two initiators. Storage slots split 4/4 and the single mail slot
+# goes to partition "left".
 NUM_DRIVES=4
 NUM_SLOTS=8
 CARTS_A=(MC01L8 MC02L8 MC03L8)
 CARTS_B=(MC04L8 MC05L8 MC06L8)
 DRIVES_A=(0 1)
 DRIVES_B=(2 3)
+SLOTS_A_START=0; SLOTS_A_END=3
+SLOTS_B_START=3; SLOTS_B_END=8
+PART_A="left"
+PART_B="right"
 INIT_IQN_A="iqn.2025-10.com.metebalci:mc-init-a"
 INIT_IQN_B="iqn.2025-10.com.metebalci:mc-init-b"
 IFACE_A="thurvtl-mc-a"
 IFACE_B="thurvtl-mc-b"
+CHAP_USER_A="mc-user-a-$$"
+CHAP_USER_B="mc-user-b-$$"
+CHAP_PASS_A="mc-secret-a-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
+CHAP_PASS_B="mc-secret-b-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
 
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
@@ -190,6 +189,8 @@ http:
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
   target_iqn: "$TARGET_IQN"
+  auth:
+    method: CHAP
 
 disk_cache:
   disk_free_min_gb: 0
@@ -209,6 +210,64 @@ EOFCONFIG
 start_daemon_mc() {
     export THURVTL_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
     DAEMON_LOG_MODE=append start_thur_daemon
+}
+
+# Carve the chassis into two logical partitions before the daemon
+# serves any session.
+#
+# `library partition create` is daemon-down and validates **after
+# each** create step — it would reject the first partition for not
+# covering the chassis on its own. The atomic multi-partition layout
+# can't be expressed incrementally, so we direct-write library.json's
+# partitions array. The daemon picks it up on next start; validate_*
+# fires at `set_partitions` time elsewhere, and Library::open trusts
+# what's on disk.
+create_partitions() {
+    log_info "Carving chassis into partitions '$PART_A' and '$PART_B'..."
+    local lib_json="$TEST_DIR/data/library/library.json"
+    if [[ ! -r "$lib_json" ]]; then
+        log_error "library.json not found at $lib_json (daemon did not materialize?)"
+        exit 1
+    fi
+    python3 - <<PYEOF || { log_error "partition layout write failed"; exit 1; }
+import json, pathlib
+p = pathlib.Path("$lib_json")
+d = json.loads(p.read_text())
+d["partitions"] = [
+    {
+        "name": "$PART_A",
+        "storage_slots": {"start": $SLOTS_A_START, "end": $SLOTS_A_END},
+        "mail_slots":    {"start": 0, "end": 1},
+        "drives":        [${DRIVES_A[0]}, ${DRIVES_A[1]}],
+    },
+    {
+        "name": "$PART_B",
+        "storage_slots": {"start": $SLOTS_B_START, "end": $SLOTS_B_END},
+        "mail_slots":    {"start": 1, "end": 1},
+        "drives":        [${DRIVES_B[0]}, ${DRIVES_B[1]}],
+    },
+]
+p.write_text(json.dumps(d, indent=2))
+PYEOF
+}
+
+# Add two CHAP users, each bound to its partition. The daemon does no
+# fencing for the changer LUN (LUN 0), and each user's drive-LUN
+# admission shrinks to its partition's drives.
+setup_chap_users() {
+    log_info "Adding CHAP users (mc-user-a → $PART_A, mc-user-b → $PART_B)..."
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER_A" \
+            --password "$CHAP_PASS_A" --partition "$PART_A" >/dev/null 2>&1; then
+        log_error "iscsi users add $CHAP_USER_A failed"
+        tail -20 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER_B" \
+            --password "$CHAP_PASS_B" --partition "$PART_B" >/dev/null 2>&1; then
+        log_error "iscsi users add $CHAP_USER_B failed"
+        tail -20 "${TEST_DIR}/daemon.log"
+        exit 1
+    fi
 }
 
 create_cartridges() {
@@ -231,15 +290,38 @@ setup_iface() {
     iscsiadm -m iface -I "$iface" -o update -n iface.initiatorname -v "$initiator_iqn" >/dev/null 2>&1
 }
 
+# Configure per-iface CHAP credentials on the discovery DB and the
+# node record. Each iface presents its own CHAP user, so the daemon
+# can distinguish the two sessions and bind each to its partition.
+setup_iface_chap() {
+    local iface="$1" user="$2" pass="$3"
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" -o new >/dev/null 2>&1 || true
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.authmethod -v CHAP >/dev/null 2>&1
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.username -v "$user" >/dev/null 2>&1
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.password -v "$pass" >/dev/null 2>&1
+}
+
 # Discover + login from a specific iface. Returns 0 on success.
 iscsi_login_iface() {
-    local iface="$1"
+    local iface="$1" user="$2" pass="$3"
     local out
-    if ! out=$(iscsiadm -m discovery -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" 2>&1); then
+    if ! out=$(iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" --discover 2>&1); then
         log_error "discovery via iface $iface failed:"
         echo "$out" | sed 's/^/    /' >&2
         return 1
     fi
+    # Set the per-iface node CHAP creds after the node record exists
+    # (discovery materializes it). session.auth.* binds against the
+    # iface-tagged node entry.
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.authmethod -v CHAP >/dev/null 2>&1
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.username -v "$user" >/dev/null 2>&1
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.password -v "$pass" >/dev/null 2>&1
     if ! out=$(iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
             -I "$iface" --login 2>&1); then
         log_error "login via iface $iface failed:"
@@ -318,8 +400,12 @@ discover_devices_for_iface() {
 iscsi_login() {
     setup_iface "$IFACE_A" "$INIT_IQN_A"
     setup_iface "$IFACE_B" "$INIT_IQN_B"
-    iscsi_login_iface "$IFACE_A" || { log_error "iscsi login (A) failed"; return 1; }
-    iscsi_login_iface "$IFACE_B" || { log_error "iscsi login (B) failed"; return 1; }
+    setup_iface_chap "$IFACE_A" "$CHAP_USER_A" "$CHAP_PASS_A"
+    setup_iface_chap "$IFACE_B" "$CHAP_USER_B" "$CHAP_PASS_B"
+    iscsi_login_iface "$IFACE_A" "$CHAP_USER_A" "$CHAP_PASS_A" \
+        || { log_error "iscsi login (A) failed"; return 1; }
+    iscsi_login_iface "$IFACE_B" "$CHAP_USER_B" "$CHAP_PASS_B" \
+        || { log_error "iscsi login (B) failed"; return 1; }
     sleep 4
 }
 
@@ -352,7 +438,7 @@ resolve_initiator_devices() {
 }
 
 setup_initiator_devices() {
-    local suffix="$1" iface="$2"
+    local suffix="$1" iface="$2" expected_drives="$3"
     local rows
     rows=$(resolve_initiator_devices "$iface") || return 1
     local changer tape_devs=() nst_devs=() row
@@ -371,12 +457,14 @@ setup_initiator_devices() {
         echo "$rows" >&2
         return 1
     fi
-    if (( ${#tape_devs[@]} < NUM_DRIVES )); then
-        log_error "initiator $suffix: only ${#tape_devs[@]} tape devices found, expected $NUM_DRIVES"
+    if (( ${#tape_devs[@]} < expected_drives )); then
+        log_error "initiator $suffix: only ${#tape_devs[@]} tape devices found, expected $expected_drives"
         echo "$rows" >&2
         return 1
     fi
-    # Sort tape paths by /dev/stN N — that matches LUN order ascending.
+    # Sort tape paths by /dev/stN N — that matches LUN order ascending,
+    # which lines up with the partition's drive order (LUN i+1 = i'th
+    # drive in PINNED_DRIVES).
     IFS=$'\n' nst_devs=($(printf '%s\n' "${nst_devs[@]}" | sort -V)) ; unset IFS
     eval "CHANGER_DEVICE_${suffix}=\"\$changer\""
     eval "NST_DEVS_${suffix}=(\"\${nst_devs[@]}\")"
@@ -393,11 +481,14 @@ setup_initiator_devices() {
 #   $6 = ops count
 #   $7 = ops log path
 #   $8 = MC_SEED for this run
+#   $9 = partition's first mtx storage slot (1-based, inclusive)
+#   $10 = partition's last mtx storage slot (1-based, inclusive)
 # ---------------------------------------------------------------------------
 
 run_initiator_ops() {
     local suffix="$1" changer="$2" nst_list="$3" drive_ids_csv="$4" carts_csv="$5"
     local n_ops="$6" ops_log="$7" seed="$8"
+    local part_slot_lo="$9" part_slot_hi="${10}"
 
     local -a NST_DEVS
     IFS='|' read -ra NST_DEVS <<< "$nst_list"
@@ -469,14 +560,47 @@ for c in d.get('cartridges', []):
         break
 "
     }
+    # mtx status surfaces every storage element in the chassis, not just
+    # this partition's — daemon-side partition filtering on READ
+    # ELEMENT STATUS is off (mtx errors on the zero-descriptor
+    # response). Constrain candidates to this partition's slot range
+    # so we never pick a slot a MOVE MEDIUM partition fence will
+    # refuse.
     any_empty_slot_local() {
         mtx -f "$changer" status 2>/dev/null \
-            | awk '/Storage Element [0-9]+:Empty/ { for (i=1;i<=NF;i++) if ($i == "Element") { print $(i+1); exit } }'
+            | awk -v lo="$part_slot_lo" -v hi="$part_slot_hi" '
+                /Storage Element [0-9]+:Empty/ {
+                    for (i=1;i<=NF;i++) {
+                        if ($i == "Element") {
+                            slot = $(i+1) + 0
+                            if (slot >= lo && slot <= hi) { print slot; exit }
+                        }
+                    }
+                }'
     }
-    # NST_DEVS is the full per-initiator device list, sorted by LUN —
-    # LUN i+1 = drive i, so position == absolute drive_id.
+    # NST_DEVS only carries the drives the kernel materialized for this
+    # session — i.e. this partition's drives. Map absolute drive id to
+    # its position within PINNED_DRIVES; that's the index into
+    # NST_DEVS. (LUN i+1 = i'th admitted drive; the kernel orders sd /
+    # st devices in admission order.)
     nst_for_drive() {
-        echo "${NST_DEVS[$1]}"
+        local want="$1" i
+        for (( i=0; i<${#PINNED_DRIVES[@]}; i++ )); do
+            if [[ "${PINNED_DRIVES[$i]}" == "$want" ]]; then
+                echo "${NST_DEVS[$i]}"
+                return 0
+            fi
+        done
+        return 1
+    }
+    # mtx numbers drives by their position in the READ ELEMENT STATUS
+    # response. Daemon-side partition filtering on READ ELEMENT STATUS
+    # is off (mtx tolerates zero-descriptor pages poorly), so mtx sees
+    # all 4 chassis drives and uses absolute drive ids directly. The
+    # MOVE MEDIUM partition fence still refuses out-of-partition
+    # source/dest at the daemon.
+    mtx_drive_for() {
+        echo "$1"
     }
     pick_pinned_drive() {
         local idx
@@ -508,20 +632,22 @@ for c in d.get('cartridges', []):
                 local other_nst
                 other_nst=$(nst_for_drive "$other")
                 mt -f "$other_nst" rewind >/dev/null 2>&1 || true
-                local origin
+                local origin other_mtx
                 origin=$(any_empty_slot_local)
-                [[ -z "$origin" ]] && origin=1
-                mtx -f "$changer" unload "$origin" "$other" >/dev/null 2>&1 || true
+                [[ -z "$origin" ]] && origin="$part_slot_lo"
+                other_mtx=$(mtx_drive_for "$other") || other_mtx="$other"
+                mtx -f "$changer" unload "$origin" "$other_mtx" >/dev/null 2>&1 || true
                 DRIVE_LOADED[$other]=""
             fi
         fi
         if [[ -n "$current" ]]; then
             mt -f "$(nst_for_drive "$drive_idx")" rewind >/dev/null 2>&1 || true
-            local origin
+            local origin local_drive
             origin=$(any_empty_slot_local)
-            [[ -z "$origin" ]] && origin=1
-            if ! mtx -f "$changer" unload "$origin" "$drive_idx" >/dev/null 2>&1; then
-                log_error "init $suffix ensure_loaded: unload of $current from drive $drive_idx failed"
+            [[ -z "$origin" ]] && origin="$part_slot_lo"
+            local_drive=$(mtx_drive_for "$drive_idx") || local_drive="$drive_idx"
+            if ! mtx -f "$changer" unload "$origin" "$local_drive" >/dev/null 2>&1; then
+                log_error "init $suffix ensure_loaded: unload of $current from drive $drive_idx (mtx $local_drive) failed"
                 return 1
             fi
             DRIVE_LOADED[$drive_idx]=""
@@ -536,7 +662,11 @@ for c in d.get('cartridges', []):
                 [[ -n "${DRIVE_LOADED[$pd]}" ]] && loaded_set+="${DRIVE_LOADED[$pd]} "
             done
             local tries=0 cand
-            while (( tries < ${#CARTS[@]} )); do
+            # First pass: try N random picks (cheap if it lands on an
+            # unloaded cart). Then deterministically walk CARTS so a
+            # stuck-on-one-RNG-output session still finds an available
+            # cartridge.
+            while (( tries < ${#CARTS[@]} * 2 )); do
                 cand="${CARTS[$(mc_rng_u32 "load-pick-$suffix-$tries" "${#CARTS[@]}")]}"
                 if [[ "$loaded_set" != *" $cand "* ]]; then
                     target_slot=$(slot_of_cart_local "$cand")
@@ -544,13 +674,24 @@ for c in d.get('cartridges', []):
                 fi
                 tries=$(( tries + 1 ))
             done
+            if [[ -z "$target_slot" ]]; then
+                for cand in "${CARTS[@]}"; do
+                    if [[ "$loaded_set" != *" $cand "* ]]; then
+                        target_slot=$(slot_of_cart_local "$cand")
+                        [[ -n "$target_slot" ]] && { target_bc="$cand"; break; }
+                    fi
+                done
+            fi
         fi
         if [[ -z "$target_slot" ]]; then
             log_error "init $suffix ensure_loaded: no cart available for drive $drive_idx"
             return 1
         fi
-        if ! mtx -f "$changer" load "$target_slot" "$drive_idx" >/dev/null 2>&1; then
-            log_error "init $suffix ensure_loaded: load of $target_bc -> drive $drive_idx failed"
+        local local_drive
+        local_drive=$(mtx_drive_for "$drive_idx") || local_drive="$drive_idx"
+        local mtx_out
+        if ! mtx_out=$(mtx -f "$changer" load "$target_slot" "$local_drive" 2>&1); then
+            log_error "init $suffix ensure_loaded: load of $target_bc -> drive $drive_idx (mtx slot=$target_slot drv=$local_drive on $changer) failed: $mtx_out"
             return 1
         fi
         DRIVE_LOADED[$drive_idx]="$target_bc"
@@ -643,9 +784,11 @@ for c in d.get('cartridges', []):
             return 0
         fi
         mt -f "$(nst_for_drive "$drive_idx")" rewind >/dev/null 2>&1 || true
-        local origin; origin=$(any_empty_slot_local); [[ -z "$origin" ]] && origin=1
-        if ! mtx -f "$changer" unload "$origin" "$drive_idx" >/dev/null 2>&1; then
-            log_error "init $suffix load_cycle: unload failed (drive=$drive_idx cart=$prev)"
+        local origin local_drive
+        origin=$(any_empty_slot_local); [[ -z "$origin" ]] && origin="$part_slot_lo"
+        local_drive=$(mtx_drive_for "$drive_idx") || local_drive="$drive_idx"
+        if ! mtx -f "$changer" unload "$origin" "$local_drive" >/dev/null 2>&1; then
+            log_error "init $suffix load_cycle: unload failed (drive=$drive_idx mtx=$local_drive cart=$prev)"
             return 1
         fi
         DRIVE_LOADED[$drive_idx]=""
@@ -681,11 +824,19 @@ main() {
     check_prerequisites
     assign_ports
     create_test_config
+    # First start materializes library.json from the YAML topology;
+    # partition creates are daemon-down, so we cycle the daemon around
+    # them. The second start picks up the partition layout and lets us
+    # add CHAP users that reference the partitions by name.
     start_daemon_mc
+    stop_thur_daemon
+    create_partitions
+    start_daemon_mc
+    setup_chap_users
     create_cartridges
     iscsi_login
-    setup_initiator_devices A "$IFACE_A" || exit 1
-    setup_initiator_devices B "$IFACE_B" || exit 1
+    setup_initiator_devices A "$IFACE_A" "${#DRIVES_A[@]}" || exit 1
+    setup_initiator_devices B "$IFACE_B" "${#DRIVES_B[@]}" || exit 1
 
     mc_seed_init "$SEED" "$TEST_DIR/ops.log"
     log_info "Running $OPS ops/initiator concurrently across 2 initiators (4 drives, 6 carts)"
@@ -702,17 +853,22 @@ main() {
 
     # Per-initiator subshells. Each seeds from a DERIVED seed (parent
     # seed XOR initiator tag) so the two streams aren't byte-identical.
+    # The last two args are this partition's mtx storage-element range
+    # (1-based, inclusive), so `any_empty_slot_local` only returns
+    # slots a MOVE MEDIUM partition fence will accept.
     local seed_a=$(( MC_SEED + 1 ))
     local seed_b=$(( MC_SEED + 2 ))
+    local a_slot_lo=$(( SLOTS_A_START + 1 )) a_slot_hi=$SLOTS_A_END
+    local b_slot_lo=$(( SLOTS_B_START + 1 )) b_slot_hi=$SLOTS_B_END
 
     (
         run_initiator_ops A "$CHANGER_DEVICE_A" "$nst_a" "$da_csv" "$ca_csv" \
-            "$OPS" "$TEST_DIR/ops-a.log" "$seed_a"
+            "$OPS" "$TEST_DIR/ops-a.log" "$seed_a" "$a_slot_lo" "$a_slot_hi"
     ) &
     local pid_a=$!
     (
         run_initiator_ops B "$CHANGER_DEVICE_B" "$nst_b" "$db_csv" "$cb_csv" \
-            "$OPS" "$TEST_DIR/ops-b.log" "$seed_b"
+            "$OPS" "$TEST_DIR/ops-b.log" "$seed_b" "$b_slot_lo" "$b_slot_hi"
     ) &
     local pid_b=$!
 

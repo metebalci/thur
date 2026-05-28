@@ -785,6 +785,65 @@ fn partition_fence_is_a_noop_for_an_unbound_session() {
     assert!(handlers::check_partition_fence(&ctx).unwrap().is_none());
 }
 
+/// Context with session_partition bound to a name the library doesn't
+/// know about. `partition_drive_ids` returns `None` for an unknown
+/// partition, which makes `owned` false in the fence — same shape as a
+/// session bound to a real partition trying to touch a drive that
+/// partition doesn't own.
+fn fence_ctx<'a>(fx: &'a Fixture, pdu: &'a mut Pdu, cdb: [u8; 16]) -> ScsiCtx<'a> {
+    let mut ctx = fx.ctx(pdu, cdb);
+    ctx.session_partition = Some("other-partition");
+    ctx
+}
+
+#[test]
+fn partition_fence_lets_report_luns_through_for_self_filtering() {
+    // REPORT LUNS on an out-of-partition LUN must pass the fence so
+    // the handler can return the admitted-LUN subset to the initiator.
+    let fx = Fixture::new();
+    let mut p = pdu();
+    let ctx = fence_ctx(&fx, &mut p, cdb(0xA0));
+    assert!(handlers::check_partition_fence(&ctx).unwrap().is_none());
+}
+
+#[test]
+fn partition_fence_returns_no_lun_inquiry_for_unowned_drive() {
+    // INQUIRY on a non-admitted LUN must return Good + the SPC-4
+    // "no logical unit" sentinel (byte 0 = 0x7F) so the Linux iSCSI
+    // initiator keeps scanning the remaining LUNs.
+    let fx = Fixture::new();
+    let mut c = cdb(0x12);
+    c[3..5].copy_from_slice(&96u16.to_be_bytes()); // allocation length
+    let mut p = pdu();
+    let ctx = fence_ctx(&fx, &mut p, c);
+    let resp = handlers::check_partition_fence(&ctx)
+        .unwrap()
+        .expect("fence must refuse INQUIRY on out-of-partition LUN");
+    assert_eq!(resp.status, ScsiStatus::Good);
+    assert!(resp.sense.is_none());
+    assert!(!resp.data_out.is_empty());
+    // byte 0 = (PQ << 5) | type = (0b011 << 5) | 0x1F = 0x7F
+    assert_eq!(resp.data_out[0], 0x7F);
+}
+
+#[test]
+fn partition_fence_returns_check_condition_for_other_opcodes() {
+    // Non-INQUIRY / non-REPORT-LUNS opcode → CHECK CONDITION +
+    // ILLEGAL REQUEST + LOGICAL UNIT NOT SUPPORTED.
+    let fx = Fixture::new();
+    let mut p = pdu();
+    let ctx = fence_ctx(&fx, &mut p, cdb(0x08)); // READ(6)
+    let resp = handlers::check_partition_fence(&ctx)
+        .unwrap()
+        .expect("fence must refuse READ on out-of-partition LUN");
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.as_ref().expect("sense buffer present");
+    // Fixed-format sense: byte 2 low 4 bits = key, byte 12 = ASC, byte 13 = ASCQ.
+    assert_eq!(sense[2] & 0x0F, 0x05); // ILLEGAL REQUEST
+    assert_eq!(sense[12], 0x25); // LOGICAL UNIT NOT SUPPORTED
+    assert_eq!(sense[13], 0x00);
+}
+
 #[test]
 fn inquiry_unsupported_vpd_page_is_rejected() {
     let fx = Fixture::new();

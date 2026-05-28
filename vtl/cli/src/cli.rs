@@ -999,12 +999,13 @@ enum PartitionAction {
 
     /// Create a new partition.
     ///
-    /// Storage range is half-open `[start, end)`. Drives is a
-    /// comma-separated list of drive ids. The partition layout must
-    /// cover every storage slot and drive exactly once across all
-    /// defined partitions; this command fails if the resulting
-    /// layout doesn't. (Mail slots are global in this build — the
-    /// single IE element is partition-agnostic.)
+    /// Storage range and mail range are half-open `[start, end)`.
+    /// Drives is a comma-separated list of drive ids. The partition
+    /// layout must cover every storage slot, mail slot, and drive
+    /// exactly once across all defined partitions; this command fails
+    /// if the resulting layout doesn't. Most chassis carry one mail
+    /// slot (the global IE element) — assign it to whichever
+    /// partition owns the host that drives imports/exports.
     Create {
         /// Partition name (1-64 chars, unique).
         name: String,
@@ -1016,6 +1017,14 @@ enum PartitionAction {
         /// Storage-slot range end (exclusive).
         #[arg(long)]
         storage_end: u32,
+
+        /// Mail-slot range start (inclusive). Default 0 (no mail slots).
+        #[arg(long, default_value_t = 0)]
+        mail_start: u32,
+
+        /// Mail-slot range end (exclusive). Default 0 (no mail slots).
+        #[arg(long, default_value_t = 0)]
+        mail_end: u32,
 
         /// Drive ids assigned to this partition (comma-separated).
         #[arg(long, value_delimiter = ',')]
@@ -1035,6 +1044,12 @@ enum PartitionAction {
 
         #[arg(long)]
         storage_end: Option<u32>,
+
+        #[arg(long)]
+        mail_start: Option<u32>,
+
+        #[arg(long)]
+        mail_end: Option<u32>,
 
         /// Replace the drive set (comma-separated). Pass `--drives ""`
         /// to clear it.

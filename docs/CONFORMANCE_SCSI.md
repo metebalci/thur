@@ -84,7 +84,7 @@ expose must answer.
 |-------:|---------|--------|:----:|-------|
 | 0x00 | TEST UNIT READY | 🟩 Yes | M | Returns GOOD once UA cleared. |
 | 0x03 | REQUEST SENSE | 🟩 Yes | M | Fixed + descriptor formats. |
-| 0x12 | INQUIRY | 🟩 Yes | M | Standard page + VPD pages — see per-product VPD tables below. |
+| 0x12 | INQUIRY | 🟩 Yes | M | Standard page + VPD pages — see per-product VPD tables below. thurvtl tape: partition-fenced sessions get the SPC-4 "no logical unit" sentinel (peripheral qualifier 0b011, peripheral type 0x1F) when INQUIRYing a drive LUN whose drive isn't in the CHAP user's partition. Same shape thurvsa returns for unmapped volume LUNs. Lets the Linux kernel iSCSI initiator's all-LUNs post-login probe skip the LU and keep scanning the rest. |
 | 0x15 | MODE SELECT(6) | 🟩 Partial | M | thurvtl tape: honors page 0x0F DCE bit and page 0x11 partition layout for behavior. Other advertised pages (0x01, 0x02, 0x10/0x00, 0x10/0x01 SPF=1, 0x1A, 0x1C) are round-tripped — bytes the host writes are stored per-drive (emulated NVRAM) and re-emitted verbatim by the next MODE SENSE under PC=Current / PC=Saved. SP=1 mirrors the bodies into `<data_dir>/library/drive_state.json` so they survive cartridge swaps and restarts. PS=1 advertised on every page header; per-page Changeable masks reflect round-tripped fields. Changer LUN 0 is read-only — every page accepted-and-ignored. thurvsa block: validate-and-accept-if-matches against the values MODE SENSE just returned (PF=1 required; SP=1 → SAVING PARAMETERS NOT SUPPORTED; every Changeable bit zero so WCE / RCD / DRA / D_SENSE can't flip). |
 | 0x16 | RESERVE(6) | 🟩 No-op | O | Accepted; reservation state not tracked. SPC-4 obsoletes RESERVE/RELEASE in favor of PERSISTENT RESERVE. |
 | 0x17 | RELEASE(6) | 🟩 No-op | O | Accepted. |
@@ -599,7 +599,7 @@ LTO-8) rather than by SSC-4.
 | 0xA6 | EXCHANGE MEDIUM | 🟩 Yes | O | Composed from two MOVE MEDIUMs. Same partition fence applies to all three element addresses. |
 | 0xB5 | REQUEST VOLUME ELEMENT ADDRESS | 🟩 Stub | O | Empty response. |
 | 0xB6 | SEND VOLUME TAG | 🟩 No-op | O | No barcode-assignment side-effect. |
-| 0xB8 | READ ELEMENT STATUS | 🟩 Yes | M | All element types; VOLTAG / DVCID / Mixed / CurData / Access flags honored. Partition-fenced sessions see only in-partition elements (out-of-partition slots/drives silently dropped). |
+| 0xB8 | READ ELEMENT STATUS | 🟩 Yes | M | All element types; VOLTAG / DVCID / Mixed / CurData / Access flags honored. **Not** partition-fenced — every session sees every element. `mtx` parses a zero-descriptor per-type page as `Transport Element Descriptor Length too short`, so dropping out-of-partition elements there breaks `mtx load`. Topology leak is contained: MOVE MEDIUM / EXCHANGE MEDIUM still refuse out-of-partition src/dst, and drive-LUN INQUIRY against an out-of-partition LUN still returns PQ=NoDevice, so the data path stays isolated. |
 
 ### Changer-side mode pages (LUN 0)
 
@@ -852,13 +852,23 @@ logical partitions, each owning a disjoint set of storage, mail, and
 drive elements. A session is bound to one partition through its CHAP
 credentials — the `partition:` field on a CHAP user in
 `<data_dir>/iscsi-users.json`. Once bound, the fence is enforced
-several ways: MOVE MEDIUM, EXCHANGE MEDIUM, and READ ELEMENT STATUS
-all refuse to reach elements outside the partition, and REPORT LUNS
-hides drives that belong to other partitions. Underneath, there is
-still a single IQN and a single, global element-address space — the
-chassis namespace is not actually subdivided — but the SCSI surface
-the bound session sees behaves as though out-of-partition elements
-did not exist.
+several ways: MOVE MEDIUM and EXCHANGE MEDIUM refuse to reach
+elements outside the partition, REPORT LUNS hides drives that belong
+to other partitions, and an out-of-partition drive-LUN INQUIRY
+returns the SPC-4 "no logical unit" sentinel (peripheral qualifier
+0b011 / peripheral type 0x1F) — the kernel iSCSI initiator's
+all-LUNs post-login probe skips the LU and keeps scanning, instead
+of fail-stopping on CHECK CONDITION. READ ELEMENT STATUS is the one
+intentional exception: it returns the full chassis to every session,
+because `mtx(1)` parses a zero-descriptor per-type page as
+`Transport Element Descriptor Length too short` and aborts. The
+resulting leak is topological only — a session can *learn* that
+other elements exist, but the data path stays isolated (drive-LUN
+INQUIRY blocks the SCSI surface; MOVE/EXCHANGE MEDIUM blocks the
+robot path). Underneath, there is still a single IQN and a single,
+global element-address space — the chassis namespace is not actually
+subdivided — but the addressable SCSI surface the bound session sees
+behaves as though out-of-partition data-path elements did not exist.
 
 **Distinct serials per partition.** So that a host treats each
 partition as a separate library, the identity values are made

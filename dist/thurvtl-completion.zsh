@@ -158,6 +158,8 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--storage-start=[Storage-slot range start (inclusive)]:STORAGE_START:_default' \
 '--storage-end=[Storage-slot range end (exclusive)]:STORAGE_END:_default' \
+'--mail-start=[Mail-slot range start (inclusive). Default 0 (no mail slots)]:MAIL_START:_default' \
+'--mail-end=[Mail-slot range end (exclusive). Default 0 (no mail slots)]:MAIL_END:_default' \
 '*--drives=[Drive ids assigned to this partition (comma-separated)]:DRIVES:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -172,6 +174,8 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--storage-start=[]:STORAGE_START:_default' \
 '--storage-end=[]:STORAGE_END:_default' \
+'--mail-start=[]:MAIL_START:_default' \
+'--mail-end=[]:MAIL_END:_default' \
 '*--drives=[Replace the drive set (comma-separated). Pass \`--drives ""\` to clear it]:DRIVES:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \

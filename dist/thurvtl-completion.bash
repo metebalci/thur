@@ -4197,7 +4197,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__create)
-            opts="-c -h --storage-start --storage-end --drives --config --user --copyright --help <NAME>"
+            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --copyright --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4208,6 +4208,14 @@ _thurvtl() {
                     return 0
                     ;;
                 --storage-end)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mail-start)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mail-end)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -4375,7 +4383,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__modify)
-            opts="-c -h --storage-start --storage-end --drives --config --user --copyright --help <NAME>"
+            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --copyright --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4386,6 +4394,14 @@ _thurvtl() {
                     return 0
                     ;;
                 --storage-end)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mail-start)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mail-end)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

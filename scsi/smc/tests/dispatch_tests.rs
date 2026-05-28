@@ -212,6 +212,34 @@ fn read_element_status_returns_descriptors_per_element_type() {
 }
 
 #[test]
+fn read_element_status_dispatch_is_not_partition_filtered() {
+    // Dispatch-level partition filtering is intentionally off — mtx
+    // breaks on zero-descriptor per-type pages. Verify a session bound
+    // to a non-existent partition still gets a non-empty data-transfer
+    // response (chassis-wide view), instead of an empty 16-byte
+    // header-only response.
+    let fx = Fixture::default();
+    let mut c = cdb(0xB8);
+    c[1] = 0x04; // DataTransfer
+    c[4..6].copy_from_slice(&2u16.to_be_bytes()); // num_elements
+    c[7..10].copy_from_slice(&[0x00, 0x01, 0x00]); // alloc = 256
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx(&mut pdu, c, 0);
+    ctx.inner.session_partition = Some("nonexistent-partition");
+    let resp = handlers::handle_read_element_status(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+    // 8-byte ESD header + 8-byte page header = 16 bytes when filtered
+    // empty. With filtering off we expect at least one descriptor (the
+    // fixture creates 2 drives, base descriptor size = 12 bytes), so
+    // a full response is > 16 bytes.
+    assert!(
+        resp.data_out.len() > 16,
+        "expected unfiltered response (>16 bytes), got {}",
+        resp.data_out.len()
+    );
+}
+
+#[test]
 fn read_element_status_rejects_an_invalid_element_type() {
     let fx = Fixture::default();
     let mut c = cdb(0xB8);

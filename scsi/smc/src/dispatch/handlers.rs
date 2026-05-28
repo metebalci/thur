@@ -63,7 +63,18 @@ pub fn handle_read_element_status(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> 
     let lun = ctx.lun;
     let library = ctx.library;
     let element_config = ctx.element_config;
-    let session_partition = ctx.session_partition;
+    // READ ELEMENT STATUS is intentionally NOT partition-filtered: mtx
+    // refuses our `descriptor_length = 12` baseline when a per-type
+    // page comes back with zero descriptors (the "Transport Element
+    // Descriptor Length too short" fatal path in `mtxl.c`). The
+    // data-path is still fenced — out-of-partition drive LUNs return
+    // the SPC-4 "no logical unit" sentinel on INQUIRY, and MOVE
+    // MEDIUM refuses any source/dest outside the session's
+    // partition. The leak is purely topological: a tenant's session
+    // can see *that* other elements exist via READ ELEMENT STATUS but
+    // can't address or move them.
+    let session_partition: Option<&str> = None;
+    let _ = ctx.session_partition;
 
     if lun != 0 {
         return Ok(ScsiResp::check_condition());

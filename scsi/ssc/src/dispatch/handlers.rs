@@ -1924,9 +1924,22 @@ pub fn handle_maintenance_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
 /// element level inside MOVE MEDIUM / READ ELEMENT STATUS.
 ///
 /// Returns `Ok(None)` to proceed with dispatch, or
-/// `Ok(Some(check_condition_response))` to refuse the command. Mirrors
-/// the historical fence in thurvtl's `dispatch_scsi`. An
-/// unpartitioned topology has its facade return `None` from
+/// `Ok(Some(refusal_response))` to refuse the command. Refusal shape
+/// depends on the CDB opcode:
+///
+/// - **INQUIRY (0x12)** — Good with the SPC-4 "no logical unit" sentinel
+///   (peripheral qualifier 0b011, peripheral type 0x1F). The Linux iSCSI
+///   initiator INQUIRYs every LUN at login; CHECK CONDITION here makes
+///   the kernel stop scanning further LUNs, hiding in-partition drives
+///   at higher LUN ids. PQ=NoDevice lets the kernel skip the LU and
+///   continue scanning, which is what real SAN LUN-masked targets do.
+/// - **REPORT LUNS (0xA0)** — allowed through (the handler filters the
+///   reported LUN list via `drive_ids_in_partition` itself).
+/// - **Everything else** — CHECK CONDITION + ILLEGAL REQUEST + ASC/ASCQ
+///   0x25/0x00 (LOGICAL UNIT NOT SUPPORTED), per SPC-4 §5.5.2 /
+///   SAM-5 §5.5.
+///
+/// An unpartitioned topology has its facade return `None` from
 /// `partition_drive_ids` and this fence is effectively a no-op.
 pub fn check_partition_fence(ctx: &ScsiCtx<'_>) -> Result<Option<ScsiResp>> {
     let Some(part_name) = ctx.session_partition else {
@@ -1945,12 +1958,44 @@ pub fn check_partition_fence(ctx: &ScsiCtx<'_>) -> Result<Option<ScsiResp>> {
         return Ok(None);
     }
 
-    tracing::warn!(
-        "partition fence: session bound to '{}' tried to address drive {} (LUN {}) not in partition",
+    // REPORT LUNS does its own per-partition filtering inside the
+    // handler — passing it through here lets the initiator discover the
+    // admitted-LUN subset on every refresh.
+    if ctx.cdb[0] == 0xA0 {
+        return Ok(None);
+    }
+
+    tracing::debug!(
+        "partition fence: session bound to '{}' refused drive {} (LUN {}, op 0x{:02x})",
         part_name,
         ctx.drive_id,
         ctx.lun,
+        ctx.cdb[0],
     );
+
+    // INQUIRY → Good with the "no logical unit" sentinel so the kernel
+    // SCSI scan keeps walking the remaining LUNs.
+    if ctx.cdb[0] == 0x12 {
+        let alloc = u16::from_be_bytes([ctx.cdb[3], ctx.cdb[4]]) as u32;
+        let no_lun = scsi_spc::inquiry::build_inquiry_no_lun(
+            scsi_spc::inquiry::Identity {
+                vendor: shared_naming::VENDOR_INQUIRY,
+                product: "",
+                revision: "",
+            },
+            scsi_spc::inquiry::InquiryFlags {
+                spc_version: 0x05,
+                hisup: true,
+                cmdque: false,
+            },
+        );
+        return Ok(Some(ScsiResp {
+            status: ScsiStatus::Good,
+            data_out: limit_len(no_lun, alloc),
+            sense: None,
+        }));
+    }
+
     // SPC-4 §5.5.2 / SAM-5 §5.5: LUN that the application client has
     // not been granted access to → CHECK CONDITION + ILLEGAL REQUEST
     // + ASC/ASCQ 0x25/0x00 (LOGICAL UNIT NOT SUPPORTED).

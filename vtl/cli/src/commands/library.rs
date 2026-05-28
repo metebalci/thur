@@ -585,6 +585,8 @@ pub async fn cmd_partition_create(
     name: String,
     storage_start: u32,
     storage_end: u32,
+    mail_start: u32,
+    mail_end: u32,
     drives: Vec<u32>,
 ) -> Result<()> {
     check_daemon_not_running(data_dir)?;
@@ -601,16 +603,17 @@ pub async fn cmd_partition_create(
             start: storage_start,
             end: storage_end,
         },
-        // Mail slot is hardwired to a single global IE element in this
-        // build (no operator surface). Partitions don't own any
-        // portion of it; this field stays for v2 schema stability.
-        mail_slots: SlotRange::default(),
+        mail_slots: SlotRange {
+            start: mail_start,
+            end: mail_end,
+        },
         drives: drives.clone(),
     });
 
     let audit_params = serde_json::json!({
         "name": name,
         "storage": [storage_start, storage_end],
+        "mail": [mail_start, mail_end],
         "drives": drives,
     });
     let result = library
@@ -635,14 +638,21 @@ pub async fn cmd_partition_modify(
     name: String,
     storage_start: Option<u32>,
     storage_end: Option<u32>,
+    mail_start: Option<u32>,
+    mail_end: Option<u32>,
     drives: Option<Vec<u32>>,
 ) -> Result<()> {
     check_daemon_not_running(data_dir)?;
     let mut library = open_library_for_chassis(data_dir)?;
 
-    if storage_start.is_none() && storage_end.is_none() && drives.is_none() {
+    if storage_start.is_none()
+        && storage_end.is_none()
+        && mail_start.is_none()
+        && mail_end.is_none()
+        && drives.is_none()
+    {
         anyhow::bail!(
-            "no modifications specified. Provide at least one of: --storage-start, --storage-end, --drives"
+            "no modifications specified. Provide at least one of: --storage-start, --storage-end, --mail-start, --mail-end, --drives"
         );
     }
 
@@ -658,6 +668,12 @@ pub async fn cmd_partition_modify(
     if let Some(v) = storage_end {
         target.storage_slots.end = v;
     }
+    if let Some(v) = mail_start {
+        target.mail_slots.start = v;
+    }
+    if let Some(v) = mail_end {
+        target.mail_slots.end = v;
+    }
     if let Some(d) = drives.clone() {
         target.drives = d;
     }
@@ -666,6 +682,8 @@ pub async fn cmd_partition_modify(
         "name": name,
         "storage_start": storage_start,
         "storage_end": storage_end,
+        "mail_start": mail_start,
+        "mail_end": mail_end,
         "drives": drives,
     });
     let result = library

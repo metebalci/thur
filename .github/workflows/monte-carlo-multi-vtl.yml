@@ -2,16 +2,15 @@ name: monte-carlo-multi-vtl
 
 # Multi-initiator companion to nightly-monte-carlo-vtl. Two distinct
 # iSCSI initiator IQNs concurrently drive disjoint drive sets against
-# a single thurvtl daemon (4 drives, 6 carts). Manual-only for now
-# because vtl-daemon's scsi_ssc::drive_manager grants drive locks
-# per-session at INQUIRY time and holds them until session close,
-# so the kernel's post-login LUN probe causes one initiator to
-# capture all drives — see the script header for the full note. The
-# workflow is wired up and ready to flip to a nightly schedule once
-# the daemon supports per-cartridge / per-partition session
-# admission or a per-command lock model.
+# a single thurvtl daemon (4 drives, 6 carts) via per-CHAP-user
+# logical partition admission. Each session locks only the drives
+# its partition owns, so the two streams hold disjoint subsets.
+# Schedule offsets from the single-initiator nightly so they don't
+# fight for runners.
 
 on:
+  schedule:
+    - cron: "30 3 * * *"
   workflow_dispatch:
 
 permissions:
