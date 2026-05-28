@@ -873,7 +873,10 @@ mod tests {
         // eviction itself still happens).
         assert!(hex_to_blake3("").is_none());
         assert!(hex_to_blake3("abc").is_none());
-        assert!(hex_to_blake3("xx112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").is_none());
+        assert!(
+            hex_to_blake3("xx112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+                .is_none()
+        );
     }
 
     /// Setter wiring contract: a fresh manager starts with no ghost

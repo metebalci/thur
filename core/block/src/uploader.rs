@@ -895,10 +895,7 @@ impl VolumeWriter {
         } else {
             if let Some(gl) = self.ghost_list.as_ref() {
                 if let Some(age) = gl.lookup(&hash, now_unix_secs()) {
-                    shared_telemetry::record::cache_miss_after_eviction(
-                        gl.backend(),
-                        age as f64,
-                    );
+                    shared_telemetry::record::cache_miss_after_eviction(gl.backend(), age as f64);
                 }
             }
             let object_key = self.pool.object_key(&hash_hex);
