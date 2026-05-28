@@ -79,6 +79,8 @@ pub mod error {
         H2CDataLengthMismatch { datal: u32, actual: usize },
         #[error("PDO {pdo} outside PDU bounds (PLEN {plen})")]
         PdoOutOfBounds { pdo: u8, plen: u32 },
+        #[error("PDO {pdo} falls inside the common header (must be >= 8)")]
+        PdoInHeader { pdo: u8 },
         #[error("I/O error reading PDU: {0}")]
         Io(#[from] std::io::Error),
         #[error("base SQE parse: {0}")]
@@ -458,6 +460,13 @@ impl RawPdu {
                 plen: self.header.plen,
             });
         }
+        // A non-zero PDO that lands inside the common header would
+        // underflow the `pdo - WIRE_LEN` body offset below. Reject it.
+        if (self.header.pdo as usize) < CommonHeader::WIRE_LEN {
+            return Err(PduError::PdoInHeader {
+                pdo: self.header.pdo,
+            });
+        }
         let data_digest_len = if self.header.flags & FLAGS_DDGSTF != 0 {
             4
         } else {
@@ -815,5 +824,28 @@ mod tests {
         let raw = RawPdu { header, body };
         let (_sqe, data) = parse_capsule_cmd(&raw).expect("parse");
         assert!(data.is_none());
+    }
+
+    #[test]
+    fn in_capsule_data_rejects_pdo_inside_header() {
+        // A hostile PDO in 1..=7 lands inside the common header. The
+        // old code computed `pdo - WIRE_LEN` and underflowed the usize,
+        // panicking on the body slice. It must now error cleanly.
+        for pdo in 1..CommonHeader::WIRE_LEN as u8 {
+            let body = vec![0u8; 64];
+            let header = CommonHeader {
+                pdu_type: PduType::CapsuleCmd,
+                flags: 0,
+                hlen: 72,
+                pdo,
+                plen: 8 + body.len() as u32,
+            };
+            let raw = RawPdu { header, body };
+            let err = raw.in_capsule_data().unwrap_err();
+            assert!(
+                matches!(err, PduError::PdoInHeader { pdo: p } if p == pdo),
+                "pdo={pdo} should be rejected, got {err:?}"
+            );
+        }
     }
 }

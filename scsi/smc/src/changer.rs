@@ -479,7 +479,7 @@ fn append_storage_elements(
 
     let descriptors_start = response.len();
     let slots = library.storage_slots();
-    for i in start_id..(start_id + count).min(slots.len() as u16) {
+    for i in start_id..start_id.saturating_add(count).min(slots.len() as u16) {
         if let Some(slot) = slots.get(i as usize) {
             if let Some(part) = partition_filter
                 && library.partition_for_storage_slot(slot.id) != Some(part)
@@ -556,7 +556,7 @@ fn append_import_export_elements(
 
     let descriptors_start = response.len();
     let mail_slots = library.mail_slots();
-    for i in start_id..(start_id + count).min(mail_slots.len() as u16) {
+    for i in start_id..start_id.saturating_add(count).min(mail_slots.len() as u16) {
         if let Some(slot) = mail_slots.get(i as usize) {
             if let Some(part) = partition_filter
                 && library.partition_for_mail_slot(slot.id) != Some(part)
@@ -636,7 +636,7 @@ fn append_data_transfer_elements(
 
     let descriptors_start = response.len();
     let drives = library.drives();
-    for i in start_id..(start_id + count).min(drives.len() as u16) {
+    for i in start_id..start_id.saturating_add(count).min(drives.len() as u16) {
         if let Some(drive) = drives.get(i as usize) {
             if let Some(part) = partition_filter
                 && library.partition_for_drive(drive.id) != Some(part)
@@ -1220,5 +1220,49 @@ mod tests {
         let per_page_bytes_filtered =
             u32::from_be_bytes([0, filtered[8 + 5], filtered[8 + 6], filtered[8 + 7]]);
         assert_eq!(per_page_bytes_filtered, 12 * 20);
+    }
+
+    #[test]
+    fn read_element_status_handles_start_plus_count_overflow() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let library = Library::initialize(
+            &temp_dir.path().join("library"),
+            &temp_dir.path().join("tapes"),
+            40,
+            0,
+            3,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .unwrap();
+        let cfg = ElementAddressConfig::new(0, 1001, 40, 101, 0, 1, 3);
+        let opts = ReadElementStatusOpts {
+            voltag: false,
+            dvcid: false,
+            mixed: false,
+            lto_generation: 8,
+        };
+
+        // Start at the last slot (start_id 39) and ask for the maximum
+        // host-supplied count. `start_id + count` = 39 + 65535 = 65574,
+        // which overflows u16 — debug panic / release wraparound before
+        // the fix. saturating_add must clamp it; only slot 39 returns.
+        let resp = handle_read_element_status(
+            &library,
+            &cfg,
+            ElementType::Storage,
+            cfg.storage_id_to_address(39),
+            u16::MAX,
+            &opts,
+            None,
+        )
+        .unwrap();
+        let per_page_bytes = u32::from_be_bytes([0, resp[8 + 5], resp[8 + 6], resp[8 + 7]]);
+        assert_eq!(per_page_bytes, 12, "exactly one slot descriptor expected");
     }
 }

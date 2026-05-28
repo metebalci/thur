@@ -992,13 +992,21 @@ leaves no addresses for the other three element types.
 The drive cap of **255** is a tighter, and unrelated, limit — it
 comes from the iSCSI transport rather than from SMC-3. In
 `shared/iscsi/src/transport.rs` the daemon parses the 8-byte LUN
-field of a SCSI Command PDU as `u64::from(pdu.lun[1])`, i.e. SAM
-"peripheral device addressing" (Method 0). That single byte yields
-256 LUNs total; LUN 0 is reserved for the changer, which leaves
-1..=255 for drives. Whatever counts the topology is configured with,
-the SCSI surface reports them back through MODE SENSE page 0x1D
+field of a SCSI Command PDU under SAM "peripheral device addressing"
+(Method 0): only `lun[1]` carries the LUN number. That single byte
+yields 256 LUNs total; LUN 0 is reserved for the changer, which
+leaves 1..=255 for drives. Whatever counts the topology is configured
+with, the SCSI surface reports them back through MODE SENSE page 0x1D
 (Element Address Assignment), derived live from the topology rather
 than stored separately.
+
+Because only `lun[1]` is significant, a malformed LUN with a non-zero
+`lun[0]` (the addressing-method / bus field) or any non-zero byte in
+`lun[2..8]` is **rejected**, not aliased: `decode_lun` maps it to an
+out-of-range sentinel so the dispatcher answers CHECK CONDITION /
+ASC 0x25 (LOGICAL UNIT NOT SUPPORTED). This stops a host from, say,
+addressing `0x01_00` and silently landing on LUN 0 (the changer) by
+having the high byte dropped.
 
 ### Firmware revision identity
 

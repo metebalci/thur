@@ -176,6 +176,15 @@ where
 /// can still accept this in one PDU plus headers.
 const ADVERTISED_MAXH2CDATA: u32 = 128 * 1024;
 
+/// Hard ceiling on a single command's total transfer length (the SGL
+/// data length in the SQE). Without it, a host's declared length flows
+/// straight into a `vec![0u8; sgl_len]` allocation — up to 4 GiB from
+/// one CapsuleCmd, a memory-amplification DoS. We advertise this as
+/// MDTS in Identify Controller (`MDTS = log2(MAX_TRANSFER_BYTES / 4 KiB)`,
+/// CAP.MPSMIN = 0 → 4 KiB page) so conformant hosts split larger I/O;
+/// anything still over the cap is aborted with Invalid Field in Command.
+const MAX_TRANSFER_BYTES: u32 = 1024 * 1024;
+
 /// Direction of host-visible data transfer on an NVMe command,
 /// derived from the low two bits of the opcode (NVMe Base §4.2.1
 /// Figure 138). Drives whether the server expects in-capsule data /
@@ -663,6 +672,27 @@ where
                 }
                 let sgl_len = pdu::sgl_data_length(&sqe);
                 let icd_len = icd_owned.len() as u32;
+
+                // Bound the host-declared transfer before it reaches the
+                // `vec![0u8; sgl_len]` in handle_command. Exceeding the
+                // advertised MDTS is aborted with Invalid Field in
+                // Command (NVMe Base §5.17.2.1) rather than allocating.
+                if sgl_len > MAX_TRANSFER_BYTES {
+                    tracing::warn!(
+                        peer = %peer,
+                        sgl_len,
+                        cap = MAX_TRANSFER_BYTES,
+                        "nvme-tcp: command transfer length exceeds MDTS cap",
+                    );
+                    let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::invalid_field());
+                    let _ = outbound
+                        .send(OutboundPdu::CommandResponse {
+                            cqe,
+                            data_in: Vec::new(),
+                        })
+                        .await;
+                    continue;
+                }
 
                 // Fused Compare+Write — first half is always fully
                 // in-capsule (Compare's data accompanies the SQE; we
@@ -1570,6 +1600,39 @@ mod tests {
         assert_eq!(captured.len(), total_len as usize);
         assert_eq!(captured, payload);
         assert_eq!(handler.io_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_transfer_length_rejected_without_alloc() {
+        let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
+        let port = spawn_server(Arc::clone(&handler)).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // ICResp
+        stream
+            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
+            .await
+            .unwrap();
+        let _ = read_pdu_async(&mut stream).await; // Connect resp
+
+        // A Write declaring a 4 GiB-1 transfer length. Pre-fix this
+        // flowed into `vec![0u8; sgl_len]`. It must instead come back
+        // as a failure CQE (Invalid Field), with no R2T and no handler
+        // dispatch.
+        let cid: u16 = 0x55;
+        stream
+            .write_all(&build_write_no_icd_pdu(cid, 1, u32::MAX))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        let resp = read_pdu_async(&mut stream).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(&resp.body[12..14], &cid.to_le_bytes());
+        let status = u16::from_le_bytes([resp.body[14], resp.body[15]]);
+        assert_eq!(status, StatusField::invalid_field().to_u16());
+        assert_eq!(handler.io_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

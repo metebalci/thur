@@ -105,6 +105,12 @@ pub struct IdentifyController {
     /// IORCSZ — I/O Queue Response Capsule Size, in units of 16 bytes.
     /// Always 1 for us (= 16 byte CQE only).
     pub iorcsz: u32,
+    /// MDTS — Maximum Data Transfer Size, in units of `2^MDTS *
+    /// CAP.MPSMIN` page (MPSMIN = 0 → 4 KiB). Caps a single command's
+    /// transfer so a host can't declare an arbitrarily large length;
+    /// the NVMe/TCP transport rejects anything over this. Zero means
+    /// "no limit" — never use that for a host-facing target.
+    pub mdts: u8,
 }
 
 /// Keep Alive Support advertised in Identify Controller (NVMe Base
@@ -158,6 +164,10 @@ impl IdentifyController {
             // wires its inline-data handler.
             ioccsz: 1028,
             iorcsz: 1,
+            // MDTS = 8 → 2^8 * 4 KiB = 1 MiB max transfer, matching the
+            // NVMe/TCP transport's MAX_TRANSFER_BYTES ceiling. Keep the
+            // two in lockstep.
+            mdts: 8,
         })
     }
 
@@ -175,8 +185,7 @@ impl IdentifyController {
         // RAB at 73 = 0 (no recommended arbitration burst hint)
         // IEEE OUI at 73..76 zero
         // CMIC at 76 zero (no multi-path)
-        // MDTS at 77 zero (no transfer-size limit beyond what the
-        //   transport enforces)
+        out[77] = self.mdts; // MDTS — max data transfer size
         out[78..80].copy_from_slice(&self.cntlid.to_le_bytes());
         out[80..84].copy_from_slice(&self.ver.to_le_bytes());
         // OAES, CTRATT etc all zero
@@ -382,6 +391,9 @@ mod tests {
         // SUBNQN starts at 768
         assert_eq!(&bytes[768..801], b"nqn.2025-10.com.metebalci:thurvsa");
         assert_eq!(bytes[801], 0);
+        // MDTS at byte 77 — non-zero so the host bounds its transfers.
+        // 8 → 2^8 * 4 KiB = 1 MiB.
+        assert_eq!(bytes[77], 8);
     }
 
     #[test]

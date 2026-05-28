@@ -163,6 +163,15 @@ versus how much the server must request via R2T:
 | Partial ICD + R2T tail (`0 < ICD < SGL`) | Allocate `Vec<u8>` of `SGL` bytes, copy ICD prefix, emit R2T for the remainder at offset `icd.len()` length `SGL - icd.len()`. H2CData payloads land at their absolute `DATAO`. |
 | Pure R2T (`ICD == 0`)          | Emit one R2T with `TTAG=1` covering the whole transfer; assemble H2CData PDUs by their `DATAO`. Honors host's MAXR2T and the advertised MAXH2CDATA per-PDU cap. |
 
+Before any of the four shapes above runs, the SGL data length is
+checked against the advertised MDTS ceiling (`MAX_TRANSFER_BYTES` =
+1 MiB; MDTS=8 at the 4 KiB MPSMIN page). A command declaring more is
+aborted with `Invalid Field in Command` *before* the `Vec<u8>` of
+`SGL` bytes is allocated — otherwise a single CapsuleCmd could declare
+a 4 GiB transfer and drive a memory-amplification allocation. Keep
+`MAX_TRANSFER_BYTES` (nvme-tcp) and the `IdentifyController::mdts`
+default (nvme-base) in lockstep.
+
 Protocol violations during R2T fulfillment — CCCID/TTAG mismatch,
 `DATAO+DATAL` overrun beyond the R2T window, wrong PDU type — close the
 connection with C2HTermReq + FES 0x01 / 0x02. The R2T loop performs no

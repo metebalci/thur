@@ -118,7 +118,7 @@ rather than via these commands, so a host that submits them receives
 | CNS | Name | Status | Notes |
 |----:|------|--------|-------|
 | 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; VWC bit 0 set (so Linux issues Flush). |
-| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID=1, VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
+| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID=1, VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
 | 0x02 | Active Namespace ID List | 🟩 Yes | Up to 1024 u32 NSIDs greater than `SQE.NSID`, zero-padded. |
 | 0x03 | Namespace ID Descriptor List | 🟩 Yes | Two descriptors: NIDT=0x02 NGUID (from volume UUID), then NIDT=0x04 CSI=0x00 (NVM). Linux nvme-tcp issues this right after CNS 0x00 and silently fails namespace attach without a CSI descriptor. |
 | 0x06 | I/O Command Set specific Identify Controller | 🟩 Yes | 4 KiB of zeros = "no specific NVM limits." Linux nvme-tcp issues this against a 1.4-versioned controller during bring-up; refusing it kills the namespace attach. |
@@ -209,6 +209,7 @@ dispatcher.
 | `MAXH2CDATA` (advertised) | 128 KiB | 🟩 Fixed | Per-PDU cap on host-to-controller data. |
 | `MAXR2T` (host-advertised) | Captured | 🟩 Yes | Clamped to ≥ 1 per NVMe-TCP §3.6.1. |
 | Outstanding R2Ts per command | 1 | 🟩 Fixed | Multi-R2T deferred — see *Deliberate non-conformance*. |
+| Max transfer per command (MDTS) | 1 MiB | 🟩 Fixed | Advertised as MDTS=8 (2^8 × 4 KiB page). The SGL data length is checked against this before the receive buffer is allocated; over-cap commands are aborted with `Invalid Field in Command`. Bounds a host-declared length so one CapsuleCmd can't drive a multi-GiB allocation. |
 
 ### Write data flow (ICD + R2T)
 

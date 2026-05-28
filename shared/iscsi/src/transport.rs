@@ -228,6 +228,25 @@ fn pdu_expected_xfer_len(pdu: &Pdu) -> u32 {
     u32::from_be_bytes([pdu.bhs[20], pdu.bhs[21], pdu.bhs[22], pdu.bhs[23]])
 }
 
+/// Sentinel LUN handed to the dispatcher when the host's 8-byte LUN
+/// field can't map to a real logical unit. No product addresses a LUN
+/// this high, so the handler's "logical unit not supported" path fires
+/// (CHECK CONDITION, ASC/ASCQ 0x25/0x00) instead of aliasing.
+const LUN_UNSUPPORTED: u64 = u64::MAX;
+
+/// Decode the 8-byte SAM LUN field under the single-level "peripheral
+/// device addressing" convention both products use: only `lun[1]`
+/// carries the LUN number. A non-zero `lun[0]` (addressing method /
+/// bus) or any non-zero byte in `lun[2..8]` is a LUN we don't address;
+/// returning the sentinel keeps a host from aliasing e.g. `0x01_00`
+/// onto LUN 0 (the changer) by silently dropping the high byte.
+fn decode_lun(lun: &[u8; 8]) -> u64 {
+    if lun[0] != 0 || lun[2..].iter().any(|&b| b != 0) {
+        return LUN_UNSUPPORTED;
+    }
+    u64::from(lun[1])
+}
+
 fn opcode_name(op: u8) -> &'static str {
     match op & 0x3F {
         // Initiator opcodes
@@ -1573,7 +1592,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 // discarded (which is what we want — any straggling
                 // Data-Out PDUs after burst completion are spec-illegal).
 
-                let lun = u64::from(pdu.lun[1]);
+                let lun = decode_lun(&pdu.lun);
                 let cdb_slice: [u8; 16] = {
                     let mut c = [0u8; 16];
                     c.copy_from_slice(&pdu.bhs[32..48]);
@@ -2089,6 +2108,23 @@ mod tests {
         };
         pdu.bhs[20..24].copy_from_slice(&12345u32.to_be_bytes());
         assert_eq!(pdu_expected_xfer_len(&pdu), 12345);
+    }
+
+    #[test]
+    fn decode_lun_reads_single_byte() {
+        assert_eq!(decode_lun(&[0, 0, 0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(decode_lun(&[0, 5, 0, 0, 0, 0, 0, 0]), 5);
+        assert_eq!(decode_lun(&[0, 255, 0, 0, 0, 0, 0, 0]), 255);
+    }
+
+    #[test]
+    fn decode_lun_rejects_high_byte_instead_of_aliasing() {
+        // 0x01_00 must NOT alias onto LUN 0 (the changer) — it has no
+        // real LUN, so it decodes to the unsupported sentinel.
+        assert_eq!(decode_lun(&[0x01, 0x00, 0, 0, 0, 0, 0, 0]), LUN_UNSUPPORTED);
+        // A non-zero byte anywhere in lun[2..8] is equally unaddressable.
+        assert_eq!(decode_lun(&[0, 1, 0, 0, 0, 0, 0, 1]), LUN_UNSUPPORTED);
+        assert_eq!(decode_lun(&[0, 0, 0, 0, 0, 0, 0, 1]), LUN_UNSUPPORTED);
     }
 
     #[test]
