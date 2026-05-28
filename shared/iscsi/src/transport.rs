@@ -1427,13 +1427,31 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
             routes.remove(&itt);
         };
 
+        // Discovery sessions (TSIH=0) have no SessionManager entry; the
+        // per-connection `statsn` seeded from the Login Response is the
+        // StatSN counter we stamp on every response PDU. Normal sessions
+        // route through SessionManager so concurrent connections of the
+        // same TSIH share the counter. Every responder branch below
+        // (NOP-In, Text, SCSI Response/Data-In, TMF, Logout Response,
+        // Reject) goes through this helper so the gate can't be missed.
+        let mut next_statsn = || -> std::result::Result<u32, crate::error::IscsiError> {
+            if tsih == 0 {
+                let s = statsn;
+                statsn = statsn.wrapping_add(1);
+                Ok(s)
+            } else {
+                session_manager.get_and_increment_statsn(tsih, cid)
+            }
+        };
+
         match pdu.opcode & 0x3F {
             0x00 => {
-                // NOP-Out ping; answer with a NOP-In.
+                // NOP-Out ping; answer with a NOP-In. Legal in
+                // discovery sessions (RFC 7143 §6.1).
                 let mut nop_in = build_nop_in_response(pdu.itt);
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut nop_in.bhs, sn, exp_cmdsn, max_cmdsn);
                 write_pdu(sock, &mut nop_in).await?;
             }
@@ -1444,13 +1462,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 tx.itt = pdu.itt;
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = if tsih == 0 {
-                    let s = statsn;
-                    statsn = statsn.wrapping_add(1);
-                    s
-                } else {
-                    session_manager.get_and_increment_statsn(tsih, cid)?
-                };
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut tx.bhs, sn, exp_cmdsn, max_cmdsn);
 
                 if let Some(st) = req_keys.get("SendTargets") {
@@ -1486,11 +1498,30 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 write_pdu(sock, &mut tx).await?;
             }
             0x01 => {
-                // SCSI Command. Drain Data-Out (R2T loop) before
-                // dispatch — the handler sees a complete payload.
-                // The reader pre-registered an ITT-keyed Data-Out
-                // route iff the W-bit was set; drop it after the
-                // burst completes (success or error).
+                // SCSI Command. Illegal in discovery sessions
+                // (RFC 7143 §6.1) — reject with a typed
+                // protocol-error Reject rather than dispatching into
+                // the handler with no LUN context.
+                if tsih == 0 {
+                    tracing::warn!(
+                        "SCSI Command on discovery session from {peer} — protocol violation"
+                    );
+                    let mut rej = build_empty_pdu(0x3F, true, true);
+                    rej.itt = 0xFFFFFFFF;
+                    rej.bhs[2] = 0x04;
+                    let exp_cmdsn = next_exp_cmdsn(&pdu);
+                    let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+                    let sn = next_statsn()?;
+                    stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
+                    write_pdu(sock, &mut rej).await?;
+                    continue;
+                }
+
+                // Drain Data-Out (R2T loop) before dispatch — the
+                // handler sees a complete payload. The reader
+                // pre-registered an ITT-keyed Data-Out route iff the
+                // W-bit was set; drop it after the burst completes
+                // (success or error).
                 let edtl = pdu_expected_xfer_len(&pdu);
                 let w_bit = (pdu.bhs[1] & 0x20) != 0;
                 if w_bit && edtl as usize > pdu.data.len() {
@@ -1580,7 +1611,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                         din.bhs[36..40].copy_from_slice(&data_sn.to_be_bytes());
                         din.bhs[40..44].copy_from_slice(&(cursor as u32).to_be_bytes());
                         if is_last {
-                            let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                            let sn = next_statsn()?;
                             stamp_serials_for_response(&mut din.bhs, sn, exp_cmdsn, max_cmdsn);
                         } else {
                             // Non-final Data-In: StatSN reserved
@@ -1622,30 +1653,49 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                         payload.extend_from_slice(&sense);
                         sresp.data = payload;
                     }
-                    let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                    let sn = next_statsn()?;
                     stamp_serials_for_response(&mut sresp.bhs, sn, exp_cmdsn, max_cmdsn);
                     write_pdu(sock, &mut sresp).await?;
                 }
             }
             0x02 => {
-                // Task Management — function complete.
+                // Task Management. Illegal in discovery sessions
+                // (RFC 7143 §6.1) — reject with a typed protocol-
+                // error Reject rather than fabricating a "function
+                // complete" TMF Response without session state.
+                if tsih == 0 {
+                    tracing::warn!(
+                        "Task Management on discovery session from {peer} — protocol violation"
+                    );
+                    let mut rej = build_empty_pdu(0x3F, true, true);
+                    rej.itt = 0xFFFFFFFF;
+                    rej.bhs[2] = 0x04;
+                    let exp_cmdsn = next_exp_cmdsn(&pdu);
+                    let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+                    let sn = next_statsn()?;
+                    stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
+                    write_pdu(sock, &mut rej).await?;
+                    continue;
+                }
                 let mut tmf = build_empty_pdu(0x22, true, true);
                 tmf.itt = pdu.itt;
                 tmf.bhs[2] = 0x00;
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut tmf.bhs, sn, exp_cmdsn, max_cmdsn);
                 write_pdu(sock, &mut tmf).await?;
             }
             0x06 => {
-                // Logout — connection closed successfully.
+                // Logout — connection closed successfully. Legal in
+                // both normal and discovery sessions (RFC 7143 §6.1);
+                // the latter is how libiscsi tears down `iscsi-ls`.
                 let mut logout_resp = build_empty_pdu(0x26, true, true);
                 logout_resp.itt = pdu.itt;
                 logout_resp.bhs[2] = 0x00;
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut logout_resp.bhs, sn, exp_cmdsn, max_cmdsn);
                 write_pdu(sock, &mut logout_resp).await?;
                 break;
@@ -1662,7 +1712,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 rej.bhs[2] = 0x04; // Protocol error
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
                 write_pdu(sock, &mut rej).await?;
             }
@@ -1678,7 +1728,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 rej.bhs[2] = 0x09; // Command not supported
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = session_manager.get_and_increment_statsn(tsih, cid)?;
+                let sn = next_statsn()?;
                 stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
                 write_pdu(sock, &mut rej).await?;
             }
@@ -2929,6 +2979,153 @@ mod tests {
         assert_eq!(rej.bhs[2], 0x04, "protocol error reason");
         drop(client);
         let _ = server.await.unwrap();
+    }
+
+    // Regression for issue #41: the discovery-session FFP loop must
+    // answer NOP-Out and Logout with the per-connection statsn counter
+    // instead of routing through SessionManager (TSIH=0 has no entry).
+    // Before the fix, `iscsi-ls iscsi://127.0.0.1:<port>` hung on Logout
+    // because the daemon returned IscsiError::InvalidSession(0) and
+    // dropped the connection without writing a Logout Response.
+    #[tokio::test]
+    async fn serve_connection_discovery_session_completes_logout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:tgt".into(),
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:9",
+                &[],
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[
+                ("InitiatorName", "iqn.init:disc-e2e"),
+                ("SessionType", "Discovery"),
+            ],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let login_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(login_resp.opcode, 0x23, "Login Response");
+        // TSIH must be 0 — this is the precondition the bug fix covers.
+        let resp_tsih = u16::from_be_bytes([login_resp.bhs[14], login_resp.bhs[15]]);
+        assert_eq!(resp_tsih, 0, "discovery session must keep TSIH=0");
+
+        // NOP-Out → NOP-In (was the second failure path).
+        let mut nop = build_empty_pdu(0x00, true, true);
+        nop.itt = 0x0111;
+        write_pdu(&mut client, &mut nop).await.unwrap();
+        let nop_in = read_pdu(&mut client).await.unwrap();
+        assert_eq!(nop_in.opcode, 0x20, "NOP-In");
+        assert_eq!(nop_in.itt, 0x0111);
+
+        // SendTargets Text Request → Text Response naming the target.
+        let mut text = build_empty_pdu(0x04, true, true);
+        text.itt = 0x0222;
+        push_kv(&mut text.data, "SendTargets", "All");
+        write_pdu(&mut client, &mut text).await.unwrap();
+        let text_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(text_resp.opcode, 0x24, "Text Response");
+        let kv = parse_text_kv(&text_resp.data);
+        assert_eq!(kv.get("TargetName"), Some(&"iqn.test:tgt".to_string()));
+
+        // Logout → Logout Response (the originally-broken path).
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0x0333;
+        logout.bhs[24..28].copy_from_slice(&1u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let logout_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(logout_resp.opcode, 0x26, "Logout Response");
+        assert_eq!(logout_resp.bhs[2], 0x00, "logout success");
+
+        // serve_connection should return Ok(()) — not the pre-fix
+        // anyhow-wrapped IscsiError::InvalidSession(0).
+        server.await.unwrap().unwrap();
+        // Discovery session was never registered in SessionManager.
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    // Discovery sessions are restricted to Login/Logout/Text/NOP-Out
+    // by RFC 7143 §6.1 — SCSI Command and TMF must be rejected with a
+    // typed protocol-error Reject rather than dispatched into the
+    // handler (the pre-fix path returned an opaque InvalidSession(0)
+    // and closed the socket).
+    #[tokio::test]
+    async fn serve_connection_discovery_session_rejects_scsi_and_tmf() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:tgt".into(),
+        });
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:10",
+                &[],
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[
+                ("InitiatorName", "iqn.init:disc-illegal"),
+                ("SessionType", "Discovery"),
+            ],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+
+        let mut scsi = make_scsi_cmd(0x0101, 1, 0, 0x12, 8);
+        write_pdu(&mut client, &mut scsi).await.unwrap();
+        let rej = read_pdu(&mut client).await.unwrap();
+        assert_eq!(rej.opcode, 0x3F, "Reject PDU for SCSI Cmd in discovery");
+        assert_eq!(rej.bhs[2], 0x04, "protocol error reason");
+
+        let mut tmf = build_empty_pdu(0x02, false, true);
+        tmf.itt = 0x0202;
+        tmf.bhs[24..28].copy_from_slice(&2u32.to_be_bytes());
+        write_pdu(&mut client, &mut tmf).await.unwrap();
+        let rej2 = read_pdu(&mut client).await.unwrap();
+        assert_eq!(rej2.opcode, 0x3F, "Reject PDU for TMF in discovery");
+        assert_eq!(rej2.bhs[2], 0x04, "protocol error reason");
+
+        // Logout cleanly to close the session.
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0x0303;
+        logout.bhs[24..28].copy_from_slice(&3u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let logout_resp = read_pdu(&mut client).await.unwrap();
+        assert_eq!(logout_resp.opcode, 0x26);
+
+        server.await.unwrap().unwrap();
     }
 
     /// Test handler that returns a deterministic N-byte payload for

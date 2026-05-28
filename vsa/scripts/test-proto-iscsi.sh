@@ -27,7 +27,7 @@
 #
 # Prerequisites:
 #   - libiscsi-bin    (Debian/Ubuntu: sudo apt-get install libiscsi-bin)
-#                     Provides the iscsi-inq binary.
+#                     Provides the iscsi-inq and iscsi-ls binaries.
 #   - thurvsad and thurvsa (built or on PATH)
 #
 # No sudo / no kernel iSCSI initiator required.
@@ -94,6 +94,10 @@ check_prerequisites() {
     if ! command -v iscsi-inq >/dev/null 2>&1; then
         missing+=("iscsi-inq")
         hints+=("  - iscsi-inq: sudo apt-get install libiscsi-bin")
+    fi
+    if ! command -v iscsi-ls >/dev/null 2>&1; then
+        missing+=("iscsi-ls")
+        hints+=("  - iscsi-ls: sudo apt-get install libiscsi-bin")
     fi
     if ! command -v curl >/dev/null 2>&1; then
         missing+=("curl")
@@ -256,12 +260,25 @@ EOFCONFIG2
         test_inquiry 0 "${TEST_DIR}/inquiry-mp-portal2.log"
     ISCSI_PORT=$iscsi_port_save
 
-    # SendTargets payload enumeration is fully covered by the
-    # `build_target_addresses_*` unit tests in shared-iscsi; the
-    # iscsi-ls wire check is skipped here because libiscsi's Logout
-    # path against a discovery session trips a pre-existing daemon
-    # bug (unconditional `get_and_increment_statsn(tsih=0)` in the
-    # Logout / NOP-Out branches that's unrelated to multi-portal).
+    # SendTargets wire check via iscsi-ls: discovery Login +
+    # SendTargets + Logout against either portal must enumerate both
+    # advertised portals and exit cleanly. Regression for issue #41
+    # (Logout / NOP-Out against discovery sessions used to hang).
+    log_test "iscsi-ls discovery enumerates both portals (issue #41)"
+    if iscsi_ls_out=$(timeout 10 iscsi-ls "iscsi://127.0.0.1:$ISCSI_PORT" 2>&1); then
+        if grep -q "127.0.0.1:$ISCSI_PORT," <<<"$iscsi_ls_out" \
+            && grep -q "127.0.0.1:$ISCSI_PORT2," <<<"$iscsi_ls_out"; then
+            log_pass "iscsi-ls listed both portals"
+            PASSED=$((PASSED + 1))
+        else
+            log_fail "iscsi-ls output missing portal(s): $iscsi_ls_out"
+            FAILED=$((FAILED + 1))
+        fi
+    else
+        log_fail "iscsi-ls hung or exited non-zero: $iscsi_ls_out"
+        FAILED=$((FAILED + 1))
+    fi
+    echo ""
 
     # /sessions HTTP endpoint must report the list of listen addresses.
     log_test "/sessions JSON carries listen_addresses array"
