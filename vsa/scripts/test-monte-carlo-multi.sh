@@ -8,45 +8,53 @@
 #
 # Sibling to vsa/scripts/test-monte-carlo.sh. Spins up a single
 # thurvsad daemon serving 4 volumes (vol-mc-a1, vol-mc-a2,
-# vol-mc-b1, vol-mc-b2) over iSCSI, and runs two concurrent op
-# streams from two distinct initiator IQNs:
+# vol-mc-b1, vol-mc-b2), and runs two concurrent op streams from two
+# distinct initiators against their own pair of volumes:
 #
-#   Initiator A: iqn.2025-10.com.metebalci:vsa-mc-a
-#       CHAP user = mc-user-a-* with --volume vol-mc-a1 --volume vol-mc-a2
-#       mount     = TEST_DIR/mnt-a-{a1,a2}
+#   Initiator A: vol-mc-a1, vol-mc-a2  -> mnt-a-{a1,a2}
+#   Initiator B: vol-mc-b1, vol-mc-b2  -> mnt-b-{b1,b2}
 #
-#   Initiator B: iqn.2025-10.com.metebalci:vsa-mc-b
-#       CHAP user = mc-user-b-* with --volume vol-mc-b1 --volume vol-mc-b2
-#       mount     = TEST_DIR/mnt-b-{b1,b2}
+# Transport selectable via --transport iscsi|nvmetcp (default iscsi).
+# Op generator, content model, and verification are
+# transport-agnostic — only login / device-discovery / logout branch.
 #
-# Per-CHAP-user volume admission keeps each session blind to the
-# other initiator's volumes — without admission filtering, the
-# kernel's post-login LUN probe across all 4 devices races, and
-# mkfs.ext4 refuses with "device is apparently in use by the
-# system" even under -F. With admission, each kernel session sees
-# only its 2 admitted LUNs, the probe race disappears, and the
-# daemon's per-volume PageCache + write-back ordering + SYNCHRONIZE
-# CACHE fencing is what we're exercising under concurrent host
-# traffic.
+# --transport iscsi:
+#   Two distinct initiator IQNs over per-`iface` iscsiadm sessions.
+#   Per-CHAP-user volume admission (`iscsi users add USER --volume
+#   ...`) fences each session to its 2 admitted LUNs. Without
+#   admission, the kernel's post-login LUN probe across all 4
+#   devices races and mkfs.ext4 refuses with "device is apparently
+#   in use by the system" even under -F; admission makes the probe
+#   race disappear by keeping each session blind to the other's
+#   LUNs.
+#
+# --transport nvmetcp:
+#   Two distinct host NQNs over plaintext NVMe/TCP. Each `nvme
+#   connect` creates its own controller (nvme0, nvme1, ...) with
+#   its own /dev/nvmeXn<NSID> tree, so the kernel-claim-race that
+#   afflicts iSCSI doesn't apply — multi-controller separation is
+#   what isolates the device trees, not admission. Both controllers
+#   see all 4 namespaces; the harness application-layer-isolates by
+#   only touching its assigned pair. (TLS-PSK + per-host admission
+#   is exercised by unit tests + the iSCSI variant here — wiring it
+#   in this script needs `tlshd` on the host and is a follow-up.)
 #
 # Op mix: write_new / overwrite / read_verify / delete / sync.
 # Directory ops + write_at_offset + restart are skipped here — the
-# single-initiator harness covers those well; this one focuses on
+# single-initiator harness covers those; this one focuses on
 # concurrent dispatch.
-#
-# Transport: iSCSI only. NVMe/TCP multi-initiator (separate hostnqns)
-# is left for a follow-up; the per-volume isolation property is the
-# same, so adding it is mechanical.
 #
 # Prerequisites:
 #   - e2fsprogs, util-linux, openssl
-#   - open-iscsi + iscsid running
+#   - --transport iscsi:   open-iscsi + iscsid + lsscsi
+#   - --transport nvmetcp: nvme-cli + linux-kernel nvme_tcp module
 #   - Root/sudo access
 #
 # Usage:
 #   ./vsa/scripts/test-monte-carlo-multi.sh [OPTIONS]
 #
 # Options:
+#   --transport T         iscsi (default) or nvmetcp
 #   --seed N              Reproduce a prior run (default: pick from /dev/urandom)
 #   --quick               150 ops/initiator (default: 1000 ops/initiator)
 #   --ops N               Override per-initiator op count
@@ -54,7 +62,8 @@
 #   --daemon-path PATH    Override thurvsad path
 #   --cli-path PATH       Override thurvsa path
 #   --keep-data           Don't clean up test data directory
-#   --iscsi-port PORT     Override iSCSI port
+#   --iscsi-port PORT     Override iSCSI port  (iscsi transport)
+#   --nvmetcp-port PORT   Override NVMe/TCP port (nvmetcp transport)
 #   --http-port PORT      Override HTTP port
 #
 
@@ -72,6 +81,8 @@ source "${SCRIPT_DIR}/../../scripts/lib/monte-carlo.sh"
 TEST_DIR="/tmp/thurvsa-monte-carlo-multi-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
+SUBNQN="nqn.2025-10.com.metebalci:thurvsa"
+TRANSPORT="iscsi"
 SEED=""
 QUICK=0
 OPS=""
@@ -79,6 +90,8 @@ OPS=""
 VOLUME_NAMES_A=("vol-mc-a1" "vol-mc-a2")
 VOLUME_NAMES_B=("vol-mc-b1" "vol-mc-b2")
 VOLUME_SIZE_MIB=512
+
+# iSCSI-only identity (one iface + one CHAP user per initiator).
 INIT_IQN_A="iqn.2025-10.com.metebalci:vsa-mc-a"
 INIT_IQN_B="iqn.2025-10.com.metebalci:vsa-mc-b"
 IFACE_A="thurvsa-mc-a"
@@ -88,9 +101,18 @@ CHAP_USER_B="mc-user-b-$$"
 CHAP_PASS_A="mc-secret-a-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
 CHAP_PASS_B="mc-secret-b-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
 
+# NVMe-TCP-only identity (one host NQN per initiator).
+HOST_NQN_A="nqn.2025-10.com.metebalci:host-mc-a"
+HOST_NQN_B="nqn.2025-10.com.metebalci:host-mc-b"
+# Resolved post-`nvme connect` via list-subsys lookup.
+NVME_CTRL_A=""
+NVME_CTRL_B=""
+
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --transport) TRANSPORT="$2"; shift 2 ;;
+        --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --ops) OPS="$2"; shift 2 ;;
@@ -105,6 +127,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$TRANSPORT" in
+    iscsi|nvmetcp) ;;
+    *) echo "Unknown --transport '$TRANSPORT' (expected iscsi or nvmetcp)" >&2; exit 1 ;;
+esac
+
 [[ $QUICK -eq 1 ]] && : "${OPS:=150}"
 : "${OPS:=1000}"
 
@@ -118,11 +145,18 @@ cleanup() {
     for mp in "$TEST_DIR"/mnt-*; do
         [[ -d "$mp" ]] && mountpoint -q "$mp" 2>/dev/null && umount "$mp" 2>/dev/null || true
     done
-    iscsiadm -m node --targetname "$TARGET_IQN" -I "$IFACE_A" --logout >/dev/null 2>&1 || true
-    iscsiadm -m node --targetname "$TARGET_IQN" -I "$IFACE_B" --logout >/dev/null 2>&1 || true
-    iscsiadm -m node --targetname "$TARGET_IQN" --op delete >/dev/null 2>&1 || true
-    iscsiadm -m iface -I "$IFACE_A" -o delete >/dev/null 2>&1 || true
-    iscsiadm -m iface -I "$IFACE_B" -o delete >/dev/null 2>&1 || true
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        iscsiadm -m node --targetname "$TARGET_IQN" -I "$IFACE_A" --logout >/dev/null 2>&1 || true
+        iscsiadm -m node --targetname "$TARGET_IQN" -I "$IFACE_B" --logout >/dev/null 2>&1 || true
+        iscsiadm -m node --targetname "$TARGET_IQN" --op delete >/dev/null 2>&1 || true
+        iscsiadm -m iface -I "$IFACE_A" -o delete >/dev/null 2>&1 || true
+        iscsiadm -m iface -I "$IFACE_B" -o delete >/dev/null 2>&1 || true
+    else
+        # `nvme disconnect -n SUBNQN` tears every controller bound to
+        # the subsystem in one shot — drops both initiator A and B.
+        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+        sleep 1
+    fi
     stop_thur_daemon
     if [[ $KEEP_DATA -eq 0 ]]; then
         rm -rf "$TEST_DIR"
@@ -134,37 +168,80 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    log_info "Checking prerequisites (build profile: $BUILD_PROFILE)..."
+    log_info "Checking prerequisites (build profile: $BUILD_PROFILE, transport: $TRANSPORT)..."
     : "${DAEMON_PATH:=./target/$BUILD_PROFILE/thurvsad}"
     : "${CLI_PATH:=./target/$BUILD_PROFILE/thurvsa}"
     local tool missing=()
-    for tool in mkfs.ext4 mount umount openssl curl cmp systemctl iscsiadm lsscsi; do
+    local base_tools=(mkfs.ext4 mount umount openssl curl cmp systemctl)
+    for tool in "${base_tools[@]}"; do
         command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
     done
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        for tool in iscsiadm lsscsi; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+        done
+    else
+        command -v nvme >/dev/null 2>&1 || missing+=("nvme (nvme-cli)")
+    fi
     [[ -x "$DAEMON_PATH" ]] || missing+=("thurvsad at $DAEMON_PATH")
     [[ -x "$CLI_PATH" ]] || missing+=("thurvsa at $CLI_PATH")
     if (( ${#missing[@]} > 0 )); then
         log_error "Missing prerequisites: ${missing[*]}"
         exit 1
     fi
-    if ! systemctl is-active --quiet iscsid 2>/dev/null && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
-        log_error "iscsid (open-iscsi) service is not running."
-        exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        if ! systemctl is-active --quiet iscsid 2>/dev/null \
+                && ! systemctl is-active --quiet open-iscsi 2>/dev/null; then
+            log_error "iscsid (open-iscsi) service is not running."
+            exit 1
+        fi
+    else
+        # Linux nvme_tcp module is auto-loaded by `nvme connect`, but
+        # the kernel must support it.
+        if ! modprobe nvme_tcp 2>/dev/null && ! lsmod | grep -q '^nvme_tcp\b'; then
+            log_error "kernel module nvme_tcp is not available"
+            exit 1
+        fi
     fi
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
+}
+
+# Mirror test-helpers.sh assign_ports but parameterised on TRANSPORT.
+assign_ports_mc() {
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        [[ -z "$ISCSI_PORT" ]] && ISCSI_PORT=$(pick_free_port)
+    else
+        [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(pick_free_port)
+    fi
+    [[ -z "$HTTP_PORT" ]] && HTTP_PORT=$(pick_free_port)
+    log_info "Using $TRANSPORT port $(_transport_port), HTTP port $HTTP_PORT"
+}
+
+# Wait on whichever port the transport binds.
+_transport_port() {
+    if [[ "$TRANSPORT" == "iscsi" ]]; then echo "$ISCSI_PORT"; else echo "$NVMETCP_PORT"; fi
 }
 
 create_test_config() {
     log_info "Creating test configuration..."
     mkdir -p "$TEST_DIR/data/volumes"
+    local transport_block
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        # CHAP is mandatory under VSA admission — without it, both
+        # initiators would see all 4 LUNs and the kernel-claim-race
+        # comes back.
+        transport_block=$'iscsi:\n  listen: "127.0.0.1:'"$ISCSI_PORT"$'"\n  auth:\n    method: CHAP'
+    else
+        # Plaintext NVMe/TCP; admission is by-design see-everything
+        # in plaintext (mirror of iSCSI no-CHAP). Multi-controller
+        # device separation is what isolates the two initiators.
+        transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "127.0.0.1:'"$NVMETCP_PORT"$'"'
+    fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
-iscsi:
-  listen: "127.0.0.1:$ISCSI_PORT"
-  auth:
-    method: CHAP
+$transport_block
 storage:
   backends:
     local:
@@ -175,13 +252,15 @@ EOFCONFIG
 
 start_daemon_mc() {
     export THURVSA_ADMIN_SOCKET="${TEST_DIR}/admin.sock"
-    log_info "Starting thurvsad..."
+    log_info "Starting thurvsad ($TRANSPORT)..."
     RUST_LOG=info "$DAEMON_PATH" --config "$TEST_CONFIG" >> "${TEST_DIR}/daemon.log" 2>&1 &
     DAEMON_PID=$!
+    local port
+    port=$(_transport_port)
     local _
     for _ in {1..60}; do
-        if ss -tln 2>/dev/null | grep -q ":$ISCSI_PORT\b"; then
-            log_info "Daemon ready (PID $DAEMON_PID, port $ISCSI_PORT)"
+        if ss -tln 2>/dev/null | grep -q ":$port\b"; then
+            log_info "Daemon ready (PID $DAEMON_PID, port $port)"
             return 0
         fi
         sleep 0.5
@@ -262,7 +341,7 @@ resolve_initiator_devices() {
     lsscsi 2>/dev/null | awk -v p="[$host_id:" 'index($1, p) == 1 && /THUR VSA/ {print $NF}'
 }
 
-setup_initiator_devices() {
+setup_initiator_devices_iscsi() {
     local suffix="$1" iface="$2"
     local devs=() row
     local tries=0
@@ -296,6 +375,65 @@ setup_initiator_devices() {
     log_info "initiator $suffix: devices=(${devs[*]})"
 }
 
+# NVMe/TCP plaintext: both controllers see all 4 NSIDs. NSIDs are
+# stable (nsid = lun + 1, and volumes register in alphabetical
+# boot-time order): vol-mc-a1=1, vol-mc-a2=2, vol-mc-b1=3, vol-mc-b2=4.
+# Application-layer isolation: A touches NSIDs 1+2, B touches 3+4.
+setup_initiator_devices_nvme() {
+    local suffix="$1" host_nqn="$2"
+    local ctrl=""
+    local tries=0
+    while (( tries < 10 )); do
+        ctrl=$(_nvme_ctrl_for_hostnqn "$host_nqn") && break
+        sleep 0.5
+        tries=$(( tries + 1 ))
+    done
+    if [[ -z "$ctrl" ]]; then
+        log_error "initiator $suffix: no nvme controller found for hostnqn=$host_nqn"
+        return 1
+    fi
+    local n1 n2
+    if [[ "$suffix" == "A" ]]; then
+        n1="/dev/${ctrl}n1"; n2="/dev/${ctrl}n2"
+        NVME_CTRL_A="$ctrl"
+    else
+        n1="/dev/${ctrl}n3"; n2="/dev/${ctrl}n4"
+        NVME_CTRL_B="$ctrl"
+    fi
+    # Wait for the namespace block devices to materialise.
+    local dev
+    for dev in "$n1" "$n2"; do
+        local t=0
+        while (( t < 10 )); do
+            [[ -b "$dev" ]] && break
+            sleep 0.5
+            t=$(( t + 1 ))
+        done
+        [[ -b "$dev" ]] || { log_error "initiator $suffix: $dev did not appear"; return 1; }
+    done
+    if [[ "$suffix" == "A" ]]; then
+        RW_DEVS_A=("$n1" "$n2")
+    else
+        RW_DEVS_B=("$n1" "$n2")
+    fi
+    log_info "initiator $suffix: controller=$ctrl devices=($n1 $n2)"
+}
+
+# Branch on TRANSPORT. iSCSI uses the per-iface SCSI device tree;
+# NVMe-TCP uses the per-controller NSID tree.
+setup_initiator_devices() {
+    local suffix="$1"
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        local iface
+        iface=$([[ "$suffix" == "A" ]] && echo "$IFACE_A" || echo "$IFACE_B")
+        setup_initiator_devices_iscsi "$suffix" "$iface"
+    else
+        local host
+        host=$([[ "$suffix" == "A" ]] && echo "$HOST_NQN_A" || echo "$HOST_NQN_B")
+        setup_initiator_devices_nvme "$suffix" "$host"
+    fi
+}
+
 iscsi_login_both() {
     setup_iface "$IFACE_A" "$INIT_IQN_A"
     setup_iface "$IFACE_B" "$INIT_IQN_B"
@@ -304,6 +442,52 @@ iscsi_login_both() {
     iscsi_login_iface "$IFACE_B" "$CHAP_USER_B" "$CHAP_PASS_B" \
         || { log_error "iscsi login (B) failed"; return 1; }
     sleep 4
+}
+
+# -----------------------------------------------------------------------
+# NVMe/TCP-specific helpers. Plaintext (no TLS-PSK), one `nvme connect`
+# per initiator with a distinct --hostnqn. Each connect produces its own
+# controller node under /sys/class/nvme; we read the hostnqn sysfs file
+# to identify which nvme<N> belongs to A and which to B.
+# -----------------------------------------------------------------------
+
+# Resolve the nvme<N> controller name for a given hostnqn by walking
+# /sys/class/nvme/nvme*/hostnqn. Returns the basename ("nvme0") or
+# empty on miss.
+_nvme_ctrl_for_hostnqn() {
+    local want="$1" ctrl
+    for ctrl in /sys/class/nvme/nvme*; do
+        [[ -d "$ctrl" ]] || continue
+        local got
+        got=$(cat "$ctrl/hostnqn" 2>/dev/null | tr -d '\n')
+        [[ "$got" == "$want" ]] || continue
+        # Also confirm this controller is bound to our subsystem
+        # (skip stale entries from other tests on the same box).
+        local sub
+        sub=$(cat "$ctrl/subsysnqn" 2>/dev/null | tr -d '\n')
+        [[ "$sub" == "$SUBNQN" ]] || continue
+        basename "$ctrl"
+        return 0
+    done
+    return 1
+}
+
+nvme_login_host() {
+    local host_nqn="$1"
+    nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
+        -n "$SUBNQN" --hostnqn "$host_nqn" \
+        > "${TEST_DIR}/nvme-connect-${host_nqn##*:}.log" 2>&1
+}
+
+nvme_login_both() {
+    nvme_login_host "$HOST_NQN_A" \
+        || { log_error "nvme connect (A) failed"; cat "${TEST_DIR}/nvme-connect-host-mc-a.log" >&2; return 1; }
+    nvme_login_host "$HOST_NQN_B" \
+        || { log_error "nvme connect (B) failed"; cat "${TEST_DIR}/nvme-connect-host-mc-b.log" >&2; return 1; }
+    # Both controllers should be visible in sysfs by the time
+    # `nvme connect` returns, but give the udev rule a tick to
+    # populate /dev/nvmeXn<NSID> nodes.
+    sleep 2
 }
 
 # One-shot per-volume mkfs + mount under per-initiator mount points.
@@ -460,14 +644,18 @@ main() {
     echo "========================================"
     echo ""
     check_prerequisites
-    assign_ports
+    assign_ports_mc
     create_test_config
     start_daemon_mc
     create_volumes
-    setup_chap_users
-    iscsi_login_both
-    setup_initiator_devices A "$IFACE_A" || exit 1
-    setup_initiator_devices B "$IFACE_B" || exit 1
+    if [[ "$TRANSPORT" == "iscsi" ]]; then
+        setup_chap_users
+        iscsi_login_both
+    else
+        nvme_login_both
+    fi
+    setup_initiator_devices A || exit 1
+    setup_initiator_devices B || exit 1
     declare -a MOUNTS_A=() MOUNTS_B=()
     mkfs_and_mount_all || exit 1
 
