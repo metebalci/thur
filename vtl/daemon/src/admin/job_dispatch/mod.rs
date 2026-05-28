@@ -151,7 +151,7 @@ mod tests {
             library: Arc::new(Mutex::new(library)),
             element_config: ElementAddressConfig::new(0, 1001, 5, 101, 0, 1, 1),
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
-            listen_address: "0.0.0.0:3260".to_string(),
+            listen_addresses: vec!["0.0.0.0:3260".to_string()],
             event_tx,
             audit_log: None,
             audit_dir: dir.join("audit"),

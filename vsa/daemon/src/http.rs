@@ -13,7 +13,7 @@
 //!   shared OTLP backends.
 //! - `GET /sessions` — iSCSI session inventory (`shared_iscsi::http`).
 //! - `GET /info`     — VSA-specific summary (volume count + IQN +
-//!   listen address).
+//!   listen addresses).
 //!
 //! Default listen address is `0.0.0.0:9090` — mirrors thurvtl's
 //! `:9090` posture so an operator running both daemons on the
@@ -49,7 +49,9 @@ pub struct HttpState {
     pub telemetry: Arc<Telemetry>,
     pub registry: Arc<VolumeRegistry>,
     pub sessions: Arc<SessionManager>,
-    pub listen_address: String,
+    /// Every transport listen address (one for NVMe/TCP, one or more
+    /// iSCSI portals). Always at least one entry.
+    pub listen_addresses: Vec<String>,
     /// Resolved iSCSI target IQN (`iscsi.target_iqn` or the default).
     pub target_iqn: String,
 }
@@ -82,7 +84,7 @@ impl FromRef<HttpState> for SessionsState {
         SessionsState {
             sessions: state.sessions.clone(),
             target_iqn: state.target_iqn.clone(),
-            listen_address: state.listen_address.clone(),
+            listen_addresses: state.listen_addresses.clone(),
         }
     }
 }
@@ -115,6 +117,6 @@ async fn info_handler(State(state): State<HttpState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "volume_count": state.registry.len(),
         "iqn": state.target_iqn,
-        "listen_address": state.listen_address,
+        "listen_addresses": state.listen_addresses,
     }))
 }

@@ -362,6 +362,40 @@ proposes `MaxOutstandingR2T=1`, and Windows matches.
 | BufferOffset monotonicity check | 🟩 Yes | M |
 | Phase-collapse (status piggybacked on Data-In) | 🟩 Yes | O |
 
+### Path redundancy — multi-portal advertisement, single TPG
+
+The daemon accepts a list of TCP listen addresses in
+`iscsi.listen` and binds one `TcpListener` per entry. SendTargets
+discovery returns one `TargetAddress` line for every configured
+portal, so an initiator that runs `iscsiadm -m discovery` once gets
+one node record per portal back. That is enough to feed
+`dm-multipath` two (or more) paths without the operator running
+SendTargets twice against two different host IPs — the manual
+workaround that path-redundancy deployments previously needed.
+
+Every advertised portal carries the same `TargetPortalGroupTag`
+(`TPGT=1`). Single-TPG is by design for this stage: with all portals
+in the same Target Port Group there is no ALUA state surface to
+manage, no REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS
+contract, and `dm-multipath`'s active/passive mode is the supported
+configuration. Active/active across portals is *not* recommended
+today because the per-session state — command queue, Unit Attention
+queue, Persistent Reservation context — is independent across the
+sessions that connect through different portals; two paths
+simultaneously holding reservations would race.
+
+Per-portal TPGT (one TPGT per `TargetAddress`) plus REPORT TARGET
+PORT GROUPS / SET TARGET PORT GROUPS / VPD 0x83 Target Port
+descriptors / VPD 0x86 are the prerequisites for full ALUA-driven
+active/active multipath. They are deliberately deferred and tracked
+separately so this stage can land on its own.
+
+Wildcard entries (`0.0.0.0:*`, `[::]:*`) are substituted with the
+connection's actual local IP when SendTargets emits — emitting the
+wildcard literally would hand the initiator an unusable record.
+Single-entry `listen: "0.0.0.0:3260"` is therefore identical in
+behavior to the pre-multi-portal target.
+
 ### Out of scope
 
 The following parts of iSCSI are deliberately not implemented, each

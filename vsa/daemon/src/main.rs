@@ -470,12 +470,11 @@ async fn main() -> Result<()> {
     // The two branches are mutually exclusive — only one binds. Each
     // produces:
     //   * `transport_fut`: the listener future tokio::select! awaits
-    //   * `transport_listen`: address string logged + surfaced in
+    //   * `transport_listens`: the address(es) logged + surfaced in
     //     HttpState (so `/health` reports something meaningful).
-    let (transport_fut, transport_listen): (
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
-        String,
-    ) = match cfg.transport {
+    //     NVMe/TCP carries a single-entry vec; iSCSI may carry many.
+    type TransportFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+    let (transport_fut, transport_listens): (TransportFut, Vec<String>) = match cfg.transport {
         Transport::Iscsi => {
             let handler = Arc::new(SbcScsiDispatcher::new(
                 Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
@@ -498,26 +497,26 @@ async fn main() -> Result<()> {
             )
             .context("building CHAP authenticator factory")?;
 
-            let iscsi_listen = cfg
+            let iscsi_listens = cfg
                 .iscsi
                 .listen
                 .clone()
-                .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_string());
+                .unwrap_or_else(|| vec![DEFAULT_LISTEN_ADDRESS.to_string()]);
             let server_config = ServerConfig {
-                listen_address: iscsi_listen.clone(),
+                listen_addresses: iscsi_listens.clone(),
                 session_manager: Arc::clone(&session_manager),
                 auth: chap_auth,
                 audit: login_audit,
                 stale_session_timeout_secs: STALE_SESSION_TIMEOUT_SECS,
             };
             let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
-            tracing::info!("transport: iscsi (listen={})", iscsi_listen);
+            tracing::info!("transport: iscsi (listen={})", iscsi_listens.join(", "));
             (
                 Box::pin(shared_iscsi::transport::run(
                     server_config,
                     transport_handler,
                 )),
-                iscsi_listen,
+                iscsi_listens,
             )
         }
         Transport::Nvmetcp => {
@@ -621,7 +620,7 @@ async fn main() -> Result<()> {
                 tls: tls_acceptor,
                 psks_path: admission_psks_path,
             };
-            (Box::pin(nvme_tcp::run(server_cfg)), nvmetcp_listen)
+            (Box::pin(nvme_tcp::run(server_cfg)), vec![nvmetcp_listen])
         }
     };
 
@@ -654,7 +653,7 @@ async fn main() -> Result<()> {
         telemetry: Arc::clone(&telemetry),
         registry: Arc::clone(&registry),
         sessions: Arc::clone(&session_manager),
-        listen_address: transport_listen.clone(),
+        listen_addresses: transport_listens.clone(),
         target_iqn,
     };
 

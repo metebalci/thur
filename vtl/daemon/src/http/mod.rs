@@ -63,7 +63,7 @@ impl FromRef<HttpState> for SessionsState {
         SessionsState {
             sessions: state.daemon_state.session_manager.clone(),
             target_iqn: state.daemon_state.target_iqn.clone(),
-            listen_address: state.daemon_state.listen_address.clone(),
+            listen_addresses: state.daemon_state.listen_addresses.clone(),
         }
     }
 }

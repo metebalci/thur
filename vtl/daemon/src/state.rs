@@ -47,9 +47,9 @@ pub struct DaemonStateConfig {
     /// into state so HTTP `/sessions` can answer without holding an
     /// `Arc<IscsiServer>`.
     pub target_iqn: String,
-    /// Configured iSCSI listen address (`ip:port`). Read-only after
-    /// boot. Same rationale as `target_iqn`.
-    pub listen_address: String,
+    /// Every configured iSCSI listen address (`ip:port`), in YAML
+    /// order. Read-only after boot. Same rationale as `target_iqn`.
+    pub listen_addresses: Vec<String>,
     pub event_tx: broadcast::Sender<TapeEvent>,
     /// Producer-side handle for the audit log writer task. Cloned by
     /// every emitter; runtime appends never touch the underlying
@@ -95,8 +95,9 @@ pub struct DaemonState {
     pub element_config: ElementAddressConfig,
     /// Configured iSCSI target IQN. Read-only after boot.
     pub target_iqn: String,
-    /// Configured iSCSI listen address (`ip:port`). Read-only after boot.
-    pub listen_address: String,
+    /// Every configured iSCSI listen address (`ip:port`), in YAML
+    /// order. Read-only after boot.
+    pub listen_addresses: Vec<String>,
     pub event_tx: broadcast::Sender<TapeEvent>,
     /// Producer-side handle for the audit log writer task. Cloned by
     /// every emitter; runtime appends never touch the underlying
@@ -173,7 +174,7 @@ impl DaemonState {
             ua_tracker: Arc::new(Mutex::new(UnitAttentionTracker::new())),
             element_config: cfg.element_config,
             target_iqn: cfg.target_iqn,
-            listen_address: cfg.listen_address,
+            listen_addresses: cfg.listen_addresses,
             event_tx: cfg.event_tx,
             audit_log: cfg.audit_log,
             audit_dir: cfg.audit_dir,
@@ -229,7 +230,7 @@ mod tests {
             library: Arc::new(Mutex::new(library)),
             element_config,
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
-            listen_address: "0.0.0.0:3260".to_string(),
+            listen_addresses: vec!["0.0.0.0:3260".to_string()],
             event_tx,
             audit_log: None,
             audit_dir: dir.path().join("audit"),
@@ -247,7 +248,7 @@ mod tests {
 
         let state = DaemonState::new(cfg);
         assert_eq!(state.target_iqn, "iqn.2025-10.com.metebalci:thurvtl");
-        assert_eq!(state.listen_address, "0.0.0.0:3260");
+        assert_eq!(state.listen_addresses, vec!["0.0.0.0:3260".to_string()]);
         assert_eq!(state.element_config.storage_count, 10);
         assert_eq!(state.element_config.data_transfer_count, 3);
         assert!(state.audit_log.is_none());

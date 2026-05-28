@@ -113,8 +113,8 @@ separately in `<data_dir>/library/inventory.json`.
 | Param | Value |
 |-------|-------|
 | Target IQN | `iqn.2025-10.com.metebalci:thurvtl` (configurable via `iscsi.target_iqn`) |
-| Portal Group Tag | 1 |
-| Listen | `0.0.0.0:3260` (configurable via `iscsi.listen`) |
+| Portal Group Tag | 1 (single TPG; every advertised portal carries the same TPGT today — per-portal TPGT is the prerequisite for ALUA Target Port Groups, tracked separately) |
+| Listen | `0.0.0.0:3260` (configurable via `iscsi.listen`; accepts a single `"ip:port"` scalar or a list of them — the daemon binds one TCP listener per entry and SendTargets advertises every entry as a separate `TargetAddress` line, so an initiator's single discovery call returns one node record per portal. Wildcard entries (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP when emitted — without the substitution an initiator would receive an unusable `0.0.0.0:3260` line. Two entries that collapse to the same line after substitution are deduped) |
 | Max sessions | 10 (configurable) |
 | Session timeout | 300 s (configurable) |
 | HeaderDigest | None or CRC32C (negotiated) |
@@ -2176,9 +2176,13 @@ VSA (`thurvsad`):
 {
   "volume_count": 42,
   "iqn": "iqn.2025-10.com.metebalci:thurvsa",
-  "listen_address": "0.0.0.0:3260"
+  "listen_addresses": ["0.0.0.0:3260"]
 }
 ```
+
+`listen_addresses` is always a JSON array — single-portal installs
+report one entry, multi-portal installs (`iscsi.listen: [...]`) report
+every entry.
 
 `/info` is a read-only summary — chassis topology on VTL, volume count
 plus iSCSI coordinates on VSA. Anything finer-grained, the per-element

@@ -225,6 +225,61 @@ main() {
     run_test "iscsi-inq INQUIRY against unmapped LUN 7 (no SCSI sense)" \
         test_inquiry_unmapped_lun "${TEST_DIR}/inquiry-lun7.log"
 
+    # --- Multi-portal phase ---------------------------------------------
+    # `iscsi.listen` accepts a list; the daemon binds one TCP listener
+    # per entry and SendTargets advertises every entry. Restart with a
+    # second loopback portal and verify both bind + SendTargets returns
+    # both portals.
+    log_info "Switching to multi-portal config (two loopback listeners)..."
+    stop_thur_daemon
+    ISCSI_PORT2=$(pick_free_port)
+    log_info "Second iSCSI portal: 127.0.0.1:$ISCSI_PORT2"
+    cat > "$TEST_CONFIG" <<EOFCONFIG2
+$(yaml_header)
+
+iscsi:
+  listen:
+    - "127.0.0.1:$ISCSI_PORT"
+    - "127.0.0.1:$ISCSI_PORT2"
+
+$(yaml_local_backend)
+
+EOFCONFIG2
+    DAEMON_LOG_MODE=append start_thur_daemon
+
+    run_test "iscsi-inq INQUIRY through portal 1 (LUN 0)" \
+        test_inquiry 0 "${TEST_DIR}/inquiry-mp-portal1.log"
+
+    iscsi_port_save=$ISCSI_PORT
+    ISCSI_PORT=$ISCSI_PORT2
+    run_test "iscsi-inq INQUIRY through portal 2 (LUN 0)" \
+        test_inquiry 0 "${TEST_DIR}/inquiry-mp-portal2.log"
+    ISCSI_PORT=$iscsi_port_save
+
+    # SendTargets payload enumeration is fully covered by the
+    # `build_target_addresses_*` unit tests in shared-iscsi; the
+    # iscsi-ls wire check is skipped here because libiscsi's Logout
+    # path against a discovery session trips a pre-existing daemon
+    # bug (unconditional `get_and_increment_statsn(tsih=0)` in the
+    # Logout / NOP-Out branches that's unrelated to multi-portal).
+
+    # /sessions HTTP endpoint must report the list of listen addresses.
+    log_test "/sessions JSON carries listen_addresses array"
+    if curl -sf "http://127.0.0.1:$HTTP_PORT/sessions" > "${TEST_DIR}/sessions.json" 2>&1; then
+        addrs_len=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("listen_addresses", [])))' "${TEST_DIR}/sessions.json")
+        if [[ "$addrs_len" -eq 2 ]]; then
+            log_pass "/sessions: listen_addresses has 2 entries"
+            PASSED=$((PASSED + 1))
+        else
+            log_fail "/sessions: listen_addresses len = $addrs_len, expected 2"
+            FAILED=$((FAILED + 1))
+        fi
+    else
+        log_fail "/sessions fetch failed"
+        FAILED=$((FAILED + 1))
+    fi
+    echo ""
+
     echo "========================================"
     echo "Test Summary"
     echo "========================================"

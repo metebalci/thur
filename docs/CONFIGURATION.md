@@ -61,7 +61,7 @@ description — is available as `thurvtl config defaults` or
 
 | Key | Default | Description |
 |---|---|---|
-| `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen address. |
+| `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen address. Accepts either a single `"ip:port"` scalar or a list of them — each entry binds its own listener and SendTargets advertises every entry, enabling multi-portal path redundancy without MC/S. Wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP. |
 | `iscsi.target_iqn` | `iqn.2025-10.com.metebalci:thurvtl` / `:thurvsa` | Target IQN advertised to initiators. |
 | `iscsi.max_sessions` | `10` | Max concurrent iSCSI sessions. **VTL only.** |
 | `iscsi.session_timeout_seconds` | `300` | Per-session inactivity timeout. **VTL only.** |

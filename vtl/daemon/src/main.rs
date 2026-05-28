@@ -576,8 +576,16 @@ impl HttpConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 struct IscsiConfig {
-    #[serde(default = "default_iscsi_listen")]
-    listen: String,
+    /// One TCP listen address, or a list of addresses for multi-portal
+    /// path redundancy. SendTargets discovery advertises every entry;
+    /// wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the
+    /// connection's actual local IP, so a single-entry `0.0.0.0:3260`
+    /// behaves exactly as before.
+    #[serde(
+        default = "default_iscsi_listen",
+        deserialize_with = "deserialize_listen"
+    )]
+    listen: Vec<String>,
     #[serde(default = "default_target_iqn")]
     target_iqn: String,
     #[serde(default = "default_max_sessions")]
@@ -588,8 +596,8 @@ struct IscsiConfig {
     auth: AuthConfig,
 }
 
-fn default_iscsi_listen() -> String {
-    "0.0.0.0:3260".to_string()
+fn default_iscsi_listen() -> Vec<String> {
+    vec!["0.0.0.0:3260".to_string()]
 }
 fn default_target_iqn() -> String {
     "iqn.2025-10.com.metebalci:thurvtl".to_string()
@@ -601,10 +609,38 @@ fn default_session_timeout() -> u32 {
     300
 }
 
+/// Accept either a single TCP address (scalar) or a list of addresses
+/// (sequence). Normalizes both forms to `Vec<String>`. Empty lists are
+/// rejected — the daemon needs at least one portal to bind.
+fn deserialize_listen<'de, D>(de: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(de)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => {
+            if v.is_empty() {
+                Err(serde::de::Error::custom(
+                    "iscsi.listen must contain at least one address",
+                ))
+            } else {
+                Ok(v)
+            }
+        }
+    }
+}
+
 impl Default for IscsiConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:3260".to_string(),
+            listen: vec!["0.0.0.0:3260".to_string()],
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
             max_sessions: 10,
             session_timeout_seconds: 300,
@@ -1563,7 +1599,7 @@ async fn main() -> Result<()> {
         library: std::sync::Arc::clone(&library_arc),
         element_config,
         target_iqn: iscsi_cfg.target_iqn.clone(),
-        listen_address: iscsi_cfg.listen.clone(),
+        listen_addresses: iscsi_cfg.listen.clone(),
         event_tx: event_tx.clone(),
         audit_log: audit_log.clone(),
         audit_dir: audit_log_dir.clone(),
@@ -1678,12 +1714,15 @@ async fn main() -> Result<()> {
     };
 
     let iscsi_result = {
-        info!("Starting iSCSI target server on {}", iscsi_cfg.listen);
+        info!(
+            "Starting iSCSI target server on {}",
+            iscsi_cfg.listen.join(", ")
+        );
 
         // Convert daemon's config to iscsi module's config
         let iscsi_config = iscsi::config::IscsiConfig {
             iscsi: iscsi::config::IscsiSettings {
-                listen_address: iscsi_cfg.listen.clone(),
+                listen_addresses: iscsi_cfg.listen.clone(),
                 target_iqn: iscsi_cfg.target_iqn.clone(),
                 max_sessions: iscsi_cfg.max_sessions,
                 session_timeout_seconds: iscsi_cfg.session_timeout_seconds,
@@ -2325,6 +2364,40 @@ mod config_parse_tests {
         let cfg: Config =
             serde_yaml::from_str(&yaml).expect("daemon must parse thurvtl.defaults.yaml");
         assert_eq!(cfg.data_dir, "/tmp/thur-test");
+    }
+
+    #[test]
+    fn iscsi_listen_scalar_form_deserializes_into_single_entry() {
+        let yaml = "listen: \"10.0.0.5:3260\"\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("scalar form parses");
+        assert_eq!(cfg.listen, vec!["10.0.0.5:3260".to_string()]);
+    }
+
+    #[test]
+    fn iscsi_listen_list_form_deserializes_in_order() {
+        let yaml = "listen:\n  - \"10.0.0.5:3260\"\n  - \"10.0.0.6:3260\"\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("list form parses");
+        assert_eq!(
+            cfg.listen,
+            vec!["10.0.0.5:3260".to_string(), "10.0.0.6:3260".to_string()]
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_missing_takes_default() {
+        let yaml = "target_iqn: \"iqn.test:tgt\"\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("default fires");
+        assert_eq!(cfg.listen, vec!["0.0.0.0:3260".to_string()]);
+    }
+
+    #[test]
+    fn iscsi_listen_empty_list_is_rejected() {
+        let yaml = "listen: []\n";
+        let err = serde_yaml::from_str::<IscsiConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one"),
+            "want 'at least one' in error, got: {err}"
+        );
     }
 
     #[test]

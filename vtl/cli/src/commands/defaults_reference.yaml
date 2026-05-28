@@ -168,7 +168,14 @@ drive:
 
 # iSCSI target.
 iscsi:
-  # Listen address for the iSCSI target.
+  # iSCSI TCP listen address. Accepts either a single address (default)
+  # or a list of addresses for multi-portal path redundancy — each
+  # entry binds its own listener and SendTargets advertises every
+  # entry (initiators see one node record per portal). Wildcards
+  # (0.0.0.0:*, [::]:*) are substituted with the connection's actual
+  # local IP, so single-entry 0.0.0.0:3260 behaves exactly as before.
+  # Multi-portal example:
+  #   listen: ["10.0.0.5:3260", "10.0.0.6:3260"]
   listen: "0.0.0.0:3260"
   # iSCSI Qualified Name advertised to initiators.
   target_iqn: "iqn.2025-10.com.metebalci:thurvtl"

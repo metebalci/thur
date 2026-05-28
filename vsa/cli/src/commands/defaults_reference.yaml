@@ -31,9 +31,16 @@
 # with a tape VTL on the canonical 3260 (operator distinguishes
 # between the two by port).
 iscsi:
-  # Listen address for the iSCSI target. Test scripts may pin an
-  # ephemeral port to avoid clashing across concurrent runs.
+  # iSCSI TCP listen address(es). Accepts either a single address
+  # (default) or a list for multi-portal path redundancy — each entry
+  # binds its own listener and SendTargets advertises every entry, so
+  # an initiator sees one node record per portal. Wildcards
+  # (0.0.0.0:*, [::]:*) are substituted with the connection's actual
+  # local IP. Test scripts may pin an ephemeral port to avoid
+  # clashing across concurrent runs.
   # listen: "0.0.0.0:3260"
+  # Multi-portal example:
+  # listen: ["10.0.0.5:3260", "10.0.0.6:3260"]
 
   # iSCSI target IQN advertised to initiators in the Login /
   # SendTargets response. Defaults to the per-product identity

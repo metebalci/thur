@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -1338,6 +1339,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
     auth: Option<&ChapAuthFactory>,
     audit: &dyn LoginAuditSink,
     peer: &str,
+    advertised_portals: &[String],
 ) -> Result<()> {
     let target_iqn = handler.target_iqn();
     let outcome = handle_login_phase(
@@ -1452,18 +1454,19 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 stamp_serials_for_response(&mut tx.bhs, sn, exp_cmdsn, max_cmdsn);
 
                 if let Some(st) = req_keys.get("SendTargets") {
-                    let addr_str = sock
-                        .local_addr()
-                        .map(|a| format!("{}:{}", a.ip(), a.port()))
-                        .unwrap_or_else(|_| "127.0.0.1:3260".to_string());
+                    // Legacy fallback: matches the pre-multi-portal
+                    // behavior on `sock.local_addr()` failure
+                    // (vanishingly rare after an accepted connection).
+                    const FALLBACK_LOCAL: SocketAddr = SocketAddr::V4(
+                        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 3260),
+                    );
+                    let local = sock.local_addr().unwrap_or(FALLBACK_LOCAL);
                     let mut lines = Vec::<u8>::new();
                     if st.eq_ignore_ascii_case("All") || st == target_iqn {
                         push_kv(&mut lines, "TargetName", target_iqn);
-                        push_kv(
-                            &mut lines,
-                            "TargetAddress",
-                            &format!("{},{}", addr_str, TPGT),
-                        );
+                        for addr in build_target_addresses(advertised_portals, local) {
+                            push_kv(&mut lines, "TargetAddress", &format!("{},{}", addr, TPGT));
+                        }
                     }
                     tx.data = lines;
                 } else {
@@ -1696,8 +1699,36 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
 /// `audit.enabled` between [`NoopLoginAudit`] and its real channel
 /// adapter). Trait-object dispatch is one vcall per login event;
 /// negligible against the I/O the handler is already doing.
+/// Build the list of `TargetAddress` payloads to emit for SendTargets,
+/// one per advertised portal. Wildcard binds (`0.0.0.0:*`, `[::]:*`)
+/// substitute the connection's actual local IP — without this, an
+/// initiator would receive an unusable `0.0.0.0:3260` line. Concrete
+/// addresses are emitted literally. Duplicates after substitution
+/// are dropped so an operator who lists `["0.0.0.0:3260",
+/// "192.0.2.5:3260"]` doesn't see the same record twice.
+fn build_target_addresses(advertised: &[String], local: SocketAddr) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(advertised.len());
+    for portal in advertised {
+        let line = match portal.parse::<SocketAddr>() {
+            Ok(sa) if sa.ip().is_unspecified() => {
+                SocketAddr::new(local.ip(), sa.port()).to_string()
+            }
+            Ok(sa) => sa.to_string(),
+            Err(_) => portal.clone(),
+        };
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+    out
+}
+
 pub struct ServerConfig {
-    pub listen_address: String,
+    /// One or more iSCSI TCP listen addresses. Each entry binds its
+    /// own [`TcpListener`]; SendTargets discovery enumerates every
+    /// entry (see [`build_target_addresses`]). Must contain at least
+    /// one address.
+    pub listen_addresses: Vec<String>,
     pub session_manager: Arc<SessionManager>,
     /// Factory that produces a fresh [`ChapAuthenticator`] per login.
     /// `None` = no auth required (sessions accepted unauthenticated).
@@ -1707,16 +1738,32 @@ pub struct ServerConfig {
     pub stale_session_timeout_secs: u64,
 }
 
-/// Bind, spawn the stale-session sweeper, and accept connections in
-/// a loop. Each accepted connection runs in its own tokio task via
-/// [`serve_connection`]. Runs forever — return value is `Err` on
-/// bind / accept failure.
+/// Bind every configured portal, spawn the stale-session sweeper,
+/// and run one accept loop per listener. Each accepted connection
+/// runs in its own tokio task via [`serve_connection`]. Runs forever
+/// — return value is `Err` on bind / accept failure on any listener.
 pub async fn run<H>(config: ServerConfig, handler: Arc<H>) -> Result<()>
 where
     H: ScsiHandler + ?Sized,
 {
-    info!("iSCSI target starting on {}", config.listen_address);
-    let listener = TcpListener::bind(&config.listen_address).await?;
+    if config.listen_addresses.is_empty() {
+        return Err(anyhow!(
+            "iscsi: ServerConfig.listen_addresses must contain at least one entry"
+        ));
+    }
+
+    info!(
+        "iSCSI target starting on {}",
+        config.listen_addresses.join(", ")
+    );
+
+    let mut listeners = Vec::with_capacity(config.listen_addresses.len());
+    for addr in &config.listen_addresses {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow!("iscsi: bind {}: {}", addr, e))?;
+        listeners.push(listener);
+    }
 
     let session_mgr_sweep = Arc::clone(&config.session_manager);
     let stale_timeout = config.stale_session_timeout_secs;
@@ -1730,14 +1777,49 @@ where
 
     info!("iSCSI target ready, waiting for connections...");
 
+    let advertised: Arc<Vec<String>> = Arc::new(config.listen_addresses.clone());
+    let mut accepts = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let handler = Arc::clone(&handler);
+        let session_manager = Arc::clone(&config.session_manager);
+        let auth = config.auth.clone();
+        let audit = Arc::clone(&config.audit);
+        let advertised = Arc::clone(&advertised);
+        accepts.spawn(async move {
+            accept_loop::<H>(listener, handler, session_manager, auth, audit, advertised).await
+        });
+    }
+
+    while let Some(joined) = accepts.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow!("iscsi accept loop joined with error: {}", e)),
+        }
+    }
+    Ok(())
+}
+
+async fn accept_loop<H>(
+    listener: TcpListener,
+    handler: Arc<H>,
+    session_manager: Arc<SessionManager>,
+    auth: Option<ChapAuthFactory>,
+    audit: Arc<dyn LoginAuditSink>,
+    advertised: Arc<Vec<String>>,
+) -> Result<()>
+where
+    H: ScsiHandler + ?Sized,
+{
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 info!("New connection from {}", addr);
                 let handler = Arc::clone(&handler);
-                let session_manager = Arc::clone(&config.session_manager);
-                let auth = config.auth.clone();
-                let audit = Arc::clone(&config.audit);
+                let session_manager = Arc::clone(&session_manager);
+                let auth = auth.clone();
+                let audit = Arc::clone(&audit);
+                let advertised = Arc::clone(&advertised);
                 tokio::spawn(async move {
                     let peer = addr.to_string();
                     let result = serve_connection(
@@ -1747,6 +1829,7 @@ where
                         auth.as_ref(),
                         audit.as_ref(),
                         &peer,
+                        &advertised,
                     )
                     .await;
                     // The owned stream was consumed by serve_connection
@@ -2682,7 +2765,16 @@ mod tests {
         let mgr_srv = Arc::clone(&mgr);
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            serve_connection(sock, handler, mgr_srv, None, &NoopLoginAudit, "127.0.0.1:6").await
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:6",
+                &[],
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -2769,7 +2861,16 @@ mod tests {
         });
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            serve_connection(sock, handler, mgr, None, &NoopLoginAudit, "127.0.0.1:7").await
+            serve_connection(
+                sock,
+                handler,
+                mgr,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:7",
+                &[],
+            )
+            .await
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
@@ -2801,7 +2902,16 @@ mod tests {
         });
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            serve_connection(sock, handler, mgr, None, &NoopLoginAudit, "127.0.0.1:8").await
+            serve_connection(
+                sock,
+                handler,
+                mgr,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:8",
+                &[],
+            )
+            .await
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut login = make_login_pdu(STAGE_SECURITY, STAGE_FULL, true, 0, &[]);
@@ -2877,6 +2987,7 @@ mod tests {
                 None,
                 &NoopLoginAudit,
                 "127.0.0.1:99",
+                &[],
             )
             .await
         });
@@ -2973,6 +3084,7 @@ mod tests {
                 None,
                 &NoopLoginAudit,
                 "127.0.0.1:100",
+                &[],
             )
             .await
         });
@@ -3026,6 +3138,7 @@ mod tests {
                 None,
                 &NoopLoginAudit,
                 "127.0.0.1:101",
+                &[],
             )
             .await
         });
@@ -3073,13 +3186,13 @@ mod tests {
             iqn: "iqn.test:run".into(),
         });
         let config = ServerConfig {
-            listen_address: "127.0.0.1:0".to_string(),
+            listen_addresses: vec!["127.0.0.1:0".to_string()],
             session_manager: Arc::clone(&mgr),
             auth: None,
             audit: Arc::new(NoopLoginAudit),
             stale_session_timeout_secs: 300,
         };
-        // `run` takes the listen_address by value and binds it; bind
+        // `run` takes listen_addresses by value and binds them; bind
         // to port 0 then discover the port is not possible through
         // `run` directly, so bind a probe listener, take its port,
         // drop it, and reuse — small race but fine for a unit test.
@@ -3087,7 +3200,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let config = ServerConfig {
-            listen_address: format!("127.0.0.1:{port}"),
+            listen_addresses: vec![format!("127.0.0.1:{port}")],
             ..config
         };
         let server = tokio::spawn(run(config, handler));
@@ -3122,14 +3235,74 @@ mod tests {
     #[test]
     fn server_config_carries_transport_hooks() {
         let config = ServerConfig {
-            listen_address: "0.0.0.0:3260".to_string(),
+            listen_addresses: vec!["0.0.0.0:3260".to_string()],
             session_manager: Arc::new(SessionManager::new()),
             auth: None,
             audit: Arc::new(NoopLoginAudit),
             stale_session_timeout_secs: 600,
         };
-        assert_eq!(config.listen_address, "0.0.0.0:3260");
+        assert_eq!(config.listen_addresses, vec!["0.0.0.0:3260".to_string()]);
         assert_eq!(config.stale_session_timeout_secs, 600);
         assert!(config.auth.is_none());
+    }
+
+    #[test]
+    fn build_target_addresses_emits_one_line_per_concrete_portal() {
+        let advertised = vec!["10.0.0.5:3260".to_string(), "10.0.0.6:3260".to_string()];
+        let local: SocketAddr = "10.0.0.5:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec!["10.0.0.5:3260", "10.0.0.6:3260"]);
+    }
+
+    #[test]
+    fn build_target_addresses_substitutes_wildcard_with_local_ip() {
+        // Legacy single-portal happy path: configured 0.0.0.0:3260,
+        // connection landed on 192.0.2.7:3260 -> emit the concrete
+        // local address (not the wildcard).
+        let advertised = vec!["0.0.0.0:3260".to_string()];
+        let local: SocketAddr = "192.0.2.7:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec!["192.0.2.7:3260"]);
+    }
+
+    #[test]
+    fn build_target_addresses_substitutes_wildcard_preserving_each_port() {
+        // Wildcard substitution keeps the *configured* port — emitting
+        // local.port() would collapse multi-port wildcard binds into
+        // one line. Mixed wildcard + literal also keeps the literal
+        // intact.
+        let advertised = vec![
+            "0.0.0.0:3260".to_string(),
+            "0.0.0.0:3261".to_string(),
+            "192.0.2.9:3260".to_string(),
+        ];
+        let local: SocketAddr = "192.0.2.7:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(
+            out,
+            vec!["192.0.2.7:3260", "192.0.2.7:3261", "192.0.2.9:3260"]
+        );
+    }
+
+    #[test]
+    fn build_target_addresses_dedupes_after_substitution() {
+        // Wildcard 0.0.0.0:3260 + literal 192.0.2.7:3260 collapse to
+        // the same line after substitution — the initiator should not
+        // see the same record twice.
+        let advertised = vec!["0.0.0.0:3260".to_string(), "192.0.2.7:3260".to_string()];
+        let local: SocketAddr = "192.0.2.7:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec!["192.0.2.7:3260"]);
+    }
+
+    #[test]
+    fn build_target_addresses_handles_ipv6_wildcard_with_brackets() {
+        // SocketAddr Display brackets IPv6 — `[fe80::1]:3260`, not
+        // `fe80::1:3260` (which would be ambiguous with port-in-low-
+        // word forms).
+        let advertised = vec!["[::]:3260".to_string()];
+        let local: SocketAddr = "[fe80::1]:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec!["[fe80::1]:3260"]);
     }
 }

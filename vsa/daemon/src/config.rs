@@ -286,14 +286,20 @@ pub enum NvmetcpTlsMode {
 }
 
 /// `iscsi:` block. Carries the optional CHAP `auth` sub-block, a
-/// tunable `listen` address, and an optional `target_iqn` override.
+/// tunable `listen` address (or list of addresses), and an optional
+/// `target_iqn` override.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct IscsiSettings {
-    /// Override the iSCSI TCP listen address. Defaults to
-    /// `0.0.0.0:3260` (thurvsa's port — thurvtl uses 3260) when
-    /// unset. Test scripts assign an ephemeral port here so
-    /// concurrent runs don't fight over a fixed bind.
-    pub listen: Option<String>,
+    /// Override the iSCSI TCP listen address(es). Accepts a single
+    /// `"ip:port"` scalar or a list of them for multi-portal path
+    /// redundancy; defaults to `["0.0.0.0:3260"]` when unset. Each
+    /// entry binds its own listener; SendTargets advertises every
+    /// entry, with wildcards (`0.0.0.0:*`, `[::]:*`) substituted by
+    /// the connection's actual local IP. Test scripts assign an
+    /// ephemeral port here so concurrent runs don't fight over a
+    /// fixed bind.
+    #[serde(default, deserialize_with = "deserialize_listen_opt")]
+    pub listen: Option<Vec<String>>,
     /// Override the iSCSI target IQN advertised to initiators in the
     /// Login / SendTargets response. Defaults to
     /// `shared_naming::DISK.iqn` (`iqn.2025-10.com.metebalci:thurvsa`)
@@ -301,6 +307,35 @@ pub struct IscsiSettings {
     pub target_iqn: Option<String>,
     #[serde(default)]
     pub auth: AuthSettings,
+}
+
+/// Accept either a single TCP address (scalar) or a list of addresses
+/// (sequence); normalizes both forms to `Option<Vec<String>>`. Empty
+/// lists are rejected — pick "unset" (omit the key) for the default.
+fn deserialize_listen_opt<'de, D>(de: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match Option::<OneOrMany>::deserialize(de)? {
+        None => Ok(None),
+        Some(OneOrMany::One(s)) => Ok(Some(vec![s])),
+        Some(OneOrMany::Many(v)) => {
+            if v.is_empty() {
+                Err(serde::de::Error::custom(
+                    "iscsi.listen must contain at least one address",
+                ))
+            } else {
+                Ok(Some(v))
+            }
+        }
+    }
 }
 
 /// `http:` block. Carries the management HTTP listen address
@@ -485,6 +520,70 @@ iscsi:
         assert_eq!(
             auth.allowed_algorithms,
             vec!["SHA3-256".to_string(), "SHA-256".to_string()]
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_scalar_form_deserializes_into_single_entry() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen: "10.0.0.5:3260"
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("scalar form parses");
+        assert_eq!(cfg.iscsi.listen, Some(vec!["10.0.0.5:3260".to_string()]));
+    }
+
+    #[test]
+    fn iscsi_listen_list_form_deserializes_in_order() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen:
+    - "10.0.0.5:3260"
+    - "10.0.0.6:3260"
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("list form parses");
+        assert_eq!(
+            cfg.iscsi.listen,
+            Some(vec![
+                "10.0.0.5:3260".to_string(),
+                "10.0.0.6:3260".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_missing_is_none() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  auth:
+    method: None
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("absent key parses");
+        assert!(cfg.iscsi.listen.is_none());
+    }
+
+    #[test]
+    fn iscsi_listen_empty_list_is_rejected() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen: []
+"#,
+        );
+        let err = DaemonConfig::load(f.path()).expect_err("empty list rejected");
+        assert!(
+            format!("{err:#}").contains("at least one"),
+            "want 'at least one' in error, got: {err:#}"
         );
     }
 
