@@ -502,20 +502,31 @@ impl DiskCacheManager {
                     continue;
                 }
             };
-            // Optional sidecar: a failed open (lost / corrupt
-            // file) falls through to the safe default (every page
-            // reads as Uploaded → evictable). Keep walking the
-            // volume's touches so LRU sort still sees this volume's
-            // pages.
+            // Optional sidecar. `open_or_create` creates the file
+            // when it's absent, so a genuinely missing sidecar
+            // (legacy volume from the synchronous-seal era) returns
+            // `Ok` full of zeros → every page reads as Uploaded,
+            // which is honest. An `Err` therefore means the file is
+            // *present but unreadable* (or uncreatable) — a real IO
+            // / permission fault, not the legacy case. We must not
+            // treat those pages as evictable: a momentary fault
+            // could otherwise delete pool chunks whose cloud PUT
+            // hasn't landed (later 404 on read). Pin conservatively
+            // — mark every page of this volume LocalOnly for this
+            // pass (which also preserves the cross-volume AND pin
+            // for chunks shared via Global dedup). The eviction
+            // worker is periodic; the next pass re-reads.
+            let mut sidecar_unreadable = false;
             let upload_idx: Option<UploadIndexFile> = match UploadIndexFile::open_or_create(
                 &vol_path,
             ) {
                 Ok(u) => Some(u),
                 Err(e) => {
                     warn!(
-                        "LRU walk: open upload.idx for '{}' failed: {} (treating chunks as Uploaded for this pass)",
+                        "LRU walk: open upload.idx for '{}' failed: {} (pinning this volume's chunks against eviction for this pass)",
                         name, e
                     );
+                    sidecar_unreadable = true;
                     None
                 }
             };
@@ -531,14 +542,20 @@ impl DiskCacheManager {
                     }
                 };
                 let ts = lru_index.read(page_id).unwrap_or(0);
-                let is_uploaded = match upload_idx.as_ref().map(|u| u.read(page_id)) {
-                    Some(Ok(UploadState::Uploaded)) | None => true,
-                    Some(Ok(UploadState::LocalOnly)) => false,
-                    // Read error on a single record: assume
-                    // Uploaded so a transient IO blip doesn't
-                    // freeze the cache. The eviction worker is
-                    // periodic; the next pass re-reads.
-                    Some(Err(_)) => true,
+                let is_uploaded = if sidecar_unreadable {
+                    // Whole-file open failed above — can't verify
+                    // upload state for any page; pin conservatively.
+                    false
+                } else {
+                    match upload_idx.as_ref().map(|u| u.read(page_id)) {
+                        Some(Ok(UploadState::Uploaded)) | None => true,
+                        Some(Ok(UploadState::LocalOnly)) => false,
+                        // Read error on a single record: assume
+                        // Uploaded so a transient IO blip doesn't
+                        // freeze the cache. The eviction worker is
+                        // periodic; the next pass re-reads.
+                        Some(Err(_)) => true,
+                    }
                 };
                 let hash_hex = hex::encode(hash);
                 bucket_t
@@ -910,6 +927,55 @@ mod tests {
         let freed = mgr.evict_lru_chunks().unwrap();
         assert_eq!(freed, 0);
         assert!(ns_pool.exists(&shared_hash));
+    }
+
+    /// Sidecar-unreadable pin: if `upload.idx` is *present but cannot
+    /// be opened* (IO / permission fault — distinct from a legacy
+    /// *absent* sidecar, which `open_or_create` would create fresh and
+    /// read as all-Uploaded), the eviction pass must pin every page of
+    /// that volume rather than treat them as Uploaded → evictable.
+    /// Otherwise a momentary fault could delete a pool chunk whose
+    /// cloud PUT hasn't landed (later 404 on read).
+    #[test]
+    fn evict_lru_chunks_pins_when_sidecar_unreadable() {
+        use crate::page_index::PageIndex;
+        use crate::upload_index::UploadIndexFile;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary", DedupScope::Local);
+        let ns = manifest.pool_namespace().unwrap();
+
+        let ns_pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (hash, _) = ns_pool.insert_bytes(&[0xAB; 4096]).unwrap();
+
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let raw: [u8; 32] = hex::decode(&hash).unwrap().try_into().unwrap();
+        pages.set(0, &raw).unwrap();
+
+        // No LocalOnly marker: under a readable sidecar this page would
+        // read as Uploaded and be evictable. Make the sidecar present
+        // but unopenable by planting a directory at its path — open
+        // fails with EISDIR, the open-failure branch under test.
+        let sidecar = UploadIndexFile::path_for(&vol_dir);
+        fs::create_dir(&sidecar).unwrap();
+
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 0);
+        mgr.calculate_usage().unwrap();
+        assert!(mgr.is_over_capacity());
+
+        let freed = mgr.evict_lru_chunks().unwrap();
+        assert_eq!(freed, 0, "unreadable sidecar must pin the volume's chunks");
+        assert!(
+            ns_pool.exists(&hash),
+            "chunk must survive when its upload state can't be verified"
+        );
     }
 
     /// End-to-end: an `evict_lru_chunks` pass that actually unlinks a

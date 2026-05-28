@@ -385,15 +385,26 @@ file (`CSUI` magic header). Records the async-upload state:
   created before async upload landed).
 - `0x01 = LocalOnly` (pool has the chunk, backend PUT pending).
 
-`VolumeWriter::write_page_unsynced` flags `LocalOnly` before enqueuing the
-[`UploadTask`]; the daemon's upload worker
-(`vsa/daemon/src/upload_worker.rs`) calls
+`VolumeWriter::write_page_unsynced` records the page->chunk hash in
+`pages.idx` **before** flagging `LocalOnly` and enqueuing the
+[`UploadTask`] — the worker can flip a page to `Uploaded` and wake a
+`synchronize_bytes` waiter the instant the task is handed off, so the hash
+write has to precede any state a SYNC waiter observes; otherwise a host
+`fsync` could settle to "durable" while `pages.idx` still had no hash for
+the page, losing the mapping on a crash even though the chunk is in the
+pool. The daemon's upload worker (`vsa/daemon/src/upload_worker.rs`) calls
 `VolumeWriter::apply_page_upload_outcome` on completion, which flips back to
 `Uploaded` and wakes any `PageCache::synchronize_bytes` waiter parked on the
 page range. The eviction filter consults the sidecar to skip pinned chunks.
 
 Local-only; corrupt header rebuilds empty — every page reads as `Uploaded`,
-the safe pre-async invariant. Format at `core/block/src/upload_index.rs`.
+the safe pre-async invariant. A genuinely *absent* sidecar (legacy volume)
+is created fresh on open, so it too reads all-`Uploaded`. But if the file
+is *present and cannot be opened* (a real IO / permission fault), the
+eviction walk pins every page of that volume for the pass rather than
+treating them as evictable — deleting a pool chunk whose PUT hasn't landed
+would surface as a later 404 on read. Format at
+`core/block/src/upload_index.rs`.
 
 ## Why this shape (vs VTL)
 

@@ -742,10 +742,37 @@ impl VolumeWriter {
             // Local dedup hit: the chunk was already in the pool, so
             // our reservation never consumed new disk — release it
             // before continuing so the budget reflects reality.
+            //
+            // This is safe even though eviction / a CloudOnly state
+            // can leave a chunk's bytes absent while the page index
+            // still references the hash: `insert_bytes` guarantees on
+            // `Ok` that `store_path(hash)` is present on disk
+            // regardless of `was_new` (a `false` means it found the
+            // file already there). The `was_new` flag reflects
+            // present-or-not *at insert time*, not a stale view — so
+            // the dedup-hit chunk we're releasing the reservation for
+            // really is on disk right now, and the payload built below
+            // points the worker at a live file.
             self.pool_budget
                 .release(reserved_bytes, namespace.as_deref());
         }
         let hash_bytes = decode_hash(&hash_hex)?;
+
+        // Record the page->chunk hash in `pages.idx` *before* any
+        // state a SYNCHRONIZE CACHE waiter can observe — the
+        // `LocalOnly` flag, the pending-upload marker, and the
+        // worker's eventual `Uploaded` flip. The worker runs on a
+        // separate task and can drain the PUT, flip the page to
+        // `Uploaded`, and wake a `synchronize_bytes` waiter the
+        // instant we hand off below; if the hash write trailed the
+        // hand-off, the host's `fsync` could settle to "durable"
+        // while `pages.idx` still had no hash for the page, and a
+        // crash in that window would lose the page->chunk mapping
+        // even though the chunk is already in the pool. The write
+        // only buffers (pwrite to the OS page cache); the trailing
+        // `page_index_sync` in the flush drain — or a concurrent
+        // SYNC's own `page_index_sync` — fsyncs it.
+        self.page_index.set_unsynced(page_id, &hash_bytes)?;
 
         // Build the shared upload payload once — both the async and
         // inline dispatch paths use it. `object_key` derivation is
@@ -813,7 +840,6 @@ impl VolumeWriter {
             self.apply_page_upload_outcome(&outcome).await?;
         }
 
-        self.page_index.set_unsynced(page_id, &hash_bytes)?;
         // LRU sidecar touch — local cache hint, never uploaded.
         // Failure is non-fatal: the eviction worker tolerates a
         // missing entry (reads as 0 = oldest).
@@ -1011,6 +1037,35 @@ mod tests {
         assert!(writer.pool().exists(&outcome.hash_hex));
         let object_key = writer.pool().object_key(&outcome.hash_hex);
         assert!(backend.chunk_exists(&object_key).await.unwrap());
+    }
+
+    /// Durability-ordering regression: on the async-dispatch path the
+    /// page->chunk hash must land in `pages.idx` *before* the upload is
+    /// handed to the worker, so a worker that flips the page to
+    /// `Uploaded` and wakes a `synchronize_bytes` waiter can never let
+    /// the host see "durable" while the index still has no hash. Attach
+    /// a sender and never drain it — the worker never runs, yet the
+    /// hash is already recorded when `write_page_unsynced` returns.
+    #[tokio::test]
+    async fn async_dispatch_records_hash_before_handoff() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        // Keep `_rx` bound so the channel stays open (a dropped
+        // receiver would send-fail into the rollback path).
+        let (tx, _rx) = mpsc::channel::<UploadTask>(8);
+        let writer = VolumeWriter::open(tmp.path(), &name, backend)
+            .unwrap()
+            .with_upload_sender(tx);
+        let bytes = page_bytes(0x5A);
+
+        let outcome = writer.write_page_unsynced(3, &bytes).await.unwrap();
+
+        let recorded = writer.page_index().get(3).unwrap();
+        assert!(
+            recorded.is_some(),
+            "page->chunk hash must be in pages.idx before the upload hand-off, \
+             even though the worker has not run"
+        );
+        assert_eq!(hex::encode(recorded.unwrap()), outcome.hash_hex);
     }
 
     #[tokio::test]

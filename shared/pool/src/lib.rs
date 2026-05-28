@@ -291,6 +291,13 @@ impl ChunkPool {
     /// `false` if an identical hash already lived in the pool (dedup
     /// hit). Atomic: writes a sibling tempfile then renames over the
     /// destination.
+    ///
+    /// Post-condition: on `Ok`, the chunk file at `store_path(hash)`
+    /// is present on disk **regardless of the flag** — `false` means
+    /// it was already on disk when the call hashed the bytes, `true`
+    /// means this call's rename put it there. Callers that release a
+    /// pool-budget reservation on a `false` (dedup-hit) result rely on
+    /// this: the bytes are accounted for by the pre-existing chunk.
     pub fn insert_bytes(&self, bytes: &[u8]) -> Result<(String, bool), ChunkPoolError> {
         let mut hasher = Hasher::new();
         hasher.update(bytes);

@@ -121,16 +121,27 @@ impl PrefetchManager {
     ) {
         let task_key = (cartridge_id.to_string(), chunk_id);
 
+        // Hold the active-task lock across the whole check-and-insert.
+        // If we dropped it after the presence check (as before), two
+        // concurrent calls for the same (cartridge, chunk) could both
+        // pass `contains_key` and both spawn; the second `insert` would
+        // orphan the first `JoinHandle`, and the orphan's later
+        // `remove` would evict the survivor so `cancel_all` could no
+        // longer abort it. None of the steps below await — the location
+        // lookup is synchronous and `tokio::spawn` only schedules — so
+        // holding the async mutex across them is cheap and deadlock-free.
+        // It also forces the spawned task's completion-`remove` to wait
+        // until after our `insert`, so a task that finishes early can't
+        // leave a stale handle behind.
+        let mut tasks = self.active_tasks.lock().await;
+
         // Check if already prefetching this chunk
-        {
-            let tasks = self.active_tasks.lock().await;
-            if tasks.contains_key(&task_key) {
-                debug!(
-                    "Prefetch already active for {}/chunk-{}",
-                    cartridge_id, chunk_id
-                );
-                return;
-            }
+        if tasks.contains_key(&task_key) {
+            debug!(
+                "Prefetch already active for {}/chunk-{}",
+                cartridge_id, chunk_id
+            );
+            return;
         }
 
         // Check chunk location
@@ -169,7 +180,7 @@ impl PrefetchManager {
 
         // Spawn background download task
         let cloud_backend = self.cloud_backend.clone();
-        let tasks = self.active_tasks.clone();
+        let tasks_handle = self.active_tasks.clone();
         let task_key_clone = task_key.clone();
 
         let task = tokio::spawn(async move {
@@ -184,13 +195,15 @@ impl PrefetchManager {
                 }
             }
 
-            // Remove from active tasks when done
-            let mut tasks = tasks.lock().await;
+            // Remove from active tasks when done. Blocks until the
+            // spawning call releases the guard below, so this can't
+            // race ahead of the `insert`.
+            let mut tasks = tasks_handle.lock().await;
             tasks.remove(&task_key_clone);
         });
 
-        // Store the task handle
-        let mut tasks = self.active_tasks.lock().await;
+        // Store the task handle under the guard still held from the
+        // presence check above.
         tasks.insert(task_key, task);
     }
 
