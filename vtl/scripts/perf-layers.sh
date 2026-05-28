@@ -42,8 +42,11 @@
 #   ./vtl/scripts/perf-layers.sh [OPTIONS]
 #   THURVTL_PERF_BACKEND=aistor-none ./vtl/scripts/perf-layers.sh
 #
+# Always uses ./target/release/ binaries — debug-build perf numbers are
+# 5-10x slower and not meaningfully comparable, so there's no flag to
+# pick the profile.
+#
 # Options:
-#   --release             Use ./target/release/ binaries (default: debug)
 #   --daemon-path PATH    Path to thurvtld binary
 #   --cli-path PATH       Path to thurvtl binary
 #   --only ROW            Run a single row (1..3); omit to run all three
@@ -79,7 +82,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
 ONLY_ROW=""
@@ -90,7 +92,6 @@ SOURCE_BACKENDS="${THURVTL_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release) BUILD_PROFILE="release"; shift ;;
         --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --only) ONLY_ROW="$2"; shift 2 ;;
@@ -102,17 +103,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvtld"
-[[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvtl"
-PERF_WRITE="${REPO_DIR}/target/${BUILD_PROFILE}/examples/perf_write"
-PERF_CART_CLOUD="${REPO_DIR}/target/${BUILD_PROFILE}/examples/perf_cart_cloud"
+[[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/release/thurvtld"
+[[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/release/thurvtl"
+PERF_WRITE="${REPO_DIR}/target/release/examples/perf_write"
+PERF_CART_CLOUD="${REPO_DIR}/target/release/examples/perf_cart_cloud"
 
 if [[ ! -x "$DAEMON_PATH" || ! -x "$CLI_PATH" ]]; then
-    log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build${BUILD_PROFILE:+ --release}"
+    log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build --release"
     exit 1
 fi
 if [[ ! -x "$PERF_WRITE" || ! -x "$PERF_CART_CLOUD" ]]; then
-    log_error "Missing perf examples. Run: cargo build${BUILD_PROFILE:+ --release} -p core-mediachanger --examples"
+    log_error "Missing perf examples. Run: cargo build --release -p core-mediachanger --examples"
     exit 1
 fi
 

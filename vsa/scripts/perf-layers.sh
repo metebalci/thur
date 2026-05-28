@@ -41,8 +41,11 @@
 #   ./vsa/scripts/perf-layers.sh [OPTIONS]
 #   THURVSA_PERF_BACKEND=aistor-none ./vsa/scripts/perf-layers.sh
 #
+# Always uses ./target/release/ binaries — debug-build perf numbers are
+# 5-10x slower and not meaningfully comparable, so there's no flag to
+# pick the profile.
+#
 # Options:
-#   --release             Use ./target/release/ binaries (default: debug)
 #   --daemon-path PATH    Path to thurvsad binary
 #   --cli-path PATH       Path to thurvsa binary
 #   --only ROW            Run a single row (1..4); omit to run all four
@@ -78,7 +81,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 
-BUILD_PROFILE="debug"
 DAEMON_PATH=""
 CLI_PATH=""
 ONLY_ROW=""
@@ -89,7 +91,6 @@ SOURCE_BACKENDS="${THURVSA_SOURCE_BACKENDS:-${REPO_DIR}/private/storage-backends
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --release) BUILD_PROFILE="release"; shift ;;
         --daemon-path) DAEMON_PATH="$2"; shift 2 ;;
         --cli-path) CLI_PATH="$2"; shift 2 ;;
         --only) ONLY_ROW="$2"; shift 2 ;;
@@ -101,17 +102,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvsad"
-[[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/${BUILD_PROFILE}/thurvsa"
-PERF_VOLUME_WRITE="${REPO_DIR}/target/${BUILD_PROFILE}/examples/perf_volume_write"
-PERF_VOLUME_CLOUD="${REPO_DIR}/target/${BUILD_PROFILE}/examples/perf_volume_cloud"
+[[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/release/thurvsad"
+[[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/release/thurvsa"
+PERF_VOLUME_WRITE="${REPO_DIR}/target/release/examples/perf_volume_write"
+PERF_VOLUME_CLOUD="${REPO_DIR}/target/release/examples/perf_volume_cloud"
 
 if [[ ! -x "$DAEMON_PATH" || ! -x "$CLI_PATH" ]]; then
-    log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build${BUILD_PROFILE:+ --release}"
+    log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build --release"
     exit 1
 fi
 if [[ ! -x "$PERF_VOLUME_WRITE" || ! -x "$PERF_VOLUME_CLOUD" ]]; then
-    log_error "Missing perf examples. Run: cargo build${BUILD_PROFILE:+ --release} -p core-block --examples"
+    log_error "Missing perf examples. Run: cargo build --release -p core-block --examples"
     exit 1
 fi
 
