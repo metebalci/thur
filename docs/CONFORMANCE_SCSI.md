@@ -362,33 +362,55 @@ proposes `MaxOutstandingR2T=1`, and Windows matches.
 | BufferOffset monotonicity check | 🟩 Yes | M |
 | Phase-collapse (status piggybacked on Data-In) | 🟩 Yes | O |
 
-### Path redundancy — multi-portal advertisement, single TPG
+### Path redundancy — multi-portal advertisement, per-portal TPG
 
-The daemon accepts a list of TCP listen addresses in
-`iscsi.listen` and binds one `TcpListener` per entry. SendTargets
-discovery returns one `TargetAddress` line for every configured
+The daemon accepts a list of TCP listen portals in `iscsi.listen`
+and binds one `TcpListener` per entry. SendTargets discovery returns
+one `TargetAddress=<address>,<tpgt>` line for every configured
 portal, so an initiator that runs `iscsiadm -m discovery` once gets
 one node record per portal back. That is enough to feed
 `dm-multipath` two (or more) paths without the operator running
 SendTargets twice against two different host IPs — the manual
 workaround that path-redundancy deployments previously needed.
 
-Every advertised portal carries the same `TargetPortalGroupTag`
-(`TPGT=1`). Single-TPG is by design for this stage: with all portals
-in the same Target Port Group there is no ALUA state surface to
-manage, no REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS
-contract, and `dm-multipath`'s active/passive mode is the supported
-configuration. Active/active across portals is *not* recommended
-today because the per-session state — command queue, Unit Attention
-queue, Persistent Reservation context — is independent across the
-sessions that connect through different portals; two paths
-simultaneously holding reservations would race.
+Each portal carries its own Target Portal Group Tag. The YAML shape
+exposes the TPGT directly:
 
-Per-portal TPGT (one TPGT per `TargetAddress`) plus REPORT TARGET
-PORT GROUPS / SET TARGET PORT GROUPS / VPD 0x83 Target Port
-descriptors / VPD 0x86 are the prerequisites for full ALUA-driven
-active/active multipath. They are deliberately deferred and tracked
-separately so this stage can land on its own.
+- Bare-string entries (e.g. `listen: ["10.0.0.5:3260",
+  "10.0.0.6:3260"]`) auto-assign sequential TPGTs from input
+  position (1, 2, …). The single-portal default
+  `listen: "0.0.0.0:3260"` keeps the historical `TPGT=1`.
+- Object-form entries (e.g.
+  `listen: [{address: "10.0.0.5:3260", tpgt: 1},
+   {address: "10.0.0.6:3260", tpgt: 2}]`) carry an explicit TPGT —
+  operators preparing for ALUA give each portal its own.
+- Multiple portals may share one TPGT (one TPG, many paths) — this
+  is the group shape ALUA's REPORT TARGET PORT GROUPS surface will
+  bind state to. The same address listed twice is rejected at boot:
+  `bind(2)` would fail anyway and the initiator can't disambiguate
+  two `TargetAddress` lines with identical `ip:port`.
+
+The Login Response `TargetPortalGroupTag` key echoes the *arrival*
+portal's TPGT per RFC 7143 §12.10 — the value the initiator gets
+back matches the portal it dialed, so a session bound to portal 2
+sees `TargetPortalGroupTag=2` regardless of what the other portals
+advertise.
+
+By itself this is pure plumbing — host-visible behavior is the same
+as the single-TPG stage. With all portals in the same Target Port
+Group there is still no ALUA state surface to manage, no
+REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS contract, and
+`dm-multipath`'s active/passive mode is the supported configuration.
+Active/active across portals is *not* recommended today because the
+per-session state — command queue, Unit Attention queue, Persistent
+Reservation context — is independent across the sessions that
+connect through different portals; two paths simultaneously holding
+reservations would race.
+
+REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS / VPD 0x83
+Target Port descriptors / VPD 0x86 are the remaining prerequisites
+for full ALUA-driven active/active multipath. They are deliberately
+deferred and tracked separately so this stage can land on its own.
 
 Wildcard entries (`0.0.0.0:*`, `[::]:*`) are substituted with the
 connection's actual local IP when SendTargets emits — emitting the

@@ -105,7 +105,7 @@ impl IscsiServer {
     /// background drive-lock sweeper still lives here because it's
     /// thurvtl-specific (drive-lock TTL is a tape concept).
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let addrs = self.config.iscsi.listen_addresses.clone();
+        let portals = self.config.iscsi.listen_portals.clone();
         info!(
             "Configuration: {} drives (LTO-{})",
             self.config.library.num_drives, self.config.library.lto_generation
@@ -145,7 +145,7 @@ impl IscsiServer {
         });
 
         let server_config = ServerConfig {
-            listen_addresses: addrs,
+            listen_portals: portals,
             session_manager: Arc::clone(&self.state.session_manager),
             auth: self.auth.clone(),
             audit,

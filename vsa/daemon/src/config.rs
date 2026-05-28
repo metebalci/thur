@@ -286,20 +286,27 @@ pub enum NvmetcpTlsMode {
 }
 
 /// `iscsi:` block. Carries the optional CHAP `auth` sub-block, a
-/// tunable `listen` address (or list of addresses), and an optional
+/// tunable `listen` portal (or list of portals), and an optional
 /// `target_iqn` override.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct IscsiSettings {
-    /// Override the iSCSI TCP listen address(es). Accepts a single
-    /// `"ip:port"` scalar or a list of them for multi-portal path
-    /// redundancy; defaults to `["0.0.0.0:3260"]` when unset. Each
-    /// entry binds its own listener; SendTargets advertises every
-    /// entry, with wildcards (`0.0.0.0:*`, `[::]:*`) substituted by
-    /// the connection's actual local IP. Test scripts assign an
-    /// ephemeral port here so concurrent runs don't fight over a
-    /// fixed bind.
+    /// Override the iSCSI TCP listen portal(s). Accepts:
+    ///
+    /// - a single `"ip:port"` scalar;
+    /// - a list of bare `"ip:port"` strings (auto-assign sequential
+    ///   TPGTs from input position, 1-indexed);
+    /// - a list of `{address, tpgt}` objects (operator-controlled
+    ///   Target Portal Group Tag — the prerequisite for ALUA);
+    /// - or a mix (per-entry).
+    ///
+    /// Defaults to `[{address: "0.0.0.0:3260", tpgt: 1}]` when unset.
+    /// Each entry binds its own listener; SendTargets advertises every
+    /// entry as `TargetAddress=<address>,<tpgt>`, with wildcards
+    /// (`0.0.0.0:*`, `[::]:*`) substituted by the connection's actual
+    /// local IP. Test scripts assign an ephemeral port here so
+    /// concurrent runs don't fight over a fixed bind.
     #[serde(default, deserialize_with = "deserialize_listen_opt")]
-    pub listen: Option<Vec<String>>,
+    pub listen: Option<Vec<shared_iscsi::transport::Portal>>,
     /// Override the iSCSI target IQN advertised to initiators in the
     /// Login / SendTargets response. Defaults to
     /// `shared_naming::DISK.iqn` (`iqn.2025-10.com.metebalci:thurvsa`)
@@ -309,33 +316,62 @@ pub struct IscsiSettings {
     pub auth: AuthSettings,
 }
 
-/// Accept either a single TCP address (scalar) or a list of addresses
-/// (sequence); normalizes both forms to `Option<Vec<String>>`. Empty
-/// lists are rejected — pick "unset" (omit the key) for the default.
-fn deserialize_listen_opt<'de, D>(de: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+/// Accept either a single TCP address (scalar) or a list of portal
+/// entries (sequence of either bare `"ip:port"` strings or
+/// `{address, tpgt}` objects); normalizes both forms to
+/// `Option<Vec<Portal>>`. Bare strings auto-assign `tpgt = position`
+/// (1-indexed) so a single-string `listen: "0.0.0.0:3260"` advertises
+/// TPGT=1. Empty lists are rejected — pick "unset" (omit the key)
+/// for the default.
+fn deserialize_listen_opt<'de, D>(
+    de: D,
+) -> std::result::Result<Option<Vec<shared_iscsi::transport::Portal>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
     #[derive(Deserialize)]
     #[serde(untagged)]
+    enum Entry {
+        Bare(String),
+        Full { address: String, tpgt: u16 },
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
     enum OneOrMany {
         One(String),
-        Many(Vec<String>),
+        Many(Vec<Entry>),
     }
-    match Option::<OneOrMany>::deserialize(de)? {
-        None => Ok(None),
-        Some(OneOrMany::One(s)) => Ok(Some(vec![s])),
+    let entries = match Option::<OneOrMany>::deserialize(de)? {
+        None => return Ok(None),
+        Some(OneOrMany::One(s)) => vec![Entry::Bare(s)],
         Some(OneOrMany::Many(v)) => {
             if v.is_empty() {
-                Err(serde::de::Error::custom(
+                return Err(serde::de::Error::custom(
                     "iscsi.listen must contain at least one address",
-                ))
-            } else {
-                Ok(Some(v))
+                ));
             }
+            v
         }
-    }
+    };
+    Ok(Some(
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let position = (i as u16) + 1;
+                match e {
+                    Entry::Bare(address) => shared_iscsi::transport::Portal {
+                        address,
+                        tpgt: position,
+                    },
+                    Entry::Full { address, tpgt } => {
+                        shared_iscsi::transport::Portal { address, tpgt }
+                    }
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// `http:` block. Carries the management HTTP listen address
@@ -523,6 +559,13 @@ iscsi:
         );
     }
 
+    fn portal(addr: &str, tpgt: u16) -> shared_iscsi::transport::Portal {
+        shared_iscsi::transport::Portal {
+            address: addr.to_string(),
+            tpgt,
+        }
+    }
+
     #[test]
     fn iscsi_listen_scalar_form_deserializes_into_single_entry() {
         let f = write_config(
@@ -533,11 +576,13 @@ iscsi:
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("scalar form parses");
-        assert_eq!(cfg.iscsi.listen, Some(vec!["10.0.0.5:3260".to_string()]));
+        assert_eq!(cfg.iscsi.listen, Some(vec![portal("10.0.0.5:3260", 1)]));
     }
 
     #[test]
     fn iscsi_listen_list_form_deserializes_in_order() {
+        // Bare strings auto-assign sequential TPGTs from their input
+        // position (1-indexed).
         let f = write_config(
             r#"
 data_dir: /var/lib/thurvsa
@@ -550,10 +595,45 @@ iscsi:
         let cfg = DaemonConfig::load(f.path()).expect("list form parses");
         assert_eq!(
             cfg.iscsi.listen,
-            Some(vec![
-                "10.0.0.5:3260".to_string(),
-                "10.0.0.6:3260".to_string()
-            ])
+            Some(vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 2)])
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_object_form_carries_explicit_tpgt() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen:
+    - { address: "10.0.0.5:3260", tpgt: 1 }
+    - { address: "10.0.0.6:3260", tpgt: 2 }
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("object form parses");
+        assert_eq!(
+            cfg.iscsi.listen,
+            Some(vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 2)])
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_object_form_allows_shared_tpgt_for_group() {
+        // Multiple portals sharing one TPGT (one group, many paths)
+        // is legal — the ALUA prerequisite this enables.
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen:
+    - { address: "10.0.0.5:3260", tpgt: 1 }
+    - { address: "10.0.0.6:3260", tpgt: 1 }
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("shared-TPGT form parses");
+        assert_eq!(
+            cfg.iscsi.listen,
+            Some(vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 1)])
         );
     }
 

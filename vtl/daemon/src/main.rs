@@ -576,16 +576,21 @@ impl HttpConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 struct IscsiConfig {
-    /// One TCP listen address, or a list of addresses for multi-portal
-    /// path redundancy. SendTargets discovery advertises every entry;
+    /// One TCP listen portal, or a list of portals for multi-portal
+    /// path redundancy. Each portal carries an iSCSI Target Portal
+    /// Group Tag — operators who want grouped portals (one TPG,
+    /// many paths) keep the same `tpgt`; operators preparing for
+    /// ALUA give each portal its own. Bare-string entries auto-assign
+    /// sequential TPGTs from their input position (1, 2, …) so the
+    /// single-portal `listen: "0.0.0.0:3260"` happy path keeps
+    /// TPGT=1. SendTargets discovery advertises every entry;
     /// wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the
-    /// connection's actual local IP, so a single-entry `0.0.0.0:3260`
-    /// behaves exactly as before.
+    /// connection's actual local IP.
     #[serde(
         default = "default_iscsi_listen",
         deserialize_with = "deserialize_listen"
     )]
-    listen: Vec<String>,
+    listen: Vec<shared_iscsi::transport::Portal>,
     #[serde(default = "default_target_iqn")]
     target_iqn: String,
     #[serde(default = "default_max_sessions")]
@@ -596,8 +601,11 @@ struct IscsiConfig {
     auth: AuthConfig,
 }
 
-fn default_iscsi_listen() -> Vec<String> {
-    vec!["0.0.0.0:3260".to_string()]
+fn default_iscsi_listen() -> Vec<shared_iscsi::transport::Portal> {
+    vec![shared_iscsi::transport::Portal {
+        address: "0.0.0.0:3260".to_string(),
+        tpgt: 1,
+    }]
 }
 fn default_target_iqn() -> String {
     "iqn.2025-10.com.metebalci:thurvtl".to_string()
@@ -609,38 +617,62 @@ fn default_session_timeout() -> u32 {
     300
 }
 
-/// Accept either a single TCP address (scalar) or a list of addresses
-/// (sequence). Normalizes both forms to `Vec<String>`. Empty lists are
+/// Accept either a single TCP address (scalar) or a list of portal
+/// entries (sequence of either bare `"ip:port"` strings or
+/// `{address, tpgt}` objects); normalizes both forms to
+/// `Vec<Portal>`. Bare strings auto-assign `tpgt = position` (1-indexed)
+/// so the single-string happy path advertises TPGT=1. Empty lists are
 /// rejected — the daemon needs at least one portal to bind.
-fn deserialize_listen<'de, D>(de: D) -> std::result::Result<Vec<String>, D::Error>
+fn deserialize_listen<'de, D>(
+    de: D,
+) -> std::result::Result<Vec<shared_iscsi::transport::Portal>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
     #[derive(Deserialize)]
     #[serde(untagged)]
+    enum Entry {
+        Bare(String),
+        Full { address: String, tpgt: u16 },
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
     enum OneOrMany {
         One(String),
-        Many(Vec<String>),
+        Many(Vec<Entry>),
     }
-    match OneOrMany::deserialize(de)? {
-        OneOrMany::One(s) => Ok(vec![s]),
+    let entries = match OneOrMany::deserialize(de)? {
+        OneOrMany::One(s) => vec![Entry::Bare(s)],
         OneOrMany::Many(v) => {
             if v.is_empty() {
-                Err(serde::de::Error::custom(
+                return Err(serde::de::Error::custom(
                     "iscsi.listen must contain at least one address",
-                ))
-            } else {
-                Ok(v)
+                ));
             }
+            v
         }
-    }
+    };
+    Ok(entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let position = (i as u16) + 1;
+            match e {
+                Entry::Bare(address) => shared_iscsi::transport::Portal {
+                    address,
+                    tpgt: position,
+                },
+                Entry::Full { address, tpgt } => shared_iscsi::transport::Portal { address, tpgt },
+            }
+        })
+        .collect())
 }
 
 impl Default for IscsiConfig {
     fn default() -> Self {
         Self {
-            listen: vec!["0.0.0.0:3260".to_string()],
+            listen: default_iscsi_listen(),
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
             max_sessions: 10,
             session_timeout_seconds: 300,
@@ -1599,7 +1631,7 @@ async fn main() -> Result<()> {
         library: std::sync::Arc::clone(&library_arc),
         element_config,
         target_iqn: iscsi_cfg.target_iqn.clone(),
-        listen_addresses: iscsi_cfg.listen.clone(),
+        listen_addresses: iscsi_cfg.listen.iter().map(|p| p.address.clone()).collect(),
         event_tx: event_tx.clone(),
         audit_log: audit_log.clone(),
         audit_dir: audit_log_dir.clone(),
@@ -1716,13 +1748,18 @@ async fn main() -> Result<()> {
     let iscsi_result = {
         info!(
             "Starting iSCSI target server on {}",
-            iscsi_cfg.listen.join(", ")
+            iscsi_cfg
+                .listen
+                .iter()
+                .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         // Convert daemon's config to iscsi module's config
         let iscsi_config = iscsi::config::IscsiConfig {
             iscsi: iscsi::config::IscsiSettings {
-                listen_addresses: iscsi_cfg.listen.clone(),
+                listen_portals: iscsi_cfg.listen.clone(),
                 target_iqn: iscsi_cfg.target_iqn.clone(),
                 max_sessions: iscsi_cfg.max_sessions,
                 session_timeout_seconds: iscsi_cfg.session_timeout_seconds,
@@ -2366,20 +2403,51 @@ mod config_parse_tests {
         assert_eq!(cfg.data_dir, "/tmp/thur-test");
     }
 
+    fn portal(addr: &str, tpgt: u16) -> shared_iscsi::transport::Portal {
+        shared_iscsi::transport::Portal {
+            address: addr.to_string(),
+            tpgt,
+        }
+    }
+
     #[test]
     fn iscsi_listen_scalar_form_deserializes_into_single_entry() {
         let yaml = "listen: \"10.0.0.5:3260\"\n";
         let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("scalar form parses");
-        assert_eq!(cfg.listen, vec!["10.0.0.5:3260".to_string()]);
+        assert_eq!(cfg.listen, vec![portal("10.0.0.5:3260", 1)]);
     }
 
     #[test]
     fn iscsi_listen_list_form_deserializes_in_order() {
+        // Bare strings auto-assign sequential TPGTs from their input
+        // position (1-indexed).
         let yaml = "listen:\n  - \"10.0.0.5:3260\"\n  - \"10.0.0.6:3260\"\n";
         let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("list form parses");
         assert_eq!(
             cfg.listen,
-            vec!["10.0.0.5:3260".to_string(), "10.0.0.6:3260".to_string()]
+            vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 2)]
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_object_form_carries_explicit_tpgt() {
+        let yaml = "listen:\n  - { address: \"10.0.0.5:3260\", tpgt: 5 }\n  - { address: \"10.0.0.6:3260\", tpgt: 9 }\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("object form parses");
+        assert_eq!(
+            cfg.listen,
+            vec![portal("10.0.0.5:3260", 5), portal("10.0.0.6:3260", 9)]
+        );
+    }
+
+    #[test]
+    fn iscsi_listen_object_form_allows_shared_tpgt_for_group() {
+        // Multiple portals sharing one TPGT is legal (one TPG, many
+        // paths) — the group surface is the prerequisite for ALUA.
+        let yaml = "listen:\n  - { address: \"10.0.0.5:3260\", tpgt: 1 }\n  - { address: \"10.0.0.6:3260\", tpgt: 1 }\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("shared-TPGT form parses");
+        assert_eq!(
+            cfg.listen,
+            vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 1)]
         );
     }
 
@@ -2387,7 +2455,7 @@ mod config_parse_tests {
     fn iscsi_listen_missing_takes_default() {
         let yaml = "target_iqn: \"iqn.test:tgt\"\n";
         let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("default fires");
-        assert_eq!(cfg.listen, vec!["0.0.0.0:3260".to_string()]);
+        assert_eq!(cfg.listen, vec![portal("0.0.0.0:3260", 1)]);
     }
 
     #[test]

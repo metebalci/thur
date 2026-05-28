@@ -242,14 +242,18 @@ EOFCONFIG2
     # SendTargets + Logout against either portal must enumerate both
     # advertised portals and exit cleanly. Regression for issue #41
     # (Logout / NOP-Out against discovery sessions used to hang).
-    log_test "iscsi-ls discovery enumerates both portals (issue #41)"
+    # Bare-string `listen` entries auto-assign sequential TPGTs by
+    # input position (1, 2, …), so the two TargetAddress lines must
+    # render as `<host:port1>,1` and `<host:port2>,2`. Regression
+    # for issue #42 (per-portal TPGT, ALUA prerequisite).
+    log_test "iscsi-ls discovery enumerates both portals with distinct TPGTs (issue #41, #42)"
     if iscsi_ls_out=$(timeout 10 iscsi-ls "iscsi://127.0.0.1:$ISCSI_PORT" 2>&1); then
-        if grep -q "127.0.0.1:$ISCSI_PORT," <<<"$iscsi_ls_out" \
-            && grep -q "127.0.0.1:$ISCSI_PORT2," <<<"$iscsi_ls_out"; then
-            log_pass "iscsi-ls listed both portals"
+        if grep -q "127.0.0.1:$ISCSI_PORT,1" <<<"$iscsi_ls_out" \
+            && grep -q "127.0.0.1:$ISCSI_PORT2,2" <<<"$iscsi_ls_out"; then
+            log_pass "iscsi-ls listed both portals with TPGTs 1 and 2"
             PASSED=$((PASSED + 1))
         else
-            log_fail "iscsi-ls output missing portal(s): $iscsi_ls_out"
+            log_fail "iscsi-ls output missing portal(s) or TPGT(s): $iscsi_ls_out"
             FAILED=$((FAILED + 1))
         fi
     else

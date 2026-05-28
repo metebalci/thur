@@ -497,20 +497,30 @@ async fn main() -> Result<()> {
             )
             .context("building CHAP authenticator factory")?;
 
-            let iscsi_listens = cfg
-                .iscsi
-                .listen
-                .clone()
-                .unwrap_or_else(|| vec![DEFAULT_LISTEN_ADDRESS.to_string()]);
+            let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
+                vec![shared_iscsi::transport::Portal {
+                    address: DEFAULT_LISTEN_ADDRESS.to_string(),
+                    tpgt: 1,
+                }]
+            });
+            let iscsi_listens: Vec<String> =
+                iscsi_portals.iter().map(|p| p.address.clone()).collect();
             let server_config = ServerConfig {
-                listen_addresses: iscsi_listens.clone(),
+                listen_portals: iscsi_portals.clone(),
                 session_manager: Arc::clone(&session_manager),
                 auth: chap_auth,
                 audit: login_audit,
                 stale_session_timeout_secs: STALE_SESSION_TIMEOUT_SECS,
             };
             let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
-            tracing::info!("transport: iscsi (listen={})", iscsi_listens.join(", "));
+            tracing::info!(
+                "transport: iscsi (listen={})",
+                iscsi_portals
+                    .iter()
+                    .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             (
                 Box::pin(shared_iscsi::transport::run(
                     server_config,

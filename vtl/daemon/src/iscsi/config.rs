@@ -38,10 +38,11 @@ pub struct IscsiConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IscsiSettings {
-    /// Every iSCSI TCP portal the daemon binds. SendTargets advertises
-    /// every entry; always at least one.
-    #[serde(default = "default_listen_addresses")]
-    pub listen_addresses: Vec<String>,
+    /// Every iSCSI TCP portal the daemon binds, each carrying its own
+    /// Target Portal Group Tag. SendTargets advertises every entry as
+    /// `TargetAddress=<address>,<tpgt>`; always at least one.
+    #[serde(default = "default_listen_portals")]
+    pub listen_portals: Vec<shared_iscsi::transport::Portal>,
     #[serde(default = "default_target_iqn")]
     pub target_iqn: String,
     #[serde(default = "default_max_sessions")]
@@ -76,7 +77,7 @@ fn default_drive_compression_zstd_level() -> i32 {
 impl Default for IscsiSettings {
     fn default() -> Self {
         Self {
-            listen_addresses: vec!["0.0.0.0:3260".to_string()],
+            listen_portals: default_listen_portals(),
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
             max_sessions: 10,
             session_timeout_seconds: 300,
@@ -140,8 +141,11 @@ impl Default for LibrarySettings {
     }
 }
 
-fn default_listen_addresses() -> Vec<String> {
-    vec!["0.0.0.0:3260".to_string()]
+fn default_listen_portals() -> Vec<shared_iscsi::transport::Portal> {
+    vec![shared_iscsi::transport::Portal {
+        address: "0.0.0.0:3260".to_string(),
+        tpgt: 1,
+    }]
 }
 
 fn default_target_iqn() -> String {
@@ -186,7 +190,13 @@ mod tests {
     #[test]
     fn iscsi_settings_default_values() {
         let s = IscsiSettings::default();
-        assert_eq!(s.listen_addresses, vec!["0.0.0.0:3260".to_string()]);
+        assert_eq!(
+            s.listen_portals,
+            vec![shared_iscsi::transport::Portal {
+                address: "0.0.0.0:3260".to_string(),
+                tpgt: 1,
+            }]
+        );
         assert_eq!(s.target_iqn, "iqn.2025-10.com.metebalci:thurvtl");
         assert_eq!(s.max_sessions, 10);
         assert_eq!(s.session_timeout_seconds, 300);
@@ -255,7 +265,16 @@ mod tests {
     #[test]
     fn iscsi_block_round_trips_through_yaml() {
         let original = IscsiSettings {
-            listen_addresses: vec!["10.0.0.1:3260".to_string(), "10.0.0.2:3260".to_string()],
+            listen_portals: vec![
+                shared_iscsi::transport::Portal {
+                    address: "10.0.0.1:3260".to_string(),
+                    tpgt: 1,
+                },
+                shared_iscsi::transport::Portal {
+                    address: "10.0.0.2:3260".to_string(),
+                    tpgt: 2,
+                },
+            ],
             target_iqn: "iqn.2025-10.com.example:vtl".to_string(),
             max_sessions: 64,
             session_timeout_seconds: 120,
@@ -265,7 +284,7 @@ mod tests {
         };
         let yaml = serde_yaml::to_string(&original).expect("serialize");
         let back: IscsiSettings = serde_yaml::from_str(&yaml).expect("deserialize");
-        assert_eq!(back.listen_addresses, original.listen_addresses);
+        assert_eq!(back.listen_portals, original.listen_portals);
         assert_eq!(back.target_iqn, original.target_iqn);
         assert_eq!(back.max_sessions, original.max_sessions);
         assert_eq!(
@@ -333,7 +352,13 @@ mod tests {
     #[test]
     fn iscsi_config_default_is_all_defaults() {
         let c = IscsiConfig::default();
-        assert_eq!(c.iscsi.listen_addresses, vec!["0.0.0.0:3260".to_string()]);
+        assert_eq!(
+            c.iscsi.listen_portals,
+            vec![shared_iscsi::transport::Portal {
+                address: "0.0.0.0:3260".to_string(),
+                tpgt: 1,
+            }]
+        );
         assert_eq!(c.library.lto_generation, 8);
     }
 }

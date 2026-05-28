@@ -61,7 +61,7 @@ description — is available as `thurvtl config defaults` or
 
 | Key | Default | Description |
 |---|---|---|
-| `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen address. Accepts either a single `"ip:port"` scalar or a list of them — each entry binds its own listener and SendTargets advertises every entry, enabling multi-portal path redundancy without MC/S. Wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP. |
+| `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen portal(s). Accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{address, tpgt}` objects — each entry binds its own listener and SendTargets advertises every entry as `TargetAddress=<address>,<tpgt>`, enabling multi-portal path redundancy without MC/S. Bare-string entries auto-assign sequential Target Portal Group Tags by input position (1, 2, …); object-form entries carry an explicit `tpgt`. Multiple portals sharing one TPGT (a group) is legal and is the prerequisite shape ALUA Target Port Groups will plug into; the same address listed twice is rejected. The Login Response `TargetPortalGroupTag` echoes the arrival portal's TPGT (RFC 7143 §12.10). Wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP. |
 | `iscsi.target_iqn` | `iqn.2025-10.com.metebalci:thurvtl` / `:thurvsa` | Target IQN advertised to initiators. |
 | `iscsi.max_sessions` | `10` | Max concurrent iSCSI sessions. **VTL only.** |
 | `iscsi.session_timeout_seconds` | `300` | Per-session inactivity timeout. **VTL only.** |
