@@ -16,16 +16,20 @@ use scsi_spc::inquiry::{
     Identity, InquiryFlags, PeripheralQualifier, PeripheralType, build_inquiry_std,
 };
 use scsi_spc::vpd::{
-    Association, CodeSet, DesignatorType, build_device_identification, build_supported_vpd_pages,
-    build_unit_serial_number, push_designator,
+    Association, CodeSet, DesignatorType, TpgsField, build_device_identification,
+    build_extended_inquiry, build_supported_vpd_pages, build_unit_serial_number, push_designator,
 };
+use shared_iscsi::alua::AluaTopology;
 
 /// Wire-shape flags for the drive-LUN standard INQUIRY: SPC-3 (the
 /// version SSC-4 / SMC-3 reference; real LTO drives advertise this),
-/// HISUP=1, CMDQUE=0 (per-drive serialization in the daemon).
+/// HISUP=1, CMDQUE=0 (per-drive serialization in the daemon),
+/// TPGS=01b (implicit-only ALUA — REPORT TARGET PORT GROUPS honored
+/// since #43).
 const DRIVE_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
     spc_version: 0x05,
     hisup: true,
+    tpgs: TpgsField::Implicit,
     cmdque: false,
 };
 
@@ -64,7 +68,8 @@ pub fn handle_inquiry(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     let data_out = match page_code {
         0x00 => build_supported_pages(),
         0x80 => build_unit_serial(facade, lun, drive_id),
-        0x83 => build_device_id(facade, lun, ctx.session_partition),
+        0x83 => build_device_id(facade, lun, ctx.session_partition, ctx.alua),
+        0x86 => build_extended_inquiry_drive(),
         0xB0 => build_seq_access_chars(drive_manager, drive_id, device_type),
         0xB1 => build_mfg_serial(facade, lun, drive_id, device_type),
         0xB2 => build_tapealert_supported(device_type),
@@ -130,9 +135,22 @@ fn build_supported_pages() -> Vec<u8> {
     let d = build_supported_vpd_pages(
         PeripheralQualifier::Connected,
         PeripheralType::SequentialAccess,
-        &[0x80, 0x83, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4],
+        &[0x80, 0x83, 0x86, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4],
     );
     tracing::debug!("INQUIRY VPD 0x00 response: {} bytes", d.len());
+    d
+}
+
+/// VPD 0x86 — Extended INQUIRY Data (SPC-4 §7.7.10). All capability
+/// bits cleared — the actual TPGS field initiators read lives in
+/// INQUIRY standard data byte 5 (`DRIVE_INQUIRY_FLAGS.tpgs`); this
+/// page exists so VPD-page enumeration sees a contiguous list.
+fn build_extended_inquiry_drive() -> Vec<u8> {
+    let d = build_extended_inquiry(
+        PeripheralQualifier::Connected,
+        PeripheralType::SequentialAccess,
+    );
+    tracing::debug!("INQUIRY VPD 0x86 response: {} bytes", d.len());
     d
 }
 
@@ -172,6 +190,7 @@ fn build_device_id(
     facade: &dyn core_mediachanger::TapeDeviceFacade,
     lun: u8,
     session_partition: Option<&str>,
+    alua: Option<&AluaTopology>,
 ) -> Vec<u8> {
     let chassis_ser = facade.chassis_serial();
     let lug_id = scsi_spc::naa::logical_unit_group(&chassis_ser, session_partition);
@@ -208,6 +227,12 @@ fn build_device_id(
         DesignatorType::LogicalUnitGroup,
         &lug_id,
     );
+    // ALUA target-port descriptors — one (NAA + RelativeTargetPort +
+    // TargetPortGroup) trio per advertised iSCSI portal. Absent for
+    // non-iSCSI / synthetic call sites (`ctx.alua == None`).
+    if let Some(topo) = alua {
+        topo.push_vpd83_target_port_descriptors(&mut descriptors);
+    }
     let d = build_device_identification(
         PeripheralQualifier::Connected,
         PeripheralType::SequentialAccess,
@@ -215,8 +240,9 @@ fn build_device_id(
     );
 
     tracing::debug!(
-        "INQUIRY VPD 0x83 response: {} bytes (NAA + T10 + LUG)",
-        d.len()
+        "INQUIRY VPD 0x83 response: {} bytes (NAA + T10 + LUG{})",
+        d.len(),
+        if alua.is_some() { " + TP" } else { "" }
     );
     d
 }

@@ -19,6 +19,7 @@
 //!   product-agnostic [`ScsiHandler`] trait the transport dispatches
 //!   through.
 
+pub mod alua;
 pub mod auth;
 pub mod error;
 pub mod handler;

@@ -117,6 +117,7 @@ impl Fixture {
             diagnostic_store: &self.diag,
             session_partition: None,
             has_changer: true,
+            alua: None,
         };
         SmcScsiCtx {
             inner,

@@ -1854,25 +1854,22 @@ pub fn handle_maintenance_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             })
         }
         0x0A => {
-            // REPORT TARGET PORT GROUPS (ALUA). Single port group,
-            // single port, status = active/optimized. SPC-4 §6.27.7.
-            //
-            //   bytes 0..3   return data length (= 8+8 = 16 - 4 = 12)
-            //   byte 4       PREF/asym access state (0x00 = optimized)
-            //   byte 5       supported access states bitmap
-            //   bytes 6..7   target port group (0)
-            //   byte 8       reserved
-            //   byte 9       status code
-            //   byte 10      vendor specific
-            //   byte 11      port count (= 1)
-            //   bytes 12..15 port descriptor: reserved + relative target port id (0x0001)
-            let mut data = vec![0u8; 16];
-            data[0..4].copy_from_slice(&12u32.to_be_bytes());
-            data[4] = 0x00; // active/optimized
-            data[5] = 0x80; // ao_sup (active/optimized supported)
-            data[6..8].copy_from_slice(&0u16.to_be_bytes()); // tpg id
-            data[11] = 1; // 1 port
-            data[14..16].copy_from_slice(&1u16.to_be_bytes()); // rel port id
+            // REPORT TARGET PORT GROUPS (ALUA, SPC-4 §6.27.7) —
+            // implementation in `shared_iscsi::alua::AluaTopology`.
+            // One TPG descriptor per distinct configured TPGT, each
+            // listing member RTPIs + the per-TPG asymmetric access
+            // state (defaults to ACTIVE_OPTIMIZED — implicit ALUA
+            // first cut). Non-iSCSI / synthetic call sites
+            // (`ctx.alua == None`) get an empty body so capability
+            // probes still see GOOD status.
+            let data = match ctx.alua {
+                Some(topo) => topo.report_target_port_groups_body(),
+                None => {
+                    let mut empty = vec![0u8; 4];
+                    empty[0..4].copy_from_slice(&0u32.to_be_bytes());
+                    empty
+                }
+            };
             Ok(ScsiResp {
                 status: ScsiStatus::Good,
                 data_out: limit_len(data, alloc),
@@ -1986,6 +1983,7 @@ pub fn check_partition_fence(ctx: &ScsiCtx<'_>) -> Result<Option<ScsiResp>> {
             scsi_spc::inquiry::InquiryFlags {
                 spc_version: 0x05,
                 hisup: true,
+                tpgs: scsi_spc::vpd::TpgsField::Implicit,
                 cmdque: false,
             },
         );

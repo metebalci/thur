@@ -19,6 +19,7 @@
 //! own store through.
 
 use core_mediachanger::{AuditActor, AuditChannel, AuditRateLimiter, TapeDeviceFacade, TapeEvent};
+use shared_iscsi::alua::AluaTopology;
 use shared_iscsi::unit_attention::UnitAttentionTracker;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -234,6 +235,14 @@ pub struct ScsiCtx<'a> {
     /// drive opcode on LUN 0 as a "wrong device type" condition or
     /// run it normally.
     pub has_changer: bool,
+    /// ALUA topology — per-portal RTPI / TPGT + per-TPG asymmetric
+    /// access state. Built once at daemon startup from
+    /// `iscsi.listen_portals`. Read by INQUIRY VPD 0x83 (TargetPort
+    /// designators) and MAINTENANCE IN SA 0x0A (REPORT TARGET PORT
+    /// GROUPS). `None` for non-iSCSI / synthetic call sites (CLI
+    /// SCSI tests, in-process smoke); in that case the dispatcher
+    /// falls back to a single-port no-ALUA response.
+    pub alua: Option<&'a AluaTopology>,
 }
 
 impl ScsiCtx<'_> {

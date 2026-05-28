@@ -31,9 +31,11 @@ use scsi_spc::inquiry::{
     write_padded_ascii,
 };
 use scsi_spc::vpd::{
-    Association, CodeSet, DesignatorType, build_device_identification, build_supported_vpd_pages,
-    build_unit_serial_number, finalize_vpd, push_designator, vpd_header,
+    Association, CodeSet, DesignatorType, TpgsField, build_device_identification,
+    build_extended_inquiry, build_supported_vpd_pages, build_unit_serial_number, finalize_vpd,
+    push_designator, vpd_header,
 };
+use shared_iscsi::alua::AluaTopology;
 use shared_naming::{DISK_PRODUCT, VENDOR_INQUIRY};
 
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
@@ -49,6 +51,7 @@ const REVISION: &str = "0001";
 const VSA_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
     spc_version: 0x06,
     hisup: true,
+    tpgs: TpgsField::Implicit,
     cmdque: true,
 };
 
@@ -62,7 +65,11 @@ fn pq_pt(lun_present: bool) -> (PeripheralQualifier, PeripheralType) {
     }
 }
 
-pub(super) fn dispatch(req: &ScsiRequest<'_>, cache: Option<&PageCache>) -> ScsiResponse {
+pub(super) fn dispatch(
+    req: &ScsiRequest<'_>,
+    cache: Option<&PageCache>,
+    alua: &AluaTopology,
+) -> ScsiResponse {
     if req.cdb.len() < 6 {
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
@@ -79,7 +86,8 @@ pub(super) fn dispatch(req: &ScsiRequest<'_>, cache: Option<&PageCache>) -> Scsi
         match page_code {
             0x00 => vpd_supported_pages(cache.is_some()),
             0x80 => vpd_unit_serial(cache),
-            0x83 => vpd_device_id(cache),
+            0x83 => vpd_device_id(cache, alua),
+            0x86 => vpd_extended_inquiry(cache),
             0x8F => vpd_third_party_copy(cache),
             0xB0 => vpd_block_limits(cache),
             0xB2 => vpd_logical_block_provisioning(cache),
@@ -115,7 +123,7 @@ fn standard_inquiry(cache: Option<&PageCache>) -> Vec<u8> {
 fn vpd_supported_pages(lun_present: bool) -> Vec<u8> {
     let (pq, pt) = pq_pt(lun_present);
     let pages: &[u8] = if lun_present {
-        &[0x80, 0x83, 0x8F, 0xB0, 0xB2]
+        &[0x80, 0x83, 0x86, 0x8F, 0xB0, 0xB2]
     } else {
         &[]
     };
@@ -146,7 +154,7 @@ fn vpd_unit_serial(cache: Option<&PageCache>) -> Vec<u8> {
 ///    has room for a 20-byte designator, so VAAI XCOPY references
 ///    LUNs by NAA. Without this entry, ESXi can't address VSA
 ///    volumes as XCOPY targets even with VPD 0x8F advertised.
-fn vpd_device_id(cache: Option<&PageCache>) -> Vec<u8> {
+fn vpd_device_id(cache: Option<&PageCache>, alua: &AluaTopology) -> Vec<u8> {
     let (pq, pt) = pq_pt(cache.is_some());
     let mut descriptors = Vec::new();
     if let Some(w) = cache {
@@ -175,8 +183,23 @@ fn vpd_device_id(cache: Option<&PageCache>) -> Vec<u8> {
             DesignatorType::Naa,
             &naa,
         );
+        // ALUA target-port descriptors — one (NAA + RelativeTargetPort
+        // + TargetPortGroup) trio per advertised iSCSI portal. dm-
+        // multipath reads these to bind a path to its TPG, then issues
+        // REPORT TARGET PORT GROUPS to discover the per-TPG access
+        // state.
+        alua.push_vpd83_target_port_descriptors(&mut descriptors);
     }
     build_device_identification(pq, pt, &descriptors)
+}
+
+/// VPD 0x86 — Extended INQUIRY Data (SPC-4 §7.7.10). All capability
+/// bits cleared — the actual TPGS field initiators read lives in
+/// INQUIRY standard data byte 5; this page exists so VPD-page
+/// enumeration sees a contiguous list.
+fn vpd_extended_inquiry(cache: Option<&PageCache>) -> Vec<u8> {
+    let (pq, pt) = pq_pt(cache.is_some());
+    build_extended_inquiry(pq, pt)
 }
 
 /// Derive the 8-byte NAA Locally Assigned identifier from a volume
@@ -459,9 +482,20 @@ mod tests {
     use super::*;
     use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
     use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
+    use shared_iscsi::transport::Portal;
     use shared_object_store::{LocalBackend, ObjectStoreBackend};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn default_alua() -> AluaTopology {
+        AluaTopology::from_portals(
+            &[Portal {
+                address: "0.0.0.0:3260".to_string(),
+                tpgt: 1,
+            }],
+            "iqn.example:test",
+        )
+    }
 
     async fn fixture_cache(data_dir: &std::path::Path) -> Arc<PageCache> {
         let cloud_root = data_dir.join("cloud");
@@ -505,7 +539,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0, 0, 0x00, 0x60, 0]; // alloc 96
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
 
         assert!(resp.sense.is_none());
         let d = &resp.data_in;
@@ -522,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn standard_inquiry_for_absent_lun() {
         let cdb = [0x12u8, 0, 0, 0x00, 0x60, 0];
-        let resp = dispatch(&req(&cdb, 99), None);
+        let resp = dispatch(&req(&cdb, 99), None, &default_alua());
         assert!(resp.sense.is_none()); // INQUIRY must succeed
         // SPC-4 §6.4.2 "no LUN" pattern: qualifier 0b011 + type 0x1F.
         assert_eq!(resp.data_in[0], 0x7F);
@@ -533,7 +567,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x00, 0x00, 0x40, 0]; // EVPD + page 0
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert_eq!(d[1], 0x00);
         assert_eq!(d[3] as usize, d.len() - 4);
@@ -547,7 +581,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x80, 0x00, 0x60, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert_eq!(d[1], 0x80);
         let serial_len = d[3] as usize;
@@ -560,7 +594,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x83, 0x00, 0x60, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert_eq!(d[1], 0x83);
         // descriptor at offset 4: code set + type, len, then designator.
@@ -574,23 +608,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_inquiry_advertises_implicit_alua_tpgs() {
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        let cdb = [0x12u8, 0, 0, 0x00, 0x60, 0];
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
+        assert!(resp.sense.is_none());
+        // INQUIRY std-data byte 5 bits 5:4 = TPGS field — 01b (0x10)
+        // when ALUA is implicit-only.
+        assert_eq!(resp.data_in[5] & 0x30, 0x10);
+    }
+
+    #[tokio::test]
+    async fn vpd_extended_inquiry_is_well_formed() {
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        let cdb = [0x12u8, 0x01, 0x86, 0x00, 0x40, 0]; // alloc 64
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
+        assert!(resp.sense.is_none());
+        assert_eq!(resp.data_in.len(), 64);
+        assert_eq!(resp.data_in[1], 0x86);
+        let page_len = u16::from_be_bytes([resp.data_in[2], resp.data_in[3]]);
+        assert_eq!(page_len, 60);
+        // No capability bits set — the page is a placeholder so
+        // multipath stacks see it in VPD 0x00 enumeration; TPGS
+        // (Target Port Group Support) lives in INQUIRY std-data byte
+        // 5, not here.
+        for byte in &resp.data_in[4..] {
+            assert_eq!(*byte, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn vpd_page_zero_lists_0x86() {
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        let cdb = [0x12u8, 0x01, 0x00, 0x00, 0x40, 0];
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
+        let d = &resp.data_in;
+        let n = d[3] as usize;
+        let pages = &d[4..4 + n];
+        assert!(pages.contains(&0x86), "VPD 0x86 must be advertised");
+    }
+
+    #[tokio::test]
+    async fn vpd_device_id_includes_target_port_descriptors() {
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path()).await;
+        // Multi-portal topology — two TP descriptor sets.
+        let alua = AluaTopology::from_portals(
+            &[
+                Portal {
+                    address: "10.0.0.1:3260".to_string(),
+                    tpgt: 1,
+                },
+                Portal {
+                    address: "10.0.0.2:3260".to_string(),
+                    tpgt: 2,
+                },
+            ],
+            "iqn.example:test",
+        );
+        let cdb = [0x12u8, 0x01, 0x83, 0x00, 0xFF, 0];
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &alua);
+        assert!(resp.sense.is_none());
+        let d = &resp.data_in;
+        // Walk descriptors past the header (4 bytes).
+        let mut cur = 4;
+        let mut tp_naa = 0;
+        let mut tp_rtpi = 0;
+        let mut tp_tpg = 0;
+        while cur + 4 <= d.len() {
+            let assoc = (d[cur + 1] >> 4) & 0x03;
+            let desig_type = d[cur + 1] & 0x0F;
+            let body_len = d[cur + 3] as usize;
+            if assoc == 0x01 {
+                match desig_type {
+                    0x03 => tp_naa += 1,
+                    0x04 => tp_rtpi += 1,
+                    0x05 => tp_tpg += 1,
+                    _ => {}
+                }
+            }
+            cur += 4 + body_len;
+        }
+        assert_eq!(tp_naa, 2, "one TP NAA designator per portal");
+        assert_eq!(tp_rtpi, 2, "one RelativeTargetPort designator per portal");
+        assert_eq!(tp_tpg, 2, "one TargetPortGroup designator per portal");
+    }
+
+    #[tokio::test]
     async fn vpd_unknown_page_rejected() {
         let cdb = [0x12u8, 0x01, 0x42, 0x00, 0x60, 0];
-        let resp = dispatch(&req(&cdb, 0), None);
+        let resp = dispatch(&req(&cdb, 0), None, &default_alua());
         assert_eq!(resp.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
     }
 
     #[tokio::test]
     async fn standard_inquiry_with_evpd_zero_and_page_set_rejected() {
         let cdb = [0x12u8, 0x00, 0x42, 0x00, 0x60, 0];
-        let resp = dispatch(&req(&cdb, 0), None);
+        let resp = dispatch(&req(&cdb, 0), None, &default_alua());
         assert_eq!(resp.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
     }
 
     #[tokio::test]
     async fn alloc_length_truncates_response() {
         let cdb = [0x12u8, 0, 0, 0x00, 0x10, 0]; // alloc only 16 bytes
-        let resp = dispatch(&req(&cdb, 99), None);
+        let resp = dispatch(&req(&cdb, 99), None, &default_alua());
         assert_eq!(resp.data_in.len(), 16);
     }
 
@@ -599,7 +723,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x00, 0x00, 0x40, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         let n = d[3] as usize;
         let pages = &d[4..4 + n];
@@ -613,7 +737,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0xB0, 0x00, 0x40, 0]; // alloc 64
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert!(resp.sense.is_none());
         assert_eq!(d.len(), 64);
@@ -643,7 +767,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0xB2, 0x00, 0x40, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert!(resp.sense.is_none());
         assert_eq!(d.len(), 8);
@@ -665,7 +789,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x00, 0x00, 0x40, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         let n = d[3] as usize;
         let pages = &d[4..4 + n];
@@ -684,7 +808,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x8F, 0x00, 0x80, 0];
-        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()));
+        let resp = dispatch(&req(&cdb, 0), Some(cache.as_ref()), &default_alua());
         let d = &resp.data_in;
         assert!(resp.sense.is_none(), "{:?}", resp.sense);
         assert_eq!(d[1], 0x8F);

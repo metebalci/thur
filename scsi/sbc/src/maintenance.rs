@@ -4,7 +4,12 @@
 //! MAINTENANCE IN (opcode 0xA3) — capability-discovery service
 //! actions.
 //!
-//! Two service actions today:
+//! Three service actions today:
+//!   - 0x0A REPORT TARGET PORT GROUPS (SPC-4 §6.27.7): publishes
+//!     the per-TPG asymmetric access state read by ALUA-aware
+//!     initiators (dm-multipath). Topology comes from
+//!     [`AluaTopology`]; first-cut all TPGs default to
+//!     `ActiveOptimized`.
 //!   - 0x0C REPORT SUPPORTED OPERATION CODES (SPC-4 §6.27.2):
 //!     VAAI / Hyper-V probe this to discover offload primitives
 //!     (CAW, WRITE SAME, UNMAP, COMPARE AND WRITE) without trying
@@ -13,10 +18,13 @@
 //!     §6.27.3): 4-byte response advertising the SAM-/iSCSI-
 //!     standard set the session layer accepts.
 //!
-//! Other service actions (REPORT TARGET PORT GROUPS 0x0A, REPORT
-//! IDENTIFYING INFORMATION 0x05, etc.) aren't wired — initiators
-//! that probe them get INVALID FIELD IN CDB. We don't model ALUA
-//! (single-port virtual target) or identifying-info storage.
+//! Other service actions (REPORT IDENTIFYING INFORMATION 0x05,
+//! etc.) aren't wired — initiators that probe them get INVALID
+//! FIELD IN CDB. SET TARGET PORT GROUPS (MAINTENANCE OUT 0x0A) is
+//! also unwired; the daemon advertises implicit-only ALUA so
+//! hosts never issue SET TPG.
+
+use shared_iscsi::alua::AluaTopology;
 
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
 
@@ -58,7 +66,7 @@ const SUPPORTED_OPCODES: &[u8] = &[
 
 /// Dispatch the MAINTENANCE IN service action. Service action is
 /// in CDB byte 1 bits 4-0; allocation length is in bytes 6-9 (BE).
-pub(super) fn maintenance_in(req: &ScsiRequest<'_>) -> ScsiResponse {
+pub(super) fn maintenance_in(req: &ScsiRequest<'_>, alua: &AluaTopology) -> ScsiResponse {
     if req.cdb.len() < 12 {
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
@@ -66,6 +74,7 @@ pub(super) fn maintenance_in(req: &ScsiRequest<'_>) -> ScsiResponse {
     let alloc_len = u32::from_be_bytes([req.cdb[6], req.cdb[7], req.cdb[8], req.cdb[9]]) as usize;
 
     let body = match service_action {
+        0x0A => alua.report_target_port_groups_body(),
         0x0C => report_supported_opcodes(),
         0x0D => report_supported_tmf(),
         _ => return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
@@ -135,6 +144,17 @@ fn report_supported_tmf() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_iscsi::transport::Portal;
+
+    fn default_alua() -> AluaTopology {
+        AluaTopology::from_portals(
+            &[Portal {
+                address: "0.0.0.0:3260".to_string(),
+                tpgt: 1,
+            }],
+            "iqn.example:test",
+        )
+    }
 
     fn req<'a>(cdb: &'a [u8]) -> ScsiRequest<'a> {
         ScsiRequest {
@@ -162,7 +182,7 @@ mod tests {
     #[test]
     fn report_supported_opcodes_returns_every_routed_opcode() {
         let cdb = build_cdb(0x0C, 4 + 8 * 64);
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         assert!(r.sense.is_none());
         let body_len =
             u32::from_be_bytes([r.data_in[0], r.data_in[1], r.data_in[2], r.data_in[3]]) as usize;
@@ -179,7 +199,7 @@ mod tests {
     fn report_supported_opcodes_includes_caw_unmap_and_writesame() {
         // VAAI / Linux / blkdiscard probe these specifically.
         let cdb = build_cdb(0x0C, 4 + 8 * 64);
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         let entries = &r.data_in[4..];
         let opcodes: Vec<u8> = entries.chunks(8).map(|e| e[0]).collect();
         assert!(opcodes.contains(&0x89), "COMPARE AND WRITE absent");
@@ -194,7 +214,7 @@ mod tests {
         // 0x84 is the companion query opcode the host uses to read
         // back COPY STATUS / OPERATING PARAMETERS.
         let cdb = build_cdb(0x0C, 4 + 8 * 64);
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         let opcodes: Vec<u8> = r.data_in[4..].chunks(8).map(|e| e[0]).collect();
         assert!(opcodes.contains(&0x83), "EXTENDED COPY absent");
         assert!(opcodes.contains(&0x84), "RECEIVE COPY RESULTS absent");
@@ -203,7 +223,7 @@ mod tests {
     #[test]
     fn report_supported_tmf_advertises_standard_set() {
         let cdb = build_cdb(0x0D, 4);
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         assert!(r.sense.is_none());
         assert_eq!(r.data_in.len(), 4);
         // ATS | ATSS | CTSS | LURS in byte 0
@@ -213,16 +233,56 @@ mod tests {
     }
 
     #[test]
+    fn report_target_port_groups_emits_default_active_optimized() {
+        let cdb = build_cdb(0x0A, 1024);
+        let r = maintenance_in(&req(&cdb), &default_alua());
+        assert!(r.sense.is_none());
+        // Single TPG → header (4 bytes) + 1 descriptor (8 + 4*1 = 12 bytes).
+        assert_eq!(r.data_in.len(), 4 + 12);
+        let body_len =
+            u32::from_be_bytes([r.data_in[0], r.data_in[1], r.data_in[2], r.data_in[3]]) as usize;
+        assert_eq!(body_len, 12);
+        // ASYMMETRIC ACCESS STATE = 0x0 (Active/Optimized).
+        assert_eq!(r.data_in[4] & 0x0F, 0x0);
+        // TPGT = 1
+        assert_eq!(u16::from_be_bytes([r.data_in[6], r.data_in[7]]), 1);
+    }
+
+    #[test]
+    fn report_target_port_groups_with_multi_portal_topology() {
+        let alua = AluaTopology::from_portals(
+            &[
+                Portal {
+                    address: "10.0.0.1:3260".to_string(),
+                    tpgt: 1,
+                },
+                Portal {
+                    address: "10.0.0.2:3260".to_string(),
+                    tpgt: 2,
+                },
+            ],
+            "iqn.example:test",
+        );
+        let cdb = build_cdb(0x0A, 1024);
+        let r = maintenance_in(&req(&cdb), &alua);
+        assert!(r.sense.is_none());
+        // Two TPG descriptors (12 bytes each) + 4-byte header = 28.
+        assert_eq!(r.data_in.len(), 4 + 12 * 2);
+        // Second TPGT at offset 4 + 12 + 2.
+        assert_eq!(u16::from_be_bytes([r.data_in[18], r.data_in[19]]), 2);
+    }
+
+    #[test]
     fn unknown_service_action_rejected() {
         let cdb = build_cdb(0x05, 256); // REPORT IDENTIFYING INFO — not wired
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
     }
 
     #[test]
     fn alloc_length_truncates_response() {
         let cdb = build_cdb(0x0D, 2);
-        let r = maintenance_in(&req(&cdb));
+        let r = maintenance_in(&req(&cdb), &default_alua());
         assert!(r.sense.is_none());
         assert_eq!(r.data_in.len(), 2);
     }

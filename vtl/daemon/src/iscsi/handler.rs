@@ -64,6 +64,11 @@ pub struct IscsiLibraryHandler {
     /// iSCSI target IQN advertised in Login / SendTargets. Resolved
     /// at boot from `iscsi.target_iqn`.
     pub(crate) target_iqn: String,
+    /// ALUA topology built from `iscsi.listen_portals` at daemon
+    /// startup. Threaded into the SCSI dispatcher's `ScsiCtx::alua`
+    /// for VPD 0x83 TargetPort designators + MAINTENANCE IN SA 0x0A
+    /// REPORT TARGET PORT GROUPS.
+    pub(crate) alua: Arc<shared_iscsi::alua::AluaTopology>,
 }
 
 impl IscsiLibraryHandler {
@@ -192,6 +197,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         let peer = req.peer.to_string();
         let partition = req.session_partition.map(str::to_string);
         let diag = Arc::clone(&self.diagnostic_store);
+        let alua = Arc::clone(&self.alua);
         let mut pdu = Pdu::synth(req.cdb, req.lun, req.data_in_max, req.data_out);
 
         let resp_result: Result<ScsiResp> = tokio::task::spawn_blocking(move || {
@@ -210,6 +216,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 &peer,
                 partition,
                 diag,
+                Some(alua),
             )
         })
         .await

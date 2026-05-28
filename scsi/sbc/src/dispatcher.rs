@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use shared_iscsi::alua::AluaTopology;
 
 use crate::VolumeLookup;
 use crate::data_path;
@@ -64,10 +65,38 @@ pub struct SbcScsiDispatcher {
     /// outcomes. The sweeper task spawned in [`Self::new`] runs every
     /// 30 s and drops entries past their inactivity deadline.
     tokens: Arc<TokenManager>,
+    /// ALUA topology — per-portal RTPI / TPGT + per-TPG asymmetric
+    /// access state. Feeds VPD 0x83 TargetPort designators, VPD 0x86
+    /// (TPGS field), and REPORT TARGET PORT GROUPS. Default
+    /// single-portal deployments end up with one TPG in
+    /// `ActiveOptimized`, which is the truthful answer for a single
+    /// host accessing a single advertised iSCSI portal.
+    alua: Arc<AluaTopology>,
 }
 
 impl SbcScsiDispatcher {
+    /// Convenience constructor for tests + non-portal-aware call
+    /// sites. Builds an `AluaTopology` over a single synthetic portal
+    /// (RTPI=1, TPGT=1) so the dispatcher's ALUA surface still
+    /// answers truthfully; production code passes through
+    /// [`Self::with_alua`] from `thurvsad::main`.
     pub fn new(registry: Arc<dyn VolumeLookup>, target_iqn: String) -> Self {
+        let portals = [shared_iscsi::transport::Portal {
+            address: String::new(),
+            tpgt: 1,
+        }];
+        let alua = Arc::new(AluaTopology::from_portals(&portals, target_iqn.clone()));
+        Self::with_alua(registry, target_iqn, alua)
+    }
+
+    /// Production constructor: pass the `AluaTopology` built from the
+    /// daemon's `iscsi.listen_portals` so VPD 0x83 / VPD 0x86 / REPORT
+    /// TPG reflect the real portal layout.
+    pub fn with_alua(
+        registry: Arc<dyn VolumeLookup>,
+        target_iqn: String,
+        alua: Arc<AluaTopology>,
+    ) -> Self {
         let tokens = Arc::new(TokenManager::new());
         // Best-effort sweeper: only spawns when called from within a
         // tokio runtime. Construction from non-tokio contexts (unit
@@ -95,6 +124,7 @@ impl SbcScsiDispatcher {
             reservations: Arc::new(ReservationManager::new()),
             caw_locks: Arc::new(CawLocks::new()),
             tokens,
+            alua,
         }
     }
 
@@ -137,7 +167,7 @@ impl SbcScsiDispatcher {
         match req.cdb[0] {
             0x00 => sizing::test_unit_ready(&req, cache),
             0x03 => probes::request_sense(&req, cache),
-            0x12 => inquiry::dispatch(&req, cache),
+            0x12 => inquiry::dispatch(&req, cache, &self.alua),
             0x15 => mode_sense::mode_select_6(&req, cache),
             0x1A => mode_sense::mode_sense_6(&req, cache),
             0x1B => probes::start_stop_unit(&req, cache),
@@ -181,7 +211,7 @@ impl SbcScsiDispatcher {
             }
             0x9E => sizing::service_action_in_16(&req, cache),
             0xA0 => sizing::report_luns(&req, &self.registry.luns_filtered(req.session_volumes)),
-            0xA3 => maintenance::maintenance_in(&req),
+            0xA3 => maintenance::maintenance_in(&req, &self.alua),
             _ => ScsiResponse::check(SenseData::INVALID_OPCODE),
         }
     }

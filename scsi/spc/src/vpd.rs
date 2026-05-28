@@ -104,6 +104,17 @@ pub enum DesignatorType {
     T10VendorId = 0x01,
     /// 0x03 — NAA (IEEE Network Address Authority).
     Naa = 0x03,
+    /// 0x04 — Relative Target Port Identifier (SPC-4 §7.7.6.10).
+    /// 4-byte body: two reserved bytes + a BE16 RTPI. Always paired
+    /// with [`Association::TargetPort`]. Linux dm-multipath reads
+    /// this to learn the RTPI of the path that issued the INQUIRY.
+    RelativeTargetPort = 0x04,
+    /// 0x05 — Target Port Group (SPC-4 §7.7.6.11). 4-byte body: two
+    /// reserved bytes + a BE16 Target Port Group Tag. Always paired
+    /// with [`Association::TargetPort`]. Together with REPORT TARGET
+    /// PORT GROUPS this lets the host correlate "what TPG does this
+    /// path belong to" against "what is the access state of TPG N".
+    TargetPortGroup = 0x05,
     /// 0x06 — Logical Unit Group. 4-byte group ID identifying a
     /// set of LUs that comprise one logical device (thurvtl emits
     /// this on drive + changer LUNs so backup software auto-
@@ -166,6 +177,51 @@ pub fn build_device_identification(
     buf
 }
 
+/// SPC-4 §7.7.10 TPGS — Target Port Group Support advertised in VPD
+/// 0x86 byte 5 bits 5:4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TpgsField {
+    /// 00b — ALUA not supported.
+    None = 0b00,
+    /// 01b — implicit ALUA. The target manages asymmetric access
+    /// state changes itself; the initiator can read state via
+    /// REPORT TARGET PORT GROUPS but cannot drive it via SET TPG.
+    Implicit = 0b01,
+    /// 10b — explicit ALUA. The initiator drives state changes
+    /// through SET TARGET PORT GROUPS; implicit transitions never
+    /// occur.
+    Explicit = 0b10,
+    /// 11b — both implicit and explicit.
+    Both = 0b11,
+}
+
+/// Build VPD page 0x86 — Extended INQUIRY Data (SPC-4 §7.7.10).
+/// 64-byte page (60-byte body) with every capability bit cleared —
+/// neither product wires protection-information features, command-
+/// queue ordering hints, V_SUP/NV_SUP, P_I_I_SUP, LUICLR, CBCS,
+/// MULTI_I_T_NEXUS_MICROCODE, EXTENDED SELF-TEST COMPLETION MINUTES,
+/// MAXIMUM SUPPORTED SENSE DATA LENGTH, etc. The page is published
+/// so multipath stacks that probe the VPD-page list don't see a hole
+/// in the supported-pages table and stop early; the actual TPGS
+/// (Target Port Group Support) field they read for implicit-vs-
+/// explicit ALUA discovery lives in INQUIRY standard data byte 5
+/// bits 5:4, not here (the SPC-4 spec deliberately puts TPGS in the
+/// standard data, not VPD 0x86 — see [`InquiryFlags::tpgs`]).
+pub fn build_extended_inquiry(
+    qualifier: PeripheralQualifier,
+    peripheral_type: PeripheralType,
+) -> Vec<u8> {
+    // SPC-4 Table 433: page length is 60 (n - 3 with n = 63).
+    let mut buf = vpd_header(qualifier, peripheral_type, 0x86, 60);
+    buf.resize(64, 0);
+    buf[2..4].copy_from_slice(&60u16.to_be_bytes());
+    // bytes 4..63: every capability field clear. The 60-byte page
+    // length is a SPC-4 invariant; initiators that read more than the
+    // populated fields see well-formed zero bytes.
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +254,71 @@ mod tests {
         let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         assert_eq!(len, 16);
         assert_eq!(&buf[4..20], b"ABC123          ");
+    }
+
+    #[test]
+    fn extended_inquiry_emits_well_formed_zero_body() {
+        let buf =
+            build_extended_inquiry(PeripheralQualifier::Connected, PeripheralType::DirectAccess);
+        // Header: byte 0 type, byte 1 page code = 0x86, bytes 2..4 length = 60.
+        assert_eq!(buf.len(), 64);
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[1], 0x86);
+        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 60);
+        // No capability bits set — TPGS belongs in INQUIRY std-data
+        // byte 5, not here.
+        for byte in &buf[4..] {
+            assert_eq!(*byte, 0);
+        }
+    }
+
+    #[test]
+    fn relative_target_port_designator_round_trips() {
+        let mut descriptors = Vec::new();
+        // SPC-4 §7.7.6.10: 4-byte body, two reserved bytes then BE16 RTPI.
+        let mut value = [0u8; 4];
+        value[2..4].copy_from_slice(&7u16.to_be_bytes());
+        push_designator(
+            &mut descriptors,
+            CodeSet::Binary,
+            Association::TargetPort,
+            DesignatorType::RelativeTargetPort,
+            &value,
+        );
+        let buf = build_device_identification(
+            PeripheralQualifier::Connected,
+            PeripheralType::DirectAccess,
+            &descriptors,
+        );
+        // Descriptor: byte 0 = code set 1 (binary), byte 1 = (assoc<<4)|type
+        // = (1<<4)|0x04 = 0x14.
+        assert_eq!(buf[4], 0x01);
+        assert_eq!(buf[5], 0x14);
+        // body length 4, value's last 2 bytes carry RTPI.
+        assert_eq!(buf[7], 4);
+        assert_eq!(u16::from_be_bytes([buf[10], buf[11]]), 7);
+    }
+
+    #[test]
+    fn target_port_group_designator_round_trips() {
+        let mut descriptors = Vec::new();
+        let mut value = [0u8; 4];
+        value[2..4].copy_from_slice(&13u16.to_be_bytes());
+        push_designator(
+            &mut descriptors,
+            CodeSet::Binary,
+            Association::TargetPort,
+            DesignatorType::TargetPortGroup,
+            &value,
+        );
+        let buf = build_device_identification(
+            PeripheralQualifier::Connected,
+            PeripheralType::DirectAccess,
+            &descriptors,
+        );
+        // byte 5: (assoc<<4)|type = (1<<4)|0x05 = 0x15.
+        assert_eq!(buf[5], 0x15);
+        assert_eq!(u16::from_be_bytes([buf[10], buf[11]]), 13);
     }
 
     #[test]

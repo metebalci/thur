@@ -34,6 +34,29 @@ pub fn naa3_locally_assigned(
     naa
 }
 
+/// Derive an 8-byte NAA-3 (Locally Assigned) identifier for a target
+/// port designator on VPD `0x83`. `namespace` is a per-daemon-stable
+/// string the caller picks so two ports on different daemons can't
+/// collide — thurvtl uses the chassis serial, thurvsa uses the target
+/// IQN. `rtpi` is the Relative Target Port Identifier (SPC-4
+/// §3.1.118) assigned at portal-topology construction.
+///
+/// Pairs with `Association::TargetPort` + `DesignatorType::Naa` in
+/// VPD 0x83; ALUA-aware initiators read this to identify each
+/// target port in REPORT TARGET PORT GROUPS' member-port list.
+pub fn naa3_target_port(namespace: &str, rtpi: u16) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"|tp|");
+    hasher.update(&rtpi.to_be_bytes());
+    let h = hasher.finalize();
+    let bytes = h.as_bytes();
+    let mut naa = [0u8; 8];
+    naa[0] = 0x30 | (bytes[0] & 0x0F);
+    naa[1..8].copy_from_slice(&bytes[1..8]);
+    naa
+}
+
 /// Derive the 4-byte Logical Unit Group designator value for VPD `0x83`.
 /// Drives in the same partition share the same group; backup software
 /// uses this to auto-correlate "drives in this group belong to one

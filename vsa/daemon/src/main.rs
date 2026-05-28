@@ -476,9 +476,28 @@ async fn main() -> Result<()> {
     type TransportFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
     let (transport_fut, transport_listens): (TransportFut, Vec<String>) = match cfg.transport {
         Transport::Iscsi => {
-            let handler = Arc::new(SbcScsiDispatcher::new(
+            // Portal list comes first — the ALUA topology + listener
+            // bind set both key off it.
+            let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
+                vec![shared_iscsi::transport::Portal {
+                    address: DEFAULT_LISTEN_ADDRESS.to_string(),
+                    tpgt: 1,
+                }]
+            });
+            let iscsi_listens: Vec<String> =
+                iscsi_portals.iter().map(|p| p.address.clone()).collect();
+
+            // ALUA topology — built from the advertised portals with
+            // the target IQN as the per-port NAA-3 namespace so two
+            // daemons on the same host pick distinct identifiers.
+            let alua = Arc::new(shared_iscsi::alua::AluaTopology::from_portals(
+                &iscsi_portals,
+                target_iqn.clone(),
+            ));
+            let handler = Arc::new(SbcScsiDispatcher::with_alua(
                 Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
                 target_iqn.clone(),
+                alua,
             ));
             tracing::info!(
                 "thurvsad: SBC-3 dispatcher ready ({} LUN(s))",
@@ -496,15 +515,6 @@ async fn main() -> Result<()> {
                 iscsi_users.users.len(),
             )
             .context("building CHAP authenticator factory")?;
-
-            let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
-                vec![shared_iscsi::transport::Portal {
-                    address: DEFAULT_LISTEN_ADDRESS.to_string(),
-                    tpgt: 1,
-                }]
-            });
-            let iscsi_listens: Vec<String> =
-                iscsi_portals.iter().map(|p| p.address.clone()).collect();
             let server_config = ServerConfig {
                 listen_portals: iscsi_portals.clone(),
                 session_manager: Arc::clone(&session_manager),

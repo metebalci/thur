@@ -105,7 +105,7 @@ expose must answer.
 | 0x5F | PERSISTENT RESERVE OUT | 🟨 No (thurvtl) / 🟩 Partial (thurvsa) | O | thurvtl tape: rejected — multi-host clustering not modeled, omitted from REPORT SUPPORTED OPCODES. thurvsa block: SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY implemented; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. |
 | 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
-| 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0C REPORT SUPPORTED OPERATION CODES and 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS only — other SAs return INVALID FIELD IN CDB. |
+| 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
 | 0xA4 | MAINTENANCE OUT | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x06 SET IDENTIFYING INFORMATION, 0x0E SET PRIORITY, storage-array-specific SAs. (thurvtl only; thurvsa rejects 0xA4.) |
 | 0xB5 | SECURITY PROTOCOL OUT | 🟩 Partial | CC | thurvtl tape: protocol 0x20 / SPSP 0x0010 (Set Data Encryption) only. Other SPSPs and protocols return CHECK CONDITION. (LUN 0 dispatches the same opcode to REQUEST VOLUME ELEMENT ADDRESS, stub — see SMC-3 table.) Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 
@@ -120,7 +120,7 @@ accepted by issuing REPORT SUPPORTED OPERATION CODES (SA 0x0C).
 | SA | Name | Status | Spec | Notes |
 |---:|------|--------|:----:|-------|
 | 0x05 | REPORT IDENTIFYING INFORMATION | 🟨 No | O | Companion to MAINTENANCE OUT SA 0x06; both unimplemented. |
-| 0x0A | REPORT TARGET PORT GROUPS | 🟩 Yes | O | thurvtl only. Single TPG, single port. |
+| 0x0A | REPORT TARGET PORT GROUPS | 🟩 Yes | O | Both products. One TPG per distinct configured TPGT, member RTPIs assigned sequentially from 1 in portal order, all TPGs default to ACTIVE/OPTIMIZED (implicit ALUA). |
 | 0x0C | REPORT SUPPORTED OPERATION CODES | 🟩 Yes | O | Both products. thurvtl tape: one-command and all-commands forms. thurvsa: every routed CDB in ascending order; source of truth for VAAI / Hyper-V offload discovery. |
 | 0x0D | REPORT SUPPORTED TASK MGMT FUNCTIONS | 🟩 Yes | O | Advertises ABORT TASK / ABORT TASK SET / CLEAR TASK SET / LU RESET / I_T NEXUS RESET. |
 | 0x0F | REPORT TIMESTAMP | 🟩 Yes | O | thurvtl only. |
@@ -362,7 +362,7 @@ proposes `MaxOutstandingR2T=1`, and Windows matches.
 | BufferOffset monotonicity check | 🟩 Yes | M |
 | Phase-collapse (status piggybacked on Data-In) | 🟩 Yes | O |
 
-### Path redundancy — multi-portal advertisement, per-portal TPG
+### Path redundancy — multi-portal advertisement, per-portal TPG, ALUA
 
 The daemon accepts a list of TCP listen portals in `iscsi.listen`
 and binds one `TcpListener` per entry. SendTargets discovery returns
@@ -384,11 +384,10 @@ exposes the TPGT directly:
   `listen: [{address: "10.0.0.5:3260", tpgt: 1},
    {address: "10.0.0.6:3260", tpgt: 2}]`) carry an explicit TPGT —
   operators preparing for ALUA give each portal its own.
-- Multiple portals may share one TPGT (one TPG, many paths) — this
-  is the group shape ALUA's REPORT TARGET PORT GROUPS surface will
-  bind state to. The same address listed twice is rejected at boot:
-  `bind(2)` would fail anyway and the initiator can't disambiguate
-  two `TargetAddress` lines with identical `ip:port`.
+- Multiple portals may share one TPGT (one TPG, many paths). The
+  same address listed twice is rejected at boot: `bind(2)` would
+  fail anyway and the initiator can't disambiguate two
+  `TargetAddress` lines with identical `ip:port`.
 
 The Login Response `TargetPortalGroupTag` key echoes the *arrival*
 portal's TPGT per RFC 7143 §12.10 — the value the initiator gets
@@ -396,21 +395,43 @@ back matches the portal it dialed, so a session bound to portal 2
 sees `TargetPortalGroupTag=2` regardless of what the other portals
 advertise.
 
-By itself this is pure plumbing — host-visible behavior is the same
-as the single-TPG stage. With all portals in the same Target Port
-Group there is still no ALUA state surface to manage, no
-REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS contract, and
-`dm-multipath`'s active/passive mode is the supported configuration.
-Active/active across portals is *not* recommended today because the
-per-session state — command queue, Unit Attention queue, Persistent
-Reservation context — is independent across the sessions that
-connect through different portals; two paths simultaneously holding
-reservations would race.
+The SCSI layer publishes the same topology through the standard
+ALUA surface (SPC-4 §5.16) so `dm-multipath`'s ALUA path-priority
+checker can drive path selection automatically:
 
-REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS / VPD 0x83
-Target Port descriptors / VPD 0x86 are the remaining prerequisites
-for full ALUA-driven active/active multipath. They are deliberately
-deferred and tracked separately so this stage can land on its own.
+- **INQUIRY standard data byte 5** — TPGS field = 01b (implicit
+  ALUA only — REPORT TPG is supported but SET TPG is not).
+- **VPD 0x83 — Device Identification** — three additional
+  `Association=TargetPort` designators per advertised portal:
+  - NAA-3 (`DesignatorType::Naa`) — 8-byte identifier derived from
+    the chassis serial (VTL) / target IQN (VSA) plus the RTPI, so
+    each port has a stable identity across daemon restarts.
+  - Relative Target Port Identifier (`DesignatorType::RelativeTargetPort`)
+    — the RTPI assigned at startup (sequential from 1 in portal
+    order).
+  - Target Port Group (`DesignatorType::TargetPortGroup`) — the
+    portal's TPGT, which is the wire identifier the host correlates
+    against the REPORT TPG response.
+- **VPD 0x86 — Extended INQUIRY Data** — published with every
+  capability bit clear so VPD-page enumeration sees a contiguous
+  list. TPGS lives in INQUIRY standard data byte 5, not in this
+  page (SPC-4 §6.4.2).
+- **REPORT TARGET PORT GROUPS** (MAINTENANCE IN service action
+  0x0A, SPC-4 §6.27.7) — one TPG descriptor per distinct
+  configured TPGT, each carrying that TPG's asymmetric access state
+  plus the RTPIs of its member ports. Every TPG defaults to
+  `ACTIVE/OPTIMIZED` on startup — no operator action needed; out of
+  the box every advertised path is usable at full priority.
+
+SET TARGET PORT GROUPS (MAINTENANCE OUT 0x0A) is deliberately not
+wired today: TPGS=01b (implicit-only) tells initiators not to issue
+SET TPG, so the four standard transitions (`active-optimized`,
+`active-non-optimized`, `standby`, `unavailable`) are reserved for
+a later operator-driven CLI verb. The other deferred edges — the
+`transitioning` access state, multi-controller logical-unit groups,
+and Persistent Reservation participation across paths — are tracked
+separately; implicit-only is enough for ALUA-aware multipath to
+work out of the box.
 
 Wildcard entries (`0.0.0.0:*`, `[::]:*`) are substituted with the
 connection's actual local IP when SendTargets emits — emitting the
@@ -702,8 +723,9 @@ there is nothing to gain from inventing them.
 |-----:|------|--------|:----:|-------|
 | 0x00 | Supported VPD Pages | 🟩 Yes | CC | Mandatory once any other VPD page is implemented. |
 | 0x80 | Unit Serial Number | 🟩 Yes | O | `<chassis_serial>_LL<NN>` — chassis serial from `library.json` (14-byte `TVLxxxxxxxxxxx` minted at init), `NN` = 1-based partition index. Sessions bound to different partitions see distinct serials. |
-| 0x83 | Device Identification | 🟩 Yes | M | Three descriptors: NAA-3 (8 B locally assigned, `BLAKE3(chassis‖lun‖partition)` so per-(chassis, partition, LUN) unique), T10 vendor-based (ASCII), Logical Unit Group (4 B, `BLAKE3(chassis‖partition)`) — drives in the same partition share the group ID for backup-software auto-correlation. |
+| 0x83 | Device Identification | 🟩 Yes | M | LU-association descriptors: NAA-3 (8 B locally assigned, `BLAKE3(chassis‖lun‖partition)` so per-(chassis, partition, LUN) unique), T10 vendor-based (ASCII), Logical Unit Group (4 B, `BLAKE3(chassis‖partition)`) — drives in the same partition share the group ID for backup-software auto-correlation. ALUA TargetPort-association descriptors per advertised iSCSI portal: NAA-3 (`BLAKE3(chassis‖"\|tp\|"‖RTPI)`), Relative Target Port Identifier (RTPI), Target Port Group (TPGT). |
 | 0x85 | Management Network Address | 🟩 Yes | O | ASCII URL to HTTP listener. |
+| 0x86 | Extended INQUIRY Data | 🟩 Yes | O | 64-byte page; all capability bits clear. TPGS for ALUA discovery lives in INQUIRY std-data byte 5, not here. |
 | 0xC0 | Firmware Build Information | 🟩 Yes | — | Vendor-specific page-code range; ASCII daemon version. |
 
 ### Tape drive (LUN ≥ 1)
@@ -712,7 +734,8 @@ there is nothing to gain from inventing them.
 |-----:|------|--------|:----:|-------|
 | 0x00 | Supported VPD Pages | 🟩 Yes | CC | Mandatory once any other VPD page is implemented. |
 | 0x80 | Unit Serial Number | 🟩 Yes | O | Per-drive `mfg_serial` from `inventory.json` (10-byte `TVLxxxxxxx`, minted once when the drive is added). Falls back to legacy `THUR-MFG-NNN` for pre-field libraries. |
-| 0x83 | Device Identification | 🟩 Yes | M | NAA-3 + T10 + Logical Unit Group (same shape as the changer LUN; LUG ID identifies the logical library the drive belongs to). |
+| 0x83 | Device Identification | 🟩 Yes | M | LU-association descriptors: NAA-3 + T10 + Logical Unit Group (same shape as the changer LUN; LUG ID identifies the logical library the drive belongs to). ALUA TargetPort-association descriptors per advertised iSCSI portal: NAA-3 (`BLAKE3(chassis‖"\|tp\|"‖RTPI)`), Relative Target Port Identifier (RTPI), Target Port Group (TPGT). |
+| 0x86 | Extended INQUIRY Data | 🟩 Yes | O | 64-byte page; all capability bits clear. TPGS for ALUA discovery lives in INQUIRY std-data byte 5, not here. |
 | 0xB0 | Sequential-Access Device Characteristics | 🟩 Yes | O | WORMM bit reflects loaded cartridge. |
 | 0xB1 | Manufacturer-Assigned Serial Number | 🟩 Yes | O | 32 B ASCII, persisted per drive in `inventory.json::DriveInfo.mfg_serial` (random `TVLxxxxxxx`, minted once when the drive is added). |
 | 0xB2 | TapeAlert Supported Flags | 🟩 Yes | O | Bitmap = 0xFF × 8 (all 64 flags advertised). |
@@ -1064,9 +1087,10 @@ triggering a cascade of CHECK CONDITION responses.
 
 | Page | Name | Status | Spec | Notes |
 |-----:|------|--------|:----:|-------|
-| 0x00 | Supported VPD Pages | 🟩 Yes | CC | Lists `[0x00, 0x80, 0x83, 0x8F, 0xB0, 0xB2]` for registered LUNs; `[0x00]` for the "no LUN" reply. |
+| 0x00 | Supported VPD Pages | 🟩 Yes | CC | Lists `[0x00, 0x80, 0x83, 0x86, 0x8F, 0xB0, 0xB2]` for registered LUNs; `[0x00]` for the "no LUN" reply. |
 | 0x80 | Unit Serial Number | 🟩 Yes | O | Hex-encoded volume UUID. |
-| 0x83 | Device Identification | 🟩 Yes | M | Two descriptors per LUN: T10 vendor-based (8-byte vendor ID `MB` + ASCII `MBD_<uuid_hex>`) and NAA Locally Assigned (8 bytes binary: top nibble = NAA type 0x3, remaining 60 bits from the volume UUID's first 8 bytes). The NAA descriptor exists so EXTENDED COPY (0x83) target descriptors — which only have a 20-byte designator slot — can reference LUNs by NAA. |
+| 0x83 | Device Identification | 🟩 Yes | M | LU-association descriptors per LUN: T10 vendor-based (8-byte vendor ID `MB` + ASCII `MBD_<uuid_hex>`) and NAA Locally Assigned (8 bytes binary: top nibble = NAA type 0x3, remaining 60 bits from the volume UUID's first 8 bytes). The NAA descriptor exists so EXTENDED COPY (0x83) target descriptors — which only have a 20-byte designator slot — can reference LUNs by NAA. ALUA TargetPort-association descriptors per advertised iSCSI portal: NAA-3 (`BLAKE3(target_iqn‖"\|tp\|"‖RTPI)`), Relative Target Port Identifier (RTPI), Target Port Group (TPGT). |
+| 0x86 | Extended INQUIRY Data | 🟩 Yes | O | 64-byte page; all capability bits clear. TPGS for ALUA discovery lives in INQUIRY std-data byte 5, not here. |
 | 0x8F | Third Party Copy | 🟩 Partial | O | The VAAI Hardware Accelerated Copy + Hyper-V ODX capability page. Sub-descriptors: 0x0000 ROD Device Type Specific Limits (MAX RANGE DESCRIPTORS = 8, DEFAULT INACTIVITY TIMEOUT = 300 s, MAX INACTIVITY TIMEOUT = 600 s, MAX TOKEN TRANSFER SIZE = 1 GiB / sector_size, OPTIMAL TRANSFER COUNT = 256 MiB / sector_size), 0x0001 SUPPORTED COMMANDS (opcodes 0x83 sa 0x00 / 0x10 / 0x11, 0x84 sa 0x00 / 0x03 / 0x07), 0x0004 PARAMETER DATA (max 2 target descriptors, max 1 segment descriptor, max 128-byte descriptor list, no inline data), 0x0008 SUPPORTED DESCRIPTORS (target type 0xE4, segment type 0x02, ODX block-device range type 0x00), 0x8001 GENERAL COPY OPERATIONS (1 concurrent copy, 16 MiB max segment, page-size log2 data granularity). |
 | 0xB0 | Block Limits | 🟩 Partial | O | MAXIMUM COMPARE AND WRITE LENGTH = sectors-per-page (16 by default), OPTIMAL TRANSFER LENGTH GRANULARITY = sectors-per-page, MAXIMUM UNMAP LBA COUNT = 0xFFFFFFFF, MAXIMUM UNMAP BLOCK DESCRIPTOR COUNT = 4095, OPTIMAL UNMAP GRANULARITY = sectors-per-page, UGAVALID=1 with alignment LBA = 0. MAXIMUM WRITE SAME LENGTH = 0 (no specific limit); WSNZ=0. MAXIMUM TRANSFER LENGTH / OPTIMAL TRANSFER LENGTH / MAXIMUM PREFETCH LENGTH all zero. |
 | 0xB2 | Logical Block Provisioning | 🟩 Partial | O | LBPU=1, LBPRZ=001 (unmapped LBAs read zeros), PROVISIONING TYPE=010 (thin). LBPWS / LBPWS10 / ANC_SUP / DP all zero. THRESHOLD EXPONENT = 0; no soft-threshold notification. |

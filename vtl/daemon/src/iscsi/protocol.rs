@@ -74,10 +74,12 @@ use scsi_spc::vpd::{
 /// Wire-shape flags for thurvtl's changer-LUN standard INQUIRY:
 /// SPC-3 (the version SMC-3 references), HISUP=1, CMDQUE=0
 /// (per-drive serialization in the daemon — no queue-tag semantics
-/// to advertise).
+/// to advertise), TPGS=01b (implicit-only ALUA — REPORT TARGET
+/// PORT GROUPS honored since #43).
 const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
     spc_version: 0x05,
     hisup: true,
+    tpgs: scsi_spc::vpd::TpgsField::Implicit,
     cmdque: false,
 };
 
@@ -298,6 +300,7 @@ pub(crate) fn handle_scsi_command(
     peer: &str,
     session_partition: Option<String>,
     diagnostic_store: Arc<DiagnosticStore>,
+    alua: Option<Arc<shared_iscsi::alua::AluaTopology>>,
 ) -> Result<ScsiResp> {
     // CDB lives in BHS bytes [32..48]; copy it to a local so handlers
     // don't have to re-slice pdu.bhs every time.
@@ -390,6 +393,7 @@ pub(crate) fn handle_scsi_command(
         diagnostic_store: &diagnostic_store,
         session_partition: session_partition.as_deref(),
         has_changer: true,
+        alua: alua.as_deref(),
     };
     let mut ctx = SmcScsiCtx {
         inner,

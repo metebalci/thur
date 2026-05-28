@@ -123,6 +123,19 @@ impl IscsiServer {
             }
         });
 
+        // ALUA topology — built from the advertised portal list +
+        // the chassis serial namespace so per-port NAA-3 identifiers
+        // are stable across daemon restarts and globally distinct
+        // from any other thurvtl/thurvsa daemon.
+        let chassis_ser = {
+            let lib = self.state.library.lock().expect("library mutex poisoned");
+            lib.chassis_serial().to_string()
+        };
+        let alua = Arc::new(shared_iscsi::alua::AluaTopology::from_portals(
+            &portals,
+            chassis_ser,
+        ));
+
         let handler = Arc::new(IscsiLibraryHandler {
             drive_manager: Arc::clone(&self.state.drive_manager),
             library: Arc::clone(&self.state.library),
@@ -136,6 +149,7 @@ impl IscsiServer {
             storage_config: Arc::clone(&self.state.storage_config),
             diagnostic_store: Arc::clone(&self.state.diagnostic_store),
             target_iqn: self.config.iscsi.target_iqn.clone(),
+            alua,
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 

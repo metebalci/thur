@@ -89,6 +89,12 @@ pub struct InquiryFlags {
     /// Byte 3 bit 4 — HISUP. Set to 1 if the target supports the
     /// LUN structure defined in SAM-5 (both products do).
     pub hisup: bool,
+    /// Byte 5 bits 5:4 — TPGS (Target Port Group Support). 00b = no
+    /// ALUA, 01b = implicit only, 10b = explicit only, 11b = both.
+    /// ALUA-aware initiators check this to decide whether to issue
+    /// REPORT TARGET PORT GROUPS / SET TARGET PORT GROUPS; the same
+    /// field is mirrored in VPD 0x86 byte 5.
+    pub tpgs: crate::vpd::TpgsField,
     /// Byte 7 bit 1 — CMDQUE. Set to 1 if the target supports the
     /// full task management model (queueing, ordering tags). Thurvsa
     /// asserts this; thurvtl historically does not because the tape
@@ -133,8 +139,12 @@ pub fn build_inquiry_std(
     // Byte 4: additional length (n - 4). 36-byte response → 31.
     buf[4] = 31;
 
-    // Bytes 5..7: SPC-4 byte 5 (PROTECT, etc.) + byte 6 (ENCSERV,
-    // MULTIP, VS) — both products keep them zero today.
+    // Byte 5: SCCS(7) | ACC(6) | TPGS(5:4) | 3PC(3) | reserved(2:1) |
+    // PROTECT(0). Only TPGS is variable per product today —
+    // implicit-only ALUA for both daemons since #43 landed.
+    buf[5] = ((flags.tpgs as u8) & 0x03) << 4;
+    // Byte 6: ENCSERV / MULTIP / VS — both products keep them zero
+    // today.
     // Byte 7: BQUE / ENCSERV / VS / MULTIP / MCHNGR / ADDR16 / CMDQUE
     // / VS. Only CMDQUE (bit 1) is variable per product.
     buf[7] = if flags.cmdque { 0x02 } else { 0x00 };
@@ -195,6 +205,7 @@ mod tests {
         InquiryFlags {
             spc_version: 0x06,
             hisup: true,
+            tpgs: crate::vpd::TpgsField::None,
             cmdque: true,
         }
     }
@@ -203,6 +214,7 @@ mod tests {
         InquiryFlags {
             spc_version: 0x05,
             hisup: true,
+            tpgs: crate::vpd::TpgsField::None,
             cmdque: false,
         }
     }
@@ -255,10 +267,31 @@ mod tests {
             InquiryFlags {
                 spc_version: 0x06,
                 hisup: false,
+                tpgs: crate::vpd::TpgsField::None,
                 cmdque: false,
             },
         );
         assert_eq!(buf[3], 0x02); // HISUP=0, format=2
+    }
+
+    #[test]
+    fn inquiry_std_byte_5_carries_tpgs_field() {
+        let buf = build_inquiry_std(
+            PeripheralQualifier::Connected,
+            PeripheralType::DirectAccess,
+            false,
+            id(),
+            InquiryFlags {
+                spc_version: 0x06,
+                hisup: true,
+                tpgs: crate::vpd::TpgsField::Implicit,
+                cmdque: true,
+            },
+        );
+        // Implicit ALUA (01b) in bits 5:4 of byte 5 = 0x10.
+        assert_eq!(buf[5] & 0x30, 0x10);
+        // Other fields in byte 5 stay zero.
+        assert_eq!(buf[5] & !0x30, 0);
     }
 
     #[test]

@@ -162,6 +162,16 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `BenchOptions`. Consumed by the `system storage benchmark` CLI verbs of
   both products.
 - **shared-iscsi** — cross-product iSCSI primitives.
+  - `alua.rs` — ALUA topology (SPC-4 §5.16). `AluaTopology` built
+    from `ServerConfig::listen_portals`: sequential per-portal
+    RTPIs (1, 2, …), per-TPG `AsymmetricAccessState` (default
+    `ActiveOptimized`), stable per-port NAA-3 identifier derived
+    from a daemon-supplied namespace (chassis serial for VTL,
+    target IQN for VSA). Exposes
+    `push_vpd83_target_port_descriptors` (the three TP-association
+    designators per portal: NAA + RelativeTargetPort +
+    TargetPortGroup) and `report_target_port_groups_body`
+    (REPORT TPG body, one descriptor per distinct TPGT).
   - `auth.rs` — CHAP (MD5 / SHA-1 / SHA-256 / SHA3-256 with
     target-preference selection).
   - `unit_attention.rs` — per-(TSIH, LUN) UA queue.

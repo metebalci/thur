@@ -14,7 +14,9 @@
 # Coverage map (see CLAUDE.md "thurvsa block-product initiative" for
 # the daemon source):
 #   SPC (shared discovery + config):
-#     0x12 INQUIRY (standard + VPD pages 0x00 / 0x80 / 0x83 / 0x8F / 0xB0 / 0xB2)
+#     0x12 INQUIRY (standard + VPD pages 0x00 / 0x80 / 0x83 / 0x86 / 0x8F /
+#                   0xB0 / 0xB2; TPGS=01b implicit ALUA in std byte 5)
+#     0xA3 sa 0x0A MAINTENANCE IN — REPORT TARGET PORT GROUPS (ALUA)
 #     0x9E READ CAPACITY 16 (LBPME + LBPRZ thin-provisioning hints)
 #     0x1A / 0x5A MODE SENSE 6 / 10 (Caching + Control pages)
 #     0x15 / 0x55 MODE SELECT 6 / 10 (round-trip + WCE mutation rejected)
@@ -1104,6 +1106,51 @@ t_xcopy_same_lun_intra_volume_copy() {
 }
 
 # ---------------------------------------------------------------------------
+# Group N — ALUA (Asymmetric Logical Unit Access)
+# ---------------------------------------------------------------------------
+
+t_inquiry_standard_tpgs_implicit() {
+    # INQUIRY standard data byte 5 bits 5:4 = TPGS field. Implicit-only
+    # ALUA encodes as 0b01. sg_inq prints it as "TPGS=1".
+    local out
+    out=$(sg_inq "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qiE 'TPGS[=:[:space:]]+1\b'
+}
+
+t_inquiry_vpd_extended_is_published() {
+    # VPD 0x86 (Extended INQUIRY Data) is published so VPD-page
+    # enumeration sees a contiguous list. SPC-4 puts TPGS in INQUIRY
+    # std-data byte 5, not here, so the page body is all-zeros; we
+    # just verify sg_vpd decodes the page header cleanly.
+    local out
+    out=$(sg_vpd -p ei "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qiE 'extended inquiry data'
+}
+
+t_report_target_port_groups() {
+    # `sg_rtpg` issues MAINTENANCE IN service action 0x0A and decodes
+    # the response. A single-portal default deployment lists one TPG
+    # with one port at ACTIVE_OPTIMIZED. Accept either prose form
+    # ("Active/optimized", "active/optimised", or the literal access
+    # state code 0x0) — sg_rtpg output drifts across sg3_utils
+    # releases.
+    local out
+    out=$(sg_rtpg "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qiE 'active[/ ]optim|asymmetric access state.*0x0|asymmetric access state.*= *0\b'
+}
+
+t_inquiry_vpd_device_id_has_target_port_descriptors() {
+    # VPD 0x83 now carries Association=TargetPort designators per
+    # advertised portal: NAA (designator type 0x03), Relative Target
+    # Port Identifier (0x04), and Target Port Group (0x05). sg_vpd
+    # prints the association as "target port" and the designator type
+    # alongside.
+    local out
+    out=$(sg_vpd -p di "$RW_DEVICE" 2>&1); echo "$out"
+    echo "$out" | grep -qiE 'target port group|target port relative|relative target port'
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1171,6 +1218,11 @@ main() {
     run_test "REPORT SUPPORTED OPCODES includes 0x83 / 0x84"      t_report_supported_opcodes_lists_odx
     run_test "POPULATE TOKEN + RECEIVE ROD TOKEN INFORMATION"     t_odx_populate_token_returns_token
     run_test "WRITE USING TOKEN same-LUN round-trip"              t_odx_write_using_token_round_trip
+    # Group N — ALUA (issue #43)
+    run_test "INQUIRY std byte 5 TPGS=01b (implicit)"             t_inquiry_standard_tpgs_implicit
+    run_test "INQUIRY VPD 0x86 (Extended INQUIRY Data) present"   t_inquiry_vpd_extended_is_published
+    run_test "INQUIRY VPD 0x83 has Target Port descriptors"       t_inquiry_vpd_device_id_has_target_port_descriptors
+    run_test "REPORT TARGET PORT GROUPS (sg_rtpg) ACTIVE/OPT"     t_report_target_port_groups
 
     echo "========================================"
     echo "Test Summary"
