@@ -20,7 +20,12 @@
 #   6. Stop the server on exit (success OR failure).
 #
 # Usage (from repo root):
-#   ./vsa/scripts/test-keystore-kmip.sh [--release]
+#   ./vsa/scripts/test-keystore-kmip.sh [--debug]
+#
+# `cargo test` runs in release by default (matches the test-helpers
+# convention). Pass --debug to fall back to the dev profile when
+# iterating with a debugger / backtraces. --release is accepted as a
+# no-op for muscle memory.
 #
 # Re-running is cheap: the venv + certs survive, only the pykmip.db
 # is wiped so each run starts with a clean KEK set.
@@ -56,12 +61,13 @@ pick_venv() {
 }
 VENV=$(pick_venv)
 
-CARGO_PROFILE=""
+CARGO_PROFILE="--release"
 for arg in "$@"; do
     case "$arg" in
+        --debug)   CARGO_PROFILE="" ;;
         --release) CARGO_PROFILE="--release" ;;
         -h|--help)
-            sed -n '3,28p' "$0" | sed 's/^# //; s/^#$//'
+            sed -n '3,31p' "$0" | sed 's/^# //; s/^#$//'
             exit 0
             ;;
         *)
