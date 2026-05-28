@@ -144,6 +144,21 @@ impl VolumeLookup for VolumeRegistry {
     fn luns(&self) -> Vec<u64> {
         VolumeRegistry::luns(self)
     }
+    fn name_for_lun(&self, lun: u64) -> Option<String> {
+        let map = self.by_lun.read().unwrap_or_else(|p| p.into_inner());
+        map.get(&lun).map(|c| c.manifest().name.clone())
+    }
+    fn luns_filtered(&self, allow: Option<&[String]>) -> Vec<u64> {
+        let map = self.by_lun.read().unwrap_or_else(|p| p.into_inner());
+        match allow {
+            None => map.keys().copied().collect(),
+            Some(names) => map
+                .iter()
+                .filter(|(_, c)| names.iter().any(|n| n == &c.manifest().name))
+                .map(|(lun, _)| *lun)
+                .collect(),
+        }
+    }
 }
 
 /// Same boundary as `VolumeLookup` but for the NVMe/TCP transport.
@@ -160,6 +175,18 @@ impl nvme_nvm::NamespaceLookup for VolumeRegistry {
     }
     fn active_namespaces(&self) -> Vec<u32> {
         VolumeRegistry::luns(self)
+            .into_iter()
+            .filter_map(|lun| u32::try_from(lun + 1).ok())
+            .collect()
+    }
+    fn name_for_nsid(&self, nsid: u32) -> Option<String> {
+        if nsid == 0 {
+            return None;
+        }
+        <Self as VolumeLookup>::name_for_lun(self, u64::from(nsid - 1))
+    }
+    fn active_namespaces_filtered(&self, allow: Option<&[String]>) -> Vec<u32> {
+        <Self as VolumeLookup>::luns_filtered(self, allow)
             .into_iter()
             .filter_map(|lun| u32::try_from(lun + 1).ok())
             .collect()
@@ -251,5 +278,82 @@ mod tests {
 
         // Second unregister of the same name → None.
         assert!(reg.unregister_by_name("alpha").is_none());
+    }
+
+    #[tokio::test]
+    async fn name_for_lun_resolves_and_misses() {
+        let tmp = TempDir::new().unwrap();
+        let reg = VolumeRegistry::new();
+        reg.register(0, fixture_cache("alpha", tmp.path()).await);
+        reg.register(1, fixture_cache("beta", tmp.path()).await);
+
+        assert_eq!(
+            <VolumeRegistry as VolumeLookup>::name_for_lun(&reg, 0).as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            <VolumeRegistry as VolumeLookup>::name_for_lun(&reg, 1).as_deref(),
+            Some("beta")
+        );
+        assert!(<VolumeRegistry as VolumeLookup>::name_for_lun(&reg, 99).is_none());
+    }
+
+    #[tokio::test]
+    async fn luns_filtered_with_no_fence_returns_all() {
+        let tmp = TempDir::new().unwrap();
+        let reg = VolumeRegistry::new();
+        reg.register(0, fixture_cache("alpha", tmp.path()).await);
+        reg.register(1, fixture_cache("beta", tmp.path()).await);
+
+        assert_eq!(
+            <VolumeRegistry as VolumeLookup>::luns_filtered(&reg, None),
+            vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn luns_filtered_excludes_unadmitted_volumes() {
+        let tmp = TempDir::new().unwrap();
+        let reg = VolumeRegistry::new();
+        reg.register(0, fixture_cache("alpha", tmp.path()).await);
+        reg.register(1, fixture_cache("beta", tmp.path()).await);
+        reg.register(2, fixture_cache("gamma", tmp.path()).await);
+
+        // Only beta is admitted — alpha and gamma must drop out.
+        let allow = vec!["beta".to_string()];
+        assert_eq!(
+            <VolumeRegistry as VolumeLookup>::luns_filtered(&reg, Some(&allow)),
+            vec![1]
+        );
+
+        // Admitting an unknown name yields an empty list — there's
+        // nothing to show.
+        let allow = vec!["nonexistent".to_string()];
+        assert!(<VolumeRegistry as VolumeLookup>::luns_filtered(&reg, Some(&allow)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_namespaces_filtered_maps_lun_plus_one() {
+        use nvme_nvm::NamespaceLookup;
+        let tmp = TempDir::new().unwrap();
+        let reg = VolumeRegistry::new();
+        reg.register(0, fixture_cache("alpha", tmp.path()).await);
+        reg.register(1, fixture_cache("beta", tmp.path()).await);
+
+        // No fence → all NSIDs (nsid = lun + 1).
+        assert_eq!(
+            <VolumeRegistry as NamespaceLookup>::active_namespaces_filtered(&reg, None),
+            vec![1, 2]
+        );
+
+        // Fenced to alpha only → NSID 1.
+        let allow = vec!["alpha".to_string()];
+        assert_eq!(
+            <VolumeRegistry as NamespaceLookup>::active_namespaces_filtered(&reg, Some(&allow)),
+            vec![1]
+        );
+
+        // NSID 0 is never resolved (reserved by NVMe).
+        assert!(<VolumeRegistry as NamespaceLookup>::name_for_nsid(&reg, 0).is_none());
     }
 }

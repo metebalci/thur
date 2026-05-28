@@ -45,13 +45,21 @@ pub use dispatcher::{ISCSI_DISK_TARGET_IQN, SbcScsiDispatcher};
 /// `VolumeRegistry` implements this trait; the dispatcher takes
 /// `Arc<dyn VolumeLookup>` and never sees the concrete registry.
 ///
-/// Two methods only:
+/// Four methods:
 /// - [`Self::get`] for per-opcode LUN resolution.
 /// - [`Self::luns`] for REPORT LUNS (opcode 0xA0).
+/// - [`Self::name_for_lun`] for admission filtering — given a LUN,
+///   the volume name the dispatcher compares against the session's
+///   admission set (`ScsiRequest::session_volumes`).
+/// - [`Self::luns_filtered`] returns the LUN list after applying an
+///   optional admission set. `None` = no fence (same as `luns()`);
+///   `Some(&[])` = empty set (deny everything).
 ///
 /// Mutation (admin-driven `register` / `unregister`) stays on the
 /// concrete registry — the dispatcher is read-only over LUNs.
 pub trait VolumeLookup: Send + Sync {
     fn get(&self, lun: u64) -> Option<Arc<PageCache>>;
     fn luns(&self) -> Vec<u64>;
+    fn name_for_lun(&self, lun: u64) -> Option<String>;
+    fn luns_filtered(&self, allow: Option<&[String]>) -> Vec<u64>;
 }

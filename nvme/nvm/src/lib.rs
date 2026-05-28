@@ -53,10 +53,18 @@ pub use opcode::NvmOpcode;
 /// Mirrors `scsi_sbc::VolumeLookup` byte-for-byte at the shape
 /// level — only the identifier renaming (`lun` → `nsid`) differs.
 ///
-/// Two methods only:
+/// Four methods:
 /// - [`Self::get`] for per-command NSID resolution.
 /// - [`Self::active_namespaces`] for the Identify CNS=0x02 list.
+/// - [`Self::name_for_nsid`] for admission filtering — given an
+///   NSID, the volume name the dispatcher compares against the
+///   connection's admission set.
+/// - [`Self::active_namespaces_filtered`] returns the NSID list
+///   after applying an optional admission set. `None` = no fence
+///   (same as `active_namespaces()`).
 pub trait NamespaceLookup: Send + Sync {
     fn get(&self, nsid: u32) -> Option<Arc<PageCache>>;
     fn active_namespaces(&self) -> Vec<u32>;
+    fn name_for_nsid(&self, nsid: u32) -> Option<String>;
+    fn active_namespaces_filtered(&self, allow: Option<&[String]>) -> Vec<u32>;
 }

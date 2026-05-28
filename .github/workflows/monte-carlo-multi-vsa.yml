@@ -3,13 +3,16 @@ name: monte-carlo-multi-vsa
 # Multi-initiator companion to nightly-monte-carlo-vsa. Two distinct
 # iSCSI initiator IQNs concurrently drive their own pair of volumes
 # against a single thurvsad daemon (4 volumes total, 2/initiator).
-# Exercises per-volume PageCache isolation, write-back ordering, and
-# multi-LUN-per-session SCSI dispatch under concurrent host traffic.
-# Manual-only for now because VSA's iface plumbing needs further
-# validation on a hosted CI runner — flip to a `schedule:` once a
-# few manual passes prove out.
+# Exercises per-CHAP-user volume admission, per-volume PageCache
+# isolation, write-back ordering, and multi-LUN-per-session SCSI
+# dispatch under concurrent host traffic.
 
 on:
+  schedule:
+    # 04:00 UTC daily, 30 min after the single-initiator nightly
+    # (03:30 UTC) so the two don't fight for cache / CPU on the
+    # shared runner.
+    - cron: "0 4 * * *"
   workflow_dispatch:
 
 permissions:

@@ -28,6 +28,12 @@ use super::iscsi_users::ApiError;
 pub struct AddRequest {
     pub host_nqn: String,
     pub interchange_key: String,
+    /// Volumes this host is admitted to. `None` or omitted = no
+    /// admission fence (see-everything). Each name must currently
+    /// resolve to a volume — VSA's admin handler rejects unknown
+    /// names before persisting.
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,9 +48,22 @@ pub struct RotateRequest {
     pub grace_seconds: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GrantRequest {
+    pub host_nqn: String,
+    pub volumes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    pub host_nqn: String,
+    pub volumes: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PskRow {
     pub host_nqn: String,
+    pub volumes: Option<Vec<String>>,
     pub disabled: bool,
     pub in_grace: bool,
     pub previous_expires_at: Option<DateTime<Utc>>,
@@ -68,6 +87,7 @@ pub async fn list(
         .into_iter()
         .map(|p| PskRow {
             host_nqn: p.host_nqn,
+            volumes: p.volumes,
             disabled: p.disabled,
             in_grace: p.previous_expires_at.map(|t| t > now).unwrap_or(false),
             previous_expires_at: p.previous_expires_at,
@@ -83,6 +103,15 @@ pub async fn add(
 ) -> Result<(StatusCode, Json<PskRow>), ApiError> {
     validate_host_nqn(&body.host_nqn)?;
     validate_interchange_key(&body.interchange_key)?;
+    // VSA-mandatory: every PSK entry must declare an admission set.
+    let names = body
+        .volumes
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("at least one --volume required"))?;
+    if names.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    validate_volumes_exist(&state, names)?;
 
     let (path, mut file) = load_psks(&state)?;
     let swept = sweep_expired_previous(&mut file);
@@ -96,6 +125,7 @@ pub async fn add(
 
     let row = PskRow {
         host_nqn: body.host_nqn.clone(),
+        volumes: body.volumes.clone(),
         disabled: false,
         in_grace: false,
         previous_expires_at: None,
@@ -104,6 +134,7 @@ pub async fn add(
         host_nqn: body.host_nqn.clone(),
         interchange_key: body.interchange_key,
         disabled: false,
+        volumes: body.volumes,
         previous_interchange_key: None,
         previous_expires_at: None,
     });
@@ -223,6 +254,7 @@ pub async fn rotate(
 
     let row = PskRow {
         host_nqn: entry.host_nqn.clone(),
+        volumes: entry.volumes.clone(),
         disabled: entry.disabled,
         in_grace: true,
         previous_expires_at: Some(expires),
@@ -271,6 +303,110 @@ pub async fn rotate_cancel(
         json!({ "host_nqn": body.host_nqn }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn grant(
+    State(state): State<AdminState>,
+    peer: PeerCred,
+    Json(body): Json<GrantRequest>,
+) -> Result<(StatusCode, Json<PskRow>), ApiError> {
+    if body.volumes.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    validate_volumes_exist(&state, &body.volumes)?;
+    let (path, mut file) = load_psks(&state)?;
+    let swept = sweep_expired_previous(&mut file);
+    let entry = file
+        .psks
+        .iter_mut()
+        .find(|p| p.host_nqn == body.host_nqn)
+        .ok_or_else(|| ApiError::not_found(format!("PSK for host_nqn '{}'", body.host_nqn)))?;
+
+    let mut current = entry.volumes.clone().unwrap_or_default();
+    let added: Vec<String> = body
+        .volumes
+        .iter()
+        .filter(|v| !current.iter().any(|c| c == *v))
+        .cloned()
+        .collect();
+    current.extend(added.iter().cloned());
+    entry.volumes = Some(current);
+
+    let row = PskRow {
+        host_nqn: entry.host_nqn.clone(),
+        volumes: entry.volumes.clone(),
+        disabled: entry.disabled,
+        in_grace: entry
+            .previous_expires_at
+            .map(|t| t > Utc::now())
+            .unwrap_or(false),
+        previous_expires_at: entry.previous_expires_at,
+    };
+    save_psks(&path, &file)?;
+    emit_sweep_audits(&state, &peer, swept);
+    audit(
+        &state,
+        &peer,
+        "nvmetcp.psks.grant",
+        json!({ "host_nqn": body.host_nqn, "volumes_added": added }),
+    );
+    Ok((StatusCode::OK, Json(row)))
+}
+
+pub async fn revoke(
+    State(state): State<AdminState>,
+    peer: PeerCred,
+    Json(body): Json<RevokeRequest>,
+) -> Result<(StatusCode, Json<PskRow>), ApiError> {
+    if body.volumes.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    let (path, mut file) = load_psks(&state)?;
+    let swept = sweep_expired_previous(&mut file);
+    let entry = file
+        .psks
+        .iter_mut()
+        .find(|p| p.host_nqn == body.host_nqn)
+        .ok_or_else(|| ApiError::not_found(format!("PSK for host_nqn '{}'", body.host_nqn)))?;
+
+    let current = entry.volumes.clone().unwrap_or_default();
+    let removed: Vec<String> = body
+        .volumes
+        .iter()
+        .filter(|v| current.iter().any(|c| c == *v))
+        .cloned()
+        .collect();
+    let next: Vec<String> = current
+        .into_iter()
+        .filter(|c| !body.volumes.iter().any(|v| v == c))
+        .collect();
+    if next.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "revoke would leave host '{}' with no volumes; use `nvmetcp psks disable` or `remove` instead",
+            body.host_nqn
+        )));
+    }
+    entry.volumes = Some(next);
+
+    let row = PskRow {
+        host_nqn: entry.host_nqn.clone(),
+        volumes: entry.volumes.clone(),
+        disabled: entry.disabled,
+        in_grace: entry
+            .previous_expires_at
+            .map(|t| t > Utc::now())
+            .unwrap_or(false),
+        previous_expires_at: entry.previous_expires_at,
+    };
+    save_psks(&path, &file)?;
+    emit_sweep_audits(&state, &peer, swept);
+    audit(
+        &state,
+        &peer,
+        "nvmetcp.psks.revoke",
+        json!({ "host_nqn": body.host_nqn, "volumes_removed": removed }),
+    );
+    Ok((StatusCode::OK, Json(row)))
 }
 
 // ---------- helpers ----------
@@ -347,6 +483,24 @@ fn validate_interchange_key(s: &str) -> Result<(), ApiError> {
         .map_err(|e| ApiError::bad_request(format!("invalid interchange_key: {}", e)))
 }
 
+/// Reject unknown volume names at add / grant time so we don't
+/// accumulate dangling admission entries.
+fn validate_volumes_exist(state: &AdminState, names: &[String]) -> Result<(), ApiError> {
+    let mut unknown = Vec::new();
+    for n in names {
+        if state.registry.get_by_name(n).is_none() {
+            unknown.push(n.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown volume name(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +510,7 @@ mod tests {
             host_nqn: host.into(),
             interchange_key: "NVMeTLSkey-1:01:00000000000000000000000000000000000000000000000000000000000000000000:".into(),
             disabled: false,
+            volumes: None,
             previous_interchange_key: prev_key.map(|s| s.into()),
             previous_expires_at: prev_expires,
         }

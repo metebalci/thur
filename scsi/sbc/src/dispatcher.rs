@@ -112,11 +112,26 @@ impl SbcScsiDispatcher {
         if req.cdb.is_empty() {
             return ScsiResponse::check(SenseData::INVALID_OPCODE);
         }
+        // Per-CHAP-user volume admission: when the session is bound
+        // to an admission set, a non-admitted LUN must be invisible
+        // to this session. Treat it as "no LU here" — leave
+        // `cache_arc` as `None` so INQUIRY falls into the
+        // peripheral-qualifier 0x3 path and TUR / READ CAPACITY /
+        // data-path arms emit `LU_NOT_SUPPORTED`. The REPORT LUNS
+        // arm uses `luns_filtered` directly so unauthorised LUNs
+        // don't surface there either.
+        //
         // Hold the cloned `Arc<PageCache>` through the awaited arms
         // below; binding the borrowed `&PageCache` directly would
         // tie its lifetime to the temporary returned by
         // `registry.get`, which Rust drops after the `match`.
-        let cache_arc = self.registry.get(req.lun);
+        let cache_arc = match req.session_volumes {
+            Some(allow) => match self.registry.name_for_lun(req.lun) {
+                Some(name) if allow.iter().any(|n| n == &name) => self.registry.get(req.lun),
+                _ => None,
+            },
+            None => self.registry.get(req.lun),
+        };
         let cache = cache_arc.as_deref();
         let nexus = Nexus::from_request(&req);
         match req.cdb[0] {
@@ -165,7 +180,7 @@ impl SbcScsiDispatcher {
                 .await
             }
             0x9E => sizing::service_action_in_16(&req, cache),
-            0xA0 => sizing::report_luns(&req, &self.registry.luns()),
+            0xA0 => sizing::report_luns(&req, &self.registry.luns_filtered(req.session_volumes)),
             0xA3 => maintenance::maintenance_in(&req),
             _ => ScsiResponse::check(SenseData::INVALID_OPCODE),
         }
@@ -230,6 +245,24 @@ mod tests {
         fn luns(&self) -> Vec<u64> {
             self.by_lun.read().unwrap().keys().copied().collect()
         }
+        fn name_for_lun(&self, lun: u64) -> Option<String> {
+            self.by_lun
+                .read()
+                .unwrap()
+                .get(&lun)
+                .map(|c| c.manifest().name.clone())
+        }
+        fn luns_filtered(&self, allow: Option<&[String]>) -> Vec<u64> {
+            let m = self.by_lun.read().unwrap();
+            match allow {
+                None => m.keys().copied().collect(),
+                Some(names) => m
+                    .iter()
+                    .filter(|(_, c)| names.iter().any(|n| n == &c.manifest().name))
+                    .map(|(lun, _)| *lun)
+                    .collect(),
+            }
+        }
     }
 
     async fn handler_with_one_volume() -> (TempDir, SbcScsiDispatcher) {
@@ -284,6 +317,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         }
     }
 
@@ -324,6 +358,93 @@ mod tests {
             resp.data_in[3],
         ]);
         assert_eq!(listed, 8);
+    }
+
+    /// Build a fixture with two volumes ("vol1", "vol2") on LUNs 0 and 1
+    /// — enough surface to verify admission filters one out.
+    async fn handler_with_two_volumes() -> (TempDir, SbcScsiDispatcher) {
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        let registry = TestRegistry::new();
+        for (lun, name) in [(0u64, "vol1"), (1u64, "vol2")] {
+            VolumeManifest::new(
+                name.into(),
+                4 * (1u64 << 20),
+                DEFAULT_SECTOR_BYTES,
+                DEFAULT_PAGE_SIZE_BYTES,
+                "primary".into(),
+                DedupScope::Local,
+                false,
+                0,
+            )
+            .unwrap()
+            .create(tmp.path())
+            .unwrap();
+            let writer =
+                Arc::new(VolumeWriter::open(tmp.path(), name, Arc::clone(&backend)).unwrap());
+            registry.register(lun, PageCache::new(writer));
+        }
+        let handler = SbcScsiDispatcher::new(Arc::new(registry), ISCSI_DISK_TARGET_IQN.to_string());
+        (tmp, handler)
+    }
+
+    fn req_with_volumes<'a>(cdb: &'a [u8], lun: u64, allow: &'a [String]) -> ScsiRequest<'a> {
+        ScsiRequest {
+            lun,
+            cdb,
+            data_out: &[],
+            data_in_max: 4096,
+            tsih: 0,
+            initiator_iqn: None,
+            cid: 0,
+            peer: "",
+            session_partition: None,
+            session_volumes: Some(allow),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_luns_filters_to_session_volume_set() {
+        let (_tmp, handler) = handler_with_two_volumes().await;
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0xA0;
+        cdb[6..10].copy_from_slice(&64u32.to_be_bytes());
+        let allow = vec!["vol2".to_string()];
+
+        let resp = handler.dispatch(req_with_volumes(&cdb, 0, &allow)).await;
+        let lun_list_len = u32::from_be_bytes([
+            resp.data_in[0],
+            resp.data_in[1],
+            resp.data_in[2],
+            resp.data_in[3],
+        ]);
+        // One admitted LUN (vol2 at LUN 1) → 8 bytes of LUN entries.
+        assert_eq!(lun_list_len, 8);
+        // The reported LUN byte (low byte of the 8-byte LUN entry) is 1.
+        assert_eq!(resp.data_in[8 + 1], 1);
+    }
+
+    #[tokio::test]
+    async fn inquiry_returns_pq_no_lu_for_non_admitted() {
+        let (_tmp, handler) = handler_with_two_volumes().await;
+        let cdb = [0x12u8, 0, 0, 0x00, 0x60, 0];
+        let allow = vec!["vol1".to_string()];
+
+        // LUN 0 (vol1) is admitted — pq = 0x0, pt = 0x0 (direct-access).
+        let resp = handler.dispatch(req_with_volumes(&cdb, 0, &allow)).await;
+        assert!(resp.sense.is_none());
+        assert_eq!(resp.data_in[0] & 0xE0, 0x00, "pq for admitted LUN is 0");
+
+        // LUN 1 (vol2) is not admitted — pq = 0x3, pt = 0x1F.
+        let resp = handler.dispatch(req_with_volumes(&cdb, 1, &allow)).await;
+        assert!(resp.sense.is_none());
+        let pq = resp.data_in[0] & 0xE0;
+        let pt = resp.data_in[0] & 0x1F;
+        assert_eq!(pq, 0x60, "pq=0x3 (no LU here) for non-admitted LUN");
+        assert_eq!(pt, 0x1F, "pt=0x1F (unknown) for non-admitted LUN");
     }
 
     #[tokio::test]
@@ -372,6 +493,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
@@ -390,6 +512,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none());
@@ -457,6 +580,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
@@ -490,6 +614,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
@@ -524,6 +649,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
@@ -554,6 +680,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
@@ -573,6 +700,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(r.sense.is_none());

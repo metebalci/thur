@@ -6,37 +6,28 @@
 #
 # thurvsa Monte Carlo Multi-Initiator Test
 #
-# KNOWN LIMITATION: mkfs.ext4 currently refuses with "/dev/sdX is
-# apparently in use by the system" when both initiator sessions are
-# logged in concurrently — the kernel's post-login LUN probe holds
-# the device long enough that mkfs (even with -F) refuses. The
-# daemon side has no per-volume session lock (each PageCache is
-# accessed concurrently by design), so once the harness gets past
-# mkfs, the per-volume PageCache isolation + write-back ordering
-# under concurrent host traffic should validate cleanly. Workarounds
-# considered: stagger logins, mkfs from a single-initiator pre-flight
-# then attach the second initiator after — neither lands cleanly with
-# iscsiadm's iface plumbing. The harness + workflow ship as a
-# skeleton; the workflow is manual-only until the mkfs path stabilises.
-#
 # Sibling to vsa/scripts/test-monte-carlo.sh. Spins up a single
 # thurvsad daemon serving 4 volumes (vol-mc-a1, vol-mc-a2,
 # vol-mc-b1, vol-mc-b2) over iSCSI, and runs two concurrent op
 # streams from two distinct initiator IQNs:
 #
 #   Initiator A: iqn.2025-10.com.metebalci:vsa-mc-a
-#       volumes = [vol-mc-a1, vol-mc-a2]
-#       mount   = TEST_DIR/mnt-a-{a1,a2}
+#       CHAP user = mc-user-a-* with --volume vol-mc-a1 --volume vol-mc-a2
+#       mount     = TEST_DIR/mnt-a-{a1,a2}
 #
 #   Initiator B: iqn.2025-10.com.metebalci:vsa-mc-b
-#       volumes = [vol-mc-b1, vol-mc-b2]
-#       mount   = TEST_DIR/mnt-b-{b1,b2}
+#       CHAP user = mc-user-b-* with --volume vol-mc-b1 --volume vol-mc-b2
+#       mount     = TEST_DIR/mnt-b-{b1,b2}
 #
-# Volumes are private to each initiator at the application layer
-# (the daemon makes all 4 visible to both sessions; the harness just
-# never touches the other initiator's volumes). The daemon's
-# per-volume PageCache + write-back ordering + SYNCHRONIZE CACHE
-# fencing is what we're exercising under concurrent host traffic.
+# Per-CHAP-user volume admission keeps each session blind to the
+# other initiator's volumes — without admission filtering, the
+# kernel's post-login LUN probe across all 4 devices races, and
+# mkfs.ext4 refuses with "device is apparently in use by the
+# system" even under -F. With admission, each kernel session sees
+# only its 2 admitted LUNs, the probe race disappears, and the
+# daemon's per-volume PageCache + write-back ordering + SYNCHRONIZE
+# CACHE fencing is what we're exercising under concurrent host
+# traffic.
 #
 # Op mix: write_new / overwrite / read_verify / delete / sync.
 # Directory ops + write_at_offset + restart are skipped here — the
@@ -92,6 +83,10 @@ INIT_IQN_A="iqn.2025-10.com.metebalci:vsa-mc-a"
 INIT_IQN_B="iqn.2025-10.com.metebalci:vsa-mc-b"
 IFACE_A="thurvsa-mc-a"
 IFACE_B="thurvsa-mc-b"
+CHAP_USER_A="mc-user-a-$$"
+CHAP_USER_B="mc-user-b-$$"
+CHAP_PASS_A="mc-secret-a-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
+CHAP_PASS_B="mc-secret-b-$(od -An -N12 -tx8 /dev/urandom | tr -d ' \n')"
 
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
@@ -168,6 +163,8 @@ http:
   listen: "127.0.0.1:$HTTP_PORT"
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
+  auth:
+    method: CHAP
 storage:
   backends:
     local:
@@ -201,6 +198,16 @@ create_volumes() {
     done
 }
 
+setup_chap_users() {
+    log_info "Adding CHAP users with disjoint --volume sets..."
+    "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER_A" \
+        --password "$CHAP_PASS_A" \
+        --volume "${VOLUME_NAMES_A[0]}" --volume "${VOLUME_NAMES_A[1]}" >/dev/null
+    "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER_B" \
+        --password "$CHAP_PASS_B" \
+        --volume "${VOLUME_NAMES_B[0]}" --volume "${VOLUME_NAMES_B[1]}" >/dev/null
+}
+
 setup_iface() {
     local iface="$1" initiator_iqn="$2"
     iscsiadm -m iface -I "$iface" -o new >/dev/null 2>&1 || true
@@ -208,8 +215,24 @@ setup_iface() {
 }
 
 iscsi_login_iface() {
-    local iface="$1"
-    iscsiadm -m discovery -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" >/dev/null 2>&1 || true
+    local iface="$1" user="$2" pass="$3"
+    # SendTargets discovery itself needs CHAP — stash creds on the
+    # discoverydb entry first. iscsiadm keys discoverydb on the
+    # (portal, iface) pair, so each iface gets its own creds.
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" -o new >/dev/null 2>&1 || true
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.authmethod -v CHAP >/dev/null 2>&1
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.username -v "$user" >/dev/null 2>&1
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        -o update -n discovery.sendtargets.auth.password -v "$pass" >/dev/null 2>&1
+    iscsiadm -m discoverydb -t st -p "127.0.0.1:$ISCSI_PORT" -I "$iface" --discover >/dev/null 2>&1
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.authmethod -v CHAP >/dev/null 2>&1
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.username -v "$user" >/dev/null 2>&1
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" -I "$iface" \
+        --op update -n node.session.auth.password -v "$pass" >/dev/null 2>&1
     iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" \
         -I "$iface" --login >/dev/null 2>&1
 }
@@ -245,24 +268,30 @@ setup_initiator_devices() {
     local tries=0
     while (( tries < 10 )); do
         mapfile -t devs < <(resolve_initiator_devices "$iface")
-        # We expect 4 LUNs visible (the daemon serves all volumes).
-        (( ${#devs[@]} >= 4 )) && break
+        # With per-CHAP-user admission, each session only sees its 2
+        # admitted volumes — not all 4.
+        (( ${#devs[@]} >= 2 )) && break
         sleep 1
         tries=$(( tries + 1 ))
     done
-    if (( ${#devs[@]} < 4 )); then
-        log_error "initiator $suffix: only ${#devs[@]} THUR VSA devices visible (expected 4)"
+    if (( ${#devs[@]} < 2 )); then
+        log_error "initiator $suffix: only ${#devs[@]} THUR VSA devices visible (expected 2)"
         return 1
     fi
-    # The boot-time discover_and_register sorts volumes alphabetically:
-    #   vol-mc-a1 (LUN 0) -> devs[0]
-    #   vol-mc-a2 (LUN 1) -> devs[1]
-    #   vol-mc-b1 (LUN 2) -> devs[2]
-    #   vol-mc-b2 (LUN 3) -> devs[3]
+    if (( ${#devs[@]} > 2 )); then
+        log_error "initiator $suffix: ${#devs[@]} THUR VSA devices visible (expected 2 — admission leak?)"
+        return 1
+    fi
+    # REPORT LUNS is filtered by admission, so each session sees only
+    # the 2 LUNs belonging to its admitted volume set. lsscsi sorts by
+    # [H:C:I:L], so devs[0]/[1] are the lower/higher LUN of the
+    # admitted pair:
+    #   A: vol-mc-a1 (LUN 0) -> devs[0], vol-mc-a2 (LUN 1) -> devs[1]
+    #   B: vol-mc-b1 (LUN 2) -> devs[0], vol-mc-b2 (LUN 3) -> devs[1]
     if [[ "$suffix" == "A" ]]; then
         eval "RW_DEVS_A=(\"${devs[0]}\" \"${devs[1]}\")"
     else
-        eval "RW_DEVS_B=(\"${devs[2]}\" \"${devs[3]}\")"
+        eval "RW_DEVS_B=(\"${devs[0]}\" \"${devs[1]}\")"
     fi
     log_info "initiator $suffix: devices=(${devs[*]})"
 }
@@ -270,8 +299,10 @@ setup_initiator_devices() {
 iscsi_login_both() {
     setup_iface "$IFACE_A" "$INIT_IQN_A"
     setup_iface "$IFACE_B" "$INIT_IQN_B"
-    iscsi_login_iface "$IFACE_A" || { log_error "iscsi login (A) failed"; return 1; }
-    iscsi_login_iface "$IFACE_B" || { log_error "iscsi login (B) failed"; return 1; }
+    iscsi_login_iface "$IFACE_A" "$CHAP_USER_A" "$CHAP_PASS_A" \
+        || { log_error "iscsi login (A) failed"; return 1; }
+    iscsi_login_iface "$IFACE_B" "$CHAP_USER_B" "$CHAP_PASS_B" \
+        || { log_error "iscsi login (B) failed"; return 1; }
     sleep 4
 }
 
@@ -433,6 +464,7 @@ main() {
     create_test_config
     start_daemon_mc
     create_volumes
+    setup_chap_users
     iscsi_login_both
     setup_initiator_devices A "$IFACE_A" || exit 1
     setup_initiator_devices B "$IFACE_B" || exit 1

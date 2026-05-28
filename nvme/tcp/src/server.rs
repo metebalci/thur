@@ -64,6 +64,13 @@ pub struct ServerConfig {
     /// [`crate::tls::build_psk_acceptor`] from the daemon-loaded
     /// PSK table.
     pub tls: Option<NvmePskAcceptor>,
+    /// Path to `nvmetcp-psks.json`. When set, the post-Connect path
+    /// looks up the host's `volumes` admission set and threads it
+    /// into every dispatched I/O / admin command (mirror of iSCSI
+    /// CHAP-user → volume-set admission). `None` = no admission
+    /// (see-everything) — used by tests and the in-process smoke
+    /// path.
+    pub psks_path: Option<std::path::PathBuf>,
 }
 
 /// Bind the configured TCP listen address and accept-loop forever.
@@ -81,6 +88,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         config.handler,
         config.controller_regs,
         config.tls.map(Arc::new),
+        config.psks_path,
     )
     .await
 }
@@ -93,22 +101,25 @@ pub async fn accept_loop(
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
     tls: Option<Arc<NvmePskAcceptor>>,
+    psks_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let handler = Arc::clone(&handler);
         let regs = Arc::clone(&controller_regs);
         let tls = tls.clone();
+        let psks_path = psks_path.clone();
         tokio::spawn(async move {
             let result = match tls {
-                None => serve_connection(stream, peer, handler, regs, None).await,
+                None => serve_connection(stream, peer, handler, regs, None, psks_path).await,
                 Some(acceptor) => match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         // Capture the PSK identity the host used so
                         // serve_connection can cross-check it against
                         // the Connect command's HostNQN.
                         let tls_host_nqn = extract_negotiated_host_nqn(&tls_stream, peer);
-                        serve_connection(tls_stream, peer, handler, regs, tls_host_nqn).await
+                        serve_connection(tls_stream, peer, handler, regs, tls_host_nqn, psks_path)
+                            .await
                     }
                     Err(e) => {
                         tracing::warn!(peer = %peer, error = %e, "nvme-tcp: TLS handshake failed");
@@ -271,6 +282,7 @@ async fn serve_connection<S>(
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
     tls_host_nqn: Option<String>,
+    psks_path: Option<std::path::PathBuf>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -383,11 +395,51 @@ where
     let cqe = Cqe::success(sqe.cid, qid, 0, dw0);
     stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
     stream.flush().await?;
+
+    // Per-hostnqn admission set. Loaded fresh post-Connect so
+    // operator edits to `nvmetcp-psks.json` take effect on the next
+    // new connection without restart.
+    //
+    // Under VSA's mandatory-admission model:
+    //   `psks_path = None`  → no admission lookup → see everything.
+    //                         Only set when TLS-PSK is off (no
+    //                         authentication = no admission, mirror
+    //                         of iSCSI no-CHAP).
+    //   `psks_path = Some`  → TLS-PSK is on, every connection MUST
+    //                         be fenced. Only entry-with-volumes is
+    //                         see-something. Entry-without-volumes,
+    //                         entry-missing, or file read error all
+    //                         reduce to `Some(empty)` = see nothing.
+    let admission_volumes: Option<Vec<String>> = match &psks_path {
+        None => None,
+        Some(p) => match crate::identity::admission_for(p, &connect_data.hostnqn) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                tracing::warn!(
+                    peer = %peer,
+                    host_nqn = %connect_data.hostnqn,
+                    "nvme-tcp: TLS-PSK on but no admission entry for host — fencing to empty",
+                );
+                Some(Vec::new())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %peer,
+                    host_nqn = %connect_data.hostnqn,
+                    error = %e,
+                    "nvme-tcp: failed to load admission table — fencing to empty",
+                );
+                Some(Vec::new())
+            }
+        },
+    };
+
     tracing::info!(
         peer = %peer,
         host_nqn = %connect_data.hostnqn,
         qid,
         cntlid,
+        admission_fenced = admission_volumes.is_some(),
         "nvme-tcp: Connect succeeded",
     );
 
@@ -413,6 +465,7 @@ where
         Arc::clone(&commands),
         outbound_tx,
         qid,
+        admission_volumes.map(Arc::new),
     ));
 
     // Two valid exit paths:
@@ -460,6 +513,7 @@ async fn reader_task<R>(
     commands: CommandTable,
     outbound: mpsc::Sender<OutboundPdu>,
     qid: u16,
+    admission_volumes: Option<Arc<Vec<String>>>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -661,18 +715,22 @@ where
                     let handler_clone = Arc::clone(&handler);
                     let outbound_clone = outbound.clone();
                     let write_data = icd_owned;
+                    let admission_clone = admission_volumes.clone();
                     tokio::spawn(async move {
+                        let admission_slice = admission_clone.as_deref().map(|v| v.as_slice());
                         let (cqe_c, cqe_w) = handler_clone
                             .handle_fused_compare_write(
                                 IoCommand {
                                     sqe: compare_sqe,
                                     data_out: Some(&compare_data),
                                     data_in_max: u32::MAX,
+                                    session_volumes: admission_slice,
                                 },
                                 IoCommand {
                                     sqe,
                                     data_out: Some(&write_data),
                                     data_in_max: u32::MAX,
+                                    session_volumes: admission_slice,
                                 },
                             )
                             .await;
@@ -735,6 +793,7 @@ where
                 let handler_clone = Arc::clone(&handler);
                 let outbound_clone = outbound.clone();
                 let commands_clone = Arc::clone(&commands);
+                let admission_clone = admission_volumes.clone();
                 tokio::spawn(handle_command(
                     sqe,
                     icd_owned,
@@ -745,6 +804,7 @@ where
                     outbound_clone,
                     commands_clone,
                     peer,
+                    admission_clone,
                 ));
             }
             other => {
@@ -852,6 +912,7 @@ async fn handle_command(
     outbound: mpsc::Sender<OutboundPdu>,
     commands: CommandTable,
     peer: std::net::SocketAddr,
+    admission_volumes: Option<Arc<Vec<String>>>,
 ) {
     let cccid = sqe.cid;
     let buf: Option<Vec<u8>> = if let Some(mut rx) = h2c_rx {
@@ -965,12 +1026,14 @@ async fn handle_command(
     };
 
     let data_out = buf.as_deref();
+    let admission_slice = admission_volumes.as_deref().map(|v| v.as_slice());
     let response = if qid == 0 {
         handler
             .handle_admin(AdminCommand {
                 sqe,
                 data_out,
                 data_in_max: u32::MAX,
+                session_volumes: admission_slice,
             })
             .await
     } else {
@@ -979,6 +1042,7 @@ async fn handle_command(
                 sqe,
                 data_out,
                 data_in_max: u32::MAX,
+                session_volumes: admission_slice,
             })
             .await
     };
@@ -1170,7 +1234,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, None).await;
+            let _ = accept_loop(listener, h, regs, None, None).await;
         });
         port
     }

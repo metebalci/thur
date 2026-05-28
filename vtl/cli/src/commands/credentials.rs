@@ -28,6 +28,7 @@ pub async fn users_add(
         password_stdin,
         mutual_chap,
         partition,
+        None,
     )
     .await
 }

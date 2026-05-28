@@ -627,6 +627,45 @@ enum IscsiUsersAction {
         /// Partition the user is fenced to (VTL only; VSA ignores).
         #[arg(long)]
         partition: Option<String>,
+
+        /// Volume the user is admitted to (repeatable, required).
+        ///
+        /// Every CHAP user must be admitted to at least one volume —
+        /// access without an explicit volume allow-list is refused.
+        /// Names must currently resolve to a volume. To change the
+        /// admission set later, use `grant` / `revoke`.
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Grant a user access to one or more volumes.
+    ///
+    /// Idempotent set-union: already-granted volumes are no-ops.
+    /// Refuses if any named volume doesn't currently exist.
+    /// Existing sessions don't see the change until they re-login —
+    /// admission is captured at login from `iscsi-users.json`.
+    Grant {
+        /// Username to grant access to.
+        name: String,
+
+        /// Volume to add to the user's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Revoke a user's access to one or more volumes.
+    ///
+    /// Set-difference; non-admitted volumes are no-ops. Refuses if
+    /// the revoke would leave the user with zero admitted volumes
+    /// — use `remove` or `disable` to fully cut access. Existing
+    /// sessions don't see the change until they re-login.
+    Revoke {
+        /// Username to revoke access from.
+        name: String,
+
+        /// Volume to remove from the user's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
     },
 
     /// Remove a CHAP user.
@@ -752,6 +791,39 @@ enum NvmetcpPsksAction {
         /// `NVMeTLSkey-X:NN:base64:` interchange string.
         #[arg(long)]
         key: String,
+
+        /// Volume the host is admitted to (repeatable, required).
+        ///
+        /// Every host PSK must be admitted to at least one volume.
+        /// Names must currently resolve to a volume. To change the
+        /// admission set later, use `grant` / `revoke`.
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Grant a host access to one or more volumes.
+    Grant {
+        /// Host NQN to grant access to.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// Volume to add to the host's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Revoke a host's access to one or more volumes.
+    ///
+    /// Refuses if the revoke would leave the host with zero admitted
+    /// volumes — use `remove` or `disable` to fully cut access.
+    Revoke {
+        /// Host NQN to revoke access from.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// Volume to remove from the host's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
     },
 
     /// Remove a host PSK.
@@ -1212,6 +1284,21 @@ mod cli_tests {
                 "--password",
                 "hunter2-long",
                 "--password-stdin",
+                "--volume",
+                "v1",
+            ])
+            .is_err()
+        );
+        // `--volume` is required: omitting it must fail to parse.
+        assert!(
+            parse(&[
+                "thurvsa",
+                "iscsi",
+                "users",
+                "add",
+                "alice",
+                "--password",
+                "hunter2-long",
             ])
             .is_err()
         );
@@ -1224,6 +1311,8 @@ mod cli_tests {
             "--password",
             "hunter2-long",
             "--mutual-chap",
+            "--volume",
+            "v1",
         ])
         .expect("users add parses");
         let add = match cli.command {
@@ -1302,6 +1391,20 @@ mod cli_tests {
 
     #[test]
     fn nvmetcp_psks_add_and_rotate() {
+        // `--volume` is required for psks add: omitting it must fail.
+        assert!(
+            parse(&[
+                "thurvsa",
+                "nvmetcp",
+                "psks",
+                "add",
+                "--host-nqn",
+                "nqn.host",
+                "--key",
+                "NVMeTLSkey-1:01:abc:",
+            ])
+            .is_err()
+        );
         let cli = parse(&[
             "thurvsa",
             "nvmetcp",
@@ -1311,13 +1414,15 @@ mod cli_tests {
             "nqn.host",
             "--key",
             "NVMeTLSkey-1:01:abc:",
+            "--volume",
+            "v1",
         ])
         .expect("psks add parses");
         assert!(matches!(
             cli.command,
             Commands::Nvmetcp {
                 action: NvmetcpAction::Psks {
-                    action: NvmetcpPsksAction::Add { host_nqn, key }
+                    action: NvmetcpPsksAction::Add { host_nqn, key, .. }
                 }
             } if host_nqn == "nqn.host" && key == "NVMeTLSkey-1:01:abc:"
         ));

@@ -724,6 +724,11 @@ pub struct LoginOutcome {
     pub statsn: u32,
     pub initiator_iqn: Option<String>,
     pub authenticated_partition: Option<String>,
+    /// Volume-name set this session is admitted to (VSA only). `None`
+    /// = no admission fence. Carried from CHAP login into the FFP
+    /// loop, which threads it as `ScsiRequest::session_volumes` on
+    /// every dispatch.
+    pub authenticated_volumes: Option<Vec<String>>,
     /// Initiator-declared `MaxRecvDataSegmentLength` from operational
     /// negotiation, falling back to the RFC 7143 §12.12 default of
     /// 8192 bytes when the initiator omits the key. Bounds the data
@@ -743,6 +748,7 @@ struct ChapState {
     waiting_for_response: bool,
     authenticated_user: Option<String>,
     authenticated_partition: Option<String>,
+    authenticated_volumes: Option<Vec<String>>,
 }
 
 impl ChapState {
@@ -754,6 +760,7 @@ impl ChapState {
             waiting_for_response: false,
             authenticated_user: None,
             authenticated_partition: None,
+            authenticated_volumes: None,
         }
     }
 }
@@ -847,6 +854,22 @@ fn negotiate_chap_security_stage(
     state.authenticated_partition = authenticator
         .get_user(username)
         .and_then(|u| u.partition().map(String::from));
+    // Mandatory admission semantics (VSA): once CHAP succeeds,
+    // `authenticated_volumes` is always `Some(_)` — never `None`. A
+    // user with no `volumes` field set becomes `Some(empty)` and
+    // sees no LUNs at the dispatcher, which is the safe fallback
+    // under mandatory. `None` (the see-everything signal at the
+    // dispatcher) is reserved for sessions that never went through
+    // CHAP at all (`iscsi.auth.method: None`). VTL ignores this
+    // field by construction (the SSC / SMC dispatchers don't read
+    // `ScsiRequest::session_volumes`), so the always-Some shape is
+    // VSA-safe + VTL-no-op.
+    state.authenticated_volumes = Some(
+        authenticator
+            .get_user(username)
+            .and_then(|u| u.volumes().map(|v| v.to_vec()))
+            .unwrap_or_default(),
+    );
     audit.record(LoginAuditEvent::ChapSuccess {
         peer,
         initiator: initiator_name,
@@ -1170,6 +1193,7 @@ pub async fn handle_login_phase(
                 statsn,
                 initiator_iqn: initiator_name,
                 authenticated_partition: chap.authenticated_partition,
+                authenticated_volumes: chap.authenticated_volumes,
                 peer_max_recv_data_segment_length,
             });
         }
@@ -1331,6 +1355,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         mut statsn,
         initiator_iqn,
         authenticated_partition,
+        authenticated_volumes,
         peer_max_recv_data_segment_length,
         ..
     } = outcome;
@@ -1505,6 +1530,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     initiator_iqn: initiator_iqn.as_deref(),
                     peer,
                     session_partition: authenticated_partition.as_deref(),
+                    session_volumes: authenticated_volumes.as_deref(),
                 };
 
                 let resp = handler.dispatch(req).await;

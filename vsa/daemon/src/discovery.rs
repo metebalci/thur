@@ -464,6 +464,7 @@ backends:
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             })
             .await;
         assert!(resp.sense.is_none(), "{:?}", resp.sense);

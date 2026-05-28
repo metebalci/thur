@@ -144,6 +144,7 @@ mod tests {
             initiator_iqn: None,
             peer: "127.0.0.1:1",
             session_partition: None,
+            session_volumes: None,
         };
         let resp = h.dispatch(req).await;
         assert_eq!(resp.data_in, vec![3u8]);
@@ -166,6 +167,7 @@ mod tests {
             initiator_iqn: None,
             peer: "p",
             session_partition: None,
+            session_volumes: None,
         };
         let resp = h.dispatch(req).await;
         assert!(matches!(resp.status, ScsiStatus::Good));

@@ -32,6 +32,7 @@ pub async fn users_add(
     password_stdin: bool,
     mutual_chap: bool,
     partition: Option<&str>,
+    volumes: Option<&[String]>,
 ) -> Result<()> {
     shared_cli_iscsi::users_add(
         PRODUCT,
@@ -40,12 +41,21 @@ pub async fn users_add(
         password_stdin,
         mutual_chap,
         partition,
+        volumes,
     )
     .await
 }
 
 pub async fn users_remove(name: &str) -> Result<()> {
     shared_cli_iscsi::users_remove(PRODUCT, name).await
+}
+
+pub async fn users_grant(name: &str, volumes: &[String]) -> Result<()> {
+    shared_cli_iscsi::users_grant(PRODUCT, name, volumes).await
+}
+
+pub async fn users_revoke(name: &str, volumes: &[String]) -> Result<()> {
+    shared_cli_iscsi::users_revoke(PRODUCT, name, volumes).await
 }
 
 pub async fn users_set_disabled(name: &str, disabled: bool) -> Result<()> {
@@ -95,16 +105,49 @@ pub async fn psks_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn psks_add(host_nqn: &str, interchange_key: &str) -> Result<()> {
+pub async fn psks_add(
+    host_nqn: &str,
+    interchange_key: &str,
+    volumes: Option<&[String]>,
+) -> Result<()> {
     parse_interchange_key(interchange_key).map_err(|e| anyhow!("invalid --key: {e}"))?;
     let admin = AdminClient::auto_discover(PRODUCT);
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "host_nqn": host_nqn,
         "interchange_key": interchange_key,
     });
+    if let Some(vs) = volumes {
+        body["volumes"] = serde_json::json!(vs);
+    }
     let _: PskRow = admin.post_json("/api/v1/nvmetcp/psks", &body).await?;
     println!("OK: PSK for host '{host_nqn}' added");
+    Ok(())
+}
+
+pub async fn psks_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
+    let _: PskRow = admin.post_json("/api/v1/nvmetcp/psks/grant", &body).await?;
+    println!(
+        "OK: host '{host_nqn}' granted access to: {}",
+        volumes.join(", ")
+    );
+    Ok(())
+}
+
+pub async fn psks_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
+    let _: PskRow = admin
+        .post_json("/api/v1/nvmetcp/psks/revoke", &body)
+        .await?;
+    println!(
+        "OK: host '{host_nqn}' revoked access to: {}",
+        volumes.join(", ")
+    );
     Ok(())
 }
 

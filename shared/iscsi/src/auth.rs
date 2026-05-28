@@ -10,6 +10,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sha3::Sha3_256;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// CHAP algorithm identifiers.
 ///
@@ -161,7 +162,8 @@ impl AuthMethod {
 
 /// One CHAP user as stored on disk in `<data_dir>/iscsi-users.json`.
 /// Field shape is identical between thurvtl and thurvsa; `partition`
-/// is only consulted by VTL (no partition concept on VSA).
+/// is only consulted by VTL (no partition concept on VSA), and
+/// `volumes` is only consulted by VSA (no volume concept on VTL).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct UserEntry {
     pub username: String,
@@ -172,6 +174,12 @@ pub struct UserEntry {
     /// omitted = no fence. Ignored by VSA at runtime.
     #[serde(default)]
     pub partition: Option<String>,
+    /// Volumes this user is admitted to, by name (VSA only). `None` or
+    /// omitted = no admission fence (see-everything). Ignored by VTL
+    /// at runtime. Captured at login; volumes created after a session
+    /// logs in are invisible to that session until re-login.
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
     /// When `true`, login attempts for this user are denied without
     /// hashing the response. Distinct from removal so the entry keeps
     /// its audit-history continuity and can be re-enabled without
@@ -228,17 +236,29 @@ impl IscsiUsersFile {
     /// Load from disk. Returns the default (empty) file if the path
     /// doesn't exist. Errors only on read-but-malformed JSON.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
+        let parsed: Self = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).map_err(|e| {
                 IscsiError::InvalidOp(Box::leak(
                     format!("failed to parse iscsi-users.json: {e}").into_boxed_str(),
                 ))
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(IscsiError::InvalidOp(Box::leak(
-                format!("I/O error on iscsi-users.json: {e}").into_boxed_str(),
-            ))),
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                return Err(IscsiError::InvalidOp(Box::leak(
+                    format!("I/O error on iscsi-users.json: {e}").into_boxed_str(),
+                )));
+            }
+        };
+        for u in &parsed.users {
+            if u.partition.is_some() && u.volumes.is_some() {
+                warn!(
+                    user = u.username.as_str(),
+                    "iscsi-users.json entry has both partition (VTL-only) and volumes (VSA-only) set; \
+                     each product consults only its own field but the combination is almost certainly a config mistake"
+                );
+            }
         }
+        Ok(parsed)
     }
 
     /// Write to disk via atomic rename. Mode 0640 on Unix.
@@ -296,6 +316,11 @@ pub struct ChapUser {
     /// partition binding (the user has full chassis-level access;
     /// only valid when no partitions are defined in library.json).
     pub partition: Option<String>,
+    /// Volumes this user is admitted to, by name (VSA only). `None` =
+    /// no admission fence (see-everything). Resolved into a per-session
+    /// snapshot at login; name → LUN/NSID resolution happens per
+    /// command, so destroy+create of a same-name volume still works.
+    pub volumes: Option<Vec<String>>,
     /// Previous password (set during a rotation grace window).
     previous_password: Option<String>,
     previous_expires_at: Option<DateTime<Utc>>,
@@ -308,6 +333,7 @@ impl ChapUser {
             password,
             mutual_chap,
             partition: None,
+            volumes: None,
             previous_password: None,
             previous_expires_at: None,
         }
@@ -315,6 +341,11 @@ impl ChapUser {
 
     pub fn with_partition(mut self, partition: Option<String>) -> Self {
         self.partition = partition;
+        self
+    }
+
+    pub fn with_volumes(mut self, volumes: Option<Vec<String>>) -> Self {
+        self.volumes = volumes;
         self
     }
 
@@ -333,6 +364,10 @@ impl ChapUser {
 
     pub fn partition(&self) -> Option<&str> {
         self.partition.as_deref()
+    }
+
+    pub fn volumes(&self) -> Option<&[String]> {
+        self.volumes.as_deref()
     }
 
     /// Returns the previous password if and only if `previous_expires_at`
@@ -419,6 +454,7 @@ impl ChapAuthenticator {
             .map(|u| {
                 ChapUser::new(u.username.clone(), u.password.clone(), u.mutual_chap)
                     .with_partition(u.partition.clone())
+                    .with_volumes(u.volumes.clone())
                     .with_grace(u.previous_password.clone(), u.previous_expires_at)
             })
             .collect();
@@ -800,6 +836,7 @@ mod tests {
                     password: "p1".into(),
                     mutual_chap: false,
                     partition: None,
+                    volumes: None,
                     disabled: false,
                     previous_password: None,
                     previous_expires_at: None,
@@ -809,6 +846,7 @@ mod tests {
                     password: "p2".into(),
                     mutual_chap: false,
                     partition: None,
+                    volumes: None,
                     disabled: true,
                     previous_password: None,
                     previous_expires_at: None,
@@ -882,6 +920,56 @@ mod tests {
             !auth
                 .verify_response("bob", &challenge, 1, &r_old, ChapAlgorithm::Sha256)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn user_entry_volumes_field_round_trips() {
+        let entry = UserEntry {
+            username: "alice".into(),
+            password: "password-1234".into(),
+            mutual_chap: false,
+            partition: None,
+            volumes: Some(vec!["v1".into(), "v2".into()]),
+            disabled: false,
+            previous_password: None,
+            previous_expires_at: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: UserEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.volumes.as_deref(),
+            Some(&["v1".to_string(), "v2".to_string()][..])
+        );
+
+        // Missing field deserialises as None (backwards compat).
+        let legacy = r#"{"username":"u","password":"123456789012"}"#;
+        let parsed: UserEntry = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.volumes.is_none());
+    }
+
+    #[test]
+    fn chap_authenticator_threads_volumes_into_user_record() {
+        let file = IscsiUsersFile {
+            version: 1,
+            target_username: None,
+            target_password: None,
+            users: vec![UserEntry {
+                username: "alice".into(),
+                password: "password-1234".into(),
+                mutual_chap: false,
+                partition: None,
+                volumes: Some(vec!["alpha".into(), "beta".into()]),
+                disabled: false,
+                previous_password: None,
+                previous_expires_at: None,
+            }],
+        };
+        let auth = ChapAuthenticator::from_file(&file, AuthMethod::Chap, vec![]).unwrap();
+        let user = auth.get_user("alice").expect("user resolved");
+        assert_eq!(
+            user.volumes(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
         );
     }
 

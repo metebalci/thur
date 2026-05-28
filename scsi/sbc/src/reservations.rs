@@ -802,6 +802,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         }
     }
 
@@ -978,6 +979,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         };
         let r = mgr.persistent_reserve_out_inner(&req, n.clone());
         assert_eq!(r.status, scsi_spc::scsi::ScsiStatus::Good);
@@ -995,6 +997,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         };
         let r = mgr.persistent_reserve_out_inner(&req, n.clone());
         assert_eq!(r.status, scsi_spc::scsi::ScsiStatus::Good);

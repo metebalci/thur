@@ -808,6 +808,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '(--password-stdin)--password=[Password as a CLI arg. Mutually exclusive with \`--password-stdin\`]:PASSWORD:_default' \
 '--partition=[Partition the user is fenced to (VTL only; VSA ignores)]:PARTITION:_default' \
+'*--volume=[Volume the user is admitted to (repeatable, required)]:NAME:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
@@ -817,6 +818,30 @@ _arguments "${_arguments_options[@]}" : \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username (CHAP identity the initiator presents):_default' \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+'*--volume=[Volume to add to the user'\''s allow-list (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':name -- Username to grant access to:_default' \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+'*--volume=[Volume to remove from the user'\''s allow-list (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':name -- Username to revoke access from:_default' \
 && ret=0
 ;;
 (remove)
@@ -884,6 +909,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1035,6 +1068,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (remove)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1146,6 +1187,31 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host-nqn=[Initiator host NQN (must match \`nvme connect --hostnqn\`)]:HOST_NQN:_default' \
 '--key=[\`NVMeTLSkey-X\:NN\:base64\:\` interchange string]:KEY:_default' \
+'*--volume=[Volume the host is admitted to (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to grant access to]:HOST_NQN:_default' \
+'*--volume=[Volume to add to the host'\''s allow-list (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to revoke access from]:HOST_NQN:_default' \
+'*--volume=[Volume to remove from the host'\''s allow-list (repeatable, required)]:NAME:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
@@ -1221,6 +1287,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (remove)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1278,6 +1352,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1626,6 +1708,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (remove)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1707,6 +1797,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1920,6 +2018,8 @@ _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users_commands() {
     local commands; commands=(
 'list:List every CHAP user' \
 'add:Add a new CHAP user' \
+'grant:Grant a user access to one or more volumes' \
+'revoke:Revoke a user'\''s access to one or more volumes' \
 'remove:Remove a CHAP user' \
 'disable:Disable a user without removing the entry' \
 'enable:Re-enable a previously disabled user' \
@@ -1942,6 +2042,11 @@ _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__enable_commands() 
     local commands; commands=()
     _describe -t commands 'thurvsa help iscsi users enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help iscsi users grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__list_commands] )) ||
 _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__list_commands() {
     local commands; commands=()
@@ -1951,6 +2056,11 @@ _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__list_commands() {
 _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help iscsi users remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help iscsi users revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() {
@@ -1969,6 +2079,8 @@ _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks_commands() {
     local commands; commands=(
 'list:List every registered host PSK' \
 'add:Add a new host PSK' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
 'remove:Remove a host PSK' \
 'disable:Disable a host PSK without removing the entry' \
 'enable:Re-enable a previously disabled host PSK' \
@@ -1991,6 +2103,11 @@ _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__enable_commands()
     local commands; commands=()
     _describe -t commands 'thurvsa help nvmetcp psks enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp psks grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__list_commands] )) ||
 _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__list_commands() {
     local commands; commands=()
@@ -2000,6 +2117,11 @@ _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__list_commands() {
 _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help nvmetcp psks remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp psks revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands() {
@@ -2230,6 +2352,8 @@ _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users_commands() {
     local commands; commands=(
 'list:List every CHAP user' \
 'add:Add a new CHAP user' \
+'grant:Grant a user access to one or more volumes' \
+'revoke:Revoke a user'\''s access to one or more volumes' \
 'remove:Remove a CHAP user' \
 'disable:Disable a user without removing the entry' \
 'enable:Re-enable a previously disabled user' \
@@ -2252,6 +2376,11 @@ _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__enable_commands() 
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi help users enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi help users grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__list_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__list_commands() {
     local commands; commands=()
@@ -2261,6 +2390,11 @@ _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__list_commands() {
 _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi help users remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi help users revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__help__subcmd__users__subcmd__rotate_commands() {
@@ -2327,6 +2461,8 @@ _thurvsa__subcmd__iscsi__subcmd__users_commands() {
     local commands; commands=(
 'list:List every CHAP user' \
 'add:Add a new CHAP user' \
+'grant:Grant a user access to one or more volumes' \
+'revoke:Revoke a user'\''s access to one or more volumes' \
 'remove:Remove a CHAP user' \
 'disable:Disable a user without removing the entry' \
 'enable:Re-enable a previously disabled user' \
@@ -2350,11 +2486,18 @@ _thurvsa__subcmd__iscsi__subcmd__users__subcmd__enable_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi users enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__users__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi users grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__users__subcmd__help_commands() {
     local commands; commands=(
 'list:List every CHAP user' \
 'add:Add a new CHAP user' \
+'grant:Grant a user access to one or more volumes' \
+'revoke:Revoke a user'\''s access to one or more volumes' \
 'remove:Remove a CHAP user' \
 'disable:Disable a user without removing the entry' \
 'enable:Re-enable a previously disabled user' \
@@ -2378,6 +2521,11 @@ _thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__enable_commands() 
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi users help enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi users help grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__help_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
@@ -2393,6 +2541,11 @@ _thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__remove_commands() 
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi users help remove commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi users help revoke commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__rotate_commands() {
     local commands; commands=()
@@ -2407,6 +2560,11 @@ _thurvsa__subcmd__iscsi__subcmd__users__subcmd__list_commands() {
 _thurvsa__subcmd__iscsi__subcmd__users__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa iscsi users remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__iscsi__subcmd__users__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa iscsi users revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__iscsi__subcmd__users__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() {
@@ -2439,6 +2597,8 @@ _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks_commands() {
     local commands; commands=(
 'list:List every registered host PSK' \
 'add:Add a new host PSK' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
 'remove:Remove a host PSK' \
 'disable:Disable a host PSK without removing the entry' \
 'enable:Re-enable a previously disabled host PSK' \
@@ -2461,6 +2621,11 @@ _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__enable_commands()
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp help psks enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help psks grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__list_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__list_commands() {
     local commands; commands=()
@@ -2470,6 +2635,11 @@ _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__list_commands() {
 _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp help psks remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help psks revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__rotate_commands() {
@@ -2481,6 +2651,8 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks_commands() {
     local commands; commands=(
 'list:List every registered host PSK' \
 'add:Add a new host PSK' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
 'remove:Remove a host PSK' \
 'disable:Disable a host PSK without removing the entry' \
 'enable:Re-enable a previously disabled host PSK' \
@@ -2504,11 +2676,18 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__enable_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp psks enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp psks grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help_commands() {
     local commands; commands=(
 'list:List every registered host PSK' \
 'add:Add a new host PSK' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
 'remove:Remove a host PSK' \
 'disable:Disable a host PSK without removing the entry' \
 'enable:Re-enable a previously disabled host PSK' \
@@ -2532,6 +2711,11 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__enable_commands()
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp psks help enable commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp psks help grant commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__help_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
@@ -2547,6 +2731,11 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__remove_commands()
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp psks help remove commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp psks help revoke commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__help__subcmd__rotate_commands() {
     local commands; commands=()
@@ -2561,6 +2750,11 @@ _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__list_commands() {
 _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__remove_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa nvmetcp psks remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp psks revoke commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__psks__subcmd__rotate_commands() {

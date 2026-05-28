@@ -42,6 +42,13 @@ pub struct PskEntry {
     /// removal so the entry keeps its audit-history continuity.
     #[serde(default)]
     pub disabled: bool,
+    /// Volumes this host is admitted to, by name (VSA only). `None`
+    /// or omitted = no admission fence (see-everything), preserving
+    /// pre-admission behaviour. Captured per-connection at Fabrics
+    /// Connect from the in-band host NQN; namespace → volume-name
+    /// resolution happens per command.
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
     /// Previous key retained for a rotation grace window. Both keys
     /// derive their (identity, TLS-PSK) pairs while
     /// `previous_expires_at` is in the future; only the current key
@@ -77,6 +84,41 @@ impl Default for NvmetcpPsksFile {
             psks: Vec::new(),
         }
     }
+}
+
+/// Resolve a host NQN to its admission set (the `volumes` field on
+/// the matching `PskEntry`). Loads the file fresh — same lifecycle
+/// as the TLS-PSK lookup that runs on every handshake.
+///
+/// Under VSA's mandatory-admission model the caller is the
+/// post-Connect path in `serve_connection`, which only consults
+/// this when TLS-PSK is on (TLS-off connections skip the lookup and
+/// see-everything). Three return shapes:
+///
+/// - `Ok(Some(names))` when the host has a `volumes` allow-list set.
+///   The dispatcher fences against this list.
+/// - `Ok(Some(empty))` when the host has a PSK entry but its
+///   `volumes` field is missing / null — a legacy entry under the
+///   mandatory regime. Safe fallback: see nothing. The operator
+///   re-issues with `nvmetcp psks add ... --volume ...` to recover.
+/// - `Ok(None)` only when the host has no matching PSK entry at all.
+///   In TLS-PSK mode this never happens for a *successful*
+///   connection — the TLS handshake would have failed. Defensive
+///   reading at the call site treats `None` as a hard refusal.
+/// - `Err(_)` only on read-but-malformed JSON or other I/O failures.
+///
+/// Disabled entries are treated as absent (consistent with the
+/// PskTable build path).
+pub fn admission_for(
+    path: &Path,
+    host_nqn: &str,
+) -> Result<Option<Vec<String>>, IdentityFileError> {
+    let file = NvmetcpPsksFile::load(path)?;
+    Ok(file
+        .psks
+        .into_iter()
+        .find(|e| !e.disabled && e.host_nqn == host_nqn)
+        .map(|e| e.volumes.unwrap_or_default()))
 }
 
 impl NvmetcpPsksFile {
@@ -249,6 +291,7 @@ mod tests {
             host_nqn: host.into(),
             interchange_key: make_interchange(key, "01"),
             disabled: false,
+            volumes: None,
             previous_interchange_key: None,
             previous_expires_at: None,
         }
@@ -306,6 +349,7 @@ mod tests {
                 host_nqn: "nqn.host.a".into(),
                 interchange_key: "not-a-valid-key".into(),
                 disabled: false,
+                volumes: None,
                 previous_interchange_key: None,
                 previous_expires_at: None,
             }],

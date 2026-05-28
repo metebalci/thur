@@ -283,19 +283,43 @@ operations update it from the CLI. Schema alongside `library.json` in
 
 `iscsi-users.json` holds the CHAP user list and the singleton mutual-CHAP
 target credential. VTL users may carry a `partition:` binding for
-partition-fenced sessions; VSA ignores that field. The file is managed by
-`<product> iscsi users {add,remove,disable,enable,rotate,list}` and
-`iscsi target {set,clear,show}` — see [`CLI.md`](CLI.md). The YAML
-conffile carries only `iscsi.auth.method` and
-`iscsi.auth.allowed_algorithms`; the credentials themselves live here.
+partition-fenced sessions; VSA ignores that field. VSA users
+**must** carry a `volumes:` field (a non-empty array of volume
+names) — admission is mandatory: every CHAP session is fenced to
+that subset. REPORT LUNS, INQUIRY, TUR, and READ CAPACITY against
+non-admitted LUNs return peripheral-qualifier 0x3 (no LU here). VTL
+ignores the `volumes` field. Sessions without CHAP
+(`iscsi.auth.method: None`) skip admission and see every volume —
+pairing admission with the auth layer mirrors NFS export-list
+behaviour.
+
+The file is managed by `<product> iscsi users
+{add,remove,disable,enable,grant,revoke,rotate,list}` and
+`iscsi target {set,clear,show}` — see [`CLI.md`](CLI.md). `add`
+takes one or more `--volume NAME` (required for VSA); `grant` /
+`revoke` mutate the list post-creation. The YAML conffile carries
+only `iscsi.auth.method` and `iscsi.auth.allowed_algorithms`; the
+credentials themselves live here.
 
 ### `nvmetcp-psks.json` — VSA
 
-`nvmetcp-psks.json` holds the TLS-PSK host-identity list for NVMe/TCP.
-It is managed by `thurvsa nvmetcp psks
-{add,remove,disable,enable,rotate,list}` and is re-read on every TLS
-handshake. PSK generation and wiring: [`AUTH.md`](AUTH.md) §
-NVMe/TCP TLS-PSK and [`NVMETCP.md`](NVMETCP.md).
+`nvmetcp-psks.json` holds the TLS-PSK host-identity list for NVMe/TCP,
+and the per-host volume admission set. Each entry **must** carry a
+`volumes:` field (a non-empty array of volume names) when TLS-PSK
+is on — admission is mandatory: every TLS-authenticated host is
+fenced to that subset. Identify CNS=0x02 (Active NS List), CNS=0x00
+(Namespace), and per-NSID I/O against non-admitted namespaces
+return Invalid Namespace. Plaintext mode (`nvmetcp.tls.mode:
+Disabled`) skips admission entirely and connections see every
+namespace — same shape as iSCSI no-CHAP.
+
+Managed by `thurvsa nvmetcp psks
+{add,remove,disable,enable,grant,revoke,rotate,list}`. The file is
+re-read on every TLS handshake and once post-Connect for the
+admission lookup, so operator edits take effect on the next *new*
+connection without restart. PSK generation and wiring:
+[`AUTH.md`](AUTH.md) § NVMe/TCP TLS-PSK and
+[`NVMETCP.md`](NVMETCP.md).
 
 ---
 

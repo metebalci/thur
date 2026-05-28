@@ -487,8 +487,15 @@ setup_chap_user() {
         return 0
     fi
     log_info "Adding CHAP user $CHAP_USER..."
+    # Mandatory admission (VSA): grant every test volume so the
+    # harness sees the full LUN set just like the no-CHAP case.
+    local volume_args=()
+    local v
+    for v in "${VOLUME_NAMES[@]}"; do
+        volume_args+=("--volume" "$v")
+    done
     if ! "$CLI_PATH" --config "$TEST_CONFIG" iscsi users add "$CHAP_USER" \
-            --password "$CHAP_PASS" >/dev/null 2>&1; then
+            --password "$CHAP_PASS" "${volume_args[@]}" >/dev/null 2>&1; then
         log_error "Failed to add CHAP user $CHAP_USER"
         tail -20 "${TEST_DIR}/daemon.log"
         exit 1

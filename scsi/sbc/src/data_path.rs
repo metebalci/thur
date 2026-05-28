@@ -1913,6 +1913,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         }
     }
 
@@ -3467,6 +3468,24 @@ mod tests {
         fn luns(&self) -> Vec<u64> {
             self.by_lun.read().unwrap().keys().copied().collect()
         }
+        fn name_for_lun(&self, lun: u64) -> Option<String> {
+            self.by_lun
+                .read()
+                .unwrap()
+                .get(&lun)
+                .map(|c| c.manifest().name.clone())
+        }
+        fn luns_filtered(&self, allow: Option<&[String]>) -> Vec<u64> {
+            let m = self.by_lun.read().unwrap();
+            match allow {
+                None => m.keys().copied().collect(),
+                Some(names) => m
+                    .iter()
+                    .filter(|(_, c)| names.iter().any(|n| n == &c.manifest().name))
+                    .map(|(lun, _)| *lun)
+                    .collect(),
+            }
+        }
     }
 
     /// Two volumes co-located on one tempdir + LocalBackend with
@@ -4026,6 +4045,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             },
             &registry,
             test_nexus(),
@@ -4048,6 +4068,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             },
             &tokens,
         );
@@ -4074,6 +4095,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             },
             &registry,
             test_nexus(),
@@ -4108,6 +4130,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             },
             &tokens,
         );
@@ -4151,6 +4174,7 @@ mod tests {
                 cid: 0,
                 peer: "",
                 session_partition: None,
+                session_volumes: None,
             },
             &registry,
             test_nexus(),

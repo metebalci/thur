@@ -444,7 +444,10 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         let moved = match code {
             0x00 => cart.space_records(count as i64),
             0x01 => cart.space_filemarks(count as i64),
-            0x03 => { cart.space_to_eod(); count as i64 }
+            0x03 => {
+                cart.space_to_eod();
+                count as i64
+            }
             _ => 0,
         };
         Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))
@@ -508,7 +511,10 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         let moved = match code {
             0x00 => cart.space_records(count),
             0x01 => cart.space_filemarks(count),
-            0x03 => { cart.space_to_eod(); count }
+            0x03 => {
+                cart.space_to_eod();
+                count
+            }
             _ => 0,
         };
         Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))

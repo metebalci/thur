@@ -83,6 +83,12 @@ pub struct ScsiRequest<'a> {
     /// partition mapping). `None` = no fence (legacy unpartitioned
     /// access; thurvsa never sets this).
     pub session_partition: Option<&'a str>,
+    /// Volume names the session is admitted to (VSA only — CHAP user
+    /// → volume-name set). `None` = no admission fence (see-everything
+    /// — sessions without CHAP, or CHAP users whose `volumes` field is
+    /// unset). Captured at login from `IscsiUsersFile`; thurvtl never
+    /// sets this.
+    pub session_volumes: Option<&'a [String]>,
 }
 
 /// Result of one dispatched SCSI command, ready for the iSCSI

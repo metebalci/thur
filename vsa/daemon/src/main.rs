@@ -563,6 +563,18 @@ async fn main() -> Result<()> {
                 volumes.len()
             );
 
+            // Path to `nvmetcp-psks.json`. Used by TLS-PSK and by
+            // per-hostnqn volume admission. We always have a path
+            // (defaulted under `<data_dir>/`); the server treats a
+            // missing or empty file as "no admission fence."
+            let psks_path = cfg
+                .nvmetcp
+                .tls
+                .identity_file
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"));
+
             // Optional TLS 1.3 PSK acceptor. Disabled = cleartext
             // (legacy default). Psk = register a ClientHelloCallback
             // that reads `nvmetcp-psks.json` and derives every PSK
@@ -572,22 +584,15 @@ async fn main() -> Result<()> {
             let tls_acceptor = match cfg.nvmetcp.tls.mode {
                 NvmetcpTlsMode::Disabled => None,
                 NvmetcpTlsMode::Psk => {
-                    let path = cfg
-                        .nvmetcp
-                        .tls
-                        .identity_file
-                        .as_deref()
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"));
                     // Touch-or-create the stub on first boot so the
                     // acceptor's load step has something to parse.
                     let initial_file =
-                        nvme_tcp::identity::NvmetcpPsksFile::load_or_create_default(&path)
-                            .with_context(|| format!("loading {}", path.display()))?;
-                    let acceptor = nvme_tcp::tls::build_psk_acceptor(&path, &subnqn)
+                        nvme_tcp::identity::NvmetcpPsksFile::load_or_create_default(&psks_path)
+                            .with_context(|| format!("loading {}", psks_path.display()))?;
+                    let acceptor = nvme_tcp::tls::build_psk_acceptor(&psks_path, &subnqn)
                         .context("building NVMe/TCP TLS-PSK acceptor")?;
                     tracing::info!(
-                        identity_file = %path.display(),
+                        identity_file = %psks_path.display(),
                         psk_count = initial_file.psks.len(),
                         "nvme-tcp: TLS-PSK enabled, parse-on-handshake",
                     );
@@ -601,11 +606,20 @@ async fn main() -> Result<()> {
                 subnqn,
                 tls_acceptor.is_some(),
             );
+            // Pair admission with auth: TLS-PSK on → admission lookup
+            // applies (mandatory). TLS-PSK off → no admission lookup
+            // → see-everything (mirror of iSCSI no-CHAP).
+            let admission_psks_path = if tls_acceptor.is_some() {
+                Some(psks_path)
+            } else {
+                None
+            };
             let server_cfg = nvme_tcp::ServerConfig {
                 listen_address: nvmetcp_listen.clone(),
                 handler,
                 controller_regs: Arc::new(nvme_base::ControllerRegs::new()),
                 tls: tls_acceptor,
+                psks_path: admission_psks_path,
             };
             (Box::pin(nvme_tcp::run(server_cfg)), nvmetcp_listen)
         }

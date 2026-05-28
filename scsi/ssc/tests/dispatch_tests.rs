@@ -1018,7 +1018,10 @@ fn space_6_filemarks_past_eod_returns_residual() {
     assert_eq!(sense[13], 0x05);
     assert_eq!(sense[0] & 0x80, 0x80, "INFORMATION VALID bit set");
     let info = u32::from_be_bytes([sense[3], sense[4], sense[5], sense[6]]);
-    assert_eq!(info, 0x7F_FFFF, "INFORMATION = count − moved (=count, moved=0)");
+    assert_eq!(
+        info, 0x7F_FFFF,
+        "INFORMATION = count − moved (=count, moved=0)"
+    );
 }
 
 /// SPACE(16) sister-test for the same residual rule, exercising the

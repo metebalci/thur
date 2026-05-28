@@ -237,7 +237,25 @@ a direct file mutation.
 **Verb shapes worth knowing:**
 
 - `add NAME --password VALUE` / `--password-stdin` (mutex). The stdin
-  variant reads one line, strips trailing CR/LF, never echoes.
+  variant reads one line, strips trailing CR/LF, never echoes. VSA
+  **requires** at least one `--volume NAME` (repeatable) on every
+  `add` — admission is mandatory. Names must currently resolve to a
+  volume. VTL has no `--volume` flag (the analogous per-partition
+  fence uses `--partition NAME`). Admission is captured at login,
+  so volumes created after a session logs in remain invisible until
+  re-login. The corresponding `thurvsa nvmetcp psks add --host-nqn
+  N --key K --volume V [...]` verb carries the same mandatory
+  admission for NVMe-TCP hosts (the join key is host NQN instead
+  of CHAP user).
+- `grant USER --volume V [...]` (VSA only) — adds volumes to the
+  user's allow-list. Idempotent set-union. Refuses unknown volume
+  names. Existing sessions don't see the change until re-login.
+  Mirror: `nvmetcp psks grant --host-nqn N --volume V [...]`.
+- `revoke USER --volume V [...]` (VSA only) — removes volumes from
+  the user's allow-list. Refuses if it would leave the user with
+  zero admitted volumes — use `remove` or `disable` for full
+  cutoff. Existing sessions don't see the change until re-login.
+  Mirror: `nvmetcp psks revoke --host-nqn N --volume V [...]`.
 - `rotate NAME --password NEW [--grace 24h]` — sets new as current, old
   as `previous_password`, with `previous_expires_at = now + grace`.
   `--grace` accepts humantime durations. Refuses if a rotation is
@@ -252,11 +270,11 @@ a direct file mutation.
 **Audit ops** (every verb is daemon-routed, so each one emits a row):
 
 ```
-iscsi.users.{add, remove, disable, enable, rotate.start,
-             rotate.cancel, rotate.commit}
+iscsi.users.{add, remove, disable, enable, grant, revoke,
+             rotate.start, rotate.cancel, rotate.commit}
 iscsi.target.{set, clear}
-nvmetcp.psks.{add, remove, disable, enable, rotate.start,
-              rotate.cancel, rotate.commit}
+nvmetcp.psks.{add, remove, disable, enable, grant, revoke,
+              rotate.start, rotate.cancel, rotate.commit}
 ```
 
 `rotate.commit` fires once per swept entry whenever any mutating verb

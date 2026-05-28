@@ -44,6 +44,12 @@ pub struct AddRequest {
     pub mutual_chap: bool,
     #[serde(default)]
     pub partition: Option<String>,
+    /// Volumes this user is admitted to, by name (VSA only). VTL
+    /// ignores. Opaque pass-through at this layer; VSA's
+    /// daemon-side admin wrapper validates that each name resolves
+    /// to a current volume before persisting.
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,11 +64,31 @@ pub struct RotateRequest {
     pub grace_seconds: u64,
 }
 
+/// `iscsi users grant USER --volume V [--volume V ...]` body.
+/// Set-union: volumes already in the user's allow-list are no-ops.
+/// VSA-only verb; VTL has no admission concept on this field.
+#[derive(Debug, Deserialize)]
+pub struct GrantRequest {
+    pub name: String,
+    pub volumes: Vec<String>,
+}
+
+/// `iscsi users revoke USER --volume V [--volume V ...]` body.
+/// Set-difference: volumes not in the user's allow-list are no-ops.
+/// Refuses if the resulting set is empty (use `remove` / `disable`
+/// for that). VSA-only verb.
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    pub name: String,
+    pub volumes: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct UserRow {
     pub username: String,
     pub mutual_chap: bool,
     pub partition: Option<String>,
+    pub volumes: Option<Vec<String>>,
     pub disabled: bool,
     pub in_grace: bool,
     pub previous_expires_at: Option<DateTime<Utc>>,
@@ -100,6 +126,7 @@ pub async fn list<S: IscsiUsersState>(
             username: u.username,
             mutual_chap: u.mutual_chap,
             partition: u.partition,
+            volumes: u.volumes,
             disabled: u.disabled,
             in_grace: u.previous_expires_at.map(|t| t > now).unwrap_or(false),
             previous_expires_at: u.previous_expires_at,
@@ -130,6 +157,7 @@ pub async fn add<S: IscsiUsersState>(
         username: body.username.clone(),
         mutual_chap: body.mutual_chap,
         partition: body.partition.clone(),
+        volumes: body.volumes.clone(),
         disabled: false,
         in_grace: false,
         previous_expires_at: None,
@@ -139,6 +167,7 @@ pub async fn add<S: IscsiUsersState>(
         password: body.password,
         mutual_chap: body.mutual_chap,
         partition: body.partition,
+        volumes: body.volumes,
         disabled: false,
         previous_password: None,
         previous_expires_at: None,
@@ -258,6 +287,7 @@ pub async fn rotate<S: IscsiUsersState>(
         username: user.username.clone(),
         mutual_chap: user.mutual_chap,
         partition: user.partition.clone(),
+        volumes: user.volumes.clone(),
         disabled: user.disabled,
         in_grace: true,
         previous_expires_at: Some(expires),
@@ -273,6 +303,113 @@ pub async fn rotate<S: IscsiUsersState>(
             "grace_seconds": body.grace_seconds,
             "previous_expires_at": expires,
         }),
+    );
+    Ok((StatusCode::OK, Json(row)))
+}
+
+pub async fn grant<S: IscsiUsersState>(
+    State(state): State<S>,
+    peer: PeerCred,
+    Json(body): Json<GrantRequest>,
+) -> Result<(StatusCode, Json<UserRow>), ApiError> {
+    if body.volumes.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    let (path, mut file) = load_users(&state)?;
+    let swept = sweep_expired_previous(&mut file);
+    let user = file
+        .users
+        .iter_mut()
+        .find(|u| u.username == body.name)
+        .ok_or_else(|| ApiError::not_found(format!("user '{}'", body.name)))?;
+
+    let mut current = user.volumes.clone().unwrap_or_default();
+    let added: Vec<String> = body
+        .volumes
+        .iter()
+        .filter(|v| !current.iter().any(|c| c == *v))
+        .cloned()
+        .collect();
+    current.extend(added.iter().cloned());
+    user.volumes = Some(current);
+
+    let row = UserRow {
+        username: user.username.clone(),
+        mutual_chap: user.mutual_chap,
+        partition: user.partition.clone(),
+        volumes: user.volumes.clone(),
+        disabled: user.disabled,
+        in_grace: user
+            .previous_expires_at
+            .map(|t| t > Utc::now())
+            .unwrap_or(false),
+        previous_expires_at: user.previous_expires_at,
+    };
+    save_users(&path, &file)?;
+    emit_sweep_audits(&state, &peer, swept);
+    audit(
+        &state,
+        &peer,
+        "iscsi.users.grant",
+        json!({ "username": body.name, "volumes_added": added }),
+    );
+    Ok((StatusCode::OK, Json(row)))
+}
+
+pub async fn revoke<S: IscsiUsersState>(
+    State(state): State<S>,
+    peer: PeerCred,
+    Json(body): Json<RevokeRequest>,
+) -> Result<(StatusCode, Json<UserRow>), ApiError> {
+    if body.volumes.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    let (path, mut file) = load_users(&state)?;
+    let swept = sweep_expired_previous(&mut file);
+    let user = file
+        .users
+        .iter_mut()
+        .find(|u| u.username == body.name)
+        .ok_or_else(|| ApiError::not_found(format!("user '{}'", body.name)))?;
+
+    let current = user.volumes.clone().unwrap_or_default();
+    let removed: Vec<String> = body
+        .volumes
+        .iter()
+        .filter(|v| current.iter().any(|c| c == *v))
+        .cloned()
+        .collect();
+    let next: Vec<String> = current
+        .into_iter()
+        .filter(|c| !body.volumes.iter().any(|v| v == c))
+        .collect();
+    if next.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "revoke would leave user '{}' with no volumes; use `iscsi users disable` or `remove` instead",
+            body.name
+        )));
+    }
+    user.volumes = Some(next);
+
+    let row = UserRow {
+        username: user.username.clone(),
+        mutual_chap: user.mutual_chap,
+        partition: user.partition.clone(),
+        volumes: user.volumes.clone(),
+        disabled: user.disabled,
+        in_grace: user
+            .previous_expires_at
+            .map(|t| t > Utc::now())
+            .unwrap_or(false),
+        previous_expires_at: user.previous_expires_at,
+    };
+    save_users(&path, &file)?;
+    emit_sweep_audits(&state, &peer, swept);
+    audit(
+        &state,
+        &peer,
+        "iscsi.users.revoke",
+        json!({ "username": body.name, "volumes_removed": removed }),
     );
     Ok((StatusCode::OK, Json(row)))
 }
@@ -554,6 +691,7 @@ mod tests {
             password: "long-enough-12".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
             disabled: false,
             previous_password: None,
             previous_expires_at: None,
@@ -564,6 +702,7 @@ mod tests {
             password: "current-password-1".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
             disabled: false,
             previous_password: Some("old".into()),
             previous_expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
@@ -574,6 +713,7 @@ mod tests {
             password: "current-password-2".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
             disabled: false,
             previous_password: Some("still-valid".into()),
             previous_expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
@@ -601,6 +741,17 @@ mod tests {
         assert_eq!(req.password, "123456789012");
         assert!(req.mutual_chap);
         assert_eq!(req.partition.as_deref(), Some("backup"));
+        assert!(req.volumes.is_none());
+    }
+
+    #[test]
+    fn add_request_with_volumes_serde_round_trip() {
+        let json = r#"{"username":"u","password":"123456789012","volumes":["v1","v2"]}"#;
+        let req: AddRequest = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            req.volumes.as_deref(),
+            Some(&["v1".to_string(), "v2".to_string()][..])
+        );
     }
 
     #[test]
@@ -652,6 +803,7 @@ mod tests {
             password: "password-1234".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
             disabled: false,
             previous_password: None,
             previous_expires_at: None,
@@ -678,6 +830,7 @@ mod tests {
             password: "password-1234".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
         };
         let _ = add(State(state.clone()), peer(), axum::Json(req))
             .await
@@ -697,6 +850,7 @@ mod tests {
             password: "short".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
         };
         let err = add(State(state), peer(), axum::Json(req))
             .await
@@ -710,6 +864,7 @@ mod tests {
             password: password.to_string(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
         }
     }
 
@@ -741,6 +896,7 @@ mod tests {
             password: "password-1234".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
         };
         let _ = add(State(state.clone()), peer(), axum::Json(add_req))
             .await
@@ -824,6 +980,7 @@ mod tests {
             password: "current-password-1".into(),
             mutual_chap: false,
             partition: None,
+            volumes: None,
             disabled: false,
             previous_password: Some("old".into()),
             // 1 ms in the past — effectively "now" for the sweep.

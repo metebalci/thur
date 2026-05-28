@@ -496,6 +496,7 @@ mod tests {
             cid: 0,
             peer: "",
             session_partition: None,
+            session_volumes: None,
         }
     }
 

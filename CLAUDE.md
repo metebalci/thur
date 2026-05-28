@@ -422,14 +422,28 @@ re-materializes `library.json` from the YAML `library:` block.
 - `iscsi-users.json` — CHAP user list + mutual-CHAP target credentials.
   The YAML carries only `iscsi.auth.method` (`None | CHAP`) and
   `iscsi.auth.allowed_algorithms`. VTL users may carry a `partition:`
-  binding for partition-fenced sessions; VSA ignores that field.
-  Managed via `thur{vtl,vsa} iscsi users
-  {add,remove,disable,enable,rotate,list}` and
-  `iscsi target {set,clear,show}` for the singleton mutual-CHAP
-  credential. Daemon re-reads on every login — no restart needed.
-- `nvmetcp-psks.json` (VSA only) — TLS-PSK host identity list. Managed
-  via `thurvsa nvmetcp psks {add,remove,disable,enable,rotate,list}`.
-  Daemon re-reads on every TLS handshake — no restart needed.
+  binding for partition-fenced sessions; VSA ignores that field. VSA
+  users **must** carry a `volumes:` array (at least one) — admission
+  is mandatory: `iscsi users add --volume NAME [--volume NAME ...]`,
+  `iscsi users grant USER --volume NAME [...]`, `iscsi users revoke
+  USER --volume NAME [...]`. Empty / missing `volumes` on a CHAP
+  session = see-nothing (safe fallback). Sessions without CHAP
+  (`auth.method: None`) skip admission entirely and see everything.
+  VTL ignores the `volumes` field. Managed via
+  `thur{vtl,vsa} iscsi users {add,remove,disable,enable,grant,revoke,
+  rotate,list}` and `iscsi target {set,clear,show}`. Daemon re-reads
+  on every login — no restart needed.
+- `nvmetcp-psks.json` (VSA only) — TLS-PSK host identity list + per-
+  hostnqn volume admission. Each entry **must** carry a `volumes:`
+  array (at least one) when TLS-PSK is on — admission is mandatory:
+  `nvmetcp psks add --host-nqn ... --key ... --volume NAME [...]`,
+  `nvmetcp psks grant --host-nqn ... --volume NAME [...]`,
+  `nvmetcp psks revoke --host-nqn ... --volume NAME [...]`. TLS off
+  (`nvmetcp.tls.mode: Disabled`) skips admission entirely and
+  connections see everything (mirror of iSCSI no-CHAP). Managed via
+  `thurvsa nvmetcp psks {add,remove,disable,enable,grant,revoke,
+  rotate,list}`. Daemon re-reads on every TLS handshake — no restart
+  needed.
 S3 / GCS / Azure backends carry an optional `retention_mode` field
 (`none` / `governance` / `compliance`). Required for WORM cartridges /
 volumes. The daemon queries each backend's actual lock state at startup

@@ -1219,6 +1219,54 @@ NVMe-TCP §3.6.1.5 mandates — `TLS_AES_128_GCM_SHA256` and
 `TLS_AES_256_GCM_SHA384` — and a TLS 1.2 fallback is refused outright.
 There is no operator knob.
 
+### Per-host volume admission (VSA only)
+
+When TLS-PSK is on (`nvmetcp.tls.mode: Psk`), every entry in
+`nvmetcp-psks.json` **must** carry a non-empty `volumes` field
+naming the subset of volumes the host is admitted to — admission is
+mandatory:
+
+```json
+{
+  "version": 1,
+  "psks": [
+    {
+      "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:initiator-1",
+      "interchange_key": "NVMeTLSkey-1:01:...:",
+      "volumes": ["alpha", "beta"]
+    }
+  ]
+}
+```
+
+The dispatcher filters Identify CNS=0x02 (Active NS List), CNS=0x00
+(Namespace), and CNS=0x03 (NS ID Descriptor List) to those names,
+and rejects per-NSID I/O against non-admitted namespaces with
+`INVALID_NAMESPACE`. The admission set is captured at Fabrics
+Connect from the in-band host NQN; volumes created after a host
+connects are invisible to existing connections until they
+reconnect.
+
+Provision via `thurvsa nvmetcp psks add --host-nqn ... --key ...
+--volume NAME [--volume NAME ...]` (at least one `--volume`
+required). Mutate post-creation with `nvmetcp psks grant` /
+`revoke` — both refuse if the operation would empty the volume set
+(use `disable` / `remove` for full cutoff). The daemon rejects
+unknown volume names at `add` / `grant` time.
+
+Pre-existing entries without `volumes` (created before the
+mandatory-admission rollout) are still loaded by the TLS handshake
+path but resolve to an empty admission set post-Connect — those
+hosts authenticate but see no namespaces. The daemon logs
+`admission_fenced` per connection so operators can audit which
+hosts need re-provisioning.
+
+Plaintext mode (`nvmetcp.tls.mode: Disabled`) skips admission
+entirely — connections see every namespace, same shape as iSCSI
+no-CHAP. The host NQN in the Connect command is unauthenticated in
+plaintext mode anyway, so admission would be advisory at best;
+pairing admission with the TLS auth layer keeps the model simple.
+
 On the host side, Linux setup is a single command per host:
 
 ```bash

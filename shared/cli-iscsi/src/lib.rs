@@ -68,16 +68,20 @@ pub async fn users_add(
     password_stdin: bool,
     mutual_chap: bool,
     partition: Option<&str>,
+    volumes: Option<&[String]>,
 ) -> Result<()> {
     let password = resolve_password(password_arg, password_stdin)?;
     let admin = AdminClient::auto_discover(product);
     require_daemon(product, &admin).await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "username": name,
         "password": password,
         "mutual_chap": mutual_chap,
         "partition": partition,
     });
+    if let Some(vs) = volumes {
+        body["volumes"] = serde_json::json!(vs);
+    }
     let _row: UserRow = admin.post_json("/api/v1/iscsi/users", &body).await?;
     println!("OK: user '{name}' added");
     Ok(())
@@ -89,6 +93,38 @@ pub async fn users_remove(product: &'static ProductIdentity, name: &str) -> Resu
     let body = serde_json::json!({ "name": name });
     admin.post_unit("/api/v1/iscsi/users/remove", &body).await?;
     println!("OK: user '{name}' removed");
+    Ok(())
+}
+
+pub async fn users_grant(
+    product: &'static ProductIdentity,
+    name: &str,
+    volumes: &[String],
+) -> Result<()> {
+    let admin = AdminClient::auto_discover(product);
+    require_daemon(product, &admin).await?;
+    let body = serde_json::json!({ "name": name, "volumes": volumes });
+    let _row: UserRow = admin.post_json("/api/v1/iscsi/users/grant", &body).await?;
+    println!(
+        "OK: user '{name}' granted access to: {}",
+        volumes.join(", ")
+    );
+    Ok(())
+}
+
+pub async fn users_revoke(
+    product: &'static ProductIdentity,
+    name: &str,
+    volumes: &[String],
+) -> Result<()> {
+    let admin = AdminClient::auto_discover(product);
+    require_daemon(product, &admin).await?;
+    let body = serde_json::json!({ "name": name, "volumes": volumes });
+    let _row: UserRow = admin.post_json("/api/v1/iscsi/users/revoke", &body).await?;
+    println!(
+        "OK: user '{name}' revoked access to: {}",
+        volumes.join(", ")
+    );
     Ok(())
 }
 

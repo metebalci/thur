@@ -45,6 +45,20 @@ use crate::opcode::NvmOpcode;
 /// connections.
 const DEFAULT_NUM_IO_QUEUES: u16 = 64;
 
+/// Per-hostnqn admission check. `None` admission slice = no fence
+/// (legacy / no PSK admission entry — see-everything). Otherwise the
+/// NSID's volume name must be in the slice. NSID 0 is reserved and
+/// never admitted; the dispatcher catches that before this call.
+fn nsid_admitted(registry: &dyn NamespaceLookup, nsid: u32, allow: Option<&[String]>) -> bool {
+    let Some(names) = allow else {
+        return true;
+    };
+    match registry.name_for_nsid(nsid) {
+        Some(name) => names.iter().any(|n| n == &name),
+        None => false,
+    }
+}
+
 /// Feature Identifier for Number of Queues (NVMe Base §5.21.1.7).
 const FID_NUMBER_OF_QUEUES: u8 = 0x07;
 
@@ -110,6 +124,12 @@ impl NvmeNvmDispatcher {
         let Some(opcode) = NvmOpcode::from_u8(sqe.opcode) else {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_opcode()));
         };
+        // Per-hostnqn namespace admission: a non-admitted NSID is
+        // surfaced to this connection as "no namespace", same shape
+        // as an unknown NSID.
+        if !nsid_admitted(self.registry.as_ref(), sqe.nsid, cmd.session_volumes) {
+            return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_namespace()));
+        }
         let Some(cache) = self.registry.get(sqe.nsid) else {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_namespace()));
         };
@@ -132,7 +152,7 @@ impl NvmeNvmDispatcher {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_opcode()));
         };
         match opcode {
-            AdminOpcode::Identify => self.cmd_identify(cid, sqe).await,
+            AdminOpcode::Identify => self.cmd_identify(cid, sqe, cmd.session_volumes).await,
             AdminOpcode::GetFeatures => self.cmd_get_features(cid, sqe),
             AdminOpcode::SetFeatures => self.cmd_set_features(cid, sqe),
             AdminOpcode::GetLogPage => self.cmd_get_log_page(cid, sqe),
@@ -260,7 +280,12 @@ impl NvmeNvmDispatcher {
         NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), payload)
     }
 
-    async fn cmd_identify(&self, cid: u16, sqe: &nvme_base::Sqe) -> NvmeResponse {
+    async fn cmd_identify(
+        &self,
+        cid: u16,
+        sqe: &nvme_base::Sqe,
+        session_volumes: Option<&[String]>,
+    ) -> NvmeResponse {
         let raw_cns = (sqe.cdw10 & 0xFF) as u8;
         let Some(cns) = CNS::from_u8(raw_cns) else {
             tracing::warn!(
@@ -302,6 +327,14 @@ impl NvmeNvmDispatcher {
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), ic.to_bytes().to_vec())
             }
             CNS::Namespace => {
+                if !nsid_admitted(self.registry.as_ref(), sqe.nsid, session_volumes) {
+                    return NvmeResponse::just(Cqe::failure(
+                        cid,
+                        0,
+                        0,
+                        StatusField::invalid_namespace(),
+                    ));
+                }
                 let Some(cache) = self.registry.get(sqe.nsid) else {
                     return NvmeResponse::just(Cqe::failure(
                         cid,
@@ -334,7 +367,7 @@ impl NvmeNvmDispatcher {
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), id.to_bytes().to_vec())
             }
             CNS::ActiveNamespaceList => {
-                let mut nsids = self.registry.active_namespaces();
+                let mut nsids = self.registry.active_namespaces_filtered(session_volumes);
                 nsids.sort_unstable();
                 let payload = nvme_base::identify::active_namespace_list(&nsids, sqe.nsid);
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), payload.to_vec())
@@ -342,6 +375,16 @@ impl NvmeNvmDispatcher {
             CNS::NamespaceIdDescList => {
                 // Validate NSID exists; per spec the Descriptor list
                 // is per-namespace and an invalid NSID should error.
+                // A non-admitted NSID is reported as invalid — same
+                // shape as an unknown one.
+                if !nsid_admitted(self.registry.as_ref(), sqe.nsid, session_volumes) {
+                    return NvmeResponse::just(Cqe::failure(
+                        cid,
+                        0,
+                        0,
+                        StatusField::invalid_namespace(),
+                    ));
+                }
                 let Some(cache) = self.registry.get(sqe.nsid) else {
                     return NvmeResponse::just(Cqe::failure(
                         cid,
@@ -670,6 +713,19 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
             );
         }
+        // Per-hostnqn admission: both halves must share the same
+        // session_volumes (they came in on the same I/O queue), so
+        // gate once.
+        if !nsid_admitted(
+            self.registry.as_ref(),
+            compare.sqe.nsid,
+            compare.session_volumes,
+        ) {
+            return (
+                Cqe::failure(compare_cid, 0, 0, StatusField::invalid_namespace()),
+                Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
+            );
+        }
         let Some(cache) = self.registry.get(compare.sqe.nsid) else {
             return (
                 Cqe::failure(compare_cid, 0, 0, StatusField::invalid_namespace()),
@@ -757,6 +813,24 @@ mod tests {
         fn active_namespaces(&self) -> Vec<u32> {
             self.by_nsid.read().unwrap().keys().copied().collect()
         }
+        fn name_for_nsid(&self, nsid: u32) -> Option<String> {
+            self.by_nsid
+                .read()
+                .unwrap()
+                .get(&nsid)
+                .map(|c| c.manifest().name.clone())
+        }
+        fn active_namespaces_filtered(&self, allow: Option<&[String]>) -> Vec<u32> {
+            let m = self.by_nsid.read().unwrap();
+            match allow {
+                None => m.keys().copied().collect(),
+                Some(names) => m
+                    .iter()
+                    .filter(|(_, c)| names.iter().any(|n| n == &c.manifest().name))
+                    .map(|(nsid, _)| *nsid)
+                    .collect(),
+            }
+        }
     }
 
     async fn fixture_dispatcher() -> (TempDir, NvmeNvmDispatcher) {
@@ -827,6 +901,7 @@ mod tests {
                 sqe: wsqe,
                 data_out: Some(&payload),
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS, "write failed");
@@ -837,6 +912,7 @@ mod tests {
                 sqe: rsqe,
                 data_out: None,
                 data_in_max: 64 * 1024,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -853,6 +929,7 @@ mod tests {
                 sqe: rsqe,
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::lba_out_of_range());
@@ -871,6 +948,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -891,6 +969,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -916,6 +995,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -939,6 +1019,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -962,6 +1043,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -982,6 +1064,7 @@ mod tests {
             sqe: wsqe,
             data_out: Some(&original),
             data_in_max: 0,
+            session_volumes: None,
         })
         .await;
 
@@ -1011,11 +1094,13 @@ mod tests {
                     sqe: csqe,
                     data_out: Some(&original),
                     data_in_max: 0,
+                    session_volumes: None,
                 },
                 IoCommand {
                     sqe: wsqe2,
                     data_out: Some(&new),
                     data_in_max: 0,
+                    session_volumes: None,
                 },
             )
             .await;
@@ -1036,6 +1121,7 @@ mod tests {
                 sqe: rsqe,
                 data_out: None,
                 data_in_max: 64 * 1024,
+                session_volumes: None,
             })
             .await;
         assert_eq!(read_resp.data_in, new);
@@ -1055,6 +1141,7 @@ mod tests {
             sqe: nvme_base::Sqe::parse(&wsqe).unwrap(),
             data_out: Some(&original),
             data_in_max: 0,
+            session_volumes: None,
         })
         .await;
 
@@ -1080,11 +1167,13 @@ mod tests {
                     sqe: nvme_base::Sqe::parse(&csqe).unwrap(),
                     data_out: Some(&bad_compare),
                     data_in_max: 0,
+                    session_volumes: None,
                 },
                 IoCommand {
                     sqe: nvme_base::Sqe::parse(&wsqe2).unwrap(),
                     data_out: Some(&new),
                     data_in_max: 0,
+                    session_volumes: None,
                 },
             )
             .await;
@@ -1102,6 +1191,7 @@ mod tests {
                 sqe: nvme_base::Sqe::parse(&rsqe).unwrap(),
                 data_out: None,
                 data_in_max: 64 * 1024,
+                session_volumes: None,
             })
             .await;
         assert_eq!(read_resp.data_in, original);
@@ -1120,6 +1210,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
@@ -1156,6 +1247,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Flush, 0, 0),
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1169,6 +1261,7 @@ mod tests {
             sqe: sqe_io(NvmOpcode::Write, 0, 0),
             data_out: Some(&payload),
             data_in_max: 0,
+            session_volumes: None,
         })
         .await;
 
@@ -1177,6 +1270,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Compare, 0, 0),
                 data_out: Some(&payload),
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(same.cqe.status, StatusField::SUCCESS);
@@ -1186,6 +1280,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Compare, 0, 0),
                 data_out: Some(&vec![0x00u8; 4096]),
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(differs.cqe.status, StatusField::compare_failure());
@@ -1199,6 +1294,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Compare, 0, 0),
                 data_out: Some(&[1, 2, 3]),
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1212,6 +1308,7 @@ mod tests {
             sqe: sqe_io(NvmOpcode::Write, 0, 0),
             data_out: Some(&vec![0xFFu8; 4096]),
             data_in_max: 0,
+            session_volumes: None,
         })
         .await;
 
@@ -1220,6 +1317,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::WriteZeroes, 0, 0),
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(wz.cqe.status, StatusField::SUCCESS);
@@ -1229,6 +1327,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Read, 0, 0),
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(rd.cqe.status, StatusField::SUCCESS);
@@ -1252,6 +1351,7 @@ mod tests {
                 sqe,
                 data_out: Some(&range),
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1270,6 +1370,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1283,6 +1384,7 @@ mod tests {
                 sqe: sqe_io(NvmOpcode::Verify, 0, 0),
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1300,6 +1402,7 @@ mod tests {
                 sqe,
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1313,6 +1416,7 @@ mod tests {
                 sqe: sqe_admin(0x06, 1, 0x00), // CNS = 0x00 Namespace
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1328,6 +1432,7 @@ mod tests {
                     sqe: sqe_admin(0x06, 1, cns),
                     data_out: None,
                     data_in_max: 4096,
+                    session_volumes: None,
                 })
                 .await;
             assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
@@ -1343,6 +1448,7 @@ mod tests {
                 sqe: sqe_admin(0x06, 1, 0x55), // CNS 0x55 is unsupported
                 data_out: None,
                 data_in_max: 4096,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1356,6 +1462,7 @@ mod tests {
                 sqe: sqe_admin(0x18, 0, 0), // KeepAlive
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1369,6 +1476,7 @@ mod tests {
                 sqe: sqe_admin(0x08, 0, 0), // Abort
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1384,6 +1492,7 @@ mod tests {
                 sqe: sqe_admin(0x0C, 0, 0), // AsyncEventRequest
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1397,8 +1506,100 @@ mod tests {
                 sqe: sqe_admin(0x03, 0, 0), // unassigned admin opcode
                 data_out: None,
                 data_in_max: 0,
+                session_volumes: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
+    }
+
+    /// Fixture with two NSIDs (1 → "ns1", 2 → "ns2") so admission can
+    /// fence one out.
+    async fn fixture_two_ns() -> (TempDir, NvmeNvmDispatcher) {
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        let reg = TestRegistry::default();
+        for (nsid, name) in [(1u32, "ns1"), (2u32, "ns2")] {
+            VolumeManifest::new(
+                name.into(),
+                4 * (1u64 << 20),
+                DEFAULT_SECTOR_BYTES,
+                DEFAULT_PAGE_SIZE_BYTES,
+                "primary".into(),
+                DedupScope::Local,
+                false,
+                0,
+            )
+            .unwrap()
+            .create(tmp.path())
+            .unwrap();
+            let writer =
+                Arc::new(VolumeWriter::open(tmp.path(), name, Arc::clone(&backend)).unwrap());
+            reg.register(nsid, PageCache::new(writer));
+        }
+        let disp = NvmeNvmDispatcher::new(
+            Arc::new(reg),
+            "nqn.2025-10.com.metebalci:thurvsa".into(),
+            "TESTSN".into(),
+            "ThurVSA Volume".into(),
+            "0.1.0".into(),
+        );
+        (tmp, disp)
+    }
+
+    #[tokio::test]
+    async fn identify_active_namespace_list_filters_to_admitted() {
+        let (_tmp, disp) = fixture_two_ns().await;
+        let allow = vec!["ns2".to_string()];
+        let resp = disp
+            .handle_admin(AdminCommand {
+                // sqe_admin(opcode, nsid, cdw10) — CNS=0x02 lives in
+                // cdw10 low byte, starting_nsid=0 in nsid.
+                sqe: sqe_admin(AdminOpcode::Identify as u8, 0, 0x02),
+                data_out: None,
+                data_in_max: nvme_base::IDENTIFY_DATA_SIZE as u32,
+                session_volumes: Some(&allow),
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        // First entry of the active NS list is a u32 LE — only ns2 (NSID 2)
+        // should be present, ns1 (NSID 1) filtered out.
+        let nsid0 = u32::from_le_bytes([
+            resp.data_in[0],
+            resp.data_in[1],
+            resp.data_in[2],
+            resp.data_in[3],
+        ]);
+        let nsid1 = u32::from_le_bytes([
+            resp.data_in[4],
+            resp.data_in[5],
+            resp.data_in[6],
+            resp.data_in[7],
+        ]);
+        assert_eq!(nsid0, 2);
+        assert_eq!(nsid1, 0); // terminator
+    }
+
+    #[tokio::test]
+    async fn dispatch_io_returns_invalid_namespace_for_non_admitted() {
+        let (_tmp, disp) = fixture_two_ns().await;
+        // Read NSID 1 (ns1) while admitted only to ns2.
+        let allow = vec!["ns2".to_string()];
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::Read as u8;
+        b[2] = 0x05; // CID
+        b[4] = 0x01; // NSID = 1 (not admitted)
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: None,
+                data_in_max: 4096,
+                session_volumes: Some(&allow),
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
     }
 }

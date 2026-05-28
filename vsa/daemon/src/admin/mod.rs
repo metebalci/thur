@@ -86,6 +86,8 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/iscsi/users/rotate/cancel",
             post(iscsi_users::rotate_cancel),
         )
+        .route("/api/v1/iscsi/users/grant", post(iscsi_users::grant))
+        .route("/api/v1/iscsi/users/revoke", post(iscsi_users::revoke))
         // mutual-CHAP target credential (singleton)
         .route(
             "/api/v1/iscsi/target",
@@ -105,6 +107,8 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/nvmetcp/psks/rotate/cancel",
             post(nvmetcp_psks::rotate_cancel),
         )
+        .route("/api/v1/nvmetcp/psks/grant", post(nvmetcp_psks::grant))
+        .route("/api/v1/nvmetcp/psks/revoke", post(nvmetcp_psks::revoke))
         .with_state(state.clone());
 
     let jobs = shared_admin_server::jobs_router(state, |kind, body, emitter, st| {

@@ -304,15 +304,26 @@ async fn run(cli: Cli) -> Result<()> {
                     password_stdin,
                     mutual_chap,
                     partition,
+                    volume,
                 } => {
+                    // clap's `required = true` + `num_args = 1..`
+                    // guarantees a non-empty Vec — under VSA's
+                    // mandatory-admission model. Wrap as Some(_).
                     credentials::users_add(
                         &name,
                         password.as_deref(),
                         password_stdin,
                         mutual_chap,
                         partition.as_deref(),
+                        Some(volume.as_slice()),
                     )
                     .await
+                }
+                IscsiUsersAction::Grant { name, volume } => {
+                    credentials::users_grant(&name, &volume).await
+                }
+                IscsiUsersAction::Revoke { name, volume } => {
+                    credentials::users_revoke(&name, &volume).await
                 }
                 IscsiUsersAction::Remove { name } => credentials::users_remove(&name).await,
                 IscsiUsersAction::Disable { name } => {
@@ -354,8 +365,20 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Nvmetcp { action } => match action {
             NvmetcpAction::Psks { action } => match action {
                 NvmetcpPsksAction::List { json } => credentials::psks_list(json).await,
-                NvmetcpPsksAction::Add { host_nqn, key } => {
-                    credentials::psks_add(&host_nqn, &key).await
+                NvmetcpPsksAction::Add {
+                    host_nqn,
+                    key,
+                    volume,
+                } => {
+                    // clap requires at least one `--volume`; pass as
+                    // Some(_) to the daemon which enforces non-empty.
+                    credentials::psks_add(&host_nqn, &key, Some(volume.as_slice())).await
+                }
+                NvmetcpPsksAction::Grant { host_nqn, volume } => {
+                    credentials::psks_grant(&host_nqn, &volume).await
+                }
+                NvmetcpPsksAction::Revoke { host_nqn, volume } => {
+                    credentials::psks_revoke(&host_nqn, &volume).await
                 }
                 NvmetcpPsksAction::Remove { host_nqn } => credentials::psks_remove(&host_nqn).await,
                 NvmetcpPsksAction::Disable { host_nqn } => {

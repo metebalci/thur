@@ -28,6 +28,11 @@ pub struct AdminCommand<'a> {
     /// Caller-supplied capacity for the data-in payload. The handler
     /// returns at most this many bytes.
     pub data_in_max: u32,
+    /// Per-connection admission set (volume names this hostnqn is
+    /// admitted to). `None` = no fence (legacy / no PSK admission
+    /// entry). Resolved at Fabrics Connect from
+    /// `nvmetcp-psks.json::PskEntry.volumes`.
+    pub session_volumes: Option<&'a [String]>,
 }
 
 /// I/O command coming in on a non-zero queue (qid > 0). Same shape
@@ -38,6 +43,8 @@ pub struct IoCommand<'a> {
     pub sqe: Sqe,
     pub data_out: Option<&'a [u8]>,
     pub data_in_max: u32,
+    /// See `AdminCommand::session_volumes`.
+    pub session_volumes: Option<&'a [String]>,
 }
 
 /// Handler reply. The CQE is always present; the data-in payload
@@ -117,6 +124,7 @@ mod tests {
             sqe: sqe_with_cid(cid),
             data_out: None,
             data_in_max: 0,
+            session_volumes: None,
         }
     }
 

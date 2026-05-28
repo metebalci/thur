@@ -31,7 +31,8 @@ impl IscsiUsersState for AdminState {
 }
 
 pub use shared_admin_iscsi::{
-    AddRequest, ApiError, ListResponse, NameOnlyRequest, RotateRequest, UserRow,
+    AddRequest, ApiError, GrantRequest, ListResponse, NameOnlyRequest, RevokeRequest,
+    RotateRequest, UserRow,
 };
 
 pub async fn list(
@@ -46,7 +47,66 @@ pub async fn add(
     peer: shared_admin_server::PeerCred,
     body: axum::Json<AddRequest>,
 ) -> Result<(axum::http::StatusCode, axum::Json<UserRow>), ApiError> {
+    // VSA-mandatory: every CHAP user must declare an admission set.
+    // Empty / missing `volumes` is refused at the wire — pairs with
+    // clap's `required=true` on the CLI side and the daemon-startup
+    // filter that drops legacy entries without volumes.
+    let names = body
+        .volumes
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("at least one --volume required"))?;
+    if names.is_empty() {
+        return Err(ApiError::bad_request("at least one --volume required"));
+    }
+    validate_admitted_volumes(&state.registry, names)?;
     shared_admin_iscsi::add::<AdminState>(state, peer, body).await
+}
+
+pub async fn grant(
+    state: axum::extract::State<AdminState>,
+    peer: shared_admin_server::PeerCred,
+    body: axum::Json<GrantRequest>,
+) -> Result<(axum::http::StatusCode, axum::Json<UserRow>), ApiError> {
+    validate_admitted_volumes(&state.registry, &body.volumes)?;
+    shared_admin_iscsi::grant::<AdminState>(state, peer, body).await
+}
+
+pub async fn revoke(
+    state: axum::extract::State<AdminState>,
+    peer: shared_admin_server::PeerCred,
+    body: axum::Json<RevokeRequest>,
+) -> Result<(axum::http::StatusCode, axum::Json<UserRow>), ApiError> {
+    // No volume-exists check on revoke — we want operators to be
+    // able to revoke names of volumes that have since been destroyed
+    // (dangling admission entries). The shared handler validates
+    // that the resulting set is non-empty.
+    shared_admin_iscsi::revoke::<AdminState>(state, peer, body).await
+}
+
+/// VSA-only pre-flight check: every volume name in the admission
+/// list must currently resolve to a registered volume. Rejecting
+/// unknown names at add / grant time keeps `iscsi-users.json` from
+/// accumulating dead admission entries that point at typos. The
+/// daemon's VolumeRegistry is the source of truth, so volumes
+/// created later that match a previously-rejected name simply
+/// require the operator to re-issue the verb.
+fn validate_admitted_volumes(
+    registry: &std::sync::Arc<crate::registry::VolumeRegistry>,
+    names: &[String],
+) -> Result<(), ApiError> {
+    let mut unknown = Vec::new();
+    for n in names {
+        if registry.get_by_name(n).is_none() {
+            unknown.push(n.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown volume name(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 pub async fn remove(
