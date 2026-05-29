@@ -1026,20 +1026,42 @@ impl ObjectStoreBackend for S3Backend {
     async fn get_object_legal_hold(&self, key: &str) -> Result<bool> {
         use aws_sdk_s3::types::ObjectLockLegalHoldStatus;
         let full_key = self.full_key(key);
-        let resp = self
+        let resp = match self
             .client
             .get_object_legal_hold()
             .bucket(&self.bucket)
             .key(&full_key)
             .send()
             .await
-            .map_err(|e| {
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // "Not held" can surface as an error from S3 in two
+                // shapes, both meaning the object carries no legal hold:
+                //   - NoSuchObjectLockConfiguration — the object has never
+                //     had a hold applied (bucket has Object Lock on).
+                //   - "Bucket is missing Object Lock Configuration"
+                //     (InvalidRequest) — the bucket has no Object Lock at
+                //     all, so nothing on it can be held.
+                // Map both to false rather than a hard error, mirroring
+                // lock_state()'s handling of the bucket-level sibling.
+                // Without this, never-held objects read as errors and
+                // tiering skips them / migrate refuses them — breaking the
+                // common case on real S3 buckets.
+                let msg = format!("{:?}", e);
+                if msg.contains("NoSuchObjectLockConfiguration")
+                    || msg.contains("does not have a ObjectLock configuration")
+                    || msg.contains("Bucket is missing Object Lock Configuration")
+                {
+                    return Ok(false);
+                }
                 let detail = describe_sdk_error("get_object_legal_hold", &e);
-                ObjectStoreError::classified(
+                return Err(ObjectStoreError::classified(
                     classify_s3_sdk_error(&e),
                     format!("{detail} (bucket: {}, key: {})", self.bucket, full_key),
-                )
-            })?;
+                ));
+            }
+        };
         Ok(matches!(
             resp.legal_hold().and_then(|lh| lh.status()),
             Some(ObjectLockLegalHoldStatus::On)
@@ -1646,6 +1668,58 @@ mod tests {
         assert_eq!(
             backend.lock_state().await.expect("lock state"),
             crate::object_store_backend::LockState::Off
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_get_object_legal_hold_false_when_never_held() {
+        let server = MockServer::start().await;
+        // GetObjectLegalHold on an object that has never had a hold
+        // applied returns NoSuchObjectLockConfiguration; the backend
+        // maps that to "not held" rather than erroring.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(xml_error(
+                        "NoSuchObjectLockConfiguration",
+                        "The specified object does not have a ObjectLock configuration",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert!(
+            !backend
+                .get_object_legal_hold("manifests/T1/manifest-latest.json")
+                .await
+                .expect("never-held object reads as not-held, not an error")
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_get_object_legal_hold_false_when_bucket_has_no_object_lock() {
+        let server = MockServer::start().await;
+        // GetObjectLegalHold against a bucket without Object Lock at all
+        // returns InvalidRequest / "Bucket is missing Object Lock
+        // Configuration"; the backend maps that to "not held".
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(xml_error(
+                        "InvalidRequest",
+                        "Bucket is missing Object Lock Configuration",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let backend = mock_s3_backend(&server).await;
+        assert!(
+            !backend
+                .get_object_legal_hold("manifests/T1/manifest-latest.json")
+                .await
+                .expect("object on a non-Object-Lock bucket reads as not-held")
         );
     }
 
