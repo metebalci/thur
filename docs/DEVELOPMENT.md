@@ -54,5 +54,76 @@ in the YAML. All non-real-backend tests (`test-smoke.sh`,
 `test-fs.sh`) run against an
 inline local backend and need no `private/` setup.
 
+### S3 IAM policy (AWS)
+
+The S3-backed tests all run as one IAM principal (the `AWS_*` creds
+above). The daemon and the test scripts together touch a small, fixed
+set of S3 operations; the policy below is the complete least-privilege
+set. Scope the resource ARNs to whichever bucket(s) your
+`private/storage-backends.yaml` points at — one `…:::bucket` ARN for the
+bucket-level actions and one `…:::bucket/*` for the object-level ones.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ThurTestsBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:GetBucketObjectLockConfiguration"
+      ],
+      "Resource": ["arn:aws:s3:::your-test-bucket"]
+    },
+    {
+      "Sid": "ThurTestsObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:GetObjectLegalHold",
+        "s3:PutObjectLegalHold",
+        "s3:BypassGovernanceRetention"
+      ],
+      "Resource": ["arn:aws:s3:::your-test-bucket/*"]
+    }
+  ]
+}
+```
+
+What each action is for:
+
+| Action | Level | Needed by |
+|--------|-------|-----------|
+| `s3:ListBucket` | bucket | the daemon's `list_objects` (manifest assembly, `cloud check`) and the scripts' `aws s3 ls` assertions. Also authorizes `HeadBucket`, which `verify_storage_creds` uses as a pre-flight (there is no separate `s3:HeadBucket` action). |
+| `s3:GetBucketObjectLockConfiguration` | bucket | the daemon probes each backend's Object-Lock state at startup to validate `retention_mode` — on every S3 backend, regardless of mode. |
+| `s3:GetObject` | object | `download_chunk` / `download_manifest`, the `chunk_exists` `HeadObject` probe (HeadObject is authorized by `s3:GetObject`, not a distinct action), and the scripts' `aws s3 cp` ciphertext checks. |
+| `s3:PutObject` | object | chunk and manifest uploads. |
+| `s3:DeleteObject` | object | GC / eviction, the `cloud check` data-plane probe, and the scripts' `aws s3 rm` prefix cleanup. |
+| `s3:GetObjectLegalHold` | object | read at **cartridge load** (the daemon snapshots hold state from the cloud sentinel) and by `system tiering plan` / `run-now` — so it's needed by any test that loads a cartridge off S3, not just the legal-hold tests. |
+| `s3:PutObjectLegalHold` | object | `cartridge legal-hold set` / `clear`. |
+| `s3:ListBucketVersions`, `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` | bucket / object / object | **cleanup only** — not used by the daemon or the test scripts. They let you purge leftover objects from an Object-Lock (governance) test bucket before the default retention window expires (a versioned `aws s3 rm` only writes delete-markers; the locked versions need a version-targeted delete with governance bypass). Drop them if you never test against a governance/compliance bucket. Note: `BypassGovernanceRetention` only overrides GOVERNANCE mode — COMPLIANCE-locked objects cannot be bypassed by anyone until expiry.
+
+Deliberately **not** in the policy, because the backend never calls them:
+multipart upload (`s3:AbortMultipartUpload` and friends — each chunk is a
+single `PutObject`), `s3:CopyObject`, object tagging, presigned URLs, and
+per-object retention (`s3:GetObjectRetention` / `s3:PutObjectRetention` —
+WORM rides the bucket's *default* retention rule, set out of band, not a
+per-object retention call).
+
+The Object-Lock and legal-hold actions only bite on buckets that actually
+have Object Lock enabled, but `s3:GetBucketObjectLockConfiguration` and
+`s3:GetObjectLegalHold` are still needed against a plain
+`retention_mode: none` bucket — the startup lock probe runs everywhere
+(and reads back "off"), and the cartridge-load hold read runs on every
+load (and reads back "not held"). GCS and Azure backends authorize through
+their own IAM / RBAC rather than this JSON; grant the equivalent object
+read/write/delete there, plus the object-lock / legal-hold roles if you
+run the hold tests against them.
+
 The release-cut process is in [`RELEASING.md`](RELEASING.md); the
 workspace crate map is in [`WORKSPACE.md`](WORKSPACE.md).
