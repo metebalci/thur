@@ -135,6 +135,10 @@ async fn run_one_task(
                     "upload worker: backend '{}' unknown (volume='{}' page={}); leaving LocalOnly",
                     task.payload.backend_name, task.volume_name, task.payload.item_id
                 );
+                shared_telemetry::record::chunk_upload_stranded(
+                    &task.payload.backend_name,
+                    "backend_unknown",
+                );
                 return;
             }
         }
@@ -145,6 +149,10 @@ async fn run_one_task(
             warn!(
                 "upload worker: volume '{}' unknown in registry (page={}); leaving LocalOnly",
                 task.volume_name, task.payload.item_id
+            );
+            shared_telemetry::record::chunk_upload_stranded(
+                &task.payload.backend_name,
+                "entity_unknown",
             );
             return;
         }

@@ -168,21 +168,33 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     // (via the trait's `clone_box`); cheap by design — the
     // expensive work was the auth/network round-trip during init.
     let backend = {
-        let mut reg = backends.lock().await;
-        if !reg.contains_key(&next.backend_name) {
-            let b = storage_config
-                .create_backend_named(&next.backend_name)
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "init backend '{}' for read prefetch: {}",
-                        next.backend_name,
-                        e
-                    )
-                })?;
-            reg.insert(next.backend_name.clone(), b);
+        // Fast path: backend already initialized. Take a clone under a
+        // short critical section and release the lock immediately.
+        let existing = backends.lock().await.get(&next.backend_name).cloned();
+        match existing {
+            Some(b) => b,
+            None => {
+                // Slow path: run the auth/network round-trip with NO lock
+                // held, then re-lock to insert. Holding the registry Mutex
+                // across `create_backend_named().await` would serialize every
+                // concurrent op behind the first cache-miss init of any
+                // backend.
+                let b = storage_config
+                    .create_backend_named(&next.backend_name)
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "init backend '{}' for read prefetch: {}",
+                            next.backend_name,
+                            e
+                        )
+                    })?;
+                // Double-check: another task may have inserted while we were
+                // initializing. Keep whichever entry won and drop our extra.
+                let mut reg = backends.lock().await;
+                reg.entry(next.backend_name.clone()).or_insert(b).clone()
+            }
         }
-        reg.get(&next.backend_name).expect("just inserted").clone()
     };
 
     let object_key = next.object_key.clone();
@@ -243,23 +255,30 @@ pub(crate) async fn read_legal_hold_at_load(
     barcode: &str,
 ) -> bool {
     let backend = {
-        let mut reg = backends.lock().await;
-        if !reg.contains_key(backend_name) {
-            match storage_config.create_backend_named(backend_name).await {
-                Ok(b) => {
-                    reg.insert(backend_name.to_string(), b);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "iSCSI legal-hold post-hook: backend '{}' init failed ({}) - treating as not held",
-                        backend_name,
-                        e
-                    );
-                    return false;
+        // Fast path: backend already initialized. Short critical section.
+        let existing = backends.lock().await.get(backend_name).cloned();
+        match existing {
+            Some(b) => b,
+            None => {
+                // Slow path: init with NO lock held (the auth/network
+                // round-trip must not serialize concurrent loads), then
+                // re-lock to insert with a double-check.
+                match storage_config.create_backend_named(backend_name).await {
+                    Ok(b) => {
+                        let mut reg = backends.lock().await;
+                        reg.entry(backend_name.to_string()).or_insert(b).clone()
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "iSCSI legal-hold post-hook: backend '{}' init failed ({}) - treating as not held",
+                            backend_name,
+                            e
+                        );
+                        return false;
+                    }
                 }
             }
         }
-        reg.get(backend_name).expect("just inserted").clone()
     };
     if !backend.supports_legal_hold() {
         return false;

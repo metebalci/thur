@@ -192,7 +192,7 @@ impl MemoryBufferManager {
                     );
                     let tape_ids: Vec<String> = self.tapes.keys().cloned().collect();
                     for tape_id in tape_ids {
-                        self.trigger_upload_batch(&tape_id).await;
+                        self.trigger_upload_batch(&tape_id);
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -261,16 +261,11 @@ impl MemoryBufferManager {
             .unwrap_or(false);
         if has_pending {
             info!("Flushing pending uploads for {} before unload", tape_id);
-            // Loop until empty: trigger_upload_batch caps at MAX_BATCH_SIZE
-            // per call, so a tape with more than that many queued chunks
-            // would otherwise leave bytes stranded after this final flush.
-            while self
-                .tapes
-                .get(tape_id)
-                .is_some_and(|t| !t.pending_uploads.is_empty())
-            {
-                self.trigger_upload_batch(tape_id).await;
-            }
+            // Blocking drain: dispatch every pending chunk (batched at
+            // UPLOAD_MAX_BATCH_SIZE) before the per-load state is
+            // cleared below. The unload path can afford to block on a
+            // full worker queue; the steady-state path cannot.
+            self.flush_all_pending(tape_id).await;
         }
         // Reset volatile per-load state. write_buffer_usage and the
         // chunk_bytes side map are bookkeeping, not durability — the
@@ -325,7 +320,7 @@ impl MemoryBufferManager {
                 "Write buffer full for {}: {} / {} bytes ({} pending uploads)",
                 tape_id, usage, limit, pending
             );
-            self.trigger_upload_batch(tape_id).await;
+            self.trigger_upload_batch(tape_id);
         }
     }
 
@@ -367,7 +362,7 @@ impl MemoryBufferManager {
                 "Sequential read detected for {}: chunk {}",
                 tape_id, chunk_id
             );
-            self.trigger_prefetch(tape_id, chunk_id + 1).await;
+            self.trigger_prefetch(tape_id, chunk_id + 1);
         }
 
         // Trigger eviction if read buffer full
@@ -433,77 +428,131 @@ impl MemoryBufferManager {
 
     /// Trigger upload batch for a tape (Phase 4: Event-Driven Uploads)
     ///
-    /// Selects up to `MAX_BATCH_SIZE` of the oldest pending chunks,
-    /// dispatches them to the upload worker, and decrements the
-    /// per-tape write-buffer accounting by their byte total. The
-    /// dispatched chunk IDs are removed from `pending_uploads` so
-    /// the next BlockWritten doesn't re-fire on the same set.
-    /// `send().await` propagates upload-worker backpressure all the
-    /// way back to the broadcast bus, instead of `try_send` silently
-    /// dropping the request when the mpsc is full.
-    async fn trigger_upload_batch(&mut self, tape_id: &str) {
-        const MAX_BATCH_SIZE: usize = 8;
-
-        let (chunk_ids, dispatched_bytes) = {
-            let Some(tape) = self.tapes.get_mut(tape_id) else {
-                return;
-            };
-            if tape.pending_uploads.is_empty() {
-                return;
-            }
-            let mut chunk_ids: Vec<u32> = tape.pending_uploads.iter().copied().collect();
-            chunk_ids.sort_unstable();
-            if chunk_ids.len() > MAX_BATCH_SIZE {
-                chunk_ids.truncate(MAX_BATCH_SIZE);
-            }
-            // Pull dispatched chunks out of the pending state. The
-            // upload worker owns chunk durability after this point
-            // (see `chunks.idx`'s `uploaded` flag + HEAD-skip on
-            // retry); a dispatched-then-failed chunk shows up again
-            // on the next event-driven trigger via
-            // `force_pending_uploads`-style scans. For now we accept
-            // the fire-and-forget semantics already in place.
-            let mut dispatched_bytes: u64 = 0;
-            for cid in &chunk_ids {
-                tape.pending_uploads.remove(cid);
-                if let Some(b) = tape.chunk_bytes.remove(cid) {
-                    dispatched_bytes = dispatched_bytes.saturating_add(b);
-                }
-            }
-            tape.write_buffer_usage = tape.write_buffer_usage.saturating_sub(dispatched_bytes);
-            (chunk_ids, dispatched_bytes)
+    /// Selects up to `MAX_BATCH_SIZE` of the oldest pending chunks and
+    /// **non-blockingly** enqueues them to the upload worker. The
+    /// dispatched chunk IDs are removed from `pending_uploads` (and
+    /// their bytes decremented from the per-tape write-buffer
+    /// accounting) *only* once the request is accepted by the worker's
+    /// queue.
+    ///
+    /// Decoupled from upload-worker backpressure on purpose: this runs
+    /// on the broadcast event-ingestion path, so blocking on a full
+    /// `upload_tx` (the previous `send().await`) would stall
+    /// `event_rx.recv()` until the broadcast ring overflowed
+    /// (`RecvError::Lagged`), dropping `BlockWritten` events and
+    /// permanently undercounting buffered bytes. Instead, a full queue
+    /// leaves the chunks pending for the next event / upload-completion
+    /// tick to retry; host-write backpressure is still applied upstream
+    /// via the per-tape write-buffer limit (chunks that don't dispatch
+    /// keep `write_buffer_usage` high).
+    fn trigger_upload_batch(&mut self, tape_id: &str) {
+        let chunk_ids = self.select_upload_batch(tape_id);
+        if chunk_ids.is_empty() {
+            return;
+        }
+        let request = UploadRequest {
+            tape_id: tape_id.to_string(),
+            chunk_ids: chunk_ids.clone(),
         };
+        match self.upload_tx.try_send(request) {
+            // Accepted — commit the pending removal + byte accounting.
+            // The upload worker owns chunk durability from here
+            // (`chunks.idx`'s `uploaded` flag + HEAD-skip on retry); a
+            // dispatched-then-failed chunk reappears on a later trigger
+            // via the crash-recovery scan.
+            Ok(()) => self.commit_upload_dispatch(tape_id, &chunk_ids),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Worker saturated; leave the chunks pending and retry
+                // on the next tick. No bus blocking, no byte drift.
+                debug!(
+                    "Upload worker queue full for {}; {} chunks stay pending (retry next tick)",
+                    tape_id,
+                    chunk_ids.len()
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    "Failed to send upload request for {} (upload channel closed)",
+                    tape_id
+                );
+            }
+        }
+    }
 
+    /// Maximum chunks dispatched to the upload worker per request.
+    const UPLOAD_MAX_BATCH_SIZE: usize = 8;
+
+    /// Pick up to [`Self::UPLOAD_MAX_BATCH_SIZE`] of the oldest pending
+    /// chunk ids for `tape_id` *without* mutating state. The caller
+    /// commits the removal via [`Self::commit_upload_dispatch`] only
+    /// once the corresponding request is actually accepted by the
+    /// upload worker, so a rejected (queue-full) enqueue leaves the
+    /// pending set untouched.
+    fn select_upload_batch(&self, tape_id: &str) -> Vec<u32> {
+        let Some(tape) = self.tapes.get(tape_id) else {
+            return Vec::new();
+        };
+        let mut chunk_ids: Vec<u32> = tape.pending_uploads.iter().copied().collect();
+        chunk_ids.sort_unstable();
+        chunk_ids.truncate(Self::UPLOAD_MAX_BATCH_SIZE);
+        chunk_ids
+    }
+
+    /// Remove a dispatched batch from `pending_uploads` and decrement
+    /// the per-tape write-buffer accounting by its byte total. Called
+    /// only after the request was accepted by the upload worker.
+    fn commit_upload_dispatch(&mut self, tape_id: &str, chunk_ids: &[u32]) {
+        let Some(tape) = self.tapes.get_mut(tape_id) else {
+            return;
+        };
+        let mut dispatched_bytes: u64 = 0;
+        for cid in chunk_ids {
+            tape.pending_uploads.remove(cid);
+            if let Some(b) = tape.chunk_bytes.remove(cid) {
+                dispatched_bytes = dispatched_bytes.saturating_add(b);
+            }
+        }
+        tape.write_buffer_usage = tape.write_buffer_usage.saturating_sub(dispatched_bytes);
         info!(
-            "Triggering upload batch for {}: {} chunks ({} bytes), write_buffer_usage now {}",
+            "Dispatched upload batch for {}: {} chunks ({} bytes), write_buffer_usage now {}",
             tape_id,
             chunk_ids.len(),
             dispatched_bytes,
-            self.tapes
-                .get(tape_id)
-                .map(|t| t.write_buffer_usage)
-                .unwrap_or(0)
+            tape.write_buffer_usage,
         );
+    }
 
-        let request = UploadRequest {
-            tape_id: tape_id.to_string(),
-            chunk_ids,
-        };
-
-        // Bounded send — applies backpressure when the upload worker
-        // is saturated. A full mpsc here means the worker is the
-        // bottleneck; blocking the manager (and ultimately lagging
-        // the broadcast bus) is the correct backpressure path.
-        if let Err(e) = self.upload_tx.send(request).await {
-            warn!(
-                "Failed to send upload request for {} (channel closed): {}",
-                tape_id, e
-            );
+    /// Blocking drain used only on the cartridge-unload path: dispatch
+    /// every pending chunk to the worker before the per-load state is
+    /// cleared. Blocking `send().await` is acceptable here — unload is
+    /// a rare, explicit event, and we must not strand a tape's tail
+    /// behind a full queue right before forgetting its pending set. The
+    /// hot `BlockWritten` path uses the non-blocking
+    /// [`Self::trigger_upload_batch`] instead.
+    async fn flush_all_pending(&mut self, tape_id: &str) {
+        loop {
+            let chunk_ids = self.select_upload_batch(tape_id);
+            if chunk_ids.is_empty() {
+                break;
+            }
+            let request = UploadRequest {
+                tape_id: tape_id.to_string(),
+                chunk_ids: chunk_ids.clone(),
+            };
+            if self.upload_tx.send(request).await.is_err() {
+                warn!(
+                    "Upload channel closed during unload flush for {} ({} chunks stranded)",
+                    tape_id,
+                    chunk_ids.len()
+                );
+                break;
+            }
+            self.commit_upload_dispatch(tape_id, &chunk_ids);
         }
     }
 
     /// Trigger prefetch for a tape (Phase 5: Event-Driven Prefetch)
-    async fn trigger_prefetch(&mut self, tape_id: &str, start_chunk_id: u32) {
+    fn trigger_prefetch(&mut self, tape_id: &str, start_chunk_id: u32) {
         let needs_prefetch: Vec<u32> = {
             let Some(tape) = self.tapes.get(tape_id) else {
                 return;
@@ -529,12 +578,24 @@ impl MemoryBufferManager {
             chunk_ids: needs_prefetch,
         };
 
-        // Bounded send — same rationale as trigger_upload_batch.
-        if let Err(e) = self.prefetch_tx.send(request).await {
-            warn!(
-                "Failed to send prefetch request for {} (channel closed): {}",
-                tape_id, e
-            );
+        // Non-blocking, like `trigger_upload_batch`: this runs on the
+        // broadcast event-ingestion path, so it must not park and lag
+        // the bus. Prefetch is best-effort read-ahead — a full queue
+        // just drops this hint and the read path fetches on miss.
+        match self.prefetch_tx.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    "Prefetch queue full for {}; dropping read-ahead hint",
+                    tape_id
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    "Failed to send prefetch request for {} (prefetch channel closed)",
+                    tape_id
+                );
+            }
         }
     }
 
@@ -662,7 +723,7 @@ mod tests {
         for cid in 0..3u32 {
             mgr.on_block_written("T1", cid, cid as u64, 1000).await;
         }
-        mgr.trigger_upload_batch("T1").await;
+        mgr.trigger_upload_batch("T1");
         let req = upload_rx.try_recv().expect("upload request dispatched");
         assert_eq!(req.tape_id, "T1");
         assert_eq!(req.chunk_ids, vec![0, 1, 2]);
@@ -677,7 +738,7 @@ mod tests {
         for cid in 0..12u32 {
             mgr.on_block_written("T1", cid, cid as u64, 100).await;
         }
-        mgr.trigger_upload_batch("T1").await;
+        mgr.trigger_upload_batch("T1");
         let req = upload_rx.try_recv().expect("upload request dispatched");
         // MAX_BATCH_SIZE is 8 — the oldest 8 chunk ids go first.
         assert_eq!(req.chunk_ids.len(), 8);
@@ -689,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_upload_batch_noop_for_unknown_tape() {
         let (mut mgr, mut upload_rx, _p) = make_manager();
-        mgr.trigger_upload_batch("ghost").await;
+        mgr.trigger_upload_batch("ghost");
         assert!(upload_rx.try_recv().is_err());
     }
 

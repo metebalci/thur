@@ -342,6 +342,12 @@ struct TelemetryInner {
     chunk_storage_cache_hits_total: Counter<u64>,
     chunk_storage_cache_inflight_coalesced_total: Counter<u64>,
     chunk_storage_cache_warmup_seeded_total: Counter<u64>,
+    /// Pages/chunks left `LocalOnly` because the async upload worker
+    /// could not resolve a backend or owning entity. Labeled
+    /// `reason ∈ {backend_unknown, entity_unknown}`. A non-zero rate
+    /// means uploads are silently stranded until the next write or the
+    /// daemon-restart recovery scan re-enqueues them.
+    chunk_upload_stranded_total: Counter<u64>,
 
     // ── iSCSI ──
     iscsi_sessions_active: Gauge<i64>,
@@ -686,6 +692,20 @@ impl Telemetry {
             .add(n, &[KeyValue::new("backend", backend.to_string())]);
     }
 
+    /// One increment each time the async upload worker strands a
+    /// page/chunk `LocalOnly` because it could not resolve a backend
+    /// (`reason="backend_unknown"`) or the owning entity
+    /// (`reason="entity_unknown"`).
+    pub fn chunk_inc_upload_stranded(&self, backend: &str, reason: &str) {
+        self.inner.chunk_upload_stranded_total.add(
+            1,
+            &[
+                KeyValue::new("backend", backend.to_string()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+    }
+
     /// iSCSI session counter (UpDownCounter via Gauge<i64>).
     pub fn iscsi_set_sessions_active(&self, n: i64) {
         self.inner.iscsi_sessions_active.record(n, &[]);
@@ -933,6 +953,12 @@ impl TelemetryInner {
                 .u64_counter(name("chunk_storage_cache_warmup_seeded_total"))
                 .with_description(
                     "Cache entries seeded from a LIST at boot / first registry insertion",
+                )
+                .build(),
+            chunk_upload_stranded_total: meter
+                .u64_counter(name("chunk_upload_stranded_total"))
+                .with_description(
+                    "Pages/chunks left LocalOnly because the upload worker could not resolve a backend or owning entity",
                 )
                 .build(),
 
@@ -1257,6 +1283,11 @@ pub mod record {
     pub fn chunk_storage_cache_warmup_seeded(backend: &str, n: u64) {
         if let Some(t) = global() {
             t.chunk_add_storage_cache_warmup_seeded(backend, n);
+        }
+    }
+    pub fn chunk_upload_stranded(backend: &str, reason: &str) {
+        if let Some(t) = global() {
+            t.chunk_inc_upload_stranded(backend, reason);
         }
     }
     pub fn iscsi_sessions_active(n: i64) {

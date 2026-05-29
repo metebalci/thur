@@ -238,14 +238,12 @@ impl IscsiUsersFile {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let parsed: Self = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).map_err(|e| {
-                IscsiError::InvalidOp(Box::leak(
-                    format!("failed to parse iscsi-users.json: {e}").into_boxed_str(),
-                ))
+                IscsiError::InvalidConfig(format!("failed to parse iscsi-users.json: {e}"))
             })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
-                return Err(IscsiError::InvalidOp(Box::leak(
-                    format!("I/O error on iscsi-users.json: {e}").into_boxed_str(),
+                return Err(IscsiError::InvalidConfig(format!(
+                    "I/O error on iscsi-users.json: {e}"
                 )));
             }
         };
@@ -264,31 +262,21 @@ impl IscsiUsersFile {
     /// Write to disk via atomic rename. Mode 0640 on Unix.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let body = serde_json::to_string_pretty(self).map_err(|e| {
-            IscsiError::InvalidOp(Box::leak(
-                format!("failed to serialize iscsi-users.json: {e}").into_boxed_str(),
-            ))
+            IscsiError::InvalidConfig(format!("failed to serialize iscsi-users.json: {e}"))
         })?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, body).map_err(|e| {
-            IscsiError::InvalidOp(Box::leak(
-                format!("I/O error writing iscsi-users.json: {e}").into_boxed_str(),
-            ))
+            IscsiError::InvalidConfig(format!("I/O error writing iscsi-users.json: {e}"))
         })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640)).map_err(
-                |e| {
-                    IscsiError::InvalidOp(Box::leak(
-                        format!("chmod failed on iscsi-users.json: {e}").into_boxed_str(),
-                    ))
-                },
+                |e| IscsiError::InvalidConfig(format!("chmod failed on iscsi-users.json: {e}")),
             )?;
         }
         std::fs::rename(&tmp, path).map_err(|e| {
-            IscsiError::InvalidOp(Box::leak(
-                format!("rename failed on iscsi-users.json: {e}").into_boxed_str(),
-            ))
+            IscsiError::InvalidConfig(format!("rename failed on iscsi-users.json: {e}"))
         })?;
         Ok(())
     }

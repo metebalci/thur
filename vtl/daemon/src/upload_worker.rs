@@ -171,9 +171,14 @@ async fn resolve_backend<'a>(
                 // the backend the registry holds. Non-blocking — a
                 // LIST failure leaves the cache cold; next write does
                 // a real HEAD/PUT.
+                //
+                // Best-effort by design: the result handle is observed by
+                // a tiny supervisor (below) only so an unexpected *panic*
+                // in `warmup_prefix` is logged rather than silently lost.
+                // A cold cache is always safe to fall back to.
                 let warmup: Box<dyn ObjectStoreBackend> = b.clone();
                 let warmup_name = backend_name.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     match warmup.warmup_prefix("chunks/").await {
                         Ok(n) => tracing::info!(
                             "cloud cache warmup: seeded {} chunks/ keys for backend '{}'",
@@ -184,6 +189,17 @@ async fn resolve_backend<'a>(
                             "cloud cache warmup failed for backend '{}': {} (continuing with cold cache)",
                             warmup_name, e
                         ),
+                    }
+                });
+                let observe_name = backend_name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await
+                        && e.is_panic()
+                    {
+                        warn!(
+                            "cloud cache warmup task for backend '{}' panicked: {} (continuing with cold cache)",
+                            observe_name, e
+                        );
                     }
                 });
                 registry.insert(backend_name.clone(), b);

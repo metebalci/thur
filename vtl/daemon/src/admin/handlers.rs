@@ -71,7 +71,11 @@ impl shared_admin_monitor::MonitorState for AdminState {
     }
     fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
         let (cartridges_loaded, cartridges_total, drives_busy, drives_total) = {
-            let lib = self.daemon.library.lock().expect("library mutex poisoned");
+            let lib = self
+                .daemon
+                .library
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let storage_occupied = lib.storage_slots().iter().filter(|s| s.occupied).count();
             let mail_occupied = lib.mail_slots().iter().filter(|s| s.occupied).count();
             let drives_occupied = lib.drives().iter().filter(|d| d.occupied).count();
@@ -146,7 +150,11 @@ pub async fn library_info(
     // Snapshot topology + (optionally) every barcode under the lock,
     // then release it before any file IO.
     let (storage_slots, mail_slots, drives, lto_generation, firmware, partitions, barcodes) = {
-        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let barcodes: Vec<String> = if q.with_cartridges {
             let mut v: Vec<String> = Vec::new();
             v.extend(lib.storage_slots().iter().filter_map(|s| s.barcode.clone()));
@@ -219,7 +227,11 @@ pub async fn library_info(
 /// the YAML `library:` block.
 pub async fn library_bounds(State(state): State<AdminState>) -> impl IntoResponse {
     let bounds = {
-        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         core_mediachanger::library::reconcile::compute_bounds(&lib)
     };
     Json(bounds)
@@ -260,7 +272,11 @@ pub async fn cartridges_list(
     State(state): State<AdminState>,
     Query(q): Query<CartridgesQuery>,
 ) -> impl IntoResponse {
-    let lib = state.daemon.library.lock().expect("library mutex poisoned");
+    let lib = state
+        .daemon
+        .library
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     let pattern = q.filter.as_deref();
 
@@ -340,7 +356,11 @@ pub async fn cartridge_info(
     // Resolve identifier (barcode or numeric slot ID) to a canonical
     // barcode + location while holding the library lock briefly.
     let resolved = {
-        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut found: Option<(String, CartridgeLocation, u32)> = None;
 
         // Match by barcode first.
@@ -2147,7 +2167,11 @@ pub async fn changer_inventory(
     State(state): State<AdminState>,
     Query(q): Query<CartridgesQuery>,
 ) -> impl IntoResponse {
-    let lib = state.daemon.library.lock().expect("library mutex poisoned");
+    let lib = state
+        .daemon
+        .library
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let pattern = q.filter.as_deref();
     let mut entries = Vec::new();
 
@@ -2211,7 +2235,11 @@ pub async fn drives_list(State(state): State<AdminState>) -> impl IntoResponse {
     // Snapshot drive metadata (lock-then-collect, so we don't hold
     // the library lock across the per-drive manifest reads below).
     let snapshots: Vec<(u32, bool, Option<String>, Option<u16>)> = {
-        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         lib.drives()
             .iter()
             .map(|d| (d.id, d.occupied, d.barcode.clone(), d.home_slot))
@@ -2240,7 +2268,11 @@ pub async fn drive_status(
     AxumPath(id): AxumPath<u32>,
 ) -> impl IntoResponse {
     let snapshot = {
-        let lib = state.daemon.library.lock().expect("library mutex poisoned");
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         lib.get_drive(id)
             .map(|d| (d.id, d.occupied, d.barcode.clone(), d.home_slot))
     };

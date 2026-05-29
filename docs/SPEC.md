@@ -2094,6 +2094,7 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | chunk | `chunk_storage_cache_hits_total` | Counter<u64> | — | `backend` |
 | chunk | `chunk_storage_cache_inflight_coalesced_total` | Counter<u64> | — | `backend` |
 | chunk | `chunk_storage_cache_warmup_seeded_total` | Counter<u64> | — | `backend` |
+| chunk | `chunk_upload_stranded_total` | Counter<u64> | — | `backend`, `reason` |
 | iscsi | `iscsi_sessions_active` | Gauge<i64> | — | — |
 | iscsi | `iscsi_commands_total` | Counter<u64> | — | `opcode`, `outcome` |
 | iscsi | `iscsi_command` | Histogram<f64> | s | `opcode`, `outcome` |
