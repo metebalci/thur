@@ -700,6 +700,16 @@ PROTECTED — WORM MEDIUM"). The per-operation behavior is:
 | WRITE(6/16) at EOD | allowed (append-only) |
 | READ family | allowed |
 
+Cross-backend migration (`cartridge migrate`, `system tiering run-now`)
+of a WORM cartridge requires the target to actually enforce
+immutability. The daemon pre-flight checks the target's YAML-declared
+`retention_mode`, and the migrate primitive then **re-probes the
+target's live `lock_state()` immediately before the manifest-flip
+commit point** — a target that does not report a locked state
+(governance/compliance) is refused there, so a conffile edited out of
+sync with the bucket after boot cannot land a WORM cartridge on a
+non-immutable backend.
+
 ### Legal hold (host-visible write-protect)
 
 Legal hold is anchored in the storage backend, not on the host. The hold state

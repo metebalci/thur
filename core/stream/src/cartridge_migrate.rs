@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
+use shared_object_store::{LockState, ObjectStoreBackend, ObjectStoreError};
 use shared_pool::{ChunkPool, PoolBudget};
 
 use crate::chunk_index::ChunkIndexFile;
@@ -142,6 +142,8 @@ struct ManifestSlice {
     backend: String,
     #[serde(default)]
     dedup: DedupSlice,
+    #[serde(default)]
+    worm: bool,
 }
 
 /// Mirror of the public `DedupScope` enum, narrow on the JSON shape
@@ -182,6 +184,35 @@ fn hold_check_permits(result: std::result::Result<bool, ObjectStoreError>) -> Re
         Ok(false) | Err(ObjectStoreError::NotSupported(_)) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Decide whether a WORM cartridge may commit to a target with the
+/// given live lock state. A WORM cartridge requires the target bucket
+/// to actually enforce immutability; a non-WORM cartridge is
+/// unconstrained.
+fn worm_lock_permits(is_worm: bool, state: LockState) -> Result<()> {
+    if is_worm && !state.is_locked() {
+        return Err(SmcError::InvalidOp(
+            "WORM cartridge target backend is not lock-enabled \
+             (live lock_state=off); refusing migration",
+        ));
+    }
+    Ok(())
+}
+
+/// Re-probe the target backend's *live* lock state immediately before
+/// the commit point and refuse a WORM cartridge whose target does not
+/// actually enforce immutability. The daemon's pre-flight gate checks
+/// the YAML-declared `retention_mode`, which a scheduler — or an
+/// operator who edited the conffile after boot — can drift out of sync
+/// with the bucket; this is the authoritative check against the bucket
+/// itself. No-op (no cloud call) for non-WORM cartridges.
+async fn verify_worm_target_lock(target: &dyn ObjectStoreBackend, is_worm: bool) -> Result<()> {
+    if !is_worm {
+        return Ok(());
+    }
+    let state = target.lock_state().await.map_err(cloud_err)?;
+    worm_lock_permits(is_worm, state)
 }
 
 /// Run a migration. Returns a populated [`MigrateReport`] on success.
@@ -342,7 +373,11 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.target_budget.as_deref(),
             )?;
 
-            // Phase 4: commit point. Flip manifest.backend atomically.
+            // Phase 4: commit point. Re-probe the target's live lock
+            // state for WORM cartridges (authoritative over the
+            // YAML-declared retention mode), then flip manifest.backend
+            // atomically.
+            verify_worm_target_lock(opts.target, slice.worm).await?;
             log("flipping manifest.backend");
             rewrite_manifest_backend(&cart_root, opts.target_name)?;
 
@@ -417,6 +452,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.source_budget.as_deref(),
                 opts.target_budget.as_deref(),
             )?;
+            verify_worm_target_lock(opts.target, slice.worm).await?;
             log("flipping manifest.backend");
             rewrite_manifest_backend(&cart_root, opts.target_name)?;
         }
@@ -620,5 +656,23 @@ mod tests {
         // A transient read failure must NOT be read as "not held".
         let err = hold_check_permits(Err(ObjectStoreError::Network("timeout".into()))).unwrap_err();
         assert!(matches!(err, SmcError::ObjectStoreError(_)));
+    }
+
+    #[test]
+    fn worm_lock_refuses_worm_onto_unlocked_target() {
+        let err = worm_lock_permits(true, LockState::Off).unwrap_err();
+        assert!(matches!(err, SmcError::InvalidOp(m) if m.contains("lock-enabled")));
+    }
+
+    #[test]
+    fn worm_lock_permits_worm_onto_locked_target() {
+        assert!(worm_lock_permits(true, LockState::Governance { default_days: 30 }).is_ok());
+        assert!(worm_lock_permits(true, LockState::Compliance { default_days: 365 }).is_ok());
+    }
+
+    #[test]
+    fn worm_lock_ignores_non_worm_cartridges() {
+        // A non-WORM cartridge is unconstrained by the target's lock state.
+        assert!(worm_lock_permits(false, LockState::Off).is_ok());
     }
 }
