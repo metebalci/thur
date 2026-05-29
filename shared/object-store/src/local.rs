@@ -223,24 +223,15 @@ impl InjectionPlan {
     }
 }
 
-/// Build a `ObjectStoreError::Other(...)` whose message contains a token that
-/// `object_store_config::classify` will deterministically map back to `kind`.
-/// Keeps the synthetic error indistinguishable from a real one as far
-/// as the retry classifier is concerned.
+/// Build the typed `ObjectStoreError` carrier for an injected `kind`, so
+/// the fault-injection backend exercises the exact same structured
+/// classify path the real backends now mint — `classify` maps it straight
+/// back to `kind` (see [`ObjectStoreError::classified`]).
 fn synthetic_error(op: &'static str, key: &str, kind: FailureKind) -> ObjectStoreError {
-    let token = match kind {
-        FailureKind::Auth => "InvalidAccessKeyId",
-        FailureKind::Authz => "AccessDenied",
-        FailureKind::NotFound => "NoSuchBucket",
-        FailureKind::RegionMismatch => "PermanentRedirect",
-        FailureKind::Network => "dispatch failure (io: connection refused)",
-        FailureKind::Timeout => "timed out",
-        FailureKind::Other => "other",
-    };
-    ObjectStoreError::Other(format!(
-        "{token}: synthetic LocalBackend injection ({} on key={key})",
-        op
-    ))
+    ObjectStoreError::classified(
+        kind,
+        format!("synthetic LocalBackend injection ({op} on key={key})"),
+    )
 }
 
 #[async_trait]

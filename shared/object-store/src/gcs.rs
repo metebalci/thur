@@ -678,9 +678,7 @@ mod tests {
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.write_outcomes.lock().expect("queue");
-            g.push(Err(ObjectStoreError::Other(
-                "AccessDenied: forbidden".into(),
-            )));
+            g.push(Err(ObjectStoreError::Authz("forbidden".into())));
         }
         let backend = backend_with(api.clone());
         let err = backend
@@ -688,8 +686,8 @@ mod tests {
             .await
             .expect_err("must fail fast");
         match err {
-            ObjectStoreError::Other(_) => {}
-            other => panic!("expected Other, got {other:?}"),
+            ObjectStoreError::Authz(_) => {}
+            other => panic!("expected Authz, got {other:?}"),
         }
         // Permanent classification → single attempt, no retry burn.
         assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);

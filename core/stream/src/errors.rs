@@ -223,6 +223,11 @@ pub type Result<T> = std::result::Result<T, SmcError>;
 /// pre-extraction variants:
 ///
 /// - `ObjectStoreError::Other(msg)` → `SmcError::ObjectStoreError(msg)`
+/// - the six retry-classification variants (`Auth` / `Authz` / `NotFound`
+///   / `RegionMismatch` / `Network` / `Timeout`) also → `SmcError::ObjectStoreError(msg)`:
+///   they exist to drive the object-store retry loop's fail-fast decision,
+///   not to carry a distinct SCSI-sense meaning, so they collapse to the
+///   generic message variant once they cross into core-mediachanger.
 /// - `ObjectStoreError::PreconditionFailed(msg)` → `SmcError::CloudPreconditionFailed(msg)`
 /// - `ObjectStoreError::Conflict(msg)` → `SmcError::CloudConflict(msg)`
 /// - `ObjectStoreError::NotSupported(msg)` → `SmcError::NotSupported(msg)`
@@ -230,15 +235,20 @@ pub type Result<T> = std::result::Result<T, SmcError>;
 /// - `ObjectStoreError::Io(e)` → `SmcError::Io(e)`
 impl From<shared_object_store::ObjectStoreError> for SmcError {
     fn from(e: shared_object_store::ObjectStoreError) -> Self {
+        use shared_object_store::ObjectStoreError as O;
         match e {
-            shared_object_store::ObjectStoreError::Other(s) => Self::ObjectStoreError(s),
-            shared_object_store::ObjectStoreError::PreconditionFailed(s) => {
-                Self::CloudPreconditionFailed(s)
-            }
-            shared_object_store::ObjectStoreError::Conflict(s) => Self::CloudConflict(s),
-            shared_object_store::ObjectStoreError::NotSupported(s) => Self::NotSupported(s),
-            shared_object_store::ObjectStoreError::Compression(s) => Self::CompressionError(s),
-            shared_object_store::ObjectStoreError::Io(e) => Self::Io(e),
+            O::Other(s)
+            | O::Auth(s)
+            | O::Authz(s)
+            | O::NotFound(s)
+            | O::RegionMismatch(s)
+            | O::Network(s)
+            | O::Timeout(s) => Self::ObjectStoreError(s),
+            O::PreconditionFailed(s) => Self::CloudPreconditionFailed(s),
+            O::Conflict(s) => Self::CloudConflict(s),
+            O::NotSupported(s) => Self::NotSupported(s),
+            O::Compression(s) => Self::CompressionError(s),
+            O::Io(e) => Self::Io(e),
         }
     }
 }
@@ -306,6 +316,27 @@ mod tests {
         for (input, expected) in cases {
             let got: SmcError = input.into();
             assert_eq!(got.to_string(), expected.to_string());
+        }
+
+        // The six retry-classification variants all fold to the generic
+        // SmcError::ObjectStoreError, carrying the inner message verbatim —
+        // they drive the object-store retry loop, not SCSI sense, so the
+        // distinction is intentionally dropped at this boundary.
+        for input in [
+            shared_object_store::ObjectStoreError::Auth("a".into()),
+            shared_object_store::ObjectStoreError::Authz("z".into()),
+            shared_object_store::ObjectStoreError::NotFound("nf".into()),
+            shared_object_store::ObjectStoreError::RegionMismatch("rm".into()),
+            shared_object_store::ObjectStoreError::Network("net".into()),
+            shared_object_store::ObjectStoreError::Timeout("to".into()),
+        ] {
+            // Each variant's inner string is the last `: `-separated field
+            // of its Display (e.g. "object store auth: a" -> "a").
+            let inner = input.to_string().rsplit(": ").next().unwrap().to_string();
+            match SmcError::from(input) {
+                SmcError::ObjectStoreError(s) => assert_eq!(s, inner),
+                other => unreachable!("expected ObjectStoreError, got {other:?}"),
+            }
         }
 
         let io = shared_object_store::ObjectStoreError::Io(std::io::Error::other("boom"));

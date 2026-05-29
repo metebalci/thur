@@ -136,18 +136,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_async_fails_fast_on_permanent_auth() {
-        // ObjectStoreError::Other with an AccessDenied substring classifies
-        // as Authz — permanent. retry_async must short-circuit on the
-        // first attempt instead of consuming the retry budget.
+        // A backend-classified Authz error is permanent. retry_async must
+        // short-circuit on the first attempt instead of consuming the
+        // retry budget.
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_c = Arc::clone(&attempts);
         let result: Result<()> = retry_async("test", 5, move || {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(ObjectStoreError::Other(
-                    "AccessDenied: bucket is forbidden".to_string(),
-                ))
+                Err(ObjectStoreError::Authz("bucket is forbidden".to_string()))
             }
         })
         .await;
@@ -167,9 +165,7 @@ mod tests {
             let attempts = Arc::clone(&attempts_c);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(ObjectStoreError::Other(
-                    "NoSuchBucket: my-bucket".to_string(),
-                ))
+                Err(ObjectStoreError::NotFound("my-bucket".to_string()))
             }
         })
         .await;

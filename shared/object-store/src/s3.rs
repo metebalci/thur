@@ -74,6 +74,100 @@ where
         _ => format!("{op} failed: {err}"),
     }
 }
+
+/// Map an S3 service-error code into a retry class.
+///
+/// The code is the canonical, SDK-version-stable AWS error code from
+/// [`ProvideErrorMetadata::code`] — classifying off it (not a substring of
+/// the rendered Display string) is the whole point of this path: an SDK
+/// wording change can no longer silently flip a permanent error to
+/// transient or vice-versa. Unknown / `None` codes fall to the retryable
+/// `Other` class; in practice S3 attaches a recognized code to every
+/// 4xx/5xx, and `SlowDown` / `ServiceUnavailable` / `InternalError` (the
+/// retryable 5xx + throttling family) all want `Other` anyway.
+///
+/// Codes: <https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html>
+fn classify_s3_service_code(code: Option<&str>) -> FailureKind {
+    let Some(code) = code else {
+        return FailureKind::Other;
+    };
+    // Credentials valid but the policy refuses the operation. (Note:
+    // `AccountProblem` is deliberately NOT here — it is an account-state
+    // issue, e.g. billing, that can clear on its own, so it stays in the
+    // retryable `Other` bucket rather than failing fast.)
+    const AUTHZ: &[&str] = &["AccessDenied", "AllAccessDisabled"];
+    // Credentials missing / invalid / expired / signature wrong /
+    // clock-skewed (which breaks the signature).
+    const AUTH: &[&str] = &[
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "InvalidToken",
+        "ExpiredToken",
+        "TokenRefreshRequired",
+        "InvalidClientTokenId",
+        "MissingAuthenticationToken",
+        "InvalidSecurity",
+        "RequestTimeTooSkewed",
+    ];
+    // Bucket exists in another region / endpoint addressing is wrong.
+    const REGION: &[&str] = &[
+        "PermanentRedirect",
+        "AuthorizationHeaderMalformed",
+        "IllegalLocationConstraintException",
+        "BucketRegionError",
+    ];
+    const NOT_FOUND: &[&str] = &["NoSuchBucket", "NoSuchKey", "NotFound"];
+
+    let eq = |set: &[&str]| set.iter().any(|c| code.eq_ignore_ascii_case(c));
+    if eq(AUTHZ) {
+        FailureKind::Authz
+    } else if eq(AUTH) {
+        FailureKind::Auth
+    } else if eq(REGION) {
+        FailureKind::RegionMismatch
+    } else if eq(NOT_FOUND) {
+        FailureKind::NotFound
+    } else if code.eq_ignore_ascii_case("RequestTimeout") {
+        FailureKind::Timeout
+    } else {
+        FailureKind::Other
+    }
+}
+
+/// Classify any `SdkError` arm into a retry class off its structured shape:
+/// the service-error code for service errors, and the dispatch-failure
+/// discriminants (`is_timeout` / `is_io` / `is_user`) for transport
+/// failures — never the rendered message string.
+fn classify_s3_sdk_error<E, R>(err: &SdkError<E, R>) -> FailureKind
+where
+    E: ProvideErrorMetadata,
+{
+    match err {
+        SdkError::ServiceError(svc) => classify_s3_service_code(svc.err().code()),
+        SdkError::DispatchFailure(d) => {
+            if d.is_timeout() {
+                FailureKind::Timeout
+            } else if d.is_io() {
+                FailureKind::Network
+            } else if d.is_user() {
+                // Signing / credential-provider failure: the SDK couldn't
+                // even build a valid signed request.
+                FailureKind::Auth
+            } else {
+                FailureKind::Other
+            }
+        }
+        SdkError::TimeoutError(_) => FailureKind::Timeout,
+        // Couldn't construct the request — typically missing/invalid
+        // credentials or bad configuration.
+        SdkError::ConstructionFailure(_) => FailureKind::Auth,
+        // Malformed / unparseable response — transient, retry.
+        SdkError::ResponseError(_) => FailureKind::Other,
+        _ => FailureKind::Other,
+    }
+}
+
+use crate::object_store_config::FailureKind;
 use std::path::Path;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
@@ -319,7 +413,7 @@ impl S3Backend {
                         std::any::type_name_of_val(&e)
                     )
                 };
-                ObjectStoreError::Other(error_msg)
+                ObjectStoreError::classified(classify_s3_sdk_error(&e), error_msg)
             })?;
             Ok(())
         })
@@ -397,7 +491,7 @@ impl S3Backend {
                             format!("chunk upload (zero-copy) failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        ObjectStoreError::Other(error_msg)
+                        ObjectStoreError::classified(classify_s3_sdk_error(&e), error_msg)
                     })?;
                 Ok(())
             },
@@ -441,7 +535,7 @@ impl S3Backend {
                             format!("chunk download failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        ObjectStoreError::Other(error_msg)
+                        ObjectStoreError::classified(classify_s3_sdk_error(&e), error_msg)
                     })?;
 
                 // Check compression metadata (clone the string to avoid borrow issues)
@@ -585,10 +679,10 @@ impl S3Backend {
                 .await
                 .map_err(|e| {
                     let detail = describe_sdk_error("manifest upload", &e);
-                    ObjectStoreError::Other(format!(
-                        "{detail} (bucket: {}, key: {})",
-                        self.bucket, full_key
-                    ))
+                    ObjectStoreError::classified(
+                        classify_s3_sdk_error(&e),
+                        format!("{detail} (bucket: {}, key: {})", self.bucket, full_key),
+                    )
                 })?;
             Ok(())
         })
@@ -629,7 +723,7 @@ impl S3Backend {
                             format!("manifest download failed: {} (bucket: {}, key: {}, error type: {:?})",
                                 e, self.bucket, full_key, std::any::type_name_of_val(&e))
                         };
-                        ObjectStoreError::Other(error_msg)
+                        ObjectStoreError::classified(classify_s3_sdk_error(&e), error_msg)
                     })?;
 
                 let data = resp
@@ -703,7 +797,10 @@ impl S3Backend {
                         std::any::type_name_of_val(&e)
                     )
                 };
-                Err(ObjectStoreError::Other(error_msg))
+                Err(ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    error_msg,
+                ))
             }
         }
     }
@@ -728,10 +825,13 @@ impl S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("list_objects", &e);
-                ObjectStoreError::Other(format!(
-                    "{detail} (bucket: {}, prefix: {})",
-                    self.bucket, full_prefix
-                ))
+                ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    format!(
+                        "{detail} (bucket: {}, prefix: {})",
+                        self.bucket, full_prefix
+                    ),
+                )
             })?;
 
         let keys: Vec<String> = resp
@@ -769,10 +869,10 @@ impl S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("delete_object", &e);
-                ObjectStoreError::Other(format!(
-                    "{detail} (bucket: {}, key: {})",
-                    self.bucket, full_key
-                ))
+                ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    format!("{detail} (bucket: {}, key: {})", self.bucket, full_key),
+                )
             })?;
 
         debug!("Deleted object from S3: {}", full_key);
@@ -853,10 +953,10 @@ impl ObjectStoreBackend for S3Backend {
                 {
                     return Ok(crate::object_store_backend::LockState::Off);
                 }
-                return Err(crate::ObjectStoreError::Other(format!(
-                    "GetObjectLockConfiguration on {}: {}",
-                    self.bucket, msg
-                )));
+                return Err(crate::ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    format!("GetObjectLockConfiguration on {}: {}", self.bucket, msg),
+                ));
             }
         };
         let lock_cfg = match resp.object_lock_configuration() {
@@ -915,10 +1015,10 @@ impl ObjectStoreBackend for S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("put_object_legal_hold", &e);
-                ObjectStoreError::Other(format!(
-                    "{detail} (bucket: {}, key: {})",
-                    self.bucket, full_key
-                ))
+                ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    format!("{detail} (bucket: {}, key: {})", self.bucket, full_key),
+                )
             })?;
         Ok(())
     }
@@ -935,10 +1035,10 @@ impl ObjectStoreBackend for S3Backend {
             .await
             .map_err(|e| {
                 let detail = describe_sdk_error("get_object_legal_hold", &e);
-                ObjectStoreError::Other(format!(
-                    "{detail} (bucket: {}, key: {})",
-                    self.bucket, full_key
-                ))
+                ObjectStoreError::classified(
+                    classify_s3_sdk_error(&e),
+                    format!("{detail} (bucket: {}, key: {})", self.bucket, full_key),
+                )
             })?;
         Ok(matches!(
             resp.legal_hold().and_then(|lh| lh.status()),
@@ -1017,8 +1117,9 @@ mod tests {
     //
     // Stand up an in-process wiremock server, point the AWS S3 SDK at it
     // via endpoint_url, and verify that canned XML error responses with
-    // realistic AWS error codes flow through the SDK -> describe_sdk_error
-    // -> ObjectStoreError::Other -> classify() pipeline to the correct
+    // realistic AWS error codes flow through the SDK -> classify_s3_sdk_error
+    // (off the structured service code, not a rendered string) -> the typed
+    // ObjectStoreError carrier -> classify() pipeline to the correct
     // FailureKind. These are the contracts that decide whether a failure
     // burns through the retry budget or fails fast.
     //
@@ -1030,6 +1131,71 @@ mod tests {
     use crate::object_store_config::{FailureKind, classify, is_retryable};
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // -- Pure service-code classification --------------------------------
+    //
+    // The wiremock tests below drive the full SDK round-trip but only cover
+    // a handful of codes (and can't easily exercise codes whose HTTP status
+    // the mock server doesn't distinguish). These pin the structured
+    // code -> FailureKind table directly, including the subtle splits the
+    // old substring matcher got wrong — e.g. a 403 that is SignatureDoesNotMatch
+    // is Auth (bad credential), not Authz (valid credential, no permission).
+
+    #[test]
+    fn classify_s3_service_code_table() {
+        use super::classify_s3_service_code as c;
+        // Authz: valid identity, policy refuses.
+        assert_eq!(c(Some("AccessDenied")), FailureKind::Authz);
+        assert_eq!(c(Some("AllAccessDisabled")), FailureKind::Authz);
+        // Auth: credential missing / invalid / expired / signature / skew.
+        assert_eq!(c(Some("InvalidAccessKeyId")), FailureKind::Auth);
+        assert_eq!(c(Some("SignatureDoesNotMatch")), FailureKind::Auth);
+        assert_eq!(c(Some("ExpiredToken")), FailureKind::Auth);
+        assert_eq!(c(Some("RequestTimeTooSkewed")), FailureKind::Auth);
+        // Region: wrong endpoint / location constraint.
+        assert_eq!(c(Some("PermanentRedirect")), FailureKind::RegionMismatch);
+        assert_eq!(
+            c(Some("AuthorizationHeaderMalformed")),
+            FailureKind::RegionMismatch
+        );
+        // NotFound.
+        assert_eq!(c(Some("NoSuchBucket")), FailureKind::NotFound);
+        assert_eq!(c(Some("NoSuchKey")), FailureKind::NotFound);
+        // Timeout.
+        assert_eq!(c(Some("RequestTimeout")), FailureKind::Timeout);
+        // Retryable Other: 5xx / throttling / account-state / unknown / absent.
+        assert_eq!(c(Some("SlowDown")), FailureKind::Other);
+        assert_eq!(c(Some("InternalError")), FailureKind::Other);
+        assert_eq!(c(Some("ServiceUnavailable")), FailureKind::Other);
+        // AccountProblem is an account-state issue, not a policy denial —
+        // retryable, not a permanent Authz.
+        assert_eq!(c(Some("AccountProblem")), FailureKind::Other);
+        assert_eq!(c(Some("SomeBrandNewCodeWeNeverSaw")), FailureKind::Other);
+        assert_eq!(c(None), FailureKind::Other);
+    }
+
+    #[test]
+    fn classify_s3_service_code_is_case_insensitive() {
+        use super::classify_s3_service_code as c;
+        assert_eq!(c(Some("accessdenied")), FailureKind::Authz);
+        assert_eq!(c(Some("NOSUCHBUCKET")), FailureKind::NotFound);
+    }
+
+    #[test]
+    fn classify_s3_permanent_codes_are_not_retryable() {
+        use super::classify_s3_service_code as c;
+        for code in [
+            "AccessDenied",
+            "InvalidAccessKeyId",
+            "PermanentRedirect",
+            "NoSuchBucket",
+        ] {
+            assert!(
+                !is_retryable(c(Some(code))),
+                "{code} must fail fast, not retry"
+            );
+        }
+    }
 
     async fn mock_s3_backend(server: &MockServer) -> S3Backend {
         S3Backend::new(

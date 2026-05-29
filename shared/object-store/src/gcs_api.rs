@@ -26,7 +26,45 @@ use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model::Object;
 use google_cloud_wkt::FieldMask;
 
+use crate::object_store_config::{FailureKind, http_status_to_failure_kind};
 use crate::{ObjectStoreError, Result};
+
+/// Classify a GCS error into a retry class off its structured signals —
+/// the gRPC status code (control-plane / `StorageControl`) and the HTTP
+/// status code (data-plane / `Storage`, or a load-balancer error before
+/// the request reaches the service) — never the rendered message string.
+///
+/// gRPC code is the more specific signal, so it wins when it pins a
+/// definite class; otherwise the HTTP status decides, and an error
+/// carrying neither falls to the retryable `Other` class. The retryable
+/// gRPC codes — `Unavailable` (≈ HTTP 503), `ResourceExhausted`
+/// (≈ 429 throttling), `Aborted` (≈ 409), `AlreadyExists`, `Internal`
+/// (≈ 500), `Unknown`, … — deliberately fall through to the HTTP / `Other`
+/// arms (the parenthesized numbers are the rough HTTP equivalents, not the
+/// gRPC code values).
+fn classify_gcs_signal(http: Option<u16>, grpc: Option<Code>) -> FailureKind {
+    if let Some(code) = grpc {
+        match code {
+            Code::NotFound => return FailureKind::NotFound,
+            Code::PermissionDenied => return FailureKind::Authz,
+            Code::Unauthenticated => return FailureKind::Auth,
+            // Conditional precondition (e.g. generation match) refused:
+            // permanent for this attempt, like a 412.
+            Code::FailedPrecondition => return FailureKind::Authz,
+            Code::DeadlineExceeded => return FailureKind::Timeout,
+            _ => {}
+        }
+    }
+    if let Some(status) = http {
+        return http_status_to_failure_kind(status);
+    }
+    FailureKind::Other
+}
+
+/// Classify a `google_cloud_gax` error via [`classify_gcs_signal`].
+fn classify_gcs_error(e: &google_cloud_gax::error::Error) -> FailureKind {
+    classify_gcs_signal(e.http_status_code(), e.status().map(|s| s.code))
+}
 
 /// Retention policy snapshot returned by [`GcsApi::get_bucket_retention`].
 ///
@@ -100,10 +138,13 @@ impl GcsApi for RealGcsApi {
             .send_buffered()
             .await
             .map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS write_object failed: {} (bucket: {}, key: {})",
-                    e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS write_object failed: {} (bucket: {}, key: {})",
+                        e, bucket, key
+                    ),
+                )
             })?;
         Ok(())
     }
@@ -115,18 +156,24 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS read_object failed: {} (bucket: {}, key: {})",
-                    e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS read_object failed: {} (bucket: {}, key: {})",
+                        e, bucket, key
+                    ),
+                )
             })?;
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.next().await {
             let chunk = chunk.map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS read_object stream failed: {} (bucket: {}, key: {})",
-                    e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS read_object stream failed: {} (bucket: {}, key: {})",
+                        e, bucket, key
+                    ),
+                )
             })?;
             buf.extend_from_slice(&chunk);
         }
@@ -154,10 +201,13 @@ impl GcsApi for RealGcsApi {
                 if is_absent {
                     Ok(false)
                 } else {
-                    Err(ObjectStoreError::Other(format!(
-                        "GCS get_object failed: {} (bucket: {}, key: {})",
-                        e, bucket, key
-                    )))
+                    Err(ObjectStoreError::classified(
+                        classify_gcs_error(&e),
+                        format!(
+                            "GCS get_object failed: {} (bucket: {}, key: {})",
+                            e, bucket, key
+                        ),
+                    ))
                 }
             }
         }
@@ -172,10 +222,13 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS get_object (legal hold) failed: {} (bucket: {}, key: {})",
-                    e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS get_object (legal hold) failed: {} (bucket: {}, key: {})",
+                        e, bucket, key
+                    ),
+                )
             })?;
         Ok(obj.event_based_hold.unwrap_or(false))
     }
@@ -199,10 +252,13 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS update_object (event_based_hold={}) failed: {} (bucket: {}, key: {})",
-                    held, e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS update_object (event_based_hold={}) failed: {} (bucket: {}, key: {})",
+                        held, e, bucket, key
+                    ),
+                )
             })?;
         Ok(())
     }
@@ -219,10 +275,13 @@ impl GcsApi for RealGcsApi {
             .by_item();
         while let Some(item) = items.next().await {
             let obj = item.map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS list_objects failed: {} (bucket: {}, prefix: {})",
-                    e, bucket, prefix
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS list_objects failed: {} (bucket: {}, prefix: {})",
+                        e, bucket, prefix
+                    ),
+                )
             })?;
             names.push(obj.name);
         }
@@ -237,10 +296,13 @@ impl GcsApi for RealGcsApi {
             .send()
             .await
             .map_err(|e| {
-                ObjectStoreError::Other(format!(
-                    "GCS delete_object failed: {} (bucket: {}, key: {})",
-                    e, bucket, key
-                ))
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!(
+                        "GCS delete_object failed: {} (bucket: {}, key: {})",
+                        e, bucket, key
+                    ),
+                )
             })?;
         Ok(())
     }
@@ -252,7 +314,12 @@ impl GcsApi for RealGcsApi {
             .set_name(Self::bucket_resource(bucket))
             .send()
             .await
-            .map_err(|e| ObjectStoreError::Other(format!("GCS get_bucket on {}: {}", bucket, e)))?;
+            .map_err(|e| {
+                ObjectStoreError::classified(
+                    classify_gcs_error(&e),
+                    format!("GCS get_bucket on {}: {}", bucket, e),
+                )
+            })?;
         let policy = match b.retention_policy {
             Some(p) => p,
             None => return Ok(None),
@@ -305,6 +372,65 @@ pub(crate) async fn build_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store_config::is_retryable;
+
+    // -- structured error classification ---------------------------------
+    //
+    // RealGcsApi is the only spot that touches the gcs SDK types, and the
+    // mock GcsApi in gcs.rs hands back hand-built ObjectStoreError values,
+    // so the SDK round-trip isn't reachable from `cargo test`. These pin
+    // the pure signal table (gRPC code + HTTP status -> FailureKind) that
+    // `classify_gcs_error` feeds.
+
+    #[test]
+    fn classify_gcs_grpc_code_table() {
+        use super::classify_gcs_signal as c;
+        assert_eq!(c(None, Some(Code::NotFound)), FailureKind::NotFound);
+        assert_eq!(c(None, Some(Code::PermissionDenied)), FailureKind::Authz);
+        assert_eq!(c(None, Some(Code::Unauthenticated)), FailureKind::Auth);
+        assert_eq!(c(None, Some(Code::FailedPrecondition)), FailureKind::Authz);
+        assert_eq!(c(None, Some(Code::DeadlineExceeded)), FailureKind::Timeout);
+        // Retryable gRPC codes fall through to Other.
+        for code in [
+            Code::Unavailable,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::AlreadyExists,
+            Code::Internal,
+            Code::Unknown,
+        ] {
+            assert_eq!(c(None, Some(code)), FailureKind::Other, "{code:?}");
+            assert!(is_retryable(c(None, Some(code))), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn classify_gcs_http_status_table() {
+        use super::classify_gcs_signal as c;
+        assert_eq!(c(Some(401), None), FailureKind::Auth);
+        assert_eq!(c(Some(403), None), FailureKind::Authz);
+        assert_eq!(c(Some(404), None), FailureKind::NotFound);
+        assert_eq!(c(Some(412), None), FailureKind::Authz);
+        // Conflict / throttle / provider 5xx / unknown: retryable Other.
+        for status in [409u16, 429, 500, 503, 418] {
+            assert_eq!(c(Some(status), None), FailureKind::Other, "{status}");
+            assert!(is_retryable(c(Some(status), None)), "{status}");
+        }
+    }
+
+    #[test]
+    fn classify_gcs_prefers_grpc_then_http_then_other() {
+        use super::classify_gcs_signal as c;
+        // Definite gRPC code wins over HTTP status.
+        assert_eq!(
+            c(Some(500), Some(Code::PermissionDenied)),
+            FailureKind::Authz
+        );
+        // Retryable gRPC code yields to a definite HTTP status.
+        assert_eq!(c(Some(404), Some(Code::Unavailable)), FailureKind::NotFound);
+        // Neither signal present: Other.
+        assert_eq!(c(None, None), FailureKind::Other);
+    }
 
     #[test]
     fn bucket_resource_wraps_into_projects_underscore_buckets() {

@@ -19,7 +19,7 @@
 
 use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
 use crate::object_store_backend::ObjectStoreBackend;
-use crate::object_store_config::ResolvedAzureAuth;
+use crate::object_store_config::{FailureKind, ResolvedAzureAuth, http_status_to_failure_kind};
 use crate::{ObjectStoreError, Result};
 use async_trait::async_trait;
 use azure_core::Bytes;
@@ -43,6 +43,42 @@ const MAX_UPLOAD_RETRIES: u32 = 5;
 /// Maximum number of retry attempts for downloads.
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
 // Backoff cadence is owned by `object_store_helpers::retry_async`.
+
+/// Classify an Azure error into a retry class off its structured shape —
+/// the [`azure_core::error::ErrorKind`] discriminant and the HTTP status —
+/// never the rendered message string.
+///
+/// `Credential` (couldn't get/refresh a token) is auth; `Connection` /
+/// `Io` (request never reached the service, or local IO) are network;
+/// otherwise the HTTP status (when the error is an `HttpResponse`) decides.
+/// This is what fixes the old 401 gap: Azure's body for an authentication
+/// failure is `AuthenticationFailed`, which matched none of the legacy
+/// substring needles, so a revoked-credential 401 used to misclassify as
+/// retryable `Other` and burn the whole backoff budget. A structured 401
+/// is now `Auth` → fail fast.
+fn classify_azure_signal(http: Option<u16>, is_credential: bool, is_network: bool) -> FailureKind {
+    if is_credential {
+        return FailureKind::Auth;
+    }
+    if is_network {
+        return FailureKind::Network;
+    }
+    match http {
+        Some(status) => http_status_to_failure_kind(status),
+        None => FailureKind::Other,
+    }
+}
+
+/// Classify an [`azure_core::Error`] via [`classify_azure_signal`].
+fn classify_azure_error(e: &azure_core::Error) -> FailureKind {
+    use azure_core::error::ErrorKind;
+    let (is_credential, is_network) = match e.kind() {
+        ErrorKind::Credential => (true, false),
+        ErrorKind::Connection | ErrorKind::Io => (false, true),
+        _ => (false, false),
+    };
+    classify_azure_signal(e.http_status().map(u16::from), is_credential, is_network)
+}
 
 /// Azure Blob Storage backend for storing chunks and manifests.
 ///
@@ -419,10 +455,13 @@ impl ObjectStoreBackend for AzureBackend {
             async move {
                 let opts = upload_options_with_metadata(applied_algo, level);
                 blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure chunk upload failed: {e} (account: {account}, \
+                    ObjectStoreError::classified(
+                        classify_azure_error(&e),
+                        format!(
+                            "Azure chunk upload failed: {e} (account: {account}, \
                              container: {container_name}, key: {full_key})"
-                    ))
+                        ),
+                    )
                 })?;
                 Ok(())
             }
@@ -466,11 +505,14 @@ impl ObjectStoreBackend for AzureBackend {
                     let body = Bytes::from(data);
                     let opts = upload_options_with_metadata(None, 0);
                     blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                        ObjectStoreError::Other(format!(
-                            "Azure chunk upload (zero-copy) failed: {e} (account: \
-                             {account}, container: {container_name}, key: {full_key}, \
-                             file: {path:?})"
-                        ))
+                        ObjectStoreError::classified(
+                            classify_azure_error(&e),
+                            format!(
+                                "Azure chunk upload (zero-copy) failed: {e} (account: \
+                                 {account}, container: {container_name}, key: {full_key}, \
+                                 file: {path:?})"
+                            ),
+                        )
                     })?;
                     Ok(())
                 }
@@ -500,10 +542,13 @@ impl ObjectStoreBackend for AzureBackend {
                 // round-trips, both small — the bulk of the time is
                 // the body transfer.
                 let props = blob.get_properties(None).await.map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure chunk get_properties failed: {e} (account: {account}, \
-                         container: {container_name}, key: {full_key})"
-                    ))
+                    ObjectStoreError::classified(
+                        classify_azure_error(&e),
+                        format!(
+                            "Azure chunk get_properties failed: {e} (account: {account}, \
+                             container: {container_name}, key: {full_key})"
+                        ),
+                    )
                 })?;
                 let metadata = props.metadata().map_err(|e| {
                     ObjectStoreError::Other(format!(
@@ -514,10 +559,13 @@ impl ObjectStoreBackend for AzureBackend {
                 let compression_type = metadata.get("compression").cloned();
 
                 let response = blob.download(None).await.map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure chunk download failed: {e} (account: {account}, \
-                         container: {container_name}, key: {full_key})"
-                    ))
+                    ObjectStoreError::classified(
+                        classify_azure_error(&e),
+                        format!(
+                            "Azure chunk download failed: {e} (account: {account}, \
+                             container: {container_name}, key: {full_key})"
+                        ),
+                    )
                 })?;
                 let buffer: Vec<u8> = response
                     .body
@@ -626,11 +674,14 @@ impl ObjectStoreBackend for AzureBackend {
                     ..Default::default()
                 };
                 blob.upload(body.into(), Some(opts)).await.map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure manifest upload failed: {e} (account: {account}, \
+                    ObjectStoreError::classified(
+                        classify_azure_error(&e),
+                        format!(
+                            "Azure manifest upload failed: {e} (account: {account}, \
                              container: {container_name}, key: {full_key}, size: \
                              {body_len} bytes)"
-                    ))
+                        ),
+                    )
                 })?;
                 Ok(())
             }
@@ -649,10 +700,13 @@ impl ObjectStoreBackend for AzureBackend {
             let container_name = self.container_name.clone();
             async move {
                 let response = blob.download(None).await.map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure manifest download failed: {e} (account: {account}, \
-                         container: {container_name}, key: {full_key})"
-                    ))
+                    ObjectStoreError::classified(
+                        classify_azure_error(&e),
+                        format!(
+                            "Azure manifest download failed: {e} (account: {account}, \
+                             container: {container_name}, key: {full_key})"
+                        ),
+                    )
                 })?;
                 let bytes: Vec<u8> = response
                     .body
@@ -679,11 +733,14 @@ impl ObjectStoreBackend for AzureBackend {
         debug!("Checking if chunk exists in Azure: {}", full_key);
 
         self.blob(&full_key).exists().await.map_err(|e| {
-            ObjectStoreError::Other(format!(
-                "Azure exists check failed: {e} (account: {}, container: {}, key: \
-                 {full_key})",
-                self.account, self.container_name
-            ))
+            ObjectStoreError::classified(
+                classify_azure_error(&e),
+                format!(
+                    "Azure exists check failed: {e} (account: {}, container: {}, key: \
+                     {full_key})",
+                    self.account, self.container_name
+                ),
+            )
         })
     }
 
@@ -696,11 +753,14 @@ impl ObjectStoreBackend for AzureBackend {
             ..Default::default()
         };
         let mut pager = self.container.list_blobs(Some(opts)).map_err(|e| {
-            ObjectStoreError::Other(format!(
-                "Azure list_blobs build failed: {e} (account: {}, container: {}, \
-                 prefix: {full_prefix})",
-                self.account, self.container_name
-            ))
+            ObjectStoreError::classified(
+                classify_azure_error(&e),
+                format!(
+                    "Azure list_blobs build failed: {e} (account: {}, container: {}, \
+                     prefix: {full_prefix})",
+                    self.account, self.container_name
+                ),
+            )
         })?;
 
         // The Pager auto-flattens pages into `BlobItem`s — its
@@ -709,11 +769,14 @@ impl ObjectStoreBackend for AzureBackend {
         // ever need next-marker / continuation handling.)
         let mut keys = Vec::new();
         while let Some(item) = pager.try_next().await.map_err(|e| {
-            ObjectStoreError::Other(format!(
-                "Azure list_blobs failed: {e} (account: {}, container: {}, prefix: \
-                 {full_prefix})",
-                self.account, self.container_name
-            ))
+            ObjectStoreError::classified(
+                classify_azure_error(&e),
+                format!(
+                    "Azure list_blobs failed: {e} (account: {}, container: {}, prefix: \
+                     {full_prefix})",
+                    self.account, self.container_name
+                ),
+            )
         })? {
             let Some(name) = item.name else {
                 continue;
@@ -735,11 +798,14 @@ impl ObjectStoreBackend for AzureBackend {
         debug!("Deleting blob from Azure: {}", full_key);
 
         self.blob(&full_key).delete(None).await.map_err(|e| {
-            ObjectStoreError::Other(format!(
-                "Azure delete_blob failed: {e} (account: {}, container: {}, key: \
-                 {full_key})",
-                self.account, self.container_name
-            ))
+            ObjectStoreError::classified(
+                classify_azure_error(&e),
+                format!(
+                    "Azure delete_blob failed: {e} (account: {}, container: {}, key: \
+                     {full_key})",
+                    self.account, self.container_name
+                ),
+            )
         })?;
 
         debug!("Deleted blob from Azure: {}", full_key);
@@ -953,32 +1019,69 @@ mod tests {
     // -- SDK-shape error classification tests --------------------------------
     //
     // Stand up an in-process wiremock server, point the Azure Blob SDK
-    // at it via a synthetic SAS URL, and verify canned XML / status
-    // responses flow through the SDK -> ObjectStoreError::Other -> classify()
-    // pipeline to the correct FailureKind.
+    // at it via a synthetic SAS URL, and verify canned status responses
+    // flow through the SDK -> classify_azure_error (off the structured
+    // ErrorKind / HTTP status, not a rendered string) -> the typed
+    // ObjectStoreError carrier -> classify() pipeline to the correct
+    // FailureKind.
     //
     // Coverage scope:
-    //   403 → AuthorizationPermissionMismatch → "forbidden" → Authz
-    //   404 → ContainerNotFound              → "(404)"     → NotFound
+    //   401 → Unauthorized → Auth   (the gap the structured rewrite closes:
+    //         Azure's 401 body is "AuthenticationFailed", which matched none
+    //         of the old substring needles, so a revoked credential used to
+    //         misclassify as retryable Other and burn the whole budget)
+    //   403 → Forbidden    → Authz
+    //   404 → NotFound     → NotFound
     //
-    // Not covered (deferred to a follow-up classifier audit):
-    //   401 — Azure's body "AuthenticationFailed" does not match any of
-    //     the Auth markers in classify() (no "unauthorized" / "invalid
-    //     access key" / etc. in the SDK error string). The classifier
-    //     currently routes Azure 401 to Other; that's a real gap worth
-    //     addressing, but a fix would change retry behavior and is out
-    //     of scope for the coverage push.
+    // Not covered:
     //   503 — the SDK's internal retry policy adds ~60 s to each test
     //     against a wiremock that returns 5xx; covered cheaply on the
     //     S3 side instead.
 
-    use super::AzureBackend;
+    use super::{AzureBackend, classify_azure_signal};
     use crate::ObjectStoreError;
     use crate::compression::CompressionConfig;
     use crate::object_store_backend::ObjectStoreBackend;
-    use crate::object_store_config::{FailureKind, ResolvedAzureAuth, classify};
+    use crate::object_store_config::{FailureKind, ResolvedAzureAuth, classify, is_retryable};
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn classify_azure_signal_table() {
+        // Credential errors win regardless of (absent) HTTP status.
+        assert_eq!(classify_azure_signal(None, true, false), FailureKind::Auth);
+        // Connection / IO -> network.
+        assert_eq!(
+            classify_azure_signal(None, false, true),
+            FailureKind::Network
+        );
+        // HTTP status mapping.
+        assert_eq!(
+            classify_azure_signal(Some(401), false, false),
+            FailureKind::Auth
+        );
+        assert_eq!(
+            classify_azure_signal(Some(403), false, false),
+            FailureKind::Authz
+        );
+        assert_eq!(
+            classify_azure_signal(Some(404), false, false),
+            FailureKind::NotFound
+        );
+        assert_eq!(
+            classify_azure_signal(Some(412), false, false),
+            FailureKind::Authz
+        );
+        // Conflict / throttle / 5xx / unknown / no-signal: retryable Other.
+        for http in [None, Some(409), Some(429), Some(500), Some(503)] {
+            assert_eq!(
+                classify_azure_signal(http, false, false),
+                FailureKind::Other,
+                "http={http:?}"
+            );
+            assert!(is_retryable(classify_azure_signal(http, false, false)));
+        }
+    }
 
     async fn mock_azure_backend(server: &MockServer) -> AzureBackend {
         // Synthetic SAS URL that points the SDK at the wiremock server.
@@ -1011,6 +1114,29 @@ mod tests {
             .list_objects("")
             .await
             .expect_err("mock returns 4xx/5xx; list_objects must error")
+    }
+
+    #[tokio::test]
+    async fn azure_401_classifies_as_auth() {
+        // The gap the structured rewrite closes: a 401 with body
+        // "AuthenticationFailed" used to fall through to retryable Other
+        // (no substring matched). Off the HTTP status it is now Auth ->
+        // fail fast, so a revoked credential surfaces in seconds.
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(azure_xml(
+                        "AuthenticationFailed",
+                        "Server failed to authenticate the request.",
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let err = capture_azure_list_error(server).await;
+        assert_eq!(classify(&err), FailureKind::Auth);
+        assert!(!is_retryable(classify(&err)));
     }
 
     #[tokio::test]

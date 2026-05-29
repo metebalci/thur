@@ -874,105 +874,38 @@ impl FailureKind {
     }
 }
 
-/// Classify a ObjectStoreError (typically `ObjectStoreError(String)` carrying the raw
-/// AWS/GCS SDK message) into a coarse FailureKind via string matching.
+/// Map a [`crate::ObjectStoreError`] to a coarse [`FailureKind`].
+///
+/// Each backend classifies its error at the SDK boundary — where the
+/// typed SDK error / HTTP status / gRPC code is still in hand — and mints
+/// the matching carrier variant via [`crate::ObjectStoreError::classified`].
+/// This function is just the inverse of that constructor, so the retry
+/// loop's fail-fast decision never depends on substring-matching a
+/// rendered message (an SDK wording change can no longer silently flip a
+/// permanent error to transient or vice-versa).
+///
+/// `PreconditionFailed` (412) and `Conflict` (409) are the two structured
+/// variants callers also match on directly; they fold into `Authz`
+/// (permanent — policy says no) and `Other` (transient — concurrent
+/// change) respectively. `NotSupported` / `Compression` are local,
+/// non-retryable-in-practice failures that fall to `Other`; `Io` is a
+/// local filesystem blip during an upload/download and is retry-eligible
+/// (`Other`).
 pub fn classify(err: &crate::ObjectStoreError) -> FailureKind {
-    // Structured variants first — the Azure legal-hold path now
-    // distinguishes 412 / 409 from generic ObjectStoreError, and they
-    // classify deterministically without the string-match dance:
-    //   412 Precondition Failed → permanent (Authz-shaped: policy says no)
-    //   409 Conflict            → transient (concurrent change; retry helps)
     match err {
-        crate::ObjectStoreError::PreconditionFailed(_) => return FailureKind::Authz,
-        crate::ObjectStoreError::Conflict(_) => return FailureKind::Other,
-        _ => {}
+        crate::ObjectStoreError::Auth(_) => FailureKind::Auth,
+        crate::ObjectStoreError::Authz(_) => FailureKind::Authz,
+        crate::ObjectStoreError::NotFound(_) => FailureKind::NotFound,
+        crate::ObjectStoreError::RegionMismatch(_) => FailureKind::RegionMismatch,
+        crate::ObjectStoreError::Network(_) => FailureKind::Network,
+        crate::ObjectStoreError::Timeout(_) => FailureKind::Timeout,
+        crate::ObjectStoreError::PreconditionFailed(_) => FailureKind::Authz,
+        crate::ObjectStoreError::Conflict(_) => FailureKind::Other,
+        crate::ObjectStoreError::Other(_)
+        | crate::ObjectStoreError::NotSupported(_)
+        | crate::ObjectStoreError::Io(_)
+        | crate::ObjectStoreError::Compression(_) => FailureKind::Other,
     }
-    let msg = err.to_string().to_ascii_lowercase();
-
-    // Construction failure, "user" dispatch failure, or any "other" dispatch
-    // failure that mentions the credential provider chain: SDK could not
-    // even sign / build the request. Almost always credentials missing.
-    if msg.contains("construction failure")
-        || msg.contains("dispatch failure (user:")
-        || msg.contains("no credentials")
-        || msg.contains("credentials not loaded")
-        || msg.contains("could not load credentials")
-        || msg.contains("credential provider")
-        || msg.contains("no providers in chain")
-        || msg.contains("missingauthenticationtoken")
-    {
-        return FailureKind::Auth;
-    }
-
-    // Real network / IO / TLS / DNS — request was attempted but couldn't reach the provider.
-    if msg.contains("dispatch failure (io:")
-        || msg.contains("no such host")
-        || msg.contains("name resolution")
-        || msg.contains("temporary failure in name resolution")
-        || msg.contains("connection refused")
-        || msg.contains("network is unreachable")
-        || msg.contains("certificate")
-        || msg.contains("tls handshake")
-        || msg.contains(" dns ")
-    {
-        return FailureKind::Network;
-    }
-
-    // Dispatch timeout
-    if msg.contains("dispatch failure (timeout:") {
-        return FailureKind::Timeout;
-    }
-
-    // Region mismatch — check before generic AUTHZ since it can look like 403.
-    if msg.contains("permanentredirect")
-        || msg.contains("bucketregionerror")
-        || msg.contains("authorizationheadermalformed")
-        || msg.contains("the bucket is in this region")
-        || msg.contains("wrong region")
-    {
-        return FailureKind::RegionMismatch;
-    }
-
-    // Authn — credentials missing, invalid, expired, or signature wrong.
-    if msg.contains("invalidaccesskeyid")
-        || msg.contains("signaturedoesnotmatch")
-        || msg.contains("expiredtoken")
-        || msg.contains("invalidclienttokenid")
-        || msg.contains("missingauthenticationtoken")
-        || msg.contains("no credentials")
-        || msg.contains("credentials not loaded")
-        || msg.contains("could not load credentials")
-        || msg.contains("invalid_grant")
-        || msg.contains("unauthorized")
-    {
-        return FailureKind::Auth;
-    }
-
-    // Authz — credentials valid but no permission.
-    if msg.contains("accessdenied")
-        || msg.contains("forbidden")
-        || msg.contains("not authorized")
-        || msg.contains(" 403")
-        || msg.contains("(403)")
-    {
-        return FailureKind::Authz;
-    }
-
-    // Bucket / project not found.
-    if msg.contains("nosuchbucket")
-        || msg.contains("bucket not found")
-        || msg.contains("notfound")
-        || msg.contains(" 404")
-        || msg.contains("(404)")
-    {
-        return FailureKind::NotFound;
-    }
-
-    if msg.contains("timeout") || msg.contains("timed out") {
-        return FailureKind::Timeout;
-    }
-
-    FailureKind::Other
 }
 
 /// Whether a classified failure is worth retrying. Permanent errors
@@ -987,6 +920,26 @@ pub fn is_retryable(kind: FailureKind) -> bool {
         | FailureKind::Authz
         | FailureKind::NotFound
         | FailureKind::RegionMismatch => false,
+    }
+}
+
+/// Map an HTTP status code to a coarse [`FailureKind`].
+///
+/// Shared by the GCS and Azure backends, which both surface a numeric
+/// HTTP status on their SDK errors. 4xx that point at a fixable
+/// credential / permission / target problem fail fast; everything else
+/// (409 conflict, 429 throttling, 5xx provider hiccups, and any
+/// unrecognized status) is retry-eligible `Other`.
+pub(crate) fn http_status_to_failure_kind(status: u16) -> FailureKind {
+    match status {
+        401 => FailureKind::Auth,
+        403 => FailureKind::Authz,
+        404 => FailureKind::NotFound,
+        408 => FailureKind::Timeout,
+        // 412 Precondition Failed: an immutability / conditional-write
+        // policy refused the request — permanent for this attempt.
+        412 => FailureKind::Authz,
+        _ => FailureKind::Other,
     }
 }
 
@@ -1937,74 +1890,48 @@ backends:
 
     // ===== classify() + is_retryable() coverage =====
     //
-    // The classifier is string-matched against the raw SDK message;
-    // these tests pin one canonical phrase per FailureKind plus a
-    // couple of structured-variant short-circuits (PreconditionFailed
-    // / Conflict). is_retryable() is exercised alongside since the
-    // retry loop's fail-fast contract depends on the pairing.
+    // Classification now happens at the SDK boundary inside each backend
+    // (s3::classify_s3_*, gcs_api::classify_gcs_*, azure::classify_azure_*),
+    // which mint the typed carrier variant via `ObjectStoreError::classified`.
+    // These tests pin that `classify` is the exact inverse of `classified`
+    // and that each kind pairs with the right `is_retryable` verdict — the
+    // fail-fast contract the retry loop depends on.
 
+    /// Every FailureKind round-trips through `classified` → `classify`.
     #[test]
-    fn classify_recognizes_auth_credentials() {
-        let err = crate::ObjectStoreError::Other("InvalidAccessKeyId: not found".to_string());
-        assert_eq!(classify(&err), FailureKind::Auth);
-        assert!(!is_retryable(FailureKind::Auth));
+    fn classified_and_classify_are_inverses() {
+        for kind in [
+            FailureKind::Auth,
+            FailureKind::Authz,
+            FailureKind::NotFound,
+            FailureKind::RegionMismatch,
+            FailureKind::Network,
+            FailureKind::Timeout,
+            FailureKind::Other,
+        ] {
+            let err = crate::ObjectStoreError::classified(kind, "x".to_string());
+            assert_eq!(classify(&err), kind, "round-trip failed for {kind:?}");
+        }
     }
 
+    /// The permanent classes fail fast; the transient classes keep retrying.
     #[test]
-    fn classify_recognizes_expired_token_as_auth() {
-        let err = crate::ObjectStoreError::Other("ExpiredToken: please refresh".to_string());
-        assert_eq!(classify(&err), FailureKind::Auth);
-    }
-
-    #[test]
-    fn classify_recognizes_authz_via_access_denied() {
-        let err = crate::ObjectStoreError::Other("AccessDenied: bucket policy refused".to_string());
-        assert_eq!(classify(&err), FailureKind::Authz);
-        assert!(!is_retryable(FailureKind::Authz));
-    }
-
-    #[test]
-    fn classify_recognizes_authz_via_403() {
-        let err = crate::ObjectStoreError::Other("HTTP 403 Forbidden".to_string());
-        assert_eq!(classify(&err), FailureKind::Authz);
-    }
-
-    #[test]
-    fn classify_recognizes_not_found_via_no_such_bucket() {
-        let err = crate::ObjectStoreError::Other("NoSuchBucket: my-bucket".to_string());
-        assert_eq!(classify(&err), FailureKind::NotFound);
-        assert!(!is_retryable(FailureKind::NotFound));
-    }
-
-    #[test]
-    fn classify_recognizes_not_found_via_404() {
-        let err = crate::ObjectStoreError::Other("HTTP 404 not found".to_string());
-        assert_eq!(classify(&err), FailureKind::NotFound);
-    }
-
-    #[test]
-    fn classify_recognizes_region_mismatch() {
-        let err = crate::ObjectStoreError::Other("PermanentRedirect: wrong region".to_string());
-        assert_eq!(classify(&err), FailureKind::RegionMismatch);
-        assert!(!is_retryable(FailureKind::RegionMismatch));
-    }
-
-    #[test]
-    fn classify_recognizes_network_via_no_such_host() {
-        let err = crate::ObjectStoreError::Other(
-            "dispatch failure (io: error performing request): no such host".to_string(),
-        );
-        assert_eq!(classify(&err), FailureKind::Network);
-        assert!(is_retryable(FailureKind::Network));
-    }
-
-    #[test]
-    fn classify_recognizes_timeout_via_dispatch_timeout() {
-        let err = crate::ObjectStoreError::Other(
-            "dispatch failure (timeout: request timed out)".to_string(),
-        );
-        assert_eq!(classify(&err), FailureKind::Timeout);
-        assert!(is_retryable(FailureKind::Timeout));
+    fn permanent_kinds_fail_fast_transient_kinds_retry() {
+        for kind in [
+            FailureKind::Auth,
+            FailureKind::Authz,
+            FailureKind::NotFound,
+            FailureKind::RegionMismatch,
+        ] {
+            assert!(!is_retryable(kind), "{kind:?} must be permanent");
+        }
+        for kind in [
+            FailureKind::Network,
+            FailureKind::Timeout,
+            FailureKind::Other,
+        ] {
+            assert!(is_retryable(kind), "{kind:?} must be retryable");
+        }
     }
 
     #[test]
@@ -2024,52 +1951,18 @@ backends:
         assert!(is_retryable(FailureKind::Other));
     }
 
+    /// Local-shaped failures (catch-all, unsupported op, io, compression)
+    /// all bucket into the retryable `Other` class.
     #[test]
-    fn classify_unrecognized_falls_through_to_other() {
-        let err = crate::ObjectStoreError::Other("a brand new sdk error nobody mapped".to_string());
-        assert_eq!(classify(&err), FailureKind::Other);
-        assert!(is_retryable(FailureKind::Other));
-    }
-
-    #[test]
-    fn classify_throttling_429_is_retryable_other() {
-        // 429 Too Many Requests / SlowDown / RequestLimitExceeded /
-        // ThrottlingException — providers signal "back off and try
-        // again" via varied strings. None match our explicit Auth /
-        // Authz / NotFound buckets, so they fall through to
-        // `FailureKind::Other`, which `is_retryable` keeps in the
-        // backoff loop. Pinning that fall-through guards against an
-        // accidental future re-classification that would burn
-        // throttle errors against the permanent-error budget.
-        for variant in [
-            "Got HTTP 429 Too Many Requests",
-            "SlowDown: please reduce your request rate",
-            "ThrottlingException: rate exceeded",
-            "RequestLimitExceeded: TPS limit hit",
+    fn classify_local_shaped_failures_are_other() {
+        for err in [
+            crate::ObjectStoreError::Other("brand new sdk error nobody mapped".to_string()),
+            crate::ObjectStoreError::NotSupported("legal hold on local".to_string()),
+            crate::ObjectStoreError::Io(std::io::Error::other("disk blip")),
+            crate::ObjectStoreError::Compression("zstd failed".to_string()),
         ] {
-            let err = crate::ObjectStoreError::Other(variant.to_string());
-            assert_eq!(classify(&err), FailureKind::Other, "variant={variant}");
-            assert!(is_retryable(classify(&err)), "variant={variant}");
-        }
-    }
-
-    #[test]
-    fn classify_5xx_provider_failures_stay_retryable() {
-        // 500 / 502 / 503 / 504 — the provider is having a moment.
-        // Must classify as Other so the backoff loop covers them.
-        for variant in [
-            "InternalError: We encountered an internal error",
-            "503 Service Unavailable",
-            "Bad Gateway (502)",
-            "Gateway Timeout (504)",
-        ] {
-            let err = crate::ObjectStoreError::Other(variant.to_string());
-            let kind = classify(&err);
-            assert!(
-                matches!(kind, FailureKind::Other | FailureKind::Timeout),
-                "variant={variant} kind={kind:?}"
-            );
-            assert!(is_retryable(kind), "variant={variant}");
+            assert_eq!(classify(&err), FailureKind::Other);
+            assert!(is_retryable(classify(&err)));
         }
     }
 
@@ -2218,7 +2111,7 @@ backends:
 
         let init = ObjectStoreConfigError::BackendInit {
             backend: "S3",
-            source: crate::ObjectStoreError::Other("AccessDenied".to_string()),
+            source: crate::ObjectStoreError::Authz("AccessDenied".to_string()),
         };
         assert_eq!(init.step(), "init");
         assert_eq!(init.kind(), FailureKind::Authz);
@@ -2226,7 +2119,7 @@ backends:
         let listed = ObjectStoreConfigError::ListFailed {
             bucket: "b".to_string(),
             prefix: "p".to_string(),
-            source: crate::ObjectStoreError::Other("NoSuchBucket".to_string()),
+            source: crate::ObjectStoreError::NotFound("NoSuchBucket".to_string()),
         };
         assert_eq!(listed.step(), "list");
         assert_eq!(listed.kind(), FailureKind::NotFound);
@@ -2245,7 +2138,7 @@ backends:
 
         let lock = ObjectStoreConfigError::LockStateQueryFailed {
             name: "n".to_string(),
-            source: crate::ObjectStoreError::Other("InvalidAccessKeyId".to_string()),
+            source: crate::ObjectStoreError::Auth("InvalidAccessKeyId".to_string()),
         };
         assert_eq!(lock.step(), "lock_state");
         assert_eq!(lock.kind(), FailureKind::Auth);
