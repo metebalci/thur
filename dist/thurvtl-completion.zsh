@@ -1193,6 +1193,28 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(run-now)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit the full result as JSON for automation]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit the summary as JSON for automation]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvtl__subcmd__system__subcmd__tiering__subcmd__help_commands" \
@@ -1206,6 +1228,14 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:thurvtl-system-tiering-help-command-$line[1]:"
         case $line[1] in
             (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(run-now)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1409,6 +1439,14 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:thurvtl-system-help-tiering-command-$line[1]:"
         case $line[1] in
             (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(run-now)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2220,6 +2258,14 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:thurvtl-help-system-tiering-command-$line[1]:"
         case $line[1] in
             (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(run-now)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3257,6 +3303,8 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands(
 _thurvtl__subcmd__help__subcmd__system__subcmd__tiering_commands() {
     local commands; commands=(
 'plan:Show migrations the tiering policies would trigger' \
+'run-now:Apply the tiering plan now (migrates cartridges)' \
+'status:Summarize tiering\: policy count and pending moves' \
     )
     _describe -t commands 'thurvtl help system tiering commands' commands "$@"
 }
@@ -3264,6 +3312,16 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__tiering_commands() {
 _thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__plan_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system tiering plan commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__run-now_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__run-now_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system tiering run-now commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__status_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system tiering status commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands() {
@@ -3967,6 +4025,8 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands(
 _thurvtl__subcmd__system__subcmd__help__subcmd__tiering_commands() {
     local commands; commands=(
 'plan:Show migrations the tiering policies would trigger' \
+'run-now:Apply the tiering plan now (migrates cartridges)' \
+'status:Summarize tiering\: policy count and pending moves' \
     )
     _describe -t commands 'thurvtl system help tiering commands' commands "$@"
 }
@@ -3974,6 +4034,16 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__tiering_commands() {
 _thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__plan_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help tiering plan commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__run-now_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__run-now_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help tiering run-now commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__status_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help tiering status commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands() {
@@ -4042,6 +4112,8 @@ _thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands()
 _thurvtl__subcmd__system__subcmd__tiering_commands() {
     local commands; commands=(
 'plan:Show migrations the tiering policies would trigger' \
+'run-now:Apply the tiering plan now (migrates cartridges)' \
+'status:Summarize tiering\: policy count and pending moves' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl system tiering commands' commands "$@"
@@ -4050,6 +4122,8 @@ _thurvtl__subcmd__system__subcmd__tiering_commands() {
 _thurvtl__subcmd__system__subcmd__tiering__subcmd__help_commands() {
     local commands; commands=(
 'plan:Show migrations the tiering policies would trigger' \
+'run-now:Apply the tiering plan now (migrates cartridges)' \
+'status:Summarize tiering\: policy count and pending moves' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl system tiering help commands' commands "$@"
@@ -4064,10 +4138,30 @@ _thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__plan_commands()
     local commands; commands=()
     _describe -t commands 'thurvtl system tiering help plan commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__run-now_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__run-now_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering help run-now commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__status_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering help status commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__plan_commands] )) ||
 _thurvtl__subcmd__system__subcmd__tiering__subcmd__plan_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system tiering plan commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__run-now_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__run-now_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering run-now commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__status_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering status commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__verify_commands() {

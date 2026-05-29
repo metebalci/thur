@@ -54,6 +54,9 @@ pub fn dispatch(
         "system.tiering.plan" => {
             tokio::spawn(tiering::run(emitter, body, state));
         }
+        "system.tiering.run" => {
+            tokio::spawn(tiering::run_apply(emitter, body, state));
+        }
         "system.audit.tail" => {
             tokio::spawn(shared_admin_audit::run_tail(
                 emitter,

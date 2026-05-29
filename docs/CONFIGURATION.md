@@ -179,9 +179,14 @@ is in [`S3_BACKENDS.md`](S3_BACKENDS.md).
 A cartridge binds to one backend at create time. Tiering is the
 operator-driven way to re-home it later under a rule instead of by
 hand: a list of placement policies, evaluated against the live
-inventory by `thurvtl system tiering plan`. The section is off by
-default (no policies), and nothing ever moves on its own — `plan`
-only previews; a future `run-now` will execute a reviewed plan.
+inventory. The section is off by default (no policies), and nothing
+ever moves on its own. The workflow is three daemon-routed verbs:
+`thurvtl system tiering plan` previews the migrations the policies
+would trigger (read-only); `system tiering run-now` applies a freshly
+re-evaluated plan, migrating each matching cartridge through the same
+primitive as `cartridge migrate` and auditing each as
+`cartridge.tiered`; `system tiering status` prints a one-line summary
+(policy count + pending moves).
 
 | Key | Default | Meaning |
 |-----|---------|---------|

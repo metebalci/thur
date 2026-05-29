@@ -1779,8 +1779,20 @@ One entry per invocation:
   `local_files_moved`, `source_delete_warnings`, `dry_run`.
 - `cartridge.rebound` — rebind mode. Same params, plus
   `chunks_verified`.
+- `cartridge.tiered` — one entry per cartridge moved by `system tiering
+  run-now` (policy-driven migration). Params on success: `barcode`,
+  `from`, `to`, `chunk_count`, `bytes`. On failure: `barcode`, `from`,
+  `to` with `result: Error(reason)`. Each move reuses the move-mode
+  primitive, so its data movement matches `cartridge.migrated`; the
+  distinct op name records that the move was policy-initiated rather
+  than operator-initiated.
 
 Both Ok and Err paths audited (failures carry `result: Error(reason)`).
+
+Migration of any kind refuses a cartridge under a cloud-native legal
+hold (the hold has no cross-backend transfer path), so neither
+`cartridge migrate` nor `system tiering run-now` can relocate a held
+cartridge.
 
 ### Crash semantics
 

@@ -404,6 +404,26 @@ enum TieringAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Apply the tiering plan now (migrates cartridges).
+    ///
+    /// Daemon-routed. Re-evaluates the policies against current state,
+    /// then migrates each matching cartridge to its target backend via
+    /// the same primitive as `cartridge migrate`. A failed move is
+    /// recorded and the run continues; every attempt is audited
+    /// (`cartridge.tiered`). Exit code is non-zero if any move failed.
+    RunNow {
+        /// Emit the full result as JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Summarize tiering: policy count and pending moves.
+    Status {
+        /// Emit the summary as JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

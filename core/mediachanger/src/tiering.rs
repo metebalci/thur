@@ -161,6 +161,56 @@ pub struct SkippedCartridge {
     pub reason: String,
 }
 
+/// The structured result of a `system tiering run-now`: the moves the
+/// plan proposed, attempted in order, split into successes and
+/// failures. A failed move does not stop the run — each is recorded and
+/// the next is attempted. Carries the plan's exclusions/skips for
+/// context. Cross-process contract, decoded by the CLI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TieringRunReport {
+    /// Number of policies evaluated.
+    pub policies: usize,
+    /// Number of cartridges examined on disk.
+    pub cartridges_scanned: usize,
+    /// Moves that completed.
+    pub migrated: Vec<MigratedReport>,
+    /// Moves that were attempted but failed, with the reason.
+    pub failed: Vec<FailedMove>,
+    /// Barcodes excluded up front because they are under legal hold.
+    pub excluded_legal_hold: Vec<String>,
+    /// Cartridges the plan could not evaluate (unreadable manifest,
+    /// failed legal-hold read, backend unavailable).
+    pub skipped: Vec<SkippedCartridge>,
+}
+
+/// One completed migration in a [`TieringRunReport`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigratedReport {
+    /// Barcode of the migrated cartridge.
+    pub barcode: String,
+    /// Backend it moved from.
+    pub from_backend: String,
+    /// Backend it moved to.
+    pub to_backend: String,
+    /// Chunks copied to the target.
+    pub chunks_copied: u64,
+    /// Bytes copied to the target.
+    pub bytes_copied: u64,
+}
+
+/// One attempted-but-failed migration in a [`TieringRunReport`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailedMove {
+    /// Barcode of the cartridge whose migration failed.
+    pub barcode: String,
+    /// Backend it is (still) on.
+    pub from_backend: String,
+    /// Backend the move targeted.
+    pub to_backend: String,
+    /// Why the move failed (gate refusal or migrate error).
+    pub reason: String,
+}
+
 impl TieringPredicates {
     /// True when every set predicate matches `facts`. An all-unset set
     /// matches everything.

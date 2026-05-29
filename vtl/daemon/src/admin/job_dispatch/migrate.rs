@@ -25,7 +25,9 @@
 
 use std::sync::Arc;
 
-use core_mediachanger::cartridge_migrate::{MigrateMode, MigrateOptions, run_migrate};
+use core_mediachanger::cartridge_migrate::{
+    MigrateMode, MigrateOptions, MigrateReport, run_migrate,
+};
 use core_mediachanger::legal_hold::find_drive_for_loaded_cartridge;
 use core_mediachanger::{AuditActor, AuditResult};
 use serde::Deserialize;
@@ -266,6 +268,104 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             emitter.emit(JobEvent::done_with_error(1, reason)).await;
         }
     }
+}
+
+/// Gates + backend build + `run_migrate` for one cartridge, shared by
+/// the tiering run-now path ([`super::tiering`]). Mirrors the gates the
+/// `cartridge.migrate` job applies inline — not-loaded, source≠target,
+/// WORM→retention — then drives the same `run_migrate` primitive (whose
+/// legal-hold refusal is the hard backstop). Returns the report on
+/// success or a human reason on failure; the caller owns auditing and
+/// terminal job events (the audit op differs: `cartridge.tiered`).
+///
+/// The manual `cartridge.migrate` `run` above keeps its own inline copy
+/// of these gates for its richer per-field error messages and dry-run
+/// reporting; both funnel through `run_migrate`.
+pub(crate) async fn migrate_one(
+    state: &DaemonState,
+    emitter: &JobEmitter,
+    barcode: &str,
+    target_backend: &str,
+    mode: MigrateMode,
+) -> std::result::Result<MigrateReport, String> {
+    match find_drive_for_loaded_cartridge(&state.data_dir, barcode) {
+        Ok(Some(drive_id)) => {
+            return Err(format!(
+                "cartridge '{barcode}' is loaded on drive {drive_id} — unload it first"
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("inventory check: {e}")),
+    }
+
+    let manifest_path = state
+        .data_dir
+        .join("tapes")
+        .join(barcode)
+        .join("manifest.json");
+    let manifest_str = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("read manifest for '{barcode}': {e}"))?;
+    let (source_backend, is_worm) = parse_backend_and_worm(&manifest_str)?;
+
+    if source_backend == target_backend {
+        return Err("source and target backend must differ".to_string());
+    }
+    if is_worm {
+        let target_mode = state.storage_config.retention_mode_named(target_backend);
+        if !target_mode.requires_lock() {
+            return Err(format!(
+                "WORM cartridge cannot migrate to backend '{}' (retention_mode={}); \
+                 target must be governance or compliance",
+                target_backend,
+                target_mode.label()
+            ));
+        }
+    }
+
+    let source = state
+        .storage_config
+        .create_backend_named(&source_backend)
+        .await
+        .map_err(|e| format!("construct source backend '{source_backend}': {e}"))?;
+    let target = state
+        .storage_config
+        .create_backend_named(target_backend)
+        .await
+        .map_err(|e| format!("construct target backend '{target_backend}': {e}"))?;
+
+    // Sync→async progress bridge (same shape as the manual job).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let forwarder = {
+        let em = emitter.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                em.info(msg).await;
+            }
+        })
+    };
+    let progress_cb = move |msg: &str| {
+        let _ = tx.send(msg.to_string());
+    };
+    let tapes_dir = state.data_dir.join("tapes");
+
+    let outcome = run_migrate(MigrateOptions {
+        tapes_dir: &tapes_dir,
+        barcode,
+        source: source.as_ref(),
+        source_name: &source_backend,
+        target: target.as_ref(),
+        target_name: target_backend,
+        mode,
+        dry_run: false,
+        progress: Some(&progress_cb),
+        source_budget: state.pool_budgets.get(&source_backend).cloned(),
+        target_budget: state.pool_budgets.get(target_backend).cloned(),
+    })
+    .await;
+
+    drop(progress_cb);
+    let _ = forwarder.await;
+    outcome.map_err(|e| e.to_string())
 }
 
 async fn preflight(params: &MigrateParams, state: &DaemonState) -> Result<(), String> {

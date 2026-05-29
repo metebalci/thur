@@ -530,6 +530,14 @@ async fn main() -> Result<()> {
                     let code = commands::tiering::cmd_tiering_plan(json).await?;
                     std::process::exit(i32::from(code));
                 }
+                TieringAction::RunNow { json } => {
+                    let code = commands::tiering::cmd_tiering_run(json).await?;
+                    std::process::exit(i32::from(code));
+                }
+                TieringAction::Status { json } => {
+                    let code = commands::tiering::cmd_tiering_status(json).await?;
+                    std::process::exit(i32::from(code));
+                }
             },
             SystemAction::RegenerateCert => {
                 shared_cli_system::cmd_regenerate_cert(
