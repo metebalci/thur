@@ -39,11 +39,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use shared_object_store::ObjectStoreBackend;
+use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
 use shared_pool::{ChunkPool, PoolBudget};
 
 use crate::chunk_index::ChunkIndexFile;
 use crate::errors::{Result, SmcError};
+use crate::legal_hold::manifest_latest_sentinel_key;
 
 /// What migration variant the operator asked for.
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +166,24 @@ impl DedupSlice {
     }
 }
 
+/// Decide whether a legal-hold read permits migration:
+///   - `Ok(true)`  — held → refuse outright (no per-policy override).
+///   - `Ok(false)` — not held → proceed.
+///   - `Err(NotSupported)` — the source backend can't carry a hold
+///     (e.g. `local`), so the cartridge is not held → proceed.
+///   - any other `Err` — fail-safe: refuse to migrate when the hold
+///     state cannot be confirmed (a transient cloud error must not be
+///     read as "not held").
+fn hold_check_permits(result: std::result::Result<bool, ObjectStoreError>) -> Result<()> {
+    match result {
+        Ok(true) => Err(SmcError::InvalidOp(
+            "cartridge is under legal hold; refusing migration",
+        )),
+        Ok(false) | Err(ObjectStoreError::NotSupported(_)) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Run a migration. Returns a populated [`MigrateReport`] on success.
 ///
 /// Failures during the per-chunk copy stage abort the migration before
@@ -202,6 +221,18 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
             "manifest label disagrees with operator-stated barcode",
         ));
     }
+
+    // Legal-hold gate. A held cartridge must never be relocated: the
+    // hold is cloud-native (provider object-lock) with no cross-backend
+    // transfer path, so moving its chunks would silently drop it. Read
+    // the source-side sentinel and refuse if held. Fires before the
+    // dry-run short-circuit so a preview can't claim a held cartridge
+    // is movable. (The tiering planner pre-filters held cartridges; this
+    // is the hard backstop shared by manual `cartridge migrate` and the
+    // tiering run-now path.)
+    let hold_key = manifest_latest_sentinel_key(opts.barcode);
+    hold_check_permits(opts.source.get_object_legal_hold(&hold_key).await)?;
+
     let namespace = slice.dedup.cloud_namespace(opts.barcode);
 
     // Walk chunks.idx, collecting hashes + sizes. We hold the index
@@ -560,4 +591,34 @@ fn shard_pair(hash_hex: &str) -> (&str, &str) {
         "00"
     };
     (s1, s2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_check_refuses_held_cartridge() {
+        let err = hold_check_permits(Ok(true)).unwrap_err();
+        assert!(matches!(err, SmcError::InvalidOp(m) if m.contains("legal hold")));
+    }
+
+    #[test]
+    fn hold_check_permits_unheld_cartridge() {
+        assert!(hold_check_permits(Ok(false)).is_ok());
+    }
+
+    #[test]
+    fn hold_check_treats_not_supported_as_unheld() {
+        // A local backend can't carry a cloud-native hold.
+        let r = hold_check_permits(Err(ObjectStoreError::NotSupported("local".into())));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn hold_check_fails_safe_on_other_errors() {
+        // A transient read failure must NOT be read as "not held".
+        let err = hold_check_permits(Err(ObjectStoreError::Network("timeout".into()))).unwrap_err();
+        assert!(matches!(err, SmcError::ObjectStoreError(_)));
+    }
 }
