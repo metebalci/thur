@@ -54,7 +54,7 @@
 //! the worker just smooths the dirty-page queue under sustained
 //! write workloads.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -93,24 +93,55 @@ enum PageState {
 }
 
 struct CacheEntry {
-    bytes: Vec<u8>,
+    /// Page body behind an `Arc` so the read path (and the
+    /// eviction / flush snapshots) clone a pointer, not the whole
+    /// 64 KiB page. In-place mutation goes through `Arc::make_mut`:
+    /// when the body is uniquely held (the common case) it mutates
+    /// without copying; when a reader still holds an off-lock clone
+    /// it copies-on-write, so the reader keeps a consistent
+    /// pre-mutation snapshot and never sees a torn page.
+    bytes: Arc<Vec<u8>>,
     state: PageState,
     /// Monotonic write counter. Bumped on every dirtying mutation so
     /// a flush can detect that the bytes it captured are stale by
     /// the time it tries to mark the entry clean — in that case the
     /// page stays dirty and the next flush picks up the latest copy.
     version: u64,
+    /// Intrusive LRU links. `newer` points toward the MRU (head) end
+    /// — the neighbor used more recently than this page; `older`
+    /// points toward the LRU (tail) end. The head's `newer` and the
+    /// tail's `older` are both `None`. A page that is present in
+    /// `pages` but absent from the list (transiently, e.g. just
+    /// inserted) also has both `None` and is not the head — see
+    /// [`CacheInner::lru_unlink`] for how that case is distinguished.
+    newer: Option<PageId>,
+    older: Option<PageId>,
 }
 
 struct CacheInner {
     /// Live page cache. `None` is never stored — pages are either
     /// in this map or absent (treated as unallocated when read
-    /// without a prior load).
+    /// without a prior load). Each entry carries its own intrusive
+    /// LRU links (`newer` / `older`), so the recency list is the set
+    /// of entries themselves — there is no parallel structure to keep
+    /// in sync or to drift.
     pages: HashMap<PageId, CacheEntry>,
-    /// LRU ring — front is most-recently-used, back is least. O(n)
-    /// per touch but n is bounded by the page budget (~1024) so the
-    /// constant factor is tiny.
-    lru: VecDeque<PageId>,
+    /// MRU end of the intrusive LRU list (the most-recently-touched
+    /// page). `None` iff the cache is empty.
+    lru_head: Option<PageId>,
+    /// LRU end of the intrusive LRU list (the eviction victim). `None`
+    /// iff the cache is empty.
+    ///
+    /// An intrusive doubly-linked list replaces the former
+    /// `VecDeque<PageId>` so that touch / remove are O(1) rather than
+    /// an O(n) scan-and-shift. n is bounded by the page budget, which
+    /// is ~1024 at the 64 KiB-page default but scales with
+    /// `cache.budget_mb`: a multi-GiB budget puts tens of thousands of
+    /// pages on the list, where an O(n) touch on every cache hit would
+    /// dominate the read path. The clean-only eviction pick still
+    /// walks from the tail (O(k) in the number of trailing dirty
+    /// pages), unchanged from before.
+    lru_tail: Option<PageId>,
     /// Set of dirty page ids — separate index so the flush worker
     /// doesn't walk every cached page on every tick.
     dirty: BTreeSet<PageId>,
@@ -120,31 +151,96 @@ impl CacheInner {
     fn new() -> Self {
         Self {
             pages: HashMap::new(),
-            lru: VecDeque::new(),
+            lru_head: None,
+            lru_tail: None,
             dirty: BTreeSet::new(),
         }
     }
 
-    fn lru_touch(&mut self, page_id: PageId) {
-        if let Some(pos) = self.lru.iter().position(|&p| p == page_id) {
-            self.lru.remove(pos);
+    /// Detach `page_id` from the intrusive LRU list, patching its
+    /// neighbors and the head / tail sentinels. Safe to call on a page
+    /// that is absent or already detached — it is then a no-op (a
+    /// detached entry is neither the head nor carries any link, so it
+    /// cannot be confused with the sole linked element, whose links
+    /// are also both `None` but which *is* the head). After return the
+    /// entry's own links are cleared so a later push re-links cleanly.
+    fn lru_unlink(&mut self, page_id: PageId) {
+        let (newer, older) = match self.pages.get(&page_id) {
+            Some(e) => (e.newer, e.older),
+            None => return,
+        };
+        // Not in the list: no links and not the head. Bail before
+        // touching head/tail, which would corrupt an otherwise valid
+        // list.
+        if newer.is_none() && older.is_none() && self.lru_head != Some(page_id) {
+            return;
         }
-        self.lru.push_front(page_id);
+        match newer {
+            Some(n) => {
+                if let Some(e) = self.pages.get_mut(&n) {
+                    e.older = older;
+                }
+            }
+            None => self.lru_head = older,
+        }
+        match older {
+            Some(o) => {
+                if let Some(e) = self.pages.get_mut(&o) {
+                    e.newer = newer;
+                }
+            }
+            None => self.lru_tail = newer,
+        }
+        if let Some(e) = self.pages.get_mut(&page_id) {
+            e.newer = None;
+            e.older = None;
+        }
     }
 
-    fn lru_remove(&mut self, page_id: PageId) {
-        if let Some(pos) = self.lru.iter().position(|&p| p == page_id) {
-            self.lru.remove(pos);
+    /// Link `page_id` at the MRU (head) end. The entry must already be
+    /// present in `pages` and currently detached (both links `None`).
+    fn lru_push_front(&mut self, page_id: PageId) {
+        let old_head = self.lru_head;
+        match self.pages.get_mut(&page_id) {
+            Some(e) => {
+                e.newer = None;
+                e.older = old_head;
+            }
+            None => return,
         }
+        match old_head {
+            Some(h) => {
+                if let Some(e) = self.pages.get_mut(&h) {
+                    e.newer = Some(page_id);
+                }
+            }
+            // List was empty — this page is now both head and tail.
+            None => self.lru_tail = Some(page_id),
+        }
+        self.lru_head = Some(page_id);
+    }
+
+    /// Move `page_id` to the MRU end. O(1): a no-op fast path when the
+    /// page is already the head, otherwise an unlink + push-front.
+    /// Correct whether the page was already linked or freshly inserted
+    /// and still detached (`lru_unlink` no-ops on the latter).
+    fn lru_touch(&mut self, page_id: PageId) {
+        if self.lru_head == Some(page_id) {
+            return;
+        }
+        self.lru_unlink(page_id);
+        self.lru_push_front(page_id);
     }
 
     /// Drop a cached page entry and clear both side indexes (LRU +
     /// dirty set). Centralizes the invariant that every entry removal
-    /// keeps `pages`, `lru`, and `dirty` consistent. Returns whether an
-    /// entry was actually present.
+    /// keeps `pages`, the LRU list, and `dirty` consistent. Unlinks
+    /// before removing from `pages` because the LRU links live inside
+    /// the entry. Returns whether an entry was actually present.
     fn drop_entry(&mut self, page_id: PageId) -> bool {
-        if self.pages.remove(&page_id).is_some() {
-            self.lru_remove(page_id);
+        if self.pages.contains_key(&page_id) {
+            self.lru_unlink(page_id);
+            self.pages.remove(&page_id);
             self.dirty.remove(&page_id);
             true
         } else {
@@ -153,24 +249,38 @@ impl CacheInner {
     }
 
     /// Find the LRU page id, optionally restricted to clean entries.
-    /// Returns `None` if the cache is empty (or no clean entries
-    /// when `clean_only`).
+    /// Walks from the tail (LRU end) toward the head. Returns `None`
+    /// if the cache is empty (or no clean entries when `clean_only`).
     fn lru_pick(&self, clean_only: bool) -> Option<PageId> {
-        for &pid in self.lru.iter().rev() {
-            if !clean_only {
+        let mut cur = self.lru_tail;
+        while let Some(pid) = cur {
+            let entry = self.pages.get(&pid)?;
+            if !clean_only || entry.state == PageState::Clean {
                 return Some(pid);
             }
-            if matches!(
-                self.pages.get(&pid),
-                Some(CacheEntry {
-                    state: PageState::Clean,
-                    ..
-                })
-            ) {
-                return Some(pid);
-            }
+            cur = entry.newer;
         }
         None
+    }
+
+    /// Test-only: collect the LRU order, head (MRU) first, walking via
+    /// the `older` links. Lets the unit tests assert the intrusive
+    /// list's shape without reaching into private link fields.
+    #[cfg(test)]
+    fn lru_order(&self) -> Vec<PageId> {
+        let mut out = Vec::new();
+        let mut cur = self.lru_head;
+        // Bound the walk by the entry count so a (bug-induced) cycle
+        // can't loop forever; an over-long walk yields a wrong vec
+        // that the caller's assertion then flags.
+        while let Some(pid) = cur {
+            out.push(pid);
+            if out.len() > self.pages.len() {
+                break;
+            }
+            cur = self.pages.get(&pid).and_then(|e| e.older);
+        }
+        out
     }
 }
 
@@ -474,7 +584,8 @@ impl PageCache {
             let chunk = std::cmp::min(data.len() - consumed, page_bytes - off_in_page);
             let slice = &data[consumed..consumed + chunk];
             if off_in_page == 0 && chunk == page_bytes {
-                self.install_full_page(page_id, slice.to_vec()).await?;
+                self.install_full_page(page_id, Arc::new(slice.to_vec()))
+                    .await?;
             } else {
                 self.modify_page(page_id, off_in_page, slice).await?;
             }
@@ -806,16 +917,17 @@ impl PageCache {
     // Cache primitives (private — invariants enforced here).
     // -------------------------------------------------------------
 
-    /// Return a clone of the page's current bytes, populating the
-    /// cache from the writer if necessary. Unallocated pages
+    /// Return the page's current bytes (as a shared `Arc`), populating
+    /// the cache from the writer if necessary. Cloning the returned
+    /// handle is a refcount bump, not a 64 KiB copy. Unallocated pages
     /// materialize as a zeroed buffer (and stay marked Clean — the
     /// page index entry is still absent).
-    async fn acquire_page(&self, page_id: PageId) -> Result<Vec<u8>, UploaderError> {
+    async fn acquire_page(&self, page_id: PageId) -> Result<Arc<Vec<u8>>, UploaderError> {
         // Hot path: cache hit.
         {
             let mut inner = self.inner.lock().await;
             if let Some(entry) = inner.pages.get(&page_id) {
-                let bytes = entry.bytes.clone();
+                let bytes = Arc::clone(&entry.bytes);
                 inner.lru_touch(page_id);
                 return Ok(bytes);
             }
@@ -839,6 +951,7 @@ impl PageCache {
                 page_size: self.page_size as u32,
             });
         }
+        let bytes = Arc::new(bytes);
 
         // Make room for the new entry. `evict_to_fit` releases the
         // inner lock during any required cloud upload, so concurrent
@@ -850,19 +963,21 @@ impl PageCache {
         // (possibly Dirty) bytes — those are the live state.
         let mut inner = self.inner.lock().await;
         if let Some(entry) = inner.pages.get(&page_id) {
-            let cached = entry.bytes.clone();
+            let cached = Arc::clone(&entry.bytes);
             inner.lru_touch(page_id);
             return Ok(cached);
         }
         inner.pages.insert(
             page_id,
             CacheEntry {
-                bytes: bytes.clone(),
+                bytes: Arc::clone(&bytes),
                 state: PageState::Clean,
                 version: 0,
+                newer: None,
+                older: None,
             },
         );
-        inner.lru.push_front(page_id);
+        inner.lru_touch(page_id);
         Ok(bytes)
     }
 
@@ -872,7 +987,7 @@ impl PageCache {
     async fn install_full_page(
         &self,
         page_id: PageId,
-        bytes: Vec<u8>,
+        bytes: Arc<Vec<u8>>,
     ) -> Result<(), UploaderError> {
         if bytes.len() != self.page_size as usize {
             return Err(UploaderError::PageSizeMismatch {
@@ -890,9 +1005,11 @@ impl PageCache {
         }
         let mut inner = self.inner.lock().await;
         let entry = inner.pages.entry(page_id).or_insert(CacheEntry {
-            bytes: Vec::new(),
+            bytes: Arc::new(Vec::new()),
             state: PageState::Clean,
             version: 0,
+            newer: None,
+            older: None,
         });
         entry.bytes = bytes;
         entry.state = PageState::Dirty;
@@ -915,11 +1032,15 @@ impl PageCache {
         bytes: &[u8],
     ) -> Result<(), UploaderError> {
         debug_assert!(offset + bytes.len() <= self.page_size as usize);
-        // Fast path: already in cache.
+        // Fast path: already in cache. `Arc::make_mut` mutates the
+        // body in place when it is uniquely held (the common case);
+        // if an off-lock reader still holds a clone it copies-on-write
+        // so that reader keeps its consistent snapshot.
         {
             let mut inner = self.inner.lock().await;
             if let Some(entry) = inner.pages.get_mut(&page_id) {
-                entry.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                Arc::make_mut(&mut entry.bytes)[offset..offset + bytes.len()]
+                    .copy_from_slice(bytes);
                 entry.state = PageState::Dirty;
                 entry.version = entry.version.wrapping_add(1);
                 inner.dirty.insert(page_id);
@@ -945,7 +1066,7 @@ impl PageCache {
                 size_bytes: self.size_bytes(),
             }
         })?;
-        entry.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Arc::make_mut(&mut entry.bytes)[offset..offset + bytes.len()].copy_from_slice(bytes);
         entry.state = PageState::Dirty;
         entry.version = entry.version.wrapping_add(1);
         inner.dirty.insert(page_id);
@@ -988,28 +1109,28 @@ impl PageCache {
         loop {
             // Snapshot a candidate under the lock. Either consume
             // the clean drop here (no cloud IO needed) or hand back
-            // a dirty-page snapshot for the off-lock flush below.
-            #[allow(clippy::large_enum_variant)]
+            // a dirty-page snapshot for the off-lock flush below. The
+            // dirty snapshot is an `Arc` clone (a refcount bump), so
+            // the lock is held only long enough to pick the victim.
             enum Step {
                 Done,
                 Cleaned,
-                Dirty(PageId, Vec<u8>, u64),
+                Dirty(PageId, Arc<Vec<u8>>, u64),
             }
             let step = {
                 let mut inner = self.inner.lock().await;
                 if inner.pages.len() + wanted <= self.budget_pages {
                     Step::Done
                 } else if let Some(pid) = inner.lru_pick(true) {
-                    inner.pages.remove(&pid);
-                    inner.lru_remove(pid);
+                    inner.drop_entry(pid);
                     Step::Cleaned
                 } else if let Some(pid) = inner.lru_pick(false) {
                     match inner.pages.get(&pid) {
-                        Some(entry) => Step::Dirty(pid, entry.bytes.clone(), entry.version),
+                        Some(entry) => Step::Dirty(pid, Arc::clone(&entry.bytes), entry.version),
                         None => {
                             // LRU pointed at a missing entry —
                             // structural drift, clean up and retry.
-                            inner.lru_remove(pid);
+                            inner.lru_unlink(pid);
                             inner.dirty.remove(&pid);
                             continue;
                         }
@@ -1034,7 +1155,7 @@ impl PageCache {
                     // batched `fdatasync`. Eviction itself doesn't
                     // owe the host durability — the host hasn't
                     // issued SYNC for these bytes.
-                    match self.writer.write_page_unsynced(pid, &bytes).await {
+                    match self.writer.write_page_unsynced(pid, bytes.as_slice()).await {
                         Ok(out) => {
                             // Inline-upload path returns Some(n);
                             // async path returns None (the worker
@@ -1047,9 +1168,7 @@ impl PageCache {
                             let mut inner = self.inner.lock().await;
                             match inner.pages.get(&pid) {
                                 Some(entry) if entry.version == version => {
-                                    inner.pages.remove(&pid);
-                                    inner.lru_remove(pid);
-                                    inner.dirty.remove(&pid);
+                                    inner.drop_entry(pid);
                                 }
                                 Some(_) => {
                                     // Got rewritten between snapshot
@@ -1064,8 +1183,9 @@ impl PageCache {
                                 }
                                 None => {
                                     // Someone else dropped it
-                                    // already — fine.
-                                    inner.lru_remove(pid);
+                                    // already — fine. `lru_unlink`
+                                    // no-ops on an absent entry.
+                                    inner.lru_unlink(pid);
                                     inner.dirty.remove(&pid);
                                 }
                             }
@@ -1178,12 +1298,16 @@ impl PageCache {
             let inner = self.inner.lock().await;
             match inner.pages.get(&page_id) {
                 Some(entry) if entry.state == PageState::Dirty => {
-                    (entry.bytes.clone(), entry.version)
+                    (Arc::clone(&entry.bytes), entry.version)
                 }
                 _ => return Ok(false),
             }
         };
-        match self.writer.write_page_unsynced(page_id, &bytes).await {
+        match self
+            .writer
+            .write_page_unsynced(page_id, bytes.as_slice())
+            .await
+        {
             Ok(out) => {
                 // Inline-upload path returns Some(n); async path
                 // returns None (the worker bumps the counter after
@@ -1245,11 +1369,12 @@ async fn clone_one_page_into(
     if std::ptr::eq(src, dst) && src_id == dst_id {
         return Ok(());
     }
-    // Case 1: source dirty in cache.
+    // Case 1: source dirty in cache. The snapshot is an `Arc` clone
+    // (refcount bump) shared straight into the destination entry.
     let src_dirty_bytes = {
         let inner = src.inner.lock().await;
         match inner.pages.get(&src_id) {
-            Some(e) if e.state == PageState::Dirty => Some(e.bytes.clone()),
+            Some(e) if e.state == PageState::Dirty => Some(Arc::clone(&e.bytes)),
             _ => None,
         }
     };
@@ -2397,5 +2522,337 @@ mod tests {
 
         let read = c_dst.read_bytes(0, PAGE).await.unwrap();
         assert_eq!(read, bytes);
+    }
+
+    // ─────────────────────── intrusive LRU coverage ───────────────────────
+    //
+    // Direct unit tests of the O(1) intrusive doubly-linked list in
+    // `CacheInner`. The cache-level tests above exercise it indirectly
+    // through eviction; these pin the data-structure invariants
+    // (head/tail sentinels, link consistency on touch / drop / pick)
+    // so a future refactor can't quietly corrupt the list.
+
+    fn push_page(inner: &mut CacheInner, pid: PageId, state: PageState) {
+        inner.pages.insert(
+            pid,
+            CacheEntry {
+                bytes: Arc::new(Vec::new()),
+                state,
+                version: 0,
+                newer: None,
+                older: None,
+            },
+        );
+        if state == PageState::Dirty {
+            inner.dirty.insert(pid);
+        }
+        inner.lru_touch(pid);
+    }
+
+    /// Assert the cache-internal head/tail sentinels agree with the
+    /// head→tail walk: head is the first element, tail the last.
+    fn assert_list_consistent(inner: &CacheInner) {
+        let order = inner.lru_order();
+        assert_eq!(inner.lru_head, order.first().copied());
+        assert_eq!(inner.lru_tail, order.last().copied());
+    }
+
+    #[test]
+    fn lru_touch_orders_most_recent_first() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Clean);
+        push_page(&mut inner, 2, PageState::Clean);
+        push_page(&mut inner, 3, PageState::Clean);
+        // Inserted 1,2,3 → MRU order is 3,2,1.
+        assert_eq!(inner.lru_order(), vec![3, 2, 1]);
+        assert_list_consistent(&inner);
+
+        // Touch the tail → it moves to the head.
+        inner.lru_touch(1);
+        assert_eq!(inner.lru_order(), vec![1, 3, 2]);
+        assert_list_consistent(&inner);
+
+        // Touch a middle node.
+        inner.lru_touch(3);
+        assert_eq!(inner.lru_order(), vec![3, 1, 2]);
+        assert_list_consistent(&inner);
+
+        // Touch the current head → no-op fast path.
+        inner.lru_touch(3);
+        assert_eq!(inner.lru_order(), vec![3, 1, 2]);
+        assert_list_consistent(&inner);
+    }
+
+    #[test]
+    fn lru_pick_returns_tail_and_skips_dirty_when_clean_only() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Dirty);
+        push_page(&mut inner, 2, PageState::Clean);
+        push_page(&mut inner, 3, PageState::Dirty);
+        // Order MRU→LRU: 3,2,1. Tail (LRU) is page 1.
+        assert_eq!(inner.lru_pick(false), Some(1));
+        // clean_only walks from the tail (1 dirty → 2 clean) and stops
+        // at the least-recently-used CLEAN page.
+        assert_eq!(inner.lru_pick(true), Some(2));
+    }
+
+    #[test]
+    fn lru_pick_clean_only_none_when_all_dirty() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Dirty);
+        push_page(&mut inner, 2, PageState::Dirty);
+        assert_eq!(inner.lru_pick(true), None);
+        assert_eq!(inner.lru_pick(false), Some(1));
+    }
+
+    #[test]
+    fn drop_entry_from_head_middle_tail_keeps_list_consistent() {
+        // Drop the middle node.
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Clean);
+        push_page(&mut inner, 2, PageState::Clean);
+        push_page(&mut inner, 3, PageState::Clean);
+        assert!(inner.drop_entry(2));
+        assert_eq!(inner.lru_order(), vec![3, 1]);
+        assert_list_consistent(&inner);
+
+        // Drop the head, then the tail.
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Clean);
+        push_page(&mut inner, 2, PageState::Clean);
+        push_page(&mut inner, 3, PageState::Clean);
+        assert!(inner.drop_entry(3)); // head
+        assert_eq!(inner.lru_order(), vec![2, 1]);
+        assert_list_consistent(&inner);
+        assert!(inner.drop_entry(1)); // tail
+        assert_eq!(inner.lru_order(), vec![2]);
+        assert_list_consistent(&inner);
+    }
+
+    #[test]
+    fn drop_entry_sole_element_empties_list() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 7, PageState::Dirty);
+        assert_eq!(inner.lru_head, Some(7));
+        assert_eq!(inner.lru_tail, Some(7));
+        assert!(inner.drop_entry(7));
+        assert!(inner.lru_order().is_empty());
+        assert_eq!(inner.lru_head, None);
+        assert_eq!(inner.lru_tail, None);
+        assert!(!inner.dirty.contains(&7));
+    }
+
+    #[test]
+    fn drop_entry_absent_returns_false_and_leaves_list_intact() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Clean);
+        push_page(&mut inner, 2, PageState::Clean);
+        assert!(!inner.drop_entry(99));
+        assert_eq!(inner.lru_order(), vec![2, 1]);
+        assert_list_consistent(&inner);
+    }
+
+    #[test]
+    fn lru_unlink_is_noop_for_absent_and_detached_entries() {
+        let mut inner = CacheInner::new();
+        push_page(&mut inner, 1, PageState::Clean);
+        push_page(&mut inner, 2, PageState::Clean);
+        // Absent page id: no-op.
+        inner.lru_unlink(99);
+        assert_eq!(inner.lru_order(), vec![2, 1]);
+
+        // Present-but-detached entry (inserted without linking): the
+        // guard must not mistake its all-None links for the sole-head
+        // case and clobber the live head/tail.
+        inner.pages.insert(
+            3,
+            CacheEntry {
+                bytes: Arc::new(Vec::new()),
+                state: PageState::Clean,
+                version: 0,
+                newer: None,
+                older: None,
+            },
+        );
+        inner.lru_unlink(3);
+        assert_eq!(inner.lru_order(), vec![2, 1]);
+        assert_list_consistent(&inner);
+    }
+
+    #[tokio::test]
+    async fn read_updates_lru_recency_so_eviction_spares_recently_read_page() {
+        // End-to-end proof that a READ updates recency through the
+        // intrusive touch on the hot path. Budget = 2 pages.
+        //
+        //   write 0, write 1  → cache [1 MRU, 0 LRU], both dirty
+        //   read 0            → 0 becomes MRU → [0 MRU, 1 LRU]
+        //   write 2           → eviction victim is the LRU = page 1
+        //
+        // So page 1 (not page 0) gets flushed out, even though page 0
+        // was written first.
+        let tmp = TempDir::new().unwrap();
+        let cloud = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        VolumeManifest::new(
+            "vol1".into(),
+            8 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let writer = Arc::new(VolumeWriter::open(tmp.path(), "vol1", backend).unwrap());
+        let cache = PageCache::with_budget(writer.clone(), 2 * PAGE as u64);
+
+        cache.write_bytes(0, &pattern(0, PAGE)).await.unwrap();
+        cache
+            .write_bytes(PAGE as u64, &pattern(1, PAGE))
+            .await
+            .unwrap();
+        // Touch page 0 via a read so it is no longer the LRU.
+        let _ = cache.read_bytes(0, PAGE).await.unwrap();
+        // This write forces eviction of the now-LRU page (page 1).
+        cache
+            .write_bytes(2 * PAGE as u64, &pattern(2, PAGE))
+            .await
+            .unwrap();
+
+        assert!(
+            writer.page_index().get(1).unwrap().is_some(),
+            "page 1 (least recently used) must have been evicted + flushed"
+        );
+        assert!(
+            writer.page_index().get(0).unwrap().is_none(),
+            "page 0 (recently read) must still be dirty in cache, not evicted"
+        );
+        // And page 0 still reads back correctly from cache.
+        assert_eq!(cache.read_bytes(0, PAGE).await.unwrap(), pattern(0, PAGE));
+    }
+
+    // ─────────────────────── Arc copy-on-write isolation ───────────────────────
+
+    #[tokio::test]
+    async fn mutating_arc_shared_source_after_clone_does_not_corrupt_destination() {
+        // Change (1)'s headline invariant. A dirty source page is
+        // Arc-shared into the destination by `clone_one_page_into`
+        // Case 1 (the destination entry holds an `Arc::clone` of the
+        // source body, refcount 2). A later sub-page WRITE to the
+        // source goes through `Arc::make_mut`, which must copy-on-write
+        // — leaving the destination's view at the pre-mutation bytes.
+        // A regression to an aliasing in-place mutation would corrupt
+        // the destination; a regression to `Arc::get_mut().unwrap()`
+        // would panic. Either way this test fails.
+        let (_tmp, cache, _w) = fixture_cache(8 * (1u64 << 20)).await;
+        let src = pattern(0x5A, PAGE);
+        cache.write_bytes(0, &src).await.unwrap();
+        let dst_off = 4 * PAGE as u64;
+        // Source is dirty (not synced) → Case 1 shares the Arc.
+        cache
+            .clone_page_range(0, dst_off, PAGE as u64)
+            .await
+            .unwrap();
+
+        // Overwrite the source's first sector AFTER the clone.
+        let overwrite = vec![0xFF; SECTOR];
+        cache.write_bytes(0, &overwrite).await.unwrap();
+
+        // Destination must still equal the ORIGINAL source bytes — the
+        // copy-on-write split kept the two views independent.
+        let dst = cache.read_bytes(dst_off, PAGE).await.unwrap();
+        assert_eq!(
+            dst, src,
+            "make_mut must copy-on-write; destination must not observe the source's later write"
+        );
+        // Source reflects the overwrite in its first sector.
+        let s0 = cache.read_bytes(0, SECTOR).await.unwrap();
+        assert_eq!(s0, overwrite);
+    }
+
+    // ─────────────────── eviction version-race recovery ───────────────────
+
+    #[tokio::test]
+    async fn eviction_losing_version_race_keeps_page_dirty_with_latest_bytes() {
+        // Exercises the "Some(_) lost the race" arm of `evict_to_fit`:
+        // a dirty page is snapshotted for eviction, the lock is dropped
+        // for the (slow) cloud upload, and a concurrent host write
+        // re-dirties that same page mid-upload (bumping its version).
+        // On re-lock the eviction must NOT drop the page — it leaves it
+        // dirty so the latest bytes survive, and evicts a different
+        // victim instead.
+        let tmp = TempDir::new().unwrap();
+        let cloud = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        let delaying = DelayingBackend::new(Arc::clone(&local), Duration::from_millis(200));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
+        VolumeManifest::new(
+            "vol1".into(),
+            8 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let writer = Arc::new(VolumeWriter::open(tmp.path(), "vol1", backend).unwrap());
+        let cache = PageCache::with_budget_and_concurrency(Arc::clone(&writer), 2 * PAGE as u64, 1);
+
+        // Pre-fill pages 0 and 1 dirty; LRU order is [1 MRU, 0 LRU] so
+        // page 0 is the first eviction victim.
+        cache.write_bytes(0, &pattern(0, PAGE)).await.unwrap();
+        cache
+            .write_bytes(PAGE as u64, &pattern(1, PAGE))
+            .await
+            .unwrap();
+
+        // Writing page 2 forces eviction of the LRU (page 0); its
+        // upload blocks ~200 ms with the inner lock released.
+        let evicting_cache = Arc::clone(&cache);
+        let evicting = tokio::spawn(async move {
+            evicting_cache
+                .write_bytes(2 * PAGE as u64, &pattern(2, PAGE))
+                .await
+                .unwrap();
+        });
+
+        // Re-dirty page 0 while its stale eviction upload is in flight:
+        // bumps page 0's version and moves it to the MRU end.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let latest = vec![0xEE; SECTOR];
+        cache.write_bytes(0, &latest).await.unwrap();
+
+        evicting.await.unwrap();
+
+        // Page 0 lost the race: it must still be dirty in cache holding
+        // the latest bytes (the stale eviction did not drop it).
+        {
+            let inner = cache.inner.lock().await;
+            assert!(
+                inner.dirty.contains(&0),
+                "re-dirtied page 0 must survive the lost eviction race"
+            );
+        }
+        let s0 = cache.read_bytes(0, SECTOR).await.unwrap();
+        assert_eq!(
+            s0, latest,
+            "page 0 must hold the re-dirtied bytes, not the evicted snapshot"
+        );
+        // The eviction made progress on a different victim instead:
+        // page 1 was flushed out.
+        assert!(
+            writer.page_index().get(1).unwrap().is_some(),
+            "eviction must fall through to page 1 after losing the race on page 0"
+        );
     }
 }
