@@ -1981,13 +1981,17 @@ async fn run_disk_cache_eviction_worker(
     backstop.tick().await; // skip immediate first tick at startup
 
     let backend_names: Vec<String> = cfg.storage.backend_names();
+    // Budget divergence detector cadence — see `reconcile` below. The
+    // worker wakes on every upload-completion notify (frequent under
+    // load), so the reconcile is gated on elapsed wall-time, not wakeup
+    // count, to keep the full walk to ~once per hour regardless.
+    let mut last_reconcile = std::time::Instant::now();
 
     loop {
         tokio::select! {
             _ = notify.notified() => {
                 // Coalesce additional notifies from the same upload
-                // batch before doing the (relatively expensive) full
-                // pool walk.
+                // batch before doing the eviction pass.
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             _ = backstop.tick() => {}
@@ -2005,6 +2009,16 @@ async fn run_disk_cache_eviction_worker(
             cfg.disk_cache.size_gb,
             cfg.disk_cache.bounds(),
         );
+
+        // Once per `BUDGET_RECONCILE_INTERVAL`, do one full-pool walk per
+        // backend purely to confirm the O(1) budget-derived usage still
+        // matches on-disk reality, warning if an un-instrumented mutation
+        // site leaked drift (#49). The only place the removed per-tick
+        // walk still happens — far less often than the eviction wakeup.
+        let reconcile = last_reconcile.elapsed() >= shared_disk_evict::BUDGET_RECONCILE_INTERVAL;
+        if reconcile {
+            last_reconcile = std::time::Instant::now();
+        }
 
         // Per-backend DiskCacheManagers. Each manager is scoped to one
         // named backend and evicts down to *that backend's* cap (read
@@ -2032,12 +2046,27 @@ async fn run_disk_cache_eviction_worker(
 
         for mut cm in managers {
             let backend = cm.backend_name().to_string();
-            // Offload the blocking pool walk (fs::read_dir + full chunk
-            // walk) to a blocking thread so it doesn't stall the async
-            // runtime; hand the manager back out.
-            let (cm_ret, usage) = match tokio::task::spawn_blocking(move || {
-                let u = cm.calculate_usage();
-                (cm, u)
+            let cap = cm.capacity();
+            let budget = pool_budgets.get(&backend).cloned();
+            let has_budget = budget.is_some();
+            // Per-tick usage is now an O(1) budget read plus a cheap
+            // staging walk, not a full O(total-chunks) pool rescan (#49).
+            // The budget is exact across every pool mutation site
+            // (seal / eviction / GC / read-miss refetch / prefetch /
+            // migrate); the only term it omits is pre-seal `.staging/`
+            // bytes, which `staging_bytes` (O(num_cartridges)) adds back.
+            // Defensive fallback: if no budget is wired for this backend
+            // (shouldn't happen in the daemon), fall back to the old full
+            // `calculate_usage` walk so behavior is preserved exactly.
+            // The blocking fs work is offloaded to a blocking thread; the
+            // manager is handed back out.
+            let (cm_ret, fs_res) = match tokio::task::spawn_blocking(move || {
+                let r = if has_budget {
+                    cm.staging_bytes()
+                } else {
+                    cm.calculate_usage()
+                };
+                (cm, r)
             })
             .await
             {
@@ -2048,8 +2077,8 @@ async fn run_disk_cache_eviction_worker(
                 }
             };
             cm = cm_ret;
-            let used = match usage {
-                Ok(u) => u,
+            let fs_val = match fs_res {
+                Ok(v) => v,
                 Err(e) => {
                     warn!(
                         "Cache usage calculation for backend '{}' failed: {e}",
@@ -2058,12 +2087,27 @@ async fn run_disk_cache_eviction_worker(
                     continue;
                 }
             };
-            let cap = cm.capacity();
-            // Within-budget log + soft-watermark alert (shared with VSA).
-            let needs_evict = match pool_budgets.get(&backend) {
-                Some(budget) => {
-                    shared_disk_evict::check_usage_or_alert(&backend, used, cap, budget)
+            // With a budget: usage = budget.current_bytes() + staging.
+            // Without: `fs_val` is the full-walk total already.
+            let used = match budget.as_ref() {
+                Some(b) => b.current_bytes().saturating_add(fs_val),
+                None => fs_val,
+            };
+            cm.set_current_usage(used);
+            // Low-cadence safety reconcile: a full walk's total includes
+            // staging, so it lines up with `used` (budget + staging).
+            // Warn if they diverge beyond tolerance (detection only).
+            if reconcile && budget.is_some() {
+                let mut cm_r = DiskCacheManager::new(data_dir.clone(), &backend, cap);
+                if let Ok(Ok(actual)) =
+                    tokio::task::spawn_blocking(move || cm_r.calculate_usage()).await
+                {
+                    shared_disk_evict::warn_on_budget_divergence(&backend, used, actual);
                 }
+            }
+            // Within-budget log + soft-watermark alert (shared with VSA).
+            let needs_evict = match budget.as_ref() {
+                Some(b) => shared_disk_evict::check_usage_or_alert(&backend, used, cap, b),
                 None => used > cap,
             };
             if !needs_evict {

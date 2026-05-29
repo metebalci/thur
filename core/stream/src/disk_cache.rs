@@ -195,6 +195,55 @@ impl DiskCacheManager {
         Ok(total_bytes)
     }
 
+    /// Seed `current_bytes` directly from the authoritative per-backend
+    /// `PoolBudget` plus the live staging total (O(num_cartridges), not
+    /// O(total-chunks)) instead of the full [`Self::calculate_usage`]
+    /// pool walk. The eviction worker calls this every tick now that the
+    /// budget is exact across every pool mutation site (seal, eviction,
+    /// GC, read-miss refetch, prefetch, migrate) — see issue #49. The
+    /// budget excludes pre-seal `.staging/` bytes, so the worker adds
+    /// [`Self::staging_bytes`] back to preserve the old usage figure
+    /// exactly. `evict_lru_chunks` reads this to size the work; its
+    /// candidate enumeration walk still runs, but only when over cap.
+    pub fn set_current_usage(&mut self, bytes: u64) {
+        self.current_bytes = bytes;
+    }
+
+    /// Sum the bytes of unsealed chunks sitting in each cartridge's
+    /// `.staging/` dir for this backend. This is the only term the
+    /// per-backend `PoolBudget` does not already track (the budget
+    /// reserve fires at seal time, when the staging file is renamed
+    /// into the pool). Walking only `tapes/<barcode>/.staging/` is
+    /// O(num_cartridges) — bounded by the chassis cartridge count, not
+    /// the pool's chunk count — so it stays cheap on every eviction
+    /// tick, unlike the full [`Self::calculate_usage`] pool walk it
+    /// replaces. Cartridges bound to other backends are skipped.
+    pub fn staging_bytes(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        let tapes_dir = self.data_dir.join("tapes");
+        if !tapes_dir.is_dir() {
+            return Ok(0);
+        }
+        for entry in fs::read_dir(&tapes_dir)? {
+            let entry = entry?;
+            if manifest_routing_for_backend(&entry.path(), &self.backend_name)?.is_none() {
+                continue;
+            }
+            let staging_dir = entry.path().join(".staging");
+            if !staging_dir.is_dir() {
+                continue;
+            }
+            for sf in fs::read_dir(&staging_dir)? {
+                let sf = sf?;
+                let meta = sf.metadata()?;
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Check if cache is over capacity
     pub fn is_over_capacity(&self) -> bool {
         self.current_bytes > self.cache_bytes
@@ -855,6 +904,40 @@ mod tests {
         // A cartridge bound to a different backend is not counted.
         let mut other = DiskCacheManager::new(tmp.path().to_path_buf(), "archive", 1 << 20);
         assert_eq!(other.calculate_usage().expect("usage"), 0);
+    }
+
+    /// `staging_bytes` (the cheap per-tick term the #49 worker adds to
+    /// `budget.current_bytes()`) counts only the `.staging/` files of
+    /// this backend's cartridges — not sealed pool chunks, and not other
+    /// backends' cartridges.
+    #[test]
+    fn staging_bytes_counts_only_this_backends_staging() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cart = tmp.path().join("tapes").join("TAPE01");
+        std::fs::create_dir_all(cart.join(".staging")).expect("dirs");
+        std::fs::write(
+            cart.join("manifest.json"),
+            r#"{"label":"TAPE01","chunks":[],"backend":"primary","dedup":"global"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(cart.join(".staging").join("chunk-0001"), vec![0u8; 4096])
+            .expect("staging chunk");
+
+        // Seal a chunk into the shared pool — it must NOT be counted by
+        // staging_bytes (only the budget tracks sealed pool bytes).
+        let store = ChunkStore::new(tmp.path(), "primary").expect("store");
+        store.insert_bytes(&[0x9; 8192]).expect("seal");
+
+        let mgr = DiskCacheManager::new(tmp.path().to_path_buf(), "primary", 1 << 20);
+        assert_eq!(
+            mgr.staging_bytes().expect("staging"),
+            4096,
+            "only the .staging chunk counts, not the sealed pool chunk"
+        );
+
+        // A different backend sees none of this cartridge's staging.
+        let other = DiskCacheManager::new(tmp.path().to_path_buf(), "archive", 1 << 20);
+        assert_eq!(other.staging_bytes().expect("staging"), 0);
     }
 
     /// `hex_to_blake3` is the only failure-surfaceable helper on the

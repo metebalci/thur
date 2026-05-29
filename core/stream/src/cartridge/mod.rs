@@ -1851,6 +1851,7 @@ impl Cartridge {
             store_path: self.chunk_store.store_path(&hash),
             object_key: self.chunk_store.object_key_in_store(&hash),
             backend_name: self.manifest.backend.clone(),
+            chunk_store: self.chunk_store.clone(),
         })
     }
 
@@ -2019,16 +2020,32 @@ impl Cartridge {
             // `data` moves into the blocking task; capture its length
             // first for the trailing log line.
             let data_len = data.len();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                chunk_store.insert_verified_bytes(&hash_for_blocking, &data)?;
-                Ok(())
+            // Cache-miss refetch grows the local pool — account it
+            // against the per-backend budget so `current_bytes()` stays
+            // equal to on-disk pool bytes (the eviction worker reads the
+            // budget instead of rescanning). Persist FIRST, then reserve
+            // only when the insert actually wrote the file (`was_new`):
+            // a chunk already warmed by a racing refetch/prefetch reports
+            // `was_new == false` and is not double-counted, and a failed
+            // persist returns via `?` with no reservation made.
+            // `force_reserve`, not `try_reserve`: a host READ must never
+            // block on backpressure — the bytes already left the backend.
+            let was_new = tokio::task::spawn_blocking(move || {
+                chunk_store.insert_verified_bytes(&hash_for_blocking, &data)
             })
             .await
             .map_err(|e| {
                 SmcError::Io(std::io::Error::other(format!(
                     "spawn_blocking join error during chunk refetch persist: {e}"
                 )))
-            })??;
+            })
+            .and_then(|inner| inner.map_err(SmcError::from))?;
+            if was_new {
+                self.pool_budget.force_reserve(
+                    data_len as u64,
+                    self.manifest.dedup.namespace(&self.manifest.label),
+                );
+            }
 
             chunk.location = LocationTag::Both;
             self.update_chunk_rec(chunk_id, &chunk)?;
@@ -2781,7 +2798,13 @@ impl Cartridge {
             };
 
             prefetch_mgr
-                .on_read(&cartridge_id, current_chunk_id, chunk_store, location_fn)
+                .on_read(
+                    &cartridge_id,
+                    current_chunk_id,
+                    chunk_store,
+                    self.pool_budget.clone(),
+                    location_fn,
+                )
                 .await;
         }
     }
@@ -3044,6 +3067,14 @@ pub struct NextReadChunk {
     /// `cloud.backends` in the daemon config. The prefetch hook
     /// resolves this name through its backend registry.
     pub backend_name: String,
+    /// Clone of the source cartridge's `ChunkStore` (backend +
+    /// dedup-scope namespace baked in). The iSCSI read-prefetch hook
+    /// routes the cloud-fetched bytes back through
+    /// `ChunkStore::insert_verified_bytes` on this handle so the
+    /// download is BLAKE3-verified, lands in the right per-backend /
+    /// per-namespace pool layout, and its `namespace()` keys the
+    /// paired pool-budget reservation.
+    pub chunk_store: ChunkStore,
 }
 
 /// Snapshot describing one chunk to upload — re-exported from

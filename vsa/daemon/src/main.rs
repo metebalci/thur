@@ -884,6 +884,8 @@ async fn run_disk_cache_eviction_worker(
     use core_block::DiskCacheManager;
     let mut tick = tokio::time::interval(interval);
     tick.tick().await; // skip the immediate first tick
+    // Budget divergence detector cadence — see `reconcile` below.
+    let mut last_reconcile = std::time::Instant::now();
     loop {
         tick.tick().await;
 
@@ -900,60 +902,57 @@ async fn run_disk_cache_eviction_worker(
             bounds,
         );
 
+        // Once per `BUDGET_RECONCILE_INTERVAL` (not every tick), do one
+        // full-pool walk per backend purely to confirm the O(1)
+        // budget-derived usage still matches on-disk reality, warning if
+        // an un-instrumented mutation site has leaked drift (#49). This
+        // is the only place the per-tick walk we removed still happens,
+        // and it runs far less often than the eviction tick.
+        let reconcile = last_reconcile.elapsed() >= shared_disk_evict::BUDGET_RECONCILE_INTERVAL;
+        if reconcile {
+            last_reconcile = std::time::Instant::now();
+        }
+
         for name in &backend_names {
             let Some(budget) = pool_budgets.get(name) else {
                 continue;
             };
             let cap = budget.cap_bytes();
+            // O(1) usage read from the per-backend budget instead of the
+            // old full-pool `calculate_usage` rescan. The budget is exact
+            // across every pool mutation site (seal / eviction / GC /
+            // read-miss refetch), so this preserves the old eviction
+            // decision while dropping the per-tick walk (#49). VSA has no
+            // `.staging/` step, so the budget total IS the on-disk pool
+            // total. The pool walk now happens only inside
+            // `evict_lru_chunks`, and only when over cap.
+            let used = budget.current_bytes();
+            // Low-cadence safety reconcile: walk the pool and warn if the
+            // budget has drifted from on-disk reality (detection only).
+            if reconcile {
+                let mut cm_r = DiskCacheManager::new(data_dir.clone(), name, cap);
+                if let Ok(Ok(actual)) =
+                    tokio::task::spawn_blocking(move || cm_r.calculate_usage()).await
+                {
+                    shared_disk_evict::warn_on_budget_divergence(name, used, actual);
+                }
+            }
+            // Within-budget log + soft-watermark alert (shared with VTL).
+            if !shared_disk_evict::check_usage_or_alert(name, used, cap, budget) {
+                continue;
+            }
             let mut cm = DiskCacheManager::new(data_dir.clone(), name, cap);
             cm.set_pool_budget(budget.clone());
             if let Some(gl) = ghost_lists.get(name) {
                 cm.set_ghost_list(gl.clone());
             }
             cm.set_recent_seal_pin_seconds(recent_seal_pin_seconds);
-            // Offload the blocking pool walk (fs::read_dir + chunk walk)
-            // to a blocking thread; hand the manager back out.
-            let (cm_ret, usage) = match tokio::task::spawn_blocking(move || {
-                let u = cm.calculate_usage();
-                (cm, u)
-            })
-            .await
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!(
-                        "disk-cache: usage task for backend '{}' panicked: {}",
-                        name,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let mut cm = cm_ret;
-            let used = match usage {
-                Ok(u) => u,
-                Err(e) => {
-                    tracing::warn!(
-                        "disk-cache: usage calc for backend '{}' failed: {}",
-                        name,
-                        e
-                    );
-                    continue;
-                }
-            };
-            // Within-budget log + soft-watermark alert (shared with VTL).
-            if !shared_disk_evict::check_usage_or_alert(name, used, cap, budget) {
-                continue;
-            }
-            // Synchronous fs-only eviction (no cloud round-trip); offload
-            // the fs::remove_file loop to a blocking thread.
-            let (cm_ret, result) = match tokio::task::spawn_blocking(move || {
-                let r = cm.evict_lru_chunks();
-                (cm, r)
-            })
-            .await
-            {
-                Ok(pair) => pair,
+            cm.set_current_usage(used);
+            // Synchronous fs-only eviction (no cloud round-trip): offload
+            // the candidate-enumeration walk + fs::remove_file loop to a
+            // blocking thread.
+            let result = match tokio::task::spawn_blocking(move || cm.evict_lru_chunks()).await {
+                Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
                         "disk-cache: eviction task for backend '{}' panicked: {}",
@@ -963,7 +962,6 @@ async fn run_disk_cache_eviction_worker(
                     continue;
                 }
             };
-            let _ = cm_ret;
             match result {
                 Ok(freed) if freed > 0 => {
                     tracing::info!("disk-cache: backend '{}' freed {} bytes", name, freed)

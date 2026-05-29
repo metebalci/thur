@@ -14,10 +14,12 @@ use bytes::Bytes;
 use common::create_test_dir;
 use core_mediachanger::cartridge_migrate::{MigrateMode, MigrateOptions, run_migrate};
 use core_mediachanger::{
-    Cartridge, CartridgeOpenMode, DedupScope, LocalBackend, ObjectStoreBackend, SmcError,
+    Cartridge, CartridgeOpenMode, DedupScope, LocalBackend, ObjectStoreBackend, PoolBudget,
+    SmcError,
 };
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 const TEST_BACKEND_SRC: &str = "src";
 const TEST_BACKEND_DST: &str = "dst";
@@ -111,6 +113,37 @@ fn count_pool_files(data_dir: &Path, backend: &str, namespace: Option<&str>) -> 
     count
 }
 
+/// Sum the on-disk byte size of every chunk file under a backend's
+/// pool slice (optionally a namespace). Used to seed a `PoolBudget` to
+/// the cartridge's real pool occupancy so the migrate budget-transfer
+/// assertions have a ground-truth total.
+fn sum_pool_bytes(data_dir: &Path, backend: &str, namespace: Option<&str>) -> u64 {
+    let mut root = data_dir.join("chunks").join(backend);
+    if let Some(ns) = namespace {
+        root = root.join(ns);
+    }
+    if !root.exists() {
+        return 0;
+    }
+    let mut total = 0u64;
+    for s1 in fs::read_dir(&root).expect("test setup").flatten() {
+        if !s1.file_type().expect("test setup").is_dir() {
+            continue;
+        }
+        for s2 in fs::read_dir(s1.path()).expect("test setup").flatten() {
+            if !s2.file_type().expect("test setup").is_dir() {
+                continue;
+            }
+            for f in fs::read_dir(s2.path()).expect("test setup").flatten() {
+                if f.file_type().expect("test setup").is_file() {
+                    total += f.metadata().expect("test setup").len();
+                }
+            }
+        }
+    }
+    total
+}
+
 fn count_bucket_chunks(bucket: &Path) -> usize {
     let chunks_dir = bucket.join("chunks");
     if !chunks_dir.exists() {
@@ -190,6 +223,8 @@ async fn migrate_move_global_dedup_round_trip() {
         mode: MigrateMode::Move,
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect("migrate move");
@@ -284,6 +319,8 @@ async fn migrate_move_local_dedup_deletes_source_chunks() {
         mode: MigrateMode::Move,
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect("migrate local-dedup move");
@@ -341,6 +378,8 @@ async fn migrate_dry_run_writes_nothing() {
         mode: MigrateMode::Move,
         dry_run: true,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect("migrate dry-run");
@@ -407,6 +446,8 @@ async fn migrate_rebind_verify_happy_path() {
         mode: MigrateMode::Rebind { verify: true },
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect("rebind");
@@ -481,6 +522,8 @@ async fn migrate_rebind_refuses_when_target_missing_chunks() {
         mode: MigrateMode::Rebind { verify: true },
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect_err("must refuse — target is empty");
@@ -532,6 +575,8 @@ async fn migrate_rebind_no_verify_proceeds_without_check() {
         mode: MigrateMode::Rebind { verify: false },
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect("no-verify rebind must succeed");
@@ -576,6 +621,8 @@ async fn migrate_refuses_same_source_and_target() {
         mode: MigrateMode::Move,
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect_err("source==target must refuse");
@@ -618,10 +665,89 @@ async fn migrate_refuses_when_manifest_backend_does_not_match() {
         mode: MigrateMode::Move,
         dry_run: false,
         progress: None,
+        source_budget: None,
+        target_budget: None,
     })
     .await
     .expect_err("backend mismatch must refuse");
     matches!(err, SmcError::InvalidOp(_));
+}
+
+/// Budget split-direction: a Move migrate must release every moved
+/// chunk's bytes from the SOURCE backend's `PoolBudget` and reserve the
+/// same bytes against the TARGET's, so both `current_bytes()` stay equal
+/// to their on-disk pool slices for the per-backend eviction workers.
+#[tokio::test]
+async fn migrate_move_transfers_pool_budget_source_to_target() {
+    let work = create_test_dir();
+    let tapes = work.path().join("tapes");
+    let src_bucket = work.path().join("buckets").join(TEST_BACKEND_SRC);
+    let dst_bucket = work.path().join("buckets").join(TEST_BACKEND_DST);
+    fs::create_dir_all(&src_bucket).expect("test setup");
+    fs::create_dir_all(&dst_bucket).expect("test setup");
+
+    seed_cartridge(
+        &tapes,
+        &src_bucket,
+        TEST_BACKEND_SRC,
+        "TAPE001",
+        DedupScope::Global,
+        4,
+    )
+    .await;
+
+    // Ground-truth source pool occupancy → seed the source budget to
+    // match (Global dedup → namespace None). Target budget starts empty.
+    let src_pool_bytes = sum_pool_bytes(work.path(), TEST_BACKEND_SRC, None);
+    assert!(src_pool_bytes > 0, "src pool must hold chunk bytes");
+    let source_budget = Arc::new(PoolBudget::new(work.path().to_path_buf(), 0, 0, 80));
+    source_budget.force_reserve(src_pool_bytes, None);
+    let target_budget = Arc::new(PoolBudget::new(work.path().to_path_buf(), 0, 0, 80));
+    assert_eq!(source_budget.current_bytes(), src_pool_bytes);
+    assert_eq!(target_budget.current_bytes(), 0);
+
+    let source: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&src_bucket).await.expect("test setup"));
+    let target: Box<dyn ObjectStoreBackend> =
+        Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
+    run_migrate(MigrateOptions {
+        tapes_dir: &tapes,
+        barcode: "TAPE001",
+        source: source.as_ref(),
+        source_name: TEST_BACKEND_SRC,
+        target: target.as_ref(),
+        target_name: TEST_BACKEND_DST,
+        mode: MigrateMode::Move,
+        dry_run: false,
+        progress: None,
+        source_budget: Some(source_budget.clone()),
+        target_budget: Some(target_budget.clone()),
+    })
+    .await
+    .expect("migrate move");
+
+    // Every moved byte left the source budget and landed in the
+    // target's — and each tracks its on-disk pool slice exactly.
+    assert_eq!(
+        source_budget.current_bytes(),
+        0,
+        "source budget must drop by the moved bytes"
+    );
+    assert_eq!(
+        target_budget.current_bytes(),
+        src_pool_bytes,
+        "target budget must rise by the moved bytes"
+    );
+    assert_eq!(
+        sum_pool_bytes(work.path(), TEST_BACKEND_DST, None),
+        src_pool_bytes,
+        "target on-disk pool now holds the moved bytes"
+    );
+    assert_eq!(
+        target_budget.current_bytes(),
+        sum_pool_bytes(work.path(), TEST_BACKEND_DST, None),
+        "target budget == target on-disk pool bytes"
+    );
 }
 
 /// Recursively copy `src` into `dst`. Used to pre-stage the target

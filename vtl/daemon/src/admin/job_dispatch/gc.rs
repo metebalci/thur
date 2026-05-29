@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::state::DaemonState;
 use core_mediachanger::chunk_index::ChunkIndexFile;
-use core_mediachanger::{ChunkStore, ObjectStoreBackend};
+use core_mediachanger::{ChunkStore, ObjectStoreBackend, PoolBudget};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 
@@ -91,15 +91,20 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             .await;
 
         // Local pool sweep on the blocking pool — chunk-store removals
-        // hit fs::remove_file in a loop.
+        // hit fs::remove_file in a loop. The per-backend PoolBudget
+        // rides along so each orphan removal releases its bytes back to
+        // the budget, keeping `current_bytes()` exact for the eviction
+        // worker (which sources its per-tick usage from the budget).
         let bn = backend_name.clone();
         let live_clone = live.clone();
         let dd = data_dir.clone();
         let dry = params.dry_run;
-        let lines_with_freed =
-            tokio::task::spawn_blocking(move || run_local_gc(&dd, &bn, &live_clone, dry))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("local gc panicked: {}", e)));
+        let budget = state.pool_budgets.get(backend_name).cloned();
+        let lines_with_freed = tokio::task::spawn_blocking(move || {
+            run_local_gc(&dd, &bn, &live_clone, dry, budget.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("local gc panicked: {}", e)));
 
         match lines_with_freed {
             Ok((lines, freed)) => {
@@ -293,6 +298,7 @@ fn run_local_gc(
     backend_name: &str,
     live: &LiveSet,
     dry_run: bool,
+    budget: Option<&PoolBudget>,
 ) -> anyhow::Result<(Vec<String>, u64)> {
     let mut lines: Vec<String> = Vec::new();
     let mut bytes_freed = 0u64;
@@ -308,6 +314,7 @@ fn run_local_gc(
         dry_run,
         "shared pool",
         None,
+        budget,
         &mut lines,
     )?);
 
@@ -347,6 +354,7 @@ fn run_local_gc(
             dry_run,
             &context,
             Some(&label),
+            budget,
             &mut lines,
         )?);
         if !dry_run && ns_live.is_empty() {
@@ -363,6 +371,7 @@ fn sweep_one_pool(
     dry_run: bool,
     context: &str,
     namespace: Option<&str>,
+    budget: Option<&PoolBudget>,
     lines: &mut Vec<String>,
 ) -> anyhow::Result<u64> {
     let pool = store.iter_chunks()?;
@@ -386,6 +395,13 @@ fn sweep_one_pool(
             ));
         } else {
             store.remove(&hash)?;
+            // Release the freed bytes back to the per-backend budget so
+            // `current_bytes()` stays equal to on-disk pool bytes (the
+            // eviction worker reads the budget instead of rescanning).
+            // Same `(size, namespace)` pairing the eviction path uses.
+            if let Some(b) = budget {
+                b.release(size, namespace);
+            }
             lines.push(format!(
                 "  deleted local chunk {}.. ({} bytes, {})",
                 &hash[..hash.len().min(8)],
@@ -762,8 +778,8 @@ mod tests {
         let mut live: HashSet<String> = HashSet::new();
         live.insert(live_hash.clone());
         let mut lines = Vec::new();
-        let freed =
-            sweep_one_pool(&store, &live, false, "test pool", None, &mut lines).expect("sweep");
+        let freed = sweep_one_pool(&store, &live, false, "test pool", None, None, &mut lines)
+            .expect("sweep");
         assert!(freed > 0);
         // Live chunk survives; orphan is gone.
         let remaining: Vec<String> = store
@@ -784,8 +800,8 @@ mod tests {
         let live: HashSet<String> = HashSet::new();
         let mut lines = Vec::new();
         // dry_run reports 0 freed and leaves the chunk in place.
-        let freed =
-            sweep_one_pool(&store, &live, true, "dry pool", None, &mut lines).expect("dry sweep");
+        let freed = sweep_one_pool(&store, &live, true, "dry pool", None, None, &mut lines)
+            .expect("dry sweep");
         assert_eq!(freed, 0);
         assert_eq!(store.iter_chunks().expect("iter").len(), 1);
     }
@@ -797,9 +813,59 @@ mod tests {
         store.insert_bytes(b"an orphan chunk").expect("insert");
         // Empty live set -> the one chunk is an orphan.
         let live: LiveSet = HashMap::new();
-        let (lines, freed) = run_local_gc(dir.path(), "s3b", &live, false).expect("run local gc");
+        let (lines, freed) =
+            run_local_gc(dir.path(), "s3b", &live, false, None).expect("run local gc");
         assert!(freed > 0);
         assert!(lines.iter().any(|l| l.contains("deleted local chunk")));
         assert_eq!(store.iter_chunks().expect("iter").len(), 0);
+    }
+
+    /// Budget exactness: a non-dry-run sweep releases exactly the
+    /// orphan bytes to the per-backend `PoolBudget`; a dry-run sweep
+    /// leaves the budget untouched. Keeps `current_bytes()` equal to
+    /// on-disk pool bytes for the eviction worker.
+    #[test]
+    fn sweep_one_pool_releases_orphan_bytes_to_budget() {
+        for dry_run in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = ChunkStore::new(dir.path(), "s3b").expect("chunk store");
+            // `insert_bytes` returns `(hash, was_new)` — the on-disk size
+            // is the input length (no compression at this layer), which
+            // is what GC's `iter_chunks` reports and releases.
+            let (live_hash, _) = store.insert_bytes(b"keep me").expect("insert live");
+            store.insert_bytes(b"orphan bytes").expect("insert orphan");
+            let live_sz = b"keep me".len() as u64;
+            let orphan_sz = b"orphan bytes".len() as u64;
+
+            let budget = PoolBudget::new(dir.path().to_path_buf(), 0, 0, 80);
+            budget.force_reserve(live_sz, None);
+            budget.force_reserve(orphan_sz, None);
+            let seeded = live_sz + orphan_sz;
+            assert_eq!(budget.current_bytes(), seeded);
+
+            let mut live: HashSet<String> = HashSet::new();
+            live.insert(live_hash);
+            let mut lines = Vec::new();
+            sweep_one_pool(
+                &store,
+                &live,
+                dry_run,
+                "test pool",
+                None,
+                Some(&budget),
+                &mut lines,
+            )
+            .expect("sweep");
+
+            if dry_run {
+                assert_eq!(budget.current_bytes(), seeded, "dry-run releases nothing");
+            } else {
+                assert_eq!(
+                    budget.current_bytes(),
+                    live_sz,
+                    "only the live chunk's bytes remain reserved after GC"
+                );
+            }
+        }
     }
 }

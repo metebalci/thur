@@ -212,6 +212,12 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
         mode,
         dry_run: params.dry_run,
         progress: Some(&progress_cb),
+        // Keep both per-backend budgets exact across the move: the
+        // source releases the bytes that physically leave its pool, the
+        // target reserves the ones that land. Absent (None) only if a
+        // backend has no live budget wired.
+        source_budget: state.pool_budgets.get(&source_backend).cloned(),
+        target_budget: state.pool_budgets.get(&params.target_backend).cloned(),
     })
     .await;
 

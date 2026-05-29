@@ -36,10 +36,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use shared_object_store::ObjectStoreBackend;
-use shared_pool::ChunkPool;
+use shared_pool::{ChunkPool, PoolBudget};
 
 use crate::chunk_index::ChunkIndexFile;
 use crate::errors::{Result, SmcError};
@@ -89,6 +90,14 @@ pub struct MigrateOptions<'a> {
     /// source …"). Daemon job workers wire this into `JobEmitter`
     /// via a sync→async forwarder; CLI-direct callers pass `None`.
     pub progress: Option<&'a (dyn Fn(&str) + Send + Sync)>,
+    /// Per-backend pool budgets for the source and target. Moving a
+    /// chunk file between backend pool dirs shrinks the source's
+    /// on-disk pool and grows the target's, so each move releases the
+    /// source budget and reserves the target's — keeping both
+    /// `current_bytes()` exact for the per-backend eviction workers.
+    /// `None` for CLI-direct / test callers with no live budgets.
+    pub source_budget: Option<Arc<PoolBudget>>,
+    pub target_budget: Option<Arc<PoolBudget>>,
 }
 
 /// Outcome of one migrate invocation. Returned regardless of mode;
@@ -297,6 +306,9 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.target_name,
                 namespace,
                 &chunk_hashes,
+                &chunk_sizes,
+                opts.source_budget.as_deref(),
+                opts.target_budget.as_deref(),
             )?;
 
             // Phase 4: commit point. Flip manifest.backend atomically.
@@ -370,6 +382,9 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.target_name,
                 namespace,
                 &chunk_hashes,
+                &chunk_sizes,
+                opts.source_budget.as_deref(),
+                opts.target_budget.as_deref(),
             )?;
             log("flipping manifest.backend");
             rewrite_manifest_backend(&cart_root, opts.target_name)?;
@@ -454,12 +469,16 @@ fn rewrite_manifest_backend(cart_root: &Path, new_backend: &str) -> Result<()> {
 /// Returns the count of files actually renamed (missing source files
 /// are skipped silently — chunks marked `CloudOnly` in the index are
 /// not expected to be local).
+#[allow(clippy::too_many_arguments)]
 fn move_local_pool_files(
     tapes_dir: &Path,
     source_backend: &str,
     target_backend: &str,
     namespace: Option<&str>,
     hashes: &[String],
+    sizes: &[u64],
+    source_budget: Option<&PoolBudget>,
+    target_budget: Option<&PoolBudget>,
 ) -> Result<u64> {
     let parent = tapes_dir
         .parent()
@@ -469,19 +488,34 @@ fn move_local_pool_files(
     let source_pool = pool_dir_for(&parent, source_backend, namespace);
     let target_pool = pool_dir_for(&parent, target_backend, namespace);
     let mut moved = 0u64;
-    for hash in hashes {
+    // Pool-budget accounting follows the actual on-disk byte movement:
+    // a chunk that physically leaves the source pool releases the
+    // source budget; one that physically lands as a NEW file in the
+    // target pool reserves the target budget. The "target already has
+    // it" branch only frees the source copy, so it releases the source
+    // but does NOT reserve the target (those bytes were already
+    // accounted when the target file first appeared). `force_reserve`,
+    // not `try_reserve`: migration is an operator job that must not
+    // block on backpressure. `namespace` is the same pool key the
+    // seal/eviction paths use, so the per-namespace bucket stays exact.
+    for (i, hash) in hashes.iter().enumerate() {
         let (s1, s2) = shard_pair(hash);
         let src = source_pool.join(s1).join(s2).join(format!("{hash}.dat"));
         if !src.is_file() {
             continue;
         }
+        let size = sizes.get(i).copied().unwrap_or(0);
         let dst_dir = target_pool.join(s1).join(s2);
         fs::create_dir_all(&dst_dir)?;
         let dst = dst_dir.join(format!("{hash}.dat"));
         if dst.is_file() {
             // Target already has it (re-run after partial failure, or
-            // dedup hit). Drop the source copy and move on.
+            // dedup hit). Drop the source copy and move on — source
+            // shrinks, target unchanged.
             fs::remove_file(&src)?;
+            if let Some(b) = source_budget {
+                b.release(size, namespace);
+            }
             moved += 1;
             continue;
         }
@@ -493,6 +527,14 @@ fn move_local_pool_files(
                 moved += 1;
             }
             Err(e) => return Err(SmcError::Io(e)),
+        }
+        // New file landed on the target, source copy gone: move the
+        // accounted bytes from the source budget to the target budget.
+        if let Some(b) = source_budget {
+            b.release(size, namespace);
+        }
+        if let Some(b) = target_budget {
+            b.force_reserve(size, namespace);
         }
     }
     Ok(moved)

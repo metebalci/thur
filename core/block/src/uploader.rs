@@ -927,7 +927,24 @@ impl VolumeWriter {
             let object_key = self.pool.object_key(&hash_hex);
             let bytes = self.backend.download_chunk(&object_key).await?;
             let cloud_bytes = bytes.len() as u64;
-            self.pool.insert_verified_bytes(&hash_hex, &bytes)?;
+            // Cache-miss refetch grows the local pool — account it
+            // against the budget so `current_bytes()` stays equal to
+            // on-disk pool bytes (the eviction worker reads the budget
+            // instead of rescanning). Insert FIRST, then reserve only
+            // when the insert actually wrote the file (`was_new`): a
+            // chunk already resident — e.g. warmed by a concurrent
+            // refetch of the same page while this read's `exists()` probe
+            // and download were in flight — reports `was_new == false`,
+            // so it is never double-counted. A failed insert (hash
+            // mismatch / IO) returns early via `?` with no reservation
+            // made. `force_reserve`, not `try_reserve`: a host READ must
+            // never block on backpressure — the bytes already left the
+            // backend and the page must be served.
+            let was_new = self.pool.insert_verified_bytes(&hash_hex, &bytes)?;
+            if was_new {
+                self.pool_budget
+                    .force_reserve(cloud_bytes, self.manifest.pool_namespace().as_deref());
+            }
             (bytes, cloud_bytes)
         };
         // Decrypt-on-read: for encrypted volumes the bytes we just
@@ -1037,6 +1054,57 @@ mod tests {
         assert!(writer.pool().exists(&outcome.hash_hex));
         let object_key = writer.pool().object_key(&outcome.hash_hex);
         assert!(backend.chunk_exists(&object_key).await.unwrap());
+    }
+
+    /// Read-miss budget accounting (#49): a cache-miss refetch must
+    /// `force_reserve` the warmed bytes so the per-backend `PoolBudget`
+    /// returns to its pre-eviction value, and a second read of the
+    /// now-resident chunk must NOT double-count. Global scope keeps the
+    /// budget namespace `None` so the assertions are exact.
+    #[tokio::test]
+    async fn read_miss_refetch_reserves_budget_exactly_once() {
+        let (tmp, name, backend) = fixture(DedupScope::Global).await;
+        let budget = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 0, 0, 80));
+        let writer = VolumeWriter::open(tmp.path(), &name, backend.clone())
+            .unwrap()
+            .with_pool_budget(budget.clone(), Duration::from_secs(5));
+        let bytes = page_bytes(0x5A);
+
+        let outcome = writer.write_page(7, &bytes).await.unwrap();
+        let seal_bytes = budget.current_bytes();
+        assert!(seal_bytes > 0, "seal must reserve the chunk bytes");
+        assert!(writer.pool().exists(&outcome.hash_hex));
+
+        // Simulate the eviction worker dropping the local pool file:
+        // remove + release, exactly the (size, namespace=None) pairing
+        // `evict_lru_chunks` uses for a Global-scope chunk. Cloud copy
+        // stays, so the next read is a genuine local-pool miss.
+        writer.pool().remove(&outcome.hash_hex).unwrap();
+        budget.release(seal_bytes, None);
+        assert_eq!(budget.current_bytes(), 0);
+        assert!(!writer.pool().exists(&outcome.hash_hex));
+
+        // Read → cache miss → download from cloud → re-warm the pool.
+        // The refetch must re-reserve exactly the chunk bytes.
+        let (got, cloud_bytes) = writer.read_page(7).await.unwrap().unwrap();
+        assert_eq!(got, bytes);
+        assert!(cloud_bytes > 0, "a miss must report a cloud fetch");
+        assert_eq!(
+            budget.current_bytes(),
+            seal_bytes,
+            "refetch must re-reserve exactly the chunk bytes"
+        );
+
+        // Second read: the chunk is resident again → local hit → no
+        // reserve. The budget must not double-count.
+        let (got2, cloud_bytes2) = writer.read_page(7).await.unwrap().unwrap();
+        assert_eq!(got2, bytes);
+        assert_eq!(cloud_bytes2, 0, "second read is a local-pool hit");
+        assert_eq!(
+            budget.current_bytes(),
+            seal_bytes,
+            "a resident-chunk read must not double-count the budget"
+        );
     }
 
     /// Durability-ordering regression: on the async-dispatch path the

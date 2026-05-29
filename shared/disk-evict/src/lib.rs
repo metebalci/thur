@@ -19,9 +19,58 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use shared_object_store::ObjectStoreConfig;
 use shared_pool::{DiskCacheBounds, DiskCacheSize, PoolBudget};
+
+/// How often the eviction worker runs the budget divergence detector
+/// ([`warn_on_budget_divergence`]). Far longer than the eviction tick so
+/// the full pool walk it performs never reintroduces the per-tick rescan
+/// that issue #49 removed — it is a slow safety reconcile, not the hot
+/// path.
+pub const BUDGET_RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Coarse tolerance for the budget divergence detector. The per-tick
+/// usage (sourced from the exact `PoolBudget`) is compared against a
+/// fresh full-pool walk; small transient skew is expected and benign:
+/// a chunk reserved-but-not-yet-on-disk (the window between
+/// `try_reserve` and the pool insert) and, on the tape side, in-flight
+/// `.staging/` bytes measured a moment apart from the walk. A genuine
+/// un-instrumented mutation site leaks unboundedly over a daemon
+/// lifetime and will blow past this; a daemon restart reseeds the
+/// budget from disk to heal it.
+pub const BUDGET_DIVERGENCE_TOLERANCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Warn if the budget-derived usage has drifted from a fresh on-disk
+/// walk beyond [`BUDGET_DIVERGENCE_TOLERANCE_BYTES`]. Detection only —
+/// does NOT mutate the budget (a daemon restart's startup reseed is the
+/// authoritative heal). Now that every pool mutation site keeps the
+/// budget exact (issue #49), this should never fire in steady state; if
+/// it does, a new pool-byte mutation path was added without a paired
+/// budget reserve/release.
+pub fn warn_on_budget_divergence(backend: &str, budget_used: u64, on_disk_walk: u64) {
+    let delta = budget_used.abs_diff(on_disk_walk);
+    if delta > BUDGET_DIVERGENCE_TOLERANCE_BYTES {
+        tracing::warn!(
+            "disk-cache budget divergence on backend '{}': budget reports {} bytes, on-disk walk reports {} bytes (delta {} > tolerance {}). \
+             Every pool mutation site should keep the budget exact; this indicates an un-instrumented mutation. A daemon restart reseeds the budget from disk.",
+            backend,
+            budget_used,
+            on_disk_walk,
+            delta,
+            BUDGET_DIVERGENCE_TOLERANCE_BYTES,
+        );
+    } else if delta > 0 {
+        tracing::debug!(
+            "disk-cache budget reconcile on backend '{}': budget {} vs on-disk {} (delta {} within tolerance)",
+            backend,
+            budget_used,
+            on_disk_walk,
+            delta,
+        );
+    }
+}
 
 /// Recompute per-backend caps for `auto`-mode entries against current
 /// free space, then push the new value into each backend's
@@ -132,5 +181,20 @@ mod tests {
     fn zero_cap_with_zero_used_is_within() {
         let budget = PoolBudget::new(std::path::PathBuf::from("/tmp"), 0, 0, 90);
         assert!(!check_usage_or_alert("b", 0, 0, &budget));
+    }
+
+    /// The divergence detector tolerates small transient skew but flags
+    /// a gross mismatch. (We can't assert on the emitted log here, but
+    /// the branch logic + arithmetic must not panic and the tolerance
+    /// boundary must be respected — exercised for coverage.)
+    #[test]
+    fn divergence_detector_handles_match_skew_and_drift() {
+        // Exact match — no-op.
+        warn_on_budget_divergence("b", 1_000, 1_000);
+        // Within tolerance — debug log only.
+        warn_on_budget_divergence("b", 1_000, 1_000 + BUDGET_DIVERGENCE_TOLERANCE_BYTES);
+        // Beyond tolerance, both directions — warn.
+        warn_on_budget_divergence("b", 0, BUDGET_DIVERGENCE_TOLERANCE_BYTES + 1);
+        warn_on_budget_divergence("b", BUDGET_DIVERGENCE_TOLERANCE_BYTES + 1, 0);
     }
 }

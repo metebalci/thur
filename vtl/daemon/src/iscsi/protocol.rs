@@ -46,8 +46,9 @@ use unit_attention::UnitAttentionTracker;
 use anyhow::{Result, anyhow};
 use core_mediachanger::{
     AuditChannel, AuditRateLimiter, Library, LibraryFacade, NextReadChunk, ObjectStoreConfig,
-    TapeEvent,
+    PoolBudget, TapeEvent,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -143,6 +144,7 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     tsih: u16,
     backends: &ObjectStoreRegistry,
     storage_config: &Arc<ObjectStoreConfig>,
+    pool_budgets: &HashMap<String, Arc<PoolBudget>>,
 ) -> Result<()> {
     // Snapshot the next-read chunk metadata under the drive lock,
     // then release the lock before any async I/O. Holding the
@@ -208,11 +210,34 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
         )
     })?;
 
-    if let Some(parent) = next.store_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&next.store_path, &bytes).await?;
     let downloaded = bytes.len() as u64;
+
+    // Persist through the pool API rather than a raw `fs::write`. This
+    // (a) BLAKE3-verifies the cloud bytes against the expected hash
+    // before they enter the pool (closing the bit-rot / wrong-bytes gap
+    // the raw write skipped), (b) does an atomic tmp+rename so a
+    // concurrent reader never sees a torn file, and (c) lands in the
+    // store's exact backend/namespace layout the eviction sweep walks.
+    //
+    // Account the warmed bytes against the per-backend budget so
+    // `current_bytes()` stays equal to on-disk pool bytes (the eviction
+    // worker reads the budget instead of rescanning). Persist FIRST, then
+    // reserve only when the insert actually wrote the file (`was_new`): a
+    // chunk already warmed by a racing read-miss/prefetch reports
+    // `was_new == false` and is not double-counted, and a failed persist
+    // returns via `?` with no reservation made. `force_reserve`, not
+    // `try_reserve`: this is on the host READ path and must never block on
+    // backpressure.
+    let store = next.chunk_store.clone();
+    let budget = pool_budgets.get(&next.backend_name).cloned();
+    let hash = next.hash.clone();
+    let was_new = tokio::task::spawn_blocking(move || store.insert_verified_bytes(&hash, &bytes))
+        .await
+        .map_err(|e| anyhow!("iSCSI prefetch insert join: {e}"))
+        .and_then(|inner| inner.map_err(|e| anyhow!("iSCSI prefetch persist: {e}")))?;
+    if was_new && let Some(b) = budget.as_ref() {
+        b.force_reserve(downloaded, next.chunk_store.namespace());
+    }
 
     tracing::info!(
         "iSCSI prefetch: refetched chunk {} ({} bytes) from {} into pool for drive {}",

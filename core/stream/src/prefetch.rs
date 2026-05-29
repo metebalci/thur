@@ -9,6 +9,7 @@
 use crate::chunk_store::ChunkStore;
 use crate::errors::Result;
 use shared_object_store::ObjectStoreBackend;
+use shared_pool::PoolBudget;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -87,6 +88,7 @@ impl PrefetchManager {
         cartridge_id: &str,
         current_chunk_id: u64,
         chunk_store: ChunkStore,
+        pool_budget: Arc<PoolBudget>,
         chunk_location_fn: impl Fn(u64) -> ChunkLocationInfo + Send + 'static + Clone,
     ) {
         if !self.config.enabled {
@@ -100,6 +102,7 @@ impl PrefetchManager {
                 cartridge_id,
                 next_chunk_id,
                 chunk_store.clone(),
+                pool_budget.clone(),
                 chunk_location_fn.clone(),
             )
             .await;
@@ -117,6 +120,7 @@ impl PrefetchManager {
         cartridge_id: &str,
         chunk_id: u64,
         chunk_store: ChunkStore,
+        pool_budget: Arc<PoolBudget>,
         chunk_location_fn: impl Fn(u64) -> ChunkLocationInfo + Send + 'static,
     ) {
         let task_key = (cartridge_id.to_string(), chunk_id);
@@ -184,8 +188,13 @@ impl PrefetchManager {
         let task_key_clone = task_key.clone();
 
         let task = tokio::spawn(async move {
-            match download_chunk_to_store(cloud_backend.as_ref().as_ref(), &hash, &chunk_store)
-                .await
+            match download_chunk_to_store(
+                cloud_backend.as_ref().as_ref(),
+                &hash,
+                &chunk_store,
+                &pool_budget,
+            )
+            .await
             {
                 Ok(bytes) => {
                     info!("Prefetch complete: chunk {} ({} bytes)", chunk_id, bytes);
@@ -285,18 +294,35 @@ async fn download_chunk_to_store(
     backend: &dyn ObjectStoreBackend,
     hash: &str,
     chunk_store: &ChunkStore,
+    pool_budget: &PoolBudget,
 ) -> Result<usize> {
     let object_key = chunk_store.object_key_in_store(hash);
     let data = backend.download_chunk(&object_key).await?;
     let size = data.len();
 
+    // Prefetch grows the local pool — account it against the per-backend
+    // budget so `current_bytes()` stays equal to on-disk pool bytes (the
+    // eviction worker reads the budget instead of rescanning). Persist
+    // FIRST, then reserve only when the insert actually wrote the file
+    // (`was_new`): a chunk already warmed by a racing read-miss/prefetch
+    // reports `was_new == false` and is not double-counted, and a failed
+    // persist returns via `?` with no reservation made. `force_reserve`,
+    // not `try_reserve`: prefetch is speculative I/O and must never block
+    // on backpressure.
     let store = chunk_store.clone();
     let hash_owned = hash.to_string();
-    tokio::task::spawn_blocking(move || store.insert_verified_bytes(&hash_owned, &data))
-        .await
-        .map_err(|e| {
-            crate::errors::SmcError::Io(std::io::Error::other(format!("prefetch insert join: {e}")))
-        })??;
+    let was_new =
+        tokio::task::spawn_blocking(move || store.insert_verified_bytes(&hash_owned, &data))
+            .await
+            .map_err(|e| {
+                crate::errors::SmcError::Io(std::io::Error::other(format!(
+                    "prefetch insert join: {e}"
+                )))
+            })
+            .and_then(|inner| inner.map_err(Into::into))?;
+    if was_new {
+        pool_budget.force_reserve(size as u64, chunk_store.namespace());
+    }
 
     debug!(
         "Wrote prefetched chunk to pool: {} ({} bytes)",

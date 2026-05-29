@@ -338,14 +338,26 @@ impl ChunkPool {
     /// Idempotent: if the destination already holds a file under
     /// `expected_hash`, return Ok without rehashing — the existing
     /// file is authoritative and the caller's bytes are surplus.
+    ///
+    /// Returns `was_new`: `true` iff this call's rename actually put
+    /// the file on disk, `false` if it was already present (the
+    /// idempotent no-op). Mirrors [`Self::insert_bytes`]'s flag — a
+    /// caller that reserves pool-budget bytes for a cache-miss /
+    /// prefetch warm-in MUST gate the reserve on `was_new` so a chunk
+    /// already warmed by a racing fetch isn't counted twice. As with
+    /// `insert_bytes`, the flag is decided by an `is_file` check
+    /// immediately before the rename, so two callers racing on the
+    /// same absent hash can both observe `true` (the rename overwrites
+    /// idempotently) — a microsecond window, not the whole download,
+    /// and the budget divergence detector is the backstop.
     pub fn insert_verified_bytes(
         &self,
         expected_hash: &str,
         bytes: &[u8],
-    ) -> Result<(), ChunkPoolError> {
+    ) -> Result<bool, ChunkPoolError> {
         let dst = self.store_path(expected_hash);
         if dst.is_file() {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut hasher = Hasher::new();
@@ -368,7 +380,7 @@ impl ChunkPool {
             f.sync_all()?;
         }
         match fs::rename(&tmp, &dst) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e.into())
@@ -678,7 +690,10 @@ mod tests {
         let bytes = b"cloud-fetched chunk".to_vec();
         let expected = hex::encode(blake3::hash(&bytes).as_bytes());
 
-        pool.insert_verified_bytes(&expected, &bytes).unwrap();
+        assert!(
+            pool.insert_verified_bytes(&expected, &bytes).unwrap(),
+            "first insert of an absent chunk reports was_new=true"
+        );
         assert!(pool.exists(&expected));
         assert_eq!(pool.read_bytes(&expected).unwrap(), bytes);
     }
@@ -715,10 +730,17 @@ mod tests {
         let bytes = b"already in the pool".to_vec();
         let hash = hex::encode(blake3::hash(&bytes).as_bytes());
 
-        pool.insert_verified_bytes(&hash, &bytes).unwrap();
+        assert!(
+            pool.insert_verified_bytes(&hash, &bytes).unwrap(),
+            "first insert reports was_new=true"
+        );
 
-        pool.insert_verified_bytes(&hash, b"wrong bytes ignored on dedup hit")
-            .unwrap();
+        assert!(
+            !pool
+                .insert_verified_bytes(&hash, b"wrong bytes ignored on dedup hit")
+                .unwrap(),
+            "dedup-hit insert reports was_new=false so callers skip the budget reserve"
+        );
         assert_eq!(pool.read_bytes(&hash).unwrap(), bytes);
         assert_eq!(pool.iter_chunks().unwrap().len(), 1);
     }

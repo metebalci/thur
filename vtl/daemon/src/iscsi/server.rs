@@ -147,6 +147,7 @@ impl IscsiServer {
             audit_ratelimiter: Arc::clone(&self.state.audit_ratelimiter),
             cloud_backends: Arc::clone(&self.state.cloud_backends),
             storage_config: Arc::clone(&self.state.storage_config),
+            pool_budgets: self.state.pool_budgets.clone(),
             diagnostic_store: Arc::clone(&self.state.diagnostic_store),
             target_iqn: self.config.iscsi.target_iqn.clone(),
             alua,

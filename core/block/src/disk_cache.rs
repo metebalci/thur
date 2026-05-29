@@ -219,6 +219,17 @@ impl DiskCacheManager {
         self.current_bytes
     }
 
+    /// Seed `current_bytes` directly from the authoritative per-backend
+    /// `PoolBudget` (O(1)) instead of the full [`Self::calculate_usage`]
+    /// pool walk. The eviction worker calls this every tick now that the
+    /// budget is exact across every pool mutation site (seal, eviction,
+    /// GC, read-miss refetch) — see issue #49. `evict_lru_chunks` reads
+    /// this value to size how much it must free; the candidate
+    /// enumeration walk still runs, but only when over cap.
+    pub fn set_current_usage(&mut self, bytes: u64) {
+        self.current_bytes = bytes;
+    }
+
     /// Is the cache currently over capacity?
     pub fn is_over_capacity(&self) -> bool {
         self.current_bytes > self.cache_bytes

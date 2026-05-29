@@ -291,7 +291,8 @@ cadence.
 ## Eviction worker
 
 `run_disk_cache_eviction_worker` ticks every
-`disk_cache.eviction_interval_seconds` (default 300). For each backend it
+`disk_cache.eviction_interval_seconds` (default 300) — on the tape side, also
+on every upload-completion `Notify` (debounced 250 ms). For each backend it
 works through the following steps:
 
 0. **Recomputes the cap** for `auto`-mode entries: calls statvfs on
@@ -300,14 +301,35 @@ works through the following steps:
    the next `try_reserve` sees the updated ceiling. Explicit `size_gb: <n>`
    entries skip this step. The 50%-of-free share is divided evenly across all
    `auto` backends.
-1. Walks every volume's `pages.idx` and `lru.idx` to build a map of
-   `namespace → hash → max(last_accessed)`. `lru.idx` is touched on every
-   `write_page` / `read_page`, so the timestamp reflects genuine recency.
-2. Lists every pool chunk for the backend, joins to the touch map, and sorts
-   ascending by `last_accessed`.
-3. Removes oldest chunks via `pool.remove` until usage is under cap. Each
-   remove calls `PoolBudget::release(size)`, immediately waking any
-   `write_page` parked on backpressure.
+1. **Reads usage from the budget — O(1), no pool walk.** Per-tick occupancy is
+   `PoolBudget::current_bytes()` (plus, on the tape side, a cheap `.staging/`
+   walk via `staging_bytes` for not-yet-sealed chunks — bounded by cartridge
+   count, not chunk count). The budget is the authoritative incremental
+   counter, kept *exact* across every pool-byte mutation site: chunk seal
+   (`try_reserve`), eviction (`release`), GC orphan removal (`release`), and
+   cache-miss refetch / prefetch / cross-backend migrate warm-ins
+   (`force_reserve` on the source-release + target-reserve). If usage is at or
+   under the cap, the worker stops here. There is **no full pool rescan on the
+   steady-state per-tick path** — that O(total-chunks) walk used to run every
+   tick and was the cost issue #49 removed.
+2. **Only when over cap** does the eviction pass walk the indexes: it builds
+   `namespace → hash → max(last_accessed)` from every volume's `pages.idx` +
+   `lru.idx` (touched on every `write_page` / `read_page`, so the timestamp
+   reflects genuine recency), lists the backend's pool chunks, joins to the
+   touch map, sorts ascending by `last_accessed`, and removes oldest-first via
+   `pool.remove` until usage is back under cap. Each remove calls
+   `PoolBudget::release(size)`, immediately waking any `write_page` parked on
+   backpressure.
+
+Because the eviction decision now trusts the budget, a low-cadence
+**divergence detector** runs about once an hour (independent of the tick /
+notify cadence): it does one full pool walk per backend purely to compare
+`current_bytes()` against on-disk reality and `warn!`s if they diverge beyond a
+coarse tolerance. It never mutates the budget — a daemon restart's
+`refresh_pool_budget_from_{volumes,tapes}` reseed is the authoritative heal —
+and exists only to surface a future un-instrumented mutation site before it can
+silently skew eviction. In steady state, with every mutation site paired to the
+budget, it never fires.
 
 Eviction skips any chunk whose pages still have a pending backend upload. The
 per-volume `upload.idx` sidecar records `LocalOnly` vs `Uploaded`, and

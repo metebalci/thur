@@ -29,6 +29,7 @@ use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_audit::{AuditActor, AuditResult};
 use shared_object_store::ObjectStoreConfig;
+use shared_pool::PoolBudget;
 use tracing::warn;
 
 use crate::admin::handlers::AdminState;
@@ -98,15 +99,20 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             .await;
 
         // Local pool sweep on the blocking pool — chunk removals hit
-        // fs::remove_file in a loop.
+        // fs::remove_file in a loop. The per-backend PoolBudget rides
+        // along so each orphan removal releases its bytes back to the
+        // budget (keeping `current_bytes()` exact for the eviction
+        // worker, which sources its per-tick usage from the budget).
         let bn = backend_name.clone();
         let live_clone = live.clone();
         let dd = data_dir.clone();
         let dry = params.dry_run;
-        let lines_with_freed =
-            tokio::task::spawn_blocking(move || run_local_gc(&dd, &bn, &live_clone, dry))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("local gc panicked: {}", e)));
+        let budget = state.pool_budgets.get(backend_name).cloned();
+        let lines_with_freed = tokio::task::spawn_blocking(move || {
+            run_local_gc(&dd, &bn, &live_clone, dry, budget.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("local gc panicked: {}", e)));
 
         match lines_with_freed {
             Ok((lines, freed)) => {
@@ -245,6 +251,7 @@ fn run_local_gc(
     backend_name: &str,
     live: &LiveSet,
     dry_run: bool,
+    budget: Option<&PoolBudget>,
 ) -> anyhow::Result<(Vec<String>, u64)> {
     let mut lines: Vec<String> = Vec::new();
     let mut bytes_freed = 0u64;
@@ -261,6 +268,7 @@ fn run_local_gc(
         dry_run,
         "shared pool",
         None,
+        budget,
         &mut lines,
     )?);
 
@@ -305,6 +313,7 @@ fn run_local_gc(
             dry_run,
             &context,
             Some(&ns),
+            budget,
             &mut lines,
         )?);
         if !dry_run && ns_live.is_empty() {
@@ -321,6 +330,7 @@ fn sweep_one_pool(
     dry_run: bool,
     context: &str,
     namespace: Option<&str>,
+    budget: Option<&PoolBudget>,
     lines: &mut Vec<String>,
 ) -> anyhow::Result<u64> {
     let chunks = pool.iter_chunks()?;
@@ -353,6 +363,13 @@ fn sweep_one_pool(
             ));
         } else {
             pool.remove(&hash)?;
+            // Release the freed bytes back to the per-backend budget so
+            // `current_bytes()` stays equal to on-disk pool bytes (the
+            // eviction worker reads the budget instead of rescanning).
+            // Same `(size, namespace)` pairing the eviction path uses.
+            if let Some(b) = budget {
+                b.release(size, namespace);
+            }
             lines.push(format!(
                 "  deleted local chunk {}.. ({} bytes, {})",
                 &hash[..hash.len().min(8)],
@@ -570,7 +587,7 @@ mod tests {
                 "only the chunk still mapped into pages.idx is live"
             );
 
-            let (_lines, freed) = run_local_gc(data_dir, "primary", &live, dry_run).unwrap();
+            let (_lines, freed) = run_local_gc(data_dir, "primary", &live, dry_run, None).unwrap();
 
             if dry_run {
                 assert_eq!(freed, 0, "dry-run frees nothing");
@@ -580,6 +597,61 @@ mod tests {
                 assert!(!pool.exists(&orphan_hash), "orphan chunk removed");
             }
             assert!(pool.exists(&live_hash), "live chunk must survive");
+        }
+    }
+
+    /// Budget exactness: a non-dry-run sweep must release exactly the
+    /// orphan bytes back to the per-backend `PoolBudget` (so the
+    /// eviction worker, which reads `current_bytes()` instead of
+    /// rescanning, sees the reclaimed space). The live chunk's bytes
+    /// stay reserved; a dry-run sweep leaves the budget untouched.
+    #[test]
+    fn local_gc_releases_orphan_bytes_to_budget() {
+        for dry_run in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path();
+            let manifest = make_volume(data_dir, "vol-a", "primary");
+            let ns = manifest.pool_namespace().unwrap();
+
+            let pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+            let (orphan_hash, _) = pool.insert_bytes(&[0x11; 4096]).unwrap();
+            let (live_hash, _) = pool.insert_bytes(&[0x22; 2048]).unwrap();
+
+            let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+            let pages = PageIndex::open(
+                &PageIndex::path_for(&vol_dir),
+                manifest.uuid,
+                u64::from(manifest.page_size_bytes),
+            )
+            .unwrap();
+            let orphan_bytes: [u8; 32] = hex::decode(&orphan_hash).unwrap().try_into().unwrap();
+            let live_bytes: [u8; 32] = hex::decode(&live_hash).unwrap().try_into().unwrap();
+            pages.set(0, &orphan_bytes).unwrap();
+            pages.set(0, &live_bytes).unwrap();
+
+            // Seed the budget to mirror the on-disk reality both chunks
+            // create under the volume's namespace.
+            let budget = PoolBudget::new(data_dir.to_path_buf(), 0, 0, 80);
+            budget.force_reserve(4096, Some(&ns));
+            budget.force_reserve(2048, Some(&ns));
+            assert_eq!(budget.current_bytes(), 4096 + 2048);
+
+            let live = collect_live_hashes(data_dir).unwrap();
+            run_local_gc(data_dir, "primary", &live, dry_run, Some(&budget)).unwrap();
+
+            if dry_run {
+                assert_eq!(
+                    budget.current_bytes(),
+                    4096 + 2048,
+                    "dry-run must not release any budget"
+                );
+            } else {
+                assert_eq!(
+                    budget.current_bytes(),
+                    2048,
+                    "only the live chunk's bytes remain reserved after GC"
+                );
+            }
         }
     }
 }

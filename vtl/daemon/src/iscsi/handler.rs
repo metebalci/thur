@@ -29,12 +29,15 @@
 //! per-I_T-nexus drive locks and PREVENT/ALLOW state — same
 //! semantics as the old `SessionGuard` drop in `serve_connection`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use core_mediachanger::{AuditChannel, AuditRateLimiter, Library, ObjectStoreConfig, TapeEvent};
+use core_mediachanger::{
+    AuditChannel, AuditRateLimiter, Library, ObjectStoreConfig, PoolBudget, TapeEvent,
+};
 use shared_iscsi::{ScsiHandler, ScsiRequest, ScsiResponse, ScsiStatus};
 use tokio::sync::broadcast;
 
@@ -60,6 +63,11 @@ pub struct IscsiLibraryHandler {
     pub(crate) audit_ratelimiter: Arc<AuditRateLimiter>,
     pub(crate) cloud_backends: ObjectStoreRegistry,
     pub(crate) storage_config: Arc<ObjectStoreConfig>,
+    /// Per-backend pool budgets. The read-prefetch hook releases a
+    /// reservation against the matching backend when it warms a
+    /// cloud-fetched chunk into the local pool, keeping
+    /// `current_bytes()` exact for the eviction worker.
+    pub(crate) pool_budgets: HashMap<String, Arc<PoolBudget>>,
     pub(crate) diagnostic_store: Arc<DiagnosticStore>,
     /// iSCSI target IQN advertised in Login / SendTargets. Resolved
     /// at boot from `iscsi.target_iqn`.
@@ -132,6 +140,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 tsih,
                 &self.cloud_backends,
                 &self.storage_config,
+                &self.pool_budgets,
             )
             .await
             {
