@@ -175,6 +175,7 @@ mod tests {
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
             storage_config: Arc::new(ObjectStoreConfig::default()),
+            tiering: Arc::new(core_mediachanger::TieringConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 1,
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,

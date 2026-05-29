@@ -525,6 +525,12 @@ async fn main() -> Result<()> {
                     commands::verify::cmd_verify(skip_storage, verbose, json, barcodes).await?;
                 std::process::exit(i32::from(code));
             }
+            SystemAction::Tiering { action } => match action {
+                TieringAction::Plan { json } => {
+                    let code = commands::tiering::cmd_tiering_plan(json).await?;
+                    std::process::exit(i32::from(code));
+                }
+            },
             SystemAction::RegenerateCert => {
                 shared_cli_system::cmd_regenerate_cert(
                     &shared_naming::TAPE_LIBRARY,

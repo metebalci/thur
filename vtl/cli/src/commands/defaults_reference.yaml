@@ -291,6 +291,42 @@ storage:
   #       access_key_id_env: THUR_S3_ACCESS_KEY_ID
   #       secret_access_key_env: THUR_S3_SECRET_ACCESS_KEY
 
+# Cartridge tiering. Operator-driven placement policies that move
+# cartridges between the backends declared above. A cartridge is bound
+# to one backend at create time; tiering is how you re-home it later
+# under a rule rather than by hand. Off by default (no policies).
+#
+# Each policy is a set of predicates (ANDed together) plus a
+# `migrate_to` backend. A cartridge is matched by the FIRST policy
+# whose predicates all hold; that policy decides its placement. The
+# supported predicates are all cheap to evaluate and survive a
+# disaster-recovery restore:
+#   barcode_prefix   - cartridge barcode starts with this string
+#   lto_generation   - exact LTO generation (e.g. 8)
+#   worm             - WORM flag (true / false)
+# (Age-based predicates are intentionally absent for now — the only
+# available "last write" signal is a local-only index that resets on
+# restore, so it cannot be trusted across DR.)
+#
+# Tiering is operator-in-the-loop: nothing moves automatically. Run
+# `thurvtl system tiering plan` to preview the migrations these
+# policies would trigger (it walks the inventory and prints proposed
+# per-cartridge moves with byte estimates). Cartridges under a
+# cloud-native legal hold are always excluded. Each `migrate_to` must
+# name a backend defined under `storage.backends:`; the daemon refuses
+# to start otherwise.
+tiering:
+  # policies:
+  #   # WORM cartridges belong on the compliance bucket.
+  #   - predicates:
+  #       worm: true
+  #     migrate_to: compliance
+  #   # Anything barcoded ARCH* goes to cold storage.
+  #   - predicates:
+  #       barcode_prefix: "ARCH"
+  #     migrate_to: cold-archive
+  policies: []
+
 # Audit log. Append-only event journal at <data_dir>/audit/ by default,
 # rolled over daily at UTC midnight. Always on. Records administrative
 # and data-plane state changes (cartridge create/import/export,

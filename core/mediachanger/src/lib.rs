@@ -99,8 +99,8 @@ pub use shared_telemetry::{
     Metrics, OtlpExporterConfig, OtlpProtocol, Telemetry, TelemetryConfig, TelemetryError,
 };
 pub use tiering::{
-    CartridgeFacts, PlannedMove, TieringConfig, TieringPolicy, TieringPredicates, plan_moves,
-    validate_policies,
+    CartridgeFacts, PlannedMove, PlannedMoveReport, SkippedCartridge, TieringConfig,
+    TieringPlanReport, TieringPolicy, TieringPredicates, plan_moves, validate_policies,
 };
 // `DriveTopology` moved to `core-stream` (the trait is drive-shaped, not
 // library-shaped — `core-mediachanger` keeps it as a flat re-export so existing

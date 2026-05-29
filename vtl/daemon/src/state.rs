@@ -19,7 +19,7 @@
 
 use core_mediachanger::{
     AuditChannel, AuditRateLimiter, CompressionAlgo, Library, ObjectStoreConfig, PoolBudget,
-    TapeEvent,
+    TapeEvent, TieringConfig,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -71,6 +71,10 @@ pub struct DaemonStateConfig {
     /// the named backend definitions under `cloud.backends:`. Distinct
     /// from `cloud_backends` (the runtime registry above).
     pub storage_config: Arc<ObjectStoreConfig>,
+    /// Parsed `tiering:` block (operator-driven cartridge tiering
+    /// policies). Validated at boot against `storage.backends`; the
+    /// `system.tiering.*` job handlers read it to plan migrations.
+    pub tiering: Arc<TieringConfig>,
     /// Full `keystore:` section of the YAML conffile — the named
     /// `keystore.backends:` map. Used by the cartridge-create admin
     /// handler to resolve the at-rest keystore backend, and by
@@ -117,6 +121,9 @@ pub struct DaemonState {
     /// Full `cloud:` section of the YAML conffile — tuning knobs plus
     /// the named backend definitions under `cloud.backends:`.
     pub storage_config: Arc<ObjectStoreConfig>,
+    /// Parsed `tiering:` block (operator-driven cartridge tiering
+    /// policies). Read by the `system.tiering.*` job handlers.
+    pub tiering: Arc<TieringConfig>,
     /// Full `keystore:` section of the YAML conffile (named
     /// `keystore.backends:` map). Read at boot, shared via Arc with
     /// admin handlers (`cartridge_create` for the at-rest wrap
@@ -181,6 +188,7 @@ impl DaemonState {
             audit_ratelimiter: cfg.audit_ratelimiter,
             cloud_backends: cfg.cloud_backends,
             storage_config: cfg.storage_config,
+            tiering: cfg.tiering,
             keystore_config: cfg.keystore_config,
             diagnostic_store: Arc::new(DiagnosticStore::new()),
             jobs: Arc::new(JobRegistry::new()),
@@ -237,6 +245,7 @@ mod tests {
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
             storage_config: Arc::new(ObjectStoreConfig::default()),
+            tiering: Arc::new(TieringConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 3,
             drive_compression_algorithm: CompressionAlgo::Lz4,

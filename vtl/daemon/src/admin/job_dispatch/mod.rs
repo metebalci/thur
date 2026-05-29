@@ -20,6 +20,7 @@ pub mod migrate;
 pub mod restore_archive;
 pub mod self_test;
 pub mod stats;
+pub mod tiering;
 pub mod verify;
 
 use std::sync::Arc;
@@ -49,6 +50,9 @@ pub fn dispatch(
         }
         "system.gc" => {
             tokio::spawn(gc::run(emitter, body, state));
+        }
+        "system.tiering.plan" => {
+            tokio::spawn(tiering::run(emitter, body, state));
         }
         "system.audit.tail" => {
             tokio::spawn(shared_admin_audit::run_tail(
@@ -158,6 +162,7 @@ mod tests {
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
             cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
             storage_config: Arc::new(ObjectStoreConfig::default()),
+            tiering: Arc::new(core_mediachanger::TieringConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),
             num_drives: 1,
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,

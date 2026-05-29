@@ -29,7 +29,7 @@
 //!     placement, even when that decision is a no-op (already on the
 //!     target). Later policies do not get a second say.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// The `tiering:` config block. Empty by default — tiering is opt-in,
@@ -113,6 +113,52 @@ pub struct PlannedMove {
     pub source_backend: String,
     /// Backend the matched policy wants it on.
     pub target_backend: String,
+}
+
+/// The structured result of a `system tiering plan` run. Serialized
+/// into the job's terminal `Result` event by the daemon and decoded by
+/// the CLI for rendering — the cross-process contract, mirroring
+/// [`crate::verify::VerifyReport`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TieringPlanReport {
+    /// Number of policies evaluated.
+    pub policies: usize,
+    /// Number of cartridges examined on disk.
+    pub cartridges_scanned: usize,
+    /// Proposed migrations (matched a policy, off-target, not held).
+    pub moves: Vec<PlannedMoveReport>,
+    /// Barcodes that matched a policy but are excluded because they
+    /// are under legal hold.
+    pub excluded_legal_hold: Vec<String>,
+    /// Cartridges that could not be evaluated (unreadable manifest,
+    /// failed legal-hold read, backend unavailable), with the reason.
+    pub skipped: Vec<SkippedCartridge>,
+}
+
+/// One proposed migration in a [`TieringPlanReport`], enriched with the
+/// data-motion estimate the engine's bare [`PlannedMove`] does not
+/// carry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedMoveReport {
+    /// Barcode of the cartridge to move.
+    pub barcode: String,
+    /// Backend the cartridge is currently on.
+    pub from_backend: String,
+    /// Backend the matched policy wants it on.
+    pub to_backend: String,
+    /// Sealed chunk count (from `chunks.idx`).
+    pub chunk_count: u64,
+    /// Total sealed bytes to move (from `chunks.idx`).
+    pub bytes: u64,
+}
+
+/// A cartridge the plan could not evaluate, with the reason.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedCartridge {
+    /// Barcode (cartridge directory name).
+    pub barcode: String,
+    /// Why it was skipped.
+    pub reason: String,
 }
 
 impl TieringPredicates {

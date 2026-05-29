@@ -363,6 +363,12 @@ enum SystemAction {
         barcodes: Vec<String>,
     },
 
+    /// Cartridge tiering — evaluate placement policies.
+    Tiering {
+        #[command(subcommand)]
+        action: TieringAction,
+    },
+
     /// Regenerate the admin HTTP self-signed TLS cert.
     ///
     /// Daemon-down only. Overwrites the cert/key files in place,
@@ -382,6 +388,21 @@ enum SystemAction {
     Alerting {
         #[command(subcommand)]
         action: AlertingAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TieringAction {
+    /// Show migrations the tiering policies would trigger.
+    ///
+    /// Daemon-routed, read-only. Walks the inventory, evaluates the
+    /// `tiering.policies` from the conffile, and prints the proposed
+    /// per-cartridge moves with byte estimates. Legal-held cartridges
+    /// are excluded; no data is moved.
+    Plan {
+        /// Emit the full plan as JSON for automation.
+        #[arg(long)]
+        json: bool,
     },
 }
 

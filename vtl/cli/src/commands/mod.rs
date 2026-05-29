@@ -11,4 +11,5 @@ pub mod monitor;
 pub mod self_test;
 pub mod stats;
 pub mod storage;
+pub mod tiering;
 pub mod verify;

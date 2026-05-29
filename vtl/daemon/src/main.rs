@@ -201,6 +201,14 @@ struct Config {
     /// `reconcile::open_or_materialize` to consume it.
     #[serde(default)]
     library: Option<LibraryConfig>,
+    /// Operator-driven cartridge tiering policies. Off by default
+    /// (no policies). Each policy matches cartridges by
+    /// barcode-prefix / LTO-generation / WORM and names a
+    /// `migrate_to` backend; `thurvtl system tiering plan` evaluates
+    /// them against the live inventory. Validated at boot against
+    /// `storage.backends`. Full schema in `core_mediachanger::tiering`.
+    #[serde(default)]
+    tiering: TieringConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -521,7 +529,7 @@ impl Default for DiskCacheConfig {
 
 // Cloud backend configuration is shared with the CLI in core-mediachanger.
 // Re-exported via aliases here so existing field/var names keep working.
-use core_mediachanger::ObjectStoreConfig;
+use core_mediachanger::{ObjectStoreConfig, TieringConfig};
 
 #[derive(Debug, Deserialize, Clone)]
 struct HttpConfig {
@@ -840,6 +848,28 @@ async fn main() -> Result<()> {
         "cloud: {} backend(s) configured",
         cfg.storage.backends.len()
     );
+
+    // Validate tiering policies against the configured backends. Each
+    // policy's `migrate_to` must name a defined backend; catch-all
+    // (zero-predicate) rules are rejected. Collects every error so the
+    // operator fixes the whole block in one pass.
+    if !cfg.tiering.policies.is_empty() {
+        let known_backends: std::collections::BTreeSet<String> =
+            cfg.storage.backends.keys().cloned().collect();
+        core_mediachanger::validate_policies(&cfg.tiering.policies, &known_backends).map_err(
+            |errs| {
+                anyhow::anyhow!(
+                    "validate tiering.policies in {}: {}",
+                    config_path,
+                    errs.join("; ")
+                )
+            },
+        )?;
+        info!(
+            "tiering: {} policy(ies) validated",
+            cfg.tiering.policies.len()
+        );
+    }
 
     let iscsi_users_path = data_dir_path.join("iscsi-users.json");
     let iscsi_users_file =
@@ -1638,6 +1668,7 @@ async fn main() -> Result<()> {
         audit_ratelimiter: std::sync::Arc::clone(&audit_ratelimiter),
         cloud_backends: std::sync::Arc::clone(&cloud_backends_registry),
         storage_config: std::sync::Arc::clone(&storage_config_arc),
+        tiering: std::sync::Arc::new(cfg.tiering.clone()),
         keystore_config: std::sync::Arc::clone(&keystore_config_arc),
         num_drives: lib_drives as usize,
         drive_compression_algorithm: drive_cfg.compression.algorithm,

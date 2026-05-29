@@ -1164,6 +1164,63 @@ _arguments "${_arguments_options[@]}" : \
 '*::barcodes -- Optional barcodes to limit the cartridge sweep:_default' \
 && ret=0
 ;;
+(tiering)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_thurvtl__subcmd__system__subcmd__tiering_commands" \
+"*::: :->tiering" \
+&& ret=0
+
+    case $state in
+    (tiering)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvtl-system-tiering-command-$line[1]:"
+        case $line[1] in
+            (plan)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit the full plan as JSON for automation]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvtl__subcmd__system__subcmd__tiering__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvtl-system-tiering-help-command-$line[1]:"
+        case $line[1] in
+            (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (regenerate-cert)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -1338,6 +1395,26 @@ _arguments "${_arguments_options[@]}" : \
 (verify)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
+;;
+(tiering)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvtl__subcmd__system__subcmd__help__subcmd__tiering_commands" \
+"*::: :->tiering" \
+&& ret=0
+
+    case $state in
+    (tiering)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvtl-system-help-tiering-command-$line[1]:"
+        case $line[1] in
+            (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (regenerate-cert)
 _arguments "${_arguments_options[@]}" : \
@@ -2129,6 +2206,26 @@ _arguments "${_arguments_options[@]}" : \
 (verify)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
+;;
+(tiering)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvtl__subcmd__help__subcmd__system__subcmd__tiering_commands" \
+"*::: :->tiering" \
+&& ret=0
+
+    case $state in
+    (tiering)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvtl-help-system-tiering-command-$line[1]:"
+        case $line[1] in
+            (plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (regenerate-cert)
 _arguments "${_arguments_options[@]}" : \
@@ -3053,6 +3150,7 @@ _thurvtl__subcmd__help__subcmd__system_commands() {
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
+'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
     )
@@ -3154,6 +3252,18 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_comma
 _thurvtl__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system storage check commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__tiering_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__tiering_commands() {
+    local commands; commands=(
+'plan:Show migrations the tiering policies would trigger' \
+    )
+    _describe -t commands 'thurvtl help system tiering commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__plan_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__tiering__subcmd__plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system tiering plan commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__verify_commands() {
@@ -3595,6 +3705,7 @@ _thurvtl__subcmd__system_commands() {
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
+'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -3743,6 +3854,7 @@ _thurvtl__subcmd__system__subcmd__help_commands() {
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
 'verify:Library-wide consistency check' \
+'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
 'alerting:First-party alerting (email + webhook)' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -3851,6 +3963,18 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands(
     local commands; commands=()
     _describe -t commands 'thurvtl system help storage check commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__tiering_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__tiering_commands() {
+    local commands; commands=(
+'plan:Show migrations the tiering policies would trigger' \
+    )
+    _describe -t commands 'thurvtl system help tiering commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__plan_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__tiering__subcmd__plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help tiering plan commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__verify_commands() {
     local commands; commands=()
@@ -3913,6 +4037,37 @@ _thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__check_commands(
 _thurvtl__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system storage help help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering_commands() {
+    local commands; commands=(
+'plan:Show migrations the tiering policies would trigger' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvtl system tiering commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__help_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__help_commands() {
+    local commands; commands=(
+'plan:Show migrations the tiering policies would trigger' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvtl system tiering help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__help_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering help help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__plan_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__help__subcmd__plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering help plan commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__tiering__subcmd__plan_commands] )) ||
+_thurvtl__subcmd__system__subcmd__tiering__subcmd__plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system tiering plan commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__verify_commands] )) ||
 _thurvtl__subcmd__system__subcmd__verify_commands() {

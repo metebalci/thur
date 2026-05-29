@@ -174,6 +174,39 @@ Per-type fields (`bucket`, `region`, `prefix`, `project_id`,
 documented in [`AUTH.md`](AUTH.md); the S3-compatible provider matrix
 is in [`S3_BACKENDS.md`](S3_BACKENDS.md).
 
+### `tiering` — VTL only
+
+A cartridge binds to one backend at create time. Tiering is the
+operator-driven way to re-home it later under a rule instead of by
+hand: a list of placement policies, evaluated against the live
+inventory by `thurvtl system tiering plan`. The section is off by
+default (no policies), and nothing ever moves on its own — `plan`
+only previews; a future `run-now` will execute a reviewed plan.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `tiering.policies` | empty | Ordered list of placement policies. The first policy whose predicates all match a cartridge decides its placement. |
+| `tiering.policies[].predicates.barcode_prefix` | unset | Match cartridges whose barcode starts with this string. |
+| `tiering.policies[].predicates.lto_generation` | unset | Match cartridges of exactly this LTO generation. |
+| `tiering.policies[].predicates.worm` | unset | Match cartridges with this WORM flag (`true` / `false`). |
+| `tiering.policies[].migrate_to` | **required** | Target backend name. Must exist under `storage.backends`. |
+
+Predicates within a policy are ANDed; at least one predicate is
+required (a zero-predicate "match everything" rule is rejected at
+startup, as is a `migrate_to` that names an undefined backend — both
+are reported with every offending policy index at once). Only the
+three predicates above are supported: each is O(1) to evaluate and
+survives a disaster-recovery restore. An age-based predicate is
+deliberately omitted — the only "last write" signal available today
+is a local-only index that is zero-filled on restore, so it cannot be
+trusted across DR.
+
+Cartridges under a cloud-native legal hold are always excluded from
+tiering, with no per-policy opt-in: a hold has no host-visible signal
+and no cross-backend transfer path, so relocating a held cartridge
+would silently drop the hold. `plan` reads each move candidate's hold
+state from its backend and reports held cartridges separately.
+
 ### `http`
 
 The HTTP listener serves the health, metrics, and status endpoints.
