@@ -4628,6 +4628,17 @@ name = "shared-dedup-stats"
 version = "0.1.0-dev.4"
 
 [[package]]
+name = "shared-disk-evict"
+version = "0.1.0-dev.4"
+dependencies = [
+ "shared-alerting",
+ "shared-object-store",
+ "shared-pool",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "shared-health"
 version = "0.1.0-dev.4"
 dependencies = [
@@ -5582,6 +5593,7 @@ dependencies = [
  "shared-audit",
  "shared-crypto",
  "shared-dedup-stats",
+ "shared-disk-evict",
  "shared-health",
  "shared-iscsi",
  "shared-keystore",
@@ -5676,6 +5688,7 @@ dependencies = [
  "shared-alerting",
  "shared-audit",
  "shared-dedup-stats",
+ "shared-disk-evict",
  "shared-health",
  "shared-iscsi",
  "shared-keystore",

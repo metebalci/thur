@@ -99,8 +99,7 @@ const FLAG_HASH_PRESENT: u8 = 0b0000_0001;
 const FLAG_UPLOADED: u8 = 0b0000_0010;
 const FLAG_LOC_MASK: u8 = 0b0000_1100;
 const FLAG_LOC_SHIFT: u8 = 2;
-const FLAG_COMP_MASK: u8 = 0b0111_0000;
-const FLAG_COMP_SHIFT: u8 = 4;
+use crate::compression_codec::{pack_compression, unpack_compression};
 
 /// Per-cartridge view of where a chunk's bytes are. Mirrors the
 /// `ChunkLocation` enum in `cartridge.rs` but lives here so the codec
@@ -121,48 +120,6 @@ impl LocationTag {
             1 => Some(Self::CloudOnly),
             2 => Some(Self::Both),
             _ => None,
-        }
-    }
-}
-
-/// Compression algorithm tag stored in the 3-bit compression field of
-/// `flags`. Local to this codec so `compression::CompressionAlgo`
-/// doesn't need a stable numeric tag of its own. Identical numeric
-/// assignments to the block-index tag for consistency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum CompressionTag {
-    None = 0,
-    Lz4 = 1,
-    Zstd = 2,
-    Sldc = 3,
-    // 4..=7 reserved
-}
-
-impl CompressionTag {
-    fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::None),
-            1 => Some(Self::Lz4),
-            2 => Some(Self::Zstd),
-            3 => Some(Self::Sldc),
-            _ => None,
-        }
-    }
-    fn from_algo(algo: Option<CompressionAlgo>) -> Self {
-        match algo {
-            None => Self::None,
-            Some(CompressionAlgo::Lz4) => Self::Lz4,
-            Some(CompressionAlgo::Zstd) => Self::Zstd,
-            Some(CompressionAlgo::Sldc) => Self::Sldc,
-        }
-    }
-    fn to_algo(self) -> Option<CompressionAlgo> {
-        match self {
-            Self::None => None,
-            Self::Lz4 => Some(CompressionAlgo::Lz4),
-            Self::Zstd => Some(CompressionAlgo::Zstd),
-            Self::Sldc => Some(CompressionAlgo::Sldc),
         }
     }
 }
@@ -205,8 +162,7 @@ impl ChunkRec {
         }
         let loc = self.location as u8;
         f |= (loc << FLAG_LOC_SHIFT) & FLAG_LOC_MASK;
-        let comp = CompressionTag::from_algo(self.compression) as u8;
-        f |= (comp << FLAG_COMP_SHIFT) & FLAG_COMP_MASK;
+        f |= pack_compression(self.compression);
         f
     }
 
@@ -217,12 +173,9 @@ impl ChunkRec {
         let location = LocationTag::from_u8(loc_bits).ok_or(SmcError::InvalidOp(
             "chunk index record has unknown location tag",
         ))?;
-        let comp_bits = (f & FLAG_COMP_MASK) >> FLAG_COMP_SHIFT;
-        let comp = CompressionTag::from_u8(comp_bits)
-            .ok_or(SmcError::InvalidOp(
-                "chunk index record has unknown compression tag",
-            ))?
-            .to_algo();
+        let comp = unpack_compression(f).ok_or(SmcError::InvalidOp(
+            "chunk index record has unknown compression tag",
+        ))?;
         Ok((hash_present, uploaded, location, comp))
     }
 
@@ -494,6 +447,7 @@ impl<'a> Iterator for ChunkIndexIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression_codec::FLAG_COMP_SHIFT;
     use tempfile::TempDir;
 
     fn sample_hash(byte: u8) -> String {

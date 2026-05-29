@@ -145,6 +145,17 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   trait, no I/O, no serde. Entity enumeration differs per product
   (VTL walks each cartridge's `chunks.idx`, VSA each volume's
   `pages.idx`) and stays in each daemon's `job_dispatch::stats`.
+- **shared-disk-evict** — the two genuinely identical halves of each
+  daemon's disk-cache eviction worker. `resolve_and_apply_caps` does
+  the `auto`-mode per-backend cap recompute against current free space
+  (byte-for-byte the same in both daemons) and pushes the new ceilings
+  into each backend's `PoolBudget`; `check_usage_or_alert` logs the
+  within-budget utilization line, fires the soft-watermark alert, and
+  returns whether eviction is needed. The wakeup source (VTL:
+  upload-completion `Notify` + 5-min backstop; VSA: interval tick) and
+  the evict call itself (VTL's async cloud-backup evict vs VSA's sync
+  fs-only trim) genuinely differ and stay per-daemon; both now offload
+  the blocking usage walk + eviction to `spawn_blocking`.
 - **shared-object-store** — storage-backend abstraction. `object_store_backend.rs` (the
   `ObjectStoreBackend` trait), `object_store_config.rs` (`ObjectStoreConfig` schema +
   `FailureKind` classifier + `validate_object_store_backend`),

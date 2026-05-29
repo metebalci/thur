@@ -96,32 +96,7 @@ pub async fn cmd_stats(json: bool) -> Result<u8> {
     Ok(u8::try_from(exit.max(0)).unwrap_or(2))
 }
 
-fn fmt_bytes(n: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    const TIB: f64 = GIB * 1024.0;
-    let f = n as f64;
-    if f >= TIB {
-        format!("{:.2} TiB", f / TIB)
-    } else if f >= GIB {
-        format!("{:.2} GiB", f / GIB)
-    } else if f >= MIB {
-        format!("{:.2} MiB", f / MIB)
-    } else if f >= KIB {
-        format!("{:.2} KiB", f / KIB)
-    } else {
-        format!("{} B", n)
-    }
-}
-
-fn fmt_ratio(logical: u64, unique: u64) -> String {
-    if unique == 0 {
-        "—".into()
-    } else {
-        format!("{:.2}x", logical as f64 / unique as f64)
-    }
-}
+use shared_cli_system::fmt::{fmt_bytes, fmt_ratio};
 
 fn print_human(r: &StatsReport) {
     if r.backends.is_empty() {
@@ -209,26 +184,8 @@ fn print_skipped(r: &StatsReport) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fmt_bytes_picks_iec_unit() {
-        assert_eq!(fmt_bytes(0), "0 B");
-        assert_eq!(fmt_bytes(512), "512 B");
-        assert_eq!(fmt_bytes(2048), "2.00 KiB");
-        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.00 MiB");
-        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.00 GiB");
-        assert_eq!(fmt_bytes(2 * 1024_u64.pow(4)), "2.00 TiB");
-    }
-
-    #[test]
-    fn fmt_ratio_handles_zero_unique() {
-        assert_eq!(fmt_ratio(1000, 0), "—");
-    }
-
-    #[test]
-    fn fmt_ratio_computes_dedup_factor() {
-        assert_eq!(fmt_ratio(4000, 1000), "4.00x");
-        assert_eq!(fmt_ratio(1500, 1000), "1.50x");
-    }
+    // fmt_bytes / fmt_ratio moved to `shared_cli_system::fmt`; their
+    // unit tests live there now.
 
     #[test]
     fn print_human_empty_report_takes_no_cartridges_branch() {

@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
-use core_block::PageCache;
+use core_block::{PageCache, RangeError};
 use nvme_base::identify::CNS;
 use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusField};
 
@@ -428,17 +428,15 @@ impl NvmeNvmDispatcher {
         data_in_max: u32,
         cache: &PageCache,
     ) -> NvmeResponse {
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(sqe);
         let nlb = read_nlb(sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(resp) = check_range(cid, cache, slba, len_bytes) {
-            return resp;
-        }
+        let (byte_off, len_bytes) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         if len_bytes > u64::from(data_in_max) {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field()));
         }
-        let byte_off = slba * lba_bytes;
         match cache.read_bytes(byte_off, len_bytes as usize).await {
             Ok(buf) => NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), buf),
             Err(e) => {
@@ -455,20 +453,18 @@ impl NvmeNvmDispatcher {
         data_out: Option<&[u8]>,
         cache: &PageCache,
     ) -> NvmeResponse {
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(sqe);
         let nlb = read_nlb(sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(resp) = check_range(cid, cache, slba, len_bytes) {
-            return resp;
-        }
+        let (byte_off, len_bytes) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let payload = match data_out {
             Some(p) if p.len() as u64 == len_bytes => p,
             _ => {
                 return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field()));
             }
         };
-        let byte_off = slba * lba_bytes;
         match cache.write_bytes(byte_off, payload).await {
             Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
@@ -485,20 +481,18 @@ impl NvmeNvmDispatcher {
         data_out: Option<&[u8]>,
         cache: &PageCache,
     ) -> NvmeResponse {
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(sqe);
         let nlb = read_nlb(sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(resp) = check_range(cid, cache, slba, len_bytes) {
-            return resp;
-        }
+        let (byte_off, len_bytes) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let expected = match data_out {
             Some(p) if p.len() as u64 == len_bytes => p,
             _ => {
                 return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field()));
             }
         };
-        let byte_off = slba * lba_bytes;
         match cache.read_bytes(byte_off, len_bytes as usize).await {
             Ok(actual) => {
                 if actual == expected {
@@ -520,13 +514,12 @@ impl NvmeNvmDispatcher {
         sqe: &nvme_base::Sqe,
         cache: &PageCache,
     ) -> NvmeResponse {
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(sqe);
         let nlb = read_nlb(sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(resp) = check_range(cid, cache, slba, len_bytes) {
-            return resp;
-        }
+        let (byte_off, len_bytes) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         // VSA's write path dedups identical pages, so a zero buffer
         // collapses to the canonical zero-chunk reference. unmap is
         // a possible optimization but core-block doesn't yet expose
@@ -534,7 +527,6 @@ impl NvmeNvmDispatcher {
         // and zero-write preserves the read-back contract NVMe writes
         // expect (all zeros, not "unallocated").
         let zeros = vec![0u8; len_bytes as usize];
-        let byte_off = slba * lba_bytes;
         match cache.write_bytes(byte_off, &zeros).await {
             Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
@@ -572,18 +564,16 @@ impl NvmeNvmDispatcher {
                 return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field()));
             }
         };
-        let lba_bytes = cache.sector_size();
         for chunk in payload.chunks_exact(16) {
             let nlb = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
             let slba = u64::from_le_bytes([
                 chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14],
                 chunk[15],
             ]);
-            let len = u64::from(nlb) * lba_bytes;
-            if let Some(resp) = check_range(cid, cache, slba, len) {
-                return resp;
-            }
-            let byte_off = slba * lba_bytes;
+            let (byte_off, len) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
             if let Err(e) = cache.unmap_bytes(byte_off, len).await {
                 tracing::warn!(error = %e, "dsm deallocate failed");
                 return NvmeResponse::just(Cqe::failure(
@@ -603,14 +593,12 @@ impl NvmeNvmDispatcher {
         // hand data to the host. core-block has no opaque-medium
         // concept so this collapses to "can we successfully read
         // these LBAs."
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(sqe);
         let nlb = read_nlb(sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(resp) = check_range(cid, cache, slba, len_bytes) {
-            return resp;
-        }
-        let byte_off = slba * lba_bytes;
+        let (byte_off, len_bytes) = match resolve_range(cid, cache, slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         match cache.read_bytes(byte_off, len_bytes as usize).await {
             Ok(_) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
@@ -632,40 +620,33 @@ fn read_nlb(sqe: &nvme_base::Sqe) -> u32 {
     u32::from((sqe.cdw12 & 0xFFFF) as u16) + 1
 }
 
-/// Range-check an LBA span. Returns a populated NvmeResponse on
-/// error so callers `return` straight through; returns None on a
-/// valid range.
-fn check_range(cid: u16, cache: &PageCache, slba: u64, len_bytes: u64) -> Option<NvmeResponse> {
-    let size = cache.size_bytes();
-    let lba_bytes = cache.sector_size();
-    if lba_bytes == 0 {
-        return Some(NvmeResponse::just(Cqe::failure(
+/// Resolve an LBA span to `(byte_offset, byte_len)` against the
+/// volume, overflow-safe and bounds-checked. Wraps the shared
+/// [`PageCache::resolve_range`] (also used by the SBC data path) and
+/// translates [`RangeError`] into a populated `NvmeResponse` so callers
+/// `return` straight through on error. `blocks` is the real
+/// (one-based) block count.
+fn resolve_range(
+    cid: u16,
+    cache: &PageCache,
+    slba: u64,
+    blocks: u64,
+) -> Result<(u64, u64), NvmeResponse> {
+    match cache.resolve_range(slba, blocks) {
+        Ok(v) => Ok(v),
+        Err(RangeError::BadSectorSize) => Err(NvmeResponse::just(Cqe::failure(
             cid,
             0,
             0,
             StatusField::internal_error(),
-        )));
-    }
-    let Some(end) = slba
-        .checked_mul(lba_bytes)
-        .and_then(|s| s.checked_add(len_bytes))
-    else {
-        return Some(NvmeResponse::just(Cqe::failure(
+        ))),
+        Err(RangeError::OutOfRange) => Err(NvmeResponse::just(Cqe::failure(
             cid,
             0,
             0,
             StatusField::lba_out_of_range(),
-        )));
-    };
-    if end > size {
-        return Some(NvmeResponse::just(Cqe::failure(
-            cid,
-            0,
-            0,
-            StatusField::lba_out_of_range(),
-        )));
+        ))),
     }
-    None
 }
 
 #[async_trait]
@@ -732,16 +713,17 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
             );
         };
-        let lba_bytes = cache.sector_size();
         let slba = read_slba(&compare.sqe);
         let nlb = read_nlb(&compare.sqe);
-        let len_bytes = u64::from(nlb) * lba_bytes;
-        if let Some(_resp) = check_range(compare_cid, &cache, slba, len_bytes) {
-            return (
-                Cqe::failure(compare_cid, 0, 0, StatusField::lba_out_of_range()),
-                Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
-            );
-        }
+        let (byte_off, len_bytes) = match cache.resolve_range(slba, u64::from(nlb)) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    Cqe::failure(compare_cid, 0, 0, StatusField::lba_out_of_range()),
+                    Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
+                );
+            }
+        };
         let expected = match compare.data_out {
             Some(d) if d.len() as u64 == len_bytes => d,
             _ => {
@@ -760,7 +742,6 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 );
             }
         };
-        let byte_off = slba * lba_bytes;
         match cache.compare_and_write_bytes(byte_off, expected, new).await {
             Ok(true) => (
                 Cqe::success(compare_cid, 0, 0, 0),

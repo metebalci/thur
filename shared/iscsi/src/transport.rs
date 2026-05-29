@@ -1487,26 +1487,46 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
             }
         };
 
+        // Stamp a response PDU's serial fields (StatSN from
+        // `next_statsn`, ExpCmdSN / MaxCmdSN derived from the request
+        // it answers) and write it. Every single-PDU responder arm
+        // below goes through this so a serial-field change is one edit,
+        // not eight. `$req` is the incoming PDU being answered. (The
+        // chunked Data-In path stamps inline — it spreads DataSN across
+        // multiple PDUs with per-PDU S-bit logic the macro can't model.)
+        macro_rules! stamp_and_write {
+            ($resp:expr, $req:expr) => {{
+                let exp_cmdsn = next_exp_cmdsn($req);
+                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+                let sn = next_statsn()?;
+                stamp_serials_for_response(&mut $resp.bhs, sn, exp_cmdsn, max_cmdsn);
+                write_pdu(sock, &mut $resp).await?;
+            }};
+        }
+
+        // Build a Reject PDU (opcode 0x3F, F=1) with the given
+        // InitiatorTaskTag and reason code (`bhs[2]`). Protocol-error
+        // rejects use ITT 0xFFFFFFFF (unsolicited); a per-command reject
+        // (e.g. unsupported opcode) echoes the command's ITT.
+        let build_reject = |itt: u32, reason: u8| {
+            let mut rej = build_empty_pdu(0x3F, true, true);
+            rej.itt = itt;
+            rej.bhs[2] = reason;
+            rej
+        };
+
         match pdu.opcode & 0x3F {
             0x00 => {
                 // NOP-Out ping; answer with a NOP-In. Legal in
                 // discovery sessions (RFC 7143 §6.1).
                 let mut nop_in = build_nop_in_response(pdu.itt);
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut nop_in.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut nop_in).await?;
+                stamp_and_write!(nop_in, &pdu);
             }
             0x04 => {
                 // Text Request — SendTargets discovery
                 let req_keys = parse_text_kv(&pdu.data);
                 let mut tx = build_empty_pdu(0x24, false, true);
                 tx.itt = pdu.itt;
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut tx.bhs, sn, exp_cmdsn, max_cmdsn);
 
                 if let Some(st) = req_keys.get("SendTargets") {
                     // Legacy fallback: matches the pre-multi-portal
@@ -1540,7 +1560,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     tx.data = keys;
                 }
                 let _ = format_text_data(&tx.data);
-                write_pdu(sock, &mut tx).await?;
+                stamp_and_write!(tx, &pdu);
             }
             0x01 => {
                 // SCSI Command. Illegal in discovery sessions
@@ -1551,14 +1571,8 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     tracing::warn!(
                         "SCSI Command on discovery session from {peer} — protocol violation"
                     );
-                    let mut rej = build_empty_pdu(0x3F, true, true);
-                    rej.itt = 0xFFFFFFFF;
-                    rej.bhs[2] = 0x04;
-                    let exp_cmdsn = next_exp_cmdsn(&pdu);
-                    let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                    let sn = next_statsn()?;
-                    stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
-                    write_pdu(sock, &mut rej).await?;
+                    let mut rej = build_reject(0xFFFFFFFF, 0x04);
+                    stamp_and_write!(rej, &pdu);
                     continue;
                 }
 
@@ -1698,9 +1712,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                         payload.extend_from_slice(&sense);
                         sresp.data = payload;
                     }
-                    let sn = next_statsn()?;
-                    stamp_serials_for_response(&mut sresp.bhs, sn, exp_cmdsn, max_cmdsn);
-                    write_pdu(sock, &mut sresp).await?;
+                    stamp_and_write!(sresp, &pdu);
                 }
             }
             0x02 => {
@@ -1712,24 +1724,14 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     tracing::warn!(
                         "Task Management on discovery session from {peer} — protocol violation"
                     );
-                    let mut rej = build_empty_pdu(0x3F, true, true);
-                    rej.itt = 0xFFFFFFFF;
-                    rej.bhs[2] = 0x04;
-                    let exp_cmdsn = next_exp_cmdsn(&pdu);
-                    let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                    let sn = next_statsn()?;
-                    stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
-                    write_pdu(sock, &mut rej).await?;
+                    let mut rej = build_reject(0xFFFFFFFF, 0x04);
+                    stamp_and_write!(rej, &pdu);
                     continue;
                 }
                 let mut tmf = build_empty_pdu(0x22, true, true);
                 tmf.itt = pdu.itt;
                 tmf.bhs[2] = 0x00;
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut tmf.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut tmf).await?;
+                stamp_and_write!(tmf, &pdu);
             }
             0x06 => {
                 // Logout — connection closed successfully. Legal in
@@ -1738,11 +1740,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 let mut logout_resp = build_empty_pdu(0x26, true, true);
                 logout_resp.itt = pdu.itt;
                 logout_resp.bhs[2] = 0x00;
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut logout_resp.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut logout_resp).await?;
+                stamp_and_write!(logout_resp, &pdu);
                 break;
             }
             0x05 => {
@@ -1752,14 +1750,8 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     pdu.itt,
                     pdu.ttt
                 );
-                let mut rej = build_empty_pdu(0x3F, true, true);
-                rej.itt = 0xFFFFFFFF;
-                rej.bhs[2] = 0x04; // Protocol error
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut rej).await?;
+                let mut rej = build_reject(0xFFFFFFFF, 0x04); // Protocol error
+                stamp_and_write!(rej, &pdu);
             }
             0xFF => break,
             _ => {
@@ -1768,14 +1760,8 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     pdu.opcode & 0x3F,
                     opcode_name(pdu.opcode)
                 );
-                let mut rej = build_empty_pdu(0x3F, true, true);
-                rej.itt = pdu.itt;
-                rej.bhs[2] = 0x09; // Command not supported
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut rej.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut rej).await?;
+                let mut rej = build_reject(pdu.itt, 0x09); // Command not supported
+                stamp_and_write!(rej, &pdu);
             }
         }
     }

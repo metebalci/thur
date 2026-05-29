@@ -23,7 +23,7 @@ pub mod uploader;
 pub mod verify;
 pub mod volume;
 
-pub use cache::{DEFAULT_CACHE_BUDGET_BYTES, PageCache};
+pub use cache::{DEFAULT_CACHE_BUDGET_BYTES, PageCache, RangeError};
 pub use chunk_pool::{ChunkPool, ChunkPoolError};
 // `DiskCacheSize` / `DiskCacheBounds` live in `shared-pool` so the
 // YAML default and the per-entry `cloud.backends:` override can't

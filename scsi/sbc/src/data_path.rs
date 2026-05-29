@@ -137,6 +137,19 @@ fn validate_in_range(range: &LbaRange, sz: &Sizing) -> Result<(), SenseData> {
     Ok(())
 }
 
+/// Resolve an LBA range to `(byte_offset, byte_len)` against the
+/// volume, mapping any past-end-of-volume / overflow condition to LBA
+/// OUT OF RANGE. Wraps the shared [`PageCache::resolve_range`] — the
+/// same overflow-safe range check the NVMe data path uses — so the
+/// LBA -> byte invariant lives in one place. `byte_len` is returned as
+/// `usize` since every caller feeds it straight to a buffer length.
+fn resolve_range_sense(cache: &PageCache, range: &LbaRange) -> Result<(u64, usize), SenseData> {
+    cache
+        .resolve_range(range.lba, range.blocks)
+        .map(|(off, len)| (off, len as usize))
+        .map_err(|_| SenseData::LBA_OUT_OF_RANGE)
+}
+
 /// WRITE (10) / WRITE (16). Routes through the per-volume
 /// [`PageCache`] which loads the affected pages, splices in the
 /// host bytes at sector grain, and marks them dirty for async
@@ -172,15 +185,13 @@ pub(super) async fn write(
         // an error.
         return ScsiResponse::good(Vec::new());
     }
-    let sz = Sizing::from(cache);
-    if let Err(s) = validate_in_range(&range, &sz) {
-        return ScsiResponse::check(s);
-    }
-    let want_bytes = (range.blocks * sz.sector) as usize;
+    let (byte_offset, want_bytes) = match resolve_range_sense(cache, &range) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
     if req.data_out.len() != want_bytes {
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
-    let byte_offset = range.lba * sz.sector;
     if let Err(e) = cache.write_bytes(byte_offset, req.data_out).await {
         return ScsiResponse::check(map_write_error(&e));
     }
@@ -218,12 +229,10 @@ pub(super) async fn read(
     if range.blocks == 0 {
         return ScsiResponse::good(Vec::new());
     }
-    let sz = Sizing::from(cache);
-    if let Err(s) = validate_in_range(&range, &sz) {
-        return ScsiResponse::check(s);
-    }
-    let want_bytes = (range.blocks * sz.sector) as usize;
-    let byte_offset = range.lba * sz.sector;
+    let (byte_offset, want_bytes) = match resolve_range_sense(cache, &range) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
 
     let mut out = match cache.read_bytes(byte_offset, want_bytes).await {
         Ok(v) => v,
@@ -339,12 +348,11 @@ pub(super) async fn compare_and_write(
     if blocks == 0 {
         return ScsiResponse::good(Vec::new()); // SBC-3: no transfer
     }
-    let sz = Sizing::from(cache);
     let range = LbaRange { lba, blocks };
-    if let Err(s) = validate_in_range(&range, &sz) {
-        return ScsiResponse::check(s);
-    }
-    let want_each = (blocks * sz.sector) as usize;
+    let (byte_offset, want_each) = match resolve_range_sense(cache, &range) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
     let want_total = match want_each.checked_mul(2) {
         Some(v) => v,
         None => return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
@@ -362,7 +370,6 @@ pub(super) async fn compare_and_write(
     let lock = caw_locks.lock_for(req.lun);
     let _guard = lock.lock().await;
 
-    let byte_offset = range.lba * sz.sector;
     match cache
         .compare_and_write_bytes(byte_offset, compare_buf, write_buf)
         .await
@@ -455,14 +462,15 @@ pub(super) async fn unmap(
     }
 
     let n = descriptor_total / 16;
-    let sz = Sizing::from(cache);
 
-    // Two-phase: validate every descriptor first so a malformed
-    // entry doesn't leave half the volume cleared. SBC-3 §5.27
-    // doesn't require all-or-nothing semantics, but it's the
+    // Two-phase: validate + resolve every descriptor first so a
+    // malformed entry doesn't leave half the volume cleared. SBC-3
+    // §5.27 doesn't require all-or-nothing semantics, but it's the
     // user-friendly behavior — an initiator that retries gets a
-    // clean slate to retry against.
-    let mut to_clear: Vec<(u64, u64)> = Vec::with_capacity(n);
+    // clean slate to retry against. Tuple is
+    // `(byte_offset, len_bytes, lba, blocks)`; the trailing LBA/blocks
+    // are kept only for the failure log.
+    let mut to_clear: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(n);
     for i in 0..n {
         let off = 8 + i * 16;
         let lba = u64::from_be_bytes(p[off..off + 8].try_into().expect("8 bytes"));
@@ -474,15 +482,14 @@ pub(super) async fn unmap(
             lba,
             blocks: u64::from(blocks),
         };
-        if let Err(s) = validate_in_range(&range, &sz) {
-            return ScsiResponse::check(s);
-        }
-        to_clear.push((range.lba, range.blocks));
+        let (byte_offset, len_bytes) = match resolve_range_sense(cache, &range) {
+            Ok(v) => v,
+            Err(s) => return ScsiResponse::check(s),
+        };
+        to_clear.push((byte_offset, len_bytes as u64, lba, range.blocks));
     }
 
-    for (lba, blocks) in to_clear {
-        let byte_offset = lba * sz.sector;
-        let len_bytes = blocks * sz.sector;
+    for (byte_offset, len_bytes, lba, blocks) in to_clear {
         if let Err(e) = cache.unmap_bytes(byte_offset, len_bytes).await {
             tracing::warn!(error = %e, lba = lba, blocks = blocks, "UNMAP: cache clear failed");
             return ScsiResponse::check(SenseData::WRITE_ERROR);
@@ -543,12 +550,10 @@ pub(super) async fn verify(
     if range.blocks == 0 {
         return ScsiResponse::good(Vec::new());
     }
-    let sz = Sizing::from(cache);
-    if let Err(s) = validate_in_range(&range, &sz) {
-        return ScsiResponse::check(s);
-    }
-    let want_bytes = (range.blocks * sz.sector) as usize;
-    let byte_offset = range.lba * sz.sector;
+    let (byte_offset, want_bytes) = match resolve_range_sense(cache, &range) {
+        Ok(v) => v,
+        Err(s) => return ScsiResponse::check(s),
+    };
 
     if bytchk == 0b00 {
         // Medium-readability check: the cache resolves every page
@@ -661,9 +666,10 @@ pub(super) async fn write_same(
         blocks_field
     };
     let range = LbaRange { lba, blocks };
-    if let Err(s) = validate_in_range(&range, &sz) {
-        return ScsiResponse::check(s);
-    }
+    let (byte_offset, len_bytes) = match resolve_range_sense(cache, &range) {
+        Ok((off, len)) => (off, len as u64),
+        Err(s) => return ScsiResponse::check(s),
+    };
 
     // Resolve the per-sector pattern. NDOB skips data-out and
     // implies zero; otherwise data_out must carry exactly one
@@ -680,9 +686,6 @@ pub(super) async fn write_same(
         req.data_out
     };
     let pattern_is_zero = pattern.iter().all(|&b| b == 0);
-
-    let byte_offset = range.lba * sz.sector;
-    let len_bytes = range.blocks * sz.sector;
 
     if unmap && pattern_is_zero {
         // Cheapest path: drop the cached entries and clear the

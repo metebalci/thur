@@ -28,6 +28,7 @@ shared-object-store = { path = "../../shared/object-store" }
 # bytes into core-block::VolumeWriter::open_with_key at boot / create.
 shared-crypto = { path = "../../shared/crypto" }
 shared-dedup-stats = { path = "../../shared/dedup-stats" }
+shared-disk-evict = { path = "../../shared/disk-evict" }
 shared-health = { path = "../../shared/health" }
 shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }
 shared-keystore = { path = "../../shared/keystore" }

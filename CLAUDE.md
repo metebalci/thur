@@ -115,6 +115,16 @@ on-disk paths group by purpose.
   `(backend, namespace)` and returns the per-entity exclusive/shared
   split + per-backend unique pool bytes. Entity enumeration
   (cartridge `chunks.idx` vs volume `pages.idx`) stays per-product.
+- `shared/disk-evict` (`shared-disk-evict`) — the two genuinely
+  identical halves of each daemon's disk-cache eviction worker:
+  `resolve_and_apply_caps` (the `auto`-mode per-backend cap recompute
+  against current free space, byte-for-byte the same in both) and
+  `check_usage_or_alert` (the within-budget utilization log + soft-
+  watermark alert, returning whether eviction is needed). The wakeup
+  source (VTL: upload-completion `Notify` + backstop; VSA: interval)
+  and the evict call (VTL's async cloud-backup evict vs VSA's sync
+  fs-only trim) genuinely differ and stay per-product; both daemons
+  now offload the blocking usage walk + eviction to `spawn_blocking`.
 - `shared/iscsi` (`shared-iscsi`) — iSCSI transport, CHAP auth,
   session management, unit-attention queue, login audit sink,
   product-agnostic `ScsiHandler` trait.

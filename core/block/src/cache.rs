@@ -138,6 +138,20 @@ impl CacheInner {
         }
     }
 
+    /// Drop a cached page entry and clear both side indexes (LRU +
+    /// dirty set). Centralizes the invariant that every entry removal
+    /// keeps `pages`, `lru`, and `dirty` consistent. Returns whether an
+    /// entry was actually present.
+    fn drop_entry(&mut self, page_id: PageId) -> bool {
+        if self.pages.remove(&page_id).is_some() {
+            self.lru_remove(page_id);
+            self.dirty.remove(&page_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Find the LRU page id, optionally restricted to clean entries.
     /// Returns `None` if the cache is empty (or no clean entries
     /// when `clean_only`).
@@ -158,6 +172,17 @@ impl CacheInner {
         }
         None
     }
+}
+
+/// Error from [`PageCache::resolve_range`]: an LBA range that can't be
+/// mapped to a valid byte window in this volume. The SBC and NVMe data
+/// paths translate it to their respective sense / status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeError {
+    /// Sector size is zero — volume manifest is malformed / not ready.
+    BadSectorSize,
+    /// `lba + blocks` overflows u64 or runs past the end of the volume.
+    OutOfRange,
 }
 
 /// Per-volume page cache. Holds the underlying `VolumeWriter` so a
@@ -374,6 +399,32 @@ impl PageCache {
     /// dispatcher which does range checking in byte space.
     pub fn size_bytes(&self) -> u64 {
         self.manifest().size_bytes
+    }
+
+    /// Resolve an LBA range to a `(byte_offset, byte_len)` window,
+    /// overflow-safe and bounds-checked against the volume size.
+    ///
+    /// Centralizes the LBA -> byte-offset invariant shared by the SBC
+    /// (`scsi-sbc`) and NVMe (`nvme-nvm`) data paths — both used to
+    /// re-derive sizing + an overflow-safe range check independently,
+    /// so a sizing bug could appear in one path but not the other. A
+    /// zero-block request resolves to a zero-length window at the
+    /// range's byte offset.
+    pub fn resolve_range(&self, lba: u64, blocks: u64) -> Result<(u64, u64), RangeError> {
+        let sector = self.sector_size();
+        if sector == 0 {
+            return Err(RangeError::BadSectorSize);
+        }
+        let total_blocks = self.size_bytes() / sector;
+        let end = lba.checked_add(blocks).ok_or(RangeError::OutOfRange)?;
+        if end > total_blocks {
+            return Err(RangeError::OutOfRange);
+        }
+        // lba <= total_blocks and total_blocks * sector <= size_bytes,
+        // so neither multiply can overflow; checked for clarity.
+        let byte_off = lba.checked_mul(sector).ok_or(RangeError::OutOfRange)?;
+        let len = blocks.checked_mul(sector).ok_or(RangeError::OutOfRange)?;
+        Ok((byte_off, len))
     }
 
     // -------------------------------------------------------------
@@ -913,10 +964,7 @@ impl PageCache {
     async fn unmap_full_page(&self, page_id: PageId) -> Result<(), UploaderError> {
         {
             let mut inner = self.inner.lock().await;
-            if inner.pages.remove(&page_id).is_some() {
-                inner.lru_remove(page_id);
-                inner.dirty.remove(&page_id);
-            }
+            inner.drop_entry(page_id);
         }
         self.writer.page_index().clear(page_id)?;
         Ok(())
@@ -1056,10 +1104,7 @@ impl PageCache {
     /// that any cached bytes would be stale.
     pub async fn invalidate_cached_page(&self, page_id: PageId) {
         let mut inner = self.inner.lock().await;
-        if inner.pages.remove(&page_id).is_some() {
-            inner.lru_remove(page_id);
-            inner.dirty.remove(&page_id);
-        }
+        inner.drop_entry(page_id);
     }
 
     /// Shared drain loop for `flush_all` and `flush_pages_in_range`.
@@ -1235,10 +1280,7 @@ async fn clone_one_page_into(
     // entry instead of returning stale cached bytes.
     {
         let mut inner = dst.inner.lock().await;
-        if inner.pages.remove(&dst_id).is_some() {
-            inner.lru_remove(dst_id);
-            inner.dirty.remove(&dst_id);
-        }
+        inner.drop_entry(dst_id);
     }
     match src.writer.page_index().get(src_id)? {
         Some(hash) => {

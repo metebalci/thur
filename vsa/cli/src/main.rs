@@ -3,7 +3,6 @@
 
 mod commands;
 mod credentials;
-mod gc;
 mod stats;
 mod storage;
 mod verify;
@@ -238,7 +237,9 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                 }
             },
-            SystemAction::Gc { dry_run, storage } => gc::cmd_gc(dry_run, storage).await,
+            SystemAction::Gc { dry_run, storage } => {
+                shared_cli_system::cmd_gc(&shared_naming::DISK, dry_run, storage).await
+            }
             SystemAction::RegenerateCert => {
                 shared_cli_system::cmd_regenerate_cert(
                     &shared_naming::DISK,

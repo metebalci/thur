@@ -26,6 +26,7 @@ shared-audit = { path = "../../shared/audit" }
 shared-admin-server = { path = "../../shared/admin-server" }
 shared-object-store = { path = "../../shared/object-store" }
 shared-dedup-stats = { path = "../../shared/dedup-stats" }
+shared-disk-evict = { path = "../../shared/disk-evict" }
 shared-health = { path = "../../shared/health" }
 shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }
 # Keystore backends for cartridge at-rest wrap targets; the daemon

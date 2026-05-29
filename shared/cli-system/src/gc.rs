@@ -1,21 +1,28 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! `thurvtl system gc` — daemon-routed orphan-chunk garbage
+//! Cross-product `system gc` — daemon-routed orphan-chunk garbage
 //! collection.
 //!
 //! The daemon owns the chunk pool and audit log; the CLI is a thin
-//! streaming client. With chunks.idx mutations and pool sweeps
-//! serialized through the daemon's locks, GC runs alongside live
-//! iSCSI traffic — no `check_daemon_not_running` gate.
+//! streaming client. With index mutations and pool sweeps serialized
+//! through the daemon's locks, GC runs alongside live host traffic —
+//! no daemon-down gate. Identical for VTL (`chunks.idx`) and VSA
+//! (`pages.idx`); the only per-product input is the
+//! [`ProductIdentity`] used for admin-socket discovery.
 
 use anyhow::{Context, Result};
 
 use shared_admin_client::AdminClient;
 use shared_admin_proto::JobEvent;
+use shared_naming::ProductIdentity;
 
-pub async fn cmd_gc(dry_run: bool, storage: bool) -> Result<()> {
-    let client = AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
+pub async fn cmd_gc(
+    identity: &'static ProductIdentity,
+    dry_run: bool,
+    storage: bool,
+) -> Result<()> {
+    let client = AdminClient::auto_discover(identity);
     let body = serde_json::json!({
         "dry_run": dry_run,
         "storage": storage,

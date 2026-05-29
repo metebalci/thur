@@ -888,45 +888,17 @@ async fn run_disk_cache_eviction_worker(
         tick.tick().await;
 
         // Recompute per-backend caps for `auto`-mode entries against
-        // current free space, then push the new value into each
-        // backend's PoolBudget so `try_reserve` immediately sees the
-        // updated ceiling. Explicit-mode entries are pinned and skip
-        // the recompute. Count auto-mode backends first so the share
-        // divisor is stable across the loop.
-        let resolved_sizes: Vec<(String, core_block::DiskCacheSize)> = backend_names
-            .iter()
-            .map(|name| {
-                let size = storage_config
-                    .backend_entry(name)
-                    .ok()
-                    .and_then(|e| e.disk_cache_size_gb())
-                    .unwrap_or(default_size);
-                (name.clone(), size)
-            })
-            .collect();
-        let auto_backends: u32 = resolved_sizes
-            .iter()
-            .filter(|(_, s)| s.is_auto())
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX);
-        for (name, size) in &resolved_sizes {
-            let Some(budget) = pool_budgets.get(name) else {
-                continue;
-            };
-            let new_cap = size.resolve_bytes(&data_dir, bounds, auto_backends);
-            if budget.cap_bytes() != new_cap {
-                if size.is_auto() {
-                    tracing::debug!(
-                        "disk-cache auto-resize backend '{}': {} -> {} bytes",
-                        name,
-                        budget.cap_bytes(),
-                        new_cap,
-                    );
-                }
-                budget.set_cap_bytes(new_cap);
-            }
-        }
+        // current free space and push the new ceilings into each
+        // backend's PoolBudget. Shared with VTL — see
+        // `shared_disk_evict::resolve_and_apply_caps`.
+        shared_disk_evict::resolve_and_apply_caps(
+            &backend_names,
+            &pool_budgets,
+            &storage_config,
+            &data_dir,
+            default_size,
+            bounds,
+        );
 
         for name in &backend_names {
             let Some(budget) = pool_budgets.get(name) else {
@@ -939,7 +911,26 @@ async fn run_disk_cache_eviction_worker(
                 cm.set_ghost_list(gl.clone());
             }
             cm.set_recent_seal_pin_seconds(recent_seal_pin_seconds);
-            let used = match cm.calculate_usage() {
+            // Offload the blocking pool walk (fs::read_dir + chunk walk)
+            // to a blocking thread; hand the manager back out.
+            let (cm_ret, usage) = match tokio::task::spawn_blocking(move || {
+                let u = cm.calculate_usage();
+                (cm, u)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        "disk-cache: usage task for backend '{}' panicked: {}",
+                        name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let mut cm = cm_ret;
+            let used = match usage {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(
@@ -950,34 +941,30 @@ async fn run_disk_cache_eviction_worker(
                     continue;
                 }
             };
-            if used <= cap {
-                let pct = if cap == 0 {
-                    0
-                } else {
-                    used.saturating_mul(100).checked_div(cap).unwrap_or(0)
-                };
-                tracing::debug!(
-                    "disk-cache pool '{}' {} / {} bytes ({}%), no eviction",
-                    name,
-                    used,
-                    cap,
-                    pct,
-                );
-                // Soft-watermark alert: per-backend dedup keeps this
-                // to one emit per dedup window for as long as the
-                // pool sits above `localonly_soft_watermark_pct`.
-                if budget.over_soft_watermark() {
-                    shared_alerting::record::disk_cache_watermark(name, pct, cap);
-                }
+            // Within-budget log + soft-watermark alert (shared with VTL).
+            if !shared_disk_evict::check_usage_or_alert(name, used, cap, budget) {
                 continue;
             }
-            tracing::info!(
-                "disk-cache pool '{}' over budget ({} / {} bytes); LRU eviction",
-                name,
-                used,
-                cap
-            );
-            match cm.evict_lru_chunks() {
+            // Synchronous fs-only eviction (no cloud round-trip); offload
+            // the fs::remove_file loop to a blocking thread.
+            let (cm_ret, result) = match tokio::task::spawn_blocking(move || {
+                let r = cm.evict_lru_chunks();
+                (cm, r)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        "disk-cache: eviction task for backend '{}' panicked: {}",
+                        name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let _ = cm_ret;
+            match result {
                 Ok(freed) if freed > 0 => {
                     tracing::info!("disk-cache: backend '{}' freed {} bytes", name, freed)
                 }

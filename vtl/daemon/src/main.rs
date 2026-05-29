@@ -2161,49 +2161,17 @@ async fn run_disk_cache_eviction_worker(
         }
 
         // Recompute per-backend caps for `auto`-mode entries against
-        // current free space, then push the new value into each
-        // backend's PoolBudget so `try_reserve` immediately sees the
-        // updated ceiling. External disk pressure shrinks the cap
-        // reactively; recovery grows it. Explicit-mode entries are
-        // pinned and skip the recompute. Count auto-mode backends
-        // first so the share divisor is stable across the loop.
-        let bounds = cfg.disk_cache.bounds();
-        let default_size = cfg.disk_cache.size_gb;
-        let resolved_sizes: Vec<(String, core_mediachanger::DiskCacheSize)> = backend_names
-            .iter()
-            .map(|name| {
-                let size = cfg
-                    .storage
-                    .backend_entry(name)
-                    .ok()
-                    .and_then(|e| e.disk_cache_size_gb())
-                    .unwrap_or(default_size);
-                (name.clone(), size)
-            })
-            .collect();
-        let auto_backends: u32 = resolved_sizes
-            .iter()
-            .filter(|(_, s)| s.is_auto())
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX);
-        for (name, size) in &resolved_sizes {
-            let Some(budget) = pool_budgets.get(name) else {
-                continue;
-            };
-            let new_cap = size.resolve_bytes(&data_dir, bounds, auto_backends);
-            if budget.cap_bytes() != new_cap {
-                if size.is_auto() {
-                    debug!(
-                        "disk-cache auto-resize backend '{}': {} -> {} bytes",
-                        name,
-                        budget.cap_bytes(),
-                        new_cap,
-                    );
-                }
-                budget.set_cap_bytes(new_cap);
-            }
-        }
+        // current free space and push the new ceilings into each
+        // backend's PoolBudget. Shared with VSA — see
+        // `shared_disk_evict::resolve_and_apply_caps`.
+        shared_disk_evict::resolve_and_apply_caps(
+            &backend_names,
+            &pool_budgets,
+            &cfg.storage,
+            &data_dir,
+            cfg.disk_cache.size_gb,
+            cfg.disk_cache.bounds(),
+        );
 
         // Per-backend DiskCacheManagers. Each manager is scoped to one
         // named backend and evicts down to *that backend's* cap (read
@@ -2213,7 +2181,7 @@ async fn run_disk_cache_eviction_worker(
         // `<data_dir>/chunks/<backend>/`, so identical hashes in two
         // backends are physically distinct files — per-backend LRU is
         // also globally correct.
-        let mut managers: Vec<DiskCacheManager> = backend_names
+        let managers: Vec<DiskCacheManager> = backend_names
             .iter()
             .map(|name| {
                 let cap = pool_budgets.get(name).map(|b| b.cap_bytes()).unwrap_or(0);
@@ -2229,58 +2197,55 @@ async fn run_disk_cache_eviction_worker(
             })
             .collect();
 
-        for cm in managers.iter_mut() {
-            let used = match cm.calculate_usage() {
+        for mut cm in managers {
+            let backend = cm.backend_name().to_string();
+            // Offload the blocking pool walk (fs::read_dir + full chunk
+            // walk) to a blocking thread so it doesn't stall the async
+            // runtime; hand the manager back out.
+            let (cm_ret, usage) = match tokio::task::spawn_blocking(move || {
+                let u = cm.calculate_usage();
+                (cm, u)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Cache usage task for backend '{}' panicked: {e}", backend);
+                    continue;
+                }
+            };
+            cm = cm_ret;
+            let used = match usage {
                 Ok(u) => u,
                 Err(e) => {
                     warn!(
                         "Cache usage calculation for backend '{}' failed: {e}",
-                        cm.backend_name()
+                        backend
                     );
                     continue;
                 }
             };
             let cap = cm.capacity();
-            if used <= cap {
-                let pct = if cap == 0 {
-                    0
-                } else {
-                    used.saturating_mul(100).checked_div(cap).unwrap_or(0)
-                };
-                debug!(
-                    "Cache pool '{}' {} / {} bytes ({}%), no eviction",
-                    cm.backend_name(),
-                    used,
-                    cap,
-                    pct,
-                );
-                // Soft-watermark alert: per-backend dedup keeps this
-                // to one emit per dedup window for as long as the
-                // pool sits above `localonly_soft_watermark_pct`.
-                if let Some(budget) = pool_budgets.get(cm.backend_name())
-                    && budget.over_soft_watermark()
-                {
-                    shared_alerting::record::disk_cache_watermark(cm.backend_name(), pct, cap);
+            // Within-budget log + soft-watermark alert (shared with VSA).
+            let needs_evict = match pool_budgets.get(&backend) {
+                Some(budget) => {
+                    shared_disk_evict::check_usage_or_alert(&backend, used, cap, budget)
                 }
+                None => used > cap,
+            };
+            if !needs_evict {
                 continue;
             }
 
-            info!(
-                "Cache pool '{}' over budget ({} / {} bytes); attempting LRU eviction",
-                cm.backend_name(),
-                used,
-                cap,
-            );
-
             // Build a fresh cloud backend for the eviction pass.
             // Eviction is rare; the construction cost is negligible.
-            let cloud_backend = match cfg.storage.create_backend_named(cm.backend_name()).await {
+            let cloud_backend = match cfg.storage.create_backend_named(&backend).await {
                 Ok(b) => Some(b),
                 Err(e) => {
                     warn!(
                         "Cache eviction: backend '{}' init failed ({e}); \
                          evicting without cloud backup",
-                        cm.backend_name()
+                        backend
                     );
                     None
                 }
@@ -2290,15 +2255,11 @@ async fn run_disk_cache_eviction_worker(
                 Ok(freed) if freed > 0 => {
                     info!(
                         "Cache eviction freed {} bytes from backend '{}'",
-                        freed,
-                        cm.backend_name()
+                        freed, backend
                     );
                 }
                 Ok(_) => {}
-                Err(e) => warn!(
-                    "Cache eviction for backend '{}' failed: {e}",
-                    cm.backend_name()
-                ),
+                Err(e) => warn!("Cache eviction for backend '{}' failed: {e}", backend),
             }
         }
     }

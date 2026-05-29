@@ -474,7 +474,7 @@ async fn main() -> Result<()> {
         },
         Commands::System { action } => match action {
             SystemAction::Gc { dry_run, storage } => {
-                commands::gc::cmd_gc(dry_run, storage).await?;
+                shared_cli_system::cmd_gc(&shared_naming::TAPE_LIBRARY, dry_run, storage).await?;
             }
             SystemAction::Storage { action } => match action {
                 StorageAction::Check => {

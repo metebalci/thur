@@ -17,6 +17,7 @@ members = [
     "shared/object-store-bench",
     "shared/crypto",
     "shared/dedup-stats",
+    "shared/disk-evict",
     "shared/health",
     "shared/iscsi",
     "shared/keystore",

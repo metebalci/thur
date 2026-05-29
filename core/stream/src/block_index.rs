@@ -88,49 +88,7 @@ pub const VERSION: u32 = 1;
 const FLAG_FILEMARK: u8 = 0b0000_0001;
 const FLAG_ENC_MASK: u8 = 0b0000_1110;
 const FLAG_ENC_SHIFT: u8 = 1;
-const FLAG_COMP_MASK: u8 = 0b0111_0000;
-const FLAG_COMP_SHIFT: u8 = 4;
-
-/// Compression algorithm tag stored in the 3-bit compression field of
-/// `flags`. Kept local to the codec so `compression::CompressionAlgo`
-/// doesn't need to grow a stable numeric tag of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum CompressionTag {
-    None = 0,
-    Lz4 = 1,
-    Zstd = 2,
-    Sldc = 3,
-    // 4..=7 reserved
-}
-
-impl CompressionTag {
-    fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::None),
-            1 => Some(Self::Lz4),
-            2 => Some(Self::Zstd),
-            3 => Some(Self::Sldc),
-            _ => None,
-        }
-    }
-    fn from_algo(algo: Option<CompressionAlgo>) -> Self {
-        match algo {
-            None => Self::None,
-            Some(CompressionAlgo::Lz4) => Self::Lz4,
-            Some(CompressionAlgo::Zstd) => Self::Zstd,
-            Some(CompressionAlgo::Sldc) => Self::Sldc,
-        }
-    }
-    fn to_algo(self) -> Option<CompressionAlgo> {
-        match self {
-            Self::None => None,
-            Self::Lz4 => Some(CompressionAlgo::Lz4),
-            Self::Zstd => Some(CompressionAlgo::Zstd),
-            Self::Sldc => Some(CompressionAlgo::Sldc),
-        }
-    }
-}
+use crate::compression_codec::{pack_compression, unpack_compression};
 
 /// Encryption algorithm tag stored in the 3-bit encryption field of
 /// `flags`. Real LTO drives all use AES-256-GCM today (SCSI algorithm
@@ -203,8 +161,7 @@ impl BlockRec {
         }
         let enc = self.encryption as u8;
         f |= (enc << FLAG_ENC_SHIFT) & FLAG_ENC_MASK;
-        let comp = CompressionTag::from_algo(self.compression) as u8;
-        f |= (comp << FLAG_COMP_SHIFT) & FLAG_COMP_MASK;
+        f |= pack_compression(self.compression);
         f
     }
 
@@ -218,12 +175,9 @@ impl BlockRec {
         let enc = EncryptionTag::from_u8(enc_bits).ok_or(SmcError::InvalidOp(
             "block index record has unknown encryption tag",
         ))?;
-        let comp_bits = (f & FLAG_COMP_MASK) >> FLAG_COMP_SHIFT;
-        let comp = CompressionTag::from_u8(comp_bits)
-            .ok_or(SmcError::InvalidOp(
-                "block index record has unknown compression tag",
-            ))?
-            .to_algo();
+        let comp = unpack_compression(f).ok_or(SmcError::InvalidOp(
+            "block index record has unknown compression tag",
+        ))?;
         Ok((kind, enc, comp))
     }
 
@@ -444,6 +398,7 @@ pub fn derive_iv(uuid: &[u8; 16], chunk_id: u64, offset: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression_codec::FLAG_COMP_SHIFT;
     use tempfile::TempDir;
 
     #[test]

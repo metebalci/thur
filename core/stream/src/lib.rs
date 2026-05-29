@@ -13,6 +13,7 @@ pub mod cartridge_archive;
 pub mod cartridge_migrate;
 pub mod chunk_index;
 pub mod chunk_store;
+mod compression_codec;
 pub mod dirty_pages;
 pub mod disk_cache;
 pub mod drive_state;

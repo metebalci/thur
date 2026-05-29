@@ -5,7 +5,6 @@ pub mod cartridge;
 pub mod cartridge_key;
 pub mod credentials;
 pub mod drive;
-pub mod gc;
 pub mod generate_config;
 pub mod library;
 pub mod monitor;
