@@ -443,7 +443,10 @@ pub async fn read_pdu<R: AsyncRead + Unpin>(sock: &mut R) -> Result<Pdu> {
 /// bits + DataSegmentLength + ITT / TTT into the BHS; serials
 /// (StatSN / ExpCmdSN / MaxCmdSN) are the caller's responsibility
 /// (see [`stamp_serials_for_response`]).
-pub async fn write_pdu<W: AsyncWrite + Unpin>(sock: &mut W, p: &mut Pdu) -> Result<()> {
+/// Stamp the opcode / flag / length / tag fields into `p.bhs` for a
+/// data segment of `data_len` bytes. Shared by [`write_pdu`] and
+/// [`write_pdu_with_data`].
+fn frame_pdu_header(p: &mut Pdu, data_len: usize) {
     p.bhs[0] = (p.bhs[0] & 0xC0) | (p.opcode & 0x3F);
     if p.immediate {
         p.bhs[0] |= 0x40;
@@ -452,21 +455,43 @@ pub async fn write_pdu<W: AsyncWrite + Unpin>(sock: &mut W, p: &mut Pdu) -> Resu
         p.bhs[1] |= 0x80;
     }
     p.total_ahs_len = 0;
-    p.data_segment_len = p.data.len() as u32;
+    p.data_segment_len = data_len as u32;
     put_u24(&mut p.bhs[5..8], p.data_segment_len);
     p.bhs[16..20].copy_from_slice(&p.itt.to_be_bytes());
     p.bhs[20..24].copy_from_slice(&p.ttt.to_be_bytes());
+}
 
-    sock.write_all(&p.bhs).await?;
-    if !p.data.is_empty() {
-        sock.write_all(&p.data).await?;
-        let pad = (4 - (p.data.len() as u32 % 4)) % 4;
+async fn write_segment<W: AsyncWrite + Unpin>(sock: &mut W, data: &[u8]) -> Result<()> {
+    if !data.is_empty() {
+        sock.write_all(data).await?;
+        let pad = (4 - (data.len() as u32 % 4)) % 4;
         if pad > 0 {
-            sock.write_all(&vec![0u8; pad as usize]).await?;
+            sock.write_all(&[0u8; 3][..pad as usize]).await?;
         }
     }
     sock.flush().await?;
     Ok(())
+}
+
+pub async fn write_pdu<W: AsyncWrite + Unpin>(sock: &mut W, p: &mut Pdu) -> Result<()> {
+    let data_len = p.data.len();
+    frame_pdu_header(p, data_len);
+    sock.write_all(&p.bhs).await?;
+    write_segment(sock, &p.data).await
+}
+
+/// Write a PDU whose data segment is supplied as a borrowed slice
+/// rather than living in `p.data` (which is ignored). Lets the Data-In
+/// burst write each chunk straight out of the owned response buffer
+/// with no per-chunk copy.
+pub async fn write_pdu_with_data<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    p: &mut Pdu,
+    data: &[u8],
+) -> Result<()> {
+    frame_pdu_header(p, data.len());
+    sock.write_all(&p.bhs).await?;
+    write_segment(sock, data).await
 }
 
 /// Compute the ExpCmdSN to put in a response PDU. RFC 3720/7143
@@ -1681,8 +1706,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                             din.bhs[28..32].copy_from_slice(&exp_cmdsn.to_be_bytes());
                             din.bhs[32..36].copy_from_slice(&max_cmdsn.to_be_bytes());
                         }
-                        din.data = data_in[cursor..end].to_vec();
-                        write_pdu(sock, &mut din).await?;
+                        write_pdu_with_data(sock, &mut din, &data_in[cursor..end]).await?;
                         data_sn = data_sn.wrapping_add(1);
                         cursor = end;
                     }

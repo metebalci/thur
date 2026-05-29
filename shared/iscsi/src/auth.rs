@@ -483,12 +483,12 @@ impl ChapAuthenticator {
             .ok_or_else(|| IscsiError::AuthFailed(format!("Unknown user: {}", username)))?;
 
         let expected = compute_chap_response(algorithm, identifier, &user.password, challenge);
-        if response == expected.as_slice() {
+        if ct_eq(response, &expected) {
             return Ok(true);
         }
         if let Some(prev) = user.previous_password_if_in_grace() {
             let expected_prev = compute_chap_response(algorithm, identifier, prev, challenge);
-            if response == expected_prev.as_slice() {
+            if ct_eq(response, &expected_prev) {
                 return Ok(true);
             }
         }
@@ -568,6 +568,16 @@ fn compute_chap_response(
             h.finalize().to_vec()
         }
     }
+}
+
+/// Constant-time equality for a host-supplied CHAP response against the
+/// locally computed one. Hash outputs are fixed-length per algorithm,
+/// but lengths can differ if the host sends a malformed response;
+/// `ConstantTimeEq` on equal-length slices is constant-time, so we gate
+/// on the length first (the length itself is not a secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && a.ct_eq(b).into()
 }
 
 #[cfg(test)]

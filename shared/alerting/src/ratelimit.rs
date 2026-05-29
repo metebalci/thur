@@ -35,6 +35,13 @@ impl AlertRateLimiter {
     /// should be suppressed (an earlier emit inside the same window
     /// already went out).
     pub fn allow(&self, alert: &Alert) -> bool {
+        // Drain expired windows so fire-once dedup keys (a backend that
+        // failed and was replaced, a one-shot audit error) don't
+        // accumulate in the inner map forever. Unlike the audit side
+        // there's no flush task here, and the rollups aren't consumed —
+        // alerts are fire-and-forget — so we drop them. Alerts are rare
+        // (dedup'd + class-gated) so the full-map walk is cheap.
+        let _ = self.inner.flush_expired();
         let key = format!("{}:{}", alert.class.as_str(), alert.dedup_key);
         // The `op` + `actor` fields aren't surfaced anywhere on the
         // alerting path; pass placeholder values so AuditRateLimiter's

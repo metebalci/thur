@@ -326,7 +326,7 @@ impl PoolBudget {
         let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
         loop {
             let cap = self.cap_bytes();
-            let pool_room_ok = cap == 0 || state.total + bytes <= cap;
+            let pool_room_ok = cap == 0 || state.total.saturating_add(bytes) <= cap;
             let disk_room_ok = self.disk_free_min_bytes == 0
                 || disk_free_bytes(&self.data_dir).unwrap_or(u64::MAX) >= self.disk_free_min_bytes;
             if pool_room_ok && disk_room_ok {

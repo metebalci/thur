@@ -526,14 +526,29 @@ impl NvmeNvmDispatcher {
         // a hint that distinguishes deallocate vs zero-fill semantics,
         // and zero-write preserves the read-back contract NVMe writes
         // expect (all zeros, not "unallocated").
-        let zeros = vec![0u8; len_bytes as usize];
-        match cache.write_bytes(byte_off, &zeros).await {
-            Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
-            Err(e) => {
+        //
+        // Cap the in-memory zero buffer at ~16 MiB and iterate so a
+        // multi-GB Write Zeroes doesn't allocate one massive block —
+        // same chunking as SBC's WRITE SAME.
+        const TARGET_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+        let mut remaining = len_bytes;
+        let mut cursor = byte_off;
+        while remaining > 0 {
+            let this = remaining.min(TARGET_CHUNK_BYTES);
+            let zeros = vec![0u8; this as usize];
+            if let Err(e) = cache.write_bytes(cursor, &zeros).await {
                 tracing::warn!(error = %e, "write-zeroes failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::data_transfer_error()))
+                return NvmeResponse::just(Cqe::failure(
+                    cid,
+                    0,
+                    0,
+                    StatusField::data_transfer_error(),
+                ));
             }
+            cursor += this;
+            remaining -= this;
         }
+        NvmeResponse::just(Cqe::success(cid, 0, 0, 0))
     }
 
     async fn cmd_dsm(

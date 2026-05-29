@@ -193,10 +193,12 @@ pub fn handle_write_attribute(data: &[u8]) -> Result<(), String> {
         ));
     }
     let payload_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if payload_len + 4 > data.len() {
+    // Compare as u64: `payload_len` is host-controlled and `+ 4` would
+    // wrap on a 32-bit `usize`, silently passing this bounds check.
+    if payload_len as u64 + 4 > data.len() as u64 {
         return Err(format!(
             "WRITE ATTRIBUTE: parameter list claims {} bytes but only {} available",
-            payload_len + 4,
+            payload_len as u64 + 4,
             data.len()
         ));
     }
@@ -207,7 +209,7 @@ pub fn handle_write_attribute(data: &[u8]) -> Result<(), String> {
         let attr_id = u16::from_be_bytes([data[offset], data[offset + 1]]);
         let _format = data[offset + 2];
         let attr_len = u16::from_be_bytes([data[offset + 4], data[offset + 5]]) as usize;
-        if offset + 6 + attr_len > end {
+        if offset as u64 + 6 + attr_len as u64 > end as u64 {
             return Err(format!(
                 "WRITE ATTRIBUTE: attribute 0x{:04x} declared length {} overflows parameter list",
                 attr_id, attr_len

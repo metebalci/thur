@@ -38,18 +38,10 @@ pub async fn cmd_verify(
     let mut report: Option<VerifyReport> = None;
     let exit = client
         .run_job("system.verify", &body, |ev| match ev {
-            JobEvent::Log { level, message } => {
-                if level == "warn" || level == "error" {
-                    eprintln!("{}", message);
-                } else if !json {
-                    // In json mode the CLI emits only the final
-                    // structured report on stdout — log lines go to
-                    // stderr so a redirected stdout is parseable.
-                    eprintln!("{}", message);
-                } else {
-                    eprintln!("{}", message);
-                }
-            }
+            // All log lines go to stderr so that in json mode a
+            // redirected stdout carries only the final structured
+            // report.
+            JobEvent::Log { message, .. } => eprintln!("{}", message),
             JobEvent::Result { data } => match serde_json::from_value::<VerifyReport>(data) {
                 Ok(r) => report = Some(r),
                 Err(e) => eprintln!("warning: failed to decode verify report: {}", e),

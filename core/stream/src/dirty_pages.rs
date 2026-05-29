@@ -180,8 +180,18 @@ impl DirtyPageTracker {
         if len == 0 {
             return;
         }
-        let first = (offset / PAGE_SIZE as u64) as u32;
-        let last = ((offset + len - 1) / PAGE_SIZE as u64) as u32;
+        // Page indices are u32. The division is done in u64 first so
+        // the intermediate can't truncate; the debug_assert documents
+        // the bound (u32::MAX pages * 64 KiB ~= 256 TiB) that today's
+        // device sizes stay well under.
+        let first_u64 = offset / PAGE_SIZE as u64;
+        let last_u64 = (offset + len - 1) / PAGE_SIZE as u64;
+        debug_assert!(
+            last_u64 <= u32::MAX as u64,
+            "page index {last_u64} exceeds u32 (offset {offset}, len {len})"
+        );
+        let first = first_u64 as u32;
+        let last = last_u64 as u32;
         let mut inner = self.inner.lock().expect("dirty-page mutex poisoned");
         Self::ensure_capacity(&mut inner.bits, last);
         for page in first..=last {

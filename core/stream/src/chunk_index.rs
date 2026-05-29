@@ -232,6 +232,16 @@ impl ChunkRec {
 /// mutation (`append`, `overwrite`, `truncate_to`, header init) marks
 /// the affected page range dirty *before* the `pwrite_at` so a crash
 /// never leaves a written-but-unmarked page.
+///
+/// **Single-writer invariant.** The mutating methods take `&self` and
+/// `next_id` is an `AtomicU64`, but this type is *not* safe under
+/// concurrent appends: `append` does a non-atomic load-then-store, so
+/// two concurrent callers could mint the same id. The atomic buys
+/// cheap interior mutability behind `&self` (positioned `pwrite_at`
+/// needs no `&mut File`), nothing more. Correctness rests on the owner:
+/// the `Cartridge` holding this file is always reached through
+/// `&mut self`, which serializes all index mutation. Don't share a
+/// `ChunkIndexFile` across threads for writing.
 #[derive(Debug)]
 pub struct ChunkIndexFile {
     path: PathBuf,

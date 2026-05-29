@@ -139,8 +139,7 @@ pub async fn cmd_restore(
         inventory_result
     };
 
-    let exit_code = if cli_result.is_err() { 1 } else { 0 };
-    let _ = crate::audit_helper::record_result(
+    let recorded = crate::audit_helper::record_result(
         data_dir,
         config_path,
         "library.restore",
@@ -148,7 +147,7 @@ pub async fn cmd_restore(
         cli_result.map_err(|e| anyhow::anyhow!("{e}")),
     );
 
-    Ok(exit_code)
+    Ok(if recorded.is_err() { 1 } else { 0 })
 }
 
 /// Seat restored cartridges into storage slots. `restored_barcodes`

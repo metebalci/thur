@@ -320,8 +320,10 @@ pub async fn cmd_destroy(name: &str, force: bool) -> Result<()> {
     let resp: serde_json::Value = admin
         .delete_json::<(), _>(&format!("/api/v1/volumes/{}", urlencode(name)), None)
         .await?;
-    let lun = resp.get("lun").and_then(|v| v.as_u64()).unwrap_or(0);
-    println!("OK: volume '{}' destroyed (was LUN {})", name, lun);
+    match resp.get("lun").and_then(|v| v.as_u64()) {
+        Some(lun) => println!("OK: volume '{}' destroyed (was LUN {})", name, lun),
+        None => println!("OK: volume '{}' destroyed", name),
+    }
     Ok(())
 }
 
