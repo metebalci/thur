@@ -566,7 +566,7 @@ this file; SSC-4 / SMC-3 in Part 2; SBC-3 in Part 3; NVMe in
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
 | 0x01 | REWIND | 🟩 Yes | M | Seeks to BOM (block 0). |
-| 0x04 | FORMAT MEDIUM | 🟩 Partial | O | FORMAT field 0x00 (erase + rewind), 0x01 (apply pending Mode Page 0x11 partition layout), 0x02 (default single partition). FORMAT 0x03–0x0F return ILLEGAL REQUEST. IMMED bit ignored — completes synchronously. |
+| 0x04 | FORMAT MEDIUM | 🟩 Yes | O | Every SSC-4-defined FORMAT field value is handled: 0x00 (erase + rewind), 0x01 (apply pending Mode Page 0x11 partition layout), 0x02 (default single partition). FORMAT 0x03–0x0F are reserved by SSC-4 and correctly return ILLEGAL REQUEST. IMMED bit ignored — completes synchronously (format is effectively instant on a VTL, so the host observes the same result). |
 | 0x05 | READ BLOCK LIMITS | 🟩 Yes | M | Max 16 MiB − 1 (`0x00FF_FFFF`, matches MaxBurstLength), min 0, optimal 0. |
 | 0x08 | READ(6) | 🟩 Yes | M | Variable + fixed block; SILI / FIXED bits honored. Hitting a filemark surfaces CHECK CONDITION + NoSense + FM=1 + INFO = TRANSFER LENGTH (SSC-4 §7.6) so the host can advance position. Reading past EOD surfaces CHECK CONDITION + BlankCheck + ASC/ASCQ 0x00/0x05 + INFO = TRANSFER LENGTH (SSC-4 §4.2.20 / §8.3.1); the EOM bit is *not* set — EOD is not physical end-of-medium. Both responses carry the residual via INFO so the Linux st driver can short-read; without it dd hands stale kernel-buffer bytes back to userspace (issues #25 / #26). |
 | 0x0A | WRITE(6) | 🟩 Yes | M | Variable + fixed block; per-block WORM / legal-hold checks. |
