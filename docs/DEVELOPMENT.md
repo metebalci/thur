@@ -41,15 +41,64 @@ S3 / GCS / Azure / AIStor / MinIO connections end-to-end. They need:
   forward those env vars explicitly by name pattern, so they survive
   the privilege hop as long as they're `export`ed.
 
-The two legal-hold suites carry one extra requirement beyond a
-non-local backend: the chosen `THURVTL_TEST_BACKEND` must point at a
-bucket with Object Lock enabled (the provider legal-hold primitive
-is what they exercise), declared with `retention_mode: none` so the
-daemon starts and the test can clear its own holds. A bucket with
-Object Lock enabled but no default retention rule is ideal — legal
-hold works and the test can delete its objects after clearing the
-hold; a default retention rule would leave un-deletable debris past
-the run (cleanup is best-effort and warns).
+### Legal-hold suites: Object-Lock bucket + IAM
+
+`test-legal-hold-lifecycle.sh` and `test-tiering-legal-hold-interaction.sh`
+carry a requirement the other real-backend suites don't, and it trips
+people up because S3 overloads the word "retention." Three *independent*
+things live under S3 Object Lock:
+
+- **Object Lock** — the bucket-level master switch. Turning it on does not,
+  by itself, make anything immutable.
+- **Retention** (WORM) — "no delete or overwrite until date T", in
+  GOVERNANCE or COMPLIANCE mode. Applied per object, or as a bucket-wide
+  *default retention rule*. This is what the conffile's `retention_mode:`
+  maps to.
+- **Legal hold** — a per-object on/off flag that blocks deletion until it
+  is flipped off. Needs Object Lock *enabled*; needs no retention.
+
+The legal-hold suites exercise the third thing, so the backend is declared
+`retention_mode: none` (we are not testing WORM) while still sitting on an
+Object-Lock-enabled bucket (so `PutObjectLegalHold` works). That
+combination only holds on a bucket with **Object Lock enabled and NO
+default retention rule**:
+
+```bash
+aws s3api create-bucket \
+  --bucket <name> --region <region> \
+  --create-bucket-configuration LocationConstraint=<region> \
+  --object-lock-enabled-for-bucket   # and DO NOT follow with
+                                     # put-object-lock-configuration —
+                                     # that is what adds a default rule
+```
+
+The daemon reports a bucket as "locked" only when it finds a default
+retention *rule* (`shared/object-store/src/s3.rs::lock_state`), so an
+Object-Lock bucket with no default rule reads back as `Off` — which matches
+the declared `retention_mode: none` and lets the daemon start. Add a
+default retention rule and two things break: (1) the daemon's startup
+lock-state check sees `none`-vs-locked and refuses to start (the safety net
+for "you declared none but the bucket is actually WORM"), and (2) every
+written object is auto-stamped with retention, so the test can't delete its
+own data afterward (cleanup is best-effort and warns about the debris).
+
+IAM matters too, and policies here are scoped *per bucket* — being able to
+reach an existing WORM bucket does **not** carry over to a brand-new
+legal-hold bucket, which must be added to the principal's policy
+explicitly. On that bucket the test principal needs:
+
+- `s3:ListBucket` (bucket ARN); `s3:GetObject` / `s3:PutObject` /
+  `s3:DeleteObject` (object ARN) — the daemon's upload / download / cleanup.
+- `s3:GetObjectLegalHold` / `s3:PutObjectLegalHold` (object ARN) — the hold
+  read/set the suites exercise.
+- `s3:GetBucketObjectLockConfiguration` (bucket ARN) — recommended but
+  optional: without it the startup lock-state check can't verify and
+  downgrades to a warning (the daemon still starts).
+
+Object-Lock buckets are versioned, so a `rm`-style purge leaves noncurrent
+versions behind; a thorough cleanup also wants `s3:ListBucketVersions` +
+`s3:DeleteObjectVersion`. A quick smoke that the principal is wired up:
+`aws s3api head-bucket --bucket <name>` should not 403.
 
 Optional: `private/thur.env` (KEY=VAL per line). Every script gates the
 source on `[[ -r ... ]]` and auto-loads it under `set -a` before
