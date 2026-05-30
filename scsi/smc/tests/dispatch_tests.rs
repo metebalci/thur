@@ -572,6 +572,71 @@ fn read_element_status_is_fenced_under_exclusive_access() {
 }
 
 #[test]
+fn exchange_and_initialize_element_status_are_fenced() {
+    // Issue #53: MOVE MEDIUM and READ ELEMENT STATUS have fence tests;
+    // the remaining write-gated changer opcodes did not. Pin every
+    // write-gated entry of `pr_gate` (EXCHANGE MEDIUM, INITIALIZE
+    // ELEMENT STATUS [+WITH RANGE], SEND VOLUME TAG) so a dropped match
+    // arm can't silently unfence a reserved changer.
+    let fx = Fixture::default();
+    fx.reserve_changer(1, 0xAAAA, 0x03); // EXCLUSIVE ACCESS by nexus A
+
+    // A non-holder (TSIH 2) is refused by the gate before the handler.
+    for op in [0xA6u8, 0x07, 0x37, 0xB6] {
+        let mut pdu = blank_pdu();
+        let mut ctx = fx.ctx_tsih(&mut pdu, cdb(op), 0, 2);
+        assert_eq!(
+            dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+            ScsiStatus::ReservationConflict,
+            "non-holder opcode {op:#04x} must be fenced",
+        );
+    }
+
+    // The holder (TSIH 1) is not fenced — the gate lets the command
+    // through (INITIALIZE ELEMENT STATUS is a benign rescan).
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx_tsih(&mut pdu, cdb(0x07), 0, 1);
+    assert_ne!(
+        dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+        ScsiStatus::ReservationConflict,
+        "holder must not be fenced",
+    );
+}
+
+#[test]
+fn write_exclusive_allows_nonholder_read_blocks_write() {
+    // Issue #53: the changer read/write gate split is only ever tested
+    // under EXCLUSIVE ACCESS (both denied). WRITE EXCLUSIVE (type 0x01)
+    // is the asymmetric case — a non-holder may READ ELEMENT STATUS but
+    // not MOVE MEDIUM — and pins the Read-vs-Write routing of
+    // `pr_enforce` (swapping its arms would pass every EA test).
+    let fx = Fixture::default();
+    fx.reserve_changer(1, 0xAAAA, 0x01); // WRITE EXCLUSIVE by nexus A
+
+    // Non-holder READ ELEMENT STATUS is allowed under Write Exclusive.
+    let mut rdcdb = cdb(0xB8);
+    rdcdb[1] = 0x00; // all element types
+    rdcdb[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    rdcdb[7..10].copy_from_slice(&[0x01, 0x00, 0x00]); // alloc = 64 KiB
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx_tsih(&mut pdu, rdcdb, 0, 2);
+    assert_eq!(
+        dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+        ScsiStatus::Good,
+        "WrEx: non-holder READ ELEMENT STATUS allowed",
+    );
+
+    // Non-holder MOVE MEDIUM is fenced.
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx_tsih(&mut pdu, cdb(0xA5), 0, 2);
+    assert_eq!(
+        dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+        ScsiStatus::ReservationConflict,
+        "WrEx: non-holder MOVE MEDIUM fenced",
+    );
+}
+
+#[test]
 fn pr_enforce_classifies_request_volume_element_address_as_a_read() {
     // REQUEST VOLUME ELEMENT ADDRESS (0xB5) is dispatched by the
     // thurvtl wrapper, not `dispatch_changer_lun`, so the wrapper

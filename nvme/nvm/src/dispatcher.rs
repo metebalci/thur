@@ -2169,4 +2169,164 @@ mod tests {
         let log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(log.data_in[8], 0, "masked notification not queued");
     }
+
+    /// The Release / Clear / Unregister adapter arms each drive a
+    /// distinct notification to the *surviving* registrant, and never to
+    /// the issuer. `reservations.rs` carries no inline tests and only
+    /// Preempt is otherwise exercised through the integrated dispatcher
+    /// path, so this pins the parse -> mgr-op -> event-derivation glue
+    /// for the other three actions (issues #54 / #55).
+    #[tokio::test]
+    async fn nvme_release_clear_unregister_emit_correct_notifications() {
+        use nvme_base::log_page::resv_notif_type;
+
+        // (label, action SQE issued by A, notification type B observes).
+        // Release leaves registrations -> survivors get Reservation
+        // Released. Clear wipes them -> Reservation Preempted. Unregister
+        // by the holder releases -> Reservation Released.
+        for (label, sqe, expected) in [
+            (
+                "release",
+                sqe_resv(
+                    NvmOpcode::ReservationRelease,
+                    wire::RRELA_RELEASE as u32 | (1u32 << 8), // RTYPE = Write Exclusive
+                    0,
+                ),
+                resv_notif_type::RESERVATION_RELEASED,
+            ),
+            (
+                "clear",
+                sqe_resv(NvmOpcode::ReservationRelease, wire::RRELA_CLEAR as u32, 0),
+                resv_notif_type::RESERVATION_PREEMPTED,
+            ),
+            (
+                "unregister",
+                sqe_resv(
+                    NvmOpcode::ReservationRegister,
+                    wire::RREGA_UNREGISTER as u32,
+                    0,
+                ),
+                resv_notif_type::RESERVATION_RELEASED,
+            ),
+        ] {
+            let (_tmp, disp) = fixture_dispatcher().await;
+            let a = [0xA1u8; 16];
+            let b = [0xB2u8; 16];
+            // Both hosts hold a live controller; the notification log is
+            // addressed per CNTLID.
+            let ca = controller_for(&disp, a);
+            let cb = controller_for(&disp, b);
+            // A holds Write Exclusive (key 0xAAAA); B is a second
+            // registrant (key 0xBBBB).
+            setup_preempt(&disp, a, b).await;
+
+            // A issues the action with its own current key.
+            let r = resv_io(&disp, sqe, Some(&keys16(0xAAAA, 0)), a).await;
+            assert_eq!(r.cqe.status, StatusField::SUCCESS, "{label} succeeds");
+
+            // The surviving registrant B is notified with the right type.
+            let b_log = admin_io(&disp, sqe_get_resv_log(), Some(cb)).await;
+            assert_eq!(b_log.data_in[8], expected, "{label}: B notification type");
+            assert_eq!(
+                u32::from_le_bytes(b_log.data_in[12..16].try_into().unwrap()),
+                1,
+                "{label}: nsid 1",
+            );
+
+            // The issuer A is never notified of its own action.
+            let a_log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
+            assert_eq!(a_log.data_in[8], 0, "{label}: issuer A not notified");
+        }
+    }
+
+    /// A fused Compare+Write from a non-holder is fenced by the
+    /// write-side reservation gate (issue #54). Both fused tests above
+    /// run with no reservation held, so that gate branch in
+    /// `handle_fused_compare_write` is otherwise never executed — a
+    /// regression would let a fenced host mutate the medium via the very
+    /// op clusters use for test-and-set fencing.
+    #[tokio::test]
+    async fn fused_compare_write_fenced_for_nonholder() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+
+        // A registers and acquires Write Exclusive.
+        resv_io(
+            &disp,
+            sqe_resv(
+                NvmOpcode::ReservationRegister,
+                wire::RREGA_REGISTER as u32,
+                0,
+            ),
+            Some(&keys16(0, 0xAAAA)),
+            a,
+        )
+        .await;
+        assert_eq!(
+            resv_io(
+                &disp,
+                sqe_resv(
+                    NvmOpcode::ReservationAcquire,
+                    wire::RACQA_ACQUIRE as u32 | (1u32 << 8),
+                    0,
+                ),
+                Some(&keys16(0xAAAA, 0)),
+                a,
+            )
+            .await
+            .cqe
+            .status,
+            StatusField::SUCCESS,
+        );
+
+        // Non-holder B issues a fused Compare+Write. The gate denies the
+        // compare half (reservation conflict) and aborts the write half
+        // before any data buffer is read.
+        let expected = vec![0u8; 64 * 1024];
+        let new = vec![0u8; 64 * 1024];
+        let mut csqe = vec![0u8; nvme_base::SQE_SIZE];
+        csqe[0] = NvmOpcode::Compare as u8;
+        csqe[1] = 0b0000_0001; // FUSE = First
+        csqe[2] = 0x61;
+        csqe[4] = 0x01;
+        csqe[48..52].copy_from_slice(&15u32.to_le_bytes());
+        let mut wsqe = vec![0u8; nvme_base::SQE_SIZE];
+        wsqe[0] = NvmOpcode::Write as u8;
+        wsqe[1] = 0b0000_0010; // FUSE = Second
+        wsqe[2] = 0x62;
+        wsqe[4] = 0x01;
+        wsqe[48..52].copy_from_slice(&15u32.to_le_bytes());
+
+        let (cqe_c, cqe_w) = disp
+            .handle_fused_compare_write(
+                IoCommand {
+                    sqe: nvme_base::Sqe::parse(&csqe).unwrap(),
+                    data_out: Some(&expected),
+                    data_in_max: 0,
+                    session_volumes: None,
+                    host_id: Some(b),
+                },
+                IoCommand {
+                    sqe: nvme_base::Sqe::parse(&wsqe).unwrap(),
+                    data_out: Some(&new),
+                    data_in_max: 0,
+                    session_volumes: None,
+                    host_id: Some(b),
+                },
+            )
+            .await;
+        assert_eq!(
+            cqe_c.status,
+            StatusField::reservation_conflict(),
+            "compare half fenced",
+        );
+        assert_eq!(
+            cqe_w.status,
+            StatusField::aborted_due_to_failed_fused(),
+            "write half aborted",
+        );
+        assert_eq!(cqe_c.cid, 0x61);
+        assert_eq!(cqe_w.cid, 0x62);
+    }
 }

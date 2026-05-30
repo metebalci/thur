@@ -2153,6 +2153,77 @@ mod tests {
         assert_eq!(n, 0, "server should close after Disconnect");
     }
 
+    /// Issue #56: a clean connection teardown must free the controller's
+    /// CNTLID in the *shared* registry (`serve_connection` ->
+    /// `aer.disconnect`), so a later association reuses it. The
+    /// registry's own unit test covers the method in isolation; this
+    /// proves the transport actually invokes it. Dropping that call
+    /// leaks a CNTLID on every clean Disconnect and passes every other
+    /// transport test.
+    #[tokio::test]
+    async fn disconnect_frees_cntlid_for_reuse() {
+        let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
+        let aer = Arc::new(ControllerRegistry::new());
+        let port = spawn_server_with_aer(Arc::clone(&handler), Arc::clone(&aer)).await;
+        let host = [0xA1u8; 16]; // build_connect_pdu's ConnectData hostid
+
+        // Admin Connect -> CNTLID 1, registered in the shared registry.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut stream).await;
+        stream
+            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 0))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut stream).await;
+        assert_eq!(
+            u16::from_le_bytes([resp.body[0], resp.body[1]]),
+            1,
+            "first controller gets CNTLID 1",
+        );
+        assert_eq!(
+            aer.cntlids_for_host(host),
+            vec![1],
+            "controller registered in the shared registry",
+        );
+
+        // Tear the connection down and wait for the socket to close.
+        stream.write_all(&build_disconnect_pdu(0xDD)).await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // Disconnect response
+        let mut tmp = [0u8; 1];
+        let n = timeout(Duration::from_secs(2), stream.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "server closes after Disconnect");
+
+        // The CNTLID is freed by the transport teardown, which runs
+        // after the socket close — poll the shared registry briefly.
+        let mut freed = false;
+        for _ in 0..40 {
+            if aer.cntlids_for_host(host).is_empty() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "teardown must free the CNTLID (aer.disconnect)");
+
+        // And it is reused: a fresh admin Connect gets CNTLID 1 again.
+        let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s2.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut s2).await;
+        s2.write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 0))
+            .await
+            .unwrap();
+        let resp2 = read_pdu_async(&mut s2).await;
+        assert_eq!(
+            u16::from_le_bytes([resp2.body[0], resp2.body[1]]),
+            1,
+            "CNTLID 1 reused after teardown",
+        );
+    }
+
     #[tokio::test]
     async fn property_get_unknown_offset_returns_invalid_field() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");

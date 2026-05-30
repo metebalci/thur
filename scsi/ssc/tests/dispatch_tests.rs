@@ -812,6 +812,126 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
     }
 }
 
+/// Register key `key` (SA 0x06) then RESERVE `type_byte` (SA 0x01) on
+/// the drive LUN (LUN 1) for the nexus (`tsih`, `iqn`). Panics unless
+/// both steps return GOOD — used to set up the reservation a test then
+/// probes for fencing.
+fn reserve_drive(fx: &Fixture, tsih: u16, iqn: Option<&str>, key: u64, type_byte: u8) {
+    {
+        let plist = prout_params(0, key);
+        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 1, 0, false, tsih, iqn);
+        assert_eq!(
+            handlers::handle_persistent_reserve_out(&mut ctx)
+                .expect("PR OUT register returns Ok")
+                .status,
+            ScsiStatus::Good,
+            "register",
+        );
+    }
+    {
+        let plist = prout_params(key, 0);
+        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x01, type_byte), 1, 0, false, tsih, iqn);
+        assert_eq!(
+            handlers::handle_persistent_reserve_out(&mut ctx)
+                .expect("PR OUT reserve returns Ok")
+                .status,
+            ScsiStatus::Good,
+            "reserve",
+        );
+    }
+}
+
+#[test]
+fn pr_gate_fences_every_write_and_read_opcode() {
+    // Issue #16: the drive-LUN reservation gate (`pr_gate`) is a
+    // hand-maintained opcode -> class match table, but the fence test
+    // above only drives WRITE(6)/READ(6). Pin every gated opcode so a
+    // dropped or mis-typed match arm can't silently unfence a reserved
+    // medium and still pass CI.
+    let fx = Fixture::new();
+    let a = Some("iqn.test:a");
+    let b = Some("iqn.test:b");
+    // A (TSIH 1) holds EXCLUSIVE ACCESS — a non-holder is denied both
+    // reads and writes.
+    reserve_drive(&fx, 1, a, 0xAAAA, 0x03);
+
+    // The full write-gated and read-gated opcode sets from `pr_gate`.
+    let write_ops = [0x0Au8, 0x10, 0x80, 0x19, 0x04];
+    let read_ops = [0x08u8, 0x13, 0x8F, 0x11, 0x91];
+
+    // A different I_T nexus (TSIH 2) is fenced out of every one — the
+    // gate returns RESERVATION CONFLICT before the data handler runs.
+    for op in write_ops.iter().chain(read_ops.iter()).copied() {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(op), 1, 0, false, 2, b);
+        let r = dispatch_drive_lun(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            r.status,
+            ScsiStatus::ReservationConflict,
+            "non-holder opcode {op:#04x} must be fenced",
+        );
+    }
+
+    // The holder (TSIH 1) is never fenced — the gate lets each read
+    // through to the real handler (an Err / non-conflict status is fine;
+    // there is no tape loaded).
+    for op in read_ops {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(op), 1, 0, false, 1, a);
+        match dispatch_drive_lun(&mut ctx) {
+            Some(Ok(r)) => assert_ne!(
+                r.status,
+                ScsiStatus::ReservationConflict,
+                "holder opcode {op:#04x} must not be fenced",
+            ),
+            Some(Err(_)) => {}
+            None => panic!("opcode {op:#04x} must dispatch"),
+        }
+    }
+}
+
+#[test]
+fn write_exclusive_allows_nonholder_read_blocks_write() {
+    // Issue #16: WRITE EXCLUSIVE (type 0x01) is the asymmetric type — a
+    // non-holder may READ but not WRITE. Every other adapter-layer PR
+    // test reserves EXCLUSIVE ACCESS (both denied), so the Read-vs-Write
+    // split of `pr_enforce` is otherwise unverified: swapping its two
+    // gate arms would still pass all the EXCLUSIVE-ACCESS tests.
+    let fx = Fixture::new();
+    let a = Some("iqn.test:a");
+    let b = Some("iqn.test:b");
+    reserve_drive(&fx, 1, a, 0xAAAA, 0x01);
+
+    // Non-holder READ(6) is allowed (Write Exclusive fences writes only).
+    {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(0x08), 1, 0, false, 2, b);
+        match dispatch_drive_lun(&mut ctx) {
+            Some(Ok(r)) => assert_ne!(
+                r.status,
+                ScsiStatus::ReservationConflict,
+                "WrEx: non-holder read must be allowed",
+            ),
+            Some(Err(_)) => {}
+            None => panic!("READ(6) must dispatch"),
+        }
+    }
+
+    // Non-holder WRITE(6) is fenced.
+    {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(0x0A), 1, 0, false, 2, b);
+        let r = dispatch_drive_lun(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            r.status,
+            ScsiStatus::ReservationConflict,
+            "WrEx: non-holder write must be fenced",
+        );
+    }
+}
+
 #[test]
 fn persistent_reserve_is_handled_on_the_changer_lun() {
     // Issue #53: PROUT / PRIN are no longer stubbed or rejected on the
