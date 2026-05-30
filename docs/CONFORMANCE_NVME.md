@@ -68,10 +68,10 @@ are indistinguishable at the chunk level.
 | 0x08 | Write Zeroes | 🟩 Yes | O | Lowered to `PageCache::write_bytes(..., &vec![0; nlb * lba_bytes])`. Sub-page zeroing via cache RMW. WORM refuses with a media-error status. |
 | 0x09 | Dataset Management | 🟩 Partial | O | AD (Deallocate, CDW11 bit 2) only — each 16-byte range descriptor calls `PageCache::unmap_bytes(slba * lba_bytes, nlb * lba_bytes)`. Without AD, IDR / IDW hint passes return success as a no-op. |
 | 0x0C | Verify | 🟩 Yes | O | Routes to `PageCache::read_bytes` and discards the payload — surfaces medium errors without returning data. Sparse-hole pages succeed. |
-| 0x0D | Reservation Register | 🟨 No | O | NVMe reservations are the protocol-native analog of SBC-3 PERSISTENT RESERVE; thurvsa's reservation surface lives on the SBC-3 side. See *Deliberate non-conformance*. |
-| 0x0E | Reservation Report | 🟨 No | O | As above. |
-| 0x11 | Reservation Acquire | 🟨 No | O | As above. |
-| 0x15 | Reservation Release | 🟨 No | O | As above. |
+| 0x0D | Reservation Register | 🟩 Yes | O | RREGA Register / Unregister / Replace, with IEKEY. Backed by the shared `scsi_spc::reservations::ReservationManager` keyed by the 128-bit HOSTID from Fabrics Connect (`nvme_nvm::reservations`). CPTPL = "set PTPL" (0b11) rejected with `Invalid Field` — PTPL is not advertised (RESCAP bit 0 = 0), mirroring the SCSI side's APTPL reject. |
+| 0x0E | Reservation Report | 🟩 Yes | O | Reservation Status Data Structure from a snapshot of the shared state. EDS (CDW11 bit 0) selects the extended 64-byte-per-controller form (full 128-bit HOSTID) vs the 24-byte form (low 64 bits). One registered-controller entry per HOSTID; CNTLID is a static `1` for every connection (the fencing identity is the HOSTID, not the CNTLID). |
+| 0x11 | Reservation Acquire | 🟩 Yes | O | RACQA Acquire / Preempt / Preempt-and-Abort. RTYPE 1..6 maps to the six SCSI reservation types. Acquire from an unregistered host returns `Reservation Conflict`. Preempt and Preempt-and-Abort collapse (no task-manager hook), matching the SCSI side. |
+| 0x15 | Reservation Release | 🟩 Yes | O | RRELA Release / Clear. A non-holder's data-path command (Read / Compare / Verify gated by `allow_read`; Write / Write Zeroes / DSM-deallocate / fused Compare+Write by `allow_write`) is rejected with `Reservation Conflict` (SCT=Command-Specific, SC=0x83). Flush is deliberately **not** gated (the NVM Command Set does not restrict it). |
 | — | Fused Compare + Write (0x05 FUSE=01 → 0x01 FUSE=10) | 🟩 Yes | O | Both halves accumulated by the transport (`nvme-tcp::server`), atomic compare-and-swap via `NvmeCommandHandler::handle_fused_compare_write` → `PageCache::compare_and_write_bytes`. Two CQEs per NVMe Base §4.2.6. Mismatch returns `Compare Failure` on the Compare CQE + `Aborted due to failed fused` (SC=0x0A) on the Write CQE. Sub-LBA CAW (single-sector VMFS heartbeat) honored end-to-end. |
 
 ---
@@ -117,8 +117,8 @@ rather than via these commands, so a host that submits them receives
 
 | CNS | Name | Status | Notes |
 |----:|------|--------|-------|
-| 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; VWC bit 0 set (so Linux issues Flush). |
-| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID=1, VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
+| 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; RESCAP (byte 31) = `0x7E` (all six reservation types, PTPL bit 0 clear); VWC bit 0 set (so Linux issues Flush). |
+| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID=1, VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
 | 0x02 | Active Namespace ID List | 🟩 Yes | Up to 1024 u32 NSIDs greater than `SQE.NSID`, zero-padded. |
 | 0x03 | Namespace ID Descriptor List | 🟩 Yes | Two descriptors: NIDT=0x02 NGUID (from volume UUID), then NIDT=0x04 CSI=0x00 (NVM). Linux nvme-tcp issues this right after CNS 0x00 and silently fails namespace attach without a CSI descriptor. |
 | 0x06 | I/O Command Set specific Identify Controller | 🟩 Yes | 4 KiB of zeros = "no specific NVM limits." Linux nvme-tcp issues this against a 1.4-versioned controller during bring-up; refusing it kills the namespace attach. |
@@ -298,7 +298,8 @@ reasoning for each. SCSI-side cross-cutting departures are in
 | Async Event Request (Admin 0x0C) | Returns `Invalid Command Opcode`. VSA produces no async events today. Per NVMe Base §5.2 AER has no timeout, but Linux nvme-tcp warns once on bring-up if it doesn't see AERs complete; Invalid Opcode makes the warning fire once instead of spinning. Wire when a real event trigger lands (`volume create` would be first). |
 | Discovery controller absent | Hosts connect direct to the subsystem NQN; operators distribute the address / port / NQN out of band. A discovery listener lands when multi-subsystem deployments become a documented use case. |
 | DH-HMAC-CHAP (NVMe Base §8.13.5, Fabrics 0x05 / 0x06) | The non-TLS auth alternative — auth exchange encrypted, data stream not. Lands only if a deployment can't terminate TLS at the target. |
-| NVMe Reservations (RR opcodes 0x0D / 0x0E / 0x11 / 0x15) | Persistent reservations are implemented on the SBC-3 side ([`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md) PRIN / PROUT). The underlying `ReservationManager` is transport-agnostic; the NVMe surface lands when a deployment names NVMe-side clustered failover as a hard requirement. |
+| Reservation Notification log page (LID 0x80) + reservation async events | NVMe Reservations themselves are now implemented (RR opcodes 0x0D / 0x0E / 0x11 / 0x15 above, sharing the SBC-3 `ReservationManager`). What stays out: the Reservation Notification log page and its async-event delivery. Without AER (also deferred), the log page would be poll-only and convey nothing a host can't already learn from the `Reservation Conflict` status on its next command. `nvme resv-notif-log` returns `Invalid Field in Command`. Lands with AER. |
+| PTPL (persist through power loss) | RESCAP bit 0 = 0; reservation state is in-memory only and a daemon restart drops it (hosts re-register on reconnect), matching the SCSI side's `PTPL_C = 0`. A Reservation Register with CPTPL = "set PTPL" is rejected with `Invalid Field`. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
 | PCIe-only admin opcodes (0x00 / 0x01 / 0x04 / 0x05 / 0x7C) | Fabrics queue creation happens via Connect; doorbells are a PCIe concept. `Invalid Command Opcode` is the correct fabrics behavior. |
@@ -436,10 +437,14 @@ NVMe code paths:
   (`NvmeNvmDispatcher::dispatch_io` / `dispatch_admin`).
 - NVM opcode enum:
   [`../nvme/nvm/src/opcode.rs`](../nvme/nvm/src/opcode.rs).
+- Reservation command adapter (parses RR wire fields, drives the
+  shared `ReservationManager` by HOSTID, renders the Report):
+  [`../nvme/nvm/src/reservations.rs`](../nvme/nvm/src/reservations.rs).
 - Admin opcode enum + Fabrics types + Identify CNS + Controller
-  registers + log-page builders:
+  registers + log-page + reservation wire shapes (RESCAP / ONCS /
+  RTYPE map / Reservation Status Data Structure):
   [`../nvme/base/src/`](../nvme/base/src/) (`opcode.rs`,
-  `fabrics.rs`, `identify.rs`, `log_page.rs`).
+  `fabrics.rs`, `identify.rs`, `log_page.rs`, `reservation.rs`).
 - NVMe/TCP transport (PDU codec, per-connection state machine,
   fabrics interception, R2T flow, fused-pair tracking):
   [`../nvme/tcp/src/`](../nvme/tcp/src/) (`pdu.rs`, `server.rs`).

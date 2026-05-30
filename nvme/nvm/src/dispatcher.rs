@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use core_block::{PageCache, RangeError};
 use nvme_base::identify::CNS;
 use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusField};
+use scsi_spc::reservations::{RegistrantId, ReservationManager};
 
 use crate::NamespaceLookup;
 use crate::handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
@@ -92,6 +93,13 @@ pub struct NvmeNvmDispatcher {
     /// Alive admin commands when they arrive — so this is purely
     /// host-visible state.
     kato_ms: AtomicU32,
+    /// Shared reservation state machine, keyed by HOSTID. Built per
+    /// dispatcher (mirror of `SbcScsiDispatcher`); since iSCSI and
+    /// NVMe/TCP are mutually exclusive per daemon there's no
+    /// cross-transport sharing. In-memory only — a daemon restart
+    /// drops every registration (PTPL not advertised), so hosts
+    /// re-register on reconnect.
+    reservations: Arc<ReservationManager>,
 }
 
 impl NvmeNvmDispatcher {
@@ -115,6 +123,7 @@ impl NvmeNvmDispatcher {
             num_io_sqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
             num_io_cqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
             kato_ms: AtomicU32::new(0),
+            reservations: Arc::new(ReservationManager::new()),
         }
     }
 
@@ -133,6 +142,76 @@ impl NvmeNvmDispatcher {
         let Some(cache) = self.registry.get(sqe.nsid) else {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_namespace()));
         };
+
+        // Reservation commands are never conflict-gated (their own key
+        // check is the only conflict path); they dispatch directly.
+        let host_id = cmd.host_id.unwrap_or([0u8; 16]);
+        match opcode {
+            NvmOpcode::ReservationRegister => {
+                return crate::reservations::reservation_register(
+                    &self.reservations,
+                    sqe.nsid,
+                    host_id,
+                    sqe,
+                    cmd.data_out,
+                );
+            }
+            NvmOpcode::ReservationReport => {
+                return crate::reservations::reservation_report(
+                    &self.reservations,
+                    sqe.nsid,
+                    sqe,
+                    cmd.data_in_max,
+                );
+            }
+            NvmOpcode::ReservationAcquire => {
+                return crate::reservations::reservation_acquire(
+                    &self.reservations,
+                    sqe.nsid,
+                    host_id,
+                    sqe,
+                    cmd.data_out,
+                );
+            }
+            NvmOpcode::ReservationRelease => {
+                return crate::reservations::reservation_release(
+                    &self.reservations,
+                    sqe.nsid,
+                    host_id,
+                    sqe,
+                    cmd.data_out,
+                );
+            }
+            _ => {}
+        }
+
+        // Enforcement gate: a non-holder's data-path command is
+        // rejected with Reservation Conflict. Read-side opcodes
+        // (Read / Compare / Verify) consult `allow_read`; write-side
+        // (Write / Write Zeroes / DSM-deallocate) consult
+        // `allow_write`. Flush is deliberately NOT gated — the NVM
+        // Command Set does not restrict it (it commits already-
+        // accepted writes), which differs from SCSI SYNCHRONIZE CACHE.
+        let registrant = RegistrantId::nvme(host_id);
+        let lun = u64::from(sqe.nsid);
+        let denied = match opcode {
+            NvmOpcode::Read | NvmOpcode::Compare | NvmOpcode::Verify => {
+                !self.reservations.allow_read(lun, &registrant)
+            }
+            NvmOpcode::Write | NvmOpcode::WriteZeroes | NvmOpcode::DatasetManagement => {
+                !self.reservations.allow_write(lun, &registrant)
+            }
+            _ => false,
+        };
+        if denied {
+            return NvmeResponse::just(Cqe::failure(
+                cid,
+                0,
+                0,
+                StatusField::reservation_conflict(),
+            ));
+        }
+
         match opcode {
             NvmOpcode::Flush => self.cmd_flush(cid, &cache).await,
             NvmOpcode::Write => self.cmd_write(cid, sqe, cmd.data_out, &cache).await,
@@ -728,6 +807,19 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
             );
         };
+        // Reservation gate: a fused Compare+Write mutates the medium,
+        // so the write-side gate applies. A host that can't write
+        // can't CAW.
+        let registrant = RegistrantId::nvme(compare.host_id.unwrap_or([0u8; 16]));
+        if !self
+            .reservations
+            .allow_write(u64::from(compare.sqe.nsid), &registrant)
+        {
+            return (
+                Cqe::failure(compare_cid, 0, 0, StatusField::reservation_conflict()),
+                Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
+            );
+        }
         let slba = read_slba(&compare.sqe);
         let nlb = read_nlb(&compare.sqe);
         let (byte_off, len_bytes) = match cache.resolve_range(slba, u64::from(nlb)) {
@@ -898,6 +990,7 @@ mod tests {
                 data_out: Some(&payload),
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS, "write failed");
@@ -909,6 +1002,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 64 * 1024,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -926,6 +1020,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::lba_out_of_range());
@@ -945,6 +1040,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -966,6 +1062,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -992,6 +1089,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1016,6 +1114,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1040,6 +1139,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1061,6 +1161,7 @@ mod tests {
             data_out: Some(&original),
             data_in_max: 0,
             session_volumes: None,
+            host_id: None,
         })
         .await;
 
@@ -1091,12 +1192,14 @@ mod tests {
                     data_out: Some(&original),
                     data_in_max: 0,
                     session_volumes: None,
+                    host_id: None,
                 },
                 IoCommand {
                     sqe: wsqe2,
                     data_out: Some(&new),
                     data_in_max: 0,
                     session_volumes: None,
+                    host_id: None,
                 },
             )
             .await;
@@ -1118,6 +1221,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 64 * 1024,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(read_resp.data_in, new);
@@ -1138,6 +1242,7 @@ mod tests {
             data_out: Some(&original),
             data_in_max: 0,
             session_volumes: None,
+            host_id: None,
         })
         .await;
 
@@ -1164,12 +1269,14 @@ mod tests {
                     data_out: Some(&bad_compare),
                     data_in_max: 0,
                     session_volumes: None,
+                    host_id: None,
                 },
                 IoCommand {
                     sqe: nvme_base::Sqe::parse(&wsqe2).unwrap(),
                     data_out: Some(&new),
                     data_in_max: 0,
                     session_volumes: None,
+                    host_id: None,
                 },
             )
             .await;
@@ -1188,6 +1295,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 64 * 1024,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(read_resp.data_in, original);
@@ -1207,6 +1315,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
@@ -1244,6 +1353,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1258,6 +1368,7 @@ mod tests {
             data_out: Some(&payload),
             data_in_max: 0,
             session_volumes: None,
+            host_id: None,
         })
         .await;
 
@@ -1267,6 +1378,7 @@ mod tests {
                 data_out: Some(&payload),
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(same.cqe.status, StatusField::SUCCESS);
@@ -1277,6 +1389,7 @@ mod tests {
                 data_out: Some(&vec![0x00u8; 4096]),
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(differs.cqe.status, StatusField::compare_failure());
@@ -1291,6 +1404,7 @@ mod tests {
                 data_out: Some(&[1, 2, 3]),
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1305,6 +1419,7 @@ mod tests {
             data_out: Some(&vec![0xFFu8; 4096]),
             data_in_max: 0,
             session_volumes: None,
+            host_id: None,
         })
         .await;
 
@@ -1314,6 +1429,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(wz.cqe.status, StatusField::SUCCESS);
@@ -1324,6 +1440,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(rd.cqe.status, StatusField::SUCCESS);
@@ -1348,6 +1465,7 @@ mod tests {
                 data_out: Some(&range),
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1367,6 +1485,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1381,6 +1500,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1399,6 +1519,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1413,6 +1534,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1429,6 +1551,7 @@ mod tests {
                     data_out: None,
                     data_in_max: 4096,
                     session_volumes: None,
+                    host_id: None,
                 })
                 .await;
             assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
@@ -1445,6 +1568,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1459,6 +1583,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1473,6 +1598,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1489,6 +1615,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1503,6 +1630,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1557,6 +1685,7 @@ mod tests {
                 data_out: None,
                 data_in_max: nvme_base::IDENTIFY_DATA_SIZE as u32,
                 session_volumes: Some(&allow),
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1594,8 +1723,142 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: Some(&allow),
+                host_id: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
+    }
+
+    // ---- NVMe reservations ----
+
+    use nvme_base::reservation as wire;
+
+    fn sqe_resv(opcode: NvmOpcode, cdw10: u32, cdw11: u32) -> nvme_base::Sqe {
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = opcode as u8;
+        b[2] = 0x60; // CID
+        b[4] = 0x01; // NSID = 1
+        b[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        b[44..48].copy_from_slice(&cdw11.to_le_bytes());
+        nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    fn keys16(crkey: u64, second: u64) -> Vec<u8> {
+        let mut v = vec![0u8; 16];
+        v[0..8].copy_from_slice(&crkey.to_le_bytes());
+        v[8..16].copy_from_slice(&second.to_le_bytes());
+        v
+    }
+
+    async fn resv_io(
+        disp: &NvmeNvmDispatcher,
+        sqe: nvme_base::Sqe,
+        data_out: Option<&[u8]>,
+        host_id: [u8; 16],
+    ) -> NvmeResponse {
+        disp.handle_io(IoCommand {
+            sqe,
+            data_out,
+            data_in_max: 4096,
+            session_volumes: None,
+            host_id: Some(host_id),
+        })
+        .await
+    }
+
+    /// Register a key + acquire Write Exclusive, then a Reservation
+    /// Report reflects the holder and key.
+    #[tokio::test]
+    async fn nvme_register_acquire_report_round_trip() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let host = [0xA1u8; 16];
+
+        // Register key 0xCAFE (RREGA=Register, CRKEY=0, NRKEY=0xCAFE).
+        let reg = sqe_resv(
+            NvmOpcode::ReservationRegister,
+            wire::RREGA_REGISTER as u32,
+            0,
+        );
+        let r = resv_io(&disp, reg, Some(&keys16(0, 0xCAFE)), host).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+
+        // Acquire Write Exclusive (NVMe RTYPE 1) with CRKEY=0xCAFE.
+        let cdw10 = wire::RACQA_ACQUIRE as u32 | (1u32 << 8);
+        let acq = sqe_resv(NvmOpcode::ReservationAcquire, cdw10, 0);
+        let r = resv_io(&disp, acq, Some(&keys16(0xCAFE, 0)), host).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+
+        // Report (NUMD large enough; EDS=0).
+        let rep = sqe_resv(NvmOpcode::ReservationReport, 0x100, 0);
+        let r = resv_io(&disp, rep, None, host).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+        // RTYPE=1 (Write Exclusive); REGCTL=1; holder bit + key set.
+        assert_eq!(r.data_in[4], 1, "RTYPE should be Write Exclusive");
+        assert_eq!(&r.data_in[5..7], &1u16.to_le_bytes(), "one registrant");
+        let entry = &r.data_in[wire::STATUS_HEADER_LEN..];
+        assert_eq!(entry[2], 1, "holder bit set");
+        assert_eq!(&entry[5..13], &host[0..8], "HOSTID low 64");
+        assert_eq!(&entry[13..21], &0xCAFEu64.to_le_bytes(), "RKEY");
+    }
+
+    /// Cross-host fencing: host A holds Write Exclusive; host B is
+    /// denied writes but allowed reads; host A may write.
+    #[tokio::test]
+    async fn nvme_reservation_fences_other_host() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+
+        let reg = sqe_resv(
+            NvmOpcode::ReservationRegister,
+            wire::RREGA_REGISTER as u32,
+            0,
+        );
+        resv_io(&disp, reg, Some(&keys16(0, 0xAAAA)), a).await;
+        let acq = sqe_resv(
+            NvmOpcode::ReservationAcquire,
+            wire::RACQA_ACQUIRE as u32 | (1u32 << 8),
+            0,
+        );
+        assert_eq!(
+            resv_io(&disp, acq, Some(&keys16(0xAAAA, 0)), a)
+                .await
+                .cqe
+                .status,
+            StatusField::SUCCESS
+        );
+
+        // B's WRITE is fenced; B's READ is allowed under Write Exclusive.
+        let payload = vec![0u8; 4096];
+        let b_write = resv_io(&disp, sqe_io(NvmOpcode::Write, 0, 0), Some(&payload), b).await;
+        assert_eq!(b_write.cqe.status, StatusField::reservation_conflict());
+        let b_read = resv_io(&disp, sqe_io(NvmOpcode::Read, 0, 0), None, b).await;
+        assert_eq!(b_read.cqe.status, StatusField::SUCCESS);
+        // A may write.
+        let a_write = resv_io(&disp, sqe_io(NvmOpcode::Write, 0, 0), Some(&payload), a).await;
+        assert_eq!(a_write.cqe.status, StatusField::SUCCESS);
+    }
+
+    /// Acquire from an unregistered host → Reservation Conflict.
+    #[tokio::test]
+    async fn nvme_acquire_without_register_conflicts() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let acq = sqe_resv(
+            NvmOpcode::ReservationAcquire,
+            wire::RACQA_ACQUIRE as u32 | (1u32 << 8),
+            0,
+        );
+        let r = resv_io(&disp, acq, Some(&keys16(0xAAAA, 0)), [0xA1u8; 16]).await;
+        assert_eq!(r.cqe.status, StatusField::reservation_conflict());
+    }
+
+    /// CPTPL = "set PTPL" is rejected (PTPL not supported).
+    #[tokio::test]
+    async fn nvme_register_cptpl_persist_rejected() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let cdw10 = wire::RREGA_REGISTER as u32 | ((wire::CPTPL_PERSIST as u32) << 30);
+        let reg = sqe_resv(NvmOpcode::ReservationRegister, cdw10, 0);
+        let r = resv_io(&disp, reg, Some(&keys16(0, 0xCAFE)), [0xA1u8; 16]).await;
+        assert_eq!(r.cqe.status, StatusField::invalid_field());
     }
 }

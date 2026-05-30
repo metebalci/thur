@@ -427,6 +427,20 @@ bring-up if it does not see AERs complete; returning Invalid Opcode makes that
 warning fire once instead of spinning. Wire this when a real async-event
 trigger lands.
 
+### Reservation notifications (LID 0x80)
+
+NVMe Reservations *themselves* are implemented (issue #54): Register / Acquire
+/ Release / Report share the transport-neutral
+`scsi_spc::reservations::ReservationManager`, keyed by the Connect HOSTID, and
+a non-holder's I/O is fenced with Reservation Conflict. What stays out is the
+**Reservation Notification log page** (LID 0x80) and async delivery of
+reservation events, which depend on AER (above). Without AER the log page is
+poll-only and conveys nothing a host can't already learn from the Reservation
+Conflict status on its next command, so `nvme resv-notif-log` returns
+`Invalid Field in Command`. It lands alongside AER. Reservation state is
+in-memory only (PTPL not advertised); a daemon restart drops registrations and
+hosts re-register on reconnect, matching the SCSI side.
+
 ### Discovery controller
 
 Hosts connect directly to the subsystem NQN; we do not ship a separate

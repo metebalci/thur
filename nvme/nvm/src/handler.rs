@@ -33,6 +33,10 @@ pub struct AdminCommand<'a> {
     /// entry). Resolved at Fabrics Connect from
     /// `nvmetcp-psks.json::PskEntry.volumes`.
     pub session_volumes: Option<&'a [String]>,
+    /// 128-bit Host Identifier from the Fabrics Connect data. Names
+    /// the reservation registrant (one HOSTID spans the host's many
+    /// connections). `None` only outside a real connection (tests).
+    pub host_id: Option<[u8; 16]>,
 }
 
 /// I/O command coming in on a non-zero queue (qid > 0). Same shape
@@ -45,6 +49,8 @@ pub struct IoCommand<'a> {
     pub data_in_max: u32,
     /// See `AdminCommand::session_volumes`.
     pub session_volumes: Option<&'a [String]>,
+    /// See `AdminCommand::host_id`.
+    pub host_id: Option<[u8; 16]>,
 }
 
 /// Handler reply. The CQE is always present; the data-in payload
@@ -125,6 +131,7 @@ mod tests {
             data_out: None,
             data_in_max: 0,
             session_volumes: None,
+            host_id: None,
         }
     }
 

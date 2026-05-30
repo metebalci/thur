@@ -44,26 +44,47 @@ use std::sync::Mutex;
 
 use crate::pr::ReservationType;
 
-/// I_T nexus identifier. Registrations are keyed by `(tsih,
-/// initiator_iqn)` — TSIH alone is sufficient for uniqueness within
-/// a running daemon (the iSCSI session manager allocates them
-/// monotonically), but the IQN is preserved so READ FULL STATUS
-/// can render an iSCSI-format TransportID and audit can name the
-/// peer.
+/// Registrant identity. A registration (and any reservation it
+/// holds) is named by the transport-specific identity of the host
+/// that created it:
+///
+/// - **iSCSI** I_T nexus: `(tsih, iqn)`. TSIH alone is sufficient for
+///   uniqueness within a running daemon (the session manager
+///   allocates them monotonically), but the IQN is preserved so READ
+///   FULL STATUS can render an iSCSI-format TransportID and audit can
+///   name the peer. Dropped on session close (see [`ReservationManager::drop_nexus`]).
+/// - **NVMe** host: the 128-bit Host Identifier from the Fabrics
+///   Connect data. One NVMe host opens many controller/queue
+///   associations (each its own TCP connection) under a single
+///   HOSTID, so the registrant is the *host*, not the connection —
+///   and unlike the iSCSI nexus it does **not** drop on connection
+///   teardown. A registration persists until explicit Release /
+///   Register-unregister / Preempt (or daemon restart, since PTPL is
+///   not advertised).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Nexus {
-    pub tsih: u16,
-    pub initiator_iqn: Option<String>,
+pub enum RegistrantId {
+    Iscsi { tsih: u16, iqn: Option<String> },
+    NvmeHost { hostid: [u8; 16] },
 }
 
-impl Nexus {
-    /// Build a nexus from the raw I_T identity each product extracts
-    /// from its own request type (`tsih` + the login-advertised IQN).
+/// Back-compatible name for the SCSI dispatchers (iSCSI block, tape
+/// drive / changer LUN), which only ever construct the iSCSI variant.
+pub type Nexus = RegistrantId;
+
+impl RegistrantId {
+    /// Build an iSCSI I_T nexus from `tsih` + the login-advertised
+    /// IQN. (Named `new` so the existing `Nexus::new` call sites in
+    /// the SCSI dispatchers keep working unchanged.)
     pub fn new(tsih: u16, initiator_iqn: Option<String>) -> Self {
-        Self {
+        Self::Iscsi {
             tsih,
-            initiator_iqn,
+            iqn: initiator_iqn,
         }
+    }
+
+    /// Build an NVMe host registrant from the 128-bit Connect HOSTID.
+    pub fn nvme(hostid: [u8; 16]) -> Self {
+        Self::NvmeHost { hostid }
     }
 }
 
@@ -98,6 +119,20 @@ pub enum PrInOutcome {
     InvalidFieldInCdb,
     /// CHECK CONDITION / ILLEGAL REQUEST — LOGICAL UNIT NOT SUPPORTED.
     LuNotSupported,
+}
+
+/// Read-only snapshot of a LUN's reservation state. Lets a renderer
+/// build a transport-specific wire structure (e.g. the NVMe
+/// Reservation Report) from the shared bookkeeping without
+/// duplicating it. The SCSI PRIN renderers read [`LunState`] directly
+/// and don't use this.
+#[derive(Debug, Clone)]
+pub struct ReservationSnapshot {
+    pub generation: u32,
+    pub reservation_type: Option<ReservationType>,
+    pub holder: Option<RegistrantId>,
+    /// `(registrant, reservation key)` in stable BTreeMap order.
+    pub registrants: Vec<(RegistrantId, u64)>,
 }
 
 /// Parsed PERSISTENT RESERVE OUT CDB + Data-Out fields. Both
@@ -148,11 +183,11 @@ struct ReservationState {
 
 #[derive(Default)]
 struct LunState {
-    /// `(tsih, initiator_iqn) -> reservation key`. Ordered map so
-    /// READ KEYS / READ FULL STATUS render in a stable order across
-    /// runs — initiators don't care, but it makes test diffs and
-    /// audit logs readable.
-    registrations: BTreeMap<(u16, Option<String>), u64>,
+    /// `registrant -> reservation key`. Ordered map so READ KEYS /
+    /// READ FULL STATUS render in a stable order across runs —
+    /// initiators don't care, but it makes test diffs and audit logs
+    /// readable.
+    registrations: BTreeMap<RegistrantId, u64>,
     reservation: Option<ReservationState>,
     /// SPC-4 §6.13.1.1 PR_GENERATION. Wraps on overflow per spec.
     generation: u32,
@@ -163,14 +198,12 @@ impl LunState {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn registration_key(&self, nexus: &Nexus) -> Option<u64> {
-        self.registrations
-            .get(&(nexus.tsih, nexus.initiator_iqn.clone()))
-            .copied()
+    fn registration_key(&self, id: &RegistrantId) -> Option<u64> {
+        self.registrations.get(id).copied()
     }
 
-    fn is_registered(&self, nexus: &Nexus) -> bool {
-        self.registration_key(nexus).is_some()
+    fn is_registered(&self, id: &RegistrantId) -> bool {
+        self.registration_key(id).is_some()
     }
 }
 
@@ -205,34 +238,29 @@ impl ReservationManager {
     pub fn drop_nexus(&self, tsih: u16) {
         let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
         for state in map.values_mut() {
-            let removed: Vec<(u16, Option<String>)> = state
+            let removed: Vec<RegistrantId> = state
                 .registrations
                 .keys()
-                .filter(|(t, _)| *t == tsih)
+                .filter(|id| matches!(id, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih))
                 .cloned()
                 .collect();
-            if removed.is_empty()
-                && state
-                    .reservation
-                    .as_ref()
-                    .is_none_or(|r| r.holder.tsih != tsih)
-            {
+            let holder_is_tsih = state.reservation.as_ref().is_some_and(
+                |r| matches!(&r.holder, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih),
+            );
+            if removed.is_empty() && !holder_is_tsih {
                 continue;
             }
             for k in &removed {
                 state.registrations.remove(k);
             }
             if let Some(r) = state.reservation.clone()
-                && r.holder.tsih == tsih
+                && matches!(&r.holder, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih)
             {
                 if r.r#type.is_all_registrants()
-                    && let Some(((t, iqn), key)) = state.registrations.iter().next()
+                    && let Some((id, key)) = state.registrations.iter().next()
                 {
                     state.reservation = Some(ReservationState {
-                        holder: Nexus {
-                            tsih: *t,
-                            initiator_iqn: iqn.clone(),
-                        },
+                        holder: id.clone(),
                         key: *key,
                         r#type: r.r#type,
                     });
@@ -370,23 +398,104 @@ impl ReservationManager {
             return PrOutOutcome::InvalidFieldInParameterList;
         }
 
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        let state = map.entry(lun).or_default();
-
+        // Dispatch to the shared semantic ops (which lock + mutate
+        // per-LUN state). These are the single code path — the NVMe
+        // adapter drives the same ops with its own parsed fields.
         match service_action {
-            0x00 => prout_register(state, nexus, reservation_key, service_action_key, false),
-            0x01 => prout_reserve(state, nexus, reservation_key, type_byte),
-            0x02 => prout_release(state, nexus, reservation_key, type_byte),
-            0x03 => prout_clear(state, nexus, reservation_key),
+            0x00 => self.register(lun, nexus, reservation_key, service_action_key, false),
+            0x01 => self.reserve(lun, nexus, reservation_key, type_byte),
+            0x02 => self.release(lun, nexus, reservation_key, type_byte),
+            0x03 => self.clear(lun, nexus, reservation_key),
             // PREEMPT AND ABORT (0x05) collapses to PREEMPT — we have
             // no task-manager hook, and the visible state transition
             // is identical.
-            0x04 | 0x05 => {
-                prout_preempt(state, nexus, reservation_key, service_action_key, type_byte)
-            }
-            0x06 => prout_register(state, nexus, reservation_key, service_action_key, true),
+            0x04 | 0x05 => self.preempt(lun, nexus, reservation_key, service_action_key, type_byte),
+            0x06 => self.register(lun, nexus, reservation_key, service_action_key, true),
             // REGISTER AND MOVE (0x07) — single target port, rejected.
             _ => PrOutOutcome::InvalidFieldInCdb,
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Semantic reservation ops (transport-neutral)
+    // ------------------------------------------------------------
+    //
+    // Each locks per-LUN state, applies one service action, and
+    // returns the response-neutral outcome. `prout` (SCSI) parses its
+    // CDB + parameter list then calls these; the NVMe adapter parses
+    // its CDW10 + key payload then calls the same ops with an
+    // `RegistrantId::NvmeHost`. One mutation path, so the two surfaces
+    // can't drift. `lun` is whatever stable per-entity key the caller
+    // chooses (SCSI LUN, or `nsid as u64` on the NVMe side).
+
+    /// REGISTER (`sark != 0`) / unregister (`sark == 0`). `ignore`
+    /// skips the existing-key check (SCSI REGISTER AND IGNORE EXISTING
+    /// KEY / NVMe IEKEY).
+    pub fn register(
+        &self,
+        lun: u64,
+        id: &RegistrantId,
+        rk: u64,
+        sark: u64,
+        ignore: bool,
+    ) -> PrOutOutcome {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        prout_register(map.entry(lun).or_default(), id, rk, sark, ignore)
+    }
+
+    /// RESERVE / NVMe Acquire (Acquire action).
+    pub fn reserve(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        prout_reserve(map.entry(lun).or_default(), id, rk, type_byte)
+    }
+
+    /// RELEASE / NVMe Release (Release action).
+    pub fn release(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        prout_release(map.entry(lun).or_default(), id, rk, type_byte)
+    }
+
+    /// CLEAR / NVMe Release (Clear action).
+    pub fn clear(&self, lun: u64, id: &RegistrantId, rk: u64) -> PrOutOutcome {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        prout_clear(map.entry(lun).or_default(), id, rk)
+    }
+
+    /// PREEMPT / PREEMPT AND ABORT / NVMe Acquire (Preempt action).
+    pub fn preempt(
+        &self,
+        lun: u64,
+        id: &RegistrantId,
+        rk: u64,
+        sark: u64,
+        type_byte: u8,
+    ) -> PrOutOutcome {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        prout_preempt(map.entry(lun).or_default(), id, rk, sark, type_byte)
+    }
+
+    /// Read-only snapshot for a transport-specific reservation
+    /// renderer (e.g. the NVMe Reservation Report). Returns an empty
+    /// snapshot for a LUN with no state.
+    pub fn snapshot(&self, lun: u64) -> ReservationSnapshot {
+        let map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(state) = map.get(&lun) else {
+            return ReservationSnapshot {
+                generation: 0,
+                reservation_type: None,
+                holder: None,
+                registrants: Vec::new(),
+            };
+        };
+        ReservationSnapshot {
+            generation: state.generation,
+            reservation_type: state.reservation.as_ref().map(|r| r.r#type),
+            holder: state.reservation.as_ref().map(|r| r.holder.clone()),
+            registrants: state
+                .registrations
+                .iter()
+                .map(|(id, key)| (id.clone(), *key))
+                .collect(),
         }
     }
 }
@@ -462,19 +571,16 @@ fn render_read_full_status(state: Option<&LunState>) -> Vec<u8> {
     let mut descs = Vec::new();
     let holder_key = state.reservation.as_ref().map(|r| r.holder.clone());
     let res_type = state.reservation.as_ref().map(|r| r.r#type);
-    for ((tsih, iqn), key) in &state.registrations {
-        let nexus_here = Nexus {
-            tsih: *tsih,
-            initiator_iqn: iqn.clone(),
+    for (id, key) in &state.registrations {
+        let is_holder =
+            holder_key.as_ref() == Some(id) || (res_type.is_some_and(|t| t.is_all_registrants()));
+        // Only the iSCSI variant carries an IQN for the TransportID;
+        // NVMe registrants never reach the SCSI PRIN path.
+        let iqn = match id {
+            RegistrantId::Iscsi { iqn, .. } => iqn.as_deref(),
+            RegistrantId::NvmeHost { .. } => None,
         };
-        let is_holder = holder_key.as_ref() == Some(&nexus_here)
-            || (res_type.is_some_and(|t| t.is_all_registrants()));
-        descs.extend(full_status_descriptor(
-            *key,
-            is_holder,
-            res_type,
-            iqn.as_deref(),
-        ));
+        descs.extend(full_status_descriptor(*key, is_holder, res_type, iqn));
     }
     let mut out = header(state.generation, descs.len() as u32).to_vec();
     out.extend_from_slice(&descs);
@@ -549,9 +655,8 @@ fn prout_register(
             return PrOutOutcome::ReservationConflict;
         }
     }
-    let key = (nexus.tsih, nexus.initiator_iqn.clone());
     if sark == 0 {
-        state.registrations.remove(&key);
+        state.registrations.remove(nexus);
         // Unregistration with the holder of a non-AR reservation
         // releases the reservation (SBC-3 §5.13.4.2).
         if let Some(r) = &state.reservation
@@ -560,11 +665,8 @@ fn prout_register(
             if r.r#type.is_all_registrants() {
                 if state.registrations.is_empty() {
                     state.reservation = None;
-                } else if let Some(((t, iqn), key)) = state.registrations.iter().next() {
-                    let new_holder = Nexus {
-                        tsih: *t,
-                        initiator_iqn: iqn.clone(),
-                    };
+                } else if let Some((id, key)) = state.registrations.iter().next() {
+                    let new_holder = id.clone();
                     let new_key = *key;
                     let r_type = r.r#type;
                     state.reservation = Some(ReservationState {
@@ -578,7 +680,7 @@ fn prout_register(
             }
         }
     } else {
-        state.registrations.insert(key, sark);
+        state.registrations.insert(nexus.clone(), sark);
     }
     state.bump_generation();
     PrOutOutcome::Good
@@ -678,13 +780,11 @@ fn prout_preempt(
     };
     // Drop every registration whose key matches SARK *except* the
     // calling nexus (the preemptor remains registered).
-    let to_drop: Vec<(u16, Option<String>)> = state
+    let to_drop: Vec<RegistrantId> = state
         .registrations
         .iter()
-        .filter(|((t, iqn), k)| {
-            **k == sark && !(*t == nexus.tsih && iqn.as_deref() == nexus.initiator_iqn.as_deref())
-        })
-        .map(|(k, _)| k.clone())
+        .filter(|(id, k)| **k == sark && **id != *nexus)
+        .map(|(id, _)| id.clone())
         .collect();
     if to_drop.is_empty() && state.reservation.as_ref().is_none_or(|r| r.key != sark) {
         // SPC-4: PREEMPT with SARK that matches no registrant and
@@ -939,5 +1039,118 @@ mod tests {
         prin[7..9].copy_from_slice(&64u16.to_be_bytes());
         assert_eq!(parse_prin_cdb(&prin), Some((0x02, 64)));
         assert!(parse_prin_cdb(&[0x5E; 4]).is_none());
+    }
+
+    // --- NVMe-host registrant lifecycle (semantic ops + snapshot) ---
+
+    fn nvme_host(seed: u8) -> RegistrantId {
+        RegistrantId::nvme([seed; 16])
+    }
+
+    #[test]
+    fn nvme_register_then_snapshot_lists_key() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        assert_eq!(mgr.register(0, &a, 0, 0xAAAA, true), PrOutOutcome::Good);
+        let snap = mgr.snapshot(0);
+        assert_eq!(snap.registrants, vec![(a, 0xAAAA)]);
+        assert!(snap.holder.is_none());
+        assert_eq!(snap.generation, 1);
+    }
+
+    #[test]
+    fn nvme_acquire_blocks_other_host_write_not_read() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        let b = nvme_host(0xB2);
+        mgr.register(0, &a, 0, 0xAAAA, true);
+        mgr.register(0, &b, 0, 0xBBBB, true);
+        assert_eq!(
+            mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::Good
+        );
+        // Under Write Exclusive: B (a registrant but not holder) is
+        // denied writes, allowed reads; A may write.
+        assert!(!mgr.allow_write(0, &b));
+        assert!(mgr.allow_read(0, &b));
+        assert!(mgr.allow_write(0, &a));
+    }
+
+    #[test]
+    fn nvme_acquire_by_non_registrant_conflicts() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        // Acquire without registering first → Reservation Conflict
+        // (NVMe: an unregistered controller may not acquire).
+        assert_eq!(
+            mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::ReservationConflict
+        );
+    }
+
+    #[test]
+    fn drop_nexus_leaves_nvme_registration_intact() {
+        // The crux of issue #54: a connection teardown
+        // (`drop_nexus`) is iSCSI-only. An NVMe host's registration
+        // must survive it — NVMe reservations are released only by
+        // explicit Release / unregister / preempt.
+        let mgr = ReservationManager::new();
+        let iscsi = Nexus::new(7, Some("iqn.test:a".into()));
+        let host = nvme_host(0xC3);
+        mgr.register(0, &iscsi, 0, 0x1111, true);
+        mgr.register(0, &host, 0, 0x2222, true);
+        mgr.reserve(0, &host, 0x2222, ReservationType::ExclusiveAccess.as_u8());
+
+        mgr.drop_nexus(7); // tear down the iSCSI nexus
+
+        let snap = mgr.snapshot(0);
+        // iSCSI registration gone; NVMe registration + its
+        // reservation survive.
+        assert_eq!(snap.registrants, vec![(host.clone(), 0x2222)]);
+        assert_eq!(snap.holder, Some(host.clone()));
+        assert!(!mgr.allow_write(0, &Nexus::new(8, None)));
+        assert!(mgr.allow_write(0, &host));
+    }
+
+    #[test]
+    fn nvme_preempt_across_hosts_replaces_holder() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        let b = nvme_host(0xB2);
+        mgr.register(0, &a, 0, 0xAAAA, true);
+        mgr.register(0, &b, 0, 0xBBBB, true);
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+        // B preempts A's reservation (SARK = A's key).
+        assert_eq!(
+            mgr.preempt(
+                0,
+                &b,
+                0xBBBB,
+                0xAAAA,
+                ReservationType::WriteExclusive.as_u8()
+            ),
+            PrOutOutcome::Good
+        );
+        // A is unregistered + no longer holder; B holds.
+        let snap = mgr.snapshot(0);
+        assert_eq!(snap.registrants, vec![(b.clone(), 0xBBBB)]);
+        assert_eq!(snap.holder, Some(b.clone()));
+        assert!(!mgr.allow_write(0, &a));
+        assert!(mgr.allow_write(0, &b));
+    }
+
+    #[test]
+    fn nvme_release_clears_reservation() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        mgr.register(0, &a, 0, 0xAAAA, true);
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+        assert_eq!(
+            mgr.release(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert!(mgr.snapshot(0).holder.is_none());
+        // Registration persists after release (NVMe Release ≠ unregister).
+        assert_eq!(mgr.snapshot(0).registrants, vec![(a, 0xAAAA)]);
     }
 }

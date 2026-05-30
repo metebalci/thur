@@ -1924,10 +1924,7 @@ mod tests {
     /// in this module exercises the data path against an empty
     /// `ReservationManager`, so the nexus identity doesn't matter.
     fn test_nexus() -> Nexus {
-        Nexus {
-            tsih: 0,
-            initiator_iqn: None,
-        }
+        Nexus::new(0, None)
     }
 
     fn test_mgr() -> ReservationManager {

@@ -397,6 +397,46 @@ run_io_round_trip() {
     fi
 }
 
+run_reservation_tests() {
+    log_info "Running NVMe reservation flow (register / acquire / report / release)..."
+    local dev="/dev/${NVME_DEVICE}n1"
+    local key=0x123456
+
+    if ! nvme resv-register "$dev" --rrega=0 --nrkey="$key" \
+        >"$TEST_DIR/resv-register.log" 2>&1; then
+        log_fail "resv-register failed: $(cat "$TEST_DIR/resv-register.log")"
+        return
+    fi
+    log_pass "Reservation Register accepted"
+
+    if ! nvme resv-acquire "$dev" --crkey="$key" --rtype=1 --racqa=0 \
+        >"$TEST_DIR/resv-acquire.log" 2>&1; then
+        log_fail "resv-acquire failed: $(cat "$TEST_DIR/resv-acquire.log")"
+        return
+    fi
+    log_pass "Reservation Acquire (Write Exclusive) accepted"
+
+    if ! nvme resv-report "$dev" --numd=256 >"$TEST_DIR/resv-report.log" 2>&1; then
+        log_fail "resv-report failed: $(cat "$TEST_DIR/resv-report.log")"
+        return
+    fi
+    # The registrant key (0x123456) and rtype=1 must appear in the
+    # Reservation Status Data Structure.
+    if grep -qiE "123456" "$TEST_DIR/resv-report.log"; then
+        log_pass "Reservation Report lists the registrant key"
+    else
+        log_fail "Reservation Report missing registrant key 0x123456"
+        cat "$TEST_DIR/resv-report.log"
+    fi
+
+    if ! nvme resv-release "$dev" --crkey="$key" --rtype=1 --rrela=0 \
+        >"$TEST_DIR/resv-release.log" 2>&1; then
+        log_fail "resv-release failed: $(cat "$TEST_DIR/resv-release.log")"
+        return
+    fi
+    log_pass "Reservation Release accepted"
+}
+
 run_disconnect() {
     log_info "Disconnecting..."
     if nvme disconnect -n "$SUBNQN" >/dev/null 2>&1; then
@@ -421,6 +461,7 @@ main() {
         run_identify_tests
         run_smart_log
         run_io_round_trip
+        run_reservation_tests
         run_disconnect
     fi
 

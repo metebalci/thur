@@ -19,6 +19,10 @@ core-block = { path = "../../core/block" }
 # SQE / CQE / status / opcodes / Identify primitives. nvme-nvm is
 # the NVM Command Set layered on the base.
 nvme-base = { path = "../base" }
+# Shared transport-neutral reservation state machine. NVMe
+# reservations reuse it (keyed by HOSTID) so the SCSI and NVMe
+# reservation surfaces can't drift.
+scsi-spc = { path = "../../scsi/spc" }
 # Vendor / model identity strings rendered by Identify Namespace.
 shared-naming = { path = "../../shared/naming" }
 

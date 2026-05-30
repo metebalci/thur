@@ -31,6 +31,7 @@ pub mod fabrics;
 pub mod identify;
 pub mod log_page;
 pub mod opcode;
+pub mod reservation;
 pub mod sqe;
 pub mod status;
 

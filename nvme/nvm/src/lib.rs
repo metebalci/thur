@@ -41,6 +41,7 @@ use core_block::PageCache;
 pub mod dispatcher;
 pub mod handler;
 pub mod opcode;
+pub mod reservations;
 
 pub use dispatcher::NvmeNvmDispatcher;
 pub use handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};

@@ -450,6 +450,92 @@ ADDRESS 0xB5. The legacy no-op RESERVE(6/10) stay accepted (CRH = 0).
 0x5F now appears in **both** the changer's and the drives' REPORT
 SUPPORTED OPERATION CODES.
 
+#### NVMe reservations (thurvsa NVMe/TCP)
+
+The NVMe/TCP target exposes reservations as the protocol-native analog
+of SBC-3 PERSISTENT RESERVE (issue #54). The *state machine* is the
+same `scsi_spc::reservations::ReservationManager`; only the wire
+encoding differs, and it is parsed / rendered in
+`nvme_nvm::reservations` + `nvme_base::reservation`. Because iSCSI and
+NVMe/TCP are mutually exclusive per daemon, each dispatcher owns its
+own manager instance.
+
+The registrant identity is the **128-bit Host Identifier** from the
+Fabrics Connect data, not a per-connection handle. One NVMe host opens
+many TCP connections (admin queue + I/O queues) under one HOSTID, so a
+single connection teardown does **not** drop the registration — there
+is no `on_session_close`/`drop_nexus` equivalent on the NVMe side. A
+reservation is released only by an explicit Reservation Release,
+Reservation Register (unregister), or Preempt, or by a daemon restart
+(state is in-memory; see PTPL below).
+
+NVMe numbers the six reservation types 1..6, mapping onto the SCSI
+TYPE byte (same semantics as the table above):
+
+  | NVMe RTYPE | SCSI byte | Name |
+  |-----------:|----------:|------|
+  | 1 | 0x01 | Write Exclusive |
+  | 2 | 0x03 | Exclusive Access |
+  | 3 | 0x05 | Write Exclusive — Registrants Only |
+  | 4 | 0x06 | Exclusive Access — Registrants Only |
+  | 5 | 0x07 | Write Exclusive — All Registrants |
+  | 6 | 0x08 | Exclusive Access — All Registrants |
+
+Advertisement: Identify Namespace **RESCAP** (byte 31) = `0x7E` (all
+six types, PTPL bit 0 clear); Identify Controller **ONCS** (bytes
+520..522) bit 5 = Reservations supported. Without these a host never
+issues the reservation command set.
+
+Command wire fields — the action lives in CDW10[2:0], IEKEY in
+CDW10[3]:
+
+```text
+Reservation Register (0x0D): RREGA 0 Register / 1 Unregister / 2 Replace
+  CDW10[31:30] CPTPL  — 0b11 (set PTPL) rejected, Invalid Field
+  data-out (16 B): CRKEY (u64 LE) + NRKEY (u64 LE)
+Reservation Acquire (0x11):  RACQA 0 Acquire / 1 Preempt / 2 Preempt-and-Abort
+  CDW10[15:8] RTYPE
+  data-out (16 B): CRKEY + PRKEY
+Reservation Release (0x15):  RRELA 0 Release / 1 Clear
+  CDW10[15:8] RTYPE (Release only)
+  data-out (8 B): CRKEY
+Reservation Report (0x0E):   CDW10 NUMD (dwords, 0-based)
+  CDW11[0] EDS — extended 64-byte entries with the full 128-bit HOSTID
+```
+
+IEKEY is honored on Register only (skips the CRKEY check); Acquire and
+Release always validate CRKEY (1.2.1 IEKEY model, RESCAP bit 7 = 0).
+Acquire from an unregistered host returns Reservation Conflict.
+
+The Reservation Report returns the **Reservation Status Data
+Structure**: a 24-byte header (GEN u32 LE at 0..4, RTYPE at 4, REGCTL
+u16 LE at 5..7, PTPLS = 0 at 9) followed by one registered-controller
+entry per registrant HOSTID. The short form (EDS = 0, 24 bytes each)
+carries CNTLID (0..2), RCSTS bit 0 = holds-reservation (2), the low 64
+bits of HOSTID (5..13), and RKEY (13..21). The extended form
+(EDS = 1, 64 bytes each) carries CNTLID (0..2), RCSTS (2), RKEY
+(5..13), and the full 128-bit HOSTID (13..29). CNTLID is a static `1`
+for every connection — the fencing identity is the HOSTID.
+
+Enforcement gate: a non-holder's data-path command returns NVMe status
+**Reservation Conflict** (SCT = Command-Specific, SC = 0x83). The read
+gate covers Read 0x02 / Compare 0x05 / Verify 0x0C; the write gate
+covers Write 0x01 / Write Zeroes 0x08 / Dataset Management 0x09
+(deallocate) / fused Compare+Write. **Flush 0x00 is not gated** — the
+NVM Command Set does not restrict it (it commits already-accepted
+writes), which is a deliberate asymmetry with SCSI SYNCHRONIZE CACHE.
+
+PTPL: not supported. RESCAP bit 0 = 0, reservation state is in-memory,
+and a daemon restart drops every registration (hosts re-register on
+reconnect) — the same `PTPL_C = 0` posture as the SCSI side. A
+Reservation Register requesting CPTPL = set-PTPL is rejected with
+Invalid Field.
+
+Out of scope: the Reservation Notification log page (LID 0x80) and
+async reservation-notification delivery, which depend on AER (also
+deferred). A host learns of a conflict from the Reservation Conflict
+status on its next command.
+
 ### Format / partitioning
 
 | Opcode | Command | Notes |

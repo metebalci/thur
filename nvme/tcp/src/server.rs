@@ -475,6 +475,7 @@ where
         outbound_tx,
         qid,
         admission_volumes.map(Arc::new),
+        connect_data.hostid,
     ));
 
     // Two valid exit paths:
@@ -505,6 +506,14 @@ where
     // Drop every remaining per-command H2CData sender so any task
     // still blocked on `rx.recv()` (e.g. R2T issued but H2CTermReq
     // arrived before the host fulfilled it) unblocks and exits.
+    //
+    // Deliberately NOT touched here: reservation state. NVMe
+    // reservations are keyed by HOSTID and a host spans many
+    // connections; tearing down one connection must not drop the
+    // host's registration / reservation (unlike the iSCSI
+    // `on_session_close -> drop_nexus` path). Release happens only on
+    // explicit Reservation Release / Register-unregister / Preempt, or
+    // a daemon restart.
     commands.lock().await.clear();
     Ok(())
 }
@@ -514,6 +523,7 @@ where
 /// per CapsuleCmd; H2CData PDUs are forwarded to the matching per-
 /// command task's mpsc::Receiver. Returns on host close (EOF /
 /// H2CTermReq) or fatal protocol violation.
+#[allow(clippy::too_many_arguments)]
 async fn reader_task<R>(
     mut read: R,
     peer: std::net::SocketAddr,
@@ -523,6 +533,9 @@ async fn reader_task<R>(
     outbound: mpsc::Sender<OutboundPdu>,
     qid: u16,
     admission_volumes: Option<Arc<Vec<String>>>,
+    // 128-bit Host Identifier from Connect; names the reservation
+    // registrant. Copy, so it threads into every per-command task.
+    host_id: [u8; 16],
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -755,12 +768,14 @@ where
                                     data_out: Some(&compare_data),
                                     data_in_max: u32::MAX,
                                     session_volumes: admission_slice,
+                                    host_id: Some(host_id),
                                 },
                                 IoCommand {
                                     sqe,
                                     data_out: Some(&write_data),
                                     data_in_max: u32::MAX,
                                     session_volumes: admission_slice,
+                                    host_id: Some(host_id),
                                 },
                             )
                             .await;
@@ -835,6 +850,7 @@ where
                     commands_clone,
                     peer,
                     admission_clone,
+                    host_id,
                 ));
             }
             other => {
@@ -932,6 +948,7 @@ where
 /// immediately with whatever ICD (or none) arrived in the CapsuleCmd.
 /// In all paths: emits a single `CommandResponse` and removes itself
 /// from the inflight table.
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     sqe: Sqe,
     icd: Vec<u8>,
@@ -943,6 +960,7 @@ async fn handle_command(
     commands: CommandTable,
     peer: std::net::SocketAddr,
     admission_volumes: Option<Arc<Vec<String>>>,
+    host_id: [u8; 16],
 ) {
     let cccid = sqe.cid;
     let buf: Option<Vec<u8>> = if let Some(mut rx) = h2c_rx {
@@ -1064,6 +1082,7 @@ async fn handle_command(
                 data_out,
                 data_in_max: u32::MAX,
                 session_volumes: admission_slice,
+                host_id: Some(host_id),
             })
             .await
     } else {
@@ -1073,6 +1092,7 @@ async fn handle_command(
                 data_out,
                 data_in_max: u32::MAX,
                 session_volumes: admission_slice,
+                host_id: Some(host_id),
             })
             .await
     };

@@ -199,6 +199,20 @@ impl StatusField {
             ..Self::SUCCESS
         }
     }
+
+    /// Command-specific: Reservation Conflict (NVM Command Set
+    /// reservations). Returned when an I/O command is blocked by a
+    /// reservation held by another host, or when a reservation
+    /// command's key check fails — the protocol-native analog of
+    /// SCSI RESERVATION CONFLICT (0x18).
+    pub fn reservation_conflict() -> Self {
+        Self {
+            sct: StatusCodeType::CommandSpecific,
+            sc: 0x83,
+            dnr: true,
+            ..Self::SUCCESS
+        }
+    }
 }
 
 impl Default for StatusField {
@@ -230,5 +244,15 @@ mod tests {
         let w = s.to_u16();
         // SC 0x80 << 1 = 0x100; SCT 0; DNR bit 15.
         assert_eq!(w, 0x8100);
+    }
+
+    #[test]
+    fn reservation_conflict_packs_command_specific_0x83() {
+        let s = StatusField::reservation_conflict();
+        // SC 0x83 << 1 = 0x106; SCT 1 (CommandSpecific) << 9 = 0x200;
+        // DNR bit 15 = 0x8000.
+        assert_eq!(s.to_u16(), 0x8306);
+        assert_eq!(s.sct, StatusCodeType::CommandSpecific);
+        assert_eq!(s.sc, 0x83);
     }
 }

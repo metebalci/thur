@@ -111,6 +111,13 @@ pub struct IdentifyController {
     /// the NVMe/TCP transport rejects anything over this. Zero means
     /// "no limit" — never use that for a host-facing target.
     pub mdts: u8,
+    /// ONCS — Optional NVM Command Support (NVMe Base §5.17.2.1 bytes
+    /// 520..522). Bit 5 = Reservations supported, which is what makes
+    /// a host issue Reservation Register/Acquire/Release/Report. Other
+    /// implemented-but-currently-unadvertised optional commands
+    /// (Compare bit 0, Write Zeroes bit 3, Dataset Management bit 2)
+    /// stay zero here — out of scope for the reservations work.
+    pub oncs: u16,
 }
 
 /// Keep Alive Support advertised in Identify Controller (NVMe Base
@@ -168,6 +175,8 @@ impl IdentifyController {
             // NVMe/TCP transport's MAX_TRANSFER_BYTES ceiling. Keep the
             // two in lockstep.
             mdts: 8,
+            // ONCS bit 5 = Reservations supported. 0x0020.
+            oncs: 0x0020,
         })
     }
 
@@ -189,6 +198,9 @@ impl IdentifyController {
         out[78..80].copy_from_slice(&self.cntlid.to_le_bytes());
         out[80..84].copy_from_slice(&self.ver.to_le_bytes());
         // OAES, CTRATT etc all zero
+        // ONCS at 520..522 — bit 5 advertises Reservations support so
+        // hosts issue the reservation command set.
+        out[520..522].copy_from_slice(&self.oncs.to_le_bytes());
         // KAS at 320..322 — mandatory non-zero for NVMe-oF
         // controllers (Linux nvme-tcp logs "keep-alive support is
         // mandatory for fabrics" and aborts otherwise).
@@ -252,6 +264,15 @@ pub struct IdentifyNamespace {
     /// (`/dev/nvmeXn<NSID>`), so without NGUID the host's only
     /// stable reference would be the filesystem UUID.
     pub nguid: [u8; 16],
+    /// RESCAP — Reservation Capabilities (NVMe Base §5.17.2.2 byte
+    /// 31). Bit layout: bit0 PTPL, bit1 Write Exclusive, bit2
+    /// Exclusive Access, bit3 WrEx-Registrants-Only, bit4
+    /// ExAc-Registrants-Only, bit5 WrEx-All-Registrants, bit6
+    /// ExAc-All-Registrants, bit7 IEKEY-revision. We advertise all
+    /// six reservation types without PTPL (0x7E), mirroring the SCSI
+    /// REPORT CAPABILITIES `PTPL_C = 0`. Zero = host never attempts
+    /// reservation commands.
+    pub rescap: u8,
 }
 
 impl IdentifyNamespace {
@@ -281,6 +302,8 @@ impl IdentifyNamespace {
             flbas: 0,
             lbads,
             nguid,
+            // All six reservation types, no PTPL (bits 1..6).
+            rescap: 0x7E,
         })
     }
 
@@ -292,7 +315,9 @@ impl IdentifyNamespace {
         out[24] = self.nsfeat;
         out[25] = self.nlbaf;
         out[26] = self.flbas;
-        // MC, DPC, DPS, NMIC, RESCAP, FPI, DLFEAT — all zero
+        // 27=MC, 28=DPC, 29=DPS, 30=NMIC — all zero
+        out[31] = self.rescap; // RESCAP — reservation capabilities
+        // 32=FPI, 33=DLFEAT — zero
         // NGUID at 104..120 (16 bytes). Linux's nvme-tcp generates
         // `/dev/disk/by-id/nvme-<wwid>` from the first non-zero
         // entry in (NGUID, EUI-64); without it, the host falls back
@@ -394,6 +419,8 @@ mod tests {
         // MDTS at byte 77 — non-zero so the host bounds its transfers.
         // 8 → 2^8 * 4 KiB = 1 MiB.
         assert_eq!(bytes[77], 8);
+        // ONCS at 520..522 — bit 5 (Reservations) set.
+        assert_eq!(&bytes[520..522], &0x0020u16.to_le_bytes());
     }
 
     #[test]
@@ -447,6 +474,8 @@ mod tests {
         assert_eq!(&bytes[0..8], &1024u64.to_le_bytes());
         assert_eq!(bytes[130], 12);
         assert_eq!(&bytes[104..120], &nguid);
+        // RESCAP at byte 31 — all six types, no PTPL.
+        assert_eq!(bytes[31], 0x7E);
     }
 
     #[test]
