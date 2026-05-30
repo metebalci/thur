@@ -88,7 +88,6 @@ pub struct Drive {
     pub cartridge: Option<Cartridge>,
     pub locked_by_session: Option<u16>, // TSIH of locking session
     pub lock_time: Option<Instant>,
-    pub reservation: Option<Reservation>,
     /// Per-drive runtime state — emulated drive NVRAM. Holds SCSI
     /// MODE SELECT round-trip bodies (host SP=1 persisted) plus any
     /// future drive-side knob the host writes. Survives cartridge
@@ -122,20 +121,6 @@ impl PreventBits {
     pub fn is_zero(&self) -> bool {
         !self.data_transport && !self.mechanical
     }
-}
-
-/// Reservation - SCSI-2/3 style persistent reservation
-#[derive(Debug, Clone)]
-pub struct Reservation {
-    pub session_tsih: u16,
-    pub reservation_type: ReservationType,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReservationType {
-    Exclusive,
-    WriteExclusive,
-    ExclusiveRegistrantsOnly,
 }
 
 impl DriveManager {
@@ -180,7 +165,6 @@ impl DriveManager {
                     cartridge: None,
                     locked_by_session: None,
                     lock_time: None,
-                    reservation: None,
                     state,
                     prevent: HashMap::new(),
                 })),
