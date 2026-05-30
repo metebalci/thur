@@ -35,6 +35,7 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-crash-audit-append.sh` | BLAKE3-chained audit log stays valid under SIGKILL mid-append. |
 | `test-crash-page-flush.sh` | Fsynced data survives SIGKILL after the fence; un-fsynced data may not. |
 | `test-multi-initiator.sh` | iSCSI persistent reservations enforce exclusivity across two initiator IQNs. |
+| `test-nvmetcp-multi-initiator.sh` | NVMe/TCP reservations across two host NQNs: fencing, cross-host preempt + Reservation Notification (AER) delivery. |
 | `test-multi-volume-dedup.sh` | 20-volume fleet exercises shared-pool dedup stats + chunk-pool bookkeeping. |
 | `test-monte-carlo.sh` | Seeded random filesystem ops with boundary-biased sizes; transport-agnostic (`--transport iscsi\|nvmetcp`). |
 | `test-pipeline-layers.sh` | Matrix of `{dedup, encrypt, storage-zstd}` combinations — five-row layer comparison. |

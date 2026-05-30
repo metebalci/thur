@@ -217,6 +217,7 @@ full backup / filesystem round-trip.
 | `test-crash-audit-append.sh` | kill -9 mid audit-burst → restart → chain re-verifies |
 | `test-crash-page-flush.sh` | kill -9 after host fsync → restart → every byte survives |
 | `test-multi-initiator.sh` | two initiators + PR matrix, RESERVATION CONFLICT sense |
+| `test-nvmetcp-multi-initiator.sh` | two host NQNs: NVMe reservation fencing + cross-host preempt/notification (AER) |
 | `test-multi-volume-dedup.sh` | soak: create/list/stats/gc N volumes (THURVSA_SOAK=1) |
 | `test-keystore.sh` | DEK keystore wrap / unwrap / migrate per backend |
 | `test-keystore-kmip.sh` | `kmip` keystore backend against a local PyKMIP server |

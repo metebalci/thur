@@ -10,7 +10,8 @@
 # fencing test). Drives two distinct NVMe hosts — each its own
 # `--hostnqn` + `--hostid` — at the same thurvsa volume and exercises
 # the reservation matrix: host A registers + acquires Write Exclusive,
-# host B registers, and host B is fenced.
+# host B registers, host B is fenced, then host B preempts host A and
+# host A learns of it through the Reservation Notification log.
 #
 # What's asserted:
 #   1. Two distinct host identities can each Connect.
@@ -21,6 +22,17 @@
 #      devices) or its conflicting Reservation Acquire returns
 #      Reservation Conflict (when the kernel coalesces the two
 #      controllers under one NGUID — see the note below).
+#   5. (two-device topology only) Host B preempts host A's reservation
+#      (resv-acquire --racqa=1 --prkey=<A's key>) and host A reads a
+#      populated Reservation Preempted (type 3) entry from its
+#      per-controller Reservation Notification log -- the AER /
+#      notification-delivery path end-to-end through the real kernel.
+#      Skipped gracefully when nvme-cli lacks `resv-notif-log`, and noted
+#      (not run) when the kernel coalesces host B into a passive multipath
+#      path with no independent namespace-I/O handle. The in-process
+#      counterpart is the unit test
+#      nvme_nvm::dispatcher::tests::nvme_preempt_emits_reservation_notification
+#      (commit 6045330).
 #
 # Why two modes: a thurvsa volume has one stable NGUID, so a single
 # host's kernel treats two controllers to it as two paths to one
@@ -36,6 +48,9 @@
 # Prerequisites:
 #   - nvme-cli, nvme_tcp kernel module, thurvsad + thurvsa
 #   - sudo (self-elevates via 'exec sudo "$0" "$@"')
+#   - nvme-cli's `resv-notif-log` is needed only for the AER /
+#     notification check (assertion 5); it is skipped gracefully on
+#     older nvme-cli builds that lack the subcommand.
 #
 # Usage (invoke from repo root):
 #   ./vsa/scripts/test-nvmetcp-multi-initiator.sh [OPTIONS]
@@ -86,8 +101,10 @@ done
 
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; PASS_COUNT=$((PASS_COUNT+1)); }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; FAIL_COUNT=$((FAIL_COUNT+1)); }
+log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; SKIP_COUNT=$((SKIP_COUNT+1)); }
 
 cleanup() {
     if nvme list-subsys 2>/dev/null | grep -q "$SUBNQN"; then
@@ -204,6 +221,24 @@ connect_host() {
     comm -13 <(echo "$before") <(echo "$after") | head -1
 }
 
+# nvme-cli's `resv-notif-log` is the host-visible surface of NVMe
+# reservation-notification AER delivery: the kernel rings on the AER and
+# the log page carries the event. Older nvme-cli builds lack the
+# subcommand entirely — gate assertion 5 on its presence.
+nvme_has_resv_notif_log() {
+    nvme help 2>&1 | grep -q 'resv-notif-log'
+}
+
+# Byte 8 of the 64-byte LID 0x80 log page is the Reservation Notification
+# Log Page Type (0 empty / 1 reg-preempted / 2 released / 3
+# reservation-preempted) — the same field the unit test inspects as
+# data_in[8]. The binary form is version-stable; the decoded text labels
+# are not. Reading the log drains it daemon-side (consumed on read).
+resv_notif_type() {
+    nvme resv-notif-log "$1" -o binary 2>/dev/null \
+        | dd bs=1 skip=8 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'
+}
+
 # Full mode: two independent namespace devices → block-I/O fencing.
 test_block_fencing() {
     local dev_a="$1" dev_b="$2"
@@ -251,6 +286,66 @@ test_block_fencing() {
     else
         log_fail "Reservation Report missing a key"; cat "$TEST_DIR/report.log"
     fi
+
+    # --- Assertion 5: cross-host preempt -> Reservation Notification ---
+    # State here: host A holds Write Exclusive, host B is a registrant.
+    # Host B preempts host A; host A must learn of it by reading a
+    # populated Reservation Preempted (type 3) entry from its
+    # per-controller notification log. This drives the AER /
+    # notification-delivery path end-to-end through the real kernel.
+    if ! nvme_has_resv_notif_log; then
+        log_skip "nvme-cli lacks resv-notif-log; skipping AER/notification check"
+        return
+    fi
+
+    # Drain any stale entry on A so the preempt is the only event we see.
+    resv_notif_type "$dev_a" >/dev/null
+
+    if nvme resv-acquire "$dev_b" --crkey="$KEY_B" --prkey="$KEY_A" \
+        --rtype=1 --racqa=1 >>"$TEST_DIR/b.log" 2>&1; then
+        log_pass "host B preempted host A's reservation"
+    else
+        log_fail "host B preempt failed"; cat "$TEST_DIR/b.log"; return
+    fi
+
+    # Host A reads its notification log; expect Reservation Preempted (3).
+    # The daemon arms the entry at preempt time and rings the AER; retry a
+    # few times to absorb AER/log propagation latency.
+    local ntype=""
+    for _ in $(seq 1 10); do
+        ntype=$(resv_notif_type "$dev_a")
+        [[ "$ntype" == "3" ]] && break
+        sleep 0.3
+    done
+    if [[ "$ntype" == "3" ]]; then
+        log_pass "host A read Reservation Preempted (type 3) from notif log"
+    else
+        log_fail "host A notif-log type was '$ntype', expected 3 (Reservation Preempted)"
+    fi
+
+    # The entry is consumed on read -> the next read is the empty page.
+    if [[ "$(resv_notif_type "$dev_a")" == "0" ]]; then
+        log_pass "notification log drained to empty after consume"
+    else
+        log_fail "notification log not drained after read"
+    fi
+
+    # The issuer (host B) is never notified of its own action.
+    if [[ "$(resv_notif_type "$dev_b")" == "0" ]]; then
+        log_pass "issuer host B was not notified"
+    else
+        log_fail "issuer host B unexpectedly has a notification"
+    fi
+
+    # Host B is now the holder; host A's registration was removed by the
+    # preempt.
+    nvme resv-report "$dev_a" --numd=256 >"$TEST_DIR/report-preempt.log" 2>&1
+    if grep -qi "b2b2" "$TEST_DIR/report-preempt.log" \
+        && ! grep -qi "a1a1" "$TEST_DIR/report-preempt.log"; then
+        log_pass "Reservation Report shows host B as holder, host A preempted"
+    else
+        log_fail "Reservation Report after preempt unexpected"; cat "$TEST_DIR/report-preempt.log"
+    fi
 }
 
 # Coalesced mode: one shared namespace device. Prove the conflict
@@ -279,6 +374,24 @@ test_conflict_status() {
     nvme resv-release "$dev" --crkey="$KEY_A" --rtype=1 --rrela=0 >/dev/null 2>&1 \
         && log_pass "Reservation Release accepted" \
         || log_fail "Reservation Release failed"
+
+    # --- Assertion 5 (coalesced topology) ---
+    # A true cross-host preempt notification can't be driven here: the
+    # kernel made host B a passive multipath path with no independent
+    # namespace-I/O handle (no second block device and no per-path
+    # /dev/ngXn1), so only one initiator identity can issue reservation
+    # I/O. The populated type-3 assertion runs in the two-device mode; the
+    # daemon-side derivation is pinned by the unit test
+    # nvme_preempt_emits_reservation_notification. We still exercise the
+    # notification-log *read* path end-to-end through the real kernel.
+    if ! nvme_has_resv_notif_log; then
+        log_skip "nvme-cli lacks resv-notif-log; skipping notification-log read"
+    elif [[ "$(resv_notif_type "$dev")" == "0" ]]; then
+        log_pass "Reservation Notification log read returns a well-formed empty page"
+        log_skip "coalesced topology: cross-host preempt notification needs independent devices"
+    else
+        log_fail "Reservation Notification log read returned an unexpected type"
+    fi
 }
 
 main() {
@@ -310,7 +423,7 @@ main() {
 
     echo
     echo "===================="
-    echo " Results: $PASS_COUNT passed / $FAIL_COUNT failed"
+    echo " Results: $PASS_COUNT passed / $FAIL_COUNT failed / $SKIP_COUNT skipped"
     echo "===================="
     if (( FAIL_COUNT > 0 )); then
         echo "Daemon log:"; tail -40 "$TEST_DIR/daemon.log"
