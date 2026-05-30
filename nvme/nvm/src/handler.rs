@@ -33,10 +33,11 @@ pub struct AdminCommand<'a> {
     /// entry). Resolved at Fabrics Connect from
     /// `nvmetcp-psks.json::PskEntry.volumes`.
     pub session_volumes: Option<&'a [String]>,
-    /// 128-bit Host Identifier from the Fabrics Connect data. Names
-    /// the reservation registrant (one HOSTID spans the host's many
-    /// connections). `None` only outside a real connection (tests).
-    pub host_id: Option<[u8; 16]>,
+    /// CNTLID of the controller this admin queue drives, assigned at
+    /// Fabrics Connect. Keys the per-controller AER state (Identify
+    /// Controller, FID 0x82 mask, LID 0x80 log). `None` only outside a
+    /// real connection (tests).
+    pub cntlid: Option<u16>,
 }
 
 /// I/O command coming in on a non-zero queue (qid > 0). Same shape
@@ -49,7 +50,9 @@ pub struct IoCommand<'a> {
     pub data_in_max: u32,
     /// See `AdminCommand::session_volumes`.
     pub session_volumes: Option<&'a [String]>,
-    /// See `AdminCommand::host_id`.
+    /// 128-bit Host Identifier from the Fabrics Connect data. Names the
+    /// reservation registrant (one HOSTID spans the host's many
+    /// connections). `None` only outside a real connection (tests).
     pub host_id: Option<[u8; 16]>,
 }
 

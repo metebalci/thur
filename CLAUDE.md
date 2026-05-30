@@ -223,8 +223,9 @@ on-disk paths group by purpose.
   (Number of Queues, Reservation Notification Mask FID 0x82), Get
   Log Page (Error / SMART / FW Slot / Reservation Notification LID
   0x80), Abort. Reservation notifications are derived by diffing the
-  shared `ReservationManager` and delivered through the per-controller
-  `AerHub` (shared with the transport, which parks the AERs).
+  shared `ReservationManager` and fanned out per-controller through the
+  shared `ControllerRegistry` (the per-subsystem CNTLID allocator +
+  controller table + AER hub the transport also uses).
   `NvmeNvmDispatcher` impls `NvmeCommandHandler`; the
   daemon plugs `VolumeRegistry` in via the `NamespaceLookup` trait
   (mirror of `scsi-sbc::VolumeLookup`). Reaches into
@@ -238,7 +239,8 @@ on-disk paths group by purpose.
   R2T tail stitching), fused Compare+Write pair tracking, C2HData
   SUCCESS-bit folding, C2HTermReq on protocol violations, reservation
   notifications via AER (Admin 0x0C) + LID 0x80 parked on a shared
-  `nvme_nvm::AerHub`. Selected via `transport: nvmetcp` in
+  `nvme_nvm::ControllerRegistry` (which also allocates a CNTLID per
+  controller at Connect). Selected via `transport: nvmetcp` in
   `thurvsa.yaml` (default `iscsi`). Out of scope: TLS-PSK auth, CRC32C
   digests, multi-outstanding R2T, discovery controller — rationale in
   [`docs/NVMETCP.md`](docs/NVMETCP.md) § *Out of scope*.

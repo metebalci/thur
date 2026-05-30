@@ -193,7 +193,11 @@ impl IdentifyController {
         write_ascii_padded(&mut out[64..72], &self.fr, b' ');
         // RAB at 73 = 0 (no recommended arbitration burst hint)
         // IEEE OUI at 73..76 zero
-        // CMIC at 76 zero (no multi-path)
+        // CMIC at 76: bit 1 = "the NVM subsystem may contain two or more
+        // controllers". True since each Fabrics Connect mints a distinct
+        // CNTLID. Bit 0 (multi-port) and bit 3 (ANA) stay clear — single
+        // port, no asymmetric namespace access.
+        out[76] = 0b0000_0010;
         out[77] = self.mdts; // MDTS — max data transfer size
         out[78..80].copy_from_slice(&self.cntlid.to_le_bytes());
         out[80..84].copy_from_slice(&self.ver.to_le_bytes());
@@ -421,6 +425,9 @@ mod tests {
         assert_eq!(bytes[77], 8);
         // ONCS at 520..522 — bit 5 (Reservations) set.
         assert_eq!(&bytes[520..522], &0x0020u16.to_le_bytes());
+        // CMIC at byte 76 — bit 1 set (subsystem may contain 2+
+        // controllers), bits 0/3 clear.
+        assert_eq!(bytes[76], 0b0000_0010);
     }
 
     #[test]

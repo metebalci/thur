@@ -36,7 +36,7 @@ use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusF
 use scsi_spc::reservations::{RegistrantId, ReservationManager};
 
 use crate::NamespaceLookup;
-use crate::aer::AerHub;
+use crate::aer::ControllerRegistry;
 use crate::handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
 use crate::opcode::NvmOpcode;
 
@@ -108,11 +108,12 @@ pub struct NvmeNvmDispatcher {
     /// drops every registration (PTPL not advertised), so hosts
     /// re-register on reconnect.
     reservations: Arc<ReservationManager>,
-    /// Per-controller AER + reservation-notification state. Shared
-    /// (one `Arc`) with the NVMe/TCP transport so an event raised here
-    /// on a reservation op completes an AER parked on the host's admin
-    /// connection. Built once at boot alongside the dispatcher.
-    aer: Arc<AerHub>,
+    /// Per-subsystem controller registry + AER hub. Shared (one `Arc`)
+    /// with the NVMe/TCP transport: the transport allocates CNTLIDs at
+    /// Connect, and an event raised here on a reservation op completes
+    /// an AER parked on a controller's admin connection. Built once at
+    /// boot alongside the dispatcher.
+    aer: Arc<ControllerRegistry>,
 }
 
 impl NvmeNvmDispatcher {
@@ -126,7 +127,7 @@ impl NvmeNvmDispatcher {
         controller_sn: String,
         controller_mn: String,
         controller_fr: String,
-        aer: Arc<AerHub>,
+        aer: Arc<ControllerRegistry>,
     ) -> Self {
         Self {
             registry,
@@ -183,6 +184,7 @@ impl NvmeNvmDispatcher {
                     sqe.nsid,
                     sqe,
                     cmd.data_in_max,
+                    |host_id| self.aer.representative_cntlid(host_id),
                 );
             }
             NvmOpcode::ReservationAcquire => {
@@ -265,10 +267,13 @@ impl NvmeNvmDispatcher {
             return NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_opcode()));
         };
         match opcode {
-            AdminOpcode::Identify => self.cmd_identify(cid, sqe, cmd.session_volumes).await,
-            AdminOpcode::GetFeatures => self.cmd_get_features(cid, sqe, cmd.host_id),
-            AdminOpcode::SetFeatures => self.cmd_set_features(cid, sqe, cmd.host_id),
-            AdminOpcode::GetLogPage => self.cmd_get_log_page(cid, sqe, cmd.host_id),
+            AdminOpcode::Identify => {
+                self.cmd_identify(cid, sqe, cmd.session_volumes, cmd.cntlid)
+                    .await
+            }
+            AdminOpcode::GetFeatures => self.cmd_get_features(cid, sqe, cmd.cntlid),
+            AdminOpcode::SetFeatures => self.cmd_set_features(cid, sqe, cmd.cntlid),
+            AdminOpcode::GetLogPage => self.cmd_get_log_page(cid, sqe, cmd.cntlid),
             AdminOpcode::KeepAlive => {
                 // No-op — host pings us on the admin queue to confirm
                 // the controller is alive. We have nothing to update
@@ -280,7 +285,7 @@ impl NvmeNvmDispatcher {
                 // AER never completes synchronously — it parks until an
                 // event fires. The NVMe/TCP transport intercepts AER
                 // before this dispatch path (it owns the connection's
-                // writer and the per-controller `AerHub`), so a real
+                // writer and the per-subsystem `ControllerRegistry`), so a real
                 // host never reaches here. This arm only covers a
                 // non-transport caller (e.g. a unit test); there is no
                 // event to report on this synchronous path, so reflect
@@ -308,7 +313,7 @@ impl NvmeNvmDispatcher {
         &self,
         cid: u16,
         sqe: &nvme_base::Sqe,
-        host_id: Option<[u8; 16]>,
+        cntlid: Option<u16>,
     ) -> NvmeResponse {
         // CDW10[7:0] FID, [10:8] SEL (0=current, 1=default, 2=saved,
         // 3=supported). We treat all SELs as "current" for now —
@@ -327,10 +332,11 @@ impl NvmeNvmDispatcher {
                 NvmeResponse::just(Cqe::success(cid, 0, 0, kato))
             }
             FID_RESERVATION_NOTIF_MASK => {
-                // Per-namespace mask (CDW1 NSID). Outside a real
-                // connection (no HOSTID) report all-enabled.
-                let host = host_id.unwrap_or([0u8; 16]);
-                let mask = self.aer.get_mask(host, sqe.nsid);
+                // Per-controller, per-namespace mask (CDW1 NSID).
+                // Outside a real connection (no CNTLID) report
+                // all-enabled.
+                let cntlid = cntlid.unwrap_or(0);
+                let mask = self.aer.get_mask(cntlid, sqe.nsid);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, mask))
             }
             _ => NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field())),
@@ -341,7 +347,7 @@ impl NvmeNvmDispatcher {
         &self,
         cid: u16,
         sqe: &nvme_base::Sqe,
-        host_id: Option<[u8; 16]>,
+        cntlid: Option<u16>,
     ) -> NvmeResponse {
         let fid = (sqe.cdw10 & 0xFF) as u8;
         tracing::debug!(
@@ -351,13 +357,13 @@ impl NvmeNvmDispatcher {
         );
         match fid {
             FID_RESERVATION_NOTIF_MASK => {
-                // Per-namespace (CDW1 NSID). CDW11 bits 1/2/3 suppress
-                // the three reservation notification classes. Store
-                // keyed by (HOSTID, NSID) so one host's masking can't
-                // silence another's notifications. Echo the stored
-                // value in CDW0.
-                let host = host_id.unwrap_or([0u8; 16]);
-                self.aer.set_mask(host, sqe.nsid, sqe.cdw11);
+                // Per-controller, per-namespace (CDW1 NSID). CDW11 bits
+                // 1/2/3 suppress the three reservation notification
+                // classes. Store keyed by (CNTLID, NSID) so one
+                // controller's masking can't silence another's
+                // notifications. Echo the stored value in CDW0.
+                let cntlid = cntlid.unwrap_or(0);
+                self.aer.set_mask(cntlid, sqe.nsid, sqe.cdw11);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, sqe.cdw11))
             }
             FID_NUMBER_OF_QUEUES => {
@@ -394,7 +400,7 @@ impl NvmeNvmDispatcher {
         &self,
         cid: u16,
         sqe: &nvme_base::Sqe,
-        host_id: Option<[u8; 16]>,
+        cntlid: Option<u16>,
     ) -> NvmeResponse {
         // CDW10[7:0] LID, [15:8] LSP, [31:16] NUMDL (zero-based).
         // CDW11[15:0] NUMDU (zero-based). Total dwords = (NUMDL |
@@ -418,12 +424,12 @@ impl NvmeNvmDispatcher {
                 log[..total_bytes.min(log.len())].to_vec()
             }
             nvme_base::log_page::lid::RESERVATION_NOTIFICATION => {
-                // Pop the host's oldest reservation notification (or an
-                // all-zero empty page when the queue is drained).
-                // Outside a real connection (no HOSTID) there is no
-                // per-host queue — return the empty page.
-                let host = host_id.unwrap_or([0u8; 16]);
-                let log = self.aer.take_log_entry(host);
+                // Pop this controller's oldest reservation notification
+                // (or an all-zero empty page when the queue is
+                // drained). Outside a real connection (no CNTLID) there
+                // is no per-controller queue — return the empty page.
+                let cntlid = cntlid.unwrap_or(0);
+                let log = self.aer.take_log_entry(cntlid);
                 log[..total_bytes.min(log.len())].to_vec()
             }
             _ => {
@@ -438,6 +444,7 @@ impl NvmeNvmDispatcher {
         cid: u16,
         sqe: &nvme_base::Sqe,
         session_volumes: Option<&[String]>,
+        cntlid: Option<u16>,
     ) -> NvmeResponse {
         let raw_cns = (sqe.cdw10 & 0xFF) as u8;
         let Some(cns) = CNS::from_u8(raw_cns) else {
@@ -458,11 +465,14 @@ impl NvmeNvmDispatcher {
                 // very opaque "Identify Controller failed (6)". Log
                 // before returning so the next overflow is debuggable
                 // from the daemon log alone.
+                // Report the CNTLID assigned to this controller at
+                // Connect. Outside a real connection (tests) fall back
+                // to 1.
                 let ic = match IdentifyController::new(
                     self.controller_sn.clone(),
                     self.controller_mn.clone(),
                     self.controller_fr.clone(),
-                    1,
+                    cntlid.unwrap_or(1),
                     nn,
                     self.subnqn.clone(),
                 ) {
@@ -1026,7 +1036,7 @@ mod tests {
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
-            Arc::new(AerHub::new()),
+            Arc::new(ControllerRegistry::new()),
         );
         (tmp, disp)
     }
@@ -1115,11 +1125,26 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
         assert_eq!(resp.data_in.len(), 4096);
+    }
+
+    /// Identify Controller reports the CNTLID threaded in from the
+    /// transport (Connect-assigned), not a static 1.
+    #[tokio::test]
+    async fn identify_controller_reports_assigned_cntlid() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = AdminOpcode::Identify as u8;
+        b[40] = CNS::Controller as u8;
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let resp = admin_io(&disp, sqe, Some(7)).await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        // CNTLID at Identify Controller bytes 78..80.
+        assert_eq!(&resp.data_in[78..80], &7u16.to_le_bytes());
     }
 
     #[tokio::test]
@@ -1137,7 +1162,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1164,7 +1189,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1189,7 +1214,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1214,7 +1239,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1609,7 +1634,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1626,7 +1651,7 @@ mod tests {
                     data_out: None,
                     data_in_max: 4096,
                     session_volumes: None,
-                    host_id: None,
+                    cntlid: None,
                 })
                 .await;
             assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
@@ -1643,7 +1668,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 4096,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1658,7 +1683,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1673,7 +1698,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1684,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn admin_async_event_request_on_dispatch_path_is_invalid_opcode() {
         // The NVMe/TCP transport intercepts AER and parks it on the
-        // AerHub before this dispatch path runs, so a real host never
+        // ControllerRegistry before this dispatch path runs, so a real host never
         // reaches here. A non-transport caller (this test) hits the
         // synchronous fallback: there is no event to report inline, so
         // the dispatcher returns Invalid Opcode rather than blocking.
@@ -1695,7 +1720,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1710,7 +1735,7 @@ mod tests {
                 data_out: None,
                 data_in_max: 0,
                 session_volumes: None,
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1749,7 +1774,7 @@ mod tests {
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
-            Arc::new(AerHub::new()),
+            Arc::new(ControllerRegistry::new()),
         );
         (tmp, disp)
     }
@@ -1766,7 +1791,7 @@ mod tests {
                 data_out: None,
                 data_in_max: nvme_base::IDENTIFY_DATA_SIZE as u32,
                 session_volumes: Some(&allow),
-                host_id: None,
+                cntlid: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1853,6 +1878,9 @@ mod tests {
     async fn nvme_register_acquire_report_round_trip() {
         let (_tmp, disp) = fixture_dispatcher().await;
         let host = [0xA1u8; 16];
+        // Give the host a live controller so the Reservation Report can
+        // map its HOSTID to a real CNTLID (rather than the 0 sentinel).
+        let cntlid = controller_for(&disp, host);
 
         // Register key 0xCAFE (RREGA=Register, CRKEY=0, NRKEY=0xCAFE).
         let reg = sqe_resv(
@@ -1877,9 +1905,44 @@ mod tests {
         assert_eq!(r.data_in[4], 1, "RTYPE should be Write Exclusive");
         assert_eq!(&r.data_in[5..7], &1u16.to_le_bytes(), "one registrant");
         let entry = &r.data_in[wire::STATUS_HEADER_LEN..];
+        assert_eq!(
+            &entry[0..2],
+            &cntlid.to_le_bytes(),
+            "real CNTLID, not static 1"
+        );
         assert_eq!(entry[2], 1, "holder bit set");
         assert_eq!(&entry[5..13], &host[0..8], "HOSTID low 64");
         assert_eq!(&entry[13..21], &0xCAFEu64.to_le_bytes(), "RKEY");
+    }
+
+    /// A registrant whose host has no live controller (registered, then
+    /// its controller torn down — or never connected through the
+    /// transport) is reported with CNTLID 0, the no-live-controller
+    /// sentinel, while its HOSTID is intact.
+    #[tokio::test]
+    async fn nvme_report_cntlid_zero_without_live_controller() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let host = [0xC3u8; 16];
+        // Register the host but give it no controller in the registry.
+        let reg = sqe_resv(
+            NvmOpcode::ReservationRegister,
+            wire::RREGA_REGISTER as u32,
+            0,
+        );
+        let r = resv_io(&disp, reg, Some(&keys16(0, 0xCAFE)), host).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+
+        let rep = sqe_resv(NvmOpcode::ReservationReport, 0x100, 0);
+        let r = resv_io(&disp, rep, None, host).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+        assert_eq!(&r.data_in[5..7], &1u16.to_le_bytes(), "one registrant");
+        let entry = &r.data_in[wire::STATUS_HEADER_LEN..];
+        assert_eq!(
+            &entry[0..2],
+            &0u16.to_le_bytes(),
+            "CNTLID 0 = no live controller"
+        );
+        assert_eq!(&entry[5..13], &host[0..8], "HOSTID still present");
     }
 
     /// Cross-host fencing: host A holds Write Exclusive; host B is
@@ -1946,16 +2009,26 @@ mod tests {
     async fn admin_io(
         disp: &NvmeNvmDispatcher,
         sqe: nvme_base::Sqe,
-        host_id: Option<[u8; 16]>,
+        cntlid: Option<u16>,
     ) -> NvmeResponse {
         disp.handle_admin(AdminCommand {
             sqe,
             data_out: None,
             data_in_max: 4096,
             session_volumes: None,
-            host_id,
+            cntlid,
         })
         .await
+    }
+
+    /// Register an admin controller for `host` in the dispatcher's
+    /// registry and return its CNTLID — the per-controller key the
+    /// admin AER commands (FID 0x82 / LID 0x80) are addressed by.
+    fn controller_for(disp: &NvmeNvmDispatcher, host: [u8; 16]) -> u16 {
+        disp.aer
+            .connect_admin(host)
+            .expect("cntlid available")
+            .cntlid()
     }
 
     /// Get Log Page LID 0x80 for NSID 1, sized for one 64-byte entry
@@ -2007,7 +2080,8 @@ mod tests {
     #[tokio::test]
     async fn nvme_reservation_notif_log_empty_when_idle() {
         let (_tmp, disp) = fixture_dispatcher().await;
-        let log = admin_io(&disp, sqe_get_resv_log(), Some([0xA1u8; 16])).await;
+        let ca = controller_for(&disp, [0xA1u8; 16]);
+        let log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(log.cqe.status, StatusField::SUCCESS);
         assert_eq!(log.data_in.len(), 64);
         assert!(
@@ -2023,6 +2097,10 @@ mod tests {
         let (_tmp, disp) = fixture_dispatcher().await;
         let a = [0xA1u8; 16];
         let b = [0xB2u8; 16];
+        // Each host has a live controller (its admin queue); the
+        // notification log is addressed per CNTLID.
+        let ca = controller_for(&disp, a);
+        let cb = controller_for(&disp, b);
         setup_preempt(&disp, a, b).await;
 
         let preempt = sqe_resv(
@@ -2034,7 +2112,7 @@ mod tests {
         assert_eq!(r.cqe.status, StatusField::SUCCESS);
 
         // A held the reservation and lost it → Reservation Preempted (3).
-        let log = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        let log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(log.cqe.status, StatusField::SUCCESS);
         assert_eq!(log.data_in[8], 3, "Reservation Preempted");
         assert_eq!(
@@ -2043,10 +2121,10 @@ mod tests {
             "nsid 1"
         );
         // Consumed on read → empty page next time.
-        let again = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        let again = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(again.data_in[8], 0, "drained after consume");
         // Issuer B was never notified.
-        let b_log = admin_io(&disp, sqe_get_resv_log(), Some(b)).await;
+        let b_log = admin_io(&disp, sqe_get_resv_log(), Some(cb)).await;
         assert_eq!(b_log.data_in[8], 0, "issuer not notified");
     }
 
@@ -2057,6 +2135,8 @@ mod tests {
         let (_tmp, disp) = fixture_dispatcher().await;
         let a = [0xA1u8; 16];
         let b = [0xB2u8; 16];
+        let ca = controller_for(&disp, a);
+        let cb = controller_for(&disp, b);
 
         // Set Features FID 0x82, NSID 1, mask Reservation Preempted (bit 3).
         let mut sb = vec![0u8; nvme_base::SQE_SIZE];
@@ -2065,18 +2145,18 @@ mod tests {
         sb[40..44].copy_from_slice(&u32::from(FID_RESERVATION_NOTIF_MASK).to_le_bytes());
         sb[44..48].copy_from_slice(&(1u32 << 3).to_le_bytes());
         let set = nvme_base::Sqe::parse(&sb).unwrap();
-        let r = admin_io(&disp, set, Some(a)).await;
+        let r = admin_io(&disp, set, Some(ca)).await;
         assert_eq!(r.cqe.status, StatusField::SUCCESS);
         assert_eq!(r.cqe.dw0, 1 << 3, "Set echoes the stored mask");
 
         // Get Features FID 0x82 reflects the stored mask.
         let get_fid = u32::from(FID_RESERVATION_NOTIF_MASK);
         let get_a = sqe_admin(AdminOpcode::GetFeatures as u8, 1, get_fid);
-        assert_eq!(admin_io(&disp, get_a, Some(a)).await.cqe.dw0, 1 << 3);
+        assert_eq!(admin_io(&disp, get_a, Some(ca)).await.cqe.dw0, 1 << 3);
 
-        // A different host's mask is independent (defaults to 0).
+        // A different controller's mask is independent (defaults to 0).
         let get_b = sqe_admin(AdminOpcode::GetFeatures as u8, 1, get_fid);
-        assert_eq!(admin_io(&disp, get_b, Some(b)).await.cqe.dw0, 0);
+        assert_eq!(admin_io(&disp, get_b, Some(cb)).await.cqe.dw0, 0);
 
         // Preempt A; the masked Reservation Preempted is not queued.
         setup_preempt(&disp, a, b).await;
@@ -2086,7 +2166,7 @@ mod tests {
             0,
         );
         resv_io(&disp, preempt, Some(&keys16(0xBBBB, 0xAAAA)), b).await;
-        let log = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        let log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(log.data_in[8], 0, "masked notification not queued");
     }
 }

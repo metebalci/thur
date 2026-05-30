@@ -69,7 +69,7 @@ are indistinguishable at the chunk level.
 | 0x09 | Dataset Management | 🟩 Partial | O | AD (Deallocate, CDW11 bit 2) only — each 16-byte range descriptor calls `PageCache::unmap_bytes(slba * lba_bytes, nlb * lba_bytes)`. Without AD, IDR / IDW hint passes return success as a no-op. |
 | 0x0C | Verify | 🟩 Yes | O | Routes to `PageCache::read_bytes` and discards the payload — surfaces medium errors without returning data. Sparse-hole pages succeed. |
 | 0x0D | Reservation Register | 🟩 Yes | O | RREGA Register / Unregister / Replace, with IEKEY. Backed by the shared `scsi_spc::reservations::ReservationManager` keyed by the 128-bit HOSTID from Fabrics Connect (`nvme_nvm::reservations`). CPTPL = "set PTPL" (0b11) rejected with `Invalid Field` — PTPL is not advertised (RESCAP bit 0 = 0), mirroring the SCSI side's APTPL reject. |
-| 0x0E | Reservation Report | 🟩 Yes | O | Reservation Status Data Structure from a snapshot of the shared state. EDS (CDW11 bit 0) selects the extended 64-byte-per-controller form (full 128-bit HOSTID) vs the 24-byte form (low 64 bits). One registered-controller entry per HOSTID; CNTLID is a static `1` for every connection (the fencing identity is the HOSTID, not the CNTLID). |
+| 0x0E | Reservation Report | 🟩 Yes | O | Reservation Status Data Structure from a snapshot of the shared state. EDS (CDW11 bit 0) selects the extended 64-byte-per-controller form (full 128-bit HOSTID) vs the 24-byte form (low 64 bits). One registered-controller entry per HOSTID; CNTLID is the registrant's representative live controller (its lowest CNTLID), or `0` if the host has a persisted registration but no live controller. The fencing identity remains the HOSTID, not the CNTLID. |
 | 0x11 | Reservation Acquire | 🟩 Yes | O | RACQA Acquire / Preempt / Preempt-and-Abort. RTYPE 1..6 maps to the six SCSI reservation types. Acquire from an unregistered host returns `Reservation Conflict`. Preempt and Preempt-and-Abort collapse (no task-manager hook), matching the SCSI side. |
 | 0x15 | Reservation Release | 🟩 Yes | O | RRELA Release / Clear. A non-holder's data-path command (Read / Compare / Verify gated by `allow_read`; Write / Write Zeroes / DSM-deallocate / fused Compare+Write by `allow_write`) is rejected with `Reservation Conflict` (SCT=Command-Specific, SC=0x83). Flush is deliberately **not** gated (the NVM Command Set does not restrict it). |
 | — | Fused Compare + Write (0x05 FUSE=01 → 0x01 FUSE=10) | 🟩 Yes | O | Both halves accumulated by the transport (`nvme-tcp::server`), atomic compare-and-swap via `NvmeCommandHandler::handle_fused_compare_write` → `PageCache::compare_and_write_bytes`. Two CQEs per NVMe Base §4.2.6. Mismatch returns `Compare Failure` on the Compare CQE + `Aborted due to failed fused` (SC=0x0A) on the Write CQE. Sub-LBA CAW (single-sector VMFS heartbeat) honored end-to-end. |
@@ -118,7 +118,7 @@ rather than via these commands, so a host that submits them receives
 | CNS | Name | Status | Notes |
 |----:|------|--------|-------|
 | 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; RESCAP (byte 31) = `0x7E` (all six reservation types, PTPL bit 0 clear); VWC bit 0 set (so Linux issues Flush). |
-| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID=1, VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
+| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID = the per-controller ID assigned at Connect (distinct per association), CMIC (byte 76) bit 1 set (subsystem may contain two or more controllers; bits 0/3 clear — single port, no ANA), VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
 | 0x02 | Active Namespace ID List | 🟩 Yes | Up to 1024 u32 NSIDs greater than `SQE.NSID`, zero-padded. |
 | 0x03 | Namespace ID Descriptor List | 🟩 Yes | Two descriptors: NIDT=0x02 NGUID (from volume UUID), then NIDT=0x04 CSI=0x00 (NVM). Linux nvme-tcp issues this right after CNS 0x00 and silently fails namespace attach without a CSI descriptor. |
 | 0x06 | I/O Command Set specific Identify Controller | 🟩 Yes | 4 KiB of zeros = "no specific NVM limits." Linux nvme-tcp issues this against a 1.4-versioned controller during bring-up; refusing it kills the namespace attach. |
@@ -159,7 +159,7 @@ above it.
 | FCTYPE | Name | Status | Spec | Notes |
 |-------:|------|--------|:----:|-------|
 | 0x00 | Property Set | 🟩 Yes | M | Writes the shared `ControllerRegs`; INTMS / INTMC / NSSR / AQA / ASQ / ACQ accepted as no-op. |
-| 0x01 | Connect | 🟩 Yes | M | First CapsuleCmd on every TCP connection must be Connect. 1024-byte in-capsule `ConnectData` carries HOSTID + requested CNTLID + SUBNQN + HOSTNQN. SUBNQN mismatch returns `Connect Invalid Parameters` (SCT=CommandSpecific, SC=0x82, DNR=1). On success: assign CNTLID=1, capture QID from CDW10[31:16], emit success CapsuleResp. A second Connect on an established queue is refused. |
+| 0x01 | Connect | 🟩 Yes | M | First CapsuleCmd on every TCP connection must be Connect. 1024-byte in-capsule `ConnectData` carries HOSTID + requested CNTLID + SUBNQN + HOSTNQN. SUBNQN mismatch returns `Connect Invalid Parameters` (SCT=CommandSpecific, SC=0x82, DNR=1). QID from CDW10[31:16] selects the queue type: QID=0 (admin) creates a controller and is assigned a fresh CNTLID; QID>0 (I/O) attaches to the controller named in `ConnectData` CNTLID, refused with `Connect Invalid Parameters` if that CNTLID has no live controller or belongs to another HOSTID. The assigned CNTLID is echoed in the success CapsuleResp DW0. A second Connect on an established queue is refused. |
 | 0x04 | Property Get | 🟩 Yes | M | Reads the shared `ControllerRegs`. |
 | 0x05 | Authentication Send | 🟨 No | CC | DH-HMAC-CHAP not implemented — see *Deliberate non-conformance*. Returns `Invalid Field in Command`. |
 | 0x06 | Authentication Receive | 🟨 No | CC | As above. |
@@ -370,8 +370,9 @@ management-plane catalog, not a host-side discovery surface.
 
 Async Event Request (Admin 0x0C) is the NVMe analog of SCSI Unit
 Attention: AER commands sit pending on the admin queue until the
-controller has news. VSA parks each AER on a per-controller hub
-(`nvme_nvm::AerHub`, shared with the transport) and completes one when
+controller has news. VSA parks each AER on the per-subsystem controller
+registry (`nvme_nvm::ControllerRegistry`, shared with the transport,
+keyed per CNTLID) and completes one when
 an event fires, with DW0 = `0x00800006` (AET=0x6 I/O Command Set
 specific, AEI=0x00 Reservation Log Page Available, LID=0x80) telling
 the host to read the Reservation Notification log. Parking lives in the
@@ -406,17 +407,25 @@ before and after each mutating op and derives the affected hosts:
   reservation in one Preempt gets type 3 only.
 
 The issuing host is never notified (it learns the result from its own
-command completion). Each event appends a 64-byte entry to the host's
-LID 0x80 queue (Log Page Count, type, NSID, and the count of further
-unread entries) and completes one parked AER. `nvme resv-notif-log`
-reads the oldest entry per call until the queue drains to an all-zero
-empty page. A host can suppress any class via Set Features FID 0x82
-(Reservation Notification Mask), stored per (HOSTID, NSID).
+command completion). A reservation event fans out to every live
+controller of the affected host: each appends a 64-byte entry to *that
+controller's* LID 0x80 queue (Log Page Count, type, NSID, and the count
+of further unread entries) and completes one parked AER. `nvme
+resv-notif-log` reads the oldest entry per call until the queue drains
+to an all-zero empty page. A controller can suppress any class via Set
+Features FID 0x82 (Reservation Notification Mask), stored per (CNTLID,
+NSID).
 
-Routing is keyed by the 128-bit Connect HOSTID — the same key the
-reservation manager uses. With CNTLID statically 1 today, that is also
-the controller identity; per-controller CNTLID allocation would refine
-the routing seam (`ConnToken` already carries a `cntlid`).
+Routing is per-controller (keyed by CNTLID); the reservation state
+itself is keyed by the 128-bit Connect HOSTID. A controller's
+notification log + FID 0x82 masks are freed when the controller's last
+association drops, while the host's reservation registration persists
+(HOSTID-keyed) — a host that reconnects gets a fresh controller and
+learns the current state via Reservation Report, not stale
+notifications. One deliberate simplification: a host's *own* other
+controllers are not notified of its commands (the issuer is excluded at
+the host level, not the controller level) — a rare case for a
+single-host-multi-controller setup releasing its own reservation.
 
 ### Is DH-HMAC-CHAP used in practice?
 

@@ -111,8 +111,14 @@ closes the connection with a C2HTermReq carrying a Fatal Error Status:
    `ConnectData` carrying HOSTID / requested CNTLID / SUBNQN / HOSTNQN.
    A SUBNQN mismatch causes a CapsuleResp with `connect_invalid_parameters`
    (SCT=CommandSpecific, SC=0x82, DNR=1) followed by close. On a match,
-   the server assigns CNTLID=1, captures QID from CDW10[31:16], and emits
-   a success CapsuleResp.
+   the server binds the connection to a controller: QID=0 (admin queue,
+   from CDW10[31:16]) creates a controller in the shared
+   `ControllerRegistry` and is assigned a fresh CNTLID; QID>0 (I/O queue)
+   attaches to the controller named in `ConnectData` CNTLID (the value
+   the host got from its admin Connect), refused with
+   `connect_invalid_parameters` if that CNTLID is unknown or owned by
+   another HOSTID. The assigned CNTLID is echoed in the success
+   CapsuleResp DW0[15:0].
 3. **Steady state — command loop.** Every subsequent CapsuleCmd is
    routed by opcode class:
      - **Admin Fabrics (OPC=0x7F):** intercepted at the transport —
@@ -245,31 +251,35 @@ another host's Preempt / Release / Clear learns via an async event
 instead of only reactively via `Reservation Conflict` (0x83) on its
 next command. The pieces:
 
-- **`nvme_nvm::AerHub`** — a per-controller hub constructed once at boot
-  and shared (one `Arc`) between the dispatcher and the transport, the
-  same way `ControllerRegs` is shared. Keyed by the 128-bit Connect
-  HOSTID. Holds, per host: parked AER completion senders (per-
-  connection), the unread LID 0x80 queue (per-host, survives reconnect),
-  and the FID 0x82 masks (per-host).
+- **`nvme_nvm::ControllerRegistry`** — the per-subsystem controller
+  registry + AER hub, constructed once at boot and shared (one `Arc`)
+  between the dispatcher and the transport, the same way `ControllerRegs`
+  is shared. It allocates CNTLIDs at Connect and holds the per-controller
+  (keyed by CNTLID) runtime state: parked AER completion senders, the
+  unread LID 0x80 queue, and the FID 0x82 masks. The controller — and all
+  this state — is freed when its last association drops; the host's
+  reservation registration is separate (HOSTID-keyed, persists).
 - **Event source** — the reservation adapter
   (`nvme_nvm::reservations`) snapshots the shared `ReservationManager`
   before and after each Acquire(Preempt) / Release / Clear /
   self-unregister, and the pure `diff_reservation_events` helper derives
-  the affected `(host, type)` set (issuer excluded). The dispatcher
-  feeds those to `AerHub::notify`.
+  the affected `(host, type)` set (issuer host excluded). The dispatcher
+  feeds those to `ControllerRegistry::notify`, which fans each event out
+  to every live controller of the affected host.
 - **Parking** — the transport's `reader_task` intercepts AER on the
-  admin queue (qid 0), creates a `oneshot`, parks it on the hub, and
-  spawns a task that awaits the completion and emits the CQE on the
+  admin queue (qid 0), creates a `oneshot`, parks it on the controller,
+  and spawns a task that awaits the completion and emits the CQE on the
   connection's writer. AER bypasses `handle_command` because it never
-  completes synchronously. On connection teardown `drop_conn` releases
-  the parked senders.
-- **Delivery** — `notify` appends a LID 0x80 entry and completes one
-  parked AER (DW0 `0x00800006`). The host reads `nvme resv-notif-log`
-  (one entry per call, oldest-first) until the page is empty.
+  completes synchronously. On connection teardown `disconnect` releases
+  the parked senders and frees the controller once idle.
+- **Delivery** — `notify` appends a LID 0x80 entry to each target
+  controller and completes one of its parked AERs (DW0 `0x00800006`).
+  The host reads `nvme resv-notif-log` (one entry per call, oldest-first)
+  until the page is empty.
 
-CNTLID is statically 1 today, so host-keying is also controller-keying;
-`ConnToken` carries a `cntlid` placeholder for the per-controller
-allocation seam.
+Routing is per-controller (keyed by CNTLID); the reservation state stays
+HOSTID-keyed. A host with no live controller drops the event and learns
+the new state via Reservation Report on reconnect.
 
 ## NQN / discovery
 
@@ -459,8 +469,8 @@ notifications (see *Reservation notifications (AER + LID 0x80)* above). The
 Notice-type events (namespace-attribute behind FID 0x0B Async Event
 Configuration, firmware-activation) and thermal notices are not produced — VSA
 has no firmware mechanism or thermal sensors, and namespaces are bound at
-`volume create`. The generic AER plumbing (`AerHub`, the DW0 builder, the
-park/notify/oneshot path) is reusable when a namespace-change source lands; it
+`volume create`. The generic AER plumbing (`ControllerRegistry`, the DW0 builder,
+the park/notify/oneshot path) is reusable when a namespace-change source lands; it
 would add OACS bit 8 + a Changed Namespace List (LID 0x04), out of scope here.
 
 ### Discovery controller

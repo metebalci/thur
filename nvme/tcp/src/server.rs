@@ -12,9 +12,11 @@
 //!    the MVP server only handles in-capsule writes.
 //! 2. **Connect** (NVMe-oF §6.3.1). The first CapsuleCmd carries an
 //!    Admin Fabrics command with FCTYPE=0x01. We validate the
-//!    host's SUBNQN against our subsystem's NQN, assign CNTLID=1,
-//!    and capture QID from CDW10[31:16]. QID=0 means this
-//!    connection drives the admin queue; QID>0 means an I/O queue.
+//!    host's SUBNQN against our subsystem's NQN and capture QID from
+//!    CDW10[31:16]. QID=0 (admin queue) creates a controller and is
+//!    assigned a fresh CNTLID; QID>0 (I/O queue) attaches to the
+//!    controller named in Connect Data CNTLID. The assigned CNTLID is
+//!    echoed in the Connect Response DW0.
 //! 3. **Command loop**. Each subsequent CapsuleCmd routes through
 //!    [`NvmeCommandHandler::handle_admin`] or
 //!    [`NvmeCommandHandler::handle_io`] based on the captured QID.
@@ -43,7 +45,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use nvme_base::{
     AdminOpcode, ConnectData, ControllerRegs, Cqe, FabricsType, Fuse, Sqe, StatusField,
 };
-use nvme_nvm::{AdminCommand, AerHub, ConnToken, IoCommand, NvmeCommandHandler};
+use nvme_nvm::{AdminCommand, ConnToken, ControllerRegistry, IoCommand, NvmeCommandHandler};
 
 use crate::pdu;
 use crate::tls::{NvmePskAcceptor, parse_psk_identity};
@@ -58,13 +60,13 @@ pub struct ServerConfig {
     /// at boot and hands the same Arc to every transport it spins
     /// up. Tests can inject a fresh one per server.
     pub controller_regs: Arc<ControllerRegs>,
-    /// Per-controller AER + reservation-notification hub, shared (one
-    /// `Arc`) with the [`NvmeNvmDispatcher`] handler. The handler
-    /// *produces* events (a reservation op on an I/O queue); the
-    /// transport *consumes* them (parks AERs on admin queues and
-    /// delivers completions). Same construct-once-at-boot pattern as
+    /// Per-subsystem controller registry + AER hub, shared (one `Arc`)
+    /// with the [`NvmeNvmDispatcher`] handler. The transport allocates
+    /// CNTLIDs at Fabrics Connect and parks/delivers AERs; the handler
+    /// *produces* reservation events (a reservation op on an I/O queue)
+    /// the transport *consumes*. Same construct-once-at-boot pattern as
     /// `controller_regs`.
-    pub aer: Arc<AerHub>,
+    pub aer: Arc<ControllerRegistry>,
     /// Optional TLS 1.3 PSK acceptor (NVMe-TCP §3.6.1.5). When set,
     /// every accepted TCP connection is wrapped in TLS before the
     /// NVMe ICReq/Connect handshake runs. Built by
@@ -108,7 +110,7 @@ pub async fn accept_loop(
     listener: TcpListener,
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
-    aer: Arc<AerHub>,
+    aer: Arc<ControllerRegistry>,
     tls: Option<Arc<NvmePskAcceptor>>,
     psks_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
@@ -309,7 +311,7 @@ async fn serve_connection<S>(
     peer: std::net::SocketAddr,
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
-    aer: Arc<AerHub>,
+    aer: Arc<ControllerRegistry>,
     tls_host_nqn: Option<String>,
     psks_path: Option<std::path::PathBuf>,
 ) -> Result<()>
@@ -419,11 +421,48 @@ where
         stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
         anyhow::bail!("HostNQN TLS/Connect mismatch");
     }
-    let cntlid: u16 = 1;
+    // Bind this connection to a controller. An admin-queue Connect
+    // (QID 0) creates a new controller and is assigned a fresh CNTLID;
+    // an I/O-queue Connect (QID > 0) attaches to the controller the
+    // host names in Connect Data CNTLID (the value it received from its
+    // admin Connect). An unknown / mismatched CNTLID on an I/O Connect
+    // is refused with Connect Invalid Parameters.
+    let conn_token = if qid == 0 {
+        aer.connect_admin(connect_data.hostid)
+    } else {
+        aer.connect_io(connect_data.hostid, connect_data.requested_cntlid)
+    };
+    let conn_token = match conn_token {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                peer = %peer,
+                qid,
+                requested_cntlid = connect_data.requested_cntlid,
+                error = %e,
+                "nvme-tcp: Connect controller binding refused",
+            );
+            let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
+            stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+            anyhow::bail!("Connect controller binding refused: {e}");
+        }
+    };
+    let cntlid = conn_token.cntlid();
     let dw0 = nvme_base::fabrics::connect_response_dw0(cntlid, false);
     let cqe = Cqe::success(sqe.cid, qid, 0, dw0);
-    stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
-    stream.flush().await?;
+    // The controller is now bound but we have not yet reached the State 3
+    // teardown that calls `disconnect`. If writing the Connect Response
+    // fails (host gone), release the binding before bailing — otherwise
+    // the controller's CNTLID + association leak in the registry with no
+    // teardown path to reclaim them.
+    if let Err(e) = stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await {
+        aer.disconnect(conn_token);
+        return Err(e.into());
+    }
+    if let Err(e) = stream.flush().await {
+        aer.disconnect(conn_token);
+        return Err(e.into());
+    }
 
     // Per-hostnqn admission set. Loaded fresh post-Connect so
     // operator edits to `nvmetcp-psks.json` take effect on the next
@@ -481,10 +520,10 @@ where
     // down the moment a second CapsuleCmd arrives during the first
     // command's R2T fulfillment.
     let _ = host_maxr2t;
-    // Per-connection AER token (the controller association this
-    // connection drives). Parked AERs on it are released at teardown
-    // via `drop_conn`; the host's notification log + masks survive.
-    let conn_token = aer.register_conn(connect_data.hostid);
+    // `conn_token` (minted above by connect_admin / connect_io) names
+    // the controller association this connection drives. Parked AERs on
+    // it are released at teardown via `disconnect`, which also frees the
+    // controller once its last association drops.
     let (read_half, write_half) = tokio::io::split(stream);
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundPdu>(OUTBOUND_CAPACITY);
     let commands: CommandTable = Arc::new(Mutex::new(HashMap::new()));
@@ -541,10 +580,12 @@ where
     // explicit Reservation Release / Register-unregister / Preempt, or
     // a daemon restart.
     commands.lock().await.clear();
-    // Release this connection's parked AERs — their oneshot senders
-    // drop, unblocking the delivery tasks. The host's notification log
-    // + FID 0x82 masks are per-host controller state and survive.
-    aer.drop_conn(conn_token);
+    // Surrender this connection's controller association: its parked
+    // AERs are released (oneshot senders drop, unblocking the delivery
+    // tasks) and, once the controller's last association drops, its
+    // CNTLID + notification log + FID 0x82 masks are freed. The host's
+    // reservation registration is HOSTID-keyed and survives (see #54).
+    aer.disconnect(conn_token);
     Ok(())
 }
 
@@ -559,7 +600,7 @@ async fn reader_task<R>(
     peer: std::net::SocketAddr,
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
-    aer: Arc<AerHub>,
+    aer: Arc<ControllerRegistry>,
     conn_token: ConnToken,
     commands: CommandTable,
     outbound: mpsc::Sender<OutboundPdu>,
@@ -572,6 +613,10 @@ async fn reader_task<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    // CNTLID of the controller this connection drives — threaded into
+    // every admin command so the per-controller AER state (Identify,
+    // FID 0x82 mask, LID 0x80 log) is keyed correctly.
+    let cntlid = conn_token.cntlid();
     let mut pending_fused: Option<(Sqe, Vec<u8>)> = None;
     loop {
         let raw = match pdu::RawPdu::read_async(&mut read).await {
@@ -705,11 +750,11 @@ where
                 // completes synchronously — it parks until a controller
                 // event fires — so it bypasses `handle_command` (which
                 // always emits exactly one CommandResponse). A delivery
-                // task awaits the AerHub oneshot and, on completion,
-                // emits the CQE on this connection's writer. Its DW0
-                // points the host at the reservation notification log
-                // (LID 0x80). On the Err path (sender dropped at
-                // teardown via `drop_conn`) it emits nothing — AER may
+                // task awaits the ControllerRegistry oneshot and, on
+                // completion, emits the CQE on this connection's writer.
+                // Its DW0 points the host at the reservation notification
+                // log (LID 0x80). On the Err path (sender dropped at
+                // teardown via `disconnect`) it emits nothing — AER may
                 // legally never complete.
                 if qid == 0
                     && AdminOpcode::from_u8(sqe.opcode) == Some(AdminOpcode::AsyncEventRequest)
@@ -927,6 +972,7 @@ where
                     peer,
                     admission_clone,
                     host_id,
+                    cntlid,
                 ));
             }
             other => {
@@ -1037,6 +1083,7 @@ async fn handle_command(
     peer: std::net::SocketAddr,
     admission_volumes: Option<Arc<Vec<String>>>,
     host_id: [u8; 16],
+    cntlid: u16,
 ) {
     let cccid = sqe.cid;
     let buf: Option<Vec<u8>> = if let Some(mut rx) = h2c_rx {
@@ -1158,7 +1205,7 @@ async fn handle_command(
                 data_out,
                 data_in_max: u32::MAX,
                 session_volumes: admission_slice,
-                host_id: Some(host_id),
+                cntlid: Some(cntlid),
             })
             .await
     } else {
@@ -1359,16 +1406,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
-        let aer = Arc::new(AerHub::new());
+        let aer = Arc::new(ControllerRegistry::new());
         tokio::spawn(async move {
             let _ = accept_loop(listener, h, regs, aer, None, None).await;
         });
         port
     }
 
-    /// Spawn a server sharing a caller-supplied `AerHub`, so the test
-    /// can raise events the same way the dispatcher would.
-    async fn spawn_server_with_aer(handler: Arc<StubHandler>, aer: Arc<AerHub>) -> u16 {
+    /// Spawn a server sharing a caller-supplied `ControllerRegistry`, so
+    /// the test can raise events the same way the dispatcher would.
+    async fn spawn_server_with_aer(handler: Arc<StubHandler>, aer: Arc<ControllerRegistry>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
@@ -1387,7 +1434,7 @@ mod tests {
     async fn async_event_request_completes_on_reservation_notice() {
         use nvme_nvm::{ReservationEvent, ReservationEventKind};
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
-        let aer = Arc::new(AerHub::new());
+        let aer = Arc::new(ControllerRegistry::new());
         let port = spawn_server_with_aer(Arc::clone(&handler), Arc::clone(&aer)).await;
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -1471,11 +1518,19 @@ mod tests {
     }
 
     /// Build a Connect CapsuleCmd, with our SUBNQN by default
-    /// (override `subnqn` to test the mismatch case). NVMe-oF
+    /// (override `subnqn` to test the mismatch case) and `CNTLID_ANY`
+    /// requested (the right value for an admin-queue Connect). NVMe-oF
     /// Fabrics SQEs put FCTYPE at byte 4 (overlapping NSID); QID
     /// lives at CDW10[31:16] with RECFMT in [15:0] (we always
     /// write 0).
     fn build_connect_pdu(subnqn: &str, qid: u16) -> Vec<u8> {
+        build_connect_pdu_cntlid(subnqn, qid, nvme_base::fabrics::CNTLID_ANY)
+    }
+
+    /// As [`build_connect_pdu`] but with an explicit requested CNTLID —
+    /// an I/O-queue Connect names the CNTLID it received from its admin
+    /// Connect.
+    fn build_connect_pdu_cntlid(subnqn: &str, qid: u16, requested_cntlid: u16) -> Vec<u8> {
         let mut sqe = [0u8; nvme_base::SQE_SIZE];
         sqe[0] = AdminOpcode::Fabrics as u8; // OPC
         // PSDT = SglInline (0b01) at CDW0[15:14].
@@ -1487,12 +1542,45 @@ mod tests {
         sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
         let cd = ConnectData {
             hostid: [0xA1; 16],
-            requested_cntlid: nvme_base::fabrics::CNTLID_ANY,
+            requested_cntlid,
             subnqn: subnqn.to_string(),
             hostnqn: "nqn.2014-08.org.nvmexpress:uuid:test-host".to_string(),
         };
         let data = cd.to_bytes().unwrap();
         build_capsule_cmd_pdu(sqe, &data)
+    }
+
+    /// Default SUBNQN the test server answers for.
+    const TEST_SUBNQN: &str = "nqn.2025-10.com.metebalci:thurvsa";
+
+    /// Establish an NVMe-oF controller against the test server: an admin
+    /// queue (QID 0, which mints the CNTLID) plus one attached I/O queue
+    /// (QID 1, naming that CNTLID). Returns `(admin_stream, io_stream)`;
+    /// the admin stream MUST be kept alive (the controller — and so the
+    /// I/O queue's CNTLID — is freed when its last association drops).
+    /// I/O-path tests run their commands on the returned `io_stream`.
+    async fn connect_io_queue(port: u16) -> (TcpStream, TcpStream) {
+        // Admin queue: creates the controller, returns its CNTLID in the
+        // Connect Response DW0[15:0].
+        let mut admin = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        admin.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut admin).await; // ICResp
+        admin
+            .write_all(&build_connect_pdu(TEST_SUBNQN, 0))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut admin).await; // Connect resp
+        let cntlid = u16::from_le_bytes([resp.body[0], resp.body[1]]);
+
+        // I/O queue: attaches to that controller by CNTLID.
+        let mut io = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        io.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut io).await; // ICResp
+        io.write_all(&build_connect_pdu_cntlid(TEST_SUBNQN, 1, cntlid))
+            .await
+            .unwrap();
+        let _ = read_pdu_async(&mut io).await; // Connect resp
+        (admin, io)
     }
 
     /// Build a Property Get fabrics command.
@@ -1603,6 +1691,57 @@ mod tests {
         assert_eq!(handler.admin_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A second admin-queue Connect (fresh connection) is assigned a
+    /// distinct CNTLID — `nvme list-ctrl` / multipath tooling no longer
+    /// see every controller as ID 1.
+    #[tokio::test]
+    async fn admin_connect_assigns_distinct_cntlids() {
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server(Arc::clone(&handler)).await;
+
+        let mut a = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        a.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut a).await;
+        a.write_all(&build_connect_pdu(TEST_SUBNQN, 0))
+            .await
+            .unwrap();
+        let ra = read_pdu_async(&mut a).await;
+        assert_eq!(u16::from_le_bytes([ra.body[0], ra.body[1]]), 1);
+
+        // `a` stays alive, so controller 1 is not freed before `b`
+        // connects — `b` gets the next CNTLID.
+        let mut b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        b.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut b).await;
+        b.write_all(&build_connect_pdu(TEST_SUBNQN, 0))
+            .await
+            .unwrap();
+        let rb = read_pdu_async(&mut b).await;
+        assert_eq!(u16::from_le_bytes([rb.body[0], rb.body[1]]), 2);
+    }
+
+    /// An I/O-queue Connect naming a CNTLID with no live controller is
+    /// refused with Connect Invalid Parameters — the host must
+    /// admin-Connect first to obtain a real CNTLID.
+    #[tokio::test]
+    async fn io_connect_unknown_cntlid_refused() {
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server(Arc::clone(&handler)).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // ICResp
+        // QID 1 naming CNTLID 7 — no controller has been created.
+        stream
+            .write_all(&build_connect_pdu_cntlid(TEST_SUBNQN, 1, 7))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut stream).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        let status = u16::from_le_bytes([resp.body[14], resp.body[15]]);
+        assert_eq!(status, StatusField::connect_invalid_parameters().to_u16());
+    }
+
     #[tokio::test]
     async fn subnqn_mismatch_returns_invalid_parameters() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
@@ -1701,14 +1840,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await; // ICResp
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await; // Connect resp
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // 1 KiB write split into two H2CData PDUs of 600 + 424 bytes.
         // Sizes are deliberately non-power-of-two and non-equal so the
@@ -1767,14 +1899,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await; // ICResp
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await; // Connect resp
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // A Write declaring a 4 GiB-1 transfer length. Pre-fix this
         // flowed into `vec![0u8; sgl_len]`. It must instead come back
@@ -1800,14 +1925,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // 2 KiB write: 800 bytes in capsule, 1248 via R2T.
         let total_len: u32 = 2048;
@@ -1861,14 +1979,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // Same 1 KiB payload, this time entirely in-capsule.
         let total_len: u32 = 1024;
@@ -1903,14 +2014,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         let total_len: u32 = 512;
         let cid: u16 = 0x55;
@@ -2078,15 +2182,7 @@ mod tests {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        // Connect on QID=1 (I/O queue).
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // Send an NVM Read; stub returns 4 bytes 0xAA.
         let mut sqe = [0u8; nvme_base::SQE_SIZE];
@@ -2137,14 +2233,7 @@ mod tests {
     async fn two_concurrent_writes_complete_independently() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         let total_len: u32 = 512;
         let cid_a: u16 = 0x00A1;
@@ -2221,14 +2310,7 @@ mod tests {
     async fn command_b_arrives_during_command_a_r2t() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         let total_len: u32 = 256;
         let cid_a: u16 = 0x00A1;
@@ -2289,14 +2371,7 @@ mod tests {
     async fn fused_with_unrelated_command_between_halves() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         // Fused-first Compare with 8 bytes of comparison data inline.
         let cmp_cid: u16 = 0x00CC;
@@ -2359,14 +2434,7 @@ mod tests {
     async fn graceful_shutdown_with_pending_commands() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         let total_len: u32 = 1024;
         let cid: u16 = 0x0042;
@@ -2402,14 +2470,7 @@ mod tests {
     async fn inflight_cap_returns_namespace_not_ready() {
         let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
         let port = spawn_server(Arc::clone(&handler)).await;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        stream.write_all(&build_icreq_pdu()).await.unwrap();
-        let _ = read_pdu_async(&mut stream).await;
-        stream
-            .write_all(&build_connect_pdu("nqn.2025-10.com.metebalci:thurvsa", 1))
-            .await
-            .unwrap();
-        let _ = read_pdu_async(&mut stream).await;
+        let (_admin, mut stream) = connect_io_queue(port).await;
 
         let total_cmds: u16 = (INFLIGHT_CAP as u16) + 1;
         // Avoid CID 0 just to make any failure log readable.

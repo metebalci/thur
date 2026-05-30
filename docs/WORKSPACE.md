@@ -355,9 +355,10 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   host MAXR2T), Connect with SUBNQN admission, Property Get/Set against
   shared `ControllerRegs`, Disconnect, command loop with R2T flow,
   fused Compare+Write pair tracking, C2HData SUCCESS-bit folding,
-  C2HTermReq on protocol violations, reservation notifications via AER
-  (Admin 0x0C) + LID 0x80 parked on a shared `nvme_nvm::AerHub`. Out of
-  scope: TLS-PSK auth, CRC32C digests, multi-outstanding R2T, discovery
+  C2HTermReq on protocol violations, per-controller CNTLID allocation at
+  Connect, reservation notifications via AER (Admin 0x0C) + LID 0x80
+  parked on a shared `nvme_nvm::ControllerRegistry`. Out of scope:
+  TLS-PSK auth, CRC32C digests, multi-outstanding R2T, discovery
   controller.
 
 ## core-stream

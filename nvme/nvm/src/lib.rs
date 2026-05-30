@@ -44,7 +44,10 @@ pub mod handler;
 pub mod opcode;
 pub mod reservations;
 
-pub use aer::{AerCompletion, AerHub, ConnToken, ReservationEvent, ReservationEventKind};
+pub use aer::{
+    AerCompletion, ConnToken, ConnectError, ControllerRegistry, ReservationEvent,
+    ReservationEventKind,
+};
 pub use dispatcher::NvmeNvmDispatcher;
 pub use handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
 pub use opcode::NvmOpcode;

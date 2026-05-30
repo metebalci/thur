@@ -562,11 +562,12 @@ async fn main() -> Result<()> {
             if let Err(e) = shared_naming::validate_nqn(&subnqn) {
                 anyhow::bail!("invalid nvmetcp.subnqn in {}: {e}", config_path.display());
             }
-            // Per-controller AER + reservation-notification hub. One
-            // instance shared between the dispatcher (event producer)
-            // and the NVMe/TCP transport (event consumer) — same
-            // construct-once-at-boot pattern as `controller_regs` below.
-            let aer_hub = Arc::new(nvme_nvm::AerHub::new());
+            // Per-subsystem controller registry + AER hub. One instance
+            // shared between the dispatcher (reservation-event producer)
+            // and the NVMe/TCP transport (CNTLID allocator + AER
+            // consumer) — same construct-once-at-boot pattern as
+            // `controller_regs` below.
+            let aer_hub = Arc::new(nvme_nvm::ControllerRegistry::new());
             let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
                 Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
                 subnqn.clone(),

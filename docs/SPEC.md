@@ -514,8 +514,10 @@ entry per registrant HOSTID. The short form (EDS = 0, 24 bytes each)
 carries CNTLID (0..2), RCSTS bit 0 = holds-reservation (2), the low 64
 bits of HOSTID (5..13), and RKEY (13..21). The extended form
 (EDS = 1, 64 bytes each) carries CNTLID (0..2), RCSTS (2), RKEY
-(5..13), and the full 128-bit HOSTID (13..29). CNTLID is a static `1`
-for every connection — the fencing identity is the HOSTID.
+(5..13), and the full 128-bit HOSTID (13..29). CNTLID is the
+registrant's representative live controller (its lowest assigned
+CNTLID), or `0` if the host has a persisted registration but no live
+controller — the fencing identity is the HOSTID.
 
 Enforcement gate: a non-holder's data-path command returns NVMe status
 **Reservation Conflict** (SCT = Command-Specific, SC = 0x83). The read

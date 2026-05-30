@@ -185,11 +185,19 @@ pub fn reservation_release(
 /// Reservation Report (0x0E) — builds the Reservation Status Data
 /// Structure from a snapshot of the shared state. EDS (CDW11[0])
 /// selects the extended 64-byte-per-controller form.
+///
+/// `cntlid_for_host` maps each registrant's HOSTID to a representative
+/// CNTLID (its lowest live controller, or 0 if the host has a persisted
+/// registration but no live controller — see #54). The registration is
+/// host-keyed (one entry per HOSTID, not per controller), so the report
+/// stays HOSTID-centric; only the CNTLID it reports is now faithful
+/// rather than a static 1.
 pub fn reservation_report(
     mgr: &ReservationManager,
     nsid: u32,
     sqe: &Sqe,
     data_in_max: u32,
+    cntlid_for_host: impl Fn([u8; 16]) -> u16,
 ) -> NvmeResponse {
     let cid = sqe.cid;
     let lun = u64::from(nsid);
@@ -214,9 +222,10 @@ pub fn reservation_report(
             };
             let holds = all_registrants || snap.holder.as_ref() == Some(id);
             wire::ReportEntry {
-                // One CNTLID per connection today (static 1); the
-                // registrant identity that fences is the HOSTID.
-                cntlid: 1,
+                // A representative live CNTLID for this registrant's
+                // host (0 if it has no live controller). The fencing
+                // identity remains the HOSTID.
+                cntlid: cntlid_for_host(hostid),
                 holds_reservation: holds,
                 hostid,
                 rkey: *key,

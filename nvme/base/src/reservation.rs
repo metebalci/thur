@@ -143,10 +143,11 @@ pub fn scsi_byte_to_nvme_rtype(scsi: u8) -> Option<u8> {
 
 // ---- Reservation Status Data Structure ----
 
-/// One registered-controller entry for the Reservation Report. We
-/// assign a single CNTLID per connection today, so every entry from
-/// one host carries the same CNTLID; the registrant identity that
-/// matters for fencing is the `hostid`.
+/// One registered-controller entry for the Reservation Report. The
+/// caller fills `cntlid` with a real per-controller CNTLID (the
+/// registrant host's representative live controller, or 0 if it has
+/// none). The registration is host-keyed, so the report stays one
+/// entry per HOSTID; the identity that matters for fencing is `hostid`.
 pub struct ReportEntry {
     pub cntlid: u16,
     pub holds_reservation: bool,
