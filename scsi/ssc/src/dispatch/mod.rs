@@ -47,9 +47,11 @@ pub fn dispatch_drive_lun(ctx: &mut ScsiCtx<'_>) -> Option<Result<ScsiResp>> {
     // reservation fences medium read / write opcodes against
     // non-permitted I_T nexuses; SAM-5 §5.9.1 commands (identity,
     // status, positioning, PRIN / PROUT themselves) are never
-    // fenced. The changer LUN holds no reservation state, so it is
-    // skipped. Runs after the dispatch-entry UA pop, preserving the
-    // SAM-5 "report pending UA before RESERVATION CONFLICT" ordering.
+    // fenced. The changer LUN has its own gate over the
+    // movement / element-status opcodes (`scsi_smc::dispatch::pr_enforce`),
+    // so it is skipped here. Runs after the dispatch-entry UA pop,
+    // preserving the SAM-5 "report pending UA before RESERVATION
+    // CONFLICT" ordering.
     if !ctx.is_changer_lun()
         && let Some(refusal) = pr_enforce(ctx)
     {

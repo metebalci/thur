@@ -494,6 +494,13 @@ fn dispatch_scsi(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         // library-local since changer 0xB5 only makes sense here.
         0xB5 => {
             if ctx.lun == 0 {
+                // PERSISTENT RESERVE fence for the changer's element-read
+                // command. The other gated changer opcodes route through
+                // `dispatch_changer_lun` (which runs the same gate); 0xB5
+                // is dispatched here, so call the gate directly.
+                if let Some(refusal) = scsi_smc::dispatch::pr_enforce(ctx) {
+                    return Ok(refusal);
+                }
                 let alloc = u32::from_be_bytes([0, ctx.cdb[7], ctx.cdb[8], ctx.cdb[9]]);
                 let mut d = vec![0u8; 8];
                 return Ok(ScsiResp {

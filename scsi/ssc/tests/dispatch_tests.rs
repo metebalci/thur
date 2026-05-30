@@ -813,26 +813,36 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
 }
 
 #[test]
-fn persistent_reserve_out_rejected_on_changer_lun() {
+fn persistent_reserve_is_handled_on_the_changer_lun() {
+    // Issue #53: PROUT / PRIN are no longer stubbed or rejected on the
+    // SMC medium changer LUN (LUN 0, has_changer = true). Register a
+    // key and read it back — `ReservationManager` is keyed per-LUN, so
+    // the changer's state is independent of every drive's. The MOVE /
+    // EXCHANGE fencing gate itself lives in scsi-smc.
     let fx = Fixture::new();
-    let plist = prout_params(0, 0xAAAA);
-    let mut p = Pdu::synth(&[], 0, 0, &plist);
-    // LUN 0 with has_changer=true → PROUT stays rejected.
-    let mut ctx = fx.ctx_session(
-        &mut p,
-        prout_cdb(0x06, 0),
-        0,
-        0,
-        true,
-        1,
-        Some("iqn.test:a"),
-    );
-    assert_eq!(
-        handlers::handle_persistent_reserve_out(&mut ctx)
-            .unwrap()
-            .status,
-        ScsiStatus::CheckCondition,
-    );
+    let a = Some("iqn.test:a");
+
+    // REGISTER AND IGNORE EXISTING KEY (SA 0x06) on the changer LUN.
+    {
+        let plist = prout_params(0, 0xAAAA);
+        let mut p = Pdu::synth(&[], 0, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 0, 0, true, 1, a);
+        let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good, "register on changer");
+    }
+
+    // READ KEYS (PRIN SA 0x00) lists the just-registered key.
+    {
+        let mut c = cdb(0x5E);
+        c[1] = 0x00;
+        c[7..9].copy_from_slice(&256u16.to_be_bytes());
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, c, 0, 0, true, 1, a);
+        let r = handlers::handle_persistent_reserve_in(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good);
+        assert_eq!(r.data_out.len(), 16); // header(8) + one key(8)
+        assert_eq!(&r.data_out[8..16], &0xAAAAu64.to_be_bytes());
+    }
 }
 
 #[test]

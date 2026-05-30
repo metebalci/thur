@@ -312,17 +312,21 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   shells of scsi-spc.
 - **scsi-ssc** — drive-LUN SCSI dispatch + drive-manager primitives +
   tape SCSI helpers (sense, log pages, MAM attributes, encryption
-  pages). PERSISTENT RESERVE IN/OUT (0x5E / 0x5F) on the drive LUN run
-  against the shared `scsi_spc::reservations::ReservationManager`
-  (threaded through `ScsiCtx`); `dispatch_drive_lun` enforces a
+  pages). PERSISTENT RESERVE IN/OUT (0x5E / 0x5F) run against the
+  shared `scsi_spc::reservations::ReservationManager` (threaded through
+  `ScsiCtx`) on both the drive LUN and the changer LUN — keyed per-LUN,
+  so the two are independent. `dispatch_drive_lun` enforces the
   reservation gate that fences medium read/write opcodes with
-  RESERVATION CONFLICT. The changer LUN keeps the legacy stub / reject.
+  RESERVATION CONFLICT (the changer's gate lives in scsi-smc).
   Consumed by `thurvtld`.
 - **scsi-smc** — changer-LUN SCSI dispatch (the six SMC opcodes:
   INITIALIZE / READ ELEMENT STATUS, MOVE / EXCHANGE MEDIUM, SEND VOLUME
   TAG, INITIALIZE WITH RANGE) plus element-address topology helpers
   (`ElementType`, `ElementAddressConfig`). The per-command `SmcScsiCtx`
-  wraps scsi-ssc's `ScsiCtx`. Consumed by `thurvtld`.
+  wraps scsi-ssc's `ScsiCtx`. `pr_enforce` is the changer-side mirror of
+  scsi-ssc's reservation gate: a reservation held on the changer LUN
+  fences MOVE / EXCHANGE / element-status opcodes with RESERVATION
+  CONFLICT (issue #53). Consumed by `thurvtld`.
 - **scsi-sbc** — SBC-3 block-target SCSI dispatch (every data-path
   opcode: READ / WRITE 10/16, COMPARE AND WRITE, UNMAP, WRITE SAME,
   SYNCHRONIZE CACHE; INQUIRY + VPD, READ CAPACITY, REPORT LUNS, MODE

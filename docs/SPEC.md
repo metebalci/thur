@@ -437,10 +437,18 @@ WRITE(6) 0x0A, WRITE FILEMARKS 0x10 / 0x80, ERASE 0x19, and FORMAT
 MEDIUM 0x04; the read gate fences READ(6) 0x08, VERIFY 0x13 / 0x8F,
 and SPACE 0x11 / 0x91. Positioning (REWIND, LOCATE, READ POSITION,
 LOAD/UNLOAD), mode pages, identity, and the PR commands themselves are
-never fenced (SAM-5 §5.9.1). The medium changer (LUN 0) does **not**
-participate: it keeps the legacy no-op RESERVE(6/10) plus a PRIN stub
-and rejects PROUT, so 0x5F appears in the drive's REPORT SUPPORTED
-OPERATION CODES but not the changer's.
+never fenced (SAM-5 §5.9.1).
+
+The **medium changer (LUN 0)** participates too (issue #53). Because
+`ReservationManager` is keyed by LUN, the changer's reservation is
+independent of every drive's. Its enforcement gate
+(`scsi_smc::dispatch::pr_enforce`) fences the movement / inventory
+opcodes: the write gate covers MOVE MEDIUM 0xA5, EXCHANGE MEDIUM 0xA6,
+INITIALIZE ELEMENT STATUS 0x07 / 0x37, and SEND VOLUME TAG 0xB6; the
+read gate covers READ ELEMENT STATUS 0xB8 and REQUEST VOLUME ELEMENT
+ADDRESS 0xB5. The legacy no-op RESERVE(6/10) stay accepted (CRH = 0).
+0x5F now appears in **both** the changer's and the drives' REPORT
+SUPPORTED OPERATION CODES.
 
 ### Format / partitioning
 

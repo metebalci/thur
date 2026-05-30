@@ -978,6 +978,37 @@ t_tape_pr_register_and_reserve() {
     sg_persist --out --register --param-rk="$key" --param-sark=0 "$TAPE_SG_DEVICE" 2>&1
     return 0
 }
+# PERSISTENT RESERVE on the SMC medium changer LUN (issue #53). Same
+# REGISTER -> RESERVE Exclusive Access -> readback -> tear-down flow as
+# the tape drive, proving the changer's LUN-0 reservation state is real
+# and independent of the drives. Single-host loopback uses one
+# InitiatorName, so the reservation is held by this nexus and never
+# fences itself; cross-nexus MOVE MEDIUM -> RESERVATION CONFLICT is
+# covered by the scsi-smc unit tests (two distinct TSIHs).
+t_changer_pr_register_and_reserve() {
+    local key="0xCAFEF00D"
+    local out
+    out=$(sg_persist --out --register --param-sark="$key" "$CHANGER_DEVICE" 2>&1); echo "$out"
+    sg_persist --out --reserve --prout-type=3 --param-rk="$key" "$CHANGER_DEVICE" 2>&1
+    out=$(sg_persist --in --read-keys "$CHANGER_DEVICE" 2>&1); echo "$out"
+    if echo "$out" | grep -qiE 'cafef00d|generation'; then
+        log_info "Registration visible via READ KEYS"
+    else
+        log_error "READ KEYS did not show registered key"
+        return 1
+    fi
+    out=$(sg_persist --in --read-reservation "$CHANGER_DEVICE" 2>&1); echo "$out"
+    if echo "$out" | grep -qiE 'reservation|generation'; then
+        log_info "READ RESERVATION shows holder"
+    else
+        log_error "READ RESERVATION did not return a holder"
+        return 1
+    fi
+    # Tear down so subsequent changer tests aren't fenced.
+    sg_persist --out --release --prout-type=3 --param-rk="$key" "$CHANGER_DEVICE" 2>&1
+    sg_persist --out --register --param-rk="$key" --param-sark=0 "$CHANGER_DEVICE" 2>&1
+    return 0
+}
 # INITIALIZE ELEMENT STATUS WITH RANGE (CDB 0x37, 10 bytes per SMC-3 §6.5).
 # RANGE bit set, start=storage_start (1001 = slot 1), count=4 storage slots.
 t_changer_init_element_status_with_range() {
@@ -1164,6 +1195,7 @@ main() {
     run_test "RELEASE(6) (changer, no-op accept)"                   t_release_6_changer
     run_test "RESERVE(10) (changer, no-op accept)"                  t_reserve_10_changer
     run_test "RELEASE(10) (changer, no-op accept)"                  t_release_10_changer
+    run_test "PERSISTENT RESERVE OUT register+reserve+readback (changer)" t_changer_pr_register_and_reserve
 
     echo "----- Group E: SSC (tape) operations w/ TST001L8 in drive 0 -----"
     setup_tape_with_cartridge

@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use core_mediachanger::{AuditChannel, Library, LibraryFacade, TapeEvent};
 use scsi_smc::changer::ElementAddressConfig;
-use scsi_smc::dispatch::{SmcScsiCtx, dispatch_changer_lun, handlers};
+use scsi_smc::dispatch::{SmcScsiCtx, dispatch_changer_lun, handlers, pr_enforce};
+use scsi_spc::reservations::{Nexus, PrOutOutcome};
 use scsi_ssc::diagnostics::DiagnosticStore;
 use scsi_ssc::dispatch::{Pdu, ScsiCtx, ScsiResp, ScsiStatus};
 use scsi_ssc::drive_manager::DriveManager;
@@ -128,10 +129,57 @@ impl Fixture {
             element_config: &self.element_config,
         }
     }
+
+    /// Like [`Fixture::ctx`] but with a caller-chosen TSIH so a test
+    /// can drive distinct I_T nexuses through the reservation gate.
+    fn ctx_tsih<'a>(
+        &'a self,
+        pdu: &'a mut Pdu,
+        cdb: [u8; 16],
+        lun: u8,
+        tsih: u16,
+    ) -> SmcScsiCtx<'a> {
+        let mut ctx = self.ctx(pdu, cdb, lun);
+        ctx.inner.tsih = tsih;
+        ctx
+    }
+
+    /// Register key `sark` then RESERVE the given `type_byte` on the
+    /// changer LUN (LUN 0) for the nexus identified by `tsih`. Used to
+    /// set up the reservation a test then probes for fencing.
+    fn reserve_changer(&self, tsih: u16, sark: u64, type_byte: u8) {
+        let nexus = Nexus::new(tsih, None);
+        // REGISTER AND IGNORE EXISTING KEY (SA 0x06): RESERVATION KEY 0,
+        // SERVICE ACTION RESERVATION KEY = sark.
+        let reg = prout_params(0, sark);
+        assert_eq!(
+            self.reservations
+                .prout(0, 0x06, 0, 0, &reg, 24, &nexus, true),
+            PrOutOutcome::Good,
+            "register",
+        );
+        // RESERVE (SA 0x01): RESERVATION KEY = sark, LU scope, type.
+        let res = prout_params(sark, 0);
+        assert_eq!(
+            self.reservations
+                .prout(0, 0x01, 0, type_byte, &res, 24, &nexus, true),
+            PrOutOutcome::Good,
+            "reserve",
+        );
+    }
 }
 
 fn blank_pdu() -> Pdu {
     Pdu::synth(&[], 0, 0, &[])
+}
+
+/// 24-byte PROUT parameter list: RESERVATION KEY + SERVICE ACTION
+/// RESERVATION KEY, all flags clear.
+fn prout_params(rk: u64, sark: u64) -> Vec<u8> {
+    let mut p = vec![0u8; 24];
+    p[0..8].copy_from_slice(&rk.to_be_bytes());
+    p[8..16].copy_from_slice(&sark.to_be_bytes());
+    p
 }
 
 /// 16-byte CDB with just the opcode set.
@@ -444,4 +492,116 @@ fn dispatch_router_handles_known_opcodes_and_passes_through_unknown() {
     let mut pdu = blank_pdu();
     let mut ctx = fx.ctx(&mut pdu, cdb(0x00), 0);
     assert!(dispatch_changer_lun(&mut ctx).is_none());
+}
+
+#[test]
+fn move_medium_is_fenced_by_a_persistent_reservation() {
+    // Issue #53: a reservation held on the changer LUN fences MOVE
+    // MEDIUM against every other I_T nexus, mirroring the drive-LUN
+    // data-path fence. Set up a loadable tape, reserve EXCLUSIVE
+    // ACCESS (type 0x03) for nexus A (TSIH 1), then confirm a
+    // non-holder (TSIH 2) is refused and the holder is not.
+    let fx = Fixture::default();
+    let slot_id = {
+        let mut lib = fx.library.lock().unwrap();
+        lib.add_or_create_tape("TAPE01", "primary").unwrap()
+    };
+    let slot_addr = STORAGE_BASE + slot_id as u16;
+    fx.reserve_changer(1, 0xAAAA, 0x03);
+
+    let mut load = cdb(0xA5);
+    load[4..6].copy_from_slice(&slot_addr.to_be_bytes());
+    load[6..8].copy_from_slice(&DRIVE_BASE.to_be_bytes());
+
+    // Non-holder (TSIH 2): RESERVATION CONFLICT, returned by the gate
+    // before the move runs.
+    {
+        let mut pdu = blank_pdu();
+        let mut ctx = fx.ctx_tsih(&mut pdu, load, 0, 2);
+        let resp = dispatch_changer_lun(&mut ctx).unwrap().unwrap();
+        assert_eq!(resp.status, ScsiStatus::ReservationConflict);
+    }
+
+    // The move never happened — the tape is still in its slot.
+    {
+        let lib = fx.library.lock().unwrap();
+        let slot = lib
+            .storage_slots()
+            .iter()
+            .find(|s| s.id == slot_id)
+            .expect("slot exists");
+        assert!(slot.occupied, "fenced MOVE must leave the tape in its slot");
+    }
+
+    // The holder (TSIH 1) is not fenced — the load succeeds.
+    {
+        let mut pdu = blank_pdu();
+        let mut ctx = fx.ctx_tsih(&mut pdu, load, 0, 1);
+        let resp = dispatch_changer_lun(&mut ctx).unwrap().unwrap();
+        assert_eq!(resp.status, ScsiStatus::Good, "holder moves freely");
+    }
+}
+
+#[test]
+fn read_element_status_is_fenced_under_exclusive_access() {
+    // The read gate: under EXCLUSIVE ACCESS, READ ELEMENT STATUS from
+    // a non-holder is a RESERVATION CONFLICT; the holder reads freely.
+    let fx = Fixture::default();
+    fx.reserve_changer(1, 0xBBBB, 0x03);
+
+    let mut c = cdb(0xB8);
+    c[1] = 0x00; // all element types
+    c[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    c[7..10].copy_from_slice(&[0x01, 0x00, 0x00]); // alloc = 64 KiB
+
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx_tsih(&mut pdu, c, 0, 2);
+    assert_eq!(
+        dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+        ScsiStatus::ReservationConflict,
+        "non-holder READ ELEMENT STATUS fenced",
+    );
+
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx_tsih(&mut pdu, c, 0, 1);
+    assert_eq!(
+        dispatch_changer_lun(&mut ctx).unwrap().unwrap().status,
+        ScsiStatus::Good,
+        "holder READ ELEMENT STATUS allowed",
+    );
+}
+
+#[test]
+fn pr_enforce_classifies_request_volume_element_address_as_a_read() {
+    // REQUEST VOLUME ELEMENT ADDRESS (0xB5) is dispatched by the
+    // thurvtl wrapper, not `dispatch_changer_lun`, so the wrapper
+    // calls `pr_enforce` directly. Verify the gate classifies it as a
+    // read: fenced for a non-holder under EXCLUSIVE ACCESS, open to
+    // the holder.
+    let fx = Fixture::default();
+    fx.reserve_changer(1, 0xCCCC, 0x03);
+
+    let mut pdu = blank_pdu();
+    let ctx = fx.ctx_tsih(&mut pdu, cdb(0xB5), 0, 2);
+    assert!(pr_enforce(&ctx).is_some(), "non-holder 0xB5 must be fenced",);
+
+    let mut pdu = blank_pdu();
+    let ctx = fx.ctx_tsih(&mut pdu, cdb(0xB5), 0, 1);
+    assert!(pr_enforce(&ctx).is_none(), "holder 0xB5 must pass");
+}
+
+#[test]
+fn pr_enforce_leaves_identity_and_pr_opcodes_open() {
+    // SAM-5 §5.9.1: identity / status / the PR commands themselves are
+    // never fenced, even from a non-holder while a reservation is held.
+    let fx = Fixture::default();
+    fx.reserve_changer(1, 0xDDDD, 0x03);
+    for op in [0x00u8, 0x12, 0x03, 0xA0, 0x5E, 0x5F] {
+        let mut pdu = blank_pdu();
+        let ctx = fx.ctx_tsih(&mut pdu, cdb(op), 0, 2);
+        assert!(
+            pr_enforce(&ctx).is_none(),
+            "opcode {op:#04x} must never be fenced",
+        );
+    }
 }

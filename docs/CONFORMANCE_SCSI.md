@@ -101,8 +101,8 @@ expose must answer.
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
 | 0x5A | MODE SENSE(10) | 🟩 Yes | O | |
-| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1); the medium changer (LUN 0) keeps the stub "no reservations" response. |
-| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. thurvtl tape: drive LUN only (LUN ≥ 1); rejected on the medium changer (LUN 0) — VTL does not model SMC reservation fencing. |
+| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1) and the medium changer (LUN 0) — reservation state is keyed per-LUN, so the changer's is independent of the drives'. |
+| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
 | 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 | 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
@@ -192,10 +192,21 @@ to the block side. The differences are tape-shaped:
   "claim the device" CDBs some backup software issues at session
   acquire stay accepted no-ops (CRH = 0); the SCSI-3 PR family is the
   real mechanism.
-- **Medium changer (LUN 0)** keeps the historical PRIN stub and
-  rejects PROUT — VTL does not model SMC reservation fencing of MOVE
-  MEDIUM. PROUT (0x5F) is therefore absent from the changer's REPORT
-  SUPPORTED OPERATION CODES but present in the drive's.
+- **Medium changer (LUN 0)** implements the same PR family as the
+  drives (issue #53) — SMC-3 changers legitimately support
+  reservations, which matter when multiple media servers share one
+  library's robotics. `ReservationManager` is keyed by LUN, so the
+  changer's reservation is **independent** of every drive's: reserving
+  the changer does not fence any drive, and vice versa. The
+  enforcement gate (`scsi_smc::dispatch::pr_enforce`) fences the
+  movement / inventory opcodes — MOVE MEDIUM 0xA5, EXCHANGE MEDIUM
+  0xA6, INITIALIZE ELEMENT STATUS 0x07 / 0x37, SEND VOLUME TAG 0xB6
+  (write-side), and READ ELEMENT STATUS 0xB8, REQUEST VOLUME ELEMENT
+  ADDRESS 0xB5 (read-side) — returning RESERVATION CONFLICT to a
+  non-permitted nexus. Identity / status / mode pages / the PR
+  commands themselves are never fenced (SAM-5 §5.9.1). PROUT (0x5F)
+  appears in both the changer's and the drives' REPORT SUPPORTED
+  OPERATION CODES.
 
 ### Read-attribute / write-attribute (thurvtl tape only)
 
@@ -669,18 +680,20 @@ LTO-8) rather than by SSC-4.
 
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
-| 0x07 | INITIALIZE ELEMENT STATUS | 🟩 Yes | M | Reloads `inventory.json`. |
+| 0x07 | INITIALIZE ELEMENT STATUS | 🟩 Yes | M | Reloads `inventory.json`. Reservation-gated (write-side — see 0x5F). |
 | 0x16 | RESERVE(6) | 🟩 No-op | O | |
 | 0x17 | RELEASE(6) | 🟩 No-op | O | |
 | 0x2B | POSITION TO ELEMENT | 🟩 No-op | O | Accepted; no robot motion to model. |
-| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | 🟩 Yes | O | Range-scoped reload. |
+| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | 🟩 Yes | O | Range-scoped reload. Reservation-gated (write-side — see 0x5F). |
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
-| 0xA5 | MOVE MEDIUM | 🟩 Yes | M | Storage ↔ Drive ↔ I/E ↔ Storage. Emits MEDIUM CHANGED UA. Partition-fenced when the session is bound to a logical partition (CHAP user → partition mapping); cross-partition src/dst returns ILLEGAL REQUEST + 0x21/0x01. |
-| 0xA6 | EXCHANGE MEDIUM | 🟩 Yes | O | Composed from two MOVE MEDIUMs. Same partition fence applies to all three element addresses. |
-| 0xB5 | REQUEST VOLUME ELEMENT ADDRESS | 🟩 Stub | O | Empty response. |
-| 0xB6 | SEND VOLUME TAG | 🟩 No-op | O | No barcode-assignment side-effect. |
-| 0xB8 | READ ELEMENT STATUS | 🟩 Yes | M | All element types; VOLTAG / DVCID / Mixed / CurData / Access flags honored. **Not** partition-fenced — every session sees every element. `mtx` parses a zero-descriptor per-type page as `Transport Element Descriptor Length too short`, so dropping out-of-partition elements there breaks `mtx load`. Topology leak is contained: MOVE MEDIUM / EXCHANGE MEDIUM still refuse out-of-partition src/dst, and drive-LUN INQUIRY against an out-of-partition LUN still returns PQ=NoDevice, so the data path stays isolated. |
+| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Full PRIN surface on the changer LUN, keyed independently of the drives (issue #53). See SPC-4 § PERSISTENT RESERVE IN. |
+| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Real reservations on the changer LUN (issue #53): a held reservation fences MOVE / EXCHANGE / element-status opcodes (`scsi_smc::dispatch::pr_enforce`) with RESERVATION CONFLICT to a non-holder. Service-action coverage matches the drive LUN; see SPC-4 § PERSISTENT RESERVE OUT and Part 1 § Reservations. |
+| 0xA5 | MOVE MEDIUM | 🟩 Yes | M | Storage ↔ Drive ↔ I/E ↔ Storage. Emits MEDIUM CHANGED UA. Partition-fenced when the session is bound to a logical partition (CHAP user → partition mapping); cross-partition src/dst returns ILLEGAL REQUEST + 0x21/0x01. Reservation-gated (write-side — see 0x5F). |
+| 0xA6 | EXCHANGE MEDIUM | 🟩 Yes | O | Composed from two MOVE MEDIUMs. Same partition fence applies to all three element addresses. Reservation-gated (write-side — see 0x5F). |
+| 0xB5 | REQUEST VOLUME ELEMENT ADDRESS | 🟩 Stub | O | Empty response. Reservation-gated (read-side — see 0x5F). |
+| 0xB6 | SEND VOLUME TAG | 🟩 No-op | O | No barcode-assignment side-effect. Reservation-gated (write-side — see 0x5F). |
+| 0xB8 | READ ELEMENT STATUS | 🟩 Yes | M | All element types; VOLTAG / DVCID / Mixed / CurData / Access flags honored. **Not** partition-fenced — every session sees every element. `mtx` parses a zero-descriptor per-type page as `Transport Element Descriptor Length too short`, so dropping out-of-partition elements there breaks `mtx load`. Topology leak is contained: MOVE MEDIUM / EXCHANGE MEDIUM still refuse out-of-partition src/dst, and drive-LUN INQUIRY against an out-of-partition LUN still returns PQ=NoDevice, so the data path stays isolated. Reservation-gated (read-side — see 0x5F). |
 
 ### Changer-side mode pages (LUN 0)
 
@@ -827,7 +840,7 @@ in a different spec baseline. Both ends are declined at the CLI.
 
 ### Deliberate divergences from typical LTO hardware
 
-#### PERSISTENT RESERVE OUT (0x5F) — implemented on the drive LUN
+#### PERSISTENT RESERVE OUT (0x5F) — implemented on both LUN types
 
 Earlier releases rejected PROUT on the tape drive, on the theory that
 a VTL is single-initiator and a no-op accept could mislead a clustered
@@ -841,17 +854,26 @@ PERSISTENT RESERVE family for real, backed by the same shared
 REGISTER / RESERVE / RELEASE / CLEAR / PREEMPT / PREEMPT AND ABORT /
 REGISTER AND IGNORE EXISTING KEY, truthful PRIN, and RESERVATION
 CONFLICT (status 0x18) on medium read/write opcodes for a non-permitted
-nexus. PROUT (0x5F) now appears in the drive's REPORT SUPPORTED
-OPERATION CODES. The full behavior — service actions, the enforcement
-opcode set, session-close `drop_nexus` — is in
+nexus. PROUT (0x5F) appears in the drive's REPORT SUPPORTED OPERATION
+CODES. The full behavior — service actions, the enforcement opcode
+set, session-close `drop_nexus` — is in
 [Part 1](#part-1-spc-4-sam-5-and-iscsi)
 § *Reservations — thurvtl tape vs thurvsa block*.
 
-The one remaining divergence is the **medium changer (LUN 0)**: it
-keeps the historical PRIN stub and still rejects PROUT, because VTL
-does not model SMC reservation fencing of MOVE MEDIUM. PROUT is
-therefore absent from the changer's REPORT SUPPORTED OPERATION CODES
-but present in the drive's.
+Issue #53 extends the same surface to the **medium changer (LUN 0)** —
+SMC-3 changers legitimately support PERSISTENT RESERVE, and it matters
+when multiple media servers share one library's robotics. Because
+`ReservationManager` is keyed by LUN, the changer's reservation is
+**independent** of every drive's. The changer's enforcement gate
+(`scsi_smc::dispatch::pr_enforce`, the mirror of the drive's
+`pr_enforce` in `scsi-ssc`) returns RESERVATION CONFLICT to a
+non-permitted nexus for the movement / inventory opcodes — MOVE
+MEDIUM 0xA5, EXCHANGE MEDIUM 0xA6, INITIALIZE ELEMENT STATUS
+0x07 / 0x37, SEND VOLUME TAG 0xB6 (write-side), and READ ELEMENT
+STATUS 0xB8, REQUEST VOLUME ELEMENT ADDRESS 0xB5 (read-side).
+Identity / status / mode pages / the PR commands themselves are never
+fenced (SAM-5 §5.9.1). PROUT (0x5F) appears in the changer's REPORT
+SUPPORTED OPERATION CODES alongside the drive's.
 
 #### Operator-driven configuration changes — UAs not broadcast
 

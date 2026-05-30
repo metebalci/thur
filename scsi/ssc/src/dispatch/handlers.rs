@@ -1698,17 +1698,15 @@ fn pr_lu_not_supported() -> ScsiResp {
     )
 }
 
-/// PERSISTENT RESERVE IN (SPC-4 §6.16, opcode 0x5E). On a drive LUN
-/// this walks the shared [`scsi_spc::reservations::ReservationManager`]
-/// and answers READ KEYS / READ RESERVATION / REPORT CAPABILITIES /
-/// READ FULL STATUS truthfully. The medium changer (LUN 0) keeps the
-/// historical stub — real persistent reservations live on the drive
-/// LUNs only (issue #16); SMC reservation fencing of MOVE MEDIUM is
-/// out of scope.
+/// PERSISTENT RESERVE IN (SPC-4 §6.16, opcode 0x5E). Walks the shared
+/// [`scsi_spc::reservations::ReservationManager`] and answers READ KEYS
+/// / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS
+/// truthfully. Both the drive LUNs and the SMC medium changer (LUN 0)
+/// route here — `ReservationManager` is keyed by LUN, so the changer's
+/// reservation state is independent of every drive's (issue #53). The
+/// changer's MOVE / EXCHANGE fencing gate lives in
+/// `scsi_smc::dispatch::pr_enforce`.
 pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    if ctx.is_changer_lun() {
-        return changer_persistent_reserve_in_stub(ctx);
-    }
     // The synthesized CDB is always 16 bytes, so `parse_prin_cdb`
     // never short-circuits here; the guard keeps the byte offsets
     // single-sourced with the block side.
@@ -1726,56 +1724,17 @@ pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     }
 }
 
-/// PERSISTENT RESERVE IN stub for the medium changer (LUN 0) —
-/// preserves the pre-PR "no reservations / no registrations / no
-/// capabilities" response so changer behavior is unchanged.
-fn changer_persistent_reserve_in_stub(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    let cdb = ctx.cdb;
-    let service_action = cdb[1] & 0x1F;
-    let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as u32;
-    let d = match service_action {
-        // READ KEYS / READ RESERVATION / READ FULL STATUS: 8-byte
-        // header (PRgeneration + additional length = 0).
-        0x00 | 0x01 | 0x03 => vec![0u8; 8],
-        0x02 => {
-            // REPORT CAPABILITIES: 8-byte response, all flags clear.
-            let mut buf = vec![0u8; 8];
-            buf[0] = 0x00;
-            buf[1] = 0x08; // length
-            buf
-        }
-        _ => {
-            tracing::warn!(
-                "PERSISTENT RESERVE IN (changer): unsupported SA 0x{:02x}",
-                service_action
-            );
-            return Ok(ScsiResp::check_condition());
-        }
-    };
-    Ok(ScsiResp {
-        status: ScsiStatus::Good,
-        data_out: limit_len(d, alloc),
-        sense: None,
-    })
-}
-
-/// PERSISTENT RESERVE OUT (SPC-4 §6.16, opcode 0x5F). On a drive LUN
-/// this mutates the shared reservation state (REGISTER / RESERVE /
-/// RELEASE / CLEAR / PREEMPT / PREEMPT AND ABORT / REGISTER AND
-/// IGNORE EXISTING KEY); the per-nexus enforcement gate in
-/// [`dispatch_drive_lun`](crate::dispatch::dispatch_drive_lun) then
-/// fences medium read/write opcodes against non-permitted
-/// initiators. The medium changer (LUN 0) keeps PROUT rejected — VTL
-/// does not model SMC reservation fencing.
+/// PERSISTENT RESERVE OUT (SPC-4 §6.16, opcode 0x5F). Mutates the
+/// shared reservation state (REGISTER / RESERVE / RELEASE / CLEAR /
+/// PREEMPT / PREEMPT AND ABORT / REGISTER AND IGNORE EXISTING KEY).
+/// The per-nexus enforcement gates then fence the data path against
+/// non-permitted initiators: medium read/write opcodes on the drive
+/// LUNs via [`dispatch_drive_lun`](crate::dispatch::dispatch_drive_lun),
+/// and MOVE / EXCHANGE / element-status opcodes on the SMC medium
+/// changer (LUN 0) via `scsi_smc::dispatch::pr_enforce`. Reservations
+/// are per-LUN, so the changer's are independent of every drive's
+/// (issue #53).
 pub fn handle_persistent_reserve_out(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    if ctx.is_changer_lun() {
-        let service_action = ctx.cdb[1] & 0x1F;
-        tracing::warn!(
-            "PERSISTENT RESERVE OUT rejected on changer LUN: SA=0x{:02x}",
-            service_action
-        );
-        return Ok(ScsiResp::check_condition());
-    }
     let nexus = Nexus::new(ctx.tsih, ctx.initiator_iqn.map(str::to_string));
     // PROUT Data-Out (the 24-byte parameter list) is the drained
     // payload on the PDU, not a separate field.
@@ -1817,17 +1776,18 @@ pub fn handle_maintenance_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             // arms in thurvtl.
             let opcodes_changer: &[u8] = &[
                 0x00, 0x03, 0x07, 0x12, 0x15, 0x16, 0x17, 0x1A, 0x1C, 0x1D, 0x1E, 0x2B, 0x37, 0x3B,
-                0x3C, 0x4C, 0x4D, 0x55, 0x56, 0x57, 0x5A, 0x5E, 0xA0, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6,
-                0xB5, 0xB6, 0xB8,
+                0x3C, 0x4C, 0x4D, 0x55, 0x56, 0x57, 0x5A, 0x5E, 0x5F, 0xA0, 0xA2, 0xA3, 0xA4, 0xA5,
+                0xA6, 0xB5, 0xB6, 0xB8,
             ];
-            // PERSISTENT RESERVE OUT (0x5F) is absent from the changer
-            // list above — VTL does not model SMC reservation fencing,
-            // so PROUT on LUN 0 stays rejected. The drive list below
-            // advertises both 0x5E and 0x5F: the drive LUN implements
-            // real persistent reservations (issue #16). RESERVE/RELEASE
-            // (6/10) and SEND VOLUME TAG are accepted as no-ops for
-            // backup-software compatibility — see docs/SPEC.md
-            // "Reservations" and "SEND VOLUME TAG".
+            // Both lists advertise 0x5E and 0x5F: the changer LUN and
+            // the drive LUNs each implement real persistent reservations
+            // (issues #16 + #53), keyed independently per LUN. The
+            // changer fences MOVE / EXCHANGE / element-status opcodes
+            // (scsi_smc::dispatch::pr_enforce); the drives fence the
+            // medium read/write path. RESERVE/RELEASE (6/10) and SEND
+            // VOLUME TAG are accepted as no-ops for backup-software
+            // compatibility — see docs/SPEC.md "Reservations" and
+            // "SEND VOLUME TAG".
             let opcodes_tape: &[u8] = &[
                 0x00, 0x01, 0x03, 0x04, 0x05, 0x08, 0x0A, 0x0B, 0x10, 0x11, 0x12, 0x13, 0x15, 0x19,
                 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x2B, 0x34, 0x3B, 0x3C, 0x44, 0x4C, 0x4D, 0x55, 0x5A,
