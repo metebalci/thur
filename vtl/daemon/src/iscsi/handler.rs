@@ -77,6 +77,12 @@ pub struct IscsiLibraryHandler {
     /// for VPD 0x83 TargetPort designators + MAINTENANCE IN SA 0x0A
     /// REPORT TARGET PORT GROUPS.
     pub(crate) alua: Arc<shared_iscsi::alua::AluaTopology>,
+    /// Persistent-reservation state machine (shared with the block
+    /// side via `scsi-spc`). Threaded into the SCSI dispatcher's
+    /// `ScsiCtx::reservations` for PROUT / PRIN + the drive-LUN
+    /// enforcement gate; `on_session_close` drops the departing
+    /// nexus's registrations here.
+    pub(crate) reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
 impl IscsiLibraryHandler {
@@ -93,6 +99,7 @@ impl IscsiLibraryHandler {
         let status = match resp.status {
             protocol::ScsiStatus::Good => ScsiStatus::Good,
             protocol::ScsiStatus::CheckCondition => ScsiStatus::CheckCondition,
+            protocol::ScsiStatus::ReservationConflict => ScsiStatus::ReservationConflict,
         };
         let sense = resp
             .sense
@@ -118,6 +125,9 @@ impl ScsiHandler for IscsiLibraryHandler {
         // ran when the connection's TCP stream closed.
         self.drive_manager.release_session_locks(tsih);
         self.drive_manager.clear_prevent_for_session(tsih);
+        // SPC-4 §5.13.4.2: persistent-reservation registrations are
+        // released when the I_T nexus that registered them goes away.
+        self.reservations.drop_nexus(tsih);
     }
 
     async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
@@ -207,6 +217,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         let partition = req.session_partition.map(str::to_string);
         let diag = Arc::clone(&self.diagnostic_store);
         let alua = Arc::clone(&self.alua);
+        let resv = Arc::clone(&self.reservations);
         let mut pdu = Pdu::synth(req.cdb, req.lun, req.data_in_max, req.data_out);
 
         let resp_result: Result<ScsiResp> = tokio::task::spawn_blocking(move || {
@@ -226,6 +237,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 partition,
                 diag,
                 Some(alua),
+                resv,
             )
         })
         .await

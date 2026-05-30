@@ -19,6 +19,7 @@
 //! own store through.
 
 use core_mediachanger::{AuditActor, AuditChannel, AuditRateLimiter, TapeDeviceFacade, TapeEvent};
+use scsi_spc::reservations::ReservationManager;
 use shared_iscsi::alua::AluaTopology;
 use shared_iscsi::unit_attention::UnitAttentionTracker;
 use std::sync::{Arc, Mutex};
@@ -125,13 +126,16 @@ mod pdu_tests {
     }
 }
 
-/// SCSI status code for `ScsiResp`. The dispatcher only ever emits
-/// `Good` or `CheckCondition` — RESERVATION CONFLICT / BUSY / TASK SET
-/// FULL etc. aren't modeled.
+/// SCSI status code for `ScsiResp`. `Good` and `CheckCondition`
+/// cover the bulk of the surface; `ReservationConflict` (0x18) is
+/// raised by the PERSISTENT RESERVE enforcement gate when an I_T
+/// nexus touches a drive LUN it isn't permitted to under the active
+/// reservation. BUSY / TASK SET FULL etc. still aren't modeled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScsiStatus {
     Good,
     CheckCondition,
+    ReservationConflict,
 }
 
 /// One SCSI command response. `data_out` holds the bytes sent back as
@@ -185,6 +189,19 @@ impl ScsiResp {
             status: ScsiStatus::CheckCondition,
             data_out: Vec::new(),
             sense: Some(sense),
+        }
+    }
+
+    /// RESERVATION CONFLICT (SAM-5 status 0x18). Per SPC-4 §6.16 no
+    /// sense data accompanies this status — the initiator recognizes
+    /// the situation from the status code alone. Emitted by the
+    /// PERSISTENT RESERVE enforcement gate and by PROUT key-check
+    /// failures.
+    pub fn reservation_conflict() -> Self {
+        Self {
+            status: ScsiStatus::ReservationConflict,
+            data_out: Vec::new(),
+            sense: None,
         }
     }
 }
@@ -243,6 +260,14 @@ pub struct ScsiCtx<'a> {
     /// SCSI tests, in-process smoke); in that case the dispatcher
     /// falls back to a single-port no-ALUA response.
     pub alua: Option<&'a AluaTopology>,
+    /// Persistent-reservation state machine, shared with the block
+    /// side via `scsi-spc`. The PR enforcement gate in
+    /// [`dispatch_drive_lun`](crate::dispatch::dispatch_drive_lun)
+    /// and the 0x5E / 0x5F handlers build a
+    /// [`Nexus`](scsi_spc::reservations::Nexus) from `tsih` +
+    /// `initiator_iqn` and consult this. One instance per daemon,
+    /// outliving every command.
+    pub reservations: &'a Arc<ReservationManager>,
 }
 
 impl ScsiCtx<'_> {

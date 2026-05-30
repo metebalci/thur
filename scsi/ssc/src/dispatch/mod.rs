@@ -43,6 +43,18 @@ pub use types::{
 /// thurvtl sets `has_changer: true` and intercepts the LUN-0 /
 /// VPD-`0xB4` / wrapper-only arms before delegating.
 pub fn dispatch_drive_lun(ctx: &mut ScsiCtx<'_>) -> Option<Result<ScsiResp>> {
+    // PERSISTENT RESERVE enforcement (drive LUNs only). A held
+    // reservation fences medium read / write opcodes against
+    // non-permitted I_T nexuses; SAM-5 §5.9.1 commands (identity,
+    // status, positioning, PRIN / PROUT themselves) are never
+    // fenced. The changer LUN holds no reservation state, so it is
+    // skipped. Runs after the dispatch-entry UA pop, preserving the
+    // SAM-5 "report pending UA before RESERVATION CONFLICT" ordering.
+    if !ctx.is_changer_lun()
+        && let Some(refusal) = pr_enforce(ctx)
+    {
+        return Some(Ok(refusal));
+    }
     Some(match ctx.cdb[0] {
         // Identity surface — facade-driven (lifted in 5.B.6 follow-up
         // step 4).
@@ -116,4 +128,65 @@ pub fn dispatch_drive_lun(ctx: &mut ScsiCtx<'_>) -> Option<Result<ScsiResp>> {
 
         _ => return None,
     })
+}
+
+/// PERSISTENT RESERVE enforcement class for a drive-LUN opcode.
+enum PrGate {
+    /// Medium-reading — gated by `allow_read`.
+    Read,
+    /// Medium-mutating — gated by `allow_write`.
+    Write,
+    /// Always permitted regardless of reservation (SAM-5 §5.9.1).
+    None,
+}
+
+/// Classify a drive-LUN opcode for PERSISTENT RESERVE enforcement.
+/// Only the medium read / write data path is fenced; identity,
+/// status, positioning (REWIND / LOCATE / READ POSITION /
+/// LOAD-UNLOAD), mode pages, and the PR commands themselves stay
+/// open — matching how a real LTO drive gates on a reservation.
+fn pr_gate(opcode: u8) -> PrGate {
+    match opcode {
+        0x0A // WRITE(6)
+        | 0x10 // WRITE FILEMARKS(6)
+        | 0x80 // WRITE FILEMARKS(16)
+        | 0x19 // ERASE(6)
+        | 0x04 // FORMAT MEDIUM
+        => PrGate::Write,
+        0x08 // READ(6)
+        | 0x13 // VERIFY(6)
+        | 0x8F // VERIFY(16)
+        | 0x11 // SPACE(6)
+        | 0x91 // SPACE(16)
+        => PrGate::Read,
+        _ => PrGate::None,
+    }
+}
+
+/// Consult the reservation manager for the current command. Returns
+/// `Some(RESERVATION CONFLICT)` when a held reservation fences this
+/// I_T nexus out of the opcode, `None` when the command may proceed.
+fn pr_enforce(ctx: &ScsiCtx<'_>) -> Option<ScsiResp> {
+    let gate = pr_gate(ctx.cdb[0]);
+    if matches!(gate, PrGate::None) {
+        return None;
+    }
+    let nexus = scsi_spc::reservations::Nexus::new(ctx.tsih, ctx.initiator_iqn.map(str::to_string));
+    let lun = ctx.lun as u64;
+    let allowed = match gate {
+        PrGate::Write => ctx.reservations.allow_write(lun, &nexus),
+        PrGate::Read => ctx.reservations.allow_read(lun, &nexus),
+        PrGate::None => true,
+    };
+    if allowed {
+        None
+    } else {
+        tracing::debug!(
+            "RESERVATION CONFLICT: opcode 0x{:02x} on LUN {} refused for TSIH {}",
+            ctx.cdb[0],
+            ctx.lun,
+            ctx.tsih
+        );
+        Some(ScsiResp::reservation_conflict())
+    }
 }

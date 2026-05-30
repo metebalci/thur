@@ -345,6 +345,7 @@ pub(crate) fn handle_scsi_command(
     session_partition: Option<String>,
     diagnostic_store: Arc<DiagnosticStore>,
     alua: Option<Arc<shared_iscsi::alua::AluaTopology>>,
+    reservations: Arc<scsi_spc::reservations::ReservationManager>,
 ) -> Result<ScsiResp> {
     // CDB lives in BHS bytes [32..48]; copy it to a local so handlers
     // don't have to re-slice pdu.bhs every time.
@@ -438,6 +439,7 @@ pub(crate) fn handle_scsi_command(
         session_partition: session_partition.as_deref(),
         has_changer: true,
         alua: alua.as_deref(),
+        reservations: &reservations,
     };
     let mut ctx = SmcScsiCtx {
         inner,

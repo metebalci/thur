@@ -161,6 +161,18 @@ impl ReservationType {
         self as u8
     }
 
+    /// All-registrants types (WR_EX_AR / EX_AC_AR) survive holder
+    /// disappearance as long as another registrant remains; for
+    /// non-AR types the reservation is released when the holder
+    /// unregisters (SPC-4 §5.13.4.2). Consumed by the shared
+    /// [`crate::reservations::ReservationManager`] state machine.
+    pub const fn is_all_registrants(self) -> bool {
+        matches!(
+            self,
+            Self::WriteExclusiveAllRegistrants | Self::ExclusiveAccessAllRegistrants
+        )
+    }
+
     /// Bitmask of supported types for REPORT CAPABILITIES TYPE_MASK
     /// bytes (SPC-4 §6.16.2.4 Table 219). Each bit position
     /// corresponds to a `ReservationType` value; the helper sets the

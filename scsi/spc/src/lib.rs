@@ -33,6 +33,7 @@ pub mod mode;
 pub mod naa;
 pub mod pr;
 pub mod report_luns;
+pub mod reservations;
 pub mod scsi;
 pub mod sense;
 pub mod vpd;

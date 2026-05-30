@@ -143,6 +143,12 @@ pub struct DaemonState {
     /// lives inside `DriveManager`; both share the same
     /// `Arc<PoolBudget>` instances so reads are coherent.
     pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
+    /// Persistent-reservation state machine (SPC-4 PERSISTENT RESERVE
+    /// IN / OUT), shared with the block side via `scsi-spc`. Held here
+    /// so registrations survive across per-connection dispatch tasks;
+    /// cloned into the iSCSI handler at server start. In-memory only —
+    /// a daemon restart drops every registration (PTPL not advertised).
+    pub reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
 impl DaemonState {
@@ -197,6 +203,7 @@ impl DaemonState {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             pool_budgets,
+            reservations: Arc::new(scsi_spc::reservations::ReservationManager::new()),
         }
     }
 }

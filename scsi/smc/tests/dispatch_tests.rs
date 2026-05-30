@@ -45,6 +45,7 @@ struct Fixture {
     element_config: ElementAddressConfig,
     data_dir: PathBuf,
     audit_log: Option<AuditChannel>,
+    reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
 impl Fixture {
@@ -87,6 +88,7 @@ impl Fixture {
             element_config,
             data_dir: tmp.path().to_path_buf(),
             audit_log: None,
+            reservations: Arc::new(scsi_spc::reservations::ReservationManager::new()),
             library,
             _tmp: tmp,
         }
@@ -118,6 +120,7 @@ impl Fixture {
             session_partition: None,
             has_changer: true,
             alua: None,
+            reservations: &self.reservations,
         };
         SmcScsiCtx {
             inner,

@@ -37,6 +37,7 @@ struct Fixture {
     ratelimiter: AuditRateLimiter,
     data_dir: PathBuf,
     audit_log: Option<AuditChannel>,
+    reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
 impl Fixture {
@@ -74,6 +75,7 @@ impl Fixture {
             ratelimiter: AuditRateLimiter::new(Duration::from_secs(60)),
             data_dir: tmp.path().to_path_buf(),
             audit_log: None,
+            reservations: Arc::new(scsi_spc::reservations::ReservationManager::new()),
             _tmp: tmp,
         }
     }
@@ -91,6 +93,23 @@ impl Fixture {
         drive_id: usize,
         has_changer: bool,
     ) -> ScsiCtx<'a> {
+        self.ctx_session(pdu, cdb, lun, drive_id, has_changer, 1, None)
+    }
+
+    /// Like [`Self::ctx_at`] but with a caller-chosen I_T nexus
+    /// (`tsih` + initiator IQN) — used by the persistent-reservation
+    /// tests to exercise cross-nexus RESERVATION CONFLICT.
+    #[allow(clippy::too_many_arguments)]
+    fn ctx_session<'a>(
+        &'a self,
+        pdu: &'a mut Pdu,
+        cdb: [u8; 16],
+        lun: u8,
+        drive_id: usize,
+        has_changer: bool,
+        tsih: u16,
+        initiator_iqn: Option<&'a str>,
+    ) -> ScsiCtx<'a> {
         ScsiCtx {
             pdu,
             cdb,
@@ -98,7 +117,7 @@ impl Fixture {
             drive_id,
             device_type: 0x01, // sequential-access
             device_name: "drive1".to_string(),
-            tsih: 1,
+            tsih,
             drive_manager: &self.drive_manager,
             facade: &self.facade,
             ua_tracker: &self.ua,
@@ -106,12 +125,13 @@ impl Fixture {
             data_dir: &self.data_dir,
             audit_log: &self.audit_log,
             audit_ratelimiter: &self.ratelimiter,
-            initiator_iqn: None,
+            initiator_iqn,
             peer: "test",
             diagnostic_store: &self.diag,
             session_partition: None,
             has_changer,
             alua: None,
+            reservations: &self.reservations,
         }
     }
 }
@@ -652,6 +672,19 @@ fn persistent_reserve_in_answers_every_service_action() {
         let resp = handlers::handle_persistent_reserve_in(&mut ctx).unwrap();
         assert_eq!(resp.status, ScsiStatus::Good, "SA {sa:#04x}");
     }
+    // REPORT CAPABILITIES (SA 0x02) advertises the real SBC-3 type
+    // mask now that the drive implements PR — TMV=1, TYPE_MASK 0xEA,0x01.
+    let mut c = cdb(0x5E);
+    c[1] = 0x02;
+    c[7..9].copy_from_slice(&256u16.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let caps = handlers::handle_persistent_reserve_in(&mut ctx).unwrap();
+    assert_eq!(caps.data_out.len(), 8);
+    assert_eq!(caps.data_out[3], 0x80); // TMV
+    assert_eq!(caps.data_out[4], 0xEA);
+    assert_eq!(caps.data_out[5], 0x01);
+
     // Unknown service action.
     let mut c = cdb(0x5E);
     c[1] = 0x1F;
@@ -665,11 +698,135 @@ fn persistent_reserve_in_answers_every_service_action() {
     );
 }
 
+/// 24-byte PROUT parameter list (RESERVATION KEY + SERVICE ACTION
+/// RESERVATION KEY, APTPL clear).
+fn prout_params(rk: u64, sark: u64) -> Vec<u8> {
+    let mut p = vec![0u8; 24];
+    p[0..8].copy_from_slice(&rk.to_be_bytes());
+    p[8..16].copy_from_slice(&sark.to_be_bytes());
+    p
+}
+
+/// A 0x5F CDB for `service_action`, LU scope, reservation `type_byte`.
+fn prout_cdb(service_action: u8, type_byte: u8) -> [u8; 16] {
+    let mut c = cdb(0x5F);
+    c[1] = service_action & 0x1F;
+    c[2] = type_byte & 0x0F; // scope 0 (LU_SCOPE) | type
+    c[5..9].copy_from_slice(&24u32.to_be_bytes());
+    c
+}
+
 #[test]
-fn persistent_reserve_out_is_always_refused() {
+fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
     let fx = Fixture::new();
-    let mut p = pdu();
-    let mut ctx = fx.ctx(&mut p, cdb(0x5F));
+    let a = Some("iqn.test:a");
+    let b = Some("iqn.test:b");
+
+    // Initiator A (TSIH 1) registers key 0xAAAA (REGISTER AND IGNORE
+    // EXISTING KEY, SA 0x06).
+    {
+        let plist = prout_params(0, 0xAAAA);
+        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 1, 0, false, 1, a);
+        let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good, "register");
+    }
+
+    // READ KEYS lists the registered key.
+    {
+        let mut c = cdb(0x5E);
+        c[1] = 0x00;
+        c[7..9].copy_from_slice(&256u16.to_be_bytes());
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, c, 1, 0, false, 1, a);
+        let r = handlers::handle_persistent_reserve_in(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good);
+        assert_eq!(r.data_out.len(), 16); // header(8) + one key(8)
+        assert_eq!(&r.data_out[8..16], &0xAAAAu64.to_be_bytes());
+    }
+
+    // A reserves EXCLUSIVE ACCESS (type 0x03).
+    {
+        let plist = prout_params(0xAAAA, 0);
+        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x01, 0x03), 1, 0, false, 1, a);
+        let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good, "reserve");
+    }
+
+    // A different I_T nexus (TSIH 2) is fenced out of both WRITE(6)
+    // and READ(6) under EXCLUSIVE ACCESS — the gate returns
+    // RESERVATION CONFLICT before reaching the data handler.
+    for op in [0x0Au8, 0x08] {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(op), 1, 0, false, 2, b);
+        let r = dispatch_drive_lun(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            r.status,
+            ScsiStatus::ReservationConflict,
+            "non-holder opcode {op:#04x} fenced"
+        );
+    }
+
+    // The holder (TSIH 1) is not fenced — the gate lets the command
+    // through to the real handler (Err is fine; it just isn't a
+    // reservation conflict).
+    {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(0x0A), 1, 0, false, 1, a);
+        match dispatch_drive_lun(&mut ctx) {
+            Some(Ok(r)) => assert_ne!(
+                r.status,
+                ScsiStatus::ReservationConflict,
+                "holder not fenced"
+            ),
+            Some(Err(_)) => {}
+            None => panic!("WRITE(6) must dispatch"),
+        }
+    }
+
+    // A releases the reservation (TYPE must match the held type).
+    {
+        let plist = prout_params(0xAAAA, 0);
+        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x02, 0x03), 1, 0, false, 1, a);
+        let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
+        assert_eq!(r.status, ScsiStatus::Good, "release");
+    }
+
+    // After release the other nexus is no longer fenced.
+    {
+        let mut p = pdu();
+        let mut ctx = fx.ctx_session(&mut p, cdb(0x08), 1, 0, false, 2, b);
+        match dispatch_drive_lun(&mut ctx) {
+            Some(Ok(r)) => {
+                assert_ne!(
+                    r.status,
+                    ScsiStatus::ReservationConflict,
+                    "released - no fence"
+                )
+            }
+            Some(Err(_)) => {}
+            None => panic!("READ(6) must dispatch"),
+        }
+    }
+}
+
+#[test]
+fn persistent_reserve_out_rejected_on_changer_lun() {
+    let fx = Fixture::new();
+    let plist = prout_params(0, 0xAAAA);
+    let mut p = Pdu::synth(&[], 0, 0, &plist);
+    // LUN 0 with has_changer=true → PROUT stays rejected.
+    let mut ctx = fx.ctx_session(
+        &mut p,
+        prout_cdb(0x06, 0),
+        0,
+        0,
+        true,
+        1,
+        Some("iqn.test:a"),
+    );
     assert_eq!(
         handlers::handle_persistent_reserve_out(&mut ctx)
             .unwrap()

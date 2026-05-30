@@ -101,8 +101,8 @@ expose must answer.
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
 | 0x5A | MODE SENSE(10) | 🟩 Yes | O | |
-| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | thurvtl tape: stub "no reservations / no registrations / PTPL not capable" response. thurvsa block: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by `ReservationManager`. |
-| 0x5F | PERSISTENT RESERVE OUT | 🟨 No (thurvtl) / 🟩 Partial (thurvsa) | O | thurvtl tape: rejected — multi-host clustering not modeled, omitted from REPORT SUPPORTED OPCODES. thurvsa block: SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY implemented; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. |
+| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1); the medium changer (LUN 0) keeps the stub "no reservations" response. |
+| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. thurvtl tape: drive LUN only (LUN ≥ 1); rejected on the medium changer (LUN 0) — VTL does not model SMC reservation fencing. |
 | 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 | 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
@@ -141,31 +141,19 @@ Only thurvtl routes this opcode.
 ### Reservations — thurvtl tape vs thurvsa block
 
 SCSI reservations exist to keep two initiators from stepping on each
-other's I/O. The two products take opposite approaches to them
-because their topologies differ: VTL guarantees a single initiator
-per LUN, so there is nothing to fence, while VSA expects clustered
-hosts and must arbitrate between them for real.
+other's I/O. Both products implement the SCSI-3 PERSISTENT RESERVE
+family for real, backed by one shared state machine
+(`scsi_spc::reservations::ReservationManager`) so the block and tape
+surfaces can't drift. The topologies still differ — VSA is a genuine
+clustered SAN, while a VTL drive is usually owned by one backup
+server — but "one connection per session" (`MaxConnections=1`, no
+MC/S) does not mean "one host per LUN": distinct initiators each open
+their own session (distinct TSIH), so two I_T nexuses can reach the
+same drive and a reservation genuinely arbitrates between them.
 
-**thurvtld (tape)** is single-initiator-per-LUN by
-construction. `MaxConnections=1`, no MC/S, and no second target port
-together mean only one host can ever be talking to a given drive, so
-there is no contention a reservation could resolve:
-
-- **RESERVE / RELEASE (6) and (10) — no-op + GOOD.** Backup software
-  (Veeam, NetBackup, BackupExec, TSM) still issues the legacy SPC-2
-  "claim the device" CDB at session acquire; accepting it is
-  truthful when the topology guarantees a single initiator.
-- **PERSISTENT RESERVE OUT (0x5F) — rejected** with ILLEGAL REQUEST,
-  omitted from REPORT SUPPORTED OPERATION CODES. Accepting it as a
-  no-op would falsely tell a clustered host a fence is in place.
-- **PERSISTENT RESERVE IN (0x5E) — yes.** Returns the truthful "no
-  reservations" descriptor.
-
-**thurvsad (block)** is the opposite case — a genuine
-multi-initiator SAN. Windows Failover Cluster, VMware MSCS, Pacemaker
-`fence_scsi`, and Oracle ASM all depend on SCSI-3 persistent
-reservations to decide which node owns a LUN, so thurvsa implements
-the PR family for real:
+**thurvsad (block)** — Windows Failover Cluster, VMware MSCS,
+Pacemaker `fence_scsi`, and Oracle ASM all depend on SCSI-3
+persistent reservations to decide which node owns a LUN:
 
 - **PRIN (0x5E) READ KEYS / READ RESERVATION / READ FULL STATUS**
   walk live `ReservationManager` state. **REPORT CAPABILITIES**
@@ -187,11 +175,27 @@ the PR family for real:
   by the dropped nexus are released; AR reservations rotate the
   recorded holder to a surviving registrant.
 
-thurvsa deliberately does not implement the legacy SPC-2
-RESERVE/RELEASE (6/10) at all. SBC-3 does not put them in its
-mandatory set, and the clusters that matter — Windows, VMware,
-Linux — use the SCSI-3 PR family exclusively, so the older CDB pair
-would be dead surface.
+**thurvtld (tape)** implements the same PR family on the **drive LUN**
+(LUN ≥ 1), reusing the shared `ReservationManager` (issue #16). PRIN /
+PROUT service actions, the I_T-nexus keying, the APTPL / SPEC_I_PT /
+ALL_TG_PT rejections, and the session-close `drop_nexus` are identical
+to the block side. The differences are tape-shaped:
+
+- **Data-path enforcement** fences the medium opcodes: WRITE(6) 0x0A,
+  WRITE FILEMARKS 0x10 / 0x80, ERASE 0x19, FORMAT MEDIUM 0x04
+  (write-side) and READ(6) 0x08, VERIFY 0x13 / 0x8F, SPACE 0x11 / 0x91
+  (read-side) return RESERVATION CONFLICT to a non-permitted nexus.
+  Positioning (REWIND, LOCATE, READ POSITION, LOAD/UNLOAD), mode
+  pages, identity, and the PR commands themselves are never fenced
+  (SAM-5 §5.9.1).
+- **RESERVE / RELEASE (6) and (10) — no-op + GOOD.** The legacy SPC-2
+  "claim the device" CDBs some backup software issues at session
+  acquire stay accepted no-ops (CRH = 0); the SCSI-3 PR family is the
+  real mechanism.
+- **Medium changer (LUN 0)** keeps the historical PRIN stub and
+  rejects PROUT — VTL does not model SMC reservation fencing of MOVE
+  MEDIUM. PROUT (0x5F) is therefore absent from the changer's REPORT
+  SUPPORTED OPERATION CODES but present in the drive's.
 
 ### Read-attribute / write-attribute (thurvtl tape only)
 
@@ -823,26 +827,31 @@ in a different spec baseline. Both ends are declined at the CLI.
 
 ### Deliberate divergences from typical LTO hardware
 
-#### PERSISTENT RESERVE OUT (0x5F) — rejected
+#### PERSISTENT RESERVE OUT (0x5F) — implemented on the drive LUN
 
-VTL does not model multi-host clustering and keeps no reservation-key
-state. That makes silent acceptance of PROUT REGISTER actively
-dangerous: two hosts could each be told their REGISTER succeeded,
-each conclude it holds the exclusive reservation, and write over each
-other's tapes. Returning CHECK CONDITION + ILLEGAL REQUEST avoids
-that trap — clustering-aware backup software (a Veeam HA pair, a
-NetBackup MSDP cluster, a Bacula multi-director) reads the rejection
-as "no PR here" and cleanly downgrades to single-host mode. The
-read-side opcode, PERSISTENT RESERVE IN (0x5E), stays supported and
-returns the truthful "no registrations / no reservation / no
-capabilities" answer. PROUT is also dropped from REPORT SUPPORTED
-OPERATION CODES so it never appears discoverable. This is how the
-enterprise VTL category generally treats shared-drive PROUT. The
-block target takes the opposite path — thurvsa *does* implement PROUT
-for real, because it is a genuine multi-initiator SAN; see
-[Part 3 (SBC-3)](#part-3-sbc-3-vsa), with the side-by-side contrast
-in [Part 1](#part-1-spc-4-sam-5-and-iscsi)
+Earlier releases rejected PROUT on the tape drive, on the theory that
+a VTL is single-initiator and a no-op accept could mislead a clustered
+host into believing it held a fence. That reasoning was too cautious:
+`MaxConnections=1` only forbids multiple connections *within* one
+session — distinct initiators still open distinct sessions (distinct
+TSIH) to the same drive, so a reservation genuinely arbitrates between
+them. As of issue #16 the drive LUN (LUN ≥ 1) implements the full
+PERSISTENT RESERVE family for real, backed by the same shared
+`scsi_spc::reservations::ReservationManager` the block target uses:
+REGISTER / RESERVE / RELEASE / CLEAR / PREEMPT / PREEMPT AND ABORT /
+REGISTER AND IGNORE EXISTING KEY, truthful PRIN, and RESERVATION
+CONFLICT (status 0x18) on medium read/write opcodes for a non-permitted
+nexus. PROUT (0x5F) now appears in the drive's REPORT SUPPORTED
+OPERATION CODES. The full behavior — service actions, the enforcement
+opcode set, session-close `drop_nexus` — is in
+[Part 1](#part-1-spc-4-sam-5-and-iscsi)
 § *Reservations — thurvtl tape vs thurvsa block*.
+
+The one remaining divergence is the **medium changer (LUN 0)**: it
+keeps the historical PRIN stub and still rejects PROUT, because VTL
+does not model SMC reservation fencing of MOVE MEDIUM. PROUT is
+therefore absent from the changer's REPORT SUPPORTED OPERATION CODES
+but present in the drive's.
 
 #### Operator-driven configuration changes — UAs not broadcast
 

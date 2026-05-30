@@ -163,6 +163,7 @@ check_prerequisites() {
         [sg_turs]="sudo apt-get install sg3-utils"
         [sg_requests]="sudo apt-get install sg3-utils"
         [sg_prevent]="sudo apt-get install sg3-utils"
+        [sg_persist]="sudo apt-get install sg3-utils"
         [sg_read_attr]="sudo apt-get install sg3-utils"
         [sg_raw]="sudo apt-get install sg3-utils"
         [mtx]="sudo apt-get install mtx"
@@ -172,7 +173,7 @@ check_prerequisites() {
         [curl]="sudo apt-get install curl"
         [systemctl]="(systemd should be present on any modern Linux)"
     )
-    for tool in sg_inq sg_logs sg_modes sg_luns sg_turs sg_requests sg_prevent sg_read_attr sg_raw mtx mt iscsiadm lsscsi curl systemctl; do
+    for tool in sg_inq sg_logs sg_modes sg_luns sg_turs sg_requests sg_prevent sg_persist sg_read_attr sg_raw mtx mt iscsiadm lsscsi curl systemctl; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
             hints+=("  - $tool: ${HINTS[$tool]}")
@@ -947,14 +948,35 @@ t_tape_pr_in_report_capabilities() {
 t_tape_pr_in_read_keys() {
     sg_raw -r 16 "$TAPE_SG_DEVICE" 5e 00 00 00 00 00 00 00 10 00
 }
-# PERSISTENT RESERVE OUT is intentionally rejected by the daemon — we don't
-# model multi-host clustering and don't want backup software to silently
-# believe it acquired exclusive access. Test expects CHECK CONDITION +
-# ILLEGAL REQUEST so the host downgrades to single-host mode.
-t_tape_pr_out_register_rejected() {
-    expect_check_cond_with_dataout "$TAPE_SG_DEVICE" 24 \
-        "Illegal Request" "Invalid command operation code|Invalid field in cdb" \
-        5f 00 00 00 00 00 00 00 00 18 00 00
+# PERSISTENT RESERVE OUT is implemented on the tape drive LUN (issue #16):
+# REGISTER a key, RESERVE Exclusive Access, confirm the key + holder are
+# visible via PRIN READ KEYS / READ RESERVATION, then tear down. Single-host
+# loopback uses one InitiatorName, so the reservation is held by this nexus
+# and never fences itself; cross-nexus RESERVATION CONFLICT is covered by the
+# scsi-ssc unit tests (two distinct TSIHs).
+t_tape_pr_register_and_reserve() {
+    local key="0xDEADBEEF"
+    local out
+    out=$(sg_persist --out --register --param-sark="$key" "$TAPE_SG_DEVICE" 2>&1); echo "$out"
+    sg_persist --out --reserve --prout-type=3 --param-rk="$key" "$TAPE_SG_DEVICE" 2>&1
+    out=$(sg_persist --in --read-keys "$TAPE_SG_DEVICE" 2>&1); echo "$out"
+    if echo "$out" | grep -qiE 'deadbeef|generation'; then
+        log_info "Registration visible via READ KEYS"
+    else
+        log_error "READ KEYS did not show registered key"
+        return 1
+    fi
+    out=$(sg_persist --in --read-reservation "$TAPE_SG_DEVICE" 2>&1); echo "$out"
+    if echo "$out" | grep -qiE 'reservation|generation'; then
+        log_info "READ RESERVATION shows holder"
+    else
+        log_error "READ RESERVATION did not return a holder"
+        return 1
+    fi
+    # Tear down so subsequent tests aren't fenced.
+    sg_persist --out --release --prout-type=3 --param-rk="$key" "$TAPE_SG_DEVICE" 2>&1
+    sg_persist --out --register --param-rk="$key" --param-sark=0 "$TAPE_SG_DEVICE" 2>&1
+    return 0
 }
 # INITIALIZE ELEMENT STATUS WITH RANGE (CDB 0x37, 10 bytes per SMC-3 §6.5).
 # RANGE bit set, start=storage_start (1001 = slot 1), count=4 storage slots.
@@ -1198,7 +1220,7 @@ main() {
     run_test "REPORT TARGET PORT GROUPS (tape, ALUA)"         t_tape_report_target_port_groups
     run_test "PERSISTENT RESERVE IN — REPORT CAPABILITIES"    t_tape_pr_in_report_capabilities
     run_test "PERSISTENT RESERVE IN — READ KEYS"              t_tape_pr_in_read_keys
-    run_test "PERSISTENT RESERVE OUT (REGISTER) -> rejected"  t_tape_pr_out_register_rejected
+    run_test "PERSISTENT RESERVE OUT register+reserve+readback" t_tape_pr_register_and_reserve
     run_test "RESERVE(6) (tape, no-op accept)"                t_reserve_6_tape
     run_test "RELEASE(6) (tape, no-op accept)"                t_release_6_tape
     run_test "RESERVE(10) (tape, no-op accept)"               t_reserve_10_tape

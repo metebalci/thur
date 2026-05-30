@@ -343,7 +343,7 @@ the per-product identity and are validated at startup.
 | 0x4D | LOG SENSE | Page 0x00 (Supported Log Pages) only, listing just 0x00 itself — the SBC-3 / SPC-4 SAS-vintage log pages (temperature, retry counters, etc.) don't apply to a virtual block target. Other page codes / non-zero subpages → INVALID FIELD IN CDB per SPC-4 §7.2.5. |
 | 0x55 | MODE SELECT(10) | Same semantics as 0x15. Honors the LONGLBA bit on header byte 4 to pick the long-form vs short-form block descriptor. |
 | 0x5A | MODE SENSE(10) | Same coverage as 0x1A. |
-| 0x5E | PERSISTENT RESERVE IN | Service actions 0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES, 0x03 READ FULL STATUS. PR_GENERATION counter; in-memory state. REPORT CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01` (WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR, EX_AC_AR), TMV=1, PTPL_C=0. READ FULL STATUS renders an iSCSI format-0 TransportID per registrant (initiator IQN, NUL-padded). See *Persistent reservations (thurvsa)* below for state model. |
+| 0x5E | PERSISTENT RESERVE IN | Service actions 0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES, 0x03 READ FULL STATUS. PR_GENERATION counter; in-memory state. REPORT CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01` (WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR, EX_AC_AR), TMV=1, PTPL_C=0. READ FULL STATUS renders an iSCSI format-0 TransportID per registrant (initiator IQN, NUL-padded). See *Persistent reservations* below for the shared state model. |
 | 0x5F | PERSISTENT RESERVE OUT | Service actions 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT (collapses to PREEMPT — no taskman hook), 0x06 REGISTER AND IGNORE EXISTING KEY. SA 0x07 REGISTER AND MOVE rejected. APTPL=1 / SPEC_I_PT=1 / ALL_TG_PT=1 in the parameter list reject as INVALID FIELD IN PARAMETER LIST. SCOPE must be 0x00 (LU_SCOPE) for SAs other than REGISTER variants. |
 | 0x83 sa 0x00 | EXTENDED COPY (LID1) | SPC-3 §6.3 EXTENDED COPY service action 0x00 — the VMware VAAI "Hardware Accelerated Copy" primitive. Parameter list = 16-byte header (target descriptor list length, segment descriptor list length, inline data length must be 0) + N × 32-byte identification target descriptors (type 0xE4, designator type 0x03 NAA only — 8 bytes binary; T10 designators rejected because they don't fit the descriptor's 20-byte designator slot) + M × 28-byte block-to-block segment descriptors (type 0x02; src CSCD index, dst CSCD index, 16-bit block count, 64-bit src LBA, 64-bit dst LBA). LID4 (sa 0x01) rejects as INVALID FIELD IN CDB; ODX service actions (sa 0x10 POPULATE TOKEN and sa 0x11 WRITE USING TOKEN) are dispatched separately — see below. Other target descriptor types and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment routing: when src and dst resolve to volumes sharing a chunk pool (same backend + matching `DedupScope` namespace), LBAs and block count are all whole multiples of the volume's page size, and src/dst byte ranges don't overlap → page-index hash clone fast path (`PageCache::clone_page_range_into`) — zero chunk-pool I/O, no backend round-trip. Cross-LUN clones reach the fast path under those same conditions. Otherwise → 1 MiB-bounded streaming bytes copy. Destination LUN reservation-gated; WORM destination volumes refuse with WRITE PROTECTED. Synchronous: the whole copy completes before GOOD returns. RECEIVE COPY RESULTS SA 0x00 reports "completed without errors" for any list ID. |
 | 0x83 sa 0x10 | POPULATE TOKEN (ODX) | Hyper-V Offloaded Data Transfer step 1. CDB carries a 32-bit LIST IDENTIFIER (bytes 2-5) and a 32-bit PARAMETER LIST LENGTH (bytes 10-13). Parameter list (≥ 16 bytes): 2-byte ROD TOKEN DATA LENGTH (= plist_len − 2) + 1-byte IMMED flag (ignored — always sync) + 1 reserved + 4-byte INACTIVITY TIMEOUT (seconds, 0 → default 300 s; clamped to 600 s max) + 6 reserved + 2-byte BLOCK DEVICE RANGE DESCRIPTORS LIST LENGTH + N × 16-byte BDRD `{LBA u64, NUMBER OF BLOCKS u32, reserved u32}`. Source LUN is the addressed LUN; no CSCD descriptors. Max N = 8 (matches VPD 0x8F descriptor 0x0000). Every range must be page-aligned (LBA + blocks are whole multiples of `sectors-per-page`); misalignment → INVALID FIELD IN PARAMETER LIST. The handler flushes any in-range dirty pages, walks the page index to collect per-page hashes, pins every unique chunk via `shared_pool::ChunkPool::pin` (eviction + manifest-walking GC skip pinned chunks), mints a 512-byte ROD token (`OsRng`), and records `{list_id → Done, transfer_blocks, token}` in the per-dispatcher token manager. Sync-inline (returns GOOD as soon as the token + job are recorded). |
@@ -366,7 +366,14 @@ the per-product identity and are validated at startup.
 Unknown opcodes → CHECK CONDITION + ILLEGAL REQUEST + INVALID
 COMMAND OPERATION CODE.
 
-#### Persistent reservations (thurvsa)
+#### Persistent reservations (shared: thurvsa block + thurvtl tape drive)
+
+Both products share one persistent-reservation state machine
+(`scsi_spc::reservations::ReservationManager`). The wire surface,
+state model, and PROUT / PRIN encodings below are identical on the
+thurvsa block LUNs and the thurvtl tape **drive** LUNs (LUN ≥ 1); only
+the data-path opcodes each gates differ (block READ/WRITE/SYNC vs tape
+medium read/write — see the tape note at the end of this section).
 
 The state model is per-LUN. Each LUN carries a set of registrations,
 each keyed by an I_T nexus `(tsih, initiator_iqn)`; at most one active
@@ -423,6 +430,17 @@ Reservation state is held in memory only, so a daemon restart drops
 every registration. That is not a hidden behavior — REPORT
 CAPABILITIES advertises `PTPL_C = 0` precisely so that initiators know
 to re-register on reconnect.
+
+On the **thurvtl tape drive LUN** the same state machine applies, with
+tape-shaped data-path enforcement (issue #16): the write gate fences
+WRITE(6) 0x0A, WRITE FILEMARKS 0x10 / 0x80, ERASE 0x19, and FORMAT
+MEDIUM 0x04; the read gate fences READ(6) 0x08, VERIFY 0x13 / 0x8F,
+and SPACE 0x11 / 0x91. Positioning (REWIND, LOCATE, READ POSITION,
+LOAD/UNLOAD), mode pages, identity, and the PR commands themselves are
+never fenced (SAM-5 §5.9.1). The medium changer (LUN 0) does **not**
+participate: it keeps the legacy no-op RESERVE(6/10) plus a PRIN stub
+and rejects PROUT, so 0x5F appears in the drive's REPORT SUPPORTED
+OPERATION CODES but not the changer's.
 
 ### Format / partitioning
 

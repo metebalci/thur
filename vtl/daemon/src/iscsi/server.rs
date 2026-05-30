@@ -151,6 +151,7 @@ impl IscsiServer {
             diagnostic_store: Arc::clone(&self.state.diagnostic_store),
             target_iqn: self.config.iscsi.target_iqn.clone(),
             alua,
+            reservations: Arc::clone(&self.state.reservations),
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 

@@ -300,12 +300,24 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   LogicalUnitGroup` (0x06) for the LUG descriptor), `report_luns.rs`
   (`build_report_luns`), `mode.rs` (MODE PARAMETER HEADER 6/10 encoders
   + length patchers), `pr.rs` (persistent-reservation primitive types —
-  scope / type / service-action enums, `ReservationKey` newtype).
-  shared-iscsi's `sense.rs` + `handler.rs` request/response types and
-  VSA's `scsi/types.rs` are thin re-export shells of scsi-spc.
+  scope / type / service-action enums, `ReservationKey` newtype),
+  `reservations.rs` (the transport-neutral PERSISTENT RESERVE state
+  machine — `ReservationManager` + `Nexus`, per-LUN registrations /
+  reservation / `PR_GENERATION`, the PROUT service-action handlers, the
+  PRIN renderers, `allow_read` / `allow_write` / `drop_nexus`, and the
+  `prin` / `prout` entry points returning the response-neutral
+  `PrInOutcome` / `PrOutOutcome`; both products' dispatchers are thin
+  adapters over it). shared-iscsi's `sense.rs` + `handler.rs`
+  request/response types and VSA's `scsi/types.rs` are thin re-export
+  shells of scsi-spc.
 - **scsi-ssc** — drive-LUN SCSI dispatch + drive-manager primitives +
   tape SCSI helpers (sense, log pages, MAM attributes, encryption
-  pages). Consumed by `thurvtld`.
+  pages). PERSISTENT RESERVE IN/OUT (0x5E / 0x5F) on the drive LUN run
+  against the shared `scsi_spc::reservations::ReservationManager`
+  (threaded through `ScsiCtx`); `dispatch_drive_lun` enforces a
+  reservation gate that fences medium read/write opcodes with
+  RESERVATION CONFLICT. The changer LUN keeps the legacy stub / reject.
+  Consumed by `thurvtld`.
 - **scsi-smc** — changer-LUN SCSI dispatch (the six SMC opcodes:
   INITIALIZE / READ ELEMENT STATUS, MOVE / EXCHANGE MEDIUM, SEND VOLUME
   TAG, INITIALIZE WITH RANGE) plus element-address topology helpers
@@ -563,16 +575,23 @@ COMPARE AND WRITE LENGTH / MAXIMUM UNMAP LBA COUNT / OPTIMAL UNMAP
 GRANULARITY (= sectors-per-page), VPD 0xB2 carries LBPU / LBPRZ /
 PROVISIONING TYPE, READ CAPACITY (16) sets LBPME + LBPRZ in byte 14.
 
-**Reservations subsystem** (`scsi/reservations.rs`): per-LUN
-registrations + at most one reservation. Registrations keyed by I_T
-nexus `(tsih, initiator_iqn)`; the SBC-3 type matrix WR_EX / EX_AC /
+**Reservations subsystem** (`scsi/sbc/src/reservations.rs`): a thin
+adapter over the shared `scsi_spc::reservations::ReservationManager`
+(the state machine itself was hoisted into scsi-spc so the tape drive
+LUN can share it — see scsi-spc above). The adapter builds a `Nexus`
+from the SBC `ScsiRequest`, parses the 0x5E / 0x5F CDBs via the shared
+slicers, and maps `PrInOutcome` / `PrOutOutcome` onto `ScsiResponse`.
+Per-LUN registrations + at most one reservation, keyed by I_T nexus
+`(tsih, initiator_iqn)`; the SBC-3 type matrix WR_EX / EX_AC /
 WR_EX_RO / EX_AC_RO / WR_EX_AR / EX_AC_AR is honored end-to-end (REPORT
 CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01`). Data-path
 enforcement: WRITE / SYNCHRONIZE CACHE check `allow_write`, READ checks
 `allow_read`; deny → SCSI status 0x18 (RESERVATION CONFLICT) with no
 sense. State is in-memory only — PTPL advertised as not capable.
 `ScsiHandler::on_session_close` calls
-`ReservationManager::drop_nexus(tsih)`.
+`ReservationManager::drop_nexus(tsih)`. The thurvtl tape drive LUN
+reuses the same manager (`vtl/daemon` threads an `Arc<ReservationManager>`
+through `ScsiCtx`; enforcement + handlers live in scsi-ssc).
 
 Modules:
 `vsa/daemon/src/scsi/{types,handler,inquiry,sizing,data_path,mode_sense,reservations,probes,maintenance}.rs`

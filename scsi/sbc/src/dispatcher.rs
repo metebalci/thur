@@ -32,7 +32,7 @@ use crate::maintenance;
 use crate::mode_sense;
 use crate::odx::TokenManager;
 use crate::probes;
-use crate::reservations::{Nexus, ReservationManager};
+use crate::reservations::{ReservationManager, SbcReservations, nexus_from_request};
 use crate::sizing;
 use crate::types::{ScsiRequest, ScsiResponse, SenseData};
 
@@ -163,7 +163,7 @@ impl SbcScsiDispatcher {
             None => self.registry.get(req.lun),
         };
         let cache = cache_arc.as_deref();
-        let nexus = Nexus::from_request(&req);
+        let nexus = nexus_from_request(&req);
         match req.cdb[0] {
             0x00 => sizing::test_unit_ready(&req, cache),
             0x03 => probes::request_sense(&req, cache),

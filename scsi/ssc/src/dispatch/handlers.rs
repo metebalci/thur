@@ -25,6 +25,8 @@
 
 use anyhow::{Result, anyhow};
 
+use scsi_spc::reservations::{self, Nexus, PrInOutcome, PrOutOutcome};
+
 use crate::drive_manager;
 use crate::scsi;
 
@@ -1657,27 +1659,86 @@ pub fn handle_maintenance_out(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     }
 }
 
-/// PERSISTENT RESERVE IN (SPC §6.13). We don't implement real
-/// multi-host clustering, but we answer the standard service actions
-/// (0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES,
-/// 0x03 READ FULL STATUS) so backup-software probe paths don't error.
-pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    let cdb = ctx.cdb;
+/// ILLEGAL REQUEST / INVALID FIELD IN CDB sense for the PR handlers.
+fn pr_invalid_field_in_cdb() -> ScsiResp {
+    ScsiResp::check_condition_with_sense(
+        scsi::sense::SenseDataBuilder::new(
+            scsi::sense::SenseKey::IllegalRequest,
+            scsi::sense::ASC_INVALID_FIELD_IN_CDB,
+        )
+        .build(),
+    )
+}
 
+/// ILLEGAL REQUEST / INVALID FIELD IN PARAMETER LIST (0x26) sense.
+fn pr_invalid_field_in_param_list() -> ScsiResp {
+    ScsiResp::check_condition_with_sense(
+        scsi::sense::SenseDataBuilder::new(
+            scsi::sense::SenseKey::IllegalRequest,
+            scsi::sense::AdditionalSenseCode {
+                asc: 0x26,
+                ascq: 0x00,
+            },
+        )
+        .build(),
+    )
+}
+
+/// ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED (0x25) sense.
+fn pr_lu_not_supported() -> ScsiResp {
+    ScsiResp::check_condition_with_sense(
+        scsi::sense::SenseDataBuilder::new(
+            scsi::sense::SenseKey::IllegalRequest,
+            scsi::sense::AdditionalSenseCode {
+                asc: 0x25,
+                ascq: 0x00,
+            },
+        )
+        .build(),
+    )
+}
+
+/// PERSISTENT RESERVE IN (SPC-4 §6.16, opcode 0x5E). On a drive LUN
+/// this walks the shared [`scsi_spc::reservations::ReservationManager`]
+/// and answers READ KEYS / READ RESERVATION / REPORT CAPABILITIES /
+/// READ FULL STATUS truthfully. The medium changer (LUN 0) keeps the
+/// historical stub — real persistent reservations live on the drive
+/// LUNs only (issue #16); SMC reservation fencing of MOVE MEDIUM is
+/// out of scope.
+pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
+    if ctx.is_changer_lun() {
+        return changer_persistent_reserve_in_stub(ctx);
+    }
+    // The synthesized CDB is always 16 bytes, so `parse_prin_cdb`
+    // never short-circuits here; the guard keeps the byte offsets
+    // single-sourced with the block side.
+    let Some((service_action, alloc)) = reservations::parse_prin_cdb(&ctx.cdb) else {
+        return Ok(pr_invalid_field_in_cdb());
+    };
+    match ctx.reservations.prin(ctx.lun as u64, service_action, true) {
+        PrInOutcome::Good(body) => Ok(ScsiResp {
+            status: ScsiStatus::Good,
+            data_out: limit_len(body, alloc as u32),
+            sense: None,
+        }),
+        PrInOutcome::InvalidFieldInCdb => Ok(pr_invalid_field_in_cdb()),
+        PrInOutcome::LuNotSupported => Ok(pr_lu_not_supported()),
+    }
+}
+
+/// PERSISTENT RESERVE IN stub for the medium changer (LUN 0) —
+/// preserves the pre-PR "no reservations / no registrations / no
+/// capabilities" response so changer behavior is unchanged.
+fn changer_persistent_reserve_in_stub(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
+    let cdb = ctx.cdb;
     let service_action = cdb[1] & 0x1F;
     let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as u32;
     let d = match service_action {
-        0x00 | 0x03 => {
-            // 8-byte header: PRgeneration (4) + additional length (4) = 0
-            vec![0u8; 8]
-        }
-        0x01 => {
-            // 8-byte header: PRgeneration (4) + additional length (4) = 0
-            vec![0u8; 8]
-        }
+        // READ KEYS / READ RESERVATION / READ FULL STATUS: 8-byte
+        // header (PRgeneration + additional length = 0).
+        0x00 | 0x01 | 0x03 => vec![0u8; 8],
         0x02 => {
-            // REPORT CAPABILITIES: 8-byte response, all flags clear,
-            // no persistent-through-power-loss support.
+            // REPORT CAPABILITIES: 8-byte response, all flags clear.
             let mut buf = vec![0u8; 8];
             buf[0] = 0x00;
             buf[1] = 0x08; // length
@@ -1685,7 +1746,7 @@ pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         }
         _ => {
             tracing::warn!(
-                "PERSISTENT RESERVE IN: unsupported SA 0x{:02x}",
+                "PERSISTENT RESERVE IN (changer): unsupported SA 0x{:02x}",
                 service_action
             );
             return Ok(ScsiResp::check_condition());
@@ -1698,19 +1759,46 @@ pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     })
 }
 
-/// PERSISTENT RESERVE OUT (SPC §6.14). We deliberately refuse —
-/// clustering-aware backup software (Veeam HA, NetBackup MSDP
-/// cluster, etc.) downgrades to single-host mode safely instead of
-/// silently believing it has acquired exclusive access. PRIN (0x5E)
-/// still reports "no reservations / no registrations / no
-/// capabilities" — that's the truthful answer and lets probes complete.
+/// PERSISTENT RESERVE OUT (SPC-4 §6.16, opcode 0x5F). On a drive LUN
+/// this mutates the shared reservation state (REGISTER / RESERVE /
+/// RELEASE / CLEAR / PREEMPT / PREEMPT AND ABORT / REGISTER AND
+/// IGNORE EXISTING KEY); the per-nexus enforcement gate in
+/// [`dispatch_drive_lun`](crate::dispatch::dispatch_drive_lun) then
+/// fences medium read/write opcodes against non-permitted
+/// initiators. The medium changer (LUN 0) keeps PROUT rejected — VTL
+/// does not model SMC reservation fencing.
 pub fn handle_persistent_reserve_out(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    let service_action = ctx.cdb[1] & 0x1F;
-    tracing::warn!(
-        "PERSISTENT RESERVE OUT rejected: SA=0x{:02x} (clustering not supported)",
-        service_action
+    if ctx.is_changer_lun() {
+        let service_action = ctx.cdb[1] & 0x1F;
+        tracing::warn!(
+            "PERSISTENT RESERVE OUT rejected on changer LUN: SA=0x{:02x}",
+            service_action
+        );
+        return Ok(ScsiResp::check_condition());
+    }
+    let nexus = Nexus::new(ctx.tsih, ctx.initiator_iqn.map(str::to_string));
+    // PROUT Data-Out (the 24-byte parameter list) is the drained
+    // payload on the PDU, not a separate field.
+    let Some(f) = reservations::parse_prout_cdb(&ctx.cdb, &ctx.pdu.data) else {
+        return Ok(pr_invalid_field_in_cdb());
+    };
+    let outcome = ctx.reservations.prout(
+        ctx.lun as u64,
+        f.service_action,
+        f.scope,
+        f.type_byte,
+        f.param_list,
+        f.param_list_len,
+        &nexus,
+        true,
     );
-    Ok(ScsiResp::check_condition())
+    Ok(match outcome {
+        PrOutOutcome::Good => ScsiResp::good(),
+        PrOutOutcome::ReservationConflict => ScsiResp::reservation_conflict(),
+        PrOutOutcome::InvalidFieldInCdb => pr_invalid_field_in_cdb(),
+        PrOutOutcome::InvalidFieldInParameterList => pr_invalid_field_in_param_list(),
+        PrOutOutcome::LuNotSupported => pr_lu_not_supported(),
+    })
 }
 
 /// MAINTENANCE IN (SPC §6.27). Service action picks the variant —
@@ -1732,17 +1820,18 @@ pub fn handle_maintenance_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 0x3C, 0x4C, 0x4D, 0x55, 0x56, 0x57, 0x5A, 0x5E, 0xA0, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6,
                 0xB5, 0xB6, 0xB8,
             ];
-            // PERSISTENT RESERVE OUT (0x5F) is intentionally absent —
-            // the daemon rejects it with CHECK CONDITION rather than
-            // claiming partial support. PRIN (0x5E) is advertised
-            // because it returns truthful "no reservations" responses.
-            // RESERVE/RELEASE (6/10) and SEND VOLUME TAG are accepted
-            // as no-ops for backup-software compatibility — see
-            // docs/SPEC.md "Reservations" and "SEND VOLUME TAG".
+            // PERSISTENT RESERVE OUT (0x5F) is absent from the changer
+            // list above — VTL does not model SMC reservation fencing,
+            // so PROUT on LUN 0 stays rejected. The drive list below
+            // advertises both 0x5E and 0x5F: the drive LUN implements
+            // real persistent reservations (issue #16). RESERVE/RELEASE
+            // (6/10) and SEND VOLUME TAG are accepted as no-ops for
+            // backup-software compatibility — see docs/SPEC.md
+            // "Reservations" and "SEND VOLUME TAG".
             let opcodes_tape: &[u8] = &[
                 0x00, 0x01, 0x03, 0x04, 0x05, 0x08, 0x0A, 0x0B, 0x10, 0x11, 0x12, 0x13, 0x15, 0x19,
                 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x2B, 0x34, 0x3B, 0x3C, 0x44, 0x4C, 0x4D, 0x55, 0x5A,
-                0x5E, 0x80, 0x82, 0x8C, 0x8D, 0x8F, 0x91, 0x92, 0xA0, 0xA2, 0xA3, 0xA4, 0xB5,
+                0x5E, 0x5F, 0x80, 0x82, 0x8C, 0x8D, 0x8F, 0x91, 0x92, 0xA0, 0xA2, 0xA3, 0xA4, 0xB5,
             ];
             let opcodes: &[u8] = if ctx.is_changer_lun() {
                 opcodes_changer
