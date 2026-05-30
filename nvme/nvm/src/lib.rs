@@ -38,11 +38,13 @@ use std::sync::Arc;
 
 use core_block::PageCache;
 
+pub mod aer;
 pub mod dispatcher;
 pub mod handler;
 pub mod opcode;
 pub mod reservations;
 
+pub use aer::{AerCompletion, AerHub, ConnToken, ReservationEvent, ReservationEventKind};
 pub use dispatcher::NvmeNvmDispatcher;
 pub use handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
 pub use opcode::NvmOpcode;

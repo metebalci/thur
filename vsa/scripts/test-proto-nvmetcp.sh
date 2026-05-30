@@ -398,7 +398,7 @@ run_io_round_trip() {
 }
 
 run_reservation_tests() {
-    log_info "Running NVMe reservation flow (register / acquire / report / release)..."
+    log_info "Running NVMe reservation flow (register / acquire / report / notif-log / release)..."
     local dev="/dev/${NVME_DEVICE}n1"
     local key=0x123456
 
@@ -427,6 +427,23 @@ run_reservation_tests() {
     else
         log_fail "Reservation Report missing registrant key 0x123456"
         cat "$TEST_DIR/resv-report.log"
+    fi
+
+    # Reservation Notification log page (LID 0x80). Before AER landed
+    # this returned "Invalid Field in Command"; it must now return a
+    # well-formed 64-byte page. A single-host flow never queues an entry
+    # (the issuing host is never notified of its own ops), so the page is
+    # the all-zero empty form — a successful read is the assertion.
+    # Cross-host notification semantics (which type, which host) are
+    # covered by the Rust unit + transport tests.
+    if nvme resv-notif-log --help >/dev/null 2>&1; then
+        if nvme resv-notif-log "$dev" >"$TEST_DIR/resv-notif-log.log" 2>&1; then
+            log_pass "Reservation Notification log (LID 0x80) returns a valid page"
+        else
+            log_fail "resv-notif-log failed: $(cat "$TEST_DIR/resv-notif-log.log")"
+        fi
+    else
+        log_info "nvme-cli lacks resv-notif-log; skipping LID 0x80 assertion"
     fi
 
     if ! nvme resv-release "$dev" --crkey="$key" --rtype=1 --rrela=0 \

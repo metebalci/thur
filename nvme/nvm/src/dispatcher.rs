@@ -36,6 +36,7 @@ use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusF
 use scsi_spc::reservations::{RegistrantId, ReservationManager};
 
 use crate::NamespaceLookup;
+use crate::aer::AerHub;
 use crate::handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
 use crate::opcode::NvmOpcode;
 
@@ -70,6 +71,13 @@ const FID_NUMBER_OF_QUEUES: u8 = 0x07;
 /// command fails and the host aborts the session.
 const FID_KEEP_ALIVE_TIMER: u8 = 0x0F;
 
+/// Feature Identifier for Reservation Notification Mask (NVMe NVM
+/// Command Set). Per-namespace; CDW11 bits 1/2/3 mask Registration
+/// Preempted / Reservation Released / Reservation Preempted
+/// notifications respectively (0 = all enabled). The host's
+/// enable/disable knob for reservation async events.
+const FID_RESERVATION_NOTIF_MASK: u8 = 0x82;
+
 pub struct NvmeNvmDispatcher {
     registry: Arc<dyn NamespaceLookup>,
     subnqn: String,
@@ -100,6 +108,11 @@ pub struct NvmeNvmDispatcher {
     /// drops every registration (PTPL not advertised), so hosts
     /// re-register on reconnect.
     reservations: Arc<ReservationManager>,
+    /// Per-controller AER + reservation-notification state. Shared
+    /// (one `Arc`) with the NVMe/TCP transport so an event raised here
+    /// on a reservation op completes an AER parked on the host's admin
+    /// connection. Built once at boot alongside the dispatcher.
+    aer: Arc<AerHub>,
 }
 
 impl NvmeNvmDispatcher {
@@ -113,6 +126,7 @@ impl NvmeNvmDispatcher {
         controller_sn: String,
         controller_mn: String,
         controller_fr: String,
+        aer: Arc<AerHub>,
     ) -> Self {
         Self {
             registry,
@@ -124,6 +138,7 @@ impl NvmeNvmDispatcher {
             num_io_cqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
             kato_ms: AtomicU32::new(0),
             reservations: Arc::new(ReservationManager::new()),
+            aer,
         }
     }
 
@@ -145,16 +160,22 @@ impl NvmeNvmDispatcher {
 
         // Reservation commands are never conflict-gated (their own key
         // check is the only conflict path); they dispatch directly.
+        // Reservation Register / Acquire / Release may fence another
+        // host; the adapter returns the notifications that fan out, and
+        // we hand them to the AER hub (which queues a LID 0x80 entry and
+        // completes a parked AER on the affected host's admin queue).
         let host_id = cmd.host_id.unwrap_or([0u8; 16]);
         match opcode {
             NvmOpcode::ReservationRegister => {
-                return crate::reservations::reservation_register(
+                let (resp, events) = crate::reservations::reservation_register(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
+                self.emit_reservation_events(events);
+                return resp;
             }
             NvmOpcode::ReservationReport => {
                 return crate::reservations::reservation_report(
@@ -165,22 +186,26 @@ impl NvmeNvmDispatcher {
                 );
             }
             NvmOpcode::ReservationAcquire => {
-                return crate::reservations::reservation_acquire(
+                let (resp, events) = crate::reservations::reservation_acquire(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
+                self.emit_reservation_events(events);
+                return resp;
             }
             NvmOpcode::ReservationRelease => {
-                return crate::reservations::reservation_release(
+                let (resp, events) = crate::reservations::reservation_release(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
+                self.emit_reservation_events(events);
+                return resp;
             }
             _ => {}
         }
@@ -224,6 +249,15 @@ impl NvmeNvmDispatcher {
         }
     }
 
+    /// Hand reservation notifications to the AER hub. Synchronous and
+    /// non-blocking — each `notify` queues a LID 0x80 entry for the
+    /// affected host and completes one parked AER if present.
+    fn emit_reservation_events(&self, events: Vec<crate::aer::ReservationEvent>) {
+        for event in events {
+            self.aer.notify(event);
+        }
+    }
+
     async fn dispatch_admin(&self, cmd: AdminCommand<'_>) -> NvmeResponse {
         let sqe = &cmd.sqe;
         let cid = sqe.cid;
@@ -232,9 +266,9 @@ impl NvmeNvmDispatcher {
         };
         match opcode {
             AdminOpcode::Identify => self.cmd_identify(cid, sqe, cmd.session_volumes).await,
-            AdminOpcode::GetFeatures => self.cmd_get_features(cid, sqe),
-            AdminOpcode::SetFeatures => self.cmd_set_features(cid, sqe),
-            AdminOpcode::GetLogPage => self.cmd_get_log_page(cid, sqe),
+            AdminOpcode::GetFeatures => self.cmd_get_features(cid, sqe, cmd.host_id),
+            AdminOpcode::SetFeatures => self.cmd_set_features(cid, sqe, cmd.host_id),
+            AdminOpcode::GetLogPage => self.cmd_get_log_page(cid, sqe, cmd.host_id),
             AdminOpcode::KeepAlive => {
                 // No-op — host pings us on the admin queue to confirm
                 // the controller is alive. We have nothing to update
@@ -243,15 +277,14 @@ impl NvmeNvmDispatcher {
                 NvmeResponse::just(Cqe::success(cid, 0, 0, 0))
             }
             AdminOpcode::AsyncEventRequest => {
-                // VSA produces no asynchronous events today (no
-                // namespace add/remove notifications, no firmware
-                // activation, no thermal events). Per NVMe Base §5.2
-                // AER has no timeout — never completing is legal —
-                // but Linux nvme-tcp posts AERs and logs warnings on
-                // controller bring-up if it doesn't see them
-                // completed within a short window. Return Invalid
-                // Command Opcode so the host stops resubmitting and
-                // logs a single, clear "AER not supported" notice.
+                // AER never completes synchronously — it parks until an
+                // event fires. The NVMe/TCP transport intercepts AER
+                // before this dispatch path (it owns the connection's
+                // writer and the per-controller `AerHub`), so a real
+                // host never reaches here. This arm only covers a
+                // non-transport caller (e.g. a unit test); there is no
+                // event to report on this synchronous path, so reflect
+                // "no immediate completion" as Invalid Opcode.
                 NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_opcode()))
             }
             AdminOpcode::Abort => {
@@ -271,7 +304,12 @@ impl NvmeNvmDispatcher {
         }
     }
 
-    fn cmd_get_features(&self, cid: u16, sqe: &nvme_base::Sqe) -> NvmeResponse {
+    fn cmd_get_features(
+        &self,
+        cid: u16,
+        sqe: &nvme_base::Sqe,
+        host_id: Option<[u8; 16]>,
+    ) -> NvmeResponse {
         // CDW10[7:0] FID, [10:8] SEL (0=current, 1=default, 2=saved,
         // 3=supported). We treat all SELs as "current" for now —
         // host most commonly uses SEL=0 and ours have no separate
@@ -288,11 +326,23 @@ impl NvmeNvmDispatcher {
                 let kato = self.kato_ms.load(Ordering::Acquire);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, kato))
             }
+            FID_RESERVATION_NOTIF_MASK => {
+                // Per-namespace mask (CDW1 NSID). Outside a real
+                // connection (no HOSTID) report all-enabled.
+                let host = host_id.unwrap_or([0u8; 16]);
+                let mask = self.aer.get_mask(host, sqe.nsid);
+                NvmeResponse::just(Cqe::success(cid, 0, 0, mask))
+            }
             _ => NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field())),
         }
     }
 
-    fn cmd_set_features(&self, cid: u16, sqe: &nvme_base::Sqe) -> NvmeResponse {
+    fn cmd_set_features(
+        &self,
+        cid: u16,
+        sqe: &nvme_base::Sqe,
+        host_id: Option<[u8; 16]>,
+    ) -> NvmeResponse {
         let fid = (sqe.cdw10 & 0xFF) as u8;
         tracing::debug!(
             fid = format!("0x{:02X}", fid),
@@ -300,6 +350,16 @@ impl NvmeNvmDispatcher {
             "nvme: Set Features",
         );
         match fid {
+            FID_RESERVATION_NOTIF_MASK => {
+                // Per-namespace (CDW1 NSID). CDW11 bits 1/2/3 suppress
+                // the three reservation notification classes. Store
+                // keyed by (HOSTID, NSID) so one host's masking can't
+                // silence another's notifications. Echo the stored
+                // value in CDW0.
+                let host = host_id.unwrap_or([0u8; 16]);
+                self.aer.set_mask(host, sqe.nsid, sqe.cdw11);
+                NvmeResponse::just(Cqe::success(cid, 0, 0, sqe.cdw11))
+            }
             FID_NUMBER_OF_QUEUES => {
                 // CDW11: requested NCQR | (NSQR << 16) — both
                 // zero-based. We grant the minimum of what the host
@@ -330,7 +390,12 @@ impl NvmeNvmDispatcher {
         }
     }
 
-    fn cmd_get_log_page(&self, cid: u16, sqe: &nvme_base::Sqe) -> NvmeResponse {
+    fn cmd_get_log_page(
+        &self,
+        cid: u16,
+        sqe: &nvme_base::Sqe,
+        host_id: Option<[u8; 16]>,
+    ) -> NvmeResponse {
         // CDW10[7:0] LID, [15:8] LSP, [31:16] NUMDL (zero-based).
         // CDW11[15:0] NUMDU (zero-based). Total dwords = (NUMDL |
         // (NUMDU << 16)) + 1.
@@ -350,6 +415,15 @@ impl NvmeNvmDispatcher {
             }
             nvme_base::log_page::lid::FIRMWARE_SLOT => {
                 let log = nvme_base::log_page::firmware_slot_info(&self.controller_fr);
+                log[..total_bytes.min(log.len())].to_vec()
+            }
+            nvme_base::log_page::lid::RESERVATION_NOTIFICATION => {
+                // Pop the host's oldest reservation notification (or an
+                // all-zero empty page when the queue is drained).
+                // Outside a real connection (no HOSTID) there is no
+                // per-host queue — return the empty page.
+                let host = host_id.unwrap_or([0u8; 16]);
+                let log = self.aer.take_log_entry(host);
                 log[..total_bytes.min(log.len())].to_vec()
             }
             _ => {
@@ -952,6 +1026,7 @@ mod tests {
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
+            Arc::new(AerHub::new()),
         );
         (tmp, disp)
     }
@@ -1607,7 +1682,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_async_event_request_is_rejected() {
+    async fn admin_async_event_request_on_dispatch_path_is_invalid_opcode() {
+        // The NVMe/TCP transport intercepts AER and parks it on the
+        // AerHub before this dispatch path runs, so a real host never
+        // reaches here. A non-transport caller (this test) hits the
+        // synchronous fallback: there is no event to report inline, so
+        // the dispatcher returns Invalid Opcode rather than blocking.
         let (_tmp, disp) = fixture_dispatcher().await;
         let resp = disp
             .handle_admin(AdminCommand {
@@ -1669,6 +1749,7 @@ mod tests {
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
+            Arc::new(AerHub::new()),
         );
         (tmp, disp)
     }
@@ -1860,5 +1941,152 @@ mod tests {
         let reg = sqe_resv(NvmOpcode::ReservationRegister, cdw10, 0);
         let r = resv_io(&disp, reg, Some(&keys16(0, 0xCAFE)), [0xA1u8; 16]).await;
         assert_eq!(r.cqe.status, StatusField::invalid_field());
+    }
+
+    async fn admin_io(
+        disp: &NvmeNvmDispatcher,
+        sqe: nvme_base::Sqe,
+        host_id: Option<[u8; 16]>,
+    ) -> NvmeResponse {
+        disp.handle_admin(AdminCommand {
+            sqe,
+            data_out: None,
+            data_in_max: 4096,
+            session_volumes: None,
+            host_id,
+        })
+        .await
+    }
+
+    /// Get Log Page LID 0x80 for NSID 1, sized for one 64-byte entry
+    /// (NUMD zero-based = 15 dwords).
+    fn sqe_get_resv_log() -> nvme_base::Sqe {
+        let cdw10 = u32::from(nvme_base::log_page::lid::RESERVATION_NOTIFICATION) | (15u32 << 16);
+        sqe_admin(AdminOpcode::GetLogPage as u8, 1, cdw10)
+    }
+
+    /// A holds Write Exclusive on the helper's two-host fixture; B
+    /// registers, then preempts. Drive the register + acquire for both.
+    async fn setup_preempt(disp: &NvmeNvmDispatcher, a: [u8; 16], b: [u8; 16]) {
+        resv_io(
+            disp,
+            sqe_resv(
+                NvmOpcode::ReservationRegister,
+                wire::RREGA_REGISTER as u32,
+                0,
+            ),
+            Some(&keys16(0, 0xAAAA)),
+            a,
+        )
+        .await;
+        resv_io(
+            disp,
+            sqe_resv(
+                NvmOpcode::ReservationAcquire,
+                wire::RACQA_ACQUIRE as u32 | (1u32 << 8),
+                0,
+            ),
+            Some(&keys16(0xAAAA, 0)),
+            a,
+        )
+        .await;
+        resv_io(
+            disp,
+            sqe_resv(
+                NvmOpcode::ReservationRegister,
+                wire::RREGA_REGISTER as u32,
+                0,
+            ),
+            Some(&keys16(0, 0xBBBB)),
+            b,
+        )
+        .await;
+    }
+
+    /// LID 0x80 is well-formed and empty when nothing has happened.
+    #[tokio::test]
+    async fn nvme_reservation_notif_log_empty_when_idle() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let log = admin_io(&disp, sqe_get_resv_log(), Some([0xA1u8; 16])).await;
+        assert_eq!(log.cqe.status, StatusField::SUCCESS);
+        assert_eq!(log.data_in.len(), 64);
+        assert!(
+            log.data_in.iter().all(|&x| x == 0),
+            "empty page is all zero"
+        );
+    }
+
+    /// End-to-end: B preempts A's Write Exclusive; host A learns via
+    /// the Reservation Notification log; the issuer B is not notified.
+    #[tokio::test]
+    async fn nvme_preempt_emits_reservation_notification() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+        setup_preempt(&disp, a, b).await;
+
+        let preempt = sqe_resv(
+            NvmOpcode::ReservationAcquire,
+            wire::RACQA_PREEMPT as u32 | (1u32 << 8),
+            0,
+        );
+        let r = resv_io(&disp, preempt, Some(&keys16(0xBBBB, 0xAAAA)), b).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+
+        // A held the reservation and lost it → Reservation Preempted (3).
+        let log = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        assert_eq!(log.cqe.status, StatusField::SUCCESS);
+        assert_eq!(log.data_in[8], 3, "Reservation Preempted");
+        assert_eq!(
+            u32::from_le_bytes(log.data_in[12..16].try_into().unwrap()),
+            1,
+            "nsid 1"
+        );
+        // Consumed on read → empty page next time.
+        let again = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        assert_eq!(again.data_in[8], 0, "drained after consume");
+        // Issuer B was never notified.
+        let b_log = admin_io(&disp, sqe_get_resv_log(), Some(b)).await;
+        assert_eq!(b_log.data_in[8], 0, "issuer not notified");
+    }
+
+    /// FID 0x82 Set/Get round-trips and a set mask bit suppresses the
+    /// matching notification class.
+    #[tokio::test]
+    async fn nvme_reservation_notif_mask_round_trip_and_suppresses() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let a = [0xA1u8; 16];
+        let b = [0xB2u8; 16];
+
+        // Set Features FID 0x82, NSID 1, mask Reservation Preempted (bit 3).
+        let mut sb = vec![0u8; nvme_base::SQE_SIZE];
+        sb[0] = AdminOpcode::SetFeatures as u8;
+        sb[4..8].copy_from_slice(&1u32.to_le_bytes());
+        sb[40..44].copy_from_slice(&u32::from(FID_RESERVATION_NOTIF_MASK).to_le_bytes());
+        sb[44..48].copy_from_slice(&(1u32 << 3).to_le_bytes());
+        let set = nvme_base::Sqe::parse(&sb).unwrap();
+        let r = admin_io(&disp, set, Some(a)).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+        assert_eq!(r.cqe.dw0, 1 << 3, "Set echoes the stored mask");
+
+        // Get Features FID 0x82 reflects the stored mask.
+        let get_fid = u32::from(FID_RESERVATION_NOTIF_MASK);
+        let get_a = sqe_admin(AdminOpcode::GetFeatures as u8, 1, get_fid);
+        assert_eq!(admin_io(&disp, get_a, Some(a)).await.cqe.dw0, 1 << 3);
+
+        // A different host's mask is independent (defaults to 0).
+        let get_b = sqe_admin(AdminOpcode::GetFeatures as u8, 1, get_fid);
+        assert_eq!(admin_io(&disp, get_b, Some(b)).await.cqe.dw0, 0);
+
+        // Preempt A; the masked Reservation Preempted is not queued.
+        setup_preempt(&disp, a, b).await;
+        let preempt = sqe_resv(
+            NvmOpcode::ReservationAcquire,
+            wire::RACQA_PREEMPT as u32 | (1u32 << 8),
+            0,
+        );
+        resv_io(&disp, preempt, Some(&keys16(0xBBBB, 0xAAAA)), b).await;
+        let log = admin_io(&disp, sqe_get_resv_log(), Some(a)).await;
+        assert_eq!(log.data_in[8], 0, "masked notification not queued");
     }
 }

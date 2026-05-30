@@ -24,12 +24,28 @@ pub const SMART_HEALTH_LEN: usize = 512;
 pub const ERROR_INFO_ENTRY_LEN: usize = 64;
 /// Firmware Slot Information log (NVMe Base §5.16.1.4). 512 bytes.
 pub const FIRMWARE_SLOT_INFO_LEN: usize = 512;
+/// Reservation Notification log page (NVMe NVM Command Set). One
+/// 64-byte entry per Get Log Page.
+pub const RESERVATION_NOTIFICATION_LEN: usize = 64;
 
 /// Log Page IDs hosts query against an NVMe-oF controller.
 pub mod lid {
     pub const ERROR_INFO: u8 = 0x01;
     pub const SMART_HEALTH: u8 = 0x02;
     pub const FIRMWARE_SLOT: u8 = 0x03;
+    /// Reservation Notification (NVMe NVM Command Set). Carries the
+    /// most-recent reservation event for the host to consume.
+    pub const RESERVATION_NOTIFICATION: u8 = 0x80;
+}
+
+/// Reservation Notification Log Page Type (byte 8 of the LID 0x80
+/// entry). 0 = no notification available; the other three name the
+/// reservation event class.
+pub mod resv_notif_type {
+    pub const EMPTY: u8 = 0;
+    pub const REGISTRATION_PREEMPTED: u8 = 1;
+    pub const RESERVATION_RELEASED: u8 = 2;
+    pub const RESERVATION_PREEMPTED: u8 = 3;
 }
 
 /// Build a SMART / Health Information page.
@@ -80,6 +96,37 @@ pub fn firmware_slot_info(active_revision: &str) -> [u8; FIRMWARE_SLOT_INFO_LEN]
     buf
 }
 
+/// Build a Reservation Notification log page (LID 0x80, 64 bytes).
+///
+/// Get Log Page LID 0x80 returns the single oldest unconsumed
+/// notification for the host:
+///
+/// - bytes 0..8  — Log Page Count (u64 LE). A controller-global,
+///   monotonically increasing identifier; 0 means "no notification"
+///   (the host treats type 0 / count 0 as an empty page).
+/// - byte  8     — Reservation Notification Log Page Type (see
+///   [`resv_notif_type`]).
+/// - byte  9     — Number of Available Log Pages: how many *more*
+///   notifications remain queued for the host *after* this one.
+/// - bytes 12..16 — Namespace ID (u32 LE) the event applies to.
+///
+/// All other bytes are reserved / zero. An empty page (no event
+/// queued) is the all-zero buffer: build it with
+/// `reservation_notification(0, resv_notif_type::EMPTY, 0, 0)`.
+pub fn reservation_notification(
+    log_page_count: u64,
+    notification_type: u8,
+    num_available: u8,
+    nsid: u32,
+) -> [u8; RESERVATION_NOTIFICATION_LEN] {
+    let mut buf = [0u8; RESERVATION_NOTIFICATION_LEN];
+    buf[0..8].copy_from_slice(&log_page_count.to_le_bytes());
+    buf[8] = notification_type;
+    buf[9] = num_available;
+    buf[12..16].copy_from_slice(&nsid.to_le_bytes());
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +154,36 @@ mod tests {
         let log = firmware_slot_info("0.1.0-alpha.1+x");
         // Truncated to 8 bytes.
         assert_eq!(&log[8..16], b"0.1.0-al");
+    }
+
+    #[test]
+    fn reservation_notification_layout() {
+        let log = reservation_notification(
+            0x0102_0304_0506_0708,
+            resv_notif_type::RESERVATION_PREEMPTED,
+            2,
+            0x0000_002A,
+        );
+        assert_eq!(log.len(), RESERVATION_NOTIFICATION_LEN);
+        // Log Page Count, u64 LE at 0..8.
+        assert_eq!(
+            u64::from_le_bytes(log[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        // Type at byte 8, available count at byte 9.
+        assert_eq!(log[8], resv_notif_type::RESERVATION_PREEMPTED);
+        assert_eq!(log[9], 2);
+        // bytes 10..12 reserved / zero.
+        assert_eq!(&log[10..12], &[0, 0]);
+        // NSID, u32 LE at 12..16.
+        assert_eq!(u32::from_le_bytes(log[12..16].try_into().unwrap()), 0x2A);
+        // Tail reserved / zero.
+        assert!(log[16..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn reservation_notification_empty_page_is_all_zero() {
+        let log = reservation_notification(0, resv_notif_type::EMPTY, 0, 0);
+        assert!(log.iter().all(|&b| b == 0));
     }
 }

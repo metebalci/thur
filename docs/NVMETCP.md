@@ -225,18 +225,51 @@ Implemented:
 
 | Admin opcode      | Code | Notes                                                                              |
 | ----------------- | ---- | ---------------------------------------------------------------------------------- |
-| Get Log Page      | 0x02 | LID 0x01 Error Info, 0x02 SMART/Health (temperature + spare), 0x03 FW Slot         |
+| Get Log Page      | 0x02 | LID 0x01 Error Info, 0x02 SMART/Health (temperature + spare), 0x03 FW Slot, 0x80 Reservation Notification (one 64-byte entry per call, oldest-first) |
 | Identify          | 0x06 | CNS 0x00 Namespace, 0x01 Controller (NN from live registry, KAS=120 = 12 s), 0x02 Active List, 0x03 NS ID Descriptor List (NGUID + CSI=NVM), 0x06 I/O Command Set Identify Controller (4 KiB of zeros) |
 | Abort             | 0x08 | Returns DW0 bit 0 = 1 (command already complete) — we don't queue at dispatcher    |
-| Set Features      | 0x09 | FID 0x07 Number of Queues — clamps to internal cap (64), echoes granted count. FID 0x0F Keep Alive Timer — stores host-negotiated KATO in ms, no watchdog |
-| Get Features      | 0x0A | FID 0x07 Number of Queues, FID 0x0F Keep Alive Timer                               |
+| Set Features      | 0x09 | FID 0x07 Number of Queues — clamps to internal cap (64), echoes granted count. FID 0x0F Keep Alive Timer — stores host-negotiated KATO in ms, no watchdog. FID 0x82 Reservation Notification Mask — per (HOSTID, NSID), echoes stored value |
+| Get Features      | 0x0A | FID 0x07 Number of Queues, FID 0x0F Keep Alive Timer, FID 0x82 Reservation Notification Mask |
+| Async Event Req.  | 0x0C | Parked by the transport until a reservation event fires; completes with DW0 = 0x00800006 (LID 0x80). See *Reservation notifications* below |
 | Keep Alive        | 0x18 | No-op success                                                                      |
 | Fabrics           | 0x7F | Connect / Property Get / Property Set / Disconnect — handled in the transport      |
 
-Async Event Request (AER, 0x0C) returns `Invalid Command Opcode` —
-see *Out of scope (with rationale)*. Create / Delete I/O SQ / CQ are
-PCIe-only; in fabrics, queue creation happens via Connect on a new
-TCP connection, so we return `Invalid Command Opcode` there too.
+Create / Delete I/O SQ / CQ are PCIe-only; in fabrics, queue creation
+happens via Connect on a new TCP connection, so we return `Invalid
+Command Opcode` there.
+
+### Reservation notifications (AER + LID 0x80)
+
+AER (Admin 0x0C) is the proactive-fencing path: a host fenced by
+another host's Preempt / Release / Clear learns via an async event
+instead of only reactively via `Reservation Conflict` (0x83) on its
+next command. The pieces:
+
+- **`nvme_nvm::AerHub`** — a per-controller hub constructed once at boot
+  and shared (one `Arc`) between the dispatcher and the transport, the
+  same way `ControllerRegs` is shared. Keyed by the 128-bit Connect
+  HOSTID. Holds, per host: parked AER completion senders (per-
+  connection), the unread LID 0x80 queue (per-host, survives reconnect),
+  and the FID 0x82 masks (per-host).
+- **Event source** — the reservation adapter
+  (`nvme_nvm::reservations`) snapshots the shared `ReservationManager`
+  before and after each Acquire(Preempt) / Release / Clear /
+  self-unregister, and the pure `diff_reservation_events` helper derives
+  the affected `(host, type)` set (issuer excluded). The dispatcher
+  feeds those to `AerHub::notify`.
+- **Parking** — the transport's `reader_task` intercepts AER on the
+  admin queue (qid 0), creates a `oneshot`, parks it on the hub, and
+  spawns a task that awaits the completion and emits the CQE on the
+  connection's writer. AER bypasses `handle_command` because it never
+  completes synchronously. On connection teardown `drop_conn` releases
+  the parked senders.
+- **Delivery** — `notify` appends a LID 0x80 entry and completes one
+  parked AER (DW0 `0x00800006`). The host reads `nvme resv-notif-log`
+  (one entry per call, oldest-first) until the page is empty.
+
+CNTLID is statically 1 today, so host-keying is also controller-keying;
+`ConnToken` carries a `cntlid` placeholder for the per-controller
+allocation seam.
 
 ## NQN / discovery
 
@@ -419,27 +452,16 @@ the network's bandwidth-delay product; the round-trip only becomes the
 bottleneck on a high-latency link. Lift this restriction if a benchmark
 demonstrates that latency is the constraint.
 
-### Async Event Request (Admin 0x0C)
+### Async events other than reservation notifications
 
-Returns `Invalid Command Opcode`. VSA produces no async events today. Per
-NVMe Base §5.2, AER has no timeout, but Linux nvme-tcp logs warnings during
-bring-up if it does not see AERs complete; returning Invalid Opcode makes that
-warning fire once instead of spinning. Wire this when a real async-event
-trigger lands.
-
-### Reservation notifications (LID 0x80)
-
-NVMe Reservations *themselves* are implemented (issue #54): Register / Acquire
-/ Release / Report share the transport-neutral
-`scsi_spc::reservations::ReservationManager`, keyed by the Connect HOSTID, and
-a non-holder's I/O is fenced with Reservation Conflict. What stays out is the
-**Reservation Notification log page** (LID 0x80) and async delivery of
-reservation events, which depend on AER (above). Without AER the log page is
-poll-only and conveys nothing a host can't already learn from the Reservation
-Conflict status on its next command, so `nvme resv-notif-log` returns
-`Invalid Field in Command`. It lands alongside AER. Reservation state is
-in-memory only (PTPL not advertised); a daemon restart drops registrations and
-hosts re-register on reconnect, matching the SCSI side.
+AER (Admin 0x0C) is implemented, but the only wired event source is reservation
+notifications (see *Reservation notifications (AER + LID 0x80)* above). The
+Notice-type events (namespace-attribute behind FID 0x0B Async Event
+Configuration, firmware-activation) and thermal notices are not produced — VSA
+has no firmware mechanism or thermal sensors, and namespaces are bound at
+`volume create`. The generic AER plumbing (`AerHub`, the DW0 builder, the
+park/notify/oneshot path) is reusable when a namespace-change source lands; it
+would add OACS bit 8 + a Changed Namespace List (LID 0x04), out of scope here.
 
 ### Discovery controller
 

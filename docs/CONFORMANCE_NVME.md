@@ -88,14 +88,14 @@ rather than via these commands, so a host that submits them receives
 |-------:|---------|--------|:----:|-------|
 | 0x00 | Delete I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Disconnect. Returns `Invalid Command Opcode`. |
 | 0x01 | Create I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Connect on a new TCP connection. |
-| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller). Other LIDs return `Invalid Field in Command`. |
+| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller), 0x80 Reservation Notification (one 64-byte entry per call, oldest-first; empty page when the host's queue is drained — see *Reservation notifications* below). Other LIDs return `Invalid Field in Command`. |
 | 0x04 | Delete I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x05 | Create I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x06 | Identify | 🟩 Partial | M | See CNS table below. |
 | 0x08 | Abort | 🟩 Stub | O | Returns CQE.DW0 bit 0 = 1 (command not aborted / already complete). The dispatcher does not queue commands at the controller level. |
 | 0x09 | Set Features | 🟩 Partial | M | See FID table below. |
 | 0x0A | Get Features | 🟩 Partial | M | See FID table below. |
-| 0x0C | Async Event Request | 🟨 No | O | Returns `Invalid Command Opcode`. VSA produces no async events today. See *Deliberate non-conformance*. |
+| 0x0C | Async Event Request | 🟩 Partial | O | Parked on the admin queue by the transport (not the dispatcher) until a controller event fires; completes with DW0 = `0x00800006` (AET=0x6 I/O Command Set specific, AEI=0x00 Reservation Log Page Available, LID=0x80) pointing the host at the Reservation Notification log. The only event source today is reservations; namespace-change / firmware / thermal notices are not produced. See *Reservation notifications* below. |
 | 0x10 | Firmware Commit | 🟨 No | O | No firmware-download surface — the daemon ships as a binary, not a flashable image. |
 | 0x11 | Firmware Image Download | 🟨 No | O | As above. |
 | 0x14 | Device Self-test | 🟨 No | O | No self-test surface. |
@@ -137,9 +137,10 @@ rather than via these commands, so a host that submits them receives
 | 0x08 | Interrupt Coalescing | 🟩 N/A | PCIe-only (no MSI-X on fabrics). |
 | 0x09 | Interrupt Vector Configuration | 🟩 N/A | PCIe-only. |
 | 0x0A | Write Atomicity Normal | 🟨 No | |
-| 0x0B | Async Event Configuration | 🟨 No | Pair to Admin 0x0C AER — not implemented for the same reason. |
+| 0x0B | Async Event Configuration | 🟨 No | Gates *Notice*-type async events (namespace-attribute / firmware-activation), which VSA does not produce — distinct from the reservation-notification mask (FID 0x82 below), which is implemented. Returns `Invalid Field in Command`. |
 | 0x0F | Keep Alive Timer | 🟩 Partial | KATO captured on Set, echoed on Get. No watchdog — KA admin commands are unconditionally acknowledged — so the value is stored only for symmetry. |
 | 0x10 | Host Identifier | 🟨 No | Host identity is captured at Connect via HOSTID in `ConnectData`. |
+| 0x82 | Reservation Notification Mask | 🟩 Yes | Per-namespace (CDW1 NSID). CDW11 bits 1 / 2 / 3 suppress Registration Preempted / Reservation Released / Reservation Preempted notifications respectively (0 = all enabled). Stored keyed by (HOSTID, NSID) so one host's masking cannot silence another's; Set echoes the stored value in CQE.DW0, Get returns it. The host's enable/disable knob for reservation async events. |
 
 Get / Set Features for unknown FIDs return `Invalid Field in
 Command`.
@@ -295,10 +296,9 @@ reasoning for each. SCSI-side cross-cutting departures are in
 |------|-----|
 | Header / data digests (CRC32C, NVMe-TCP §3.5) | Negotiate `dgst=0`. TCP provides a checksum and TLS-PSK provides AEAD over the whole stream. Symmetric with the iSCSI transport, which also negotiates `HeaderDigest=None` / `DataDigest=None`. CRC32C is implemented elsewhere — SSC LTO-7+ Logical Block Protection appends a per-tape-block CRC32C trailer (`core/mediachanger/src/lbp.rs`) — distinct from the transport-frame digest. Hosts that require transport digests see negotiation fail and pick a different target. |
 | Multi-outstanding R2T per command | Single-R2T-per-command is bandwidth-equivalent for any transfer that fits the network's bandwidth-delay product. Lift only if a benchmark shows the round-trip is the bottleneck on a high-latency link. |
-| Async Event Request (Admin 0x0C) | Returns `Invalid Command Opcode`. VSA produces no async events today. Per NVMe Base §5.2 AER has no timeout, but Linux nvme-tcp warns once on bring-up if it doesn't see AERs complete; Invalid Opcode makes the warning fire once instead of spinning. Wire when a real event trigger lands (`volume create` would be first). |
+| Async events other than reservation notifications | AER (Admin 0x0C) is implemented, but the only event source wired is reservation notifications (LID 0x80 — see *Reservation notifications* below). Namespace-attribute (the Notice-type events behind FID 0x0B Async Event Configuration), firmware-activation, and thermal notices are not produced — VSA has no firmware mechanism or thermal sensors, and namespaces are bound at `volume create`. The generic AER plumbing is reusable when a namespace-change source lands. |
 | Discovery controller absent | Hosts connect direct to the subsystem NQN; operators distribute the address / port / NQN out of band. A discovery listener lands when multi-subsystem deployments become a documented use case. |
 | DH-HMAC-CHAP (NVMe Base §8.13.5, Fabrics 0x05 / 0x06) | The non-TLS auth alternative — auth exchange encrypted, data stream not. Lands only if a deployment can't terminate TLS at the target. |
-| Reservation Notification log page (LID 0x80) + reservation async events | NVMe Reservations themselves are now implemented (RR opcodes 0x0D / 0x0E / 0x11 / 0x15 above, sharing the SBC-3 `ReservationManager`). What stays out: the Reservation Notification log page and its async-event delivery. Without AER (also deferred), the log page would be poll-only and convey nothing a host can't already learn from the `Reservation Conflict` status on its next command. `nvme resv-notif-log` returns `Invalid Field in Command`. Lands with AER. |
 | PTPL (persist through power loss) | RESCAP bit 0 = 0; reservation state is in-memory only and a daemon restart drops it (hosts re-register on reconnect), matching the SCSI side's `PTPL_C = 0`. A Reservation Register with CPTPL = "set PTPL" is rejected with `Invalid Field`. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
@@ -366,17 +366,57 @@ Operators get a multi-volume view via the admin Unix socket
 (`GET /api/v1/volumes` / `thurvsa volume list`) — a
 management-plane catalog, not a host-side discovery surface.
 
-### What is AER, and why do we refuse it?
+### What is AER, and how does VSA use it?
 
 Async Event Request (Admin 0x0C) is the NVMe analog of SCSI Unit
 Attention: AER commands sit pending on the admin queue until the
-controller has news (namespace change, thermal threshold, firmware
-activation, error log threshold). VSA has no events to push today —
-no thermal sensors, no firmware mechanism, namespaces bound at
-`volume create`. Per NVMe Base §5.2 AERs have no timeout, but Linux
-nvme-tcp logs warnings on bring-up if it doesn't see AERs complete.
-Returning `Invalid Command Opcode` makes the warning fire once
-instead of spinning. Wire AER when a real event trigger arrives.
+controller has news. VSA parks each AER on a per-controller hub
+(`nvme_nvm::AerHub`, shared with the transport) and completes one when
+an event fires, with DW0 = `0x00800006` (AET=0x6 I/O Command Set
+specific, AEI=0x00 Reservation Log Page Available, LID=0x80) telling
+the host to read the Reservation Notification log. Parking lives in the
+transport (`nvme-tcp::server`), not the dispatcher, because completing
+an AER needs the connection's writer — the dispatcher hands back one
+synchronous CQE per command and has no deferred-completion path.
+
+The **only** event source today is reservations. Thermal, firmware-
+activation, and namespace-change notices are not produced (no sensors,
+no firmware mechanism, namespaces bound at `volume create`), so an AER
+parks until a reservation event affects the host or the connection
+tears down. Per NVMe Base §5.2 an AER that never completes is legal;
+parked AERs are released when the admin connection closes.
+
+### Reservation notifications (LID 0x80)
+
+When a host is fenced by another host's Reservation Acquire (Preempt),
+Release, or Clear, the loser learns *proactively* instead of only
+reactively via `Reservation Conflict` (0x83) on its next command. The
+NVMe reservation adapter diffs the shared `ReservationManager` state
+before and after each mutating op and derives the affected hosts:
+
+- **Registration Preempted (type 1)** — a non-holder registrant whose
+  registration is removed by a Preempt.
+- **Reservation Released (type 2)** — every other registrant when a
+  reservation is released (Release, or the holder self-unregistering a
+  non-all-registrants reservation). An all-registrants holder
+  *rotation* keeps the reservation, so it emits nothing.
+- **Reservation Preempted (type 3)** — the prior holder whose
+  reservation is taken over by a Preempt, and every other registrant on
+  a Clear. A host that loses both its registration and its held
+  reservation in one Preempt gets type 3 only.
+
+The issuing host is never notified (it learns the result from its own
+command completion). Each event appends a 64-byte entry to the host's
+LID 0x80 queue (Log Page Count, type, NSID, and the count of further
+unread entries) and completes one parked AER. `nvme resv-notif-log`
+reads the oldest entry per call until the queue drains to an all-zero
+empty page. A host can suppress any class via Set Features FID 0x82
+(Reservation Notification Mask), stored per (HOSTID, NSID).
+
+Routing is keyed by the 128-bit Connect HOSTID — the same key the
+reservation manager uses. With CNTLID statically 1 today, that is also
+the controller identity; per-controller CNTLID allocation would refine
+the routing seam (`ConnToken` already carries a `cntlid`).
 
 ### Is DH-HMAC-CHAP used in practice?
 

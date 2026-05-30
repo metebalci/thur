@@ -562,6 +562,11 @@ async fn main() -> Result<()> {
             if let Err(e) = shared_naming::validate_nqn(&subnqn) {
                 anyhow::bail!("invalid nvmetcp.subnqn in {}: {e}", config_path.display());
             }
+            // Per-controller AER + reservation-notification hub. One
+            // instance shared between the dispatcher (event producer)
+            // and the NVMe/TCP transport (event consumer) — same
+            // construct-once-at-boot pattern as `controller_regs` below.
+            let aer_hub = Arc::new(nvme_nvm::AerHub::new());
             let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
                 Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
                 subnqn.clone(),
@@ -576,6 +581,7 @@ async fn main() -> Result<()> {
                 // first thing to fall off, leaving the version core
                 // visible to `nvme id-ctrl`).
                 THURVSA_VERSION_STR.to_string(),
+                Arc::clone(&aer_hub),
             ));
             tracing::info!(
                 "thurvsad: NVMe NVM dispatcher ready ({} NSID(s))",
@@ -637,6 +643,7 @@ async fn main() -> Result<()> {
                 listen_address: nvmetcp_listen.clone(),
                 handler,
                 controller_regs: Arc::new(nvme_base::ControllerRegs::new()),
+                aer: aer_hub,
                 tls: tls_acceptor,
                 psks_path: admission_psks_path,
             };

@@ -20,6 +20,7 @@ use nvme_base::{Cqe, Sqe, StatusField};
 use scsi_spc::pr::ReservationType;
 use scsi_spc::reservations::{PrOutOutcome, RegistrantId, ReservationManager};
 
+use crate::aer::{ReservationEvent, ResvAction, diff_reservation_events};
 use crate::handler::NvmeResponse;
 
 /// Map a neutral PROUT-style outcome onto an NVMe completion.
@@ -49,7 +50,7 @@ pub fn reservation_register(
     host_id: [u8; 16],
     sqe: &Sqe,
     data_out: Option<&[u8]>,
-) -> NvmeResponse {
+) -> (NvmeResponse, Vec<ReservationEvent>) {
     let cid = sqe.cid;
     let lun = u64::from(nsid);
     let id = RegistrantId::nvme(host_id);
@@ -57,21 +58,50 @@ pub fn reservation_register(
     // PTPL is not supported — reject a "set PTPL" request the same way
     // the SCSI side rejects APTPL=1.
     if wire::cptpl(sqe.cdw10) == wire::CPTPL_PERSIST {
-        return fail(cid, StatusField::invalid_field());
+        return (fail(cid, StatusField::invalid_field()), Vec::new());
     }
     let Some((crkey, nrkey)) = data_out.and_then(wire::parse_register_keys) else {
-        return fail(cid, StatusField::invalid_field());
+        return (fail(cid, StatusField::invalid_field()), Vec::new());
     };
     let iekey = wire::iekey(sqe.cdw10);
-    let outcome = match wire::action(sqe.cdw10) {
+    let (outcome, events) = match wire::action(sqe.cdw10) {
         // Register and Replace both set the registration to NRKEY
-        // after the CRKEY check (skipped when IEKEY=1).
-        wire::RREGA_REGISTER | wire::RREGA_REPLACE => mgr.register(lun, &id, crkey, nrkey, iekey),
-        // Unregister: NRKEY ignored, registration removed.
-        wire::RREGA_UNREGISTER => mgr.register(lun, &id, crkey, 0, iekey),
-        _ => return fail(cid, StatusField::invalid_field()),
+        // after the CRKEY check (skipped when IEKEY=1). Neither fences
+        // another host, so there is nothing to notify.
+        wire::RREGA_REGISTER | wire::RREGA_REPLACE => {
+            (mgr.register(lun, &id, crkey, nrkey, iekey), Vec::new())
+        }
+        // Unregister: NRKEY ignored, registration removed. If the
+        // departing host held a (non-all-registrants) reservation it is
+        // released, which fans a Reservation Released to the survivors.
+        wire::RREGA_UNREGISTER => {
+            let pre = mgr.snapshot(lun);
+            let outcome = mgr.register(lun, &id, crkey, 0, iekey);
+            let events =
+                reservation_events(mgr, ResvAction::Unregister, outcome, &pre, host_id, nsid);
+            (outcome, events)
+        }
+        _ => return (fail(cid, StatusField::invalid_field()), Vec::new()),
     };
-    map_outcome(cid, outcome)
+    (map_outcome(cid, outcome), events)
+}
+
+/// Diff the post-op snapshot against `pre` and derive notifications,
+/// but only for a successful (`Good`) mutation. The post-op snapshot is
+/// taken here so callers don't repeat the conditional.
+fn reservation_events(
+    mgr: &ReservationManager,
+    action: ResvAction,
+    outcome: PrOutOutcome,
+    pre: &scsi_spc::reservations::ReservationSnapshot,
+    host_id: [u8; 16],
+    nsid: u32,
+) -> Vec<ReservationEvent> {
+    if !matches!(outcome, PrOutOutcome::Good) {
+        return Vec::new();
+    }
+    let post = mgr.snapshot(u64::from(nsid));
+    diff_reservation_events(action, pre, &post, host_id, nsid)
 }
 
 /// Reservation Acquire (0x11) — RACQA Acquire / Preempt /
@@ -83,27 +113,33 @@ pub fn reservation_acquire(
     host_id: [u8; 16],
     sqe: &Sqe,
     data_out: Option<&[u8]>,
-) -> NvmeResponse {
+) -> (NvmeResponse, Vec<ReservationEvent>) {
     let cid = sqe.cid;
     let lun = u64::from(nsid);
     let id = RegistrantId::nvme(host_id);
 
     let Some(scsi_type) = wire::nvme_rtype_to_scsi_byte(wire::rtype(sqe.cdw10)) else {
-        return fail(cid, StatusField::invalid_field());
+        return (fail(cid, StatusField::invalid_field()), Vec::new());
     };
     let Some((crkey, prkey)) = data_out.and_then(wire::parse_acquire_keys) else {
-        return fail(cid, StatusField::invalid_field());
+        return (fail(cid, StatusField::invalid_field()), Vec::new());
     };
-    let outcome = match wire::action(sqe.cdw10) {
-        wire::RACQA_ACQUIRE => mgr.reserve(lun, &id, crkey, scsi_type),
+    let (outcome, events) = match wire::action(sqe.cdw10) {
+        // Acquire only takes a free reservation — it never fences an
+        // existing registrant, so there is nothing to notify.
+        wire::RACQA_ACQUIRE => (mgr.reserve(lun, &id, crkey, scsi_type), Vec::new()),
         // Preempt and Preempt-and-Abort collapse — no task-manager
         // hook, identical visible transition (same as the SCSI side).
+        // Preempting fences the prior holder / registrants → notify.
         wire::RACQA_PREEMPT | wire::RACQA_PREEMPT_ABORT => {
-            mgr.preempt(lun, &id, crkey, prkey, scsi_type)
+            let pre = mgr.snapshot(lun);
+            let outcome = mgr.preempt(lun, &id, crkey, prkey, scsi_type);
+            let events = reservation_events(mgr, ResvAction::Preempt, outcome, &pre, host_id, nsid);
+            (outcome, events)
         }
-        _ => return fail(cid, StatusField::invalid_field()),
+        _ => return (fail(cid, StatusField::invalid_field()), Vec::new()),
     };
-    map_outcome(cid, outcome)
+    (map_outcome(cid, outcome), events)
 }
 
 /// Reservation Release (0x15) — RRELA Release / Clear.
@@ -113,25 +149,37 @@ pub fn reservation_release(
     host_id: [u8; 16],
     sqe: &Sqe,
     data_out: Option<&[u8]>,
-) -> NvmeResponse {
+) -> (NvmeResponse, Vec<ReservationEvent>) {
     let cid = sqe.cid;
     let lun = u64::from(nsid);
     let id = RegistrantId::nvme(host_id);
 
     let Some(crkey) = data_out.and_then(wire::parse_release_key) else {
-        return fail(cid, StatusField::invalid_field());
+        return (fail(cid, StatusField::invalid_field()), Vec::new());
     };
-    let outcome = match wire::action(sqe.cdw10) {
+    let (outcome, events) = match wire::action(sqe.cdw10) {
+        // Release drops the reservation but leaves registrations → the
+        // other registrants get Reservation Released.
         wire::RRELA_RELEASE => {
             let Some(scsi_type) = wire::nvme_rtype_to_scsi_byte(wire::rtype(sqe.cdw10)) else {
-                return fail(cid, StatusField::invalid_field());
+                return (fail(cid, StatusField::invalid_field()), Vec::new());
             };
-            mgr.release(lun, &id, crkey, scsi_type)
+            let pre = mgr.snapshot(lun);
+            let outcome = mgr.release(lun, &id, crkey, scsi_type);
+            let events = reservation_events(mgr, ResvAction::Release, outcome, &pre, host_id, nsid);
+            (outcome, events)
         }
-        wire::RRELA_CLEAR => mgr.clear(lun, &id, crkey),
-        _ => return fail(cid, StatusField::invalid_field()),
+        // Clear wipes every registration and the reservation → the
+        // other registrants get Reservation Preempted.
+        wire::RRELA_CLEAR => {
+            let pre = mgr.snapshot(lun);
+            let outcome = mgr.clear(lun, &id, crkey);
+            let events = reservation_events(mgr, ResvAction::Clear, outcome, &pre, host_id, nsid);
+            (outcome, events)
+        }
+        _ => return (fail(cid, StatusField::invalid_field()), Vec::new()),
     };
-    map_outcome(cid, outcome)
+    (map_outcome(cid, outcome), events)
 }
 
 /// Reservation Report (0x0E) — builds the Reservation Status Data

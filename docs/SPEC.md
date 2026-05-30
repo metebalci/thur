@@ -531,10 +531,44 @@ reconnect) — the same `PTPL_C = 0` posture as the SCSI side. A
 Reservation Register requesting CPTPL = set-PTPL is rejected with
 Invalid Field.
 
-Out of scope: the Reservation Notification log page (LID 0x80) and
-async reservation-notification delivery, which depend on AER (also
-deferred). A host learns of a conflict from the Reservation Conflict
-status on its next command.
+Reservation notifications (proactive fencing): in addition to the
+synchronous Reservation Conflict gate, a fenced host is told
+asynchronously via Async Event Request (Admin 0x0C) + the Reservation
+Notification log page (LID 0x80).
+
+```text
+AER completion DW0 (NVMe Base §5.2):
+  bits 2:0   Asynchronous Event Type      = 0x6 (I/O Command Set specific)
+  bits 15:8  Asynchronous Event Info      = 0x00 (Reservation Log Page Available)
+  bits 23:16 Associated Log Page (LID)    = 0x80
+  => DW0 = 0x0080_0006
+
+Reservation Notification log page (LID 0x80, 64 bytes):
+  bytes 0..8   Log Page Count (u64 LE; 0 = empty page)
+  byte  8      Notification Type: 1 Registration Preempted /
+                                  2 Reservation Released /
+                                  3 Reservation Preempted
+  byte  9      Number of Available Log Pages (entries still queued after this)
+  bytes 12..16 Namespace ID (u32 LE)
+
+Reservation Notification Mask (Set/Get Features FID 0x82, per NSID):
+  CDW11 bit 1  mask Registration Preempted
+  CDW11 bit 2  mask Reservation Released
+  CDW11 bit 3  mask Reservation Preempted   (0 = all enabled)
+```
+
+The notification type is derived by diffing the shared
+`ReservationManager` state across the op: a non-holder registrant
+removed by Preempt → Registration Preempted; the prior holder whose
+reservation is taken over by Preempt, and every other registrant on a
+Clear → Reservation Preempted; every other registrant when a
+reservation is Released (or the holder self-unregisters a
+non-all-registrants reservation) → Reservation Released. The issuing
+host is never notified. Routing is keyed by the Connect HOSTID (the
+fencing identity); each event completes one AER parked on that host's
+admin queue and queues a LID 0x80 entry the host drains oldest-first.
+Out of scope: async events other than reservation notifications
+(namespace-attribute, firmware-activation, thermal).
 
 ### Format / partitioning
 

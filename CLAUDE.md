@@ -213,14 +213,19 @@ on-disk paths group by purpose.
   Namespace / Active NS list builders, Fabrics command shapes
   (`ConnectData`, `FabricsType`, `extract_fctype`), controller
   register state (`ControllerRegs`: CC / CSTS / VS / CAP), log-page
-  builders (SMART, Error Info, FW Slot). Wire-format ground floor
-  every NVMe command set + NVMe-oF transport consumes.
+  builders (SMART, Error Info, FW Slot, Reservation Notification),
+  AER completion DW0 packing. Wire-format ground floor every NVMe
+  command set + NVMe-oF transport consumes.
 - `nvme/nvm` (`nvme-nvm`) — NVM Command Set dispatch
   (Read / Write / Flush / Compare / Write Zeroes / DSM Deallocate /
   Verify; fused Compare+Write via `handle_fused_compare_write`).
   Admin command coverage: Identify, Keep Alive, Get/Set Features
-  (Number of Queues), Get Log Page (Error / SMART / FW Slot),
-  Abort. `NvmeNvmDispatcher` impls `NvmeCommandHandler`; the
+  (Number of Queues, Reservation Notification Mask FID 0x82), Get
+  Log Page (Error / SMART / FW Slot / Reservation Notification LID
+  0x80), Abort. Reservation notifications are derived by diffing the
+  shared `ReservationManager` and delivered through the per-controller
+  `AerHub` (shared with the transport, which parks the AERs).
+  `NvmeNvmDispatcher` impls `NvmeCommandHandler`; the
   daemon plugs `VolumeRegistry` in via the `NamespaceLookup` trait
   (mirror of `scsi-sbc::VolumeLookup`). Reaches into
   `core-block::PageCache` directly — same boundary as the SBC
@@ -231,10 +236,11 @@ on-disk paths group by purpose.
   Property Get/Set against shared `ControllerRegs`, Disconnect,
   command loop with R2T flow (single-outstanding, partial-ICD +
   R2T tail stitching), fused Compare+Write pair tracking, C2HData
-  SUCCESS-bit folding, C2HTermReq on protocol violations. Selected
-  via `transport: nvmetcp` in `thurvsa.yaml` (default `iscsi`).
-  Out of scope: TLS-PSK auth, CRC32C digests, multi-outstanding
-  R2T, AER, discovery controller — rationale in
+  SUCCESS-bit folding, C2HTermReq on protocol violations, reservation
+  notifications via AER (Admin 0x0C) + LID 0x80 parked on a shared
+  `nvme_nvm::AerHub`. Selected via `transport: nvmetcp` in
+  `thurvsa.yaml` (default `iscsi`). Out of scope: TLS-PSK auth, CRC32C
+  digests, multi-outstanding R2T, discovery controller — rationale in
   [`docs/NVMETCP.md`](docs/NVMETCP.md) § *Out of scope*.
 - `core/ssc` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
   cartridge, block/chunk/lru indexes, dirty-page tracker, index-page
