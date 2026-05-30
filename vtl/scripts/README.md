@@ -29,8 +29,11 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-backup-storage.sh` | `test-backup-workflow` + real S3/GCS/Azure backend — upload pipeline, dedup, refetch. |
 | `test-backup-storage-failures.sh` | Backend failure injection (auth, timeout, throttling) on the backup upload path. |
 | `test-backup-storage-resume.sh` | Boot-time orphan-chunk scan + recovery after SIGKILL mid-PUT. |
+| `test-legal-hold-lifecycle.sh` | Cloud-native legal hold end-to-end: set/clear/status + the migrate gate refusing a held cartridge (Object-Lock backend, `THURVTL_TEST_BACKEND`). |
+| `test-tiering-legal-hold-interaction.sh` | Tiering never moves a legal-held cartridge: plan excludes it, run-now skips it, clearing the hold lifts the exclusion (Object-Lock backend, `THURVTL_TEST_BACKEND`). |
 | `test-app-bareos.sh` | Real Bareos director driving 2-drive chassis + autochanger; concurrent jobs + restore-and-diff. |
 | `test-lifecycle-cartridge-migrate.sh` | CLI surface for `cartridge migrate / archive / restore-archive` (preconditions, dry-run, on-disk state). |
+| `test-tiering-plan-and-run.sh` | CLI surface for `system tiering plan / run-now / status` over two local backends — policy match, plan/run/idempotence, `cartridge.tiered` audit. |
 | `test-lifecycle-many-cartridges.sh` | Metadata lifecycle stress: create/destroy ~30 cartridges; inventory + audit chain stay valid. |
 | `test-lifecycle-dr-restore.sh` | Daemon-down `library restore` CLI surface (dry-run, empty-bucket discovery, audit replay). |
 | `test-crash-audit-append.sh` | BLAKE3-chained audit log stays valid under SIGKILL mid-append. |

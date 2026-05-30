@@ -25,7 +25,9 @@ breakdown, the methodology, and the suite catalogue.
 A handful of scripts under `vtl/scripts/` and `vsa/scripts/` (the
 `test-*-storage.sh` and `test-fs-storage-failures.sh` suites, plus
 `test-pipeline-layers.sh`, `test-lifecycle-cartridge-migrate.sh`, `test-keystore.sh`,
-and `test-monte-carlo.sh` against a non-local backend) exercise real
+the two legal-hold suites (`test-legal-hold-lifecycle.sh`,
+`test-tiering-legal-hold-interaction.sh`), and `test-monte-carlo.sh`
+against a non-local backend) exercise real
 S3 / GCS / Azure / AIStor / MinIO connections end-to-end. They need:
 
 - `private/storage-backends.yaml` — one entry per backend (bucket /
@@ -38,6 +40,16 @@ S3 / GCS / Azure / AIStor / MinIO connections end-to-end. They need:
   (`AISTOR_*`, `WASABI_*`, …). The scripts self-elevate via `sudo` and
   forward those env vars explicitly by name pattern, so they survive
   the privilege hop as long as they're `export`ed.
+
+The two legal-hold suites carry one extra requirement beyond a
+non-local backend: the chosen `THURVTL_TEST_BACKEND` must point at a
+bucket with Object Lock enabled (the provider legal-hold primitive
+is what they exercise), declared with `retention_mode: none` so the
+daemon starts and the test can clear its own holds. A bucket with
+Object Lock enabled but no default retention rule is ideal — legal
+hold works and the test can delete its objects after clearing the
+hold; a default retention rule would leave un-deletable debris past
+the run (cleanup is best-effort and warns).
 
 Optional: `private/thur.env` (KEY=VAL per line). Every script gates the
 source on `[[ -r ... ]]` and auto-loads it under `set -a` before
