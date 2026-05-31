@@ -91,6 +91,59 @@ pub struct ServerConfig {
     /// in-band auth. Orthogonal to `tls`: setting both runs
     /// DH-HMAC-CHAP inside a TLS-PSK channel ("dhchap+tls").
     pub dhchap_path: Option<std::path::PathBuf>,
+    /// Login-phase audit sink for DH-HMAC-CHAP success / failure
+    /// (NVMe counterpart of shared-iscsi's CHAP audit hook). thurvsad
+    /// wires its `AuditChannel` + the `shared_alerting` brute-force
+    /// hook in here; tests and the in-process path pass
+    /// [`NoopLoginAudit`]. The transport never stores secrets — only
+    /// the metadata fields on [`LoginAuditEvent`].
+    pub audit: Arc<dyn LoginAuditSink>,
+}
+
+// ===== Login audit hook =====
+
+/// DH-HMAC-CHAP login-phase events the consuming product can opt into
+/// auditing. Mirror of shared-iscsi's `LoginAuditEvent`: thurvsad
+/// implements the sink against its `AuditChannel` (one
+/// `nvmetcp.dhchap.{success,failure}` row per event) and the
+/// `shared_alerting::record::chap_failure` brute-force counter;
+/// everything else passes [`NoopLoginAudit`]. The transport decides
+/// *which* wire outcomes count as a refused auth (negotiation
+/// failure, reply mismatch, mutual-auth rejection, timeout); the sink
+/// decides what to do with the row.
+pub enum LoginAuditEvent<'a> {
+    DhchapSuccess {
+        peer: &'a str,
+        host_nqn: &'a str,
+        admitted_volumes: usize,
+    },
+    DhchapFailure {
+        peer: &'a str,
+        host_nqn: &'a str,
+        /// Stable machine-readable category — one of
+        /// `negotiation_failed`, `reply_invalid`,
+        /// `controller_rejected`, `success2_tid_mismatch`, `timeout`.
+        reason: &'a str,
+        /// Human-readable detail (the error that closed the
+        /// connection). Recorded in the audit row's `result`.
+        error: String,
+    },
+}
+
+/// Optional audit sink for DH-HMAC-CHAP login-phase events. The
+/// transport never stores credentials — only the metadata fields on
+/// [`LoginAuditEvent`].
+pub trait LoginAuditSink: Send + Sync {
+    fn record(&self, event: LoginAuditEvent<'_>);
+}
+
+/// Default no-op audit sink (tests; the in-process smoke path; any
+/// boot with `audit.enabled = false`).
+#[derive(Default, Clone, Copy)]
+pub struct NoopLoginAudit;
+
+impl LoginAuditSink for NoopLoginAudit {
+    fn record(&self, _event: LoginAuditEvent<'_>) {}
 }
 
 /// Bind the configured TCP listen address and accept-loop forever.
@@ -111,6 +164,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         config.tls.map(Arc::new),
         config.psks_path,
         config.dhchap_path,
+        config.audit,
     )
     .await
 }
@@ -118,6 +172,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 /// Accept-loop body factored out so tests can supply their own
 /// pre-bound listener (e.g. `127.0.0.1:0` to let the kernel pick a
 /// free port).
+#[allow(clippy::too_many_arguments)]
 pub async fn accept_loop(
     listener: TcpListener,
     handler: Arc<dyn NvmeCommandHandler>,
@@ -126,6 +181,7 @@ pub async fn accept_loop(
     tls: Option<Arc<NvmePskAcceptor>>,
     psks_path: Option<std::path::PathBuf>,
     dhchap_path: Option<std::path::PathBuf>,
+    audit: Arc<dyn LoginAuditSink>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -135,6 +191,7 @@ pub async fn accept_loop(
         let tls = tls.clone();
         let psks_path = psks_path.clone();
         let dhchap_path = dhchap_path.clone();
+        let audit = Arc::clone(&audit);
         tokio::spawn(async move {
             let result = match tls {
                 None => {
@@ -147,6 +204,7 @@ pub async fn accept_loop(
                         None,
                         psks_path,
                         dhchap_path,
+                        audit,
                     )
                     .await
                 }
@@ -165,6 +223,7 @@ pub async fn accept_loop(
                             tls_host_nqn,
                             psks_path,
                             dhchap_path,
+                            audit,
                         )
                         .await
                     }
@@ -351,6 +410,7 @@ async fn serve_connection<S>(
     tls_host_nqn: Option<String>,
     psks_path: Option<std::path::PathBuf>,
     dhchap_path: Option<std::path::PathBuf>,
+    audit: Arc<dyn LoginAuditSink>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -538,6 +598,7 @@ where
                 handler.subnqn(),
                 &connect_data.hostnqn,
                 dhpath,
+                audit.as_ref(),
             ),
         )
         .await;
@@ -549,11 +610,21 @@ where
                     admitted_volumes = volumes.len(),
                     "nvme-tcp: DH-HMAC-CHAP authentication succeeded",
                 );
+                audit.record(LoginAuditEvent::DhchapSuccess {
+                    peer: &peer.to_string(),
+                    host_nqn: &connect_data.hostnqn,
+                    admitted_volumes: volumes.len(),
+                });
                 Some(volumes)
             }
             Ok(Err(e)) => {
                 // Release the controller binding minted at Connect so its
-                // CNTLID / association don't leak on a failed auth.
+                // CNTLID / association don't leak on a failed auth. The
+                // granular failure audit row + brute-force alert were
+                // already emitted at the refusal site inside
+                // `run_auth_phase`; the remaining errors reaching here are
+                // transport I/O faults (host EOF mid-exchange), not auth
+                // refusals, so they get no `chap_failure` counter bump.
                 aer.disconnect(conn_token);
                 tracing::warn!(
                     peer = %peer,
@@ -564,6 +635,17 @@ where
                 return Err(e);
             }
             Err(_elapsed) => {
+                // Timeout is owned by serve_connection (it wraps
+                // run_auth_phase), so the failure row + alert are emitted
+                // here rather than inside the auth routine.
+                audit.record(LoginAuditEvent::DhchapFailure {
+                    peer: &peer.to_string(),
+                    host_nqn: &connect_data.hostnqn,
+                    reason: "timeout",
+                    error: format!(
+                        "DH-HMAC-CHAP authentication timed out after {AUTH_PHASE_TIMEOUT_SECS}s"
+                    ),
+                });
                 aer.disconnect(conn_token);
                 tracing::warn!(
                     peer = %peer,
@@ -1626,10 +1708,26 @@ async fn run_auth_phase<S>(
     subnqn: &str,
     hostnqn: &str,
     dhchap_path: &std::path::Path,
+    audit: &dyn LoginAuditSink,
 ) -> Result<Vec<String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Record a refused-auth audit row (and, via the daemon sink, bump
+    // the brute-force alert counter) at each genuine auth-refusal site
+    // below. Transport I/O faults (a host that drops mid-exchange) take
+    // the `?` early-return paths and are deliberately *not* audited —
+    // they are not credential refusals.
+    let peer_str = peer.to_string();
+    let emit_failure = |reason: &str, error: String| {
+        audit.record(LoginAuditEvent::DhchapFailure {
+            peer: &peer_str,
+            host_nqn: hostnqn,
+            reason,
+            error,
+        });
+    };
+
     use dhwire::{
         NVME_AUTH_DHCHAP_FAILURE_CONCAT_MISMATCH as FAIL_CONCAT,
         NVME_AUTH_DHCHAP_FAILURE_DHGROUP_UNUSABLE as FAIL_DHGROUP,
@@ -1717,6 +1815,10 @@ where
                 &dhwire::build_failure1(t_id, REASON_FAILED, reason),
             )
             .await?;
+            emit_failure(
+                "negotiation_failed",
+                format!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})"),
+            );
             anyhow::bail!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})");
         }
         Ok(v) => v,
@@ -1769,6 +1871,10 @@ where
                 &dhwire::build_failure1(t_id, REASON_FAILED, reason),
             )
             .await?;
+            emit_failure(
+                "reply_invalid",
+                format!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})"),
+            );
             anyhow::bail!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})");
         }
         Ok(success1) => send_auth_message(stream, recv2_sqe.cid, &success1).await?,
@@ -1781,6 +1887,10 @@ where
     match dhwire::peek_message_type(&final_data) {
         Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE1))
         | Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE2)) => {
+            emit_failure(
+                "controller_rejected",
+                "host rejected controller authentication".to_string(),
+            );
             anyhow::bail!("host rejected controller authentication");
         }
         _ => {
@@ -1790,6 +1900,10 @@ where
             // response HMACs).
             let s2_tid = dhwire::parse_success2(&final_data)?;
             if s2_tid != t_id {
+                emit_failure(
+                    "success2_tid_mismatch",
+                    format!("DH-HMAC-CHAP Success2 t_id {s2_tid:#06x} != negotiated {t_id:#06x}"),
+                );
                 anyhow::bail!("DH-HMAC-CHAP Success2 t_id {s2_tid:#06x} != negotiated {t_id:#06x}");
             }
         }
@@ -1886,16 +2000,54 @@ mod tests {
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
         let aer = Arc::new(ControllerRegistry::new());
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, aer, None, None, None).await;
+            let _ = accept_loop(
+                listener,
+                h,
+                regs,
+                aer,
+                None,
+                None,
+                None,
+                Arc::new(NoopLoginAudit),
+            )
+            .await;
         });
         port
     }
 
+    /// Test sink that captures every login-audit event so a test can
+    /// assert the transport recorded an auth refusal (the daemon-side
+    /// `chap_failure` alert + audit row are driven off the same hook).
+    #[derive(Default)]
+    struct CapturingAudit {
+        // (kind, reason_or_empty, host_nqn)
+        events: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    impl LoginAuditSink for CapturingAudit {
+        fn record(&self, event: LoginAuditEvent<'_>) {
+            let row = match event {
+                LoginAuditEvent::DhchapSuccess { host_nqn, .. } => {
+                    ("success".to_string(), String::new(), host_nqn.to_string())
+                }
+                LoginAuditEvent::DhchapFailure {
+                    host_nqn, reason, ..
+                } => (
+                    "failure".to_string(),
+                    reason.to_string(),
+                    host_nqn.to_string(),
+                ),
+            };
+            self.events.lock().unwrap().push(row);
+        }
+    }
+
     /// Spawn a server requiring DH-HMAC-CHAP auth, reading per-host
-    /// secrets from `dhchap_path`.
+    /// secrets from `dhchap_path`. `audit` lets a test observe the
+    /// success / refusal events the transport records.
     async fn spawn_server_with_dhchap(
         handler: Arc<StubHandler>,
         dhchap_path: std::path::PathBuf,
+        audit: Arc<dyn LoginAuditSink>,
     ) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1903,7 +2055,7 @@ mod tests {
         let regs = Arc::new(ControllerRegs::new());
         let aer = Arc::new(ControllerRegistry::new());
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, aer, None, None, Some(dhchap_path)).await;
+            let _ = accept_loop(listener, h, regs, aer, None, None, Some(dhchap_path), audit).await;
         });
         port
     }
@@ -1916,7 +2068,17 @@ mod tests {
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
         let regs = Arc::new(ControllerRegs::new());
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, aer, None, None, None).await;
+            let _ = accept_loop(
+                listener,
+                h,
+                regs,
+                aer,
+                None,
+                None,
+                None,
+                Arc::new(NoopLoginAudit),
+            )
+            .await;
         });
         port
     }
@@ -3243,7 +3405,10 @@ mod tests {
         let secret = dhcrypt::encode_dhchap_secret(&[0x11; 32], 0);
         let path = write_dhchap_file("null-ok", dhchap_entry_for(&secret, None, &["vol-a"]));
         let handler = StubHandler::new(TEST_SUBNQN);
-        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+        let audit = Arc::new(CapturingAudit::default());
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::clone(&audit) as _)
+                .await;
 
         let mut s = connect_with_authreq(port).await;
         // Negotiate (Auth Send) -> ACK.
@@ -3291,6 +3456,21 @@ mod tests {
         let c2h = read_pdu_async(&mut s).await;
         assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
         assert_eq!(c2h.body[16], 0xC0); // stub canary -> auth gate passed
+
+        // The transport must have recorded a DhchapSuccess for this host
+        // (guards the success-path audit emit in serve_connection).
+        let mut recorded = None;
+        for _ in 0..50 {
+            if let Some(row) = audit.events.lock().unwrap().first().cloned() {
+                recorded = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (kind, reason, host) = recorded.expect("a DhchapSuccess must be recorded");
+        assert_eq!(kind, "success");
+        assert_eq!(reason, "");
+        assert_eq!(host, TEST_HOSTNQN);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3300,7 +3480,10 @@ mod tests {
         let wrong = dhcrypt::encode_dhchap_secret(&[0x99; 32], 0);
         let path = write_dhchap_file("wrong", dhchap_entry_for(&real, None, &["vol-a"]));
         let handler = StubHandler::new(TEST_SUBNQN);
-        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+        let audit = Arc::new(CapturingAudit::default());
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::clone(&audit) as _)
+                .await;
 
         let mut s = connect_with_authreq(port).await;
         s.write_all(&build_auth_send_pdu(
@@ -3332,6 +3515,84 @@ mod tests {
         let f = dhwire::parse_failure(&msg).unwrap();
         assert_eq!(f.rescode, dhwire::NVME_AUTH_DHCHAP_FAILURE_REASON_FAILED);
         assert_eq!(f.rescode_exp, dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED);
+        // The refusal must have driven a `reply_invalid` audit/alert
+        // event (the security-observability gap issue #68 closes). Poll
+        // briefly: the transport records it on its own task right before
+        // closing the connection, which may land just after the host
+        // observes the Failure1.
+        let mut recorded = None;
+        for _ in 0..50 {
+            if let Some(row) = audit.events.lock().unwrap().first().cloned() {
+                recorded = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (kind, reason, host) = recorded.expect("a DhchapFailure must be recorded");
+        assert_eq!(kind, "failure");
+        assert_eq!(reason, "reply_invalid");
+        assert_eq!(host, TEST_HOSTNQN);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_unknown_host_refused_at_negotiation() {
+        // The secret store has an entry, but for a *different* host NQN,
+        // so the lookup for our connecting host misses. This is the most
+        // common production refusal (an un-provisioned host) and exits at
+        // the negotiation stage with reason `negotiation_failed`.
+        let other = crate::identity::DhchapEntry {
+            host_nqn: "nqn.2014-08.org.nvmexpress:uuid:someone-else".into(),
+            dhchap_key: dhcrypt::encode_dhchap_secret(&[0x55; 32], 0),
+            dhchap_ctrl_key: None,
+            disabled: false,
+            volumes: Some(vec!["vol-a".into()]),
+            previous_dhchap_key: None,
+            previous_expires_at: None,
+        };
+        let path = write_dhchap_file("unknown-host", other);
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let audit = Arc::new(CapturingAudit::default());
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::clone(&audit) as _)
+                .await;
+
+        let mut s = connect_with_authreq(port).await;
+        // Negotiate (Auth Send) -> ACK.
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x44,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // Auth Receive -> the negotiation outcome is already a failure
+        // (host unknown), so the controller answers with Failure1 instead
+        // of a Challenge and closes.
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let msg = read_auth_message(&mut s).await;
+        let f = dhwire::parse_failure(&msg).unwrap();
+        assert_eq!(f.rescode, dhwire::NVME_AUTH_DHCHAP_FAILURE_REASON_FAILED);
+        assert_eq!(f.rescode_exp, dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED);
+
+        let mut recorded = None;
+        for _ in 0..50 {
+            if let Some(row) = audit.events.lock().unwrap().first().cloned() {
+                recorded = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (kind, reason, host) = recorded.expect("a DhchapFailure must be recorded");
+        assert_eq!(kind, "failure");
+        assert_eq!(reason, "negotiation_failed");
+        assert_eq!(host, TEST_HOSTNQN);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3344,7 +3605,9 @@ mod tests {
             dhchap_entry_for(&host_secret, Some(&ctrl_secret), &["vol-a"]),
         );
         let handler = StubHandler::new(TEST_SUBNQN);
-        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::new(NoopLoginAudit))
+                .await;
 
         let mut s = connect_with_authreq(port).await;
         s.write_all(&build_auth_send_pdu(
@@ -3386,7 +3649,9 @@ mod tests {
         let secret = dhcrypt::encode_dhchap_secret(&[0x55; 32], 1); // SHA-256 transform
         let path = write_dhchap_file("ffdhe", dhchap_entry_for(&secret, None, &["vol-a"]));
         let handler = StubHandler::new(TEST_SUBNQN);
-        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::new(NoopLoginAudit))
+                .await;
 
         let mut s = connect_with_authreq(port).await;
         // Offer NULL + ffdhe2048; the controller prefers ffdhe2048.

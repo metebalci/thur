@@ -53,4 +53,4 @@ pub mod pdu;
 pub mod server;
 pub mod tls;
 
-pub use server::{ServerConfig, run};
+pub use server::{LoginAuditEvent, LoginAuditSink, NoopLoginAudit, ServerConfig, run};

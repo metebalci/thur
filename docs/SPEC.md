@@ -1659,9 +1659,9 @@ synchronously, on that same rollover path.
   "seq": 12345,
   "ts": "2026-05-03T14:22:01.123456Z",
   "actor": {
-    "kind": "cli|daemon|rest|system",
-    "user": "root",            // optional
-    "addr": "127.0.0.1"        // optional
+    "kind": "cli|daemon|rest|system|iscsi|nvme",
+    "user": "root",            // optional (IQN / host NQN for wire kinds)
+    "addr": "127.0.0.1"        // optional (peer ip:port for wire kinds)
   },
   "op": "cartridge.create",
   "params": { "barcode": "TAPE001", "backend": "primary", "worm": false },
@@ -1743,6 +1743,23 @@ the initiator advertised one, `addr` = peer ip:port):
   `"invalid_response"` (CHAP_R didn't match), `"verify_error"`
   (verifier returned an error), `"skipped_security_stage"` (initiator
   tried to enter OPNEG without completing CHAP).
+
+NVMe/TCP-side (thurvsa; actor `kind:"nvme"`, `user` = host NQN,
+`addr` = peer ip:port). Emitted by the DH-HMAC-CHAP login phase when
+`nvmetcp.auth.mode = dhchap`:
+- `nvmetcp.dhchap.success` — in-band auth completed. `params:
+  {host_nqn, admitted_volumes}`.
+- `nvmetcp.dhchap.failure` — auth refused. `params: {host_nqn,
+  reason}`, `result:"error"` with the detail string. `reason` is one
+  of `"negotiation_failed"` (unknown host / unusable hash or DH group
+  / malformed negotiate / unreadable secret store — all collapse to a
+  generic AUTH_Failure on the wire), `"reply_invalid"` (response R1
+  HMAC mismatch, i.e. wrong secret), `"controller_rejected"` (host
+  rejected the controller's mutual-auth R2), `"success2_tid_mismatch"`
+  (final transaction id didn't match the negotiated one), or
+  `"timeout"` (host stalled past the 30 s auth-phase deadline). Each
+  failure also bumps the `chap_failures` alert counter keyed on
+  `host_nqn` (parity with `iscsi.chap.failure`).
 
 Special: `audit.chain_reset` (reset entry).
 

@@ -136,6 +136,31 @@ IQN as `user` and the peer ip:port as `addr`. Audit-append failures
 on the SCSI path are logged and swallowed — never tear down the
 session.
 
+### NVMe/TCP login events (thurvsa)
+
+The NVMe/TCP transport's DH-HMAC-CHAP login phase
+(`nvmetcp.auth.mode = dhchap`) mirrors the iSCSI CHAP hook — same
+forensic row + brute-force-alert shape, off the same `AuditChannel`:
+
+- `nvmetcp.dhchap.success` — in-band auth completed. `params:
+  {host_nqn, admitted_volumes}`.
+- `nvmetcp.dhchap.failure` — auth refused. `params: {host_nqn,
+  reason}`, `result:"error"` carrying the detail. `reason` is one of
+  `negotiation_failed` (unknown host / unusable hash or DH group /
+  malformed negotiate / unreadable secret store), `reply_invalid`
+  (response R1 HMAC mismatch — the wrong-secret case),
+  `controller_rejected` (host rejected our mutual-auth R2),
+  `success2_tid_mismatch` (final transaction-id mismatch), or
+  `timeout` (host stalled past the 30 s auth-phase deadline).
+
+Every NVMe entry's actor is `kind:"nvme"` with the host NQN as
+`user` and the peer ip:port as `addr`. Each `nvmetcp.dhchap.failure`
+also feeds `shared_alerting::record::chap_failure(host_nqn, peer)`,
+so repeated refusals raise the `chap_failures` alert exactly as
+iSCSI CHAP failures do. Transport I/O faults mid-exchange (host EOF)
+are *not* audited — only genuine auth refusals are. As with the
+iSCSI path, append failures are logged and swallowed.
+
 ### Rate-limited failure paths
 
 A misbehaving initiator — one presenting a wrong CHAP secret or

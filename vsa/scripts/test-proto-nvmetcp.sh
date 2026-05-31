@@ -409,6 +409,24 @@ run_dhchap_wrong_secret() {
     else
         log_pass "connect with a wrong secret refused"
     fi
+
+    # Issue #68: the refusal must also leave a forensic trail. Verify the
+    # live daemon's NvmetcpLoginAudit sink wrote a reply_invalid row to the
+    # audit chain (the writer task is async, so poll briefly).
+    local found=0
+    for _ in $(seq 1 30); do
+        if grep -rqs 'nvmetcp.dhchap.failure' "$TEST_DIR/data/audit/" 2>/dev/null \
+            && grep -rqs 'reply_invalid' "$TEST_DIR/data/audit/" 2>/dev/null; then
+            found=1
+            break
+        fi
+        sleep 0.2
+    done
+    if [[ $found -eq 1 ]]; then
+        log_pass "wrong-secret refusal recorded an nvmetcp.dhchap.failure audit row"
+    else
+        log_fail "no nvmetcp.dhchap.failure (reply_invalid) audit row after refused connect"
+    fi
 }
 
 connect_nvmetcp() {

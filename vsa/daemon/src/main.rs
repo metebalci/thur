@@ -23,7 +23,7 @@ use shared_telemetry::{Telemetry, TelemetryConfig};
 use tokio::sync::Mutex;
 
 use crate::admin::handlers::AdminState;
-use crate::audit::{IscsiDiskLoginAudit, audit_dir, boot_audit_log};
+use crate::audit::{IscsiDiskLoginAudit, NvmetcpLoginAudit, audit_dir, boot_audit_log};
 use crate::config::{
     DEFAULT_CONFIG_PATH, DaemonConfig, NvmetcpAuthMode, NvmetcpTlsMode, Transport,
 };
@@ -220,7 +220,12 @@ async fn main() -> Result<()> {
     // `NoopLoginAudit`.
     let mut audit_lifecycle = None;
     let mut audit_channel_for_admin = None;
-    let login_audit: Arc<dyn shared_iscsi::transport::LoginAuditSink> = if cfg.audit.enabled {
+    // Both transports get a login-audit sink off the same channel: iSCSI
+    // CHAP and NVMe/TCP DH-HMAC-CHAP each emit success/failure rows and
+    // feed the shared `chap_failures` alert class (issue #68).
+    let login_audit: Arc<dyn shared_iscsi::transport::LoginAuditSink>;
+    let nvmetcp_login_audit: Arc<dyn nvme_tcp::LoginAuditSink>;
+    if cfg.audit.enabled {
         let dir = audit_dir(&cfg.audit, &data_dir);
         let boot = boot_audit_log(dir.clone(), Some(cfg.data_dir.as_str()))
             .await
@@ -231,15 +236,16 @@ async fn main() -> Result<()> {
             writer,
         } = boot;
         tracing::info!("audit: log opened at {}", dir.display());
-        let sink = Arc::new(IscsiDiskLoginAudit::new(channel.clone()));
+        login_audit = Arc::new(IscsiDiskLoginAudit::new(channel.clone()));
+        nvmetcp_login_audit = Arc::new(NvmetcpLoginAudit::new(channel.clone()));
         audit_channel_for_admin = Some(channel.clone());
         audit_lifecycle = Some((channel, writer));
-        sink
     } else {
         tracing::warn!(
             "audit.enabled=false - running without an audit log; not recommended outside dev"
         );
-        Arc::new(shared_iscsi::transport::NoopLoginAudit)
+        login_audit = Arc::new(shared_iscsi::transport::NoopLoginAudit);
+        nvmetcp_login_audit = Arc::new(nvme_tcp::NoopLoginAudit);
     };
 
     // Resolve the operator's `cloud.upload.max_concurrent` once at
@@ -500,6 +506,7 @@ async fn main() -> Result<()> {
     // the loop). Config de-dups `transports`, so iSCSI runs at most once
     // and the `.take()` below can't double-fire.
     let mut login_audit_slot = Some(login_audit);
+    let mut nvmetcp_login_audit_slot = Some(nvmetcp_login_audit);
     for transport in &cfg.transports {
         match transport {
             Transport::Iscsi => {
@@ -586,11 +593,12 @@ async fn main() -> Result<()> {
                 )));
             }
             Transport::Nvmetcp => {
-                // NVMe-TCP path. No login-audit sink is taken (CHAP-style
-                // per-login auditing doesn't fit the TLS-PSK flow — the
-                // host's identity is captured in the TLS handshake; per-
-                // connection audit would need a separate hook). The slot is
-                // dropped after the loop if no iSCSI arm consumed it.
+                // NVMe-TCP path. The DH-HMAC-CHAP login phase gets its own
+                // login-audit sink (issue #68): refused in-band auths emit
+                // `nvmetcp.dhchap.failure` rows + feed the `chap_failures`
+                // alert class, parity with iSCSI CHAP. (TLS-PSK identity is
+                // captured in the handshake and needs no per-connection
+                // hook; this sink only fires when `auth.mode = dhchap`.)
                 let nvmetcp_listen = cfg
                     .nvmetcp
                     .listen
@@ -734,14 +742,18 @@ async fn main() -> Result<()> {
                     tls: tls_acceptor,
                     psks_path: admission_psks_path,
                     dhchap_path,
+                    audit: nvmetcp_login_audit_slot
+                        .take()
+                        .expect("transports de-duped: nvmetcp runs at most once"),
                 };
                 transport_listens.push(nvmetcp_listen.clone());
                 transport_futs.push(Box::pin(nvme_tcp::run(server_cfg)));
             }
         }
     }
-    // If iSCSI wasn't listed, its audit sink was never consumed.
+    // If a transport wasn't listed, its audit sink was never consumed.
     drop(login_audit_slot);
+    drop(nvmetcp_login_audit_slot);
     // Config guarantees >= 1 transport; guard anyway so the JoinSet is
     // never empty (an empty data path would silently serve nothing).
     if transport_futs.is_empty() {

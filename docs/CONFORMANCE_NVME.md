@@ -294,6 +294,7 @@ operator surface in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
 | Key transform (NQN binding) | 🟩 Yes | M | `HMAC_secret(NQN ‖ "NVMe-over-Fabrics")` using the secret's own hash, per `nvme_auth_transform_key`. |
 | Per-handshake secret reload + rotation grace | 🟩 Yes | — | `nvmetcp-dhchap.json` is re-read on every Connect; `previous_dhchap_key` + `previous_expires_at` let both secrets authenticate during a grace window. |
 | Per-host volume admission | 🟩 Yes | — | The authenticated host's `volumes` allow-list gates every I/O command — mandatory under `auth.mode = dhchap` (mirror of TLS-PSK admission). |
+| Auth-failure audit + alert | 🟩 Yes | — | Every refused auth emits an `nvmetcp.dhchap.failure` audit row (`reason` = `negotiation_failed` / `reply_invalid` / `controller_rejected` / `success2_tid_mismatch` / `timeout`) and bumps the `chap_failures` alert counter keyed on host NQN — forensic + brute-force-alert parity with iSCSI CHAP (issue #68). Success emits `nvmetcp.dhchap.success`. |
 | Secure-channel concatenation (`sc_c` ≠ 0, TLS-PSK insertion via auth) | 🟨 No | O | Refused with `AUTH_Failure` (CONCAT_MISMATCH). Use `tls.mode = psk` for a TLS channel. |
 
 ---

@@ -80,8 +80,9 @@ pub enum AuditError {
 pub type Result<T> = std::result::Result<T, AuditError>;
 
 /// Where the event came from. `kind` is one of `"cli"`, `"daemon"`,
-/// `"rest"`, `"system"`. `user` and `addr` are optional context (CLI
-/// shell user, REST caller IP).
+/// `"rest"`, `"system"`, `"iscsi"`, `"nvme"` — one per constructor
+/// below. `user` and `addr` are optional context (CLI shell user,
+/// REST caller IP, initiator IQN / host NQN + peer ip:port).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditActor {
     pub kind: String,
@@ -134,6 +135,18 @@ impl AuditActor {
         Self {
             kind: "iscsi".to_string(),
             user: initiator.map(Into::into),
+            addr: Some(addr.into()),
+        }
+    }
+
+    /// NVMe/TCP command audit actor. `user` carries the host NQN; `addr`
+    /// carries the peer's `ip:port`. Use for events that originate over
+    /// the wire from an NVMe host — today DH-HMAC-CHAP login
+    /// success/failure (the NVMe counterpart of `iscsi.chap.*`).
+    pub fn nvme(host_nqn: impl Into<String>, addr: impl Into<String>) -> Self {
+        Self {
+            kind: "nvme".to_string(),
+            user: Some(host_nqn.into()),
             addr: Some(addr.into()),
         }
     }

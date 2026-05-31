@@ -3,21 +3,26 @@
 
 //! thurvsad audit wiring.
 //!
-//! thurvsa today has exactly one audit emitter — the shared-iscsi
-//! login phase (CHAP success / failure). The whole audit
-//! infrastructure (chain hashing, daily rotation, mpsc producer
-//! decoupling, replay, verify, ratelimit) lives in `shared-audit`,
-//! lifted out of core-mediachanger (Step 5 — shared-audit, 2026-05-09).
-//! This module is the thurvsa-side glue: an [`AuditLog`] opener +
-//! writer-task spawn, and a [`IscsiDiskLoginAudit`] that implements
-//! [`shared_iscsi::transport::LoginAuditSink`] by forwarding into
-//! the shared `AuditChannel`.
+//! thurvsa's audit emitters are the two transport login phases:
+//! the shared-iscsi CHAP path ([`IscsiDiskLoginAudit`]) and the
+//! NVMe/TCP DH-HMAC-CHAP path ([`NvmetcpLoginAudit`]). Both emit
+//! success/failure rows and feed the shared `chap_failures` alert
+//! class (issue #68). The whole audit infrastructure (chain hashing,
+//! daily rotation, mpsc producer decoupling, replay, verify,
+//! ratelimit) lives in `shared-audit`, lifted out of
+//! core-mediachanger (Step 5 — shared-audit, 2026-05-09). This module
+//! is the thurvsa-side glue: an [`AuditLog`] opener + writer-task
+//! spawn, plus the two [`LoginAuditSink`](shared_iscsi::transport::LoginAuditSink)
+//! / [`nvme_tcp::LoginAuditSink`] adapters that forward into the
+//! shared `AuditChannel`.
 //!
-//! There's no rate-limiter wired up yet — thurvsa has only the one
-//! emitter, and CHAP failure storms haven't shown up in practice.
-//! When thurvsa grows more host-driven failure paths (e.g. WORM
-//! refusals, ACL violations against volume admin ops) the
-//! `AuditRateLimiter` from shared-audit drops in unchanged.
+//! There's no audit-chain rate-limiter wired up yet — the failure
+//! rows write one-per-event (the per-host/per-NQN brute-force *alert*
+//! is already deduped + thresholded in `shared-alerting`), and chain
+//! floods haven't shown up in practice. When thurvsa grows more
+//! host-driven failure paths (e.g. WORM refusals, ACL violations
+//! against volume admin ops) the `AuditRateLimiter` from shared-audit
+//! drops in unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -159,6 +164,70 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
     }
 }
 
+/// `LoginAuditSink` adapter for thurvsad's NVMe/TCP transport. The
+/// NVMe counterpart of [`IscsiDiskLoginAudit`]: it forwards
+/// DH-HMAC-CHAP login-phase events into the same audit channel as
+/// `nvmetcp.dhchap.{success,failure}` rows and feeds the shared
+/// `chap_failures` alert class on each refused auth — closing the
+/// security-observability gap where DH-HMAC-CHAP failures only hit a
+/// `tracing::warn!` (issue #68). Same forensic + brute-force-alert
+/// shape iSCSI CHAP already has.
+pub struct NvmetcpLoginAudit {
+    channel: AuditChannel,
+}
+
+impl NvmetcpLoginAudit {
+    pub fn new(channel: AuditChannel) -> Self {
+        Self { channel }
+    }
+}
+
+impl nvme_tcp::LoginAuditSink for NvmetcpLoginAudit {
+    fn record(&self, event: nvme_tcp::LoginAuditEvent<'_>) {
+        match event {
+            nvme_tcp::LoginAuditEvent::DhchapSuccess {
+                peer,
+                host_nqn,
+                admitted_volumes,
+            } => {
+                let actor = AuditActor::nvme(host_nqn, peer.to_string());
+                self.channel.try_append(
+                    "nvmetcp.dhchap.success",
+                    actor,
+                    serde_json::json!({
+                        "host_nqn": host_nqn,
+                        "admitted_volumes": admitted_volumes,
+                    }),
+                    AuditResult::Ok,
+                );
+            }
+            nvme_tcp::LoginAuditEvent::DhchapFailure {
+                peer,
+                host_nqn,
+                reason,
+                error,
+            } => {
+                let actor = AuditActor::nvme(host_nqn, peer.to_string());
+                self.channel.try_append(
+                    "nvmetcp.dhchap.failure",
+                    actor,
+                    serde_json::json!({
+                        "host_nqn": host_nqn,
+                        "reason": reason,
+                    }),
+                    AuditResult::Error(error),
+                );
+                // Alert side: the host NQN is the brute-force counter
+                // key (NVMe's equivalent of the CHAP username). Audit
+                // row goes out every time; the WARN alert only when this
+                // host's failure count inside the dedup window crosses
+                // `alerting.chap_failures_threshold`.
+                shared_alerting::record::chap_failure(host_nqn, peer);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +316,50 @@ mod tests {
         assert!(combined.contains("iscsi.chap.failure"));
         assert!(combined.contains("alice"));
         assert!(combined.contains("mallory"));
+    }
+
+    #[tokio::test]
+    async fn nvmetcp_login_audit_sink_forwards_dhchap_events() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        let boot = boot_audit_log(dir.clone(), None)
+            .await
+            .expect("audit log boots");
+        let sink = NvmetcpLoginAudit::new(boot.channel.clone());
+
+        nvme_tcp::LoginAuditSink::record(
+            &sink,
+            nvme_tcp::LoginAuditEvent::DhchapSuccess {
+                peer: "10.0.0.1:4420",
+                host_nqn: "nqn.2014-08.org.nvmexpress:uuid:good",
+                admitted_volumes: 2,
+            },
+        );
+        nvme_tcp::LoginAuditSink::record(
+            &sink,
+            nvme_tcp::LoginAuditEvent::DhchapFailure {
+                peer: "10.0.0.2:4420",
+                host_nqn: "nqn.2014-08.org.nvmexpress:uuid:bad",
+                reason: "reply_invalid",
+                error: "DH-HMAC-CHAP host response invalid".to_string(),
+            },
+        );
+
+        boot.writer.shutdown().await;
+
+        let mut combined = String::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                combined.push_str(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+        assert!(combined.contains("nvmetcp.dhchap.success"));
+        assert!(combined.contains("nvmetcp.dhchap.failure"));
+        assert!(combined.contains("reply_invalid"));
+        // Actor kind for NVMe host events is "nvme", host NQN as user.
+        assert!(combined.contains("\"nvme\""));
+        assert!(combined.contains("uuid:good"));
+        assert!(combined.contains("uuid:bad"));
     }
 }
