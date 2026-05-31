@@ -479,194 +479,215 @@ async fn main() -> Result<()> {
         anyhow::bail!("invalid iscsi.target_iqn in {}: {e}", config_path.display());
     }
 
-    // Boot the wire-protocol stack selected by `transport:` in YAML.
-    // The two branches are mutually exclusive — only one binds. Each
-    // produces:
-    //   * `transport_fut`: the listener future tokio::select! awaits
-    //   * `transport_listens`: the address(es) logged + surfaced in
-    //     HttpState (so `/health` reports something meaningful).
-    //     NVMe/TCP carries a single-entry vec; iSCSI may carry many.
+    // Boot every wire-protocol stack listed in `transports:`. Each
+    // listed transport binds its own listener concurrently against the
+    // shared VolumeRegistry + ReservationManager built above, so a
+    // volume is reachable as a SCSI LUN and an NVMe namespace at once.
+    // Each arm pushes:
+    //   * a `TransportFut` into `transport_futs` — the JoinSet below
+    //     drives them; the first to exit (clean, error, or bind
+    //     failure) tears the daemon down.
+    //   * its listen address(es) into `transport_listens` — logged +
+    //     surfaced in HttpState so `/health` reports every bound
+    //     portal. NVMe/TCP contributes one entry; iSCSI may add many.
     type TransportFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-    let (transport_fut, transport_listens): (TransportFut, Vec<String>) = match cfg.transport {
-        Transport::Iscsi => {
-            // Portal list comes first — the ALUA topology + listener
-            // bind set both key off it.
-            let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
-                vec![shared_iscsi::transport::Portal {
-                    address: DEFAULT_LISTEN_ADDRESS.to_string(),
-                    tpgt: 1,
-                }]
-            });
-            let iscsi_listens: Vec<String> =
-                iscsi_portals.iter().map(|p| p.address.clone()).collect();
+    let mut transport_futs: Vec<TransportFut> = Vec::with_capacity(cfg.transports.len());
+    let mut transport_listens: Vec<String> = Vec::new();
+    // The login-audit sink is consumed only by the iSCSI arm; park it in
+    // an Option so an NVMe-only boot leaves it untouched (dropped after
+    // the loop). Config de-dups `transports`, so iSCSI runs at most once
+    // and the `.take()` below can't double-fire.
+    let mut login_audit_slot = Some(login_audit);
+    for transport in &cfg.transports {
+        match transport {
+            Transport::Iscsi => {
+                // Portal list comes first — the ALUA topology + listener
+                // bind set both key off it.
+                let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
+                    vec![shared_iscsi::transport::Portal {
+                        address: DEFAULT_LISTEN_ADDRESS.to_string(),
+                        tpgt: 1,
+                    }]
+                });
+                let iscsi_listens: Vec<String> =
+                    iscsi_portals.iter().map(|p| p.address.clone()).collect();
 
-            // ALUA topology — built from the advertised portals with
-            // the target IQN as the per-port NAA-3 namespace so two
-            // daemons on the same host pick distinct identifiers.
-            let alua = Arc::new(shared_iscsi::alua::AluaTopology::from_portals(
-                &iscsi_portals,
-                target_iqn.clone(),
-            ));
-            let handler = Arc::new(SbcScsiDispatcher::with_alua(
-                Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
-                target_iqn.clone(),
-                alua,
-                Arc::clone(&reservations),
-                cfg.iscsi.reservations.initiator_port.collapse_isid(),
-            ));
-            tracing::info!(
-                "thurvsad: SBC-3 dispatcher ready ({} LUN(s))",
-                volumes.len()
-            );
+                // ALUA topology — built from the advertised portals with
+                // the target IQN as the per-port NAA-3 namespace so two
+                // daemons on the same host pick distinct identifiers.
+                let alua = Arc::new(shared_iscsi::alua::AluaTopology::from_portals(
+                    &iscsi_portals,
+                    target_iqn.clone(),
+                ));
+                let handler = Arc::new(SbcScsiDispatcher::with_alua(
+                    Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
+                    target_iqn.clone(),
+                    alua,
+                    Arc::clone(&reservations),
+                    cfg.iscsi.reservations.initiator_port.collapse_isid(),
+                ));
+                tracing::info!(
+                    "thurvsad: SBC-3 dispatcher ready ({} LUN(s))",
+                    volumes.len()
+                );
 
-            // CHAP authenticator: factory closure that reads
-            // `iscsi-users.json` on every login. `method: None`
-            // (default) means an unauthenticated target. The
-            // initial-boot snapshot is logged once; subsequent
-            // sessions pick up file edits without restart.
-            let chap_auth = auth::build(
-                &cfg.iscsi.auth,
-                iscsi_users_path.clone(),
-                iscsi_users.users.len(),
-            )
-            .context("building CHAP authenticator factory")?;
-            let server_config = ServerConfig {
-                listen_portals: iscsi_portals.clone(),
-                session_manager: Arc::clone(&session_manager),
-                auth: chap_auth,
-                audit: login_audit,
-                stale_session_timeout_secs: STALE_SESSION_TIMEOUT_SECS,
-            };
-            let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
-            tracing::info!(
-                "transport: iscsi (listen={})",
-                iscsi_portals
-                    .iter()
-                    .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            (
-                Box::pin(shared_iscsi::transport::run(
+                // CHAP authenticator: factory closure that reads
+                // `iscsi-users.json` on every login. `method: None`
+                // (default) means an unauthenticated target. The
+                // initial-boot snapshot is logged once; subsequent
+                // sessions pick up file edits without restart.
+                let chap_auth = auth::build(
+                    &cfg.iscsi.auth,
+                    iscsi_users_path.clone(),
+                    iscsi_users.users.len(),
+                )
+                .context("building CHAP authenticator factory")?;
+                let server_config = ServerConfig {
+                    listen_portals: iscsi_portals.clone(),
+                    session_manager: Arc::clone(&session_manager),
+                    auth: chap_auth,
+                    audit: login_audit_slot
+                        .take()
+                        .expect("transports de-duped: iscsi runs at most once"),
+                    stale_session_timeout_secs: STALE_SESSION_TIMEOUT_SECS,
+                };
+                let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
+                tracing::info!(
+                    "transport: iscsi (listen={})",
+                    iscsi_portals
+                        .iter()
+                        .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                transport_listens.extend(iscsi_listens);
+                transport_futs.push(Box::pin(shared_iscsi::transport::run(
                     server_config,
                     transport_handler,
-                )),
-                iscsi_listens,
-            )
-        }
-        Transport::Nvmetcp => {
-            // NVMe-TCP path. Login audit is dropped (CHAP-style
-            // per-login auditing doesn't fit the TLS-PSK flow — the
-            // host's identity is captured in the TLS handshake; per-
-            // connection audit would need a separate hook).
-            drop(login_audit);
-            let nvmetcp_listen = cfg
-                .nvmetcp
-                .listen
-                .clone()
-                .unwrap_or_else(|| DEFAULT_NVMETCP_LISTEN_ADDRESS.to_string());
-            // NVMe Subsystem NQN — operator override (`nvmetcp.subnqn`)
-            // or the per-product default. Feeds the dispatcher, the
-            // TLS-PSK acceptor (the PSK derivation binds to it), and
-            // the boot log line.
-            let subnqn = cfg
-                .nvmetcp
-                .subnqn
-                .clone()
-                .unwrap_or_else(|| shared_naming::DISK.nqn.to_string());
-            if let Err(e) = shared_naming::validate_nqn(&subnqn) {
-                anyhow::bail!("invalid nvmetcp.subnqn in {}: {e}", config_path.display());
+                )));
             }
-            // Per-subsystem controller registry + AER hub. One instance
-            // shared between the dispatcher (reservation-event producer)
-            // and the NVMe/TCP transport (CNTLID allocator + AER
-            // consumer) — same construct-once-at-boot pattern as
-            // `controller_regs` below.
-            let aer_hub = Arc::new(nvme_nvm::ControllerRegistry::new());
-            let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
-                Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
-                subnqn.clone(),
-                // SN: 20 ASCII chars, fingerprint of the data dir.
-                // Keep simple for now — the data dir basename plus the
-                // volume count is stable across reboots for an
-                // unchanged install.
-                format!("THURVSA{:013}", volumes.len()),
-                shared_naming::DISK_PRODUCT.to_string(),
-                // FR: 8 ASCII chars on the wire — IdentifyController
-                // truncates anything longer (the SHA suffix is the
-                // first thing to fall off, leaving the version core
-                // visible to `nvme id-ctrl`).
-                THURVSA_VERSION_STR.to_string(),
-                Arc::clone(&aer_hub),
-                Arc::clone(&reservations),
-            ));
-            tracing::info!(
-                "thurvsad: NVMe NVM dispatcher ready ({} NSID(s))",
-                volumes.len()
-            );
-
-            // Path to `nvmetcp-psks.json`. Used by TLS-PSK and by
-            // per-hostnqn volume admission. We always have a path
-            // (defaulted under `<data_dir>/`); the server treats a
-            // missing or empty file as "no admission fence."
-            let psks_path = cfg
-                .nvmetcp
-                .tls
-                .identity_file
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"));
-
-            // Optional TLS 1.3 PSK acceptor. Disabled = cleartext
-            // (legacy default). Psk = register a ClientHelloCallback
-            // that reads `nvmetcp-psks.json` and derives every PSK
-            // on every handshake. Operator edits via the
-            // `nvmetcp psks` CLI verbs take effect on the next
-            // session without restart.
-            let tls_acceptor = match cfg.nvmetcp.tls.mode {
-                NvmetcpTlsMode::Disabled => None,
-                NvmetcpTlsMode::Psk => {
-                    // Touch-or-create the stub on first boot so the
-                    // acceptor's load step has something to parse.
-                    let initial_file =
-                        nvme_tcp::identity::NvmetcpPsksFile::load_or_create_default(&psks_path)
-                            .with_context(|| format!("loading {}", psks_path.display()))?;
-                    let acceptor = nvme_tcp::tls::build_psk_acceptor(&psks_path, &subnqn)
-                        .context("building NVMe/TCP TLS-PSK acceptor")?;
-                    tracing::info!(
-                        identity_file = %psks_path.display(),
-                        psk_count = initial_file.psks.len(),
-                        "nvme-tcp: TLS-PSK enabled, parse-on-handshake",
-                    );
-                    Some(acceptor)
+            Transport::Nvmetcp => {
+                // NVMe-TCP path. No login-audit sink is taken (CHAP-style
+                // per-login auditing doesn't fit the TLS-PSK flow — the
+                // host's identity is captured in the TLS handshake; per-
+                // connection audit would need a separate hook). The slot is
+                // dropped after the loop if no iSCSI arm consumed it.
+                let nvmetcp_listen = cfg
+                    .nvmetcp
+                    .listen
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_NVMETCP_LISTEN_ADDRESS.to_string());
+                // NVMe Subsystem NQN — operator override (`nvmetcp.subnqn`)
+                // or the per-product default. Feeds the dispatcher, the
+                // TLS-PSK acceptor (the PSK derivation binds to it), and
+                // the boot log line.
+                let subnqn = cfg
+                    .nvmetcp
+                    .subnqn
+                    .clone()
+                    .unwrap_or_else(|| shared_naming::DISK.nqn.to_string());
+                if let Err(e) = shared_naming::validate_nqn(&subnqn) {
+                    anyhow::bail!("invalid nvmetcp.subnqn in {}: {e}", config_path.display());
                 }
-            };
+                // Per-subsystem controller registry + AER hub. One instance
+                // shared between the dispatcher (reservation-event producer)
+                // and the NVMe/TCP transport (CNTLID allocator + AER
+                // consumer) — same construct-once-at-boot pattern as
+                // `controller_regs` below.
+                let aer_hub = Arc::new(nvme_nvm::ControllerRegistry::new());
+                let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
+                    Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
+                    subnqn.clone(),
+                    // SN: 20 ASCII chars, fingerprint of the data dir.
+                    // Keep simple for now — the data dir basename plus the
+                    // volume count is stable across reboots for an
+                    // unchanged install.
+                    format!("THURVSA{:013}", volumes.len()),
+                    shared_naming::DISK_PRODUCT.to_string(),
+                    // FR: 8 ASCII chars on the wire — IdentifyController
+                    // truncates anything longer (the SHA suffix is the
+                    // first thing to fall off, leaving the version core
+                    // visible to `nvme id-ctrl`).
+                    THURVSA_VERSION_STR.to_string(),
+                    Arc::clone(&aer_hub),
+                    Arc::clone(&reservations),
+                ));
+                tracing::info!(
+                    "thurvsad: NVMe NVM dispatcher ready ({} NSID(s))",
+                    volumes.len()
+                );
 
-            tracing::info!(
-                "transport: nvmetcp (listen={}, subnqn={}, tls={})",
-                nvmetcp_listen,
-                subnqn,
-                tls_acceptor.is_some(),
-            );
-            // Pair admission with auth: TLS-PSK on → admission lookup
-            // applies (mandatory). TLS-PSK off → no admission lookup
-            // → see-everything (mirror of iSCSI no-CHAP).
-            let admission_psks_path = if tls_acceptor.is_some() {
-                Some(psks_path)
-            } else {
-                None
-            };
-            let server_cfg = nvme_tcp::ServerConfig {
-                listen_address: nvmetcp_listen.clone(),
-                handler,
-                controller_regs: Arc::new(nvme_base::ControllerRegs::new()),
-                aer: aer_hub,
-                tls: tls_acceptor,
-                psks_path: admission_psks_path,
-            };
-            (Box::pin(nvme_tcp::run(server_cfg)), vec![nvmetcp_listen])
+                // Path to `nvmetcp-psks.json`. Used by TLS-PSK and by
+                // per-hostnqn volume admission. We always have a path
+                // (defaulted under `<data_dir>/`); the server treats a
+                // missing or empty file as "no admission fence."
+                let psks_path = cfg
+                    .nvmetcp
+                    .tls
+                    .identity_file
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"));
+
+                // Optional TLS 1.3 PSK acceptor. Disabled = cleartext
+                // (legacy default). Psk = register a ClientHelloCallback
+                // that reads `nvmetcp-psks.json` and derives every PSK
+                // on every handshake. Operator edits via the
+                // `nvmetcp psks` CLI verbs take effect on the next
+                // session without restart.
+                let tls_acceptor = match cfg.nvmetcp.tls.mode {
+                    NvmetcpTlsMode::Disabled => None,
+                    NvmetcpTlsMode::Psk => {
+                        // Touch-or-create the stub on first boot so the
+                        // acceptor's load step has something to parse.
+                        let initial_file =
+                            nvme_tcp::identity::NvmetcpPsksFile::load_or_create_default(&psks_path)
+                                .with_context(|| format!("loading {}", psks_path.display()))?;
+                        let acceptor = nvme_tcp::tls::build_psk_acceptor(&psks_path, &subnqn)
+                            .context("building NVMe/TCP TLS-PSK acceptor")?;
+                        tracing::info!(
+                            identity_file = %psks_path.display(),
+                            psk_count = initial_file.psks.len(),
+                            "nvme-tcp: TLS-PSK enabled, parse-on-handshake",
+                        );
+                        Some(acceptor)
+                    }
+                };
+
+                tracing::info!(
+                    "transport: nvmetcp (listen={}, subnqn={}, tls={})",
+                    nvmetcp_listen,
+                    subnqn,
+                    tls_acceptor.is_some(),
+                );
+                // Pair admission with auth: TLS-PSK on → admission lookup
+                // applies (mandatory). TLS-PSK off → no admission lookup
+                // → see-everything (mirror of iSCSI no-CHAP).
+                let admission_psks_path = if tls_acceptor.is_some() {
+                    Some(psks_path)
+                } else {
+                    None
+                };
+                let server_cfg = nvme_tcp::ServerConfig {
+                    listen_address: nvmetcp_listen.clone(),
+                    handler,
+                    controller_regs: Arc::new(nvme_base::ControllerRegs::new()),
+                    aer: aer_hub,
+                    tls: tls_acceptor,
+                    psks_path: admission_psks_path,
+                };
+                transport_listens.push(nvmetcp_listen.clone());
+                transport_futs.push(Box::pin(nvme_tcp::run(server_cfg)));
+            }
         }
-    };
+    }
+    // If iSCSI wasn't listed, its audit sink was never consumed.
+    drop(login_audit_slot);
+    // Config guarantees >= 1 transport; guard anyway so the JoinSet is
+    // never empty (an empty data path would silently serve nothing).
+    if transport_futs.is_empty() {
+        anyhow::bail!("no transports configured; set transports: [iscsi] and/or [nvmetcp]");
+    }
 
     // Admin Unix socket — live volume create / destroy + read APIs +
     // long-running jobs.
@@ -751,13 +772,31 @@ async fn main() -> Result<()> {
         }))
     };
 
+    // Drive every data-path listener concurrently. The first to finish
+    // (clean shutdown, error, bind failure, or task panic) resolves the
+    // select arm and tears the daemon down — the same fail-fast the
+    // single-transport boot had. Remaining listeners are aborted when
+    // `transport_set` drops at end of scope.
+    let mut transport_set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    for fut in transport_futs {
+        transport_set.spawn(fut);
+    }
+
     let result = tokio::select! {
-        res = transport_fut => {
-            if let Err(e) = res {
-                tracing::error!("data-path transport exited with error: {}", e);
-                Err(e)
-            } else {
-                Ok(())
+        joined = transport_set.join_next() => {
+            match joined {
+                Some(Ok(Ok(()))) => Ok(()),
+                Some(Ok(Err(e))) => {
+                    tracing::error!("data-path transport exited with error: {}", e);
+                    Err(e)
+                }
+                Some(Err(join_err)) => {
+                    tracing::error!("data-path transport task panicked: {}", join_err);
+                    Err(anyhow::anyhow!(join_err))
+                }
+                // Unreachable: the set is non-empty (guarded above), so
+                // join_next never yields None before a task completes.
+                None => Ok(()),
             }
         }
         res = admin::run_admin_server(admin_socket.clone(), admin_state) => {

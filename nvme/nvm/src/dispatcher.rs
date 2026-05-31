@@ -101,11 +101,13 @@ pub struct NvmeNvmDispatcher {
     /// Alive admin commands when they arrive — so this is purely
     /// host-visible state.
     kato_ms: AtomicU32,
-    /// Shared reservation state machine, keyed by HOSTID. Injected by
+    /// Shared reservation state machine, keyed by LUN. Injected by
     /// the daemon (`load_from(<data_dir>/reservations.json, ...)`) so
     /// CPTPL-set reservations survive a daemon restart (issue #57); the
     /// test fixtures pass an in-memory `new()` manager (PTPL not
-    /// capable). iSCSI and NVMe/TCP are mutually exclusive per daemon.
+    /// capable). The daemon hands the *same* `Arc` to the SBC
+    /// dispatcher, so under a dual-transport export (issue #66) a
+    /// reservation taken over iSCSI fences NVMe writes and vice-versa.
     reservations: Arc<ReservationManager>,
     /// Per-subsystem controller registry + AER hub. Shared (one `Arc`)
     /// with the NVMe/TCP transport: the transport allocates CNTLIDs at

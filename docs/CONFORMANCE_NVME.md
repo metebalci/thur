@@ -3,7 +3,7 @@
 This document covers per-spec compliance for thurvsa's NVMe-over-TCP block
 target. thurvsa exposes one NVM Subsystem (NQN
 `nqn.2025-10.com.metebalci:thurvsa`) over NVMe/TCP on port 4420 by default,
-selected via `transport: nvmetcp` in the daemon config. Volumes are
+selected by listing `nvmetcp` in the daemon config's `transports:`. Volumes are
 page-grained internally (default 64 KiB) and advertise 4 KiB LBAs to the
 host. NSID maps one-to-one onto the volume → LUN registry as `nsid = lun + 1`
 (NVMe Base reserves NSID 0 for broadcast / no namespace).
@@ -17,10 +17,13 @@ Related docs:
   machine, fused Compare+Write, R2T flow, TLS-PSK derivation) →
   [`NVMETCP.md`](NVMETCP.md).
 
-The two transports are mutually exclusive — only one listener binds per
-daemon — and they reduce to the same `PageCache` + `ChunkPool` below the
-dispatcher boundary, so encryption, dedup, and backend upload behave
-identically regardless of which transport the host used.
+iSCSI and NVMe/TCP can bind concurrently (`transports: [iscsi, nvmetcp]`,
+issue #66) or singly. Both reduce to the same `PageCache` + `ChunkPool` below
+the dispatcher boundary, so encryption, dedup, and backend upload behave
+identically regardless of which transport the host used. When both are bound
+they share one `scsi_spc::reservations::ReservationManager`, so reservations
+fence across protocols — see *Reservation notifications* and the cross-protocol
+note in [`NVMETCP.md`](NVMETCP.md).
 
 **Targets:** NVMe Base 1.4, NVM Command Set 1.0, NVMe-oF 1.1, NVMe
 TCP Transport 1.0a.
@@ -425,6 +428,23 @@ notifications. One deliberate simplification: a host's *own* other
 controllers are not notified of its commands (the issuer is excluded at
 the host level, not the controller level) — a rare case for a
 single-host-multi-controller setup releasing its own reservation.
+
+**Cross-transport scope (issue #66).** When a volume is exported over both
+iSCSI and NVMe/TCP, the two data paths share this one `ReservationManager`, so
+*enforcement* is fully coherent: a Write Exclusive (or any of the six types)
+reservation held by a SCSI initiator denies an NVMe host's writes via the same
+`allow_write` / `allow_read` checks, and vice-versa — the SCSI↔NVMe type mapping
+is 1:1 and an iSCSI `(IQN, ISID)` registrant never equals an NVMe HOSTID
+registrant. The *pull* reports also agree (`nvme resv-report` shows an iSCSI
+holder with `hostid = 0`, `cntlid = 0`; `sg_persist --read-reservation` shows
+the NVMe holder's key + type). What is **not** wired is *proactive*
+cross-transport notification: the diff above only fans LID 0x80 events to NVMe
+controllers, and only for NVMe-originated mutations — a reservation change made
+over iSCSI raises no NVMe AER (and no NVMe change raises a SCSI Unit Attention,
+which the SCSI path does not emit for reservations at all). A host fenced from
+across the other transport discovers it reactively (Reservation Conflict on its
+next I/O) or by polling the report. A transport-neutral `ReservationManager`
+change-observer that fans out to both paths is a tracked follow-up.
 
 **Persistence across a target restart (PTPL).** When a host's most-recent
 Reservation Register set CPTPL = "set PTPL", the registration and any

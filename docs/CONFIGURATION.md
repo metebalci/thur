@@ -52,11 +52,11 @@ description — is available as `thurvtl config defaults` or
 |---|---|---|
 | `data_dir` | **none — required** | Local storage root: disk cache / chunk pool, manifests, library or volume state, the audit log. |
 
-### `transport` — VSA only
+### `transports` — VSA only
 
 | Key | Default | Description |
 |---|---|---|
-| `transport` | `iscsi` | Host-facing data path: `iscsi` binds the SCSI-over-TCP listener, `nvmetcp` binds the NVMe/TCP listener. Mutually exclusive — only one binds. |
+| `transports` | `[iscsi]` | Host-facing data path(s). A list (or a bare scalar) of `iscsi` (SCSI-over-TCP listener) and/or `nvmetcp` (NVMe/TCP listener). List both (`[iscsi, nvmetcp]`) to bind both concurrently against the shared volume set + reservation state — a volume is then a SCSI LUN and an NVMe namespace (`nsid = lun + 1`) at once (issue #66). The default ports don't clash (3260 vs 4420). An empty list is rejected; duplicates are de-duped. A host reachable over both transports must be admitted on **both** (`iscsi-users.json` *and* `nvmetcp-psks.json`); the two admission fences are independent. A reservation taken over one transport fences the other (enforcement + pull reports are coherent; proactive cross-transport notification is out of scope). |
 
 ### `iscsi`
 
@@ -75,7 +75,7 @@ CHAP users and the mutual-CHAP target credential live in
 
 ### `nvmetcp` — VSA only
 
-This section is consulted only when `transport: nvmetcp`.
+This section is consulted only when `nvmetcp` is listed in `transports`.
 
 | Key | Default | Description |
 |---|---|---|

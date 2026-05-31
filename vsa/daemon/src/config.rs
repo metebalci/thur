@@ -45,19 +45,24 @@ pub const DEFAULT_CONFIG_PATH: &str = shared_naming::DISK.config_path;
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfig {
     pub data_dir: String,
-    /// Wire transport for the host-facing data path. Picks
-    /// between iSCSI (SCSI-over-TCP) and NVMe/TCP
-    /// (NVMe-over-Fabrics TCP). Mutually exclusive — only one
-    /// listener binds. Defaults to `iscsi`; flip to `nvmetcp`
-    /// in YAML to switch.
-    #[serde(default)]
-    pub transport: Transport,
+    /// Host-facing wire transports. One daemon exports every listed
+    /// transport concurrently against the shared volume set + shared
+    /// reservation state, so a volume is reachable as a SCSI LUN and
+    /// an NVMe namespace (`nsid = lun + 1`) at the same time. Accepts
+    /// a bare scalar (`transports: iscsi`) or a list
+    /// (`transports: [iscsi, nvmetcp]`). Defaults to `[iscsi]`; an
+    /// empty list is rejected and duplicates are de-duped.
+    #[serde(
+        default = "default_transports",
+        deserialize_with = "deserialize_transports"
+    )]
+    pub transports: Vec<Transport>,
     #[serde(default)]
     pub storage: ObjectStoreConfig,
     #[serde(default)]
     pub iscsi: IscsiSettings,
-    /// NVMe/TCP listener settings. Only consulted when
-    /// `transport: nvmetcp`. Single tunable today (the listen
+    /// NVMe/TCP listener settings. Only consulted when `nvmetcp` is
+    /// listed in `transports`. Single tunable today (the listen
     /// address); auth + NQN overrides land alongside the protocol
     /// implementation in a follow-up.
     #[serde(default)]
@@ -219,11 +224,12 @@ impl DiskCacheSettings {
     }
 }
 
-/// Host-facing wire transport. `iscsi` (default) binds the iSCSI
-/// listener and routes through `shared-iscsi` + `scsi-sbc`.
-/// `nvmetcp` binds the NVMe/TCP listener and routes through
-/// `nvme-tcp` + `nvme-nvm` instead. The two are mutually
-/// exclusive — daemon picks one at boot.
+/// Host-facing wire transport. `iscsi` binds the iSCSI listener and
+/// routes through `shared-iscsi` + `scsi-sbc`. `nvmetcp` binds the
+/// NVMe/TCP listener and routes through `nvme-tcp` + `nvme-nvm`. Both
+/// may be listed in `transports` — they bind concurrently against the
+/// shared volume set + reservation state (their default ports don't
+/// collide: 3260 vs 4420).
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -232,11 +238,50 @@ pub enum Transport {
     Nvmetcp,
 }
 
-/// `nvmetcp:` block. Only consulted when `transport: nvmetcp`.
-/// Defaults are operationally safe: bind 0.0.0.0:4420 (the
-/// IANA-registered NVMe/TCP port; doesn't collide with iSCSI's
-/// 3260, so a future "expose both" mode wouldn't need an
-/// override).
+/// Default `transports` when the key is omitted: iSCSI only (the
+/// historical single-transport default).
+fn default_transports() -> Vec<Transport> {
+    vec![Transport::Iscsi]
+}
+
+/// Accept either a bare scalar (`transports: iscsi`) or a list
+/// (`transports: [iscsi, nvmetcp]`); normalize both to a
+/// `Vec<Transport>`. An empty list is rejected — omit the key for the
+/// default. Duplicates are de-duped, first occurrence kept (order
+/// preserved). Mirrors `deserialize_listen_opt`'s scalar-or-list shape.
+fn deserialize_transports<'de, D>(de: D) -> std::result::Result<Vec<Transport>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Transport),
+        Many(Vec<Transport>),
+    }
+    let raw = match OneOrMany::deserialize(de)? {
+        OneOrMany::One(t) => vec![t],
+        OneOrMany::Many(v) => v,
+    };
+    if raw.is_empty() {
+        return Err(serde::de::Error::custom(
+            "transports must list at least one of [iscsi, nvmetcp]",
+        ));
+    }
+    let mut seen = Vec::with_capacity(raw.len());
+    for t in raw {
+        if !seen.contains(&t) {
+            seen.push(t);
+        }
+    }
+    Ok(seen)
+}
+
+/// `nvmetcp:` block. Only consulted when `nvmetcp` is listed in
+/// `transports`. Defaults are operationally safe: bind 0.0.0.0:4420
+/// (the IANA-registered NVMe/TCP port; doesn't collide with iSCSI's
+/// 3260, so the two bind concurrently with no override).
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct NvmetcpSettings {
     /// Override the NVMe/TCP TCP listen address. Defaults to
@@ -688,29 +733,69 @@ audit:
     }
 
     #[test]
-    fn transport_defaults_to_iscsi() {
+    fn transports_default_is_iscsi() {
         let f = write_config(
             r#"
 data_dir: /var/lib/thurvsa
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
-        assert_eq!(cfg.transport, Transport::Iscsi);
+        assert_eq!(cfg.transports, vec![Transport::Iscsi]);
     }
 
     #[test]
-    fn transport_can_select_nvmetcp() {
+    fn transports_scalar_form() {
         let f = write_config(
             r#"
 data_dir: /var/lib/thurvsa
-transport: nvmetcp
+transports: nvmetcp
 nvmetcp:
   listen: 0.0.0.0:4420
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
-        assert_eq!(cfg.transport, Transport::Nvmetcp);
+        assert_eq!(cfg.transports, vec![Transport::Nvmetcp]);
         assert_eq!(cfg.nvmetcp.listen.as_deref(), Some("0.0.0.0:4420"));
+    }
+
+    #[test]
+    fn transports_list_both() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+transports: [iscsi, nvmetcp]
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        assert_eq!(cfg.transports, vec![Transport::Iscsi, Transport::Nvmetcp]);
+    }
+
+    #[test]
+    fn transports_empty_rejected() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+transports: []
+"#,
+        );
+        let err = DaemonConfig::load(f.path()).expect_err("empty transports must fail");
+        assert!(
+            format!("{err:#}").contains("at least one"),
+            "want 'at least one' in error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn transports_dedup() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+transports: [nvmetcp, iscsi, nvmetcp]
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        // First occurrence kept, order preserved.
+        assert_eq!(cfg.transports, vec![Transport::Nvmetcp, Transport::Iscsi]);
     }
 
     #[test]

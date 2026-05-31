@@ -761,8 +761,15 @@ fn render_read_full_status(state: Option<&LunState>) -> Vec<u8> {
     for (id, key) in &state.registrations {
         let is_holder =
             holder_key.as_ref() == Some(id) || (res_type.is_some_and(|t| t.is_all_registrants()));
-        // Only the iSCSI variant carries an IQN for the TransportID;
-        // NVMe registrants never reach the SCSI PRIN path.
+        // Only the iSCSI variant carries an IQN for the TransportID.
+        // Under a dual-transport export (issue #66) an NVMe host can be
+        // a registrant on the same LUN a SCSI initiator is reading FULL
+        // STATUS for: there is no clean SPC-4 TransportID format for an
+        // NVMe host, so we render the descriptor with an empty iSCSI
+        // TransportID. The key, R_HOLDER bit, and type stay correct, so
+        // `sg_persist --read-full-status` still reports the holder; only
+        // the registrant's transport name is blank (documented
+        // limitation). READ RESERVATION / READ KEYS are unaffected.
         let iqn = match id {
             RegistrantId::Iscsi { iqn, .. } => iqn.as_deref(),
             RegistrantId::NvmeHost { .. } => None,
@@ -1540,6 +1547,44 @@ mod tests {
         // registrant, but not the holder, of a non-*RO/*AR type) is
         // fenced from both reads and writes.
         assert!(!mgr.allow_write(0, &iscsi));
+        assert!(mgr.allow_write(0, &host));
+    }
+
+    #[test]
+    fn cross_transport_write_exclusive_fences_the_other_transport() {
+        // Issue #66 acceptance primitive: one volume exported over both
+        // transports keys the same LUN in the shared manager, so a Write
+        // Exclusive reservation taken over one transport fences the other
+        // transport's writes. An iSCSI initiator port and an NVMe host are
+        // distinct registrant identities that never compare equal, so the
+        // non-holder is denied regardless of which transport it speaks.
+
+        // Direction 1: iSCSI holds WE -> the NVMe host's writes are fenced.
+        let mgr = ReservationManager::new();
+        let iscsi = nexus(1, "iqn.test:a");
+        let host = nvme_host(0xD4);
+        register(&mgr, &iscsi, 0xAAAA);
+        reserve(
+            &mgr,
+            &iscsi,
+            0xAAAA,
+            ReservationType::WriteExclusive.as_u8(),
+        );
+        assert!(!mgr.allow_write(0, &host)); // NVMe host (non-holder) fenced
+        assert!(mgr.allow_read(0, &host)); // reads open under Write Exclusive
+        assert!(mgr.allow_write(0, &iscsi)); // holder may write
+
+        // Direction 2: NVMe holds WE -> the iSCSI initiator's writes are fenced.
+        let mgr = ReservationManager::new();
+        let iscsi = nexus(1, "iqn.test:a");
+        let host = nvme_host(0xD4);
+        mgr.register(0, &host, 0, 0xBBBB, true, None);
+        assert_eq!(
+            mgr.reserve(0, &host, 0xBBBB, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert!(!mgr.allow_write(0, &iscsi)); // iSCSI port (non-holder) fenced
+        assert!(mgr.allow_read(0, &iscsi));
         assert!(mgr.allow_write(0, &host));
     }
 

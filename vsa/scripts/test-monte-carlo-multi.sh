@@ -235,7 +235,7 @@ create_test_config() {
         # Plaintext NVMe/TCP; admission is by-design see-everything
         # in plaintext (mirror of iSCSI no-CHAP). Multi-controller
         # device separation is what isolates the two initiators.
-        transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "127.0.0.1:'"$NVMETCP_PORT"$'"'
+        transport_block=$'transports: [nvmetcp]\nnvmetcp:\n  listen: "127.0.0.1:'"$NVMETCP_PORT"$'"'
     fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"

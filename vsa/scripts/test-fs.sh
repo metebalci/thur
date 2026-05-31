@@ -312,7 +312,7 @@ EOFCONFIG
         cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
-transport: nvmetcp
+transports: [nvmetcp]
 
 http:
   listen: "127.0.0.1:$HTTP_PORT"

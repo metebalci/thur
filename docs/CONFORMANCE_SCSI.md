@@ -18,10 +18,14 @@ independent parts:
 - **[Part 3: SBC-3 (VSA)](#part-3-sbc-3-vsa)** — VSA's direct-access
   block volumes over iSCSI / SCSI.
 
-VSA can also be reached over a second, mutually exclusive transport —
-NVMe / NVMe-oF / NVMe-TCP. That surface has its own document,
-[`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md). Byte-level CDB and page
-layouts are not repeated here; they live in [`SPEC.md`](SPEC.md).
+VSA can also be reached over a second transport — NVMe / NVMe-oF /
+NVMe-TCP — concurrently with iSCSI (`transports: [iscsi, nvmetcp]`,
+issue #66). That surface has its own document,
+[`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md). When both are bound they
+share one `scsi_spc::reservations::ReservationManager`, so a reservation
+taken over one transport fences initiators on the other (see *Persistent
+Reservations* below). Byte-level CDB and page layouts are not repeated
+here; they live in [`SPEC.md`](SPEC.md).
 
 Read each part as a snapshot of *what is actually wired in the code*,
 not as a restatement of what the standard mandates. The **Spec**
@@ -160,7 +164,14 @@ persistent reservations to decide which node owns a LUN:
   advertises the full SBC-3 type matrix (WR_EX / EX_AC / WR_EX_RO /
   EX_AC_RO / WR_EX_AR / EX_AC_AR — TYPE_MASK = `0xEA, 0x01`) and sets
   PTPL_C = 1 (the daemon persists reservation state across power loss);
-  PTPL_A reflects the LU's currently-active APTPL bit.
+  PTPL_A reflects the LU's currently-active APTPL bit. Under a
+  dual-transport export (`transports: [iscsi, nvmetcp]`, issue #66) the
+  registrant set on a LUN can include NVMe hosts: READ KEYS (keys only)
+  and READ RESERVATION (holder key + type) render them transparently;
+  READ FULL STATUS has no SPC-4 TransportID format for an NVMe host, so
+  such a registrant's descriptor carries an **empty iSCSI TransportID**
+  (its key, R_HOLDER bit, and type stay correct) — a documented
+  limitation, not in any acceptance path.
 - **PROUT (0x5F) REGISTER, RESERVE, RELEASE, CLEAR, PREEMPT,
   PREEMPT AND ABORT, REGISTER AND IGNORE EXISTING KEY** mutate state
   per SPC-4 §6.14. Registrations are keyed by the **stable iSCSI
@@ -175,7 +186,15 @@ persistent reservations to decide which node owns a LUN:
   Data-path
   enforcement: WRITE (10/16), SYNCHRONIZE CACHE (10/16), READ (10/16)
   consult `ReservationManager::allow_write` / `allow_read` and surface
-  RESERVATION CONFLICT (status 0x18, no sense) when blocked.
+  RESERVATION CONFLICT (status 0x18, no sense) when blocked. Because
+  those checks are transport-neutral and keyed by LUN, a reservation
+  held by an NVMe host (when the volume is also exported over NVMe/TCP,
+  issue #66) fences a SCSI initiator's WRITE just the same — the iSCSI
+  port and the NVMe host are distinct registrants under the 1:1 SCSI↔NVMe
+  type mapping. Proactive cross-transport notification is out of scope
+  (the loser learns via the CONFLICT above or by polling READ
+  RESERVATION); see [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md)
+  § Reservation notifications.
 - **REGISTER AND MOVE (SA 0x07)** rejected — thurvsa is single-port.
 - **APTPL = 1** is honored: the LU's registrations + reservation are
   written to `<data_dir>/reservations.json` (atomic temp-file write +

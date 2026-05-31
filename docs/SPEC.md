@@ -320,9 +320,13 @@ on the same backend chunk pool. Internally, volumes are page-grained
 with a default 64 KiB page, but to the host they advertise plain 4 KiB
 sectors over SBC-3 — the paging is invisible at the SCSI surface. The
 iSCSI target IQN is configurable via `iscsi.target_iqn`, and when the
-volume is served over NVMe/TCP instead (`transport: nvmetcp`), the
+volume is served over NVMe/TCP (`nvmetcp` listed in `transports:`), the
 subsystem NQN is configurable via `nvmetcp.subnqn`. Both default to
-the per-product identity and are validated at startup.
+the per-product identity and are validated at startup. The two
+transports can bind concurrently (`transports: [iscsi, nvmetcp]`,
+issue #66): a volume is then addressable as a SCSI LUN and an NVMe
+namespace (`nsid = lun + 1`) at the same time, sharing one
+reservation state (see § Persistent reservations).
 
 | Opcode | Command | Notes |
 |-------:|---------|-------|
@@ -497,9 +501,25 @@ The NVMe/TCP target exposes reservations as the protocol-native analog
 of SBC-3 PERSISTENT RESERVE (issue #54). The *state machine* is the
 same `scsi_spc::reservations::ReservationManager`; only the wire
 encoding differs, and it is parsed / rendered in
-`nvme_nvm::reservations` + `nvme_base::reservation`. Because iSCSI and
-NVMe/TCP are mutually exclusive per daemon, each dispatcher owns its
-own manager instance.
+`nvme_nvm::reservations` + `nvme_base::reservation`. The daemon builds
+**one** `ReservationManager` (keyed by LUN) and hands a shared
+`Arc` to both the SBC and the NVMe dispatcher, so when a volume is
+exported over both transports concurrently (`transports: [iscsi,
+nvmetcp]`, issue #66) the two surfaces enforce one reservation state.
+A reservation held by a SCSI initiator therefore fences NVMe writes and
+vice-versa: an iSCSI `(IQN, ISID)` registrant and an NVMe HOSTID
+registrant are distinct identities under the 1:1 type mapping below, so
+the non-holder is denied by the same `allow_write` / `allow_read`
+checks. The pull-side reports stay consistent too — `nvme resv-report`
+renders an iSCSI holder with `hostid = 0` / `cntlid = 0`, and SCSI READ
+RESERVATION / READ KEYS render NVMe registrants by key (READ FULL STATUS
+emits an empty iSCSI TransportID for an NVMe host, since SPC-4 has no
+NVMe-host TransportID format — a documented limitation). **Out of
+scope (issue #66):** proactive cross-transport notification — a fence
+taken over one transport raises no AER / Unit Attention on the other;
+the loser learns reactively (Reservation Conflict on its next command)
+or by polling the report. NVMe→NVMe Reservation Notifications (LID
+0x80) are unaffected.
 
 The registrant identity is the **128-bit Host Identifier** from the
 Fabrics Connect data, not a per-connection handle. One NVMe host opens

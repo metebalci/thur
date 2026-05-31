@@ -381,7 +381,7 @@ create_test_config() {
             transport_block+=$'\n  auth:\n    method: CHAP'
         fi
     else
-        transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
+        transport_block=$'transports: [nvmetcp]\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
     fi
     if [[ -z "$BACKEND_NAME" ]]; then
         BACKEND_NAME="local"

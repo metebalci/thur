@@ -274,9 +274,9 @@ sudo journalctl -u thurvtld -f
 
 Each daemon runs a storage target and an HTTP metrics server
 (port 9090) in a single process. Thur VTL serves iSCSI on port 3260;
-Thur VSA serves iSCSI on port 3260 by default, or NVMe/TCP on port
-4420 if `transport: nvmetcp` is set in `thurvsa.yaml` (one listener
-binds, not both). For co-resident installs, override the shared ports
+Thur VSA serves iSCSI on port 3260 and/or NVMe/TCP on port 4420,
+depending on `transports:` in `thurvsa.yaml` (default `[iscsi]`; list
+`[iscsi, nvmetcp]` to bind both at once). For co-resident installs, override the shared ports
 in YAML so the two daemons don't clash. Persist systemd
 customizations through `sudo systemctl edit <unit>` so package
 upgrades don't clobber them.
@@ -336,8 +336,9 @@ sudo tar -xvf /dev/nst0                      # restore
 ## Connect (iSCSI or NVMe/TCP)
 
 VSA serves each volume as a block LUN. The default transport is
-iSCSI; set `transport: nvmetcp` in `thurvsa.yaml` to serve NVMe/TCP
-instead (one listener binds, not both).
+iSCSI; list `nvmetcp` in `transports:` in `thurvsa.yaml` to serve
+NVMe/TCP, or `[iscsi, nvmetcp]` to serve both at once (a volume is then
+reachable over both transports simultaneously).
 
 ```bash
 # iSCSI (port 3260)

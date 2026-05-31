@@ -1168,8 +1168,8 @@ cheap to replace — re-mint them annually.
 
 ## NVMe/TCP TLS-PSK (VSA only)
 
-When VSA is run over the NVMe/TCP transport — selected with
-`transport: nvmetcp` — that transport can additionally run opt-in
+When VSA is run over the NVMe/TCP transport — enabled by listing
+`nvmetcp` in `transports:` — that transport can additionally run opt-in
 TLS 1.3 with pre-shared keys, as specified in NVMe-TCP §3.6.1.5. The
 full wire-flow and key-derivation design is documented in
 [`NVMETCP.md`](NVMETCP.md) § TLS-PSK; this section covers only the

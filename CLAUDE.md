@@ -240,8 +240,9 @@ on-disk paths group by purpose.
   SUCCESS-bit folding, C2HTermReq on protocol violations, reservation
   notifications via AER (Admin 0x0C) + LID 0x80 parked on a shared
   `nvme_nvm::ControllerRegistry` (which also allocates a CNTLID per
-  controller at Connect). Selected via `transport: nvmetcp` in
-  `thurvsa.yaml` (default `iscsi`). Out of scope: TLS-PSK auth, CRC32C
+  controller at Connect). Enabled by listing `nvmetcp` in `transports:`
+  in `thurvsa.yaml` (default `[iscsi]`; list both to bind concurrently —
+  issue #66). Out of scope: TLS-PSK auth, CRC32C
   digests, multi-outstanding R2T, discovery controller — rationale in
   [`docs/NVMETCP.md`](docs/NVMETCP.md) § *Out of scope*.
 - `core/ssc` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
@@ -495,7 +496,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 Two product-prefixed sets, in increasing order of prereqs / coverage:
 
 - `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
+- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,dual-transport,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,monte-carlo,app-postgres,app-vm}.sh`
 
 Run from the repo root; flags `--debug`, `--keep-data` (release is the
 default — debug builds are 5-10x slower, only useful when iterating on a

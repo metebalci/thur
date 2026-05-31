@@ -359,7 +359,7 @@ create_test_config() {
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         transport_block=$'iscsi:\n  listen: "127.0.0.1:'"$ISCSI_PORT"'"'
     else
-        transport_block=$'transport: nvmetcp\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
+        transport_block=$'transports: [nvmetcp]\nnvmetcp:\n  listen: "0.0.0.0:'"$NVMETCP_PORT"'"'
     fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"

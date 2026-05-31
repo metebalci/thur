@@ -20,12 +20,14 @@
 # default — must be set.
 # data_dir: "/var/lib/thurvsa"
 
-# Wire transport for the host-facing data path. "iscsi" (default)
-# binds the SCSI-over-TCP listener; "nvmetcp" binds the
-# NVMe-over-Fabrics TCP listener instead. Mutually exclusive — only
-# one listener binds. Their default ports don't collide
-# (3260 vs. 4420) so the only knob you need to flip is `transport:`.
-# transport: "iscsi"
+# Host-facing wire transports. "iscsi" binds the SCSI-over-TCP
+# listener; "nvmetcp" binds the NVMe-over-Fabrics TCP listener. List
+# one or both: each listed transport binds its own listener
+# concurrently against the shared volume set + reservation state, so a
+# volume is reachable as a SCSI LUN and an NVMe namespace at once.
+# Accepts a bare scalar (transports: iscsi) or a list. Their default
+# ports don't collide (3260 vs. 4420). Defaults to [iscsi].
+# transports: [iscsi]
 
 # iSCSI target. thurvsa binds3260by default so it can coexist
 # with a tape VTL on the canonical 3260 (operator distinguishes
@@ -87,8 +89,9 @@ iscsi:
     # 3.x+. Empty falls back to ["SHA3-256", "SHA-256", "SHA-1", "MD5"].
     allowed_algorithms: []
 
-# NVMe/TCP target. Only consulted when `transport: nvmetcp`. Binds
-# 0.0.0.0:4420 (IANA-registered nvme-tcp port) by default.
+# NVMe/TCP target. Only consulted when `nvmetcp` is listed in
+# `transports`. Binds 0.0.0.0:4420 (IANA-registered nvme-tcp port) by
+# default.
 # nvmetcp:
 #   # Listen address override. Test scripts may pin an ephemeral
 #   # port to avoid clashing across concurrent runs.

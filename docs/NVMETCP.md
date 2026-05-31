@@ -15,25 +15,56 @@ path is in [`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md).
 
 ## Selecting the transport
 
-`thurvsa.yaml` carries a top-level `transport:` enum:
+`thurvsa.yaml` carries a top-level `transports:` list (a bare scalar is also
+accepted):
 
 ```yaml
-transport: iscsi      # default
-# transport: nvmetcp
+transports: [iscsi]              # default
+# transports: [nvmetcp]
+# transports: [iscsi, nvmetcp]   # both at once
 ```
 
-The two transports are mutually exclusive — only one listener binds. NVMe/TCP
-defaults to the IANA-registered nvme-tcp port (`0.0.0.0:4420`); iSCSI keeps
-`0.0.0.0:3260`. Both can be overridden via the per-transport `listen:` field:
+List one or both. Each listed transport binds its own listener concurrently
+against the shared volume set and the shared reservation state, so a single
+volume is reachable as a SCSI LUN **and** an NVMe namespace (`nsid = lun + 1`)
+at the same time (issue #66). The default ports don't clash — iSCSI keeps
+`0.0.0.0:3260`, NVMe/TCP the IANA-registered `0.0.0.0:4420` — so no override is
+needed to run both; each is still tunable via its own `listen:` field:
 
 ```yaml
-transport: nvmetcp
+transports: [iscsi, nvmetcp]
+iscsi:
+  listen: 0.0.0.0:3260
 nvmetcp:
   listen: 0.0.0.0:4420
 ```
 
-Because the default ports don't clash, a future concurrent-both-transports
-mode would require no operator override.
+### Cross-protocol reservation coherence
+
+Both data paths share one `scsi_spc::reservations::ReservationManager` keyed by
+LUN, so a reservation taken over one transport fences initiators on the other:
+an iSCSI initiator port `(IQN, ISID)` and an NVMe host (HOSTID) are distinct
+registrant identities that never compare equal, and the SCSI↔NVMe reservation
+type mapping is 1:1. A Write Exclusive reservation held by a SCSI host therefore
+denies an NVMe host's writes (and vice-versa); `nvme resv-report` and
+`sg_persist --read-reservation` report the same holder. The two admission
+fences stay independent — see [admission](#admission-is-per-transport).
+
+**Limitation (out of scope, #66):** there is no *proactive* cross-transport
+notification. A fence taken over one transport does **not** push an NVMe AER or
+a SCSI Unit Attention to hosts on the other transport — they discover the fence
+reactively (Reservation Conflict on the next I/O) or by polling resv-report /
+read-reservation. (The SCSI/iSCSI path emits no reservation Unit Attention at
+all today; wiring a `ReservationManager` change-observer that fans out to both
+transports' notification machinery is tracked as a follow-up.)
+
+### Admission is per-transport
+
+A host reachable over both transports must be admitted on **both**: a CHAP user
+entry in `iscsi-users.json` (per-CHAP-user `volumes:`) for the iSCSI path and a
+host-NQN entry in `nvmetcp-psks.json` (per-hostNQN `volumes:`) for the NVMe
+path. The two admission fences are independent — a grant on one does not imply
+the other.
 
 ## Crate split
 
@@ -312,11 +343,20 @@ Two layers, in increasing order of prerequisites:
 - **`vsa/scripts/test-proto-nvmetcp.sh`** — live stack test
   driven by Linux `nvme-cli`. Self-elevates via sudo, loads
   `nvme_tcp` if needed, brings the daemon up with
-  `transport: nvmetcp` on a free ephemeral port, runs
+  `transports: [nvmetcp]` on a free ephemeral port, runs
   `nvme connect` / `id-ctrl` / `id-ns` / `smart-log` / 10 MiB `dd`
   write+read with SHA-256 compare / `nvme disconnect`. Prereqs:
   `nvme-cli` + kernel ≥ 5.0. Pass `--tls` to exercise the TLS-PSK
   path (additional prereqs: `keyctl`, a running `tlshd`).
+- **`vsa/scripts/test-dual-transport.sh`** — issue #66 acceptance:
+  brings the daemon up with `transports: [iscsi, nvmetcp]` and one
+  volume, connects over both (`iscsiadm` + `nvme connect`), checks
+  cross-transport data coherence, then asserts a Write Exclusive
+  reservation taken over either transport fences the other (both
+  directions), with `nvme resv-report` / `sg_persist
+  --read-reservation` reporting the same holder. Self-elevates via
+  sudo. Prereqs: `open-iscsi`, `sg3-utils`, `lsscsi`, `nvme-cli`,
+  `nvme_tcp`.
 
 ## TLS-PSK (NVMe-TCP §3.6.1.5)
 
@@ -472,6 +512,13 @@ has no firmware mechanism or thermal sensors, and namespaces are bound at
 `volume create`. The generic AER plumbing (`ControllerRegistry`, the DW0 builder,
 the park/notify/oneshot path) is reusable when a namespace-change source lands; it
 would add OACS bit 8 + a Changed Namespace List (LID 0x04), out of scope here.
+
+Reservation notifications are also **not** fanned out across transports: a
+reservation taken/preempted over iSCSI does not raise an NVMe AER (and an NVMe
+reservation change raises no SCSI Unit Attention). Enforcement and the pull-side
+reports stay coherent (see *Cross-protocol reservation coherence* above); only
+the proactive signal is per-transport. Wiring a transport-neutral
+`ReservationManager` change-observer is a tracked follow-up.
 
 ### Discovery controller
 
