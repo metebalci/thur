@@ -147,17 +147,9 @@ pub fn parse_interchange_key(s: &str) -> Result<ParsedInterchangeKey, PskError> 
             got: decoded.len(),
         });
     }
-    let (key, crc_bytes) = decoded.split_at(hash.len());
-    // safe: split_at(hash.len()) leaves exactly 4 bytes (we verified
-    // the total length above as hash.len() + 4).
-    let crc_arr: [u8; 4] = crc_bytes
-        .try_into()
-        .map_err(|_| PskError::BadInterchangeFormat)?;
-    let want_crc = u32::from_le_bytes(crc_arr);
-    let got_crc = crc32fast::hash(key);
-    if want_crc != got_crc {
-        return Err(PskError::CrcMismatch);
-    }
+    // Length check above pins the split point; the shared CRC-tail
+    // core validates the trailing CRC-32 and strips it.
+    let key = crate::split_verify_crc_tail(&decoded).ok_or(PskError::CrcMismatch)?;
 
     Ok(ParsedInterchangeKey {
         version,

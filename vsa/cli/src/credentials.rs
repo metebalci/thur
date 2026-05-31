@@ -116,7 +116,7 @@ pub async fn psks_add(
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
     let mut body = serde_json::json!({
         "host_nqn": host_nqn,
-        "interchange_key": interchange_key,
+        "key": interchange_key,
     });
     if let Some(vs) = volumes {
         body["volumes"] = serde_json::json!(vs);
@@ -181,7 +181,7 @@ pub async fn psks_rotate(host_nqn: &str, interchange_key: &str, grace: &str) -> 
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
     let body = serde_json::json!({
         "host_nqn": host_nqn,
-        "interchange_key": interchange_key,
+        "key": interchange_key,
         "grace_seconds": grace_secs,
     });
     let row: PskRow = admin
@@ -234,9 +234,9 @@ pub async fn dhchap_add(
     }
     let admin = AdminClient::auto_discover(PRODUCT);
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let mut body = serde_json::json!({ "host_nqn": host_nqn, "dhchap_key": key });
+    let mut body = serde_json::json!({ "host_nqn": host_nqn, "key": key });
     if let Some(c) = ctrl_key {
-        body["dhchap_ctrl_key"] = serde_json::json!(c);
+        body["ctrl_key"] = serde_json::json!(c);
     }
     if let Some(vs) = volumes {
         body["volumes"] = serde_json::json!(vs);
@@ -300,7 +300,7 @@ pub async fn dhchap_set_ctrl_key(host_nqn: &str, key: &str) -> Result<()> {
     parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
     let admin = AdminClient::auto_discover(PRODUCT);
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn, "dhchap_ctrl_key": key });
+    let body = serde_json::json!({ "host_nqn": host_nqn, "ctrl_key": key });
     let _: DhchapRow = admin
         .post_json("/api/v1/nvmetcp/dhchap/ctrl-key/set", &body)
         .await?;
@@ -326,7 +326,7 @@ pub async fn dhchap_rotate(host_nqn: &str, key: &str, grace: &str) -> Result<()>
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
     let body = serde_json::json!({
         "host_nqn": host_nqn,
-        "dhchap_key": key,
+        "key": key,
         "grace_seconds": grace_secs,
     });
     let row: DhchapRow = admin

@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{DhchapError, DhchapKey, parse_dhchap_secret};
@@ -122,29 +123,47 @@ pub fn admission_for(
         .map(|e| e.volumes.unwrap_or_default()))
 }
 
+/// Load a JSON file into `T`, returning `T::default()` when the path
+/// is absent. Errors only on read-but-malformed JSON or other I/O
+/// failure. Shared by [`NvmetcpPsksFile`] and [`NvmetcpDhchapFile`] so
+/// the two daemon-managed credential files can't drift on load
+/// semantics.
+fn load_json_or_default<T: DeserializeOwned + Default>(
+    path: &Path,
+) -> Result<T, IdentityFileError> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).map_err(IdentityFileError::Parse),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(IdentityFileError::Io(e)),
+    }
+}
+
+/// Atomic JSON save (write tmp -> chmod 0640 on Unix -> rename).
+/// Shared by both credential files so the on-disk discipline (atomic
+/// rename + 0640) stays identical.
+fn save_json_atomic_0640<T: Serialize>(path: &Path, value: &T) -> Result<(), IdentityFileError> {
+    let body = serde_json::to_string_pretty(value).map_err(IdentityFileError::Parse)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(IdentityFileError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
+            .map_err(IdentityFileError::Io)?;
+    }
+    std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)
+}
+
 impl NvmetcpPsksFile {
     /// Load from disk. Returns the default (empty) file when the
     /// path doesn't exist. Errors only on read-but-malformed JSON.
     pub fn load(path: &Path) -> Result<Self, IdentityFileError> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).map_err(IdentityFileError::Parse),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(IdentityFileError::Io(e)),
-        }
+        load_json_or_default(path)
     }
 
-    /// Atomic save (write tmp → chmod 0640 → rename).
+    /// Atomic save (write tmp -> chmod 0640 -> rename).
     pub fn save(&self, path: &Path) -> Result<(), IdentityFileError> {
-        let body = serde_json::to_string_pretty(self).map_err(IdentityFileError::Parse)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(IdentityFileError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
-                .map_err(IdentityFileError::Io)?;
-        }
-        std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)
+        save_json_atomic_0640(path, self)
     }
 
     /// Load if present, otherwise write an empty stub and return it.
@@ -308,25 +327,12 @@ impl NvmetcpDhchapFile {
     /// Load from disk. Returns the default (empty) file when the path
     /// doesn't exist; errors only on read-but-malformed JSON.
     pub fn load(path: &Path) -> Result<Self, IdentityFileError> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).map_err(IdentityFileError::Parse),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(IdentityFileError::Io(e)),
-        }
+        load_json_or_default(path)
     }
 
     /// Atomic save (write tmp -> chmod 0640 -> rename).
     pub fn save(&self, path: &Path) -> Result<(), IdentityFileError> {
-        let body = serde_json::to_string_pretty(self).map_err(IdentityFileError::Parse)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(IdentityFileError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
-                .map_err(IdentityFileError::Io)?;
-        }
-        std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)
+        save_json_atomic_0640(path, self)
     }
 
     /// Load if present, otherwise write an empty stub and return it.
@@ -393,6 +399,188 @@ pub fn dhchap_lookup(
         ctrl_secret,
         volumes: entry.volumes.unwrap_or_default(),
     }))
+}
+
+// ===================== Shared rotatable-entry surface =====================
+//
+// [`PskEntry`] and [`DhchapEntry`] are structurally the same rotatable
+// per-host credential record: a host NQN, a disabled flag, a volume
+// admission set, a current secret, and a (previous secret + expiry)
+// rotation grace pair. These two traits expose that common surface so
+// the daemon's `nvmetcp {psks,dhchap}` admin handlers can share one
+// copy of the rotation state machine (begin / cancel / sweep) and the
+// add / remove / grant / revoke lifecycle (issue #70). The secret
+// field names (`interchange_key` vs `dhchap_key`) and the DH-HMAC-CHAP
+// controller key stay surface-specific.
+
+/// The common surface of a rotatable per-host credential entry.
+pub trait HostCredentialEntry {
+    fn host_nqn(&self) -> &str;
+    fn disabled(&self) -> bool;
+    fn set_disabled(&mut self, disabled: bool);
+    fn volumes(&self) -> Option<&Vec<String>>;
+    fn set_volumes(&mut self, volumes: Option<Vec<String>>);
+    fn previous_expires_at(&self) -> Option<DateTime<Utc>>;
+
+    /// True iff a previous key and its expiry are both staged — a
+    /// rotation grace window is in progress.
+    fn rotation_pending(&self) -> bool;
+
+    /// Stage a rotation: move the current key into the previous slot,
+    /// install `new_key` as current, and arm the grace expiry.
+    fn begin_rotation(&mut self, new_key: String, expires: DateTime<Utc>);
+
+    /// Cancel a staged rotation: restore the previous key as current
+    /// and clear the grace fields. Returns `false` (a no-op) when no
+    /// rotation is pending.
+    fn cancel_rotation(&mut self) -> bool;
+
+    /// Clear an expired previous key (`expires <= now`). Returns
+    /// `true` when a key was cleared, so the caller can emit a
+    /// `rotate.commit` audit row.
+    fn sweep_expired(&mut self, now: DateTime<Utc>) -> bool;
+}
+
+/// The common surface of a daemon-managed credential file: the entry
+/// list plus the on-disk load/save lifecycle.
+pub trait HostCredentialFile: Default + Sized {
+    type Entry: HostCredentialEntry;
+    fn entries(&self) -> &[Self::Entry];
+    fn entries_mut(&mut self) -> &mut Vec<Self::Entry>;
+    fn from_path(path: &Path) -> Result<Self, IdentityFileError>;
+    fn to_path(&self, path: &Path) -> Result<(), IdentityFileError>;
+}
+
+impl HostCredentialEntry for PskEntry {
+    fn host_nqn(&self) -> &str {
+        &self.host_nqn
+    }
+    fn disabled(&self) -> bool {
+        self.disabled
+    }
+    fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
+    fn volumes(&self) -> Option<&Vec<String>> {
+        self.volumes.as_ref()
+    }
+    fn set_volumes(&mut self, volumes: Option<Vec<String>>) {
+        self.volumes = volumes;
+    }
+    fn previous_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.previous_expires_at
+    }
+    fn rotation_pending(&self) -> bool {
+        self.previous_interchange_key.is_some() && self.previous_expires_at.is_some()
+    }
+    fn begin_rotation(&mut self, new_key: String, expires: DateTime<Utc>) {
+        let old = std::mem::replace(&mut self.interchange_key, new_key);
+        self.previous_interchange_key = Some(old);
+        self.previous_expires_at = Some(expires);
+    }
+    fn cancel_rotation(&mut self) -> bool {
+        match self.previous_interchange_key.take() {
+            Some(prev) => {
+                self.previous_expires_at = None;
+                self.interchange_key = prev;
+                true
+            }
+            None => false,
+        }
+    }
+    fn sweep_expired(&mut self, now: DateTime<Utc>) -> bool {
+        if let Some(expires) = self.previous_expires_at
+            && expires <= now
+        {
+            self.previous_interchange_key = None;
+            self.previous_expires_at = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl HostCredentialFile for NvmetcpPsksFile {
+    type Entry = PskEntry;
+    fn entries(&self) -> &[PskEntry] {
+        &self.psks
+    }
+    fn entries_mut(&mut self) -> &mut Vec<PskEntry> {
+        &mut self.psks
+    }
+    fn from_path(path: &Path) -> Result<Self, IdentityFileError> {
+        Self::load(path)
+    }
+    fn to_path(&self, path: &Path) -> Result<(), IdentityFileError> {
+        self.save(path)
+    }
+}
+
+impl HostCredentialEntry for DhchapEntry {
+    fn host_nqn(&self) -> &str {
+        &self.host_nqn
+    }
+    fn disabled(&self) -> bool {
+        self.disabled
+    }
+    fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
+    fn volumes(&self) -> Option<&Vec<String>> {
+        self.volumes.as_ref()
+    }
+    fn set_volumes(&mut self, volumes: Option<Vec<String>>) {
+        self.volumes = volumes;
+    }
+    fn previous_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.previous_expires_at
+    }
+    fn rotation_pending(&self) -> bool {
+        self.previous_dhchap_key.is_some() && self.previous_expires_at.is_some()
+    }
+    fn begin_rotation(&mut self, new_key: String, expires: DateTime<Utc>) {
+        let old = std::mem::replace(&mut self.dhchap_key, new_key);
+        self.previous_dhchap_key = Some(old);
+        self.previous_expires_at = Some(expires);
+    }
+    fn cancel_rotation(&mut self) -> bool {
+        match self.previous_dhchap_key.take() {
+            Some(prev) => {
+                self.previous_expires_at = None;
+                self.dhchap_key = prev;
+                true
+            }
+            None => false,
+        }
+    }
+    fn sweep_expired(&mut self, now: DateTime<Utc>) -> bool {
+        if let Some(expires) = self.previous_expires_at
+            && expires <= now
+        {
+            self.previous_dhchap_key = None;
+            self.previous_expires_at = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl HostCredentialFile for NvmetcpDhchapFile {
+    type Entry = DhchapEntry;
+    fn entries(&self) -> &[DhchapEntry] {
+        &self.dhchap
+    }
+    fn entries_mut(&mut self) -> &mut Vec<DhchapEntry> {
+        &mut self.dhchap
+    }
+    fn from_path(path: &Path) -> Result<Self, IdentityFileError> {
+        Self::load(path)
+    }
+    fn to_path(&self, path: &Path) -> Result<(), IdentityFileError> {
+        self.save(path)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -712,5 +900,78 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         std::fs::remove_file(&tmp).unwrap();
+    }
+
+    // ----- HostCredentialEntry rotation state machine -----
+    //
+    // The daemon's `nvmetcp {psks,dhchap}` admin handlers drive
+    // rotation entirely through these trait methods, so the state
+    // machine is unit-tested here once for both entry types.
+
+    #[test]
+    fn psk_entry_begin_cancel_rotation_round_trips() {
+        let mut e = entry("nqn.host.a", &[0xAA; 32]);
+        assert!(!e.rotation_pending());
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        e.begin_rotation("new-current".into(), expires);
+        assert!(e.rotation_pending());
+        assert_eq!(e.interchange_key, "new-current");
+        assert_eq!(e.previous_expires_at, Some(expires));
+        // Cancel restores the previous key as current and clears grace.
+        assert!(e.cancel_rotation());
+        assert!(!e.rotation_pending());
+        assert!(e.previous_interchange_key.is_none());
+        assert!(e.previous_expires_at.is_none());
+        // A second cancel is a no-op.
+        assert!(!e.cancel_rotation());
+    }
+
+    #[test]
+    fn psk_entry_sweep_clears_only_expired_previous() {
+        let now = Utc::now();
+        let mut active = entry("nqn.host.a", &[0xAA; 32]);
+        active.begin_rotation("k".into(), now + chrono::Duration::hours(1));
+        assert!(!active.sweep_expired(now), "future grace must survive");
+        assert!(active.rotation_pending());
+
+        let mut expired = entry("nqn.host.b", &[0xBB; 32]);
+        expired.begin_rotation("k".into(), now - chrono::Duration::seconds(1));
+        assert!(expired.sweep_expired(now), "expired grace must be swept");
+        assert!(!expired.rotation_pending());
+        assert!(expired.previous_interchange_key.is_none());
+
+        // No previous staged -> sweep is a no-op.
+        let mut fresh = entry("nqn.host.c", &[0xCC; 32]);
+        assert!(!fresh.sweep_expired(now));
+    }
+
+    #[test]
+    fn psk_entry_volume_and_disabled_accessors() {
+        let mut e = entry("nqn.host.a", &[0xAA; 32]);
+        assert_eq!(e.host_nqn(), "nqn.host.a");
+        assert!(!e.disabled());
+        e.set_disabled(true);
+        assert!(e.disabled());
+        assert!(e.volumes().is_none());
+        e.set_volumes(Some(vec!["v1".into()]));
+        assert_eq!(e.volumes().map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn dhchap_entry_begin_cancel_sweep_round_trip() {
+        let now = Utc::now();
+        let mut e = dhchap_entry("nqn.host.a");
+        assert!(!e.rotation_pending());
+        e.begin_rotation("new-secret".into(), now + chrono::Duration::hours(1));
+        assert!(e.rotation_pending());
+        assert_eq!(e.dhchap_key, "new-secret");
+        assert!(!e.sweep_expired(now), "future grace survives");
+        assert!(e.cancel_rotation());
+        assert!(e.previous_dhchap_key.is_none());
+
+        e.begin_rotation("s2".into(), now - chrono::Duration::seconds(1));
+        assert!(e.sweep_expired(now), "expired grace swept");
+        assert!(e.previous_dhchap_key.is_none());
+        assert!(e.previous_expires_at.is_none());
     }
 }

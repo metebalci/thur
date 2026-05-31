@@ -565,6 +565,18 @@ Secrets rotate with a grace window (`previous_dhchap_key` +
 `previous_expires_at`) — both authenticate while the window is open. Operator
 surface + secret-store schema in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
 
+Because `nvmetcp-dhchap.json` and `nvmetcp-psks.json` are structurally the
+same rotatable per-host record, the daemon's `nvmetcp dhchap` and `nvmetcp
+psks` admin verbs (add / remove / disable / enable / rotate / rotate-cancel /
+grant / revoke) are one generic implementation parameterized on a per-surface
+`Surface` trait — `vsa/daemon/src/admin/nvmetcp_host_file.rs` — so a fix to the
+rotation grace state machine lands on both surfaces at once. The on-disk
+records expose that common shape through the `HostCredentialEntry` /
+`HostCredentialFile` traits in `nvme-tcp::identity`, and the two secret parsers
+(`NVMeTLSkey-...` and `DHHC-1:...`) share one base64 + CRC32-LE-tail validation
+core. The DH-HMAC-CHAP-only `set-ctrl-key` / `clear-ctrl-key` verbs and each
+surface's `list` envelope stay surface-specific.
+
 ## Out of scope (with rationale)
 
 The following features are intentionally not implemented in this stack. Each

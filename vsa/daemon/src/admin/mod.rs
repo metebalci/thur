@@ -21,6 +21,7 @@ pub mod iscsi_target;
 pub mod iscsi_users;
 pub mod job_dispatch;
 pub mod nvmetcp_dhchap;
+pub mod nvmetcp_host_file;
 pub mod nvmetcp_psks;
 
 use anyhow::Result;
@@ -32,6 +33,9 @@ use shared_admin_server::HasJobs;
 use std::path::PathBuf;
 
 use handlers::AdminState;
+use nvmetcp_dhchap::DhchapSurface;
+use nvmetcp_host_file as host_file;
+use nvmetcp_psks::PsksSurface;
 
 /// Canonical admin socket path. Sourced from [`shared_naming::DISK`]
 /// so the daemon and CLI agree without duplicating the literal.
@@ -95,50 +99,76 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             get(iscsi_target::show).post(iscsi_target::set),
         )
         .route("/api/v1/iscsi/target/clear", post(iscsi_target::clear))
-        // NVMe-TCP TLS-PSK lifecycle
+        // NVMe-TCP TLS-PSK lifecycle. The mutating verbs are the
+        // generic host-credential handlers parameterized on the
+        // TLS-PSK surface; only `list` carries a surface-specific
+        // response envelope.
         .route(
             "/api/v1/nvmetcp/psks",
-            get(nvmetcp_psks::list).post(nvmetcp_psks::add),
+            get(nvmetcp_psks::list).post(host_file::add::<PsksSurface>),
         )
-        .route("/api/v1/nvmetcp/psks/remove", post(nvmetcp_psks::remove))
-        .route("/api/v1/nvmetcp/psks/disable", post(nvmetcp_psks::disable))
-        .route("/api/v1/nvmetcp/psks/enable", post(nvmetcp_psks::enable))
-        .route("/api/v1/nvmetcp/psks/rotate", post(nvmetcp_psks::rotate))
+        .route(
+            "/api/v1/nvmetcp/psks/remove",
+            post(host_file::remove::<PsksSurface>),
+        )
+        .route(
+            "/api/v1/nvmetcp/psks/disable",
+            post(host_file::disable::<PsksSurface>),
+        )
+        .route(
+            "/api/v1/nvmetcp/psks/enable",
+            post(host_file::enable::<PsksSurface>),
+        )
+        .route(
+            "/api/v1/nvmetcp/psks/rotate",
+            post(host_file::rotate::<PsksSurface>),
+        )
         .route(
             "/api/v1/nvmetcp/psks/rotate/cancel",
-            post(nvmetcp_psks::rotate_cancel),
+            post(host_file::rotate_cancel::<PsksSurface>),
         )
-        .route("/api/v1/nvmetcp/psks/grant", post(nvmetcp_psks::grant))
-        .route("/api/v1/nvmetcp/psks/revoke", post(nvmetcp_psks::revoke))
-        // NVMe-TCP DH-HMAC-CHAP lifecycle
+        .route(
+            "/api/v1/nvmetcp/psks/grant",
+            post(host_file::grant::<PsksSurface>),
+        )
+        .route(
+            "/api/v1/nvmetcp/psks/revoke",
+            post(host_file::revoke::<PsksSurface>),
+        )
+        // NVMe-TCP DH-HMAC-CHAP lifecycle (same generic handlers on the
+        // DH-HMAC-CHAP surface; `list` + the ctrl-key verbs are
+        // surface-specific).
         .route(
             "/api/v1/nvmetcp/dhchap",
-            get(nvmetcp_dhchap::list).post(nvmetcp_dhchap::add),
+            get(nvmetcp_dhchap::list).post(host_file::add::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/remove",
-            post(nvmetcp_dhchap::remove),
+            post(host_file::remove::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/disable",
-            post(nvmetcp_dhchap::disable),
+            post(host_file::disable::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/enable",
-            post(nvmetcp_dhchap::enable),
+            post(host_file::enable::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/rotate",
-            post(nvmetcp_dhchap::rotate),
+            post(host_file::rotate::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/rotate/cancel",
-            post(nvmetcp_dhchap::rotate_cancel),
+            post(host_file::rotate_cancel::<DhchapSurface>),
         )
-        .route("/api/v1/nvmetcp/dhchap/grant", post(nvmetcp_dhchap::grant))
+        .route(
+            "/api/v1/nvmetcp/dhchap/grant",
+            post(host_file::grant::<DhchapSurface>),
+        )
         .route(
             "/api/v1/nvmetcp/dhchap/revoke",
-            post(nvmetcp_dhchap::revoke),
+            post(host_file::revoke::<DhchapSurface>),
         )
         .route(
             "/api/v1/nvmetcp/dhchap/ctrl-key/set",

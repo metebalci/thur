@@ -125,19 +125,11 @@ pub fn parse_dhchap_secret(secret: &str) -> Result<DhchapKey, DhchapError> {
             "decoded key length not 36/52/68",
         ));
     }
-    let key_len = decoded.len() - 4;
-    let crc = crc32fast::hash(&decoded[..key_len]);
-    let stored = u32::from_le_bytes([
-        decoded[key_len],
-        decoded[key_len + 1],
-        decoded[key_len + 2],
-        decoded[key_len + 3],
-    ]);
-    if crc != stored {
-        return Err(DhchapError::CrcMismatch);
-    }
+    // Length validated above; the shared CRC-tail core validates the
+    // trailing CRC-32 and returns the key bytes (CRC stripped).
+    let key = crate::split_verify_crc_tail(&decoded).ok_or(DhchapError::CrcMismatch)?;
     Ok(DhchapKey {
-        raw: decoded[..key_len].to_vec(),
+        raw: key.to_vec(),
         hash,
     })
 }

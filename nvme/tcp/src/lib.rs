@@ -54,3 +54,23 @@ pub mod server;
 pub mod tls;
 
 pub use server::{LoginAuditEvent, LoginAuditSink, NoopLoginAudit, ServerConfig, run};
+
+/// Verify the trailing 4-byte little-endian CRC-32 carried by the
+/// `NVMeTLSkey-...` and `DHHC-1:...` secret formats. The kernel encodes
+/// both as `base64(key_bytes || crc32_le(key_bytes))`; this is the
+/// shared CRC-tail core of [`tls::parse_interchange_key`] and
+/// [`auth::parse_dhchap_secret`] (issue #70).
+///
+/// `decoded` is the base64-decoded body; the caller is responsible for
+/// having validated its overall length first (the two formats disagree
+/// on the legal key lengths and surface distinct length errors). On a
+/// CRC match the key bytes (CRC stripped) are returned; on mismatch —
+/// or a body shorter than the 4-byte CRC — `None`.
+pub(crate) fn split_verify_crc_tail(decoded: &[u8]) -> Option<&[u8]> {
+    if decoded.len() < 4 {
+        return None;
+    }
+    let (key, crc_bytes) = decoded.split_at(decoded.len() - 4);
+    let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+    (crc32fast::hash(key) == stored).then_some(key)
+}
