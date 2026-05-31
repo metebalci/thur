@@ -49,13 +49,9 @@ jobs:
 
       # --keep-data so the test's cleanup trap doesn't rm -rf the tmp
       # dir before the upload step runs (CI runners are ephemeral, so
-      # keeping data has no downside). RUST_LOG bumps the tape + changer
-      # SCSI dispatch to debug so a failed REWIND / WRITE FILEMARK /
-      # MOVE MEDIUM logs its CDB + returned sense daemon-side; the iSCSI
-      # transport stays at info to avoid a per-PDU firehose.
+      # keeping data has no downside). Daemon stays at the default info
+      # log level.
       - name: run monte-carlo
-        env:
-          RUST_LOG: "info,scsi_ssc=debug,scsi_smc=debug"
         run: ./vtl/scripts/test-monte-carlo.sh --keep-data
 
       # Host-side mt / mtx failures report their sense data into the

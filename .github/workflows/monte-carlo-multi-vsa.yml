@@ -41,13 +41,9 @@ jobs:
 
       # --keep-data so the test's cleanup trap doesn't rm -rf the tmp
       # dir before the upload step runs (CI runners are ephemeral, so
-      # keeping data has no downside). RUST_LOG bumps the block SCSI
-      # dispatch + block core to debug so a failed data-path command
-      # logs its CDB + returned sense daemon-side; the iSCSI transport
-      # stays at info to avoid a per-PDU firehose.
+      # keeping data has no downside). Daemon stays at the default info
+      # log level.
       - name: run monte-carlo (multi-initiator)
-        env:
-          RUST_LOG: "info,scsi_sbc=debug,core_block=debug"
         run: ./vsa/scripts/test-monte-carlo-multi.sh --keep-data
 
       # Host-side device failures report their sense data into the
