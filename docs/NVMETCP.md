@@ -522,7 +522,14 @@ Receive returns the controller message as a C2HData PDU followed by a
 CapsuleResp. An in-band failure (wrong secret, no entry, unusable hash/group)
 is delivered as an `AUTH_Failure` message on the next Authentication Receive,
 then the connection is closed — the Fabrics commands themselves still complete
-with a success CQE.
+with a success CQE. Each auth-phase CapsuleResp echoes the queue's QID in its
+SQID field (consistent with the Connect Response, so I/O-queue auth matches the
+admin queue). The one case where an Authentication Receive does *not* complete
+with success is a host whose advertised Allocation Length (CDW11) cannot hold
+the controller message: rather than over-send, the command is failed with
+Invalid Field in Command. No conformant host trips this — the Challenge is at
+most ~1.1 KiB (FFDHE-8192) against an AL sized near IOCCSZ — so it is purely
+conformance hardening.
 
 ### Negotiation + crypto
 
@@ -534,6 +541,10 @@ with a success CQE.
   response HMAC is the *augmented* challenge `HMAC(H(g^xy), C)`. The shared
   secret is MSB-zero-padded to the prime length before hashing — matching the
   kernel's `crypto_kpp_maxsize` buffer — so the session key is byte-identical.
+  The two heavy modular exponentiations (ephemeral keygen and the session-key
+  derivation, plus the reply HMACs that ride with it) run on a `spawn_blocking`
+  thread so a connection flood negotiating a large group cannot stall the async
+  reactor — the auth-phase timeout still bounds the per-connection cost.
 - **Response:** `HMAC_K(challenge ‖ seqnum(LE32) ‖ t_id(LE16) ‖ sc_c ‖ label ‖
   nqn_a ‖ 0x00 ‖ nqn_b)`, where `K` is the NQN-transformed secret. `label` is
   `"HostHost"` with `(hostnqn, subnqn)` for the host's R1; `"Controller"` with

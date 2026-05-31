@@ -726,6 +726,15 @@ rotation grace window), and — if the host sent C2 (`cvalid`) and a
 controller secret is configured — returns R2 in Success1. `sc_c` must be
 0 (secure-channel concatenation is refused with CONCAT_MISMATCH).
 
+Every auth-phase CapsuleResp echoes the queue's QID in its SQID field,
+matching the Connect Response (so I/O-queue auth is consistent with the
+admin queue). A controller→host message is never sent past the host's
+Authentication Receive Allocation Length (CDW11): if the message would
+exceed it the command is failed with Invalid Field in Command rather than
+over-sent. In practice every controller message stays well under a
+conformant host's AL (the Challenge is <= ~1.1 KiB even at FFDHE-8192),
+so the AL fail-path is conformance hardening, not a path a real host hits.
+
 Per-host secrets + admission live in `nvmetcp-dhchap.json` (schema in
 [`CONFIGURATION.md`](CONFIGURATION.md); operator surface in
 [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP).

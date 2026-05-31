@@ -595,6 +595,7 @@ where
             run_auth_phase(
                 &mut stream,
                 peer,
+                qid,
                 handler.subnqn(),
                 &connect_data.hostnqn,
                 dhpath,
@@ -1511,6 +1512,7 @@ fn compute_fabrics_response(
 
 /// Negotiated DH-HMAC-CHAP parameters carried from Challenge to the
 /// Reply validation.
+#[derive(Clone, Copy)]
 struct NegotiatedParams {
     hash_id: u8,
     hash_len: usize,
@@ -1583,13 +1585,14 @@ where
 /// ACK an Authentication Send command with a success CapsuleResp.
 /// In-band auth failures travel as an AUTH_Failure message on the next
 /// Authentication Receive, not as a command error, so a well-formed
-/// Send always completes successfully.
-async fn ack_auth_send<S>(stream: &mut S, cid: u16) -> Result<()>
+/// Send always completes successfully. `qid` is echoed in the CQE SQID
+/// to match the Connect Response (consistent on I/O-queue auth).
+async fn ack_auth_send<S>(stream: &mut S, cid: u16, qid: u16) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     stream
-        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, 0, 0, 0)))
+        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)))
         .await?;
     stream.flush().await?;
     Ok(())
@@ -1597,14 +1600,37 @@ where
 
 /// Send a controller->host auth message as the data-in of an
 /// Authentication Receive command: a C2HData PDU carrying the message,
-/// then the command's success CapsuleResp.
-async fn send_auth_message<S>(stream: &mut S, cid: u16, msg: &[u8]) -> Result<()>
+/// then the command's success CapsuleResp (SQID echoes `qid`).
+///
+/// `al` is the host-advertised Allocation Length from the Authentication
+/// Receive's CDW11. If the controller message exceeds it, we cannot
+/// honor the transfer, so the command is failed with Invalid Field in
+/// Command rather than over-sending — and the auth phase bails. Our
+/// messages stay well under any conformant host's AL (the Challenge is
+/// <= ~1.1 KiB at FFDHE-8192), so this never trips in practice.
+async fn send_auth_message<S>(stream: &mut S, cid: u16, qid: u16, al: u32, msg: &[u8]) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    if msg.len() as u64 > u64::from(al) {
+        stream
+            .write_all(&pdu::build_capsule_resp_pdu(&Cqe::failure(
+                cid,
+                qid,
+                0,
+                StatusField::invalid_field(),
+            )))
+            .await?;
+        stream.flush().await?;
+        anyhow::bail!(
+            "auth: controller message {} bytes exceeds host allocation length {} bytes",
+            msg.len(),
+            al
+        );
+    }
     stream.write_all(&pdu::build_c2hdata_pdu(cid, msg)).await?;
     stream
-        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, 0, 0, 0)))
+        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)))
         .await?;
     stream.flush().await?;
     Ok(())
@@ -1705,6 +1731,7 @@ fn validate_reply(
 async fn run_auth_phase<S>(
     stream: &mut S,
     peer: std::net::SocketAddr,
+    qid: u16,
     subnqn: &str,
     hostnqn: &str,
     dhchap_path: &std::path::Path,
@@ -1749,7 +1776,7 @@ where
     }
     // Well-formed Send always ACKs; failures surface on the next Receive.
     let neg = dhwire::parse_negotiate(&neg_data);
-    ack_auth_send(stream, neg_sqe.cid).await?;
+    ack_auth_send(stream, neg_sqe.cid, qid).await?;
 
     // Compute the negotiation outcome: parameters + resolved secret, or
     // a failure explanation code to return in AUTH_Failure.
@@ -1807,18 +1834,26 @@ where
 
     // --- Challenge (Authentication Receive pulls it) ---
     let (recv1_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    let recv1_al = dhwire::parse_auth_command(&recv1_sqe).tl_al;
     let (params, resolved) = match outcome {
         Err(reason) => {
-            send_auth_message(
-                stream,
-                recv1_sqe.cid,
-                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
-            )
-            .await?;
+            // Record the refusal (audit row + brute-force counter) before
+            // attempting delivery: this is a genuine credential refusal, so
+            // the security signal must not hinge on the Failure1 send
+            // succeeding — e.g. a host that advertised a too-small AL makes
+            // `send_auth_message` bail before any post-send code runs.
             emit_failure(
                 "negotiation_failed",
                 format!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})"),
             );
+            send_auth_message(
+                stream,
+                recv1_sqe.cid,
+                qid,
+                recv1_al,
+                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+            )
+            .await?;
             anyhow::bail!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})");
         }
         Ok(v) => v,
@@ -1827,11 +1862,17 @@ where
     let c1 =
         dhcrypt::random_bytes(params.hash_len).map_err(|e| anyhow::anyhow!("auth rng: {e}"))?;
     let s1 = dhcrypt::random_seqnum().map_err(|e| anyhow::anyhow!("auth rng: {e}"))?;
+    // FFDHE keygen is a modular exponentiation that can take low single-
+    // digit milliseconds (more for a heavy group) — run it off the
+    // reactor so a connection flood negotiating a large group can't stall
+    // other tasks on this worker thread.
     let dh_keypair = if params.dhgid != dhwire::NVME_AUTH_DHGROUP_NULL {
-        Some(
-            dhcrypt::DhKeypair::generate(params.dhgid)
-                .map_err(|e| anyhow::anyhow!("auth dh: {e}"))?,
-        )
+        let dhgid = params.dhgid;
+        let kp = tokio::task::spawn_blocking(move || dhcrypt::DhKeypair::generate(dhgid))
+            .await
+            .map_err(|e| anyhow::anyhow!("auth dh keygen task: {e}"))?
+            .map_err(|e| anyhow::anyhow!("auth dh: {e}"))?;
+        Some(kp)
     } else {
         None
     };
@@ -1842,48 +1883,71 @@ where
         None => Vec::new(),
     };
     let challenge = dhwire::build_challenge(t_id, params.hash_id, params.dhgid, s1, &c1, &dhval);
-    send_auth_message(stream, recv1_sqe.cid, &challenge).await?;
+    send_auth_message(stream, recv1_sqe.cid, qid, recv1_al, &challenge).await?;
 
     // --- Reply (Authentication Send) ---
     let (reply_sqe, reply_data) =
         recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
-    ack_auth_send(stream, reply_sqe.cid).await?;
-    let result2 = validate_reply(
-        &reply_data,
-        &params,
-        t_id,
-        sc_c,
-        &c1,
-        s1,
-        dh_keypair.as_ref(),
-        &resolved,
-        subnqn,
-        hostnqn,
-    );
+    ack_auth_send(stream, reply_sqe.cid, qid).await?;
+    // Validate R1 (and build R2 for mutual auth) off the reactor: the
+    // DH session-key derivation is a full-width modular exponentiation,
+    // and the HMACs ride along. `validate_reply` is pure CPU, so move
+    // owned copies of its inputs into the blocking task. `resolved` is
+    // cloned (cheap — a few key blobs) so the original survives for the
+    // `volumes` return below; the ephemeral keypair is consumed here.
+    let result2 = {
+        let c1 = c1.clone();
+        let resolved = resolved.clone();
+        let subnqn = subnqn.to_string();
+        let hostnqn = hostnqn.to_string();
+        tokio::task::spawn_blocking(move || {
+            validate_reply(
+                &reply_data,
+                &params,
+                t_id,
+                sc_c,
+                &c1,
+                s1,
+                dh_keypair.as_ref(),
+                &resolved,
+                &subnqn,
+                &hostnqn,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("auth reply-validation task: {e}"))?
+    };
 
     // --- Success1 / Failure (Authentication Receive pulls it) ---
     let (recv2_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    let recv2_al = dhwire::parse_auth_command(&recv2_sqe).tl_al;
     match result2 {
         Err(reason) => {
-            send_auth_message(
-                stream,
-                recv2_sqe.cid,
-                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
-            )
-            .await?;
+            // Emit before delivery (see the negotiation-failure site): a
+            // failed R1 is a genuine refusal whose audit row + brute-force
+            // counter must fire regardless of whether the Failure1 send
+            // succeeds (e.g. a too-small host AL bails the send).
             emit_failure(
                 "reply_invalid",
                 format!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})"),
             );
+            send_auth_message(
+                stream,
+                recv2_sqe.cid,
+                qid,
+                recv2_al,
+                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+            )
+            .await?;
             anyhow::bail!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})");
         }
-        Ok(success1) => send_auth_message(stream, recv2_sqe.cid, &success1).await?,
+        Ok(success1) => send_auth_message(stream, recv2_sqe.cid, qid, recv2_al, &success1).await?,
     }
 
     // --- Success2 (or Failure2 if the host rejected our R2) ---
     let (final_sqe, final_data) =
         recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
-    ack_auth_send(stream, final_sqe.cid).await?;
+    ack_auth_send(stream, final_sqe.cid, qid).await?;
     match dhwire::peek_message_type(&final_data) {
         Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE1))
         | Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE2)) => {
@@ -3691,6 +3755,247 @@ mod tests {
             .await
             .unwrap();
         read_capsule_resp_ack(&mut s).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_challenge_exceeding_al_fails_command() {
+        // The host advertises an Allocation Length on the Authentication
+        // Receive too small to hold the Challenge. Rather than over-send a
+        // C2HData, the controller fails the command with Invalid Field in
+        // Command (issue #71) and closes the connection.
+        let secret = dhcrypt::encode_dhchap_secret(&[0x11; 32], 0);
+        let path = write_dhchap_file("al-too-small", dhchap_entry_for(&secret, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::new(NoopLoginAudit))
+                .await;
+
+        let mut s = connect_with_authreq(port).await;
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x77,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // A SHA-256 NULL-group Challenge is 16 + 32 = 48 bytes; AL = 16
+        // cannot hold it.
+        s.write_all(&build_auth_receive_pdu(0x11, 16))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut s).await;
+        assert_eq!(
+            resp.header.pdu_type,
+            pdu::PduType::CapsuleResp,
+            "AL-too-small must yield a bare CapsuleResp, not a C2HData",
+        );
+        let status = u16::from_le_bytes([resp.body[14], resp.body[15]]);
+        assert_eq!(
+            status,
+            StatusField::invalid_field().to_u16(),
+            "over-sized auth message must fail with Invalid Field in Command",
+        );
+        // CID echoed.
+        assert_eq!(u16::from_le_bytes([resp.body[12], resp.body[13]]), 0x11);
+        // The auth phase bailed, so the controller closes the connection:
+        // the next read sees EOF, not a trailing C2HData (which would mean
+        // the controller over-sent the Challenge after the failure CQE).
+        let mut probe = [0u8; 1];
+        let n = s.read(&mut probe).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "controller must close the connection after an AL-too-small failure",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_reply_invalid_with_tiny_al_still_audits() {
+        // A genuine credential refusal (wrong secret) where the host set a
+        // too-small AL on the failure-pulling Authentication Receive: the
+        // 8-byte Failure1 can't be delivered (the command fails with
+        // Invalid Field), but the refusal MUST still be audited + counted
+        // for brute-force detection. Guards the issue #71 review fix that
+        // emits the failure event *before* attempting the Failure1 send.
+        let real = dhcrypt::encode_dhchap_secret(&[0x22; 32], 0);
+        let wrong = dhcrypt::encode_dhchap_secret(&[0x99; 32], 0);
+        let path = write_dhchap_file("tiny-al-audit", dhchap_entry_for(&real, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let audit = Arc::new(CapturingAudit::default());
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::clone(&audit) as _)
+                .await;
+
+        let mut s = connect_with_authreq(port).await;
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x33,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let challenge = read_auth_message(&mut s).await;
+        let (reply, _) = host_build_reply(&challenge, &wrong, None);
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // Failure-pulling Auth Receive with AL = 4 < the 8-byte Failure1.
+        s.write_all(&build_auth_receive_pdu(0x13, 4)).await.unwrap();
+        let resp = read_pdu_async(&mut s).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([resp.body[14], resp.body[15]]),
+            StatusField::invalid_field().to_u16(),
+            "too-small AL on the Failure1 must fail the command",
+        );
+        // Despite the undeliverable Failure1, the refusal is still audited.
+        let mut recorded = None;
+        for _ in 0..50 {
+            if let Some(row) = audit.events.lock().unwrap().first().cloned() {
+                recorded = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (kind, reason, host) =
+            recorded.expect("a DhchapFailure must be recorded even when the AL fails the send");
+        assert_eq!(kind, "failure");
+        assert_eq!(reason, "reply_invalid");
+        assert_eq!(host, TEST_HOSTNQN);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Admin Connect (QID 0, mints the CNTLID) then an I/O Connect (QID 1
+    /// naming that CNTLID) against a dhchap-enabled server, asserting ATR
+    /// on the I/O Connect Response and that its SQID echoes QID 1. The
+    /// admin auth is left unstarted; its stream is returned only to keep
+    /// the controller (and so the CNTLID) alive. Returns
+    /// `(admin_stream, io_stream)` positioned to auth on the I/O queue.
+    async fn connect_io_with_authreq(port: u16) -> (TcpStream, TcpStream) {
+        let mut admin = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        admin.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut admin).await; // ICResp
+        admin
+            .write_all(&build_connect_pdu(TEST_SUBNQN, 0))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut admin).await;
+        let cntlid = u16::from_le_bytes([resp.body[0], resp.body[1]]);
+
+        let mut io = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        io.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut io).await; // ICResp
+        io.write_all(&build_connect_pdu_cntlid(TEST_SUBNQN, 1, cntlid))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut io).await;
+        let dw0 = u32::from_le_bytes([resp.body[0], resp.body[1], resp.body[2], resp.body[3]]);
+        assert_eq!((dw0 >> 17) & 1, 1, "ATR must be set on the I/O queue too");
+        assert_eq!(
+            u16::from_le_bytes([resp.body[10], resp.body[11]]),
+            1,
+            "I/O Connect Response SQID echoes QID 1",
+        );
+        (admin, io)
+    }
+
+    #[tokio::test]
+    async fn dhchap_io_queue_auth_echoes_qid_in_sqid() {
+        // On an I/O-queue (QID > 0) auth, every auth-phase CapsuleResp must
+        // echo the queue id in SQID, matching the Connect Response (issue
+        // #71). On the admin queue QID is 0, so the echo is only observable
+        // on an I/O queue.
+        let secret = dhcrypt::encode_dhchap_secret(&[0x21; 32], 0);
+        let path = write_dhchap_file("io-qid-echo", dhchap_entry_for(&secret, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port =
+            spawn_server_with_dhchap(Arc::clone(&handler), path.clone(), Arc::new(NoopLoginAudit))
+                .await;
+
+        let (_admin, mut s) = connect_io_with_authreq(port).await;
+
+        // Negotiate (Auth Send) -> ACK; the ACK CapsuleResp echoes QID 1.
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x55,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        let ack = read_pdu_async(&mut s).await;
+        assert_eq!(ack.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([ack.body[10], ack.body[11]]),
+            1,
+            "auth-send ACK must echo QID in SQID",
+        );
+
+        // Auth Receive -> Challenge; the trailing CapsuleResp echoes QID 1.
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let c2h = read_pdu_async(&mut s).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        let challenge = c2h.body[16..].to_vec();
+        let resp = read_pdu_async(&mut s).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([resp.body[10], resp.body[11]]),
+            1,
+            "auth-receive CapsuleResp must echo QID in SQID",
+        );
+
+        // Finish the (unidirectional) exchange, asserting the QID echo on
+        // every remaining auth CapsuleResp so all five send sites — both
+        // `ack_auth_send` and `send_auth_message` call sites — are covered.
+        let (reply, _) = host_build_reply(&challenge, &secret, None);
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        let reply_ack = read_pdu_async(&mut s).await;
+        assert_eq!(reply_ack.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([reply_ack.body[10], reply_ack.body[11]]),
+            1,
+            "reply ACK must echo QID in SQID",
+        );
+        s.write_all(&build_auth_receive_pdu(0x13, 4096))
+            .await
+            .unwrap();
+        let _success1 = read_pdu_async(&mut s).await; // C2HData (Success1)
+        let succ_resp = read_pdu_async(&mut s).await;
+        assert_eq!(succ_resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([succ_resp.body[10], succ_resp.body[11]]),
+            1,
+            "Success1 CapsuleResp must echo QID in SQID",
+        );
+        s.write_all(&build_auth_send_pdu(0x14, &dhwire::build_success2(0x55)))
+            .await
+            .unwrap();
+        let final_ack = read_pdu_async(&mut s).await;
+        assert_eq!(final_ack.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([final_ack.body[10], final_ack.body[11]]),
+            1,
+            "Success2 ACK must echo QID in SQID",
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
