@@ -709,7 +709,7 @@ where
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundPdu>(OUTBOUND_CAPACITY);
     let commands: CommandTable = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut writer = tokio::spawn(writer_task(write_half, outbound_rx, peer));
+    let mut writer = tokio::spawn(writer_task(write_half, outbound_rx, peer, qid));
     let mut reader = tokio::spawn(reader_task(
         read_half,
         peer,
@@ -1188,6 +1188,7 @@ async fn writer_task<W>(
     mut write: W,
     mut outbound: mpsc::Receiver<OutboundPdu>,
     peer: std::net::SocketAddr,
+    qid: u16,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -1205,7 +1206,17 @@ where
                     .await?;
                 write.flush().await?;
             }
-            OutboundPdu::CommandResponse { cqe, data_in } => {
+            OutboundPdu::CommandResponse { mut cqe, data_in } => {
+                // Stamp the connection's QID into SQID so steady-state
+                // completions match the Connect Response + auth phases
+                // (issue #72). The command-set layers (nvme-nvm, fabrics)
+                // build CQEs with SQID=0 because queue ids are a transport
+                // concern they don't know about; the transport owns the
+                // mapping and overrides it here — the one chokepoint every
+                // steady-state completion (data path, AER, Property /
+                // Identify / probe, fused-error) funnels through. On the
+                // admin queue QID is 0, so this is a no-op there.
+                cqe.sqid = qid;
                 if !data_in.is_empty() {
                     // SUCCESS-bit optimization (NVMe/TCP §3.6.7): if
                     // the CQE is a no-payload success, fold completion
@@ -2995,6 +3006,35 @@ mod tests {
         );
         assert_eq!(handler.io_calls.load(Ordering::SeqCst), 1);
         assert_eq!(handler.admin_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn io_queue_steady_state_cqe_echoes_qid_in_sqid() {
+        // Steady-state completions must carry SQID = QID, matching the
+        // Connect Response + auth phases (issue #72). A Flush on QID 1
+        // returns a no-payload success: data_in is empty, so the writer
+        // emits a standalone CapsuleResp (no SUCCESS-bit fold), making the
+        // SQID field observable on the wire.
+        let handler = StubHandler::new("nqn.2025-10.com.metebalci:thurvsa");
+        let port = spawn_server(Arc::clone(&handler)).await;
+
+        let (_admin, mut stream) = connect_io_queue(port).await;
+
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = NvmOpcode::Flush as u8;
+        sqe[2] = 0x77; // CID
+        sqe[4] = 0x01; // NSID
+        stream
+            .write_all(&build_capsule_cmd_pdu(sqe, &[]))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut stream).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            u16::from_le_bytes([resp.body[10], resp.body[11]]),
+            1,
+            "steady-state CapsuleResp must echo QID in SQID",
+        );
     }
 
     /// Build an H2CTermReq PDU. Used by the

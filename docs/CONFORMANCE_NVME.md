@@ -198,7 +198,7 @@ dispatcher.
 | 0x02 | H2CTermReq | H → C | 🟩 Yes | M | Logged; closes the connection silently. |
 | 0x03 | C2HTermReq | C → H | 🟩 Yes | M | Emitted on protocol violations (FES 0x01 Invalid Header Field / 0x02 PDU Sequence Error / 0x07 Invalid PDU Header Type) before closing. |
 | 0x04 | CapsuleCmd | H → C | 🟩 Yes | M | 64-byte SQE + optional in-capsule data. |
-| 0x05 | CapsuleResp | C → H | 🟩 Yes | M | 16-byte CQE. |
+| 0x05 | CapsuleResp | C → H | 🟩 Yes | M | 16-byte CQE. The SQID field (bytes 10..11) carries the connection's QID in every phase — Connect, auth, and steady state alike (issue #72). Cosmetic only: the host correlates completions by CID over the per-queue connection, never by SQID. |
 | 0x06 | H2CData | H → C | 🟩 Yes | M | R2T fulfillment — partial-ICD + tail stitching supported. Honors host's MAXR2T and the advertised MAXH2CDATA per-PDU cap. |
 | 0x07 | C2HData | C → H | 🟩 Yes | M | One PDU per command for controller-to-host transfers. SUCCESS bit folds the CQE into the C2HData when the CQE is success with `DW0 = DW1 = 0` (saves one PDU on every Identify / Read / Get Log Page). |
 | 0x09 | R2T | C → H | 🟩 Yes | M | One R2T per write command; `TTAG=1` covers the whole transfer (pure-R2T) or the tail (partial-ICD). See [`NVMETCP.md`](NVMETCP.md) § *Write data flow (ICD + R2T)*. |

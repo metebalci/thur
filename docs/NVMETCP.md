@@ -166,6 +166,16 @@ closes the connection with a C2HTermReq carrying a Fatal Error Status:
    violation triggers C2HTermReq with FES (0x01 Invalid PDU Header
    Field / 0x02 PDU Sequence Error / 0x07 Invalid PDU Header Type).
 
+   Every completion CapsuleResp the writer emits in this phase stamps the
+   connection's QID into the CQE SQID field, so the data path, AER, and
+   the intercepted Property / Identify / probe completions all match the
+   Connect Response and the auth phase (issue #72). The command-set layers
+   (`nvme-nvm`, the fabrics handler) build CQEs with `SQID = 0` because a
+   queue id is a transport concern they don't model; the per-connection
+   `writer_task` — the one chokepoint every steady-state completion funnels
+   through — overrides it. Cosmetic uniformity only: on NVMe/TCP each queue
+   is its own connection and the host correlates by CID, never by SQID.
+
 ## Fabrics commands (post-Connect)
 
 Property Get and Property Set operate against a per-controller
