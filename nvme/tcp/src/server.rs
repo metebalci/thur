@@ -47,8 +47,10 @@ use nvme_base::{
 };
 use nvme_nvm::{AdminCommand, ConnToken, ControllerRegistry, IoCommand, NvmeCommandHandler};
 
+use crate::auth as dhcrypt;
 use crate::pdu;
 use crate::tls::{NvmePskAcceptor, parse_psk_identity};
+use nvme_base::auth as dhwire;
 
 /// Server boot config.
 pub struct ServerConfig {
@@ -80,6 +82,15 @@ pub struct ServerConfig {
     /// (see-everything) — used by tests and the in-process smoke
     /// path.
     pub psks_path: Option<std::path::PathBuf>,
+    /// Path to `nvmetcp-dhchap.json`. When set, DH-HMAC-CHAP in-band
+    /// authentication is required: every Connect Response asserts
+    /// AUTHREQ and the host must complete the Authentication
+    /// Send/Receive exchange before any other command. On success the
+    /// host's `volumes` admission set comes from its dhchap entry
+    /// (taking the place of the `psks_path` lookup). `None` = no
+    /// in-band auth. Orthogonal to `tls`: setting both runs
+    /// DH-HMAC-CHAP inside a TLS-PSK channel ("dhchap+tls").
+    pub dhchap_path: Option<std::path::PathBuf>,
 }
 
 /// Bind the configured TCP listen address and accept-loop forever.
@@ -99,6 +110,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         config.aer,
         config.tls.map(Arc::new),
         config.psks_path,
+        config.dhchap_path,
     )
     .await
 }
@@ -113,6 +125,7 @@ pub async fn accept_loop(
     aer: Arc<ControllerRegistry>,
     tls: Option<Arc<NvmePskAcceptor>>,
     psks_path: Option<std::path::PathBuf>,
+    dhchap_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -121,9 +134,22 @@ pub async fn accept_loop(
         let aer = Arc::clone(&aer);
         let tls = tls.clone();
         let psks_path = psks_path.clone();
+        let dhchap_path = dhchap_path.clone();
         tokio::spawn(async move {
             let result = match tls {
-                None => serve_connection(stream, peer, handler, regs, aer, None, psks_path).await,
+                None => {
+                    serve_connection(
+                        stream,
+                        peer,
+                        handler,
+                        regs,
+                        aer,
+                        None,
+                        psks_path,
+                        dhchap_path,
+                    )
+                    .await
+                }
                 Some(acceptor) => match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         // Capture the PSK identity the host used so
@@ -138,6 +164,7 @@ pub async fn accept_loop(
                             aer,
                             tls_host_nqn,
                             psks_path,
+                            dhchap_path,
                         )
                         .await
                     }
@@ -225,6 +252,15 @@ fn data_direction(opc: u8) -> DataDirection {
         _ => DataDirection::Bidirectional,
     }
 }
+
+/// Wall-clock cap on the whole DH-HMAC-CHAP exchange. The controller
+/// binding (CNTLID + association) is minted at Connect, *before* auth
+/// runs; without a deadline a host that completes Connect and then
+/// stalls mid-auth would pin that binding (and the connection task)
+/// indefinitely — an unauthenticated slowloris that exhausts the
+/// CNTLID space. 30 s is generous for a few small round-trips plus an
+/// FFDHE keygen even on a slow host.
+const AUTH_PHASE_TIMEOUT_SECS: u64 = 30;
 
 /// FES codes (NVMe/TCP §3.6.4) we emit. Only the subset the MVP
 /// can hit; full enumeration in the spec.
@@ -314,6 +350,7 @@ async fn serve_connection<S>(
     aer: Arc<ControllerRegistry>,
     tls_host_nqn: Option<String>,
     psks_path: Option<std::path::PathBuf>,
+    dhchap_path: Option<std::path::PathBuf>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -448,7 +485,12 @@ where
         }
     };
     let cntlid = conn_token.cntlid();
-    let dw0 = nvme_base::fabrics::connect_response_dw0(cntlid, false);
+    // Assert ATR (Connect Response DW0 bit 17, Authentication Transaction
+    // Required) when DH-HMAC-CHAP is configured: the host must complete the
+    // Authentication Send/Receive exchange before any other command on this
+    // queue.
+    let auth_required = dhchap_path.is_some();
+    let dw0 = nvme_base::fabrics::connect_response_dw0(cntlid, auth_required);
     let cqe = Cqe::success(sqe.cid, qid, 0, dw0);
     // The controller is now bound but we have not yet reached the State 3
     // teardown that calls `disconnect`. If writing the Connect Response
@@ -478,28 +520,84 @@ where
     //                         see-something. Entry-without-volumes,
     //                         entry-missing, or file read error all
     //                         reduce to `Some(empty)` = see nothing.
-    let admission_volumes: Option<Vec<String>> = match &psks_path {
-        None => None,
-        Some(p) => match crate::identity::admission_for(p, &connect_data.hostnqn) {
-            Ok(Some(v)) => Some(v),
-            Ok(None) => {
-                tracing::warn!(
+    // When DH-HMAC-CHAP is configured the auth phase below supplies the
+    // admission set (and bypasses the TLS-PSK lookup); otherwise the
+    // TLS-PSK `volumes` lookup applies. Both reduce a missing / failed
+    // lookup to `Some(empty)` = see-nothing.
+    let admission_volumes: Option<Vec<String>> = if let Some(dhpath) = &dhchap_path {
+        // State 2b: DH-HMAC-CHAP in-band authentication. Sequential
+        // request/response on the still-unsplit stream, before State 3.
+        // Bounded by AUTH_PHASE_TIMEOUT_SECS so a host that stalls
+        // mid-exchange can't pin the controller binding minted at
+        // Connect (slowloris CNTLID exhaustion).
+        let auth_result = tokio::time::timeout(
+            std::time::Duration::from_secs(AUTH_PHASE_TIMEOUT_SECS),
+            run_auth_phase(
+                &mut stream,
+                peer,
+                handler.subnqn(),
+                &connect_data.hostnqn,
+                dhpath,
+            ),
+        )
+        .await;
+        match auth_result {
+            Ok(Ok(volumes)) => {
+                tracing::info!(
                     peer = %peer,
                     host_nqn = %connect_data.hostnqn,
-                    "nvme-tcp: TLS-PSK on but no admission entry for host — fencing to empty",
+                    admitted_volumes = volumes.len(),
+                    "nvme-tcp: DH-HMAC-CHAP authentication succeeded",
                 );
-                Some(Vec::new())
+                Some(volumes)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                // Release the controller binding minted at Connect so its
+                // CNTLID / association don't leak on a failed auth.
+                aer.disconnect(conn_token);
                 tracing::warn!(
                     peer = %peer,
                     host_nqn = %connect_data.hostnqn,
                     error = %e,
-                    "nvme-tcp: failed to load admission table — fencing to empty",
+                    "nvme-tcp: DH-HMAC-CHAP authentication failed - closing",
                 );
-                Some(Vec::new())
+                return Err(e);
             }
-        },
+            Err(_elapsed) => {
+                aer.disconnect(conn_token);
+                tracing::warn!(
+                    peer = %peer,
+                    host_nqn = %connect_data.hostnqn,
+                    timeout_secs = AUTH_PHASE_TIMEOUT_SECS,
+                    "nvme-tcp: DH-HMAC-CHAP authentication timed out - closing",
+                );
+                anyhow::bail!("DH-HMAC-CHAP authentication timed out");
+            }
+        }
+    } else {
+        match &psks_path {
+            None => None,
+            Some(p) => match crate::identity::admission_for(p, &connect_data.hostnqn) {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        host_nqn = %connect_data.hostnqn,
+                        "nvme-tcp: TLS-PSK on but no admission entry for host — fencing to empty",
+                    );
+                    Some(Vec::new())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        host_nqn = %connect_data.hostnqn,
+                        error = %e,
+                        "nvme-tcp: failed to load admission table — fencing to empty",
+                    );
+                    Some(Vec::new())
+                }
+            },
+        }
     };
 
     tracing::info!(
@@ -1320,6 +1418,385 @@ fn compute_fabrics_response(
     }
 }
 
+// ===================== DH-HMAC-CHAP auth phase =====================
+//
+// Runs on the still-unsplit stream between the Connect Response and the
+// State-3 reader/writer split, only when DH-HMAC-CHAP is configured.
+// The exchange is strictly serialized — Negotiate/Challenge/Reply/
+// Success1/Success2 — so the simple read/write style of the Connect
+// phase suffices. The wire (de)serialization is `nvme_base::auth`
+// (`dhwire`); the HMAC / Diffie-Hellman is `crate::auth` (`dhcrypt`).
+
+/// Negotiated DH-HMAC-CHAP parameters carried from Challenge to the
+/// Reply validation.
+struct NegotiatedParams {
+    hash_id: u8,
+    hash_len: usize,
+    dhgid: u8,
+}
+
+/// Pick the strongest hash the host offered (SHA-512 > 384 > 256).
+fn select_hash(offered: &[u8]) -> Option<u8> {
+    [
+        dhwire::NVME_AUTH_HASH_SHA512,
+        dhwire::NVME_AUTH_HASH_SHA384,
+        dhwire::NVME_AUTH_HASH_SHA256,
+    ]
+    .into_iter()
+    .find(|h| offered.contains(h))
+}
+
+/// Pick the DH group, preferring real Diffie-Hellman at a sane cost.
+///
+/// We prefer ffdhe3072 (NIST ~128-bit security, a few-ms keygen), then
+/// 4096, then 2048, then the heavy 6144/8192 only if the host offers
+/// nothing smaller, then NULL last. Deliberately *not* "strongest
+/// first": the controller mints an ephemeral keypair for the chosen
+/// group before the host proves any secret, and a per-connection
+/// 8192-bit keygen is a needless CPU cost on every legitimate connect
+/// (the Linux host offers every group, so we'd otherwise always land on
+/// 8192). The auth-phase timeout bounds the abuse window for a host
+/// that offers only a heavy group.
+fn select_dhgroup(offered: &[u8]) -> Option<u8> {
+    [
+        dhwire::NVME_AUTH_DHGROUP_3072,
+        dhwire::NVME_AUTH_DHGROUP_4096,
+        dhwire::NVME_AUTH_DHGROUP_2048,
+        dhwire::NVME_AUTH_DHGROUP_6144,
+        dhwire::NVME_AUTH_DHGROUP_8192,
+        dhwire::NVME_AUTH_DHGROUP_NULL,
+    ]
+    .into_iter()
+    .find(|g| offered.contains(g))
+}
+
+/// Read one CapsuleCmd that must be an Authentication Send / Receive
+/// Fabrics command of the expected FCTYPE; returns the SQE plus the
+/// in-capsule message bytes (empty for Authentication Receive). A
+/// non-conforming PDU is a transport violation -> C2HTermReq + bail.
+async fn recv_auth_capsule<S>(stream: &mut S, expect: FabricsType) -> Result<(Sqe, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let raw = pdu::RawPdu::read_async(stream).await?;
+    if raw.header.pdu_type != pdu::PduType::CapsuleCmd {
+        write_term_req(stream, fes::PDU_SEQUENCE_ERROR).await?;
+        anyhow::bail!("auth: expected CapsuleCmd, got {:?}", raw.header.pdu_type);
+    }
+    let (sqe, data) = pdu::parse_capsule_cmd(&raw)?;
+    if AdminOpcode::from_u8(sqe.opcode) != Some(AdminOpcode::Fabrics) {
+        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD).await?;
+        anyhow::bail!(
+            "auth: expected Admin Fabrics opcode, got 0x{:02X}",
+            sqe.opcode
+        );
+    }
+    if nvme_base::fabrics::extract_fctype(&sqe) != Some(expect) {
+        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD).await?;
+        anyhow::bail!("auth: unexpected Fabrics command (wanted {:?})", expect);
+    }
+    Ok((sqe, data.map(|d| d.to_vec()).unwrap_or_default()))
+}
+
+/// ACK an Authentication Send command with a success CapsuleResp.
+/// In-band auth failures travel as an AUTH_Failure message on the next
+/// Authentication Receive, not as a command error, so a well-formed
+/// Send always completes successfully.
+async fn ack_auth_send<S>(stream: &mut S, cid: u16) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, 0, 0, 0)))
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Send a controller->host auth message as the data-in of an
+/// Authentication Receive command: a C2HData PDU carrying the message,
+/// then the command's success CapsuleResp.
+async fn send_auth_message<S>(stream: &mut S, cid: u16, msg: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&pdu::build_c2hdata_pdu(cid, msg)).await?;
+    stream
+        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, 0, 0, 0)))
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Validate the host's Reply (response R1) and, for mutual auth, build
+/// the controller response R2 into a Success1 message. Returns the
+/// Success1 message bytes on success, or an AUTH_Failure `rescode_exp`.
+#[allow(clippy::too_many_arguments)]
+fn validate_reply(
+    reply_data: &[u8],
+    params: &NegotiatedParams,
+    t_id: u16,
+    sc_c: u8,
+    c1: &[u8],
+    s1: u32,
+    dh_keypair: Option<&dhcrypt::DhKeypair>,
+    resolved: &crate::identity::ResolvedDhchap,
+    subnqn: &str,
+    hostnqn: &str,
+) -> Result<Vec<u8>, u8> {
+    let reply = dhwire::parse_reply(reply_data, params.hash_len)
+        .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_INCORRECT_PAYLOAD)?;
+    // DH session key (once), if a non-NULL group was negotiated.
+    let session_key = match dh_keypair {
+        Some(kp) => Some(
+            kp.session_key(&reply.host_dh_value, params.hash_id)
+                .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?,
+        ),
+        None => None,
+    };
+    let augment = |chal: &[u8]| -> Result<Vec<u8>, u8> {
+        match &session_key {
+            Some(sk) => dhcrypt::augmented_challenge(params.hash_id, sk, chal)
+                .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED),
+            None => Ok(chal.to_vec()),
+        }
+    };
+    // Validate R1 against the current secret (and the previous one
+    // during a rotation grace window).
+    let c1_aug = augment(c1)?;
+    let mut authenticated = false;
+    for secret in &resolved.secrets {
+        let tk = dhcrypt::transform_key(secret, hostnqn)
+            .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?;
+        let expected = dhcrypt::dhchap_response(&dhcrypt::ResponseInput {
+            transformed_key: &tk,
+            hash_id: params.hash_id,
+            challenge: &c1_aug,
+            seqnum: s1,
+            t_id,
+            sc_c,
+            label: dhcrypt::LABEL_HOST,
+            nqn_first: hostnqn,
+            nqn_second: subnqn,
+        })
+        .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?;
+        if dhcrypt::responses_equal(&expected, &reply.response) {
+            authenticated = true;
+            break;
+        }
+    }
+    if !authenticated {
+        return Err(dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED);
+    }
+    // Mutual auth: the host included a challenge C2 and expects the
+    // controller to prove itself with R2 (needs a configured ctrl key).
+    if let Some(c2) = &reply.host_challenge {
+        let ctrl = resolved
+            .ctrl_secret
+            .as_ref()
+            .ok_or(dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?;
+        let c2_aug = augment(c2)?;
+        let ctk = dhcrypt::transform_key(ctrl, subnqn)
+            .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?;
+        let r2 = dhcrypt::dhchap_response(&dhcrypt::ResponseInput {
+            transformed_key: &ctk,
+            hash_id: params.hash_id,
+            challenge: &c2_aug,
+            seqnum: reply.seqnum,
+            t_id,
+            sc_c,
+            label: dhcrypt::LABEL_CONTROLLER,
+            nqn_first: subnqn,
+            nqn_second: hostnqn,
+        })
+        .map_err(|_| dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED)?;
+        Ok(dhwire::build_success1(t_id, params.hash_len, Some(&r2)))
+    } else {
+        Ok(dhwire::build_success1(t_id, params.hash_len, None))
+    }
+}
+
+/// Drive the controller side of the DH-HMAC-CHAP exchange. Returns the
+/// host's admission `volumes` on success; any failure has already
+/// emitted an AUTH_Failure (where the protocol allows) before the
+/// returned error closes the connection.
+async fn run_auth_phase<S>(
+    stream: &mut S,
+    peer: std::net::SocketAddr,
+    subnqn: &str,
+    hostnqn: &str,
+    dhchap_path: &std::path::Path,
+) -> Result<Vec<String>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use dhwire::{
+        NVME_AUTH_DHCHAP_FAILURE_CONCAT_MISMATCH as FAIL_CONCAT,
+        NVME_AUTH_DHCHAP_FAILURE_DHGROUP_UNUSABLE as FAIL_DHGROUP,
+        NVME_AUTH_DHCHAP_FAILURE_FAILED as FAIL_FAILED,
+        NVME_AUTH_DHCHAP_FAILURE_HASH_UNUSABLE as FAIL_HASH,
+        NVME_AUTH_DHCHAP_FAILURE_INCORRECT_PAYLOAD as FAIL_PAYLOAD,
+        NVME_AUTH_DHCHAP_FAILURE_REASON_FAILED as REASON_FAILED,
+    };
+
+    // --- Negotiate (Authentication Send) ---
+    let (neg_sqe, neg_data) = recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
+    let fields = dhwire::parse_auth_command(&neg_sqe);
+    if fields.secp != dhwire::NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER {
+        tracing::debug!(
+            peer = %peer,
+            secp = fields.secp,
+            "nvme-tcp: auth: unexpected SECP (continuing)",
+        );
+    }
+    // Well-formed Send always ACKs; failures surface on the next Receive.
+    let neg = dhwire::parse_negotiate(&neg_data);
+    ack_auth_send(stream, neg_sqe.cid).await?;
+
+    // Compute the negotiation outcome: parameters + resolved secret, or
+    // a failure explanation code to return in AUTH_Failure.
+    let (t_id, sc_c, outcome): (
+        u16,
+        u8,
+        Result<(NegotiatedParams, crate::identity::ResolvedDhchap), u8>,
+    ) = match neg {
+        // Echo the host's t_id even on a parse failure (it sits at a
+        // fixed offset, recoverable when the buffer reached it) so a
+        // host that demultiplexes auth responses by transaction id can
+        // match the Failure to its request.
+        Err(_) => (dhwire::peek_t_id(&neg_data), 0, Err(FAIL_PAYLOAD)),
+        Ok(n) => {
+            let t_id = n.t_id;
+            let sc_c = n.sc_c;
+            let result = (|| {
+                if sc_c != 0 {
+                    // We do not implement secure-channel concatenation.
+                    return Err(FAIL_CONCAT);
+                }
+                let desc = n.dhchap_descriptor().ok_or(FAIL_PAYLOAD)?;
+                let hash_id = select_hash(&desc.hash_ids).ok_or(FAIL_HASH)?;
+                let hash_len = dhwire::hash_len(hash_id).ok_or(FAIL_HASH)?;
+                let dhgid = select_dhgroup(&desc.dhgroup_ids).ok_or(FAIL_DHGROUP)?;
+                // A read/parse/bad-key error in the secret store is an
+                // operator misconfiguration, not "unknown host" — log it
+                // distinctly (the host still gets a generic AUTH_Failure;
+                // we never leak which case it was on the wire).
+                let resolved = match crate::identity::dhchap_lookup(dhchap_path, hostnqn) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Err(FAIL_FAILED),
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer,
+                            host_nqn = %hostnqn,
+                            error = %e,
+                            "nvme-tcp: DH-HMAC-CHAP secret store unreadable or malformed - refusing",
+                        );
+                        return Err(FAIL_FAILED);
+                    }
+                };
+                Ok((
+                    NegotiatedParams {
+                        hash_id,
+                        hash_len,
+                        dhgid,
+                    },
+                    resolved,
+                ))
+            })();
+            (t_id, sc_c, result)
+        }
+    };
+
+    // --- Challenge (Authentication Receive pulls it) ---
+    let (recv1_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    let (params, resolved) = match outcome {
+        Err(reason) => {
+            send_auth_message(
+                stream,
+                recv1_sqe.cid,
+                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+            )
+            .await?;
+            anyhow::bail!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})");
+        }
+        Ok(v) => v,
+    };
+
+    let c1 =
+        dhcrypt::random_bytes(params.hash_len).map_err(|e| anyhow::anyhow!("auth rng: {e}"))?;
+    let s1 = dhcrypt::random_seqnum().map_err(|e| anyhow::anyhow!("auth rng: {e}"))?;
+    let dh_keypair = if params.dhgid != dhwire::NVME_AUTH_DHGROUP_NULL {
+        Some(
+            dhcrypt::DhKeypair::generate(params.dhgid)
+                .map_err(|e| anyhow::anyhow!("auth dh: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let dhval = match &dh_keypair {
+        Some(kp) => kp
+            .public_value()
+            .map_err(|e| anyhow::anyhow!("auth dh: {e}"))?,
+        None => Vec::new(),
+    };
+    let challenge = dhwire::build_challenge(t_id, params.hash_id, params.dhgid, s1, &c1, &dhval);
+    send_auth_message(stream, recv1_sqe.cid, &challenge).await?;
+
+    // --- Reply (Authentication Send) ---
+    let (reply_sqe, reply_data) =
+        recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
+    ack_auth_send(stream, reply_sqe.cid).await?;
+    let result2 = validate_reply(
+        &reply_data,
+        &params,
+        t_id,
+        sc_c,
+        &c1,
+        s1,
+        dh_keypair.as_ref(),
+        &resolved,
+        subnqn,
+        hostnqn,
+    );
+
+    // --- Success1 / Failure (Authentication Receive pulls it) ---
+    let (recv2_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    match result2 {
+        Err(reason) => {
+            send_auth_message(
+                stream,
+                recv2_sqe.cid,
+                &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+            )
+            .await?;
+            anyhow::bail!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})");
+        }
+        Ok(success1) => send_auth_message(stream, recv2_sqe.cid, &success1).await?,
+    }
+
+    // --- Success2 (or Failure2 if the host rejected our R2) ---
+    let (final_sqe, final_data) =
+        recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
+    ack_auth_send(stream, final_sqe.cid).await?;
+    match dhwire::peek_message_type(&final_data) {
+        Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE1))
+        | Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE2)) => {
+            anyhow::bail!("host rejected controller authentication");
+        }
+        _ => {
+            // Success2 carries no HMAC, so its only transaction binding
+            // is the t_id field — require it to match the negotiated
+            // transaction (the rest of the exchange is bound via the
+            // response HMACs).
+            let s2_tid = dhwire::parse_success2(&final_data)?;
+            if s2_tid != t_id {
+                anyhow::bail!("DH-HMAC-CHAP Success2 t_id {s2_tid:#06x} != negotiated {t_id:#06x}");
+            }
+        }
+    }
+    Ok(resolved.volumes)
+}
+
 /// Best-effort C2HTermReq write before closing. Used by the State 1
 /// / State 2 admission code (ICReq / Connect) — once State 3 has
 /// split the stream, the writer task owns all PDU emission and
@@ -1409,7 +1886,24 @@ mod tests {
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
         let aer = Arc::new(ControllerRegistry::new());
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, aer, None, None).await;
+            let _ = accept_loop(listener, h, regs, aer, None, None, None).await;
+        });
+        port
+    }
+
+    /// Spawn a server requiring DH-HMAC-CHAP auth, reading per-host
+    /// secrets from `dhchap_path`.
+    async fn spawn_server_with_dhchap(
+        handler: Arc<StubHandler>,
+        dhchap_path: std::path::PathBuf,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
+        let regs = Arc::new(ControllerRegs::new());
+        let aer = Arc::new(ControllerRegistry::new());
+        tokio::spawn(async move {
+            let _ = accept_loop(listener, h, regs, aer, None, None, Some(dhchap_path)).await;
         });
         port
     }
@@ -1422,7 +1916,7 @@ mod tests {
         let h = Arc::clone(&handler) as Arc<dyn NvmeCommandHandler>;
         let regs = Arc::new(ControllerRegs::new());
         tokio::spawn(async move {
-            let _ = accept_loop(listener, h, regs, aer, None, None).await;
+            let _ = accept_loop(listener, h, regs, aer, None, None, None).await;
         });
         port
     }
@@ -2577,5 +3071,361 @@ mod tests {
         }
         assert_eq!(r2t_count, INFLIGHT_CAP as u32);
         assert_eq!(not_ready_count, 1);
+    }
+
+    // ===================== DH-HMAC-CHAP auth phase =====================
+
+    const TEST_HOSTNQN: &str = "nqn.2014-08.org.nvmexpress:uuid:test-host";
+
+    fn write_dhchap_file(slug: &str, entry: crate::identity::DhchapEntry) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nvme-tcp-dhchap-srv-{}-{}.json",
+            slug,
+            std::process::id()
+        ));
+        crate::identity::NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![entry],
+        }
+        .save(&path)
+        .unwrap();
+        path
+    }
+
+    fn dhchap_entry_for(
+        secret: &str,
+        ctrl: Option<&str>,
+        volumes: &[&str],
+    ) -> crate::identity::DhchapEntry {
+        crate::identity::DhchapEntry {
+            host_nqn: TEST_HOSTNQN.into(),
+            dhchap_key: secret.into(),
+            dhchap_ctrl_key: ctrl.map(String::from),
+            disabled: false,
+            volumes: Some(volumes.iter().map(|s| s.to_string()).collect()),
+            previous_dhchap_key: None,
+            previous_expires_at: None,
+        }
+    }
+
+    fn build_auth_send_pdu(cid: u16, msg: &[u8]) -> Vec<u8> {
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::Fabrics as u8;
+        sqe[1] = 0b0100_0000; // PSDT SglInline
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4] = FabricsType::AuthenticationSend as u8;
+        // CDW10 = [resv3, spsp0, spsp1, secp].
+        sqe[41] = 0x01;
+        sqe[42] = 0x01;
+        sqe[43] = dhwire::NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER;
+        sqe[44..48].copy_from_slice(&(msg.len() as u32).to_le_bytes()); // TL
+        build_capsule_cmd_pdu(sqe, msg)
+    }
+
+    fn build_auth_receive_pdu(cid: u16, al: u32) -> Vec<u8> {
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::Fabrics as u8;
+        sqe[1] = 0b0100_0000;
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4] = FabricsType::AuthenticationReceive as u8;
+        sqe[41] = 0x01;
+        sqe[42] = 0x01;
+        sqe[43] = dhwire::NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER;
+        sqe[44..48].copy_from_slice(&al.to_le_bytes()); // AL
+        build_capsule_cmd_pdu(sqe, &[])
+    }
+
+    fn host_negotiate(t_id: u16, hashes: &[u8], groups: &[u8]) -> Vec<u8> {
+        dhwire::build_negotiate(
+            t_id,
+            0,
+            &[dhwire::ProtocolDescriptor {
+                authid: dhwire::NVME_AUTH_DHCHAP_AUTH_ID,
+                hash_ids: hashes.to_vec(),
+                dhgroup_ids: groups.to_vec(),
+            }],
+        )
+    }
+
+    /// Read a controller->host auth message (C2HData + CapsuleResp);
+    /// returns the message bytes.
+    async fn read_auth_message(stream: &mut TcpStream) -> Vec<u8> {
+        let c2h = read_pdu_async(stream).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        let msg = c2h.body[16..].to_vec();
+        let resp = read_pdu_async(stream).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        msg
+    }
+
+    async fn read_capsule_resp_ack(stream: &mut TcpStream) {
+        let r = read_pdu_async(stream).await;
+        assert_eq!(r.header.pdu_type, pdu::PduType::CapsuleResp);
+    }
+
+    /// Compute a host Reply from a received Challenge, mirroring the
+    /// controller's crypto. Returns the Reply bytes plus, for mutual
+    /// auth, the R2 the controller is expected to return in Success1.
+    fn host_build_reply(
+        challenge_msg: &[u8],
+        secret: &str,
+        ctrl_secret: Option<&str>,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let ch = dhwire::parse_challenge(challenge_msg).unwrap();
+        let (host_dh_value, session_key) = if ch.dhgid != dhwire::NVME_AUTH_DHGROUP_NULL {
+            let kp = dhcrypt::DhKeypair::generate(ch.dhgid).unwrap();
+            let sk = kp.session_key(&ch.dh_value, ch.hashid).unwrap();
+            (kp.public_value().unwrap(), Some(sk))
+        } else {
+            (Vec::new(), None)
+        };
+        let augment = |c: &[u8]| match &session_key {
+            Some(sk) => dhcrypt::augmented_challenge(ch.hashid, sk, c).unwrap(),
+            None => c.to_vec(),
+        };
+        let key = dhcrypt::parse_dhchap_secret(secret).unwrap();
+        let tk = dhcrypt::transform_key(&key, TEST_HOSTNQN).unwrap();
+        let r1 = dhcrypt::dhchap_response(&dhcrypt::ResponseInput {
+            transformed_key: &tk,
+            hash_id: ch.hashid,
+            challenge: &augment(&ch.cval),
+            seqnum: ch.seqnum,
+            t_id: ch.t_id,
+            sc_c: 0,
+            label: dhcrypt::LABEL_HOST,
+            nqn_first: TEST_HOSTNQN,
+            nqn_second: TEST_SUBNQN,
+        })
+        .unwrap();
+        let (c2_opt, s2, expected_r2) = if let Some(cs) = ctrl_secret {
+            let c2 = vec![0x5cu8; ch.cval.len()];
+            let s2 = 0x0807_0605u32;
+            let ck = dhcrypt::parse_dhchap_secret(cs).unwrap();
+            let ctk = dhcrypt::transform_key(&ck, TEST_SUBNQN).unwrap();
+            let r2 = dhcrypt::dhchap_response(&dhcrypt::ResponseInput {
+                transformed_key: &ctk,
+                hash_id: ch.hashid,
+                challenge: &augment(&c2),
+                seqnum: s2,
+                t_id: ch.t_id,
+                sc_c: 0,
+                label: dhcrypt::LABEL_CONTROLLER,
+                nqn_first: TEST_SUBNQN,
+                nqn_second: TEST_HOSTNQN,
+            })
+            .unwrap();
+            (Some(c2), s2, Some(r2))
+        } else {
+            (None, 0u32, None)
+        };
+        let msg = dhwire::build_reply(ch.t_id, &r1, c2_opt.as_deref(), s2, &host_dh_value);
+        (msg, expected_r2)
+    }
+
+    /// Drive ICReq + admin Connect, asserting AUTHREQ is set. Leaves the
+    /// stream positioned to start the auth exchange.
+    async fn connect_with_authreq(port: u16) -> TcpStream {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut s).await; // ICResp
+        s.write_all(&build_connect_pdu(TEST_SUBNQN, 0))
+            .await
+            .unwrap();
+        let resp = read_pdu_async(&mut s).await;
+        let dw0 = u32::from_le_bytes([resp.body[0], resp.body[1], resp.body[2], resp.body[3]]);
+        // ATR (Authentication Transaction Required) is DW0 bit 17.
+        assert_eq!((dw0 >> 17) & 1, 1, "ATR must be set when dhchap on");
+        s
+    }
+
+    #[tokio::test]
+    async fn dhchap_null_group_happy_path_then_admin() {
+        let secret = dhcrypt::encode_dhchap_secret(&[0x11; 32], 0);
+        let path = write_dhchap_file("null-ok", dhchap_entry_for(&secret, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+
+        let mut s = connect_with_authreq(port).await;
+        // Negotiate (Auth Send) -> ACK.
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x77,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // Auth Receive -> Challenge.
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let challenge = read_auth_message(&mut s).await;
+        // Reply (Auth Send) -> ACK.
+        let (reply, _) = host_build_reply(&challenge, &secret, None);
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // Auth Receive -> Success1 (unidirectional, no R2).
+        s.write_all(&build_auth_receive_pdu(0x13, 4096))
+            .await
+            .unwrap();
+        let success1 = read_auth_message(&mut s).await;
+        let s1 = dhwire::parse_success1(&success1).unwrap();
+        assert_eq!(s1.response, None);
+        // Success2 (Auth Send) -> ACK.
+        s.write_all(&build_auth_send_pdu(0x14, &dhwire::build_success2(0x77)))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+
+        // Auth complete: a normal admin Identify now succeeds.
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::Identify as u8;
+        sqe[2] = 0x55;
+        sqe[40] = nvme_base::identify::CNS::Controller as u8;
+        s.write_all(&build_capsule_cmd_pdu(sqe, &[])).await.unwrap();
+        let c2h = read_pdu_async(&mut s).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        assert_eq!(c2h.body[16], 0xC0); // stub canary -> auth gate passed
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_wrong_secret_refused() {
+        let real = dhcrypt::encode_dhchap_secret(&[0x22; 32], 0);
+        let wrong = dhcrypt::encode_dhchap_secret(&[0x99; 32], 0);
+        let path = write_dhchap_file("wrong", dhchap_entry_for(&real, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+
+        let mut s = connect_with_authreq(port).await;
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x33,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let challenge = read_auth_message(&mut s).await;
+        // Reply computed with the WRONG secret.
+        let (reply, _) = host_build_reply(&challenge, &wrong, None);
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        // Auth Receive yields a Failure1, then the connection closes.
+        s.write_all(&build_auth_receive_pdu(0x13, 4096))
+            .await
+            .unwrap();
+        let msg = read_auth_message(&mut s).await;
+        let f = dhwire::parse_failure(&msg).unwrap();
+        assert_eq!(f.rescode, dhwire::NVME_AUTH_DHCHAP_FAILURE_REASON_FAILED);
+        assert_eq!(f.rescode_exp, dhwire::NVME_AUTH_DHCHAP_FAILURE_FAILED);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_bidirectional_mutual_auth() {
+        let host_secret = dhcrypt::encode_dhchap_secret(&[0x33; 48], 0);
+        let ctrl_secret = dhcrypt::encode_dhchap_secret(&[0x44; 48], 0);
+        let path = write_dhchap_file(
+            "mutual",
+            dhchap_entry_for(&host_secret, Some(&ctrl_secret), &["vol-a"]),
+        );
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+
+        let mut s = connect_with_authreq(port).await;
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x44,
+                &[dhwire::NVME_AUTH_HASH_SHA384],
+                &[dhwire::NVME_AUTH_DHGROUP_NULL],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let challenge = read_auth_message(&mut s).await;
+        let (reply, expected_r2) = host_build_reply(&challenge, &host_secret, Some(&ctrl_secret));
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x13, 4096))
+            .await
+            .unwrap();
+        let success1 = read_auth_message(&mut s).await;
+        let s1 = dhwire::parse_success1(&success1).unwrap();
+        // Controller proved itself: Success1 carries R2 matching ours.
+        assert_eq!(s1.response, expected_r2);
+        s.write_all(&build_auth_send_pdu(0x14, &dhwire::build_success2(0x44)))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn dhchap_ffdhe2048_full_dh() {
+        let secret = dhcrypt::encode_dhchap_secret(&[0x55; 32], 1); // SHA-256 transform
+        let path = write_dhchap_file("ffdhe", dhchap_entry_for(&secret, None, &["vol-a"]));
+        let handler = StubHandler::new(TEST_SUBNQN);
+        let port = spawn_server_with_dhchap(Arc::clone(&handler), path.clone()).await;
+
+        let mut s = connect_with_authreq(port).await;
+        // Offer NULL + ffdhe2048; the controller prefers ffdhe2048.
+        s.write_all(&build_auth_send_pdu(
+            0x10,
+            &host_negotiate(
+                0x55,
+                &[dhwire::NVME_AUTH_HASH_SHA256],
+                &[
+                    dhwire::NVME_AUTH_DHGROUP_NULL,
+                    dhwire::NVME_AUTH_DHGROUP_2048,
+                ],
+            ),
+        ))
+        .await
+        .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x11, 4096))
+            .await
+            .unwrap();
+        let challenge = read_auth_message(&mut s).await;
+        // The controller must have selected the FFDHE group.
+        let ch = dhwire::parse_challenge(&challenge).unwrap();
+        assert_eq!(ch.dhgid, dhwire::NVME_AUTH_DHGROUP_2048);
+        assert_eq!(ch.dh_value.len(), 256);
+        let (reply, _) = host_build_reply(&challenge, &secret, None);
+        s.write_all(&build_auth_send_pdu(0x12, &reply))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        s.write_all(&build_auth_receive_pdu(0x13, 4096))
+            .await
+            .unwrap();
+        let success1 = read_auth_message(&mut s).await;
+        assert!(dhwire::parse_success1(&success1).is_ok());
+        s.write_all(&build_auth_send_pdu(0x14, &dhwire::build_success2(0x55)))
+            .await
+            .unwrap();
+        read_capsule_resp_ack(&mut s).await;
+        let _ = std::fs::remove_file(&path);
     }
 }

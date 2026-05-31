@@ -20,6 +20,7 @@ pub mod handlers;
 pub mod iscsi_target;
 pub mod iscsi_users;
 pub mod job_dispatch;
+pub mod nvmetcp_dhchap;
 pub mod nvmetcp_psks;
 
 use anyhow::Result;
@@ -109,6 +110,44 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
         )
         .route("/api/v1/nvmetcp/psks/grant", post(nvmetcp_psks::grant))
         .route("/api/v1/nvmetcp/psks/revoke", post(nvmetcp_psks::revoke))
+        // NVMe-TCP DH-HMAC-CHAP lifecycle
+        .route(
+            "/api/v1/nvmetcp/dhchap",
+            get(nvmetcp_dhchap::list).post(nvmetcp_dhchap::add),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/remove",
+            post(nvmetcp_dhchap::remove),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/disable",
+            post(nvmetcp_dhchap::disable),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/enable",
+            post(nvmetcp_dhchap::enable),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/rotate",
+            post(nvmetcp_dhchap::rotate),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/rotate/cancel",
+            post(nvmetcp_dhchap::rotate_cancel),
+        )
+        .route("/api/v1/nvmetcp/dhchap/grant", post(nvmetcp_dhchap::grant))
+        .route(
+            "/api/v1/nvmetcp/dhchap/revoke",
+            post(nvmetcp_dhchap::revoke),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/ctrl-key/set",
+            post(nvmetcp_dhchap::set_ctrl_key),
+        )
+        .route(
+            "/api/v1/nvmetcp/dhchap/ctrl-key/clear",
+            post(nvmetcp_dhchap::clear_ctrl_key),
+        )
         .with_state(state.clone());
 
     let jobs = shared_admin_server::jobs_router(state, |kind, body, emitter, st| {

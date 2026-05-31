@@ -52,6 +52,16 @@
 #                         imports the key into the kernel keyring, then
 #                         runs nvme connect --tls. Everything else
 #                         identical to the cleartext path.
+#   --dhchap              Enable DH-HMAC-CHAP in-band auth (NVMe Base
+#                         §8.13). Generates a host secret + a controller
+#                         secret with `nvme gen-dhchap-key`, writes
+#                         nvmetcp-dhchap.json (admitting the host to
+#                         test-vol only), and runs `nvme connect
+#                         --dhchap-secret --dhchap-ctrl-secret` (mutual
+#                         auth). Also asserts a wrong secret is refused
+#                         and that a non-admitted volume stays invisible.
+#                         Requires nvme-cli + kernel with dhchap support.
+#                         Composes with --tls ("dhchap+tls").
 #
 
 # Self-elevate to root (needed for nvme connect / disconnect and the
@@ -73,12 +83,16 @@ HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-conformance-test"
 NVME_DEVICE=""
 USE_TLS=0
 TLS_KEY_STR=""
+USE_DHCHAP=0
+DHCHAP_KEY_STR=""
+DHCHAP_CTRL_STR=""
 
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
         --nvmetcp-port) NVMETCP_PORT="$2"; shift 2 ;;
         --tls) USE_TLS=1; shift ;;
+        --dhchap) USE_DHCHAP=1; shift ;;
         *)
             if parse_common_daemon_arg "$@"; then
                 shift "$_CONSUMED_ARGS"
@@ -187,6 +201,15 @@ check_prerequisites() {
         fi
     fi
 
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        # DH-HMAC-CHAP needs an nvme-cli/kernel that accepts
+        # --dhchap-secret on connect (and can generate a secret).
+        if ! nvme connect --help 2>&1 | grep -q -- '--dhchap-secret'; then
+            missing+=("nvme connect --dhchap-secret (nvme-cli too old)")
+            hints+=("  - dhchap: needs nvme-cli >= 2.0 and kernel >= 5.20")
+        fi
+    fi
+
     if (( ${#missing[@]} > 0 )); then
         log_error "Missing prerequisites: ${missing[*]}"
         echo "Install hints:"
@@ -209,6 +232,10 @@ create_test_config() {
     if [[ $USE_TLS -eq 1 ]]; then
         tls_block=$'\n  tls:\n    mode: psk\n    identity_file: "'"$TEST_DIR/data/nvmetcp-psks.json"$'"'
     fi
+    local auth_block=""
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        auth_block=$'\n  auth:\n    mode: dhchap\n    identity_file: "'"$TEST_DIR/data/nvmetcp-dhchap.json"$'"'
+    fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
 
@@ -218,7 +245,7 @@ http:
   listen: "127.0.0.1:$HTTP_PORT"
 
 nvmetcp:
-  listen: "0.0.0.0:$NVMETCP_PORT"$tls_block
+  listen: "0.0.0.0:$NVMETCP_PORT"$tls_block$auth_block
 
 storage:
   backends:
@@ -309,11 +336,90 @@ EOFPSK
     chmod 0640 "$TEST_DIR/data/nvmetcp-psks.json"
 }
 
+setup_dhchap() {
+    log_info "Generating DH-HMAC-CHAP secrets..."
+    # `nvme gen-dhchap-key --hmac=1` emits one `DHHC-1:01:base64:` line:
+    # a random, NQN-transformable secret (the transform binds to the
+    # hostnqn at auth time on both sides). One for the host, one for the
+    # controller (bidirectional / mutual auth).
+    DHCHAP_KEY_STR=$(nvme gen-dhchap-key --hmac=1 \
+        2>"$TEST_DIR/gen-dhchap-key.err" | grep -E '^DHHC-1:' | head -1)
+    DHCHAP_CTRL_STR=$(nvme gen-dhchap-key --hmac=1 \
+        2>>"$TEST_DIR/gen-dhchap-key.err" | grep -E '^DHHC-1:' | head -1)
+    if [[ -z "$DHCHAP_KEY_STR" || -z "$DHCHAP_CTRL_STR" ]]; then
+        log_error "nvme gen-dhchap-key produced no key: $(cat "$TEST_DIR/gen-dhchap-key.err")"
+        exit 1
+    fi
+    log_info "Host secret ${DHCHAP_KEY_STR:0:16}... ctrl secret ${DHCHAP_CTRL_STR:0:16}..."
+    # Daemon-side identity file: admit the host to test-vol ONLY, so the
+    # non-admitted test-vol-hidden stays invisible (admission-fence test).
+    cat > "$TEST_DIR/data/nvmetcp-dhchap.json" <<EOFDH
+{
+  "version": 1,
+  "dhchap": [
+    {
+      "host_nqn": "$HOST_NQN",
+      "dhchap_key": "$DHCHAP_KEY_STR",
+      "dhchap_ctrl_key": "$DHCHAP_CTRL_STR",
+      "volumes": ["test-vol"]
+    }
+  ]
+}
+EOFDH
+    chmod 0640 "$TEST_DIR/data/nvmetcp-dhchap.json"
+}
+
+create_hidden_volume() {
+    log_info "Creating a second, non-admitted volume (admission fence)..."
+    "$CLI_PATH" --config "$TEST_CONFIG" --user root volume create test-vol-hidden \
+        --size 100MiB --backend primary --page-size 64KiB \
+        || { log_error "Failed to create hidden volume"; exit 1; }
+}
+
+run_dhchap_admission_check() {
+    log_info "Checking DH-HMAC-CHAP volume admission fence..."
+    # test-vol is admitted (visible); test-vol-hidden is not. Linux only
+    # creates block devices for namespaces in the (filtered) Active NS
+    # list, so the non-admitted namespace must have no /dev node.
+    if [[ -e "/dev/${NVME_DEVICE}n1" ]]; then
+        log_pass "Admitted namespace /dev/${NVME_DEVICE}n1 visible"
+    else
+        log_fail "Admitted namespace /dev/${NVME_DEVICE}n1 missing"
+    fi
+    if [[ -e "/dev/${NVME_DEVICE}n2" ]]; then
+        log_fail "Non-admitted namespace /dev/${NVME_DEVICE}n2 visible — fence broken"
+    else
+        log_pass "Non-admitted namespace fenced (no /dev/${NVME_DEVICE}n2)"
+    fi
+}
+
+run_dhchap_wrong_secret() {
+    log_info "Verifying a wrong DH-HMAC-CHAP secret is refused..."
+    local bogus
+    bogus=$(nvme gen-dhchap-key --hmac=1 2>/dev/null | grep -E '^DHHC-1:' | head -1)
+    if [[ -z "$bogus" ]]; then
+        log_info "could not generate a bogus key; skipping negative test"
+        return
+    fi
+    if nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
+        -n "$SUBNQN" --hostnqn "$HOST_NQN" --dhchap-secret "$bogus" \
+        >"$TEST_DIR/nvme-connect-bogus.log" 2>&1; then
+        log_fail "connect with a wrong secret SUCCEEDED (should be refused)"
+        nvme disconnect -n "$SUBNQN" >/dev/null 2>&1
+    else
+        log_pass "connect with a wrong secret refused"
+    fi
+}
+
 connect_nvmetcp() {
     log_info "Connecting via nvme-cli..."
     local tls_args=()
     if [[ $USE_TLS -eq 1 ]]; then
         tls_args+=(--tls --tls-key="$TLS_KEY_STR")
+    fi
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        tls_args+=(--dhchap-secret "$DHCHAP_KEY_STR")
+        [[ -n "$DHCHAP_CTRL_STR" ]] && tls_args+=(--dhchap-ctrl-secret "$DHCHAP_CTRL_STR")
     fi
     if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
         -n "$SUBNQN" --hostnqn "$HOST_NQN" "${tls_args[@]}" \
@@ -471,15 +577,23 @@ main() {
     if [[ $USE_TLS -eq 1 ]]; then
         setup_tls_psk
     fi
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        setup_dhchap
+    fi
     create_test_config
     start_daemon
     create_volume
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        create_hidden_volume
+    fi
     if connect_nvmetcp; then
         run_identify_tests
+        [[ $USE_DHCHAP -eq 1 ]] && run_dhchap_admission_check
         run_smart_log
         run_io_round_trip
         run_reservation_tests
         run_disconnect
+        [[ $USE_DHCHAP -eq 1 ]] && run_dhchap_wrong_secret
     fi
 
     echo

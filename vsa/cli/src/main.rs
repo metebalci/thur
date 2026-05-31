@@ -404,6 +404,59 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             },
+            NvmetcpAction::Dhchap { action } => match action {
+                NvmetcpDhchapAction::List { json } => credentials::dhchap_list(json).await,
+                NvmetcpDhchapAction::Add {
+                    host_nqn,
+                    key,
+                    ctrl_key,
+                    volume,
+                } => {
+                    credentials::dhchap_add(
+                        &host_nqn,
+                        &key,
+                        ctrl_key.as_deref(),
+                        Some(volume.as_slice()),
+                    )
+                    .await
+                }
+                NvmetcpDhchapAction::Grant { host_nqn, volume } => {
+                    credentials::dhchap_grant(&host_nqn, &volume).await
+                }
+                NvmetcpDhchapAction::Revoke { host_nqn, volume } => {
+                    credentials::dhchap_revoke(&host_nqn, &volume).await
+                }
+                NvmetcpDhchapAction::Remove { host_nqn } => {
+                    credentials::dhchap_remove(&host_nqn).await
+                }
+                NvmetcpDhchapAction::Disable { host_nqn } => {
+                    credentials::dhchap_set_disabled(&host_nqn, true).await
+                }
+                NvmetcpDhchapAction::Enable { host_nqn } => {
+                    credentials::dhchap_set_disabled(&host_nqn, false).await
+                }
+                NvmetcpDhchapAction::SetCtrlKey { host_nqn, key } => {
+                    credentials::dhchap_set_ctrl_key(&host_nqn, &key).await
+                }
+                NvmetcpDhchapAction::ClearCtrlKey { host_nqn } => {
+                    credentials::dhchap_clear_ctrl_key(&host_nqn).await
+                }
+                NvmetcpDhchapAction::Rotate {
+                    host_nqn,
+                    key,
+                    grace,
+                    cancel,
+                } => {
+                    if cancel {
+                        credentials::dhchap_rotate_cancel(&host_nqn).await
+                    } else {
+                        let k = key.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("--key is required (use --cancel to revert a rotation)")
+                        })?;
+                        credentials::dhchap_rotate(&host_nqn, k, &grace).await
+                    }
+                }
+            },
         },
         // Config dispatched above before runtime construction.
         Commands::Config { .. } => unreachable!(),

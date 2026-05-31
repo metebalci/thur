@@ -17,11 +17,10 @@
 //! | 0x06   | Authentication Recv| ditto                                  |
 //! | 0x08   | Disconnect         | Release a previously-established queue |
 //!
-//! Today this module only models Connect — the rest are deferred to
-//! future sessions per the roadmap in `docs/NVMETCP.md`. The
-//! enum is exposed in full so a follow-up only needs to add the
-//! corresponding structure on the other side of the existing
-//! discriminant.
+//! Connect, Property Get/Set, and Disconnect are modeled here; the
+//! Authentication Send / Receive message shapes (DH-HMAC-CHAP) live in
+//! the sibling [`crate::auth`] module, driven by the controller-side
+//! state machine in `nvme-tcp`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -153,15 +152,23 @@ impl ConnectData {
 ///
 /// ```text
 ///   bits 15:0    CNTLID assigned by the controller
-///   bit  16      AUTHREQ — 1 if the host must follow up with
-///                          Authentication Send / Receive before
-///                          any other command is accepted
-///   bits 31:17   reserved
+///   bit  16      reserved
+///   bit  17      ATR — Authentication Transaction Required. Set to
+///                      require an in-band DH-HMAC-CHAP exchange before
+///                      any other command is accepted.
+///   bit  18      ASCR — Authentication and Secure Channel Required
+///                      (TLS via the auth transaction). Not set; we use
+///                      socket-level TLS-PSK for an encrypted channel.
+///   bits 31:19   reserved
 /// ```
+///
+/// The Linux host (`NVME_CONNECT_AUTHREQ_ATR = 1 << 17`) keys its auth
+/// state machine off ATR — bit 16 is *not* the AUTHREQ bit, despite
+/// being a natural guess.
 pub fn connect_response_dw0(cntlid: u16, auth_required: bool) -> u32 {
     let mut dw0 = u32::from(cntlid);
     if auth_required {
-        dw0 |= 1 << 16;
+        dw0 |= 1 << 17; // ATR
     }
     dw0
 }
@@ -378,7 +385,8 @@ mod tests {
     #[test]
     fn dw0_packs_cntlid_and_authreq() {
         assert_eq!(connect_response_dw0(1, false), 1);
-        assert_eq!(connect_response_dw0(1, true), 1 | (1 << 16));
+        // ATR is bit 17 (NVME_CONNECT_AUTHREQ_ATR), not bit 16.
+        assert_eq!(connect_response_dw0(1, true), 1 | (1 << 17));
         assert_eq!(connect_response_dw0(0xABCD, false), 0xABCD);
     }
 

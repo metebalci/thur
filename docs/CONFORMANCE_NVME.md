@@ -164,8 +164,8 @@ above it.
 | 0x00 | Property Set | 🟩 Yes | M | Writes the shared `ControllerRegs`; INTMS / INTMC / NSSR / AQA / ASQ / ACQ accepted as no-op. |
 | 0x01 | Connect | 🟩 Yes | M | First CapsuleCmd on every TCP connection must be Connect. 1024-byte in-capsule `ConnectData` carries HOSTID + requested CNTLID + SUBNQN + HOSTNQN. SUBNQN mismatch returns `Connect Invalid Parameters` (SCT=CommandSpecific, SC=0x82, DNR=1). QID from CDW10[31:16] selects the queue type: QID=0 (admin) creates a controller and is assigned a fresh CNTLID; QID>0 (I/O) attaches to the controller named in `ConnectData` CNTLID, refused with `Connect Invalid Parameters` if that CNTLID has no live controller or belongs to another HOSTID. The assigned CNTLID is echoed in the success CapsuleResp DW0. A second Connect on an established queue is refused. |
 | 0x04 | Property Get | 🟩 Yes | M | Reads the shared `ControllerRegs`. |
-| 0x05 | Authentication Send | 🟨 No | CC | DH-HMAC-CHAP not implemented — see *Deliberate non-conformance*. Returns `Invalid Field in Command`. |
-| 0x06 | Authentication Receive | 🟨 No | CC | As above. |
+| 0x05 | Authentication Send | 🟩 Yes | CC | DH-HMAC-CHAP host messages (Negotiate / Reply / Success2 / Failure2). In-capsule data; SECP=0xE9, SPSP0=SPSP1=0x01. See *DH-HMAC-CHAP authentication*. |
+| 0x06 | Authentication Receive | 🟩 Yes | CC | DH-HMAC-CHAP controller messages (Challenge / Success1 / Failure1) returned as a C2HData PDU + CapsuleResp. |
 | 0x08 | Disconnect | 🟩 Yes | M | Sends a success CapsuleResp then closes the TCP connection from the controller side. Any in-flight pending fused-first half is reported as `aborted_due_to_missing_fused` before close. |
 
 ### Controller registers (touched via Property Get / Set)
@@ -269,7 +269,32 @@ s2n-tls integration — is in [`NVMETCP.md`](NVMETCP.md) §
 | Per-handshake config reload (`ClientHelloCallback`) | 🟩 Yes | — | Adds, disables, and rotates take effect on the next session with no daemon restart. |
 | Mutual host-NQN cross-check | 🟩 Yes | — | After the TLS handshake, the host-NQN field of the negotiated PSK identity is compared against the host-NQN in the subsequent Connect. Mismatch fails Connect with `connect_invalid_parameters` and tears the session down. Silent in cleartext mode. |
 | Rotation grace window | 🟩 Yes | — | Per-entry `previous_interchange_key` + `previous_expires_at`; both keys derive their (v0, v1) PSK pairs while the grace window is open. |
-| DH-HMAC-CHAP (Admin Fabrics 0x05 / 0x06) | 🟨 No | O | See *Deliberate non-conformance*. |
+| DH-HMAC-CHAP (Admin Fabrics 0x05 / 0x06) | 🟩 Yes | O | The non-TLS in-band auth alternative. See *DH-HMAC-CHAP authentication*. |
+
+### DH-HMAC-CHAP authentication (NVMe Base §8.13)
+
+Controller-side in-band authentication, the NVMe analog of iSCSI CHAP — the
+common choice for Linux NVMe/TCP on trusted networks (`nvme connect
+--dhchap-secret`), authenticating the host without a TLS stack. Enabled with
+`nvmetcp.auth.mode = dhchap`; orthogonal to TLS-PSK, so `auth = dhchap` with
+`tls = psk` runs the exchange inside a TLS-PSK channel ("dhchap+tls").
+Implemented against the Linux kernel host as the interop reference; design
+walkthrough in [`NVMETCP.md`](NVMETCP.md) § DH-HMAC-CHAP, secret-store +
+operator surface in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
+
+| Item | Status | Spec | Notes |
+|------|--------|:----:|-------|
+| ATR (Authentication Transaction Required) in Connect Response (DW0 bit 17) | 🟩 Yes | CC | Asserted on every Connect when `auth.mode = dhchap`, so the host runs the auth exchange before any other command — on every queue (admin + each I/O). Bit 17 (`NVME_CONNECT_AUTHREQ_ATR`), not bit 16. |
+| Negotiate → Challenge → Reply → Success1 → Success2 state machine | 🟩 Yes | CC | Driven sequentially between the Connect Response and steady state (`nvme-tcp::server::run_auth_phase`). |
+| Hash negotiation | 🟩 Yes | M | SHA-256 / SHA-384 / SHA-512 (ids 0x01 / 0x02 / 0x03). The controller selects the strongest the host offers. |
+| DH-group negotiation | 🟩 Yes | M | NULL plus RFC 7919 FFDHE ffdhe2048 / 3072 / 4096 / 6144 / 8192 (ids 0x00–0x05). The controller selects the strongest FFDHE the host offers, falling back to NULL. Augmented challenge `HMAC(H(g^xy), C)` when a DH group is used. |
+| Augmented challenge / forward secrecy | 🟩 Yes | O | Ephemeral DH keypair per transaction; the shared secret is MSB-zero-padded to the prime length before hashing (matching the kernel) so the session key is byte-identical. |
+| Bidirectional (mutual) auth | 🟩 Yes | O | When the host includes a challenge (`--dhchap-ctrl-secret`) and a controller secret is configured for the host, the controller proves itself with R2 in Success1. A host requesting mutual auth without a configured controller secret is failed. |
+| `DHHC-1:NN:<base64(key‖crc32)>:` secret format | 🟩 Yes | — | `nvme gen-dhchap-key` output. NN selects the key-transform hash (00 = none); CRC-32 validated at parse. 32/48/64-byte keys. |
+| Key transform (NQN binding) | 🟩 Yes | M | `HMAC_secret(NQN ‖ "NVMe-over-Fabrics")` using the secret's own hash, per `nvme_auth_transform_key`. |
+| Per-handshake secret reload + rotation grace | 🟩 Yes | — | `nvmetcp-dhchap.json` is re-read on every Connect; `previous_dhchap_key` + `previous_expires_at` let both secrets authenticate during a grace window. |
+| Per-host volume admission | 🟩 Yes | — | The authenticated host's `volumes` allow-list gates every I/O command — mandatory under `auth.mode = dhchap` (mirror of TLS-PSK admission). |
+| Secure-channel concatenation (`sc_c` ≠ 0, TLS-PSK insertion via auth) | 🟨 No | O | Refused with `AUTH_Failure` (CONCAT_MISMATCH). Use `tls.mode = psk` for a TLS channel. |
 
 ---
 
@@ -301,7 +326,6 @@ reasoning for each. SCSI-side cross-cutting departures are in
 | Multi-outstanding R2T per command | Single-R2T-per-command is bandwidth-equivalent for any transfer that fits the network's bandwidth-delay product. Lift only if a benchmark shows the round-trip is the bottleneck on a high-latency link. |
 | Async events other than reservation notifications | AER (Admin 0x0C) is implemented, but the only event source wired is reservation notifications (LID 0x80 — see *Reservation notifications* below). Namespace-attribute (the Notice-type events behind FID 0x0B Async Event Configuration), firmware-activation, and thermal notices are not produced — VSA has no firmware mechanism or thermal sensors, and namespaces are bound at `volume create`. The generic AER plumbing is reusable when a namespace-change source lands. |
 | Discovery controller absent | Hosts connect direct to the subsystem NQN; operators distribute the address / port / NQN out of band. A discovery listener lands when multi-subsystem deployments become a documented use case. |
-| DH-HMAC-CHAP (NVMe Base §8.13.5, Fabrics 0x05 / 0x06) | The non-TLS auth alternative — auth exchange encrypted, data stream not. Lands only if a deployment can't terminate TLS at the target. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
 | PCIe-only admin opcodes (0x00 / 0x01 / 0x04 / 0x05 / 0x7C) | Fabrics queue creation happens via Connect; doorbells are a PCIe concept. `Invalid Command Opcode` is the correct fabrics behavior. |
@@ -473,13 +497,17 @@ by the initiator IQN + ISID rather than the ephemeral TSIH).
 
 ### Is DH-HMAC-CHAP used in practice?
 
-Rarely. DH-HMAC-CHAP (NVMe Base §8.13.5, Fabrics 0x05 / 0x06) is
-NVMe's challenge-response auth wrapped in a Diffie-Hellman key
-exchange. Its raison d'être is environments that can't terminate
-TLS at the storage target — typically enterprise SAN gear with a
-fabric appliance doing TLS in front of the array. Almost every
-other deployment uses TLS-PSK (what we ship) or runs cleartext on a
-trusted network.
+Yes — it is the common auth choice for Linux NVMe/TCP on trusted
+networks (`nvme connect --dhchap-secret`), where it authenticates the
+host without requiring a TLS stack. DH-HMAC-CHAP (NVMe Base §8.13) is
+NVMe's challenge-response auth optionally wrapped in a Diffie-Hellman
+key exchange — the NVMe analog of the iSCSI CHAP we already implement.
+VSA implements the controller side in full: NULL + RFC 7919 FFDHE group
+negotiation, SHA-256/384/512 hash negotiation, the augmented challenge,
+and optional bidirectional (mutual) auth (`--dhchap-ctrl-secret`).
+Enable it with `nvmetcp.auth.mode = dhchap`; it composes with TLS-PSK
+(run both for "dhchap+tls"). The other common postures remain available:
+TLS-PSK for an encrypted data stream, or cleartext on a trusted network.
 
 ### Format NVM and Sanitize — should we at least stub them?
 

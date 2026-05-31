@@ -120,6 +120,27 @@ iscsi:
 #     # Override the identity-file path. Default:
 #     # <data_dir>/nvmetcp-psks.json.
 #     # identity_file: "/etc/thurvsa/nvmetcp-psks.json"
+#
+#   # DH-HMAC-CHAP in-band host authentication (NVMe Base 8.13) — the
+#   # NVMe analog of iSCSI CHAP, for trusted networks without a TLS
+#   # stack. Orthogonal to `tls`: "none" + tls "disabled" is the legacy
+#   # cleartext default; "dhchap" alone authenticates the host in-band
+#   # over plain TCP; "dhchap" + tls "psk" runs DH-HMAC-CHAP inside a
+#   # TLS-PSK channel ("dhchap+tls"). Secrets live in the identity file
+#   # (default <data_dir>/nvmetcp-dhchap.json, daemon-managed).
+#   auth:
+#     # "none" (default) or "dhchap". When "dhchap", every Connect
+#     # asserts AUTHREQ and the host must pass a challenge/response
+#     # before any I/O; per-host secrets + volume admission reload on
+#     # each handshake (no restart for `nvmetcp dhchap` edits).
+#     # Generate a per-host secret on the initiator with
+#     # `nvme gen-dhchap-key --hostnqn=...` and register it with
+#     # `thurvsa nvmetcp dhchap add --host-nqn=... --key=DHHC-1:... --volume=...`.
+#     # See docs/AUTH.md § NVMe/TCP DH-HMAC-CHAP.
+#     mode: "none"
+#     # Override the identity-file path. Default:
+#     # <data_dir>/nvmetcp-dhchap.json.
+#     # identity_file: "/etc/thurvsa/nvmetcp-dhchap.json"
 
 # Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
 # applied per cloud backend. `size_gb` here is the **per-backend

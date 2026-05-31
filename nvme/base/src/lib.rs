@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aer;
+pub mod auth;
 pub mod cqe;
 pub mod error;
 pub mod fabrics;

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{DhchapError, DhchapKey, parse_dhchap_secret};
 use crate::tls::{ParsedInterchangeKey, PskError, parse_interchange_key};
 
 /// One PSK entry per host NQN. The `interchange_key` field holds the
@@ -236,6 +237,164 @@ impl PskTable {
     }
 }
 
+// ===================== DH-HMAC-CHAP secret store =====================
+//
+// `<data_dir>/nvmetcp-dhchap.json` — the in-band-auth analog of
+// `nvmetcp-psks.json`. One entry per host NQN carrying the operator-
+// pasted `DHHC-1:...` secret (from `nvme gen-dhchap-key`), an optional
+// controller secret for mutual auth, the volume admission set, and the
+// same rotation-grace fields. Read fresh on every Connect by the
+// transport's auth phase, so `nvmetcp dhchap` edits take effect on the
+// next session without restart. Same on-disk discipline as the PSK file
+// (atomic rename on save, chmod 0640, default-empty stub on first boot).
+
+/// One DH-HMAC-CHAP entry per host NQN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhchapEntry {
+    /// Initiator host NQN — must match the host's `--hostnqn`.
+    pub host_nqn: String,
+    /// `DHHC-1:NN:base64:` host secret. The host authenticates itself
+    /// with this (`nvme connect --dhchap-secret`).
+    pub dhchap_key: String,
+    /// Optional `DHHC-1:NN:base64:` controller secret. When set, the
+    /// controller proves itself back to the host (bidirectional /
+    /// mutual auth — the host runs `--dhchap-ctrl-secret <this>`).
+    #[serde(default)]
+    pub dhchap_ctrl_key: Option<String>,
+    /// When `true`, this host's auth attempts are refused (the entry is
+    /// treated as absent). Distinct from removal to preserve audit
+    /// continuity.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Volumes this host is admitted to (VSA only). `None`/omitted = no
+    /// admission (see-nothing safe fallback under mandatory admission).
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+    /// Previous secret retained for a rotation grace window. Both the
+    /// current and previous secret validate a host response while
+    /// `previous_expires_at` is in the future.
+    #[serde(default)]
+    pub previous_dhchap_key: Option<String>,
+    /// Wall-clock instant at which `previous_dhchap_key` stops being
+    /// honored (evaluated at Connect; a `rotate.commit` sweep zeroes the
+    /// pair on the next mutating admin verb that observes expiry).
+    #[serde(default)]
+    pub previous_expires_at: Option<DateTime<Utc>>,
+}
+
+/// On-disk schema for `<data_dir>/nvmetcp-dhchap.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvmetcpDhchapFile {
+    #[serde(default = "default_dhchap_file_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub dhchap: Vec<DhchapEntry>,
+}
+
+fn default_dhchap_file_version() -> u32 {
+    1
+}
+
+impl Default for NvmetcpDhchapFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            dhchap: Vec::new(),
+        }
+    }
+}
+
+impl NvmetcpDhchapFile {
+    /// Load from disk. Returns the default (empty) file when the path
+    /// doesn't exist; errors only on read-but-malformed JSON.
+    pub fn load(path: &Path) -> Result<Self, IdentityFileError> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => serde_json::from_str(&s).map_err(IdentityFileError::Parse),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(IdentityFileError::Io(e)),
+        }
+    }
+
+    /// Atomic save (write tmp -> chmod 0640 -> rename).
+    pub fn save(&self, path: &Path) -> Result<(), IdentityFileError> {
+        let body = serde_json::to_string_pretty(self).map_err(IdentityFileError::Parse)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body).map_err(IdentityFileError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
+                .map_err(IdentityFileError::Io)?;
+        }
+        std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)
+    }
+
+    /// Load if present, otherwise write an empty stub and return it.
+    pub fn load_or_create_default(path: &Path) -> Result<Self, IdentityFileError> {
+        if !path.exists() {
+            let stub = Self::default();
+            stub.save(path)?;
+            return Ok(stub);
+        }
+        Self::load(path)
+    }
+}
+
+/// A host's resolved DH-HMAC-CHAP credentials for one Connect.
+#[derive(Debug, Clone)]
+pub struct ResolvedDhchap {
+    /// Host secret(s) the response is validated against — the current
+    /// secret first, plus the previous secret during a rotation grace
+    /// window. A host response matching *any* of these authenticates.
+    pub secrets: Vec<DhchapKey>,
+    /// Controller secret for mutual auth, if configured for this host.
+    pub ctrl_secret: Option<DhchapKey>,
+    /// Volume admission set (empty = see-nothing).
+    pub volumes: Vec<String>,
+}
+
+/// Resolve a host NQN to its DH-HMAC-CHAP credentials. Loads the file
+/// fresh (same lifecycle as the TLS-PSK lookup). Returns `Ok(None)`
+/// when the host has no enabled entry (the auth phase then fails with
+/// AUTH_Failure). Parses every `DHHC-1:` secret via
+/// [`parse_dhchap_secret`], surfacing a malformed key with host context.
+pub fn dhchap_lookup(
+    path: &Path,
+    host_nqn: &str,
+) -> Result<Option<ResolvedDhchap>, IdentityFileError> {
+    let file = NvmetcpDhchapFile::load(path)?;
+    let now = Utc::now();
+    let Some(entry) = file
+        .dhchap
+        .into_iter()
+        .find(|e| !e.disabled && e.host_nqn == host_nqn)
+    else {
+        return Ok(None);
+    };
+    let parse = |s: &str| {
+        parse_dhchap_secret(s).map_err(|source| IdentityFileError::BadDhchapKey {
+            host_nqn: host_nqn.to_string(),
+            source,
+        })
+    };
+    let mut secrets = Vec::with_capacity(2);
+    secrets.push(parse(&entry.dhchap_key)?);
+    if let (Some(prev), Some(expires)) = (&entry.previous_dhchap_key, entry.previous_expires_at)
+        && expires > now
+    {
+        secrets.push(parse(prev)?);
+    }
+    let ctrl_secret = match &entry.dhchap_ctrl_key {
+        Some(k) => Some(parse(k)?),
+        None => None,
+    };
+    Ok(Some(ResolvedDhchap {
+        secrets,
+        ctrl_secret,
+        volumes: entry.volumes.unwrap_or_default(),
+    }))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityFileError {
     #[error("I/O error: {0}")]
@@ -251,6 +410,12 @@ pub enum IdentityFileError {
         host_nqn: String,
         #[source]
         source: PskError,
+    },
+    #[error("bad DH-HMAC-CHAP key for host {host_nqn}: {source}")]
+    BadDhchapKey {
+        host_nqn: String,
+        #[source]
+        source: DhchapError,
     },
 }
 
@@ -415,5 +580,137 @@ mod tests {
             slug,
             std::process::id()
         ))
+    }
+
+    // ----- DH-HMAC-CHAP secret store -----
+
+    fn dhchap_entry(host: &str) -> DhchapEntry {
+        DhchapEntry {
+            host_nqn: host.into(),
+            dhchap_key: crate::auth::encode_dhchap_secret(&[0xAB; 32], 0),
+            dhchap_ctrl_key: None,
+            disabled: false,
+            volumes: Some(vec!["vol-a".into()]),
+            previous_dhchap_key: None,
+            previous_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn dhchap_empty_file_round_trip_0640() {
+        let tmp = tempfile_path("dhchap-empty");
+        let _ = std::fs::remove_file(&tmp);
+        let loaded = NvmetcpDhchapFile::load_or_create_default(&tmp).unwrap();
+        assert_eq!(loaded.version, 1);
+        assert!(loaded.dhchap.is_empty());
+        assert!(tmp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640);
+        }
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dhchap_lookup_finds_secret_and_volumes() {
+        let tmp = tempfile_path("dhchap-lookup");
+        let file = NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![dhchap_entry("nqn.host.a")],
+        };
+        file.save(&tmp).unwrap();
+        let r = dhchap_lookup(&tmp, "nqn.host.a").unwrap().unwrap();
+        assert_eq!(r.secrets.len(), 1);
+        assert_eq!(r.secrets[0].raw, vec![0xAB; 32]);
+        assert_eq!(r.volumes, vec!["vol-a".to_string()]);
+        assert!(r.ctrl_secret.is_none());
+        // Absent host -> None.
+        assert!(dhchap_lookup(&tmp, "nqn.host.missing").unwrap().is_none());
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dhchap_lookup_skips_disabled() {
+        let tmp = tempfile_path("dhchap-disabled");
+        let mut e = dhchap_entry("nqn.host.off");
+        e.disabled = true;
+        NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![e],
+        }
+        .save(&tmp)
+        .unwrap();
+        assert!(dhchap_lookup(&tmp, "nqn.host.off").unwrap().is_none());
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dhchap_lookup_carries_ctrl_secret() {
+        let tmp = tempfile_path("dhchap-ctrl");
+        let mut e = dhchap_entry("nqn.host.mutual");
+        e.dhchap_ctrl_key = Some(crate::auth::encode_dhchap_secret(&[0xCD; 48], 2));
+        NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![e],
+        }
+        .save(&tmp)
+        .unwrap();
+        let r = dhchap_lookup(&tmp, "nqn.host.mutual").unwrap().unwrap();
+        let ctrl = r.ctrl_secret.unwrap();
+        assert_eq!(ctrl.raw, vec![0xCD; 48]);
+        assert_eq!(ctrl.hash, 2);
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dhchap_lookup_grace_window_includes_then_drops_previous() {
+        use chrono::Duration;
+        let tmp = tempfile_path("dhchap-grace");
+        let mut e = dhchap_entry("nqn.host.rot");
+        e.previous_dhchap_key = Some(crate::auth::encode_dhchap_secret(&[0x11; 32], 0));
+        e.previous_expires_at = Some(Utc::now() + Duration::hours(1));
+        NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![e.clone()],
+        }
+        .save(&tmp)
+        .unwrap();
+        let r = dhchap_lookup(&tmp, "nqn.host.rot").unwrap().unwrap();
+        assert_eq!(r.secrets.len(), 2, "current + previous during grace");
+        assert_eq!(r.secrets[1].raw, vec![0x11; 32]);
+
+        // Expired previous -> only current.
+        e.previous_expires_at = Some(Utc::now() - Duration::seconds(1));
+        NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![e],
+        }
+        .save(&tmp)
+        .unwrap();
+        let r = dhchap_lookup(&tmp, "nqn.host.rot").unwrap().unwrap();
+        assert_eq!(r.secrets.len(), 1);
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dhchap_lookup_bad_key_surfaces_host_context() {
+        let tmp = tempfile_path("dhchap-badkey");
+        let mut e = dhchap_entry("nqn.host.bad");
+        e.dhchap_key = "not-a-dhchap-key".into();
+        NvmetcpDhchapFile {
+            version: 1,
+            dhchap: vec![e],
+        }
+        .save(&tmp)
+        .unwrap();
+        match dhchap_lookup(&tmp, "nqn.host.bad") {
+            Err(IdentityFileError::BadDhchapKey { host_nqn, .. }) => {
+                assert_eq!(host_nqn, "nqn.host.bad")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        std::fs::remove_file(&tmp).unwrap();
     }
 }

@@ -46,6 +46,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
+mod ffdhe;
 pub mod identity;
 pub mod pdu;
 pub mod server;

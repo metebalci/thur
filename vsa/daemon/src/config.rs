@@ -299,6 +299,14 @@ pub struct NvmetcpSettings {
     /// § NVMe/TCP TLS-PSK).
     #[serde(default)]
     pub tls: NvmetcpTlsSettings,
+    /// DH-HMAC-CHAP in-band host authentication (NVMe Base §8.13).
+    /// Default `none`; `dhchap` requires every host to pass a
+    /// challenge/response before any command. Orthogonal to `tls`:
+    /// `auth.mode: dhchap` with `tls.mode: psk` runs DH-HMAC-CHAP
+    /// inside a TLS-PSK channel ("dhchap+tls"). See [`docs/AUTH.md`]
+    /// § NVMe/TCP DH-HMAC-CHAP.
+    #[serde(default)]
+    pub auth: NvmetcpAuthSettings,
 }
 
 /// `nvmetcp.tls:` block. Mode-selector + identity-file path. The
@@ -328,6 +336,37 @@ pub enum NvmetcpTlsMode {
     #[default]
     Disabled,
     Psk,
+}
+
+/// `nvmetcp.auth:` block. Mode-selector + identity-file path for
+/// DH-HMAC-CHAP in-band authentication. The `DHHC-1:` secrets live in
+/// the identity file (default `<data_dir>/nvmetcp-dhchap.json`,
+/// daemon-managed via `thurvsa nvmetcp dhchap`), not in YAML — same
+/// split as `iscsi.auth.method` + `iscsi-users.json`.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct NvmetcpAuthSettings {
+    #[serde(default)]
+    pub mode: NvmetcpAuthMode,
+    /// Override the identity-file path. Defaults to
+    /// `<data_dir>/nvmetcp-dhchap.json` when unset.
+    pub identity_file: Option<String>,
+}
+
+/// In-band authentication mode for the NVMe/TCP listener.
+///
+/// - `None` (default): no in-band auth. Combined with `tls.mode:
+///   disabled` this is the legacy cleartext, see-everything behavior.
+/// - `Dhchap`: DH-HMAC-CHAP (NVMe Base §8.13). Every Connect asserts
+///   AUTHREQ and the host must complete Authentication Send/Receive
+///   before any command. Per-host secrets + volume admission load from
+///   the identity file on every handshake — `nvmetcp dhchap` edits take
+///   effect on the next session without restart.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NvmetcpAuthMode {
+    #[default]
+    None,
+    Dhchap,
 }
 
 /// `iscsi:` block. Carries the optional CHAP `auth` sub-block, a
@@ -826,6 +865,50 @@ nvmetcp:
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
         assert!(cfg.iscsi.target_iqn.is_none());
         assert!(cfg.nvmetcp.subnqn.is_none());
+    }
+
+    #[test]
+    fn nvmetcp_auth_mode_defaults_to_none() {
+        let f = write_config("data_dir: /var/lib/thurvsa\n");
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        assert_eq!(cfg.nvmetcp.auth.mode, NvmetcpAuthMode::None);
+        assert!(cfg.nvmetcp.auth.identity_file.is_none());
+    }
+
+    #[test]
+    fn nvmetcp_auth_dhchap_and_dhchap_plus_tls_parse() {
+        // dhchap alone (no TLS).
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+nvmetcp:
+  auth:
+    mode: dhchap
+    identity_file: /etc/thurvsa/nvmetcp-dhchap.json
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        assert_eq!(cfg.nvmetcp.auth.mode, NvmetcpAuthMode::Dhchap);
+        assert_eq!(cfg.nvmetcp.tls.mode, NvmetcpTlsMode::Disabled);
+        assert_eq!(
+            cfg.nvmetcp.auth.identity_file.as_deref(),
+            Some("/etc/thurvsa/nvmetcp-dhchap.json")
+        );
+
+        // dhchap + tls (the combined "dhchap+tls" mode).
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+nvmetcp:
+  tls:
+    mode: psk
+  auth:
+    mode: dhchap
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        assert_eq!(cfg.nvmetcp.auth.mode, NvmetcpAuthMode::Dhchap);
+        assert_eq!(cfg.nvmetcp.tls.mode, NvmetcpTlsMode::Psk);
     }
 
     #[test]

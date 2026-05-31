@@ -24,7 +24,9 @@ use tokio::sync::Mutex;
 
 use crate::admin::handlers::AdminState;
 use crate::audit::{IscsiDiskLoginAudit, audit_dir, boot_audit_log};
-use crate::config::{DEFAULT_CONFIG_PATH, DaemonConfig, NvmetcpTlsMode, Transport};
+use crate::config::{
+    DEFAULT_CONFIG_PATH, DaemonConfig, NvmetcpAuthMode, NvmetcpTlsMode, Transport,
+};
 use crate::http::HttpState;
 use scsi_sbc::SbcScsiDispatcher;
 
@@ -678,16 +680,48 @@ async fn main() -> Result<()> {
                     }
                 };
 
+                // Optional DH-HMAC-CHAP in-band auth. Independent of TLS:
+                // `dhchap` can run with or without a TLS-PSK channel. When
+                // on, every Connect asserts AUTHREQ and per-host secrets +
+                // volume admission load from `nvmetcp-dhchap.json` on each
+                // handshake. Operator edits via `nvmetcp dhchap` take
+                // effect on the next session without restart.
+                let dhchap_path = match cfg.nvmetcp.auth.mode {
+                    NvmetcpAuthMode::None => None,
+                    NvmetcpAuthMode::Dhchap => {
+                        let p = cfg
+                            .nvmetcp
+                            .auth
+                            .identity_file
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| data_dir.join("nvmetcp-dhchap.json"));
+                        let initial =
+                            nvme_tcp::identity::NvmetcpDhchapFile::load_or_create_default(&p)
+                                .with_context(|| format!("loading {}", p.display()))?;
+                        tracing::info!(
+                            identity_file = %p.display(),
+                            entries = initial.dhchap.len(),
+                            "nvme-tcp: DH-HMAC-CHAP enabled, parse-on-handshake",
+                        );
+                        Some(p)
+                    }
+                };
+
                 tracing::info!(
-                    "transport: nvmetcp (listen={}, subnqn={}, tls={})",
+                    "transport: nvmetcp (listen={}, subnqn={}, tls={}, dhchap={})",
                     nvmetcp_listen,
                     subnqn,
                     tls_acceptor.is_some(),
+                    dhchap_path.is_some(),
                 );
-                // Pair admission with auth: TLS-PSK on → admission lookup
-                // applies (mandatory). TLS-PSK off → no admission lookup
-                // → see-everything (mirror of iSCSI no-CHAP).
-                let admission_psks_path = if tls_acceptor.is_some() {
+                // Pair admission with auth. DH-HMAC-CHAP owns admission
+                // when on (its entries carry `volumes`); otherwise TLS-PSK
+                // on -> admission lookup applies (mandatory); both off ->
+                // see-everything (mirror of iSCSI no-CHAP).
+                let admission_psks_path = if dhchap_path.is_some() {
+                    None
+                } else if tls_acceptor.is_some() {
                     Some(psks_path)
                 } else {
                     None
@@ -699,6 +733,7 @@ async fn main() -> Result<()> {
                     aer: aer_hub,
                     tls: tls_acceptor,
                     psks_path: admission_psks_path,
+                    dhchap_path,
                 };
                 transport_listens.push(nvmetcp_listen.clone());
                 transport_futs.push(Box::pin(nvme_tcp::run(server_cfg)));

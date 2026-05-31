@@ -767,6 +767,12 @@ enum NvmetcpAction {
         #[command(subcommand)]
         action: NvmetcpPsksAction,
     },
+
+    /// DH-HMAC-CHAP in-band auth lifecycle for NVMe-TCP hosts.
+    Dhchap {
+        #[command(subcommand)]
+        action: NvmetcpDhchapAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -865,6 +871,127 @@ enum NvmetcpPsksAction {
         grace: String,
 
         /// Cancel an in-flight rotation: drop the new key, restore
+        /// the previous one. Errors if no rotation is in progress.
+        #[arg(long)]
+        cancel: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NvmetcpDhchapAction {
+    /// List every registered host DH-HMAC-CHAP entry.
+    List {
+        /// Emit JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Add a new host DH-HMAC-CHAP secret.
+    ///
+    /// `--key` is the `DHHC-1:...` secret generated host-side with
+    /// `nvme gen-dhchap-key`. CRC-validated CLI-side before sending.
+    /// `--ctrl-key` (optional) sets a controller secret for mutual
+    /// auth (`nvme connect --dhchap-ctrl-secret`).
+    Add {
+        /// Initiator host NQN (must match `nvme connect --hostnqn`).
+        #[arg(long)]
+        host_nqn: String,
+
+        /// `DHHC-1:NN:base64:` host secret.
+        #[arg(long)]
+        key: String,
+
+        /// Optional `DHHC-1:...` controller secret (mutual auth).
+        #[arg(long)]
+        ctrl_key: Option<String>,
+
+        /// Volume the host is admitted to (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Grant a host access to one or more volumes.
+    Grant {
+        /// Host NQN to grant access to.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// Volume to add to the host's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Revoke a host's access to one or more volumes.
+    ///
+    /// Refuses if the revoke would leave the host with zero admitted
+    /// volumes — use `remove` or `disable` to fully cut access.
+    Revoke {
+        /// Host NQN to revoke access from.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// Volume to remove from the host's allow-list (repeatable, required).
+        #[arg(long = "volume", value_name = "NAME", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        volume: Vec<String>,
+    },
+
+    /// Remove a host DH-HMAC-CHAP entry.
+    Remove {
+        /// Host NQN to remove.
+        #[arg(long)]
+        host_nqn: String,
+    },
+
+    /// Disable a host entry without removing it.
+    Disable {
+        /// Host NQN to disable.
+        #[arg(long)]
+        host_nqn: String,
+    },
+
+    /// Re-enable a previously disabled host entry.
+    Enable {
+        /// Host NQN to re-enable.
+        #[arg(long)]
+        host_nqn: String,
+    },
+
+    /// Set (or replace) a host's controller secret for mutual auth.
+    SetCtrlKey {
+        /// Host NQN.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// `DHHC-1:...` controller secret.
+        #[arg(long)]
+        key: String,
+    },
+
+    /// Clear a host's controller secret (disable mutual auth).
+    ClearCtrlKey {
+        /// Host NQN.
+        #[arg(long)]
+        host_nqn: String,
+    },
+
+    /// Rotate a host's DH-HMAC-CHAP secret with a grace window.
+    ///
+    /// Both old and new secrets authenticate until the grace expires
+    /// (default 24h). Revert with `rotate --host-nqn N --cancel`.
+    Rotate {
+        /// Host NQN to rotate.
+        #[arg(long)]
+        host_nqn: String,
+
+        /// New `DHHC-1:...` secret.
+        #[arg(long, conflicts_with = "cancel")]
+        key: Option<String>,
+
+        /// Grace window (humantime: `24h`, `5m`, `1d12h`). Default `24h`.
+        #[arg(long, default_value = "24h", conflicts_with = "cancel")]
+        grace: String,
+
+        /// Cancel an in-flight rotation: drop the new secret, restore
         /// the previous one. Errors if no rotation is in progress.
         #[arg(long)]
         cancel: bool,

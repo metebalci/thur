@@ -1286,6 +1286,111 @@ Note that `nvme connect --tls` on Linux requires the `tlshd` userspace
 TLS daemon — the kernel hands the TLS 1.3 handshake off to it. On
 Debian and Ubuntu that ships in the `ktls-utils` package.
 
+## NVMe/TCP DH-HMAC-CHAP (VSA only)
+
+DH-HMAC-CHAP is in-band host authentication — the NVMe analog of the
+iSCSI CHAP described above, and the common choice for Linux NVMe/TCP on
+trusted networks (`nvme connect --dhchap-secret`). It authenticates the
+host *without* requiring a TLS stack. The wire-flow and crypto design
+are in [`NVMETCP.md`](NVMETCP.md) § DH-HMAC-CHAP; this section is the
+operator-facing schema.
+
+It is selected by its own block, independent of `tls`:
+
+```yaml
+nvmetcp:
+  auth:
+    mode: dhchap   # none (default) | dhchap
+    # identity_file: "/etc/thurvsa/nvmetcp-dhchap.json"
+```
+
+The three postures: `auth.mode: none` (+ `tls.mode: disabled`) is the
+legacy cleartext default; `auth.mode: dhchap` alone authenticates the
+host in-band over plain TCP; `auth.mode: dhchap` with `tls.mode: psk`
+runs DH-HMAC-CHAP inside a TLS-PSK channel ("dhchap+tls"), getting both
+an authenticated host *and* an encrypted data stream.
+
+Per-host secrets live in an identity file at
+`<data_dir>/nvmetcp-dhchap.json` — daemon-managed, mode 0640, atomic
+save. Unlike the TLS-PSK file, it is **re-read on every Connect**, so
+`nvmetcp dhchap` edits take effect on the next session with no restart:
+
+```json
+{
+  "version": 1,
+  "dhchap": [
+    {
+      "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:initiator-1",
+      "dhchap_key": "DHHC-1:01:base64key...:",
+      "volumes": ["alpha", "beta"]
+    }
+  ]
+}
+```
+
+The `dhchap_key` is the `DHHC-1:NN:<base64(key‖crc32)>:` string the host
+operator generates with `nvme gen-dhchap-key`; the `NN` selects the
+key-transform hash (`00` = none, `01`/`02`/`03` = SHA-256/384/512) and
+the CRC is validated at parse. As with TLS-PSK, every entry **must**
+carry a non-empty `volumes` admission set — admission is mandatory under
+`auth.mode: dhchap`, gating every I/O command (the host NQN is now
+authenticated, so the fence is meaningful). A revoke that would empty
+the set is refused.
+
+Provision and manage with the `nvmetcp dhchap` verbs (daemon-routed,
+audited):
+
+```bash
+# Add a host secret + admit it to one or more volumes.
+thurvsa nvmetcp dhchap add \
+    --host-nqn nqn.2014-08.org.nvmexpress:uuid:initiator-1 \
+    --key "DHHC-1:01:base64key...:" \
+    --volume alpha --volume beta
+
+thurvsa nvmetcp dhchap list [--json]
+thurvsa nvmetcp dhchap grant  --host-nqn ... --volume gamma
+thurvsa nvmetcp dhchap revoke --host-nqn ... --volume beta
+thurvsa nvmetcp dhchap disable/enable/remove --host-nqn ...
+# Rotate with a grace window (both secrets authenticate until it expires).
+thurvsa nvmetcp dhchap rotate --host-nqn ... --key "DHHC-1:01:...:" --grace 24h
+thurvsa nvmetcp dhchap rotate --host-nqn ... --cancel
+```
+
+On the host side:
+
+```bash
+# Generate a host secret (paste the printed DHHC-1 string into `add`).
+nvme gen-dhchap-key --hostnqn nqn.2014-08.org.nvmexpress:uuid:initiator-1
+# Connect with in-band auth (no TLS / tlshd needed).
+sudo nvme connect -t tcp -a <vsa-host> -s 4420 \
+    -n nqn.2025-10.com.metebalci:thurvsa \
+    --hostnqn nqn.2014-08.org.nvmexpress:uuid:initiator-1 \
+    --dhchap-secret "DHHC-1:01:base64key...:"
+```
+
+### Bidirectional (mutual) authentication
+
+To also authenticate the *controller* to the host, configure a
+controller secret per host and have the host pass `--dhchap-ctrl-secret`:
+
+```bash
+# Controller side — set the controller secret for a host.
+thurvsa nvmetcp dhchap set-ctrl-key --host-nqn ... --key "DHHC-1:02:...:"
+# (or pass --ctrl-key on `add`; clear with `clear-ctrl-key`).
+
+# Host side — supply both secrets.
+sudo nvme connect -t tcp -a <vsa-host> -s 4420 -n <subnqn> \
+    --hostnqn <hostnqn> \
+    --dhchap-secret "DHHC-1:01:...:" \
+    --dhchap-ctrl-secret "DHHC-1:02:...:"
+```
+
+The controller then proves itself with the response `R2` in the
+Success1 message. A host that requests mutual auth against a host entry
+with no controller secret configured is refused. The `list` output's
+`MUTUAL` column shows which hosts have a controller secret set (the
+secret itself is never returned).
+
 ## Test-only failure injection (LocalBackend)
 
 `LocalBackend` (`type: local`) reads the `THUR_STORAGE_INJECT_FAIL` env

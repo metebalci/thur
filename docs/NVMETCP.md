@@ -9,7 +9,7 @@ touching the storage engine at all.
 
 This document is the NVMe/TCP design walkthrough: crate split, the
 per-connection state machine, write data flow, fused Compare+Write, TLS-PSK,
-testing, and the out-of-scope list. The per-opcode and per-feature compliance
+DH-HMAC-CHAP in-band auth, testing, and the out-of-scope list. The per-opcode and per-feature compliance
 table is in [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md); the iSCSI and SBC-3
 path is in [`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md).
 
@@ -182,9 +182,11 @@ The register coverage is:
 
 Disconnect emits a success CapsuleResp and then closes the TCP connection
 from the controller side. Any in-flight pending fused half is reported as
-`aborted_due_to_missing_fused` before the close. Authentication Send /
-Receive (FCTYPE 0x05 / 0x06) and a second Connect on an established queue
-are both refused.
+`aborted_due_to_missing_fused` before the close. A second Connect on an
+established queue is refused. Authentication Send / Receive (FCTYPE 0x05 /
+0x06) drive the DH-HMAC-CHAP exchange in the pre-steady-state auth phase
+(see *DH-HMAC-CHAP* below) and are refused here, post-Connect, in steady
+state.
 
 ## Write data flow (ICD + R2T)
 
@@ -472,12 +474,85 @@ Per-handshake parse failures — for example if the file is edited to a corrupt
 state mid-run — fail that single handshake; the daemon keeps running and
 previously-good PSKs remain good.
 
-### Out of scope here
+## DH-HMAC-CHAP (NVMe Base §8.13)
 
-- **DH-HMAC-CHAP** — the alternative auth mechanism for environments that
-  cannot terminate TLS at the target. It is strictly worse than TLS-PSK for
-  the typical case (auth encrypted, data stream not). Lands only on concrete
-  request.
+DH-HMAC-CHAP is in-band host authentication — the NVMe analog of the iSCSI CHAP
+the iSCSI transport already speaks, and the common choice for Linux NVMe/TCP on
+trusted networks (`nvme connect --dhchap-secret`). It authenticates the host
+*without* a TLS stack, and is orthogonal to TLS-PSK: enable it alone over plain
+TCP, or layer it inside a TLS-PSK channel ("dhchap+tls"). It is controlled by a
+separate config block from `tls`:
+
+```yaml
+nvmetcp:
+  auth:
+    mode: dhchap          # none (default) | dhchap
+    # identity_file: <data_dir>/nvmetcp-dhchap.json
+```
+
+The issue's three postures map to `(auth=none)` = off, `(auth=dhchap,
+tls=disabled)` = dhchap-only, `(auth=dhchap, tls=psk)` = dhchap+tls.
+
+### Where it sits
+
+When `auth.mode = dhchap`, every Connect Response asserts **ATR** (Authentication
+Transaction Required, DW0 bit 17 — `NVME_CONNECT_AUTHREQ_ATR`, not bit 16). Per
+NVMe-oF the host must then complete the authentication exchange before
+any other command — on every queue association (admin queue and each I/O
+queue, since each is its own TCP connection). The exchange is strictly
+serialized, so it runs as a dedicated phase **between the Connect Response and
+the State-3 reader/writer split** in `serve_connection`
+(`nvme-tcp::server::run_auth_phase`), reusing the same simple read/write style
+as the Connect phase. The wire (de)serialization lives in `nvme-base::auth`; the
+HMAC + Diffie-Hellman crypto in `nvme-tcp::auth` (OpenSSL, the same backend the
+TLS-PSK HKDF uses).
+
+### Message flow
+
+```text
+  host -> Negotiate    (Auth Send 0x05)      offered hashes + DH groups, sc_c
+  ctrl -> Challenge    (Auth Receive 0x06)   chosen hash/group, C1, S1, g^x
+  host -> Reply        (Auth Send 0x05)      R1, optional C2+g^y, S2
+  ctrl -> Success1     (Auth Receive 0x06)   optional R2 (mutual auth)
+  host -> Success2     (Auth Send 0x05)      acknowledgement
+```
+
+Authentication Send carries the host message as in-capsule data; Authentication
+Receive returns the controller message as a C2HData PDU followed by a
+CapsuleResp. An in-band failure (wrong secret, no entry, unusable hash/group)
+is delivered as an `AUTH_Failure` message on the next Authentication Receive,
+then the connection is closed — the Fabrics commands themselves still complete
+with a success CQE.
+
+### Negotiation + crypto
+
+- **Hash:** SHA-256 / 384 / 512. The controller picks the strongest the host
+  offers.
+- **DH group:** NULL or RFC 7919 FFDHE ffdhe2048 / 3072 / 4096 / 6144 / 8192.
+  The controller picks the strongest FFDHE offered, else NULL. With a DH group,
+  the controller generates an ephemeral keypair, and the challenge fed to the
+  response HMAC is the *augmented* challenge `HMAC(H(g^xy), C)`. The shared
+  secret is MSB-zero-padded to the prime length before hashing — matching the
+  kernel's `crypto_kpp_maxsize` buffer — so the session key is byte-identical.
+- **Response:** `HMAC_K(challenge ‖ seqnum(LE32) ‖ t_id(LE16) ‖ sc_c ‖ label ‖
+  nqn_a ‖ 0x00 ‖ nqn_b)`, where `K` is the NQN-transformed secret. `label` is
+  `"HostHost"` with `(hostnqn, subnqn)` for the host's R1; `"Controller"` with
+  `(subnqn, hostnqn)` for the controller's R2. Byte-exact layout in
+  [`SPEC.md`](SPEC.md) § DH-HMAC-CHAP authentication.
+
+### Secrets, admission, bidirectional
+
+Per-host secrets live in `<data_dir>/nvmetcp-dhchap.json` (daemon-managed,
+0640, atomic save), re-read on every Connect — `thurvsa nvmetcp dhchap` edits
+take effect on the next session with no restart. Each entry carries a `volumes`
+allow-list; under `auth.mode = dhchap` admission is **mandatory** and gates
+every I/O command (same model as TLS-PSK admission). A `dhchap_ctrl_key`
+enables **bidirectional** auth: when the host sends a challenge
+(`--dhchap-ctrl-secret`), the controller proves itself with R2 in Success1; a
+host requesting mutual auth without a configured controller secret is failed.
+Secrets rotate with a grace window (`previous_dhchap_key` +
+`previous_expires_at`) — both authenticate while the window is open. Operator
+surface + secret-store schema in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
 
 ## Out of scope (with rationale)
 
@@ -527,8 +602,11 @@ discovery NQN (`nqn.2014-08.org.nvmexpress.discovery`). Operators distribute
 the address, port, and NQN out of band. A discovery controller lands when
 multi-subsystem deployments become a documented use case.
 
-### DH-HMAC-CHAP (NVMe Base §8.13.5)
+### Secure-channel concatenation (DH-HMAC-CHAP `sc_c` ≠ 0)
 
-The non-TLS auth alternative — auth exchange encrypted, data stream not. Lands
-only if a deployment cannot terminate TLS at the target (e.g. behind a fabric
-appliance doing the TLS work).
+DH-HMAC-CHAP itself is implemented (see *DH-HMAC-CHAP* above); the one piece we
+refuse is the secure-channel-concatenation variant, where the auth exchange
+negotiates a TLS-PSK to insert for the rest of the connection (`sc_c` ≠ 0 in
+the Negotiate). We reject it with `AUTH_Failure` (CONCAT_MISMATCH). Operators
+who want an encrypted data stream use `tls.mode = psk` directly (optionally with
+`auth.mode = dhchap` layered on top), which is simpler and the documented path.

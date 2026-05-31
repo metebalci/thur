@@ -1323,6 +1323,207 @@ esac
     ;;
 esac
 ;;
+(dhchap)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_thurvsa__subcmd__nvmetcp__subcmd__dhchap_commands" \
+"*::: :->dhchap" \
+&& ret=0
+
+    case $state in
+    (dhchap)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-nvmetcp-dhchap-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit JSON for automation]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Initiator host NQN (must match \`nvme connect --hostnqn\`)]:HOST_NQN:_default' \
+'--key=[\`DHHC-1\:NN\:base64\:\` host secret]:KEY:_default' \
+'--ctrl-key=[Optional \`DHHC-1\:...\` controller secret (mutual auth)]:CTRL_KEY:_default' \
+'*--volume=[Volume the host is admitted to (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to grant access to]:HOST_NQN:_default' \
+'*--volume=[Volume to add to the host'\''s allow-list (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to revoke access from]:HOST_NQN:_default' \
+'*--volume=[Volume to remove from the host'\''s allow-list (repeatable, required)]:NAME:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to remove]:HOST_NQN:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(disable)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to disable]:HOST_NQN:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(enable)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to re-enable]:HOST_NQN:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(set-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN]:HOST_NQN:_default' \
+'--key=[\`DHHC-1\:...\` controller secret]:KEY:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(clear-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN]:HOST_NQN:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(rotate)
+_arguments "${_arguments_options[@]}" : \
+'--host-nqn=[Host NQN to rotate]:HOST_NQN:_default' \
+'(--cancel)--key=[New \`DHHC-1\:...\` secret]:KEY:_default' \
+'(--cancel)--grace=[Grace window (humantime\: \`24h\`, \`5m\`, \`1d12h\`). Default \`24h\`]:GRACE:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--cancel[Cancel an in-flight rotation\: drop the new secret, restore the previous one. Errors if no rotation is in progress]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-nvmetcp-dhchap-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(disable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(enable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clear-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rotate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvsa__subcmd__nvmetcp__subcmd__help_commands" \
@@ -1372,6 +1573,62 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (enable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rotate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(dhchap)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap_commands" \
+"*::: :->dhchap" \
+&& ret=0
+
+    case $state in
+    (dhchap)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-nvmetcp-help-dhchap-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(disable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(enable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clear-ctrl-key)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1828,6 +2085,62 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(dhchap)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap_commands" \
+"*::: :->dhchap" \
+&& ret=0
+
+    case $state in
+    (dhchap)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-help-nvmetcp-dhchap-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grant)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(disable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(enable)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clear-ctrl-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rotate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
         esac
     ;;
 esac
@@ -2071,8 +2384,75 @@ _thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() 
 _thurvsa__subcmd__help__subcmd__nvmetcp_commands() {
     local commands; commands=(
 'psks:TLS-PSK lifecycle for NVMe-TCP hosts' \
+'dhchap:DH-HMAC-CHAP in-band auth lifecycle for NVMe-TCP hosts' \
     )
     _describe -t commands 'thurvsa help nvmetcp commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap_commands() {
+    local commands; commands=(
+'list:List every registered host DH-HMAC-CHAP entry' \
+'add:Add a new host DH-HMAC-CHAP secret' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
+'remove:Remove a host DH-HMAC-CHAP entry' \
+'disable:Disable a host entry without removing it' \
+'enable:Re-enable a previously disabled host entry' \
+'set-ctrl-key:Set (or replace) a host'\''s controller secret for mutual auth' \
+'clear-ctrl-key:Clear a host'\''s controller secret (disable mutual auth)' \
+'rotate:Rotate a host'\''s DH-HMAC-CHAP secret with a grace window' \
+    )
+    _describe -t commands 'thurvsa help nvmetcp dhchap commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__add_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap add commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear-ctrl-key_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap clear-ctrl-key commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap disable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap enable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap grant commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__list_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap revoke commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap rotate commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__set-ctrl-key_commands] )) ||
+_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__set-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help nvmetcp dhchap set-ctrl-key commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks_commands] )) ||
 _thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks_commands() {
@@ -2575,17 +2955,224 @@ _thurvsa__subcmd__iscsi__subcmd__users__subcmd__rotate_commands() {
 _thurvsa__subcmd__nvmetcp_commands() {
     local commands; commands=(
 'psks:TLS-PSK lifecycle for NVMe-TCP hosts' \
+'dhchap:DH-HMAC-CHAP in-band auth lifecycle for NVMe-TCP hosts' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa nvmetcp commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap_commands() {
+    local commands; commands=(
+'list:List every registered host DH-HMAC-CHAP entry' \
+'add:Add a new host DH-HMAC-CHAP secret' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
+'remove:Remove a host DH-HMAC-CHAP entry' \
+'disable:Disable a host entry without removing it' \
+'enable:Re-enable a previously disabled host entry' \
+'set-ctrl-key:Set (or replace) a host'\''s controller secret for mutual auth' \
+'clear-ctrl-key:Clear a host'\''s controller secret (disable mutual auth)' \
+'rotate:Rotate a host'\''s DH-HMAC-CHAP secret with a grace window' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa nvmetcp dhchap commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__add_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap add commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap clear-ctrl-key commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap disable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap enable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap grant commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help_commands() {
+    local commands; commands=(
+'list:List every registered host DH-HMAC-CHAP entry' \
+'add:Add a new host DH-HMAC-CHAP secret' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
+'remove:Remove a host DH-HMAC-CHAP entry' \
+'disable:Disable a host entry without removing it' \
+'enable:Re-enable a previously disabled host entry' \
+'set-ctrl-key:Set (or replace) a host'\''s controller secret for mutual auth' \
+'clear-ctrl-key:Clear a host'\''s controller secret (disable mutual auth)' \
+'rotate:Rotate a host'\''s DH-HMAC-CHAP secret with a grace window' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa nvmetcp dhchap help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__add_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help add commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__clear-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__clear-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help clear-ctrl-key commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__disable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__disable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help disable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__enable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__enable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help enable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help grant commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__help_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__list_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__remove_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help revoke commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__rotate_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__rotate_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help rotate commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__set-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__set-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap help set-ctrl-key commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__list_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap revoke commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap rotate commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__set-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__set-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp dhchap set-ctrl-key commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__help_commands() {
     local commands; commands=(
 'psks:TLS-PSK lifecycle for NVMe-TCP hosts' \
+'dhchap:DH-HMAC-CHAP in-band auth lifecycle for NVMe-TCP hosts' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa nvmetcp help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap_commands() {
+    local commands; commands=(
+'list:List every registered host DH-HMAC-CHAP entry' \
+'add:Add a new host DH-HMAC-CHAP secret' \
+'grant:Grant a host access to one or more volumes' \
+'revoke:Revoke a host'\''s access to one or more volumes' \
+'remove:Remove a host DH-HMAC-CHAP entry' \
+'disable:Disable a host entry without removing it' \
+'enable:Re-enable a previously disabled host entry' \
+'set-ctrl-key:Set (or replace) a host'\''s controller secret for mutual auth' \
+'clear-ctrl-key:Clear a host'\''s controller secret (disable mutual auth)' \
+'rotate:Rotate a host'\''s DH-HMAC-CHAP secret with a grace window' \
+    )
+    _describe -t commands 'thurvsa nvmetcp help dhchap commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__add_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap add commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__clear-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__clear-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap clear-ctrl-key commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__disable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__disable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap disable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__enable_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__enable_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap enable commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__grant_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__grant_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap grant commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__list_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__remove_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap remove commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__revoke_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap revoke commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__rotate_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__rotate_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap rotate commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__set-ctrl-key_commands] )) ||
+_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__set-ctrl-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa nvmetcp help dhchap set-ctrl-key commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__help_commands] )) ||
 _thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__help_commands() {

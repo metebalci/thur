@@ -24,6 +24,7 @@ the same commit whenever a YAML key is added or changed.**
 | `inventory.json` | `<data_dir>/library/` | VTL | JSON | daemon + `thurvtl changer` ops |
 | `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
+| `nvmetcp-dhchap.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp dhchap` |
 | `reservations.json` | `<data_dir>/` | both | JSON | daemon — persisted SCSI/NVMe PERSISTENT RESERVE state (PTPL); written on every APTPL/CPTPL-set reservation change, reloaded at start. No CLI verb; never hand-edited (a corrupt file is ignored and the daemon starts with empty reservation state). |
 
 The YAML conffile carries install-time and tuning knobs. The JSON files
@@ -83,6 +84,8 @@ This section is consulted only when `nvmetcp` is listed in `transports`.
 | `nvmetcp.subnqn` | `nqn.2025-10.com.metebalci:thurvsa` | NVMe subsystem NQN. The TLS-PSK derivation binds to this — changing it rederives every per-host PSK. |
 | `nvmetcp.tls.mode` | `disabled` | `disabled` (cleartext) or `psk` (TLS 1.3 with the two NVMe-TCP mandated cipher suites). |
 | `nvmetcp.tls.identity_file` | `<data_dir>/nvmetcp-psks.json` | Path to the TLS-PSK host-identity file. |
+| `nvmetcp.auth.mode` | `none` | `none` or `dhchap` (DH-HMAC-CHAP in-band host auth, NVMe Base §8.13). Orthogonal to `tls.mode`: `dhchap` + `psk` = "dhchap+tls". |
+| `nvmetcp.auth.identity_file` | `<data_dir>/nvmetcp-dhchap.json` | Path to the DH-HMAC-CHAP host-secret file. |
 
 ### `memory_buffers` — VTL only
 
@@ -359,6 +362,26 @@ re-read on every TLS handshake and once post-Connect for the
 admission lookup, so operator edits take effect on the next *new*
 connection without restart. PSK generation and wiring:
 [`AUTH.md`](AUTH.md) § NVMe/TCP TLS-PSK and
+[`NVMETCP.md`](NVMETCP.md).
+
+### `nvmetcp-dhchap.json` — VSA
+
+`nvmetcp-dhchap.json` holds the DH-HMAC-CHAP host-secret list for
+NVMe/TCP in-band authentication (`nvmetcp.auth.mode: dhchap`), plus the
+per-host volume admission set. Each entry carries a `dhchap_key` (the
+host's `DHHC-1:...` secret from `nvme gen-dhchap-key`), an optional
+`dhchap_ctrl_key` (a controller secret enabling bidirectional / mutual
+auth), `disabled`, a mandatory non-empty `volumes` array, and the
+rotation-grace pair `previous_dhchap_key` / `previous_expires_at`.
+Admission works exactly like the TLS-PSK file: the authenticated host is
+fenced to its `volumes`, and non-admitted namespaces return Invalid
+Namespace. With `auth.mode: none` no in-band auth runs.
+
+Managed by `thurvsa nvmetcp dhchap
+{add,remove,disable,enable,grant,revoke,rotate,set-ctrl-key,clear-ctrl-key,list}`.
+The file is re-read on every Connect, so operator edits take effect on
+the next *new* connection without restart. Secret generation and wiring:
+[`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP and
 [`NVMETCP.md`](NVMETCP.md).
 
 ---

@@ -657,6 +657,79 @@ admin queue and queues a LID 0x80 entry the host drains oldest-first.
 Out of scope: async events other than reservation notifications
 (namespace-attribute, firmware-activation, thermal).
 
+#### DH-HMAC-CHAP authentication (NVMe/TCP in-band auth)
+
+Enabled by `nvmetcp.auth.mode: dhchap`. When on, every Connect Response
+sets **ATR** (Authentication Transaction Required, DW0 bit 17 —
+`NVME_CONNECT_AUTHREQ_ATR`, not bit 16) and the host must complete the
+exchange before any other command on that queue. Messages travel on the
+Authentication Send (FCTYPE 0x05, host→ctrl, in-capsule data) and
+Authentication Receive (FCTYPE 0x06, ctrl→host, returned as C2HData +
+CapsuleResp) Fabrics commands, with `SECP = 0xE9`, `SPSP0 = SPSP1 =
+0x01`, and the transfer/allocation length in CDW11. Interop reference:
+the Linux kernel host (`drivers/nvme/{common,host,target}/auth.c`).
+
+All multi-byte fields little-endian. Common header on every message:
+`auth_type(1) auth_id(1) rsvd(2) t_id(2 LE)`. Message `auth_id` /
+`auth_type`:
+
+```text
+  Negotiate  auth_type=0x00(common)  auth_id=0x00     host -> ctrl
+  Challenge  auth_type=0x01(dhchap)  auth_id=0x01     ctrl -> host
+  Reply      auth_type=0x01          auth_id=0x02     host -> ctrl
+  Success1   auth_type=0x01          auth_id=0x03     ctrl -> host
+  Success2   auth_type=0x01          auth_id=0x04     host -> ctrl
+  Failure1   auth_type=0x00          auth_id=0xF1     either
+  Failure2   auth_type=0x00          auth_id=0xF0     host -> ctrl
+```
+
+Message bodies (offsets past the 6-byte header field `t_id` at 4..6):
+
+```text
+Negotiate : sc_c(1)@6 napd(1)@7, then napd 64-byte protocol descriptors @8:
+            descriptor = authid(1) rsvd(1) halen(1) dhlen(1) idlist[60]
+            hash ids at idlist[0..halen], DH-group ids at idlist[30..30+dhlen]
+Challenge : hl(1)@6 rsvd(1) hashid(1)@8 dhgid(1)@9 dhvlen(2 LE)@10 seqnum(4 LE)@12
+            then C1[hl]@16, then g^x[dhvlen]
+Reply     : hl(1)@6 rsvd(1) cvalid(1)@8 rsvd(1) dhvlen(2 LE)@10 seqnum(4 LE)@12
+            then R1[hl]@16, then C2[hl] iff cvalid bit0, then g^y[dhvlen]
+Success1  : hl(1)@6 rsvd(1) rvalid(1)@8 rsvd[7], then R2[hl]@16 iff rvalid bit0
+Success2  : rsvd[10]@6  (no payload)
+Failure   : rescode(1)@6 rescode_exp(1)@7
+```
+
+Hash ids: SHA-256=0x01, SHA-384=0x02, SHA-512=0x03 (digest 32/48/64).
+DH-group ids: NULL=0x00, RFC 7919 ffdhe2048/3072/4096/6144/8192 =
+0x01..0x05. Failure `rescode` is always 0x01 (FAILED); `rescode_exp` ∈
+{FAILED=0x01, CONCAT_MISMATCH=0x03, HASH_UNUSABLE=0x04,
+DHGROUP_UNUSABLE=0x05, INCORRECT_PAYLOAD=0x06, INCORRECT_MESSAGE=0x07}.
+
+Crypto (verbatim from the kernel):
+
+```text
+transform_key(secret, nqn): if secret.hash==0 -> secret bytes; else
+    HMAC_secret( nqn || "NVMe-over-Fabrics"(17) )  using secret's own hash.
+session_key (DH only): K = H( g^xy mod p ), the shared secret MSB-zero-
+    padded to prime length before hashing.
+augmented_challenge(C) = C                       (NULL group)
+                       = HMAC_K(C)               (DH group)
+response R = HMAC_transformed( challenge || seqnum(4 LE) || t_id(2 LE)
+                || sc_c(1) || label || nqn_a || 0x00 || nqn_b )
+    host R1:  label="HostHost"(8),  nqn_a=hostnqn, nqn_b=subnqn,  seqnum=S1
+    ctrl R2:  label="Controller"(10), nqn_a=subnqn, nqn_b=hostnqn, seqnum=S2
+```
+
+The controller selects the strongest offered hash + DH group, mints a
+random C1 and S1 (and an ephemeral DH keypair for a non-NULL group),
+validates R1 against the host's secret (and the previous secret during a
+rotation grace window), and — if the host sent C2 (`cvalid`) and a
+controller secret is configured — returns R2 in Success1. `sc_c` must be
+0 (secure-channel concatenation is refused with CONCAT_MISMATCH).
+
+Per-host secrets + admission live in `nvmetcp-dhchap.json` (schema in
+[`CONFIGURATION.md`](CONFIGURATION.md); operator surface in
+[`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP).
+
 ### Format / partitioning
 
 | Opcode | Command | Notes |

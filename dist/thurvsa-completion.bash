@@ -124,8 +124,41 @@ _thurvsa() {
             thurvsa__subcmd__help__subcmd__iscsi__subcmd__users,rotate)
                 cmd="thurvsa__subcmd__help__subcmd__iscsi__subcmd__users__subcmd__rotate"
                 ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp,dhchap)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap"
+                ;;
             thurvsa__subcmd__help__subcmd__nvmetcp,psks)
                 cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,add)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__add"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,clear-ctrl-key)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,disable)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,enable)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,grant)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,list)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__list"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,remove)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,revoke)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,rotate)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate"
+                ;;
+            thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap,set-ctrl-key)
+                cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key"
                 ;;
             thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks,add)
                 cmd="thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__psks__subcmd__add"
@@ -358,17 +391,119 @@ _thurvsa() {
             thurvsa__subcmd__iscsi__subcmd__users__subcmd__help,rotate)
                 cmd="thurvsa__subcmd__iscsi__subcmd__users__subcmd__help__subcmd__rotate"
                 ;;
+            thurvsa__subcmd__nvmetcp,dhchap)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap"
+                ;;
             thurvsa__subcmd__nvmetcp,help)
                 cmd="thurvsa__subcmd__nvmetcp__subcmd__help"
                 ;;
             thurvsa__subcmd__nvmetcp,psks)
                 cmd="thurvsa__subcmd__nvmetcp__subcmd__psks"
                 ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,add)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__add"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,clear-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,disable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,enable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,grant)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,help)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,list)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__list"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,remove)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,revoke)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,rotate)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap,set-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,add)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__add"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,clear-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__clear__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,disable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__disable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,enable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__enable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,grant)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__grant"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,help)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__help"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,list)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__list"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,remove)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__remove"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,revoke)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__revoke"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,rotate)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__rotate"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help,set-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__set__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help,dhchap)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap"
+                ;;
             thurvsa__subcmd__nvmetcp__subcmd__help,help)
                 cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__help"
                 ;;
             thurvsa__subcmd__nvmetcp__subcmd__help,psks)
                 cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,add)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__add"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,clear-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,disable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__disable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,enable)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__enable"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,grant)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__grant"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,list)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__list"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,remove)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__remove"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,revoke)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__revoke"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,rotate)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__rotate"
+                ;;
+            thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap,set-ctrl-key)
+                cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key"
                 ;;
             thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks,add)
                 cmd="thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__psks__subcmd__add"
@@ -1160,8 +1295,162 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__nvmetcp)
-            opts="psks"
+            opts="psks dhchap"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap)
+            opts="list add grant revoke remove disable enable set-ctrl-key clear-ctrl-key rotate"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__nvmetcp__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -2512,7 +2801,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__nvmetcp)
-            opts="-c -h --config --user --copyright --help psks help"
+            opts="-c -h --config --user --copyright --help psks dhchap help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2537,9 +2826,685 @@ _thurvsa() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        thurvsa__subcmd__nvmetcp__subcmd__help)
-            opts="psks help"
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap)
+            opts="-c -h --config --user --copyright --help list add grant revoke remove disable enable set-ctrl-key clear-ctrl-key rotate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__add)
+            opts="-c -h --host-nqn --key --ctrl-key --volume --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --ctrl-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --volume)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key)
+            opts="-c -h --host-nqn --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__disable)
+            opts="-c -h --host-nqn --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__enable)
+            opts="-c -h --host-nqn --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__grant)
+            opts="-c -h --host-nqn --volume --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --volume)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help)
+            opts="list add grant revoke remove disable enable set-ctrl-key clear-ctrl-key rotate help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__clear__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__disable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__enable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__grant)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__revoke)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__rotate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__help__subcmd__set__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__list)
+            opts="-c -h --json --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__remove)
+            opts="-c -h --host-nqn --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__revoke)
+            opts="-c -h --host-nqn --volume --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --volume)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__rotate)
+            opts="-c -h --host-nqn --key --grace --cancel --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --grace)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key)
+            opts="-c -h --host-nqn --key --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --host-nqn)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help)
+            opts="psks dhchap help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap)
+            opts="list add grant revoke remove disable enable set-ctrl-key clear-ctrl-key rotate"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__clear__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__disable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__enable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__grant)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__revoke)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__rotate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__nvmetcp__subcmd__help__subcmd__dhchap__subcmd__set__subcmd__ctrl__subcmd__key)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

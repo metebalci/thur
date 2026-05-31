@@ -15,6 +15,7 @@
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use nvme_tcp::auth::parse_dhchap_secret;
 use nvme_tcp::tls::parse_interchange_key;
 use shared_admin_client::AdminClient;
 
@@ -207,6 +208,151 @@ pub async fn psks_rotate_cancel(host_nqn: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------- nvmetcp dhchap (VSA only) ----------
+
+pub async fn dhchap_list(json: bool) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let resp: DhchapListResponse = admin.get_json("/api/v1/nvmetcp/dhchap").await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        print_dhchap_table(&resp.dhchap);
+    }
+    Ok(())
+}
+
+pub async fn dhchap_add(
+    host_nqn: &str,
+    key: &str,
+    ctrl_key: Option<&str>,
+    volumes: Option<&[String]>,
+) -> Result<()> {
+    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+    if let Some(c) = ctrl_key {
+        parse_dhchap_secret(c).map_err(|e| anyhow!("invalid --ctrl-key: {e}"))?;
+    }
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let mut body = serde_json::json!({ "host_nqn": host_nqn, "dhchap_key": key });
+    if let Some(c) = ctrl_key {
+        body["dhchap_ctrl_key"] = serde_json::json!(c);
+    }
+    if let Some(vs) = volumes {
+        body["volumes"] = serde_json::json!(vs);
+    }
+    let _: DhchapRow = admin.post_json("/api/v1/nvmetcp/dhchap", &body).await?;
+    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' added");
+    Ok(())
+}
+
+pub async fn dhchap_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
+    let _: DhchapRow = admin
+        .post_json("/api/v1/nvmetcp/dhchap/grant", &body)
+        .await?;
+    println!(
+        "OK: host '{host_nqn}' granted access to: {}",
+        volumes.join(", ")
+    );
+    Ok(())
+}
+
+pub async fn dhchap_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
+    let _: DhchapRow = admin
+        .post_json("/api/v1/nvmetcp/dhchap/revoke", &body)
+        .await?;
+    println!(
+        "OK: host '{host_nqn}' revoked access to: {}",
+        volumes.join(", ")
+    );
+    Ok(())
+}
+
+pub async fn dhchap_remove(host_nqn: &str) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn });
+    admin
+        .post_unit("/api/v1/nvmetcp/dhchap/remove", &body)
+        .await?;
+    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' removed");
+    Ok(())
+}
+
+pub async fn dhchap_set_disabled(host_nqn: &str, disabled: bool) -> Result<()> {
+    let verb = if disabled { "disable" } else { "enable" };
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn });
+    let path = format!("/api/v1/nvmetcp/dhchap/{verb}");
+    admin.post_unit(&path, &body).await?;
+    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' {verb}d");
+    Ok(())
+}
+
+pub async fn dhchap_set_ctrl_key(host_nqn: &str, key: &str) -> Result<()> {
+    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn, "dhchap_ctrl_key": key });
+    let _: DhchapRow = admin
+        .post_json("/api/v1/nvmetcp/dhchap/ctrl-key/set", &body)
+        .await?;
+    println!("OK: controller secret set for host '{host_nqn}' (mutual auth enabled)");
+    Ok(())
+}
+
+pub async fn dhchap_clear_ctrl_key(host_nqn: &str) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn });
+    admin
+        .post_unit("/api/v1/nvmetcp/dhchap/ctrl-key/clear", &body)
+        .await?;
+    println!("OK: controller secret cleared for host '{host_nqn}' (mutual auth disabled)");
+    Ok(())
+}
+
+pub async fn dhchap_rotate(host_nqn: &str, key: &str, grace: &str) -> Result<()> {
+    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+    let grace_secs = shared_cli_iscsi::parse_grace(grace)?;
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({
+        "host_nqn": host_nqn,
+        "dhchap_key": key,
+        "grace_seconds": grace_secs,
+    });
+    let row: DhchapRow = admin
+        .post_json("/api/v1/nvmetcp/dhchap/rotate", &body)
+        .await?;
+    let expires = row
+        .previous_expires_at
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "?".to_string());
+    println!(
+        "OK: DH-HMAC-CHAP secret for host '{host_nqn}' rotated; previous secret honored until {expires} (grace {grace})"
+    );
+    Ok(())
+}
+
+pub async fn dhchap_rotate_cancel(host_nqn: &str) -> Result<()> {
+    let admin = AdminClient::auto_discover(PRODUCT);
+    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let body = serde_json::json!({ "host_nqn": host_nqn });
+    admin
+        .post_unit("/api/v1/nvmetcp/dhchap/rotate/cancel", &body)
+        .await?;
+    println!("OK: DH-HMAC-CHAP rotation for host '{host_nqn}' cancelled; previous secret restored");
+    Ok(())
+}
+
 // ---------- helpers ----------
 
 // Re-export the shared helpers so tests + future PSK extensions can
@@ -242,6 +388,44 @@ fn print_psks_table(rows: &[PskRow]) {
             _ => "-".to_string(),
         };
         println!("{:<60} {:<10} {}", r.host_nqn, state, grace);
+    }
+}
+
+// ---------- DH-HMAC-CHAP wire/table types ----------
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct DhchapRow {
+    host_nqn: String,
+    #[serde(default)]
+    volumes: Option<Vec<String>>,
+    mutual: bool,
+    disabled: bool,
+    in_grace: bool,
+    previous_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct DhchapListResponse {
+    dhchap: Vec<DhchapRow>,
+}
+
+fn print_dhchap_table(rows: &[DhchapRow]) {
+    if rows.is_empty() {
+        println!("(no DH-HMAC-CHAP entries)");
+        return;
+    }
+    println!(
+        "{:<60} {:<10} {:<7} GRACE-UNTIL",
+        "HOST_NQN", "STATE", "MUTUAL"
+    );
+    for r in rows {
+        let state = if r.disabled { "disabled" } else { "active" };
+        let mutual = if r.mutual { "yes" } else { "no" };
+        let grace = match (r.in_grace, r.previous_expires_at) {
+            (true, Some(t)) => t.to_rfc3339(),
+            _ => "-".to_string(),
+        };
+        println!("{:<60} {:<10} {:<7} {}", r.host_nqn, state, mutual, grace);
     }
 }
 
