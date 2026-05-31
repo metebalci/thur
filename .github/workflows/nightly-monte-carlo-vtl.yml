@@ -30,6 +30,18 @@ jobs:
       - name: start iscsid
         run: sudo systemctl enable --now iscsid
 
+      # GitHub's hosted runners don't auto-load the SCSI tape (st)
+      # kernel module, so the emulated LTO drives attach only as
+      # scsi-generic (sgN) nodes and never get /dev/nstN — every mt / dd
+      # tape op then fails host-side before reaching the daemon. mtx
+      # keeps working (it drives the changer's sg node), which is why
+      # only the drive ops failed. Load st explicitly before the test.
+      - name: load SCSI tape driver (st)
+        run: |
+          sudo modprobe st \
+            || (sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe st)
+          lsmod | grep -qE '^st\s' || { echo "st (SCSI tape) module not loaded"; exit 1; }
+
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: build release binaries
