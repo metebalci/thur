@@ -45,7 +45,7 @@
 #
 # Options:
 #   --seed N              Reproduce a prior run
-#   --quick               200 ops (default: 3000)
+#   --quick               200 ops (default: 1000)
 #   --ops N               Override op count
 #   --backend NAME        Use named backend entry (same as THURVTL_TEST_BACKEND)
 #   --debug               Use ./target/debug/ binaries (default: ./target/release/)
@@ -161,8 +161,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Op-count rationale: 1000 is the "standard" run (override with --ops N;
+# --quick = 200-op smoke). By the rule of three (~3/N), 1000 ops catch
+# per-op regressions down to ~0.3% (1-in-333) at 95% confidence and give
+# even the rarest ~2%-weighted ops ~20 occurrences -- enough to exercise
+# their branches without a multi-thousand-op soak. The deep tail (rare op
+# *sequences*, e.g. one rare op right after another) is not caught by a
+# bigger single run but by the nightly re-running with a fresh seed:
+# independent trajectories compound coverage and grow the reproducible
+# seed corpus over time. Use --ops 3000 or more for a pre-release soak.
 [[ $QUICK -eq 1 ]] && : "${OPS:=200}"
-: "${OPS:=3000}"
+: "${OPS:=1000}"
 
 log_pass() { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail() { echo -e "${RED}[FAIL]${NC} $*"; }
