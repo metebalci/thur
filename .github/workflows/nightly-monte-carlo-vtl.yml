@@ -35,12 +35,35 @@ jobs:
       - name: build release binaries
         run: cargo build --release -p vtl-daemon -p vtl-cli
 
+      # --keep-data so the test's cleanup trap doesn't rm -rf the tmp
+      # dir before the upload step runs (CI runners are ephemeral, so
+      # keeping data has no downside). RUST_LOG bumps the tape + changer
+      # SCSI dispatch to debug so a failed REWIND / WRITE FILEMARK /
+      # MOVE MEDIUM logs its CDB + returned sense daemon-side; the iSCSI
+      # transport stays at info to avoid a per-PDU firehose.
       - name: run monte-carlo
-        run: ./vtl/scripts/test-monte-carlo.sh
+        env:
+          RUST_LOG: "info,scsi_ssc=debug,scsi_smc=debug"
+        run: ./vtl/scripts/test-monte-carlo.sh --keep-data
 
-      # Preserve the op log + daemon log on failure so the seed printed
-      # in the run output can be reproduced + the daemon-side cause is
-      # available without re-running.
+      # Host-side mt / mtx failures report their sense data into the
+      # kernel ring buffer, which outlives the test's iSCSI logout.
+      # Capture it (plus iscsid's journal, the device map, and tool
+      # versions) so the daemon-side log and the kernel-side view can
+      # be cross-read without re-running.
+      - name: capture host diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/mc-diag
+          sudo dmesg -T > /tmp/mc-diag/dmesg-vtl.txt 2>&1 || true
+          sudo journalctl -u iscsid --no-pager > /tmp/mc-diag/iscsid-vtl.txt 2>&1 || true
+          { lsscsi -g; echo; lsscsi -t; } > /tmp/mc-diag/lsscsi-vtl.txt 2>&1 || true
+          { uname -a; dpkg -l | grep -E 'open-iscsi|sg3-utils|mtx|mt-st|lsscsi'; } \
+            > /tmp/mc-diag/env-vtl.txt 2>&1 || true
+
+      # Preserve the op log + daemon log + host diagnostics on failure
+      # so the seed printed in the run output can be reproduced + the
+      # cause is available without re-running.
       - name: upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -49,5 +72,6 @@ jobs:
           path: |
             /tmp/thurvtl-monte-carlo-*/ops.log
             /tmp/thurvtl-monte-carlo-*/daemon.log
+            /tmp/mc-diag/*
           retention-days: 30
           if-no-files-found: ignore
