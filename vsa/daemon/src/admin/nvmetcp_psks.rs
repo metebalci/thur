@@ -412,7 +412,9 @@ pub async fn revoke(
 // ---------- helpers ----------
 
 fn psks_path(state: &AdminState) -> PathBuf {
-    state.data_dir.join("nvmetcp-psks.json")
+    // Resolved once at boot — honors `nvmetcp.tls.identity_file` so the
+    // CLI writes where the TLS-PSK acceptor reads (issue #69).
+    state.nvmetcp_psks_path.clone()
 }
 
 fn load_psks(state: &AdminState) -> Result<(PathBuf, NvmetcpPsksFile), ApiError> {

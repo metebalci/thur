@@ -137,6 +137,14 @@ async fn main() -> Result<()> {
     let iscsi_users = shared_iscsi::auth::IscsiUsersFile::load_or_create_default(&iscsi_users_path)
         .with_context(|| format!("loading {}", iscsi_users_path.display()))?;
 
+    // NVMe-TCP identity files honor the optional
+    // `nvmetcp.{tls,auth}.identity_file` override, else default under
+    // `<data_dir>/`. Resolved once here so the transport listener and
+    // the `nvmetcp psks` / `nvmetcp dhchap` admin handlers agree on the
+    // path (issue #69) — a mismatch silently refuses every host.
+    let nvmetcp_psks_path = cfg.nvmetcp.psks_path(&data_dir);
+    let nvmetcp_dhchap_path = cfg.nvmetcp.dhchap_path(&data_dir);
+
     tracing::info!(
         config = %config_path.display(),
         data_dir = %data_dir.display(),
@@ -653,15 +661,10 @@ async fn main() -> Result<()> {
 
                 // Path to `nvmetcp-psks.json`. Used by TLS-PSK and by
                 // per-hostnqn volume admission. We always have a path
-                // (defaulted under `<data_dir>/`); the server treats a
-                // missing or empty file as "no admission fence."
-                let psks_path = cfg
-                    .nvmetcp
-                    .tls
-                    .identity_file
-                    .as_deref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"));
+                // (resolved once at boot from `tls.identity_file` or the
+                // `<data_dir>/` default); the server treats a missing or
+                // empty file as "no admission fence."
+                let psks_path = nvmetcp_psks_path.clone();
 
                 // Optional TLS 1.3 PSK acceptor. Disabled = cleartext
                 // (legacy default). Psk = register a ClientHelloCallback
@@ -697,13 +700,7 @@ async fn main() -> Result<()> {
                 let dhchap_path = match cfg.nvmetcp.auth.mode {
                     NvmetcpAuthMode::None => None,
                     NvmetcpAuthMode::Dhchap => {
-                        let p = cfg
-                            .nvmetcp
-                            .auth
-                            .identity_file
-                            .as_deref()
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| data_dir.join("nvmetcp-dhchap.json"));
+                        let p = nvmetcp_dhchap_path.clone();
                         let initial =
                             nvme_tcp::identity::NvmetcpDhchapFile::load_or_create_default(&p)
                                 .with_context(|| format!("loading {}", p.display()))?;
@@ -768,6 +765,8 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
+        nvmetcp_psks_path,
+        nvmetcp_dhchap_path,
         storage: Arc::new(cfg.storage.clone()),
         registry: Arc::clone(&registry),
         backends: admin_backends,

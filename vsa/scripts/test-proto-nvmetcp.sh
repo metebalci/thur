@@ -47,21 +47,28 @@
 #   --tls                 Enable TLS 1.3 PSK (NVMe-TCP §3.6.1.5). Adds
 #                         prereqs: `tlshd` userspace TLS daemon running
 #                         (Linux nvme_tcp uses kTLS — the kernel hands
-#                         the handshake off to tlshd). Generates a
-#                         single host PSK, writes nvmetcp-psks.json,
-#                         imports the key into the kernel keyring, then
-#                         runs nvme connect --tls. Everything else
-#                         identical to the cleartext path.
+#                         the handshake off to tlshd). Generates a single
+#                         host PSK, registers it with the live daemon via
+#                         `thurvsa nvmetcp psks add` (admitting the host
+#                         to test-vol), imports the key into the kernel
+#                         keyring, then runs nvme connect --tls.
 #   --dhchap              Enable DH-HMAC-CHAP in-band auth (NVMe Base
 #                         §8.13). Generates a host secret + a controller
-#                         secret with `nvme gen-dhchap-key`, writes
-#                         nvmetcp-dhchap.json (admitting the host to
-#                         test-vol only), and runs `nvme connect
-#                         --dhchap-secret --dhchap-ctrl-secret` (mutual
-#                         auth). Also asserts a wrong secret is refused
-#                         and that a non-admitted volume stays invisible.
-#                         Requires nvme-cli + kernel with dhchap support.
-#                         Composes with --tls ("dhchap+tls").
+#                         secret with `nvme gen-dhchap-key`, registers
+#                         them with the live daemon via `thurvsa nvmetcp
+#                         dhchap add` (admitting the host to test-vol
+#                         only), and runs `nvme connect --dhchap-secret
+#                         --dhchap-ctrl-secret` (mutual auth). Also
+#                         asserts a wrong secret is refused and that a
+#                         non-admitted volume stays invisible. Requires
+#                         nvme-cli + kernel with dhchap support. Composes
+#                         with --tls ("dhchap+tls").
+#
+#   Both auth modes set `nvmetcp.{tls,auth}.identity_file` to a path
+#   OUTSIDE <data_dir> and assert the CLI `add` wrote there (not under
+#   <data_dir>): the issue #69 regression guard — the admin handlers
+#   must honor the override the transport reads, or every host is
+#   silently refused.
 #
 
 # Self-elevate to root (needed for nvme connect / disconnect and the
@@ -83,6 +90,7 @@ HOST_NQN="nqn.2014-08.org.nvmexpress:uuid:thurvsa-conformance-test"
 NVME_DEVICE=""
 USE_TLS=0
 TLS_KEY_STR=""
+PSK_KEY_STR=""
 USE_DHCHAP=0
 DHCHAP_KEY_STR=""
 DHCHAP_CTRL_STR=""
@@ -228,13 +236,19 @@ check_prerequisites() {
 create_test_config() {
     log_info "Creating test configuration..."
     mkdir -p "$TEST_DIR/data/volumes"
+    # Identity files live OUTSIDE <data_dir> on purpose: the override dir
+    # is distinct from the daemon default so a handler that ignored
+    # `identity_file` (issue #69) would write under <data_dir> and
+    # diverge from where the transport reads. register_identities asserts
+    # the override path got the entry and the default path did not.
+    mkdir -p "$TEST_DIR/etc"
     local tls_block=""
     if [[ $USE_TLS -eq 1 ]]; then
-        tls_block=$'\n  tls:\n    mode: psk\n    identity_file: "'"$TEST_DIR/data/nvmetcp-psks.json"$'"'
+        tls_block=$'\n  tls:\n    mode: psk\n    identity_file: "'"$TEST_DIR/etc/nvmetcp-psks.json"$'"'
     fi
     local auth_block=""
     if [[ $USE_DHCHAP -eq 1 ]]; then
-        auth_block=$'\n  auth:\n    mode: dhchap\n    identity_file: "'"$TEST_DIR/data/nvmetcp-dhchap.json"$'"'
+        auth_block=$'\n  auth:\n    mode: dhchap\n    identity_file: "'"$TEST_DIR/etc/nvmetcp-dhchap.json"$'"'
     fi
     cat > "$TEST_CONFIG" <<EOFCONFIG
 data_dir: "$TEST_DIR/data"
@@ -320,20 +334,11 @@ setup_tls_psk() {
     serial_dec=$(printf '%d' "0x$serial")
     log_info "Generated PSK: ${key_str:0:24}...: (keyring serial: 0x$serial / $serial_dec)"
     TLS_KEY_STR="$serial_dec"
-
-    # Daemon-side identity file
-    cat > "$TEST_DIR/data/nvmetcp-psks.json" <<EOFPSK
-{
-  "version": 1,
-  "psks": [
-    {
-      "host_nqn": "$HOST_NQN",
-      "interchange_key": "$key_str"
-    }
-  ]
-}
-EOFPSK
-    chmod 0640 "$TEST_DIR/data/nvmetcp-psks.json"
+    # Stash the interchange string; it's registered with the LIVE daemon
+    # later via `thurvsa nvmetcp psks add` (register_identities), which
+    # exercises the admin write path against the identity_file override
+    # — the issue #69 guard. The daemon mints an empty stub at boot.
+    PSK_KEY_STR="$key_str"
 }
 
 setup_dhchap() {
@@ -351,22 +356,12 @@ setup_dhchap() {
         exit 1
     fi
     log_info "Host secret ${DHCHAP_KEY_STR:0:16}... ctrl secret ${DHCHAP_CTRL_STR:0:16}..."
-    # Daemon-side identity file: admit the host to test-vol ONLY, so the
-    # non-admitted test-vol-hidden stays invisible (admission-fence test).
-    cat > "$TEST_DIR/data/nvmetcp-dhchap.json" <<EOFDH
-{
-  "version": 1,
-  "dhchap": [
-    {
-      "host_nqn": "$HOST_NQN",
-      "dhchap_key": "$DHCHAP_KEY_STR",
-      "dhchap_ctrl_key": "$DHCHAP_CTRL_STR",
-      "volumes": ["test-vol"]
-    }
-  ]
-}
-EOFDH
-    chmod 0640 "$TEST_DIR/data/nvmetcp-dhchap.json"
+    # The secrets are registered with the LIVE daemon later via `thurvsa
+    # nvmetcp dhchap add` (register_identities), admitting the host to
+    # test-vol ONLY (test-vol-hidden stays invisible — the admission
+    # fence) and exercising the admin write path against the
+    # identity_file override (the issue #69 guard). Daemon mints an
+    # empty stub at boot.
 }
 
 create_hidden_volume() {
@@ -374,6 +369,57 @@ create_hidden_volume() {
     "$CLI_PATH" --config "$TEST_CONFIG" --user root volume create test-vol-hidden \
         --size 100MiB --backend primary --page-size 64KiB \
         || { log_error "Failed to create hidden volume"; exit 1; }
+}
+
+# Issue #69 guard. The CLI `add` must land the entry in the configured
+# identity_file override (<TEST_DIR>/etc/nvmetcp-<kind>.json) — where the
+# transport reads — and must NOT write the <data_dir> default path. Under
+# the pre-fix bug the admin handlers hardcoded <data_dir>/..., so the
+# entry would diverge from the transport's read path and every host would
+# be refused. <kind> is "psks" or "dhchap".
+assert_identity_override() {
+    local kind="$1"
+    local override="$TEST_DIR/etc/nvmetcp-$kind.json"
+    local default="$TEST_DIR/data/nvmetcp-$kind.json"
+    if grep -qF "$HOST_NQN" "$override" 2>/dev/null; then
+        log_pass "nvmetcp $kind add honored identity_file override (issue #69)"
+    else
+        log_fail "nvmetcp $kind entry missing from override $override (issue #69)"
+    fi
+    if [[ -e "$default" ]]; then
+        log_fail "nvmetcp $kind written to <data_dir> default $default — override ignored (issue #69)"
+    else
+        log_pass "nvmetcp $kind not written under <data_dir> (issue #69)"
+    fi
+}
+
+# Register host identities with the LIVE daemon via the admin CLI. This
+# is the path the pre-fix bug broke (the handlers wrote the wrong file);
+# the existing flow wrote the JSON by hand and never exercised it. Runs
+# after the volumes exist (admission validates volume names) and before
+# connect (the daemon re-reads the identity file per handshake).
+register_identities() {
+    if [[ $USE_TLS -eq 1 ]]; then
+        log_info "Registering host PSK via 'nvmetcp psks add'..."
+        if "$CLI_PATH" --config "$TEST_CONFIG" --user root \
+            nvmetcp psks add --host-nqn "$HOST_NQN" --key "$PSK_KEY_STR" \
+            --volume test-vol >"$TEST_DIR/psks-add.log" 2>&1; then
+            assert_identity_override psks
+        else
+            log_fail "nvmetcp psks add failed: $(cat "$TEST_DIR/psks-add.log")"
+        fi
+    fi
+    if [[ $USE_DHCHAP -eq 1 ]]; then
+        log_info "Registering host DH-HMAC-CHAP secret via 'nvmetcp dhchap add'..."
+        if "$CLI_PATH" --config "$TEST_CONFIG" --user root \
+            nvmetcp dhchap add --host-nqn "$HOST_NQN" --key "$DHCHAP_KEY_STR" \
+            --ctrl-key "$DHCHAP_CTRL_STR" --volume test-vol \
+            >"$TEST_DIR/dhchap-add.log" 2>&1; then
+            assert_identity_override dhchap
+        else
+            log_fail "nvmetcp dhchap add failed: $(cat "$TEST_DIR/dhchap-add.log")"
+        fi
+    fi
 }
 
 run_dhchap_admission_check() {
@@ -604,6 +650,7 @@ main() {
     if [[ $USE_DHCHAP -eq 1 ]]; then
         create_hidden_volume
     fi
+    register_identities
     if connect_nvmetcp; then
         run_identify_tests
         [[ $USE_DHCHAP -eq 1 ]] && run_dhchap_admission_check

@@ -458,7 +458,9 @@ pub async fn clear_ctrl_key(
 // ---------- helpers ----------
 
 fn dhchap_path(state: &AdminState) -> PathBuf {
-    state.data_dir.join("nvmetcp-dhchap.json")
+    // Resolved once at boot — honors `nvmetcp.auth.identity_file` so the
+    // CLI writes where the DH-HMAC-CHAP handshake reads (issue #69).
+    state.nvmetcp_dhchap_path.clone()
 }
 
 fn load_dhchap(state: &AdminState) -> Result<(PathBuf, NvmetcpDhchapFile), ApiError> {

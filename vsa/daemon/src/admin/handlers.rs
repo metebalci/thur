@@ -56,6 +56,16 @@ use crate::registry::VolumeRegistry;
 #[derive(Clone)]
 pub struct AdminState {
     pub data_dir: PathBuf,
+    /// Resolved `nvmetcp-psks.json` path — the `nvmetcp.tls.identity_file`
+    /// override or the `<data_dir>/` default, resolved once at boot so the
+    /// `nvmetcp psks` handlers write where the TLS-PSK acceptor reads
+    /// (issue #69).
+    pub nvmetcp_psks_path: PathBuf,
+    /// Resolved `nvmetcp-dhchap.json` path — the
+    /// `nvmetcp.auth.identity_file` override or the `<data_dir>/` default,
+    /// resolved once at boot so the `nvmetcp dhchap` handlers write where
+    /// the DH-HMAC-CHAP handshake reads (issue #69).
+    pub nvmetcp_dhchap_path: PathBuf,
     pub storage: Arc<ObjectStoreConfig>,
     pub registry: Arc<VolumeRegistry>,
     pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,

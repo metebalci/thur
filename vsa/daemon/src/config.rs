@@ -28,7 +28,7 @@
 //! discovery time on a per-volume basis — the daemon doesn't sweep
 //! every backend at boot since most runs reference only one or two.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -307,6 +307,32 @@ pub struct NvmetcpSettings {
     /// § NVMe/TCP DH-HMAC-CHAP.
     #[serde(default)]
     pub auth: NvmetcpAuthSettings,
+}
+
+impl NvmetcpSettings {
+    /// Resolved TLS-PSK identity-file path: the `tls.identity_file`
+    /// override if set, else the `<data_dir>/nvmetcp-psks.json` default.
+    /// Resolved once at boot so the transport listener and the
+    /// `nvmetcp psks` admin handlers agree on the path (issue #69).
+    pub fn psks_path(&self, data_dir: &Path) -> PathBuf {
+        self.tls
+            .identity_file
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("nvmetcp-psks.json"))
+    }
+
+    /// Resolved DH-HMAC-CHAP identity-file path: the `auth.identity_file`
+    /// override if set, else the `<data_dir>/nvmetcp-dhchap.json`
+    /// default. Resolved once at boot so the transport listener and the
+    /// `nvmetcp dhchap` admin handlers agree on the path (issue #69).
+    pub fn dhchap_path(&self, data_dir: &Path) -> PathBuf {
+        self.auth
+            .identity_file
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("nvmetcp-dhchap.json"))
+    }
 }
 
 /// `nvmetcp.tls:` block. Mode-selector + identity-file path. The
@@ -909,6 +935,55 @@ nvmetcp:
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
         assert_eq!(cfg.nvmetcp.auth.mode, NvmetcpAuthMode::Dhchap);
         assert_eq!(cfg.nvmetcp.tls.mode, NvmetcpTlsMode::Psk);
+    }
+
+    #[test]
+    fn nvmetcp_identity_paths_default_under_data_dir() {
+        // No override -> the daemon defaults under <data_dir>/. This is
+        // the path the admin handlers must resolve to so CLI edits land
+        // where the transport reads (issue #69).
+        let f = write_config("data_dir: /var/lib/thurvsa\n");
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        let data_dir = Path::new("/var/lib/thurvsa");
+        assert_eq!(
+            cfg.nvmetcp.psks_path(data_dir),
+            Path::new("/var/lib/thurvsa/nvmetcp-psks.json")
+        );
+        assert_eq!(
+            cfg.nvmetcp.dhchap_path(data_dir),
+            Path::new("/var/lib/thurvsa/nvmetcp-dhchap.json")
+        );
+    }
+
+    #[test]
+    fn nvmetcp_identity_paths_honor_override() {
+        // With an explicit identity_file the resolved path is the
+        // override verbatim, NOT <data_dir>/... (the issue #69 bug: the
+        // admin handlers ignored this and wrote under <data_dir>/).
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+nvmetcp:
+  tls:
+    mode: psk
+    identity_file: /etc/thurvsa/nvmetcp-psks.json
+  auth:
+    mode: dhchap
+    identity_file: /etc/thurvsa/nvmetcp-dhchap.json
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        // data_dir is deliberately distinct from the override dir so a
+        // resolution that fell back to <data_dir>/ would mismatch.
+        let data_dir = Path::new("/var/lib/thurvsa");
+        assert_eq!(
+            cfg.nvmetcp.psks_path(data_dir),
+            Path::new("/etc/thurvsa/nvmetcp-psks.json")
+        );
+        assert_eq!(
+            cfg.nvmetcp.dhchap_path(data_dir),
+            Path::new("/etc/thurvsa/nvmetcp-dhchap.json")
+        );
     }
 
     #[test]
