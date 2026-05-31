@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use shared_iscsi::alua::AluaTopology;
+use shared_iscsi::unit_attention::UnitAttentionTracker;
 
 use crate::VolumeLookup;
 use crate::data_path;
@@ -76,6 +77,13 @@ pub struct SbcScsiDispatcher {
     /// collapses the ISID so reservations key by IQN alone. Sourced from
     /// `iscsi.reservations.initiator_port`; default `false`.
     pr_collapse_isid: bool,
+    /// Per-(TSIH, LUN) Unit Attention queue, shared with the iSCSI
+    /// reservation-UA sink (issue #67). `None` in test / non-iSCSI
+    /// construction, in which case the per-command UA check is skipped.
+    /// The daemon injects the same tracker the `IscsiReservationSink`
+    /// enqueues into, so a reservation change preempted over either
+    /// transport surfaces here on the initiator's next command.
+    ua: Option<Arc<UnitAttentionTracker>>,
 }
 
 impl SbcScsiDispatcher {
@@ -91,15 +99,16 @@ impl SbcScsiDispatcher {
         }];
         let alua = Arc::new(AluaTopology::from_portals(&portals, target_iqn.clone()));
         // In-memory reservation manager (PTPL not capable) + default
-        // (IQN, ISID) initiator port. Production injects a
-        // persistence-backed manager + the configured port policy via
-        // `with_alua`.
+        // (IQN, ISID) initiator port + no UA tracker. Production injects a
+        // persistence-backed manager, the configured port policy, and the
+        // shared UA tracker via `with_alua`.
         Self::with_alua(
             registry,
             target_iqn,
             alua,
             Arc::new(ReservationManager::new()),
             false,
+            None,
         )
     }
 
@@ -116,6 +125,7 @@ impl SbcScsiDispatcher {
         alua: Arc<AluaTopology>,
         reservations: Arc<ReservationManager>,
         pr_collapse_isid: bool,
+        ua: Option<Arc<UnitAttentionTracker>>,
     ) -> Self {
         let tokens = Arc::new(TokenManager::new());
         // Best-effort sweeper: only spawns when called from within a
@@ -146,6 +156,7 @@ impl SbcScsiDispatcher {
             tokens,
             alua,
             pr_collapse_isid,
+            ua,
         }
     }
 
@@ -162,6 +173,23 @@ impl SbcScsiDispatcher {
     pub async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
         if req.cdb.is_empty() {
             return ScsiResponse::check(SenseData::INVALID_OPCODE);
+        }
+        // Proactive Unit Attention (issue #67): report a pending
+        // reservation UA before dispatching. INQUIRY (0x12), REQUEST
+        // SENSE (0x03), and REPORT LUNS (0xA0) complete normally even
+        // with a UA pending (SPC-4) so the initiator can still read
+        // identity / drain sense / enumerate LUNs; any other opcode
+        // preempts to CHECK CONDITION + UNIT ATTENTION and pops one UA.
+        // The enqueue side is the shared `IscsiReservationSink`.
+        if let Some(ua) = &self.ua
+            && !matches!(req.cdb[0], 0x12 | 0x03 | 0xA0)
+            && let Some(code) = ua.check_and_pop_ua(req.tsih, u8::try_from(req.lun).unwrap_or(0xFF))
+        {
+            return ScsiResponse::check(SenseData::new(
+                scsi_spc::sense::SenseKey::UnitAttention,
+                code.asc,
+                code.ascq,
+            ));
         }
         // Per-CHAP-user volume admission: when the session is bound
         // to an admission set, a non-admitted LUN must be invisible
@@ -411,6 +439,95 @@ mod tests {
             resp.data_in[3],
         ]);
         assert_eq!(listed, 8);
+    }
+
+    /// One-volume fixture wired with a shared UA tracker (issue #67), so
+    /// the per-command reservation-UA pop can be exercised.
+    async fn handler_with_ua() -> (TempDir, SbcScsiDispatcher, Arc<UnitAttentionTracker>) {
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        VolumeManifest::new(
+            "vol1".into(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let writer = Arc::new(VolumeWriter::open(tmp.path(), "vol1", backend).unwrap());
+        let cache = PageCache::new(writer);
+        let registry = TestRegistry::new();
+        registry.register(0, cache);
+        let ua = Arc::new(UnitAttentionTracker::new());
+        let alua = Arc::new(AluaTopology::from_portals(
+            &[shared_iscsi::transport::Portal {
+                address: String::new(),
+                tpgt: 1,
+            }],
+            ISCSI_DISK_TARGET_IQN.to_string(),
+        ));
+        let handler = SbcScsiDispatcher::with_alua(
+            Arc::new(registry),
+            ISCSI_DISK_TARGET_IQN.to_string(),
+            alua,
+            Arc::new(ReservationManager::new()),
+            false,
+            Some(Arc::clone(&ua)),
+        );
+        (tmp, handler, ua)
+    }
+
+    #[tokio::test]
+    async fn pending_reservation_ua_preempts_data_path_and_clears() {
+        use shared_iscsi::unit_attention::UnitAttentionCode;
+        let (_tmp, handler, ua) = handler_with_ua().await;
+        ua.add_ua(0, 0, UnitAttentionCode::RESERVATIONS_PREEMPTED);
+        // A non-exempt opcode (TEST UNIT READY) is preempted with CHECK
+        // CONDITION + UNIT ATTENTION carrying the queued ASC/ASCQ.
+        let resp = handler.dispatch(req(&[0x00, 0, 0, 0, 0, 0], 0)).await;
+        assert_eq!(
+            resp.sense,
+            Some(SenseData::new(
+                scsi_spc::sense::SenseKey::UnitAttention,
+                0x2A,
+                0x03
+            ))
+        );
+        // The UA was popped: the same opcode now proceeds normally.
+        let resp2 = handler.dispatch(req(&[0x00, 0, 0, 0, 0, 0], 0)).await;
+        assert!(resp2.sense.is_none());
+    }
+
+    #[tokio::test]
+    async fn exempt_opcodes_do_not_pop_reservation_ua() {
+        use shared_iscsi::unit_attention::UnitAttentionCode;
+        let (_tmp, handler, ua) = handler_with_ua().await;
+        ua.add_ua(0, 0, UnitAttentionCode::RESERVATIONS_RELEASED);
+        // INQUIRY (0x12) completes normally and must NOT pop the UA.
+        let inq = handler.dispatch(req(&[0x12, 0, 0, 0x00, 0x60, 0], 0)).await;
+        assert!(inq.sense.is_none());
+        assert!(
+            ua.has_pending_ua(0, 0),
+            "exempt opcode must leave the UA queued"
+        );
+        // A non-exempt opcode then still surfaces it as 0x2A/0x04.
+        let resp = handler.dispatch(req(&[0x00, 0, 0, 0, 0, 0], 0)).await;
+        assert_eq!(
+            resp.sense,
+            Some(SenseData::new(
+                scsi_spc::sense::SenseKey::UnitAttention,
+                0x2A,
+                0x04
+            ))
+        );
     }
 
     /// Build a fixture with two volumes ("vol1", "vol2") on LUNs 0 and 1

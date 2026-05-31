@@ -55,7 +55,7 @@ use scsi_smc::changer::{ElementAddressConfig, ElementType};
 pub struct IscsiLibraryHandler {
     pub(crate) drive_manager: Arc<DriveManager>,
     pub(crate) library: Arc<Mutex<Library>>,
-    pub(crate) ua_tracker: Arc<Mutex<UnitAttentionTracker>>,
+    pub(crate) ua_tracker: Arc<UnitAttentionTracker>,
     pub(crate) element_config: ElementAddressConfig,
     pub(crate) event_tx: broadcast::Sender<TapeEvent>,
     pub(crate) data_dir: PathBuf,

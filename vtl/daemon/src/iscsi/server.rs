@@ -161,6 +161,23 @@ impl IscsiServer {
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 
+        // Proactive reservation-change notification (issue #67): a
+        // reservation preempted/released over iSCSI raises a RESERVATIONS
+        // PREEMPTED / RELEASED Unit Attention on the affected initiators'
+        // next command — for tape drive LUNs and the changer LUN alike.
+        // Registered before the listener binds, so no session can race it.
+        self.state.reservations.register_observer(Arc::new(
+            shared_iscsi::IscsiReservationSink::new(
+                Arc::clone(&self.state.ua_tracker),
+                Arc::clone(&self.state.session_manager),
+                self.config
+                    .iscsi
+                    .reservations
+                    .initiator_port
+                    .collapse_isid(),
+            ),
+        ));
+
         let audit = Arc::new(IscsiLibraryLoginAudit {
             audit_log: self.state.audit_log.clone(),
             ratelimiter: Arc::clone(&self.state.audit_ratelimiter),

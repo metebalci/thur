@@ -361,9 +361,7 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
             // head_lba never got reset, and a follow-up SPACE BLOCKS
             // landed at the wrong LBA, leaving stale filemarks in
             // the block index (issue #37).
-            let ua = ua_tracker
-                .lock()
-                .map_err(|_| anyhow!("UA tracker mutex poisoned"))?;
+            let ua = ua_tracker;
             let mut affected_drives: Vec<u32> = Vec::new();
             if matches!(source_type, Some(changer::ElementType::DataTransfer))
                 && let Some(id) = element_config.address_to_drive_id(source_address)
@@ -550,9 +548,7 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     // participated in the swap. Broadcasting across every drive LUN
     // races the host's positioning sequence on unrelated drives (see
     // handle_move_medium for the full rationale + issue #37).
-    let ua = ua_tracker
-        .lock()
-        .map_err(|_| anyhow!("UA tracker mutex poisoned"))?;
+    let ua = ua_tracker;
     let mut affected_drives: Vec<u32> = Vec::new();
     for (addr, kind) in [
         (source_address, source_type),

@@ -592,21 +592,15 @@ fn audit_append(
 /// the resulting CHECK CONDITION (e.g. `mt rewind 2>/dev/null`)
 /// would never reset the daemon-side head position — surfaces as
 /// issue #37 (stale filemark in the block index between writes).
-/// Best-effort: UA queue mutex poisoned just gets logged.
 fn raise_medium_may_have_changed(state: &DaemonState, drive_ids: &[u32]) {
     if drive_ids.is_empty() {
         return;
     }
-    let ua = match state.ua_tracker.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            warn!("UA tracker mutex poisoned, skipping medium-may-have-changed broadcast");
-            return;
-        }
-    };
     for drive_id in drive_ids {
         let drive_lun = (*drive_id as u8) + 1;
-        ua.add_ua_all_sessions(drive_lun, UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED);
+        state
+            .ua_tracker
+            .add_ua_all_sessions(drive_lun, UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED);
     }
 }
 

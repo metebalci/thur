@@ -519,13 +519,30 @@ async fn main() -> Result<()> {
                     &iscsi_portals,
                     target_iqn.clone(),
                 ));
+                // Per-(TSIH, LUN) Unit Attention queue, shared between the
+                // SBC dispatcher's per-command pop and the reservation-UA
+                // sink's enqueue (issue #67).
+                let ua_tracker =
+                    Arc::new(shared_iscsi::unit_attention::UnitAttentionTracker::new());
+                let collapse_isid = cfg.iscsi.reservations.initiator_port.collapse_isid();
                 let handler = Arc::new(SbcScsiDispatcher::with_alua(
                     Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
                     target_iqn.clone(),
                     alua,
                     Arc::clone(&reservations),
-                    cfg.iscsi.reservations.initiator_port.collapse_isid(),
+                    collapse_isid,
+                    Some(Arc::clone(&ua_tracker)),
                 ));
+                // Proactive reservation-change notification (issue #67): a
+                // reservation preempted/released over iSCSI or NVMe raises
+                // a RESERVATIONS PREEMPTED / RELEASED UA on the affected
+                // iSCSI initiators' next command. Registered before the
+                // listener binds, so no session can race it.
+                reservations.register_observer(Arc::new(shared_iscsi::IscsiReservationSink::new(
+                    Arc::clone(&ua_tracker),
+                    Arc::clone(&session_manager),
+                    collapse_isid,
+                )));
                 tracing::info!(
                     "thurvsad: SBC-3 dispatcher ready ({} LUN(s))",
                     volumes.len()
@@ -595,6 +612,13 @@ async fn main() -> Result<()> {
                 // consumer) — same construct-once-at-boot pattern as
                 // `controller_regs` below.
                 let aer_hub = Arc::new(nvme_nvm::ControllerRegistry::new());
+                // Proactive reservation-change notification (issue #67): a
+                // reservation preempted/released over iSCSI or NVMe drives
+                // a LID 0x80 + AER to the affected NVMe controllers.
+                // Registered before the listener binds.
+                reservations.register_observer(Arc::new(nvme_nvm::AerReservationSink::new(
+                    Arc::clone(&aer_hub),
+                )));
                 let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
                     Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
                     subnqn.clone(),

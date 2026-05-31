@@ -95,7 +95,7 @@ pub struct DaemonState {
     pub library: Arc<Mutex<Library>>,
     pub drive_manager: Arc<DriveManager>,
     pub session_manager: Arc<SessionManager>,
-    pub ua_tracker: Arc<Mutex<UnitAttentionTracker>>,
+    pub ua_tracker: Arc<UnitAttentionTracker>,
     pub element_config: ElementAddressConfig,
     /// Configured iSCSI target IQN. Read-only after boot.
     pub target_iqn: String,
@@ -196,7 +196,7 @@ impl DaemonState {
             library: cfg.library,
             drive_manager,
             session_manager: Arc::new(SessionManager::new()),
-            ua_tracker: Arc::new(Mutex::new(UnitAttentionTracker::new())),
+            ua_tracker: Arc::new(UnitAttentionTracker::new()),
             element_config: cfg.element_config,
             target_iqn: cfg.target_iqn,
             listen_addresses: cfg.listen_addresses,

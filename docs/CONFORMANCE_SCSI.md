@@ -191,10 +191,16 @@ persistent reservations to decide which node owns a LUN:
   held by an NVMe host (when the volume is also exported over NVMe/TCP,
   issue #66) fences a SCSI initiator's WRITE just the same — the iSCSI
   port and the NVMe host are distinct registrants under the 1:1 SCSI↔NVMe
-  type mapping. Proactive cross-transport notification is out of scope
-  (the loser learns via the CONFLICT above or by polling READ
-  RESERVATION); see [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md)
-  § Reservation notifications.
+  type mapping. **Proactive notification (issue #67):** a reservation
+  preempted/released — over either transport — now also raises a
+  RESERVATIONS PREEMPTED (0x06/0x2A/0x03) or RESERVATIONS RELEASED
+  (0x06/0x2A/0x04) Unit Attention on each affected iSCSI initiator's next
+  command (delivered by the dispatch-level UA preemption, exactly like
+  MEDIUM MAY HAVE CHANGED on tape). It is driven by a transport-neutral
+  observer on the shared `ReservationManager`, so it fires whether the
+  change originated over iSCSI or NVMe, and the same path closes the
+  pre-existing iSCSI→iSCSI gap for VTL tape drive + changer LUNs; see
+  [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md) § Reservation notifications.
 - **REGISTER AND MOVE (SA 0x07)** rejected — thurvsa is single-port.
 - **APTPL = 1** is honored: the LU's registrations + reservation are
   written to `<data_dir>/reservations.json` (atomic temp-file write +

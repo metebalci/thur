@@ -178,6 +178,62 @@ pub struct ReservationSnapshot {
     pub aptpl: bool,
 }
 
+/// The reservation mutation that just succeeded. Disambiguates the
+/// proactive-notification class a snapshot diff maps to (e.g. a removed
+/// registrant means RegistrationPreempted under a Preempt but
+/// ReservationPreempted under a Clear). Transport-neutral — it is a
+/// manager-API + [`diff_reservation_changes`] input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResvAction {
+    Register,
+    Acquire,
+    Unregister,
+    Release,
+    Clear,
+    Preempt,
+}
+
+/// Neutral proactive-notification class. Maps onto the NVMe LID 0x80
+/// type byte / FID 0x82 mask bit at the NVMe AER sink boundary, and onto
+/// the two iSCSI RESERVATIONS PREEMPTED / RELEASED Unit Attention codes
+/// at the SCSI UA sink boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationChangeKind {
+    RegistrationPreempted,
+    ReservationReleased,
+    ReservationPreempted,
+}
+
+/// One proactive reservation change to fan out to a single affected
+/// registrant. `affected` carries the full [`RegistrantId`] (not a
+/// transport-specific host id) so a dual-transport op surfaces the whole
+/// mixed iSCSI + NVMe set in one slice; each sink self-filters by
+/// transport variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationChange {
+    pub lun: u64,
+    pub affected: RegistrantId,
+    pub kind: ReservationChangeKind,
+}
+
+/// A sink for proactive reservation-change notifications. The manager
+/// fires every registered observer once per successful, persisted
+/// mutating op, with the issuer-excluded affected set (see
+/// [`ReservationManager::register_observer`]).
+///
+/// thurvsa registers two: the NVMe `AerReservationSink` (LID 0x80 + AER)
+/// and the iSCSI `IscsiReservationSink` (Unit Attention). thurvtl
+/// registers only the iSCSI one. Centralizing the diff here is what makes
+/// the notification fire regardless of which transport originated the
+/// change (issue #67).
+///
+/// Implementations MUST NOT call back into the [`ReservationManager`] —
+/// the manager fires the hook after releasing its `by_lun` lock, but a
+/// re-entrant mutate would still violate the documented lock order.
+pub trait ReservationObserver: Send + Sync {
+    fn on_reservation_change(&self, changes: &[ReservationChange]);
+}
+
 /// Parsed PERSISTENT RESERVE OUT CDB + Data-Out fields. Both
 /// products use identical byte offsets, so [`parse_prout_cdb`] is the
 /// single source of truth for the slicing.
@@ -320,6 +376,13 @@ pub struct ReservationManager {
     /// `None` = in-memory only (PTPL not capable). `Some` = persist
     /// APTPL/CPTPL-set LUs to disk (persist-before-ack).
     persist: Option<Persist>,
+    /// Proactive-notification sinks (issue #67), empty by default.
+    /// Registered at daemon boot via [`Self::register_observer`] — the
+    /// sinks' dependencies (NVMe aer hub, iSCSI UA tracker) are born
+    /// later than the manager, so registration is runtime, not
+    /// construction-time. Boot is single-threaded, so there is never a
+    /// concurrent register / fire.
+    observers: Mutex<Vec<Arc<dyn ReservationObserver>>>,
 }
 
 impl Default for ReservationManager {
@@ -336,6 +399,7 @@ impl ReservationManager {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
             persist: None,
+            observers: Mutex::new(Vec::new()),
         }
     }
 
@@ -348,6 +412,7 @@ impl ReservationManager {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
             persist: Some(Persist { path, resolver }),
+            observers: Mutex::new(Vec::new()),
         }
     }
 
@@ -362,7 +427,20 @@ impl ReservationManager {
         Self {
             by_lun: Mutex::new(by_lun),
             persist: Some(Persist { path, resolver }),
+            observers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a proactive-notification sink (issue #67). Called at
+    /// daemon boot, before any transport listener accepts a connection,
+    /// so it never races [`mutate`]'s fan-out. A manager with no
+    /// observers (every unit test, any caller that skips this) does no
+    /// extra work on the mutate hot path.
+    pub fn register_observer(&self, observer: Arc<dyn ReservationObserver>) {
+        self.observers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(observer);
     }
 
     /// True when power-loss persistence is wired (a data dir is present).
@@ -401,7 +479,7 @@ impl ReservationManager {
     /// failed must not silently linger and fence its peers, nor would it
     /// survive a restart). Non-`Good` outcomes never touch disk (the
     /// handlers mutate nothing on conflict).
-    fn mutate<F>(&self, lun: u64, f: F) -> PrOutOutcome
+    fn mutate<F>(&self, lun: u64, action: ResvAction, issuer: &RegistrantId, f: F) -> PrOutOutcome
     where
         F: FnOnce(&mut LunState) -> PrOutOutcome,
     {
@@ -432,6 +510,31 @@ impl ReservationManager {
                     }
                 }
                 return PrOutOutcome::PersistFailed;
+            }
+        }
+
+        // Proactive cross-transport notification (issue #67). Only on a
+        // successful, persisted mutation (every non-Good / PersistFailed
+        // path returned above). Capture the pre/post snapshots while
+        // `by_lun` is still held, then RELEASE it before firing observers
+        // — the sinks take other locks (NVMe aer hub, iSCSI UA tracker /
+        // session table) and must never run while `by_lun` is held. The
+        // empty-observer fast path keeps the hot path (and every unit
+        // test) clone-free.
+        let observers = {
+            let obs = self.observers.lock().unwrap_or_else(|p| p.into_inner());
+            if obs.is_empty() {
+                return outcome;
+            }
+            obs.clone()
+        };
+        let pre = snapshot_of(prior.as_ref());
+        let post = snapshot_of(map.get(&lun));
+        drop(map);
+        let changes = diff_reservation_changes(action, lun, issuer, &pre, &post);
+        if !changes.is_empty() {
+            for observer in &observers {
+                observer.on_reservation_change(&changes);
             }
         }
         outcome
@@ -628,22 +731,36 @@ impl ReservationManager {
         ignore: bool,
         aptpl: Option<bool>,
     ) -> PrOutOutcome {
-        self.mutate(lun, |st| prout_register(st, id, rk, sark, ignore, aptpl))
+        // A REGISTER with service-action-key 0 unregisters this port
+        // (SPC-4 §6.14.3); only the unregister case can release a held
+        // reservation, so it carries the notification-bearing action.
+        let action = if sark == 0 {
+            ResvAction::Unregister
+        } else {
+            ResvAction::Register
+        };
+        self.mutate(lun, action, id, |st| {
+            prout_register(st, id, rk, sark, ignore, aptpl)
+        })
     }
 
     /// RESERVE / NVMe Acquire (Acquire action).
     pub fn reserve(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
-        self.mutate(lun, |st| prout_reserve(st, id, rk, type_byte))
+        self.mutate(lun, ResvAction::Acquire, id, |st| {
+            prout_reserve(st, id, rk, type_byte)
+        })
     }
 
     /// RELEASE / NVMe Release (Release action).
     pub fn release(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
-        self.mutate(lun, |st| prout_release(st, id, rk, type_byte))
+        self.mutate(lun, ResvAction::Release, id, |st| {
+            prout_release(st, id, rk, type_byte)
+        })
     }
 
     /// CLEAR / NVMe Release (Clear action).
     pub fn clear(&self, lun: u64, id: &RegistrantId, rk: u64) -> PrOutOutcome {
-        self.mutate(lun, |st| prout_clear(st, id, rk))
+        self.mutate(lun, ResvAction::Clear, id, |st| prout_clear(st, id, rk))
     }
 
     /// PREEMPT / PREEMPT AND ABORT / NVMe Acquire (Preempt action).
@@ -655,7 +772,9 @@ impl ReservationManager {
         sark: u64,
         type_byte: u8,
     ) -> PrOutOutcome {
-        self.mutate(lun, |st| prout_preempt(st, id, rk, sark, type_byte))
+        self.mutate(lun, ResvAction::Preempt, id, |st| {
+            prout_preempt(st, id, rk, sark, type_byte)
+        })
     }
 
     /// Read-only snapshot for a transport-specific reservation
@@ -663,27 +782,122 @@ impl ReservationManager {
     /// snapshot for a LUN with no state.
     pub fn snapshot(&self, lun: u64) -> ReservationSnapshot {
         let map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(state) = map.get(&lun) else {
-            return ReservationSnapshot {
-                generation: 0,
-                reservation_type: None,
-                holder: None,
-                registrants: Vec::new(),
-                aptpl: false,
-            };
+        snapshot_of(map.get(&lun))
+    }
+}
+
+/// Build a [`ReservationSnapshot`] from an already-borrowed [`LunState`]
+/// (or its absence). Shared by the public [`ReservationManager::snapshot`]
+/// and by `mutate`'s notification hook, which holds the `by_lun` lock and
+/// so cannot re-lock through `snapshot`.
+fn snapshot_of(state: Option<&LunState>) -> ReservationSnapshot {
+    let Some(state) = state else {
+        return ReservationSnapshot {
+            generation: 0,
+            reservation_type: None,
+            holder: None,
+            registrants: Vec::new(),
+            aptpl: false,
         };
-        ReservationSnapshot {
-            generation: state.generation,
-            reservation_type: state.reservation.as_ref().map(|r| r.r#type),
-            holder: state.reservation.as_ref().map(|r| r.holder.clone()),
-            registrants: state
-                .registrations
-                .iter()
-                .map(|(id, key)| (id.clone(), *key))
-                .collect(),
-            aptpl: state.aptpl,
+    };
+    ReservationSnapshot {
+        generation: state.generation,
+        reservation_type: state.reservation.as_ref().map(|r| r.r#type),
+        holder: state.reservation.as_ref().map(|r| r.holder.clone()),
+        registrants: state
+            .registrations
+            .iter()
+            .map(|(id, key)| (id.clone(), *key))
+            .collect(),
+        aptpl: state.aptpl,
+    }
+}
+
+/// Derive the proactive reservation-change notifications a just-completed
+/// (`Good`) mutating op generates, from the before/after snapshots, the
+/// issuing registrant, and the action. Pure and table-testable.
+///
+/// Transport-neutral: it emits a [`ReservationChange`] for **every**
+/// affected registrant of either transport (the NVMe AER sink and the
+/// iSCSI UA sink each self-filter by variant). The command issuer is
+/// excluded here, once, by [`RegistrantId`] equality — handling an iSCSI
+/// issuer and an NVMe issuer uniformly — so a host never receives an
+/// asynchronous notice for its own command.
+///
+/// Rules (mirroring the NVM Command Set reservation notices, now applied
+/// to both transports):
+/// - **Preempt**: the prior reservation holder that lost its reservation
+///   → `ReservationPreempted`; any other registrant whose registration
+///   was removed → `RegistrationPreempted` (the holder is deduped to
+///   `ReservationPreempted` only, never both).
+/// - **Release / Unregister**: a reservation that existed and is now
+///   released with no successor → `ReservationReleased` to every other
+///   current registrant. An all-registrants holder *rotation* keeps
+///   `post.holder` set, so it emits nothing.
+/// - **Clear**: every registration and the reservation are wiped →
+///   `ReservationPreempted` to every other prior registrant.
+/// - **Acquire / Register**: never fence another registrant → nothing.
+pub fn diff_reservation_changes(
+    action: ResvAction,
+    lun: u64,
+    issuer: &RegistrantId,
+    pre: &ReservationSnapshot,
+    post: &ReservationSnapshot,
+) -> Vec<ReservationChange> {
+    let mut out = Vec::new();
+    // The command issuer learns the result from its own completion; it is
+    // never sent an asynchronous notification.
+    let mut emit = |affected: &RegistrantId, kind: ReservationChangeKind| {
+        if affected != issuer {
+            out.push(ReservationChange {
+                lun,
+                affected: affected.clone(),
+                kind,
+            });
+        }
+    };
+    let is_present = |id: &RegistrantId| post.registrants.iter().any(|(p, _)| p == id);
+
+    match action {
+        ResvAction::Register | ResvAction::Acquire => {}
+        ResvAction::Clear => {
+            for (id, _) in &pre.registrants {
+                emit(id, ReservationChangeKind::ReservationPreempted);
+            }
+        }
+        ResvAction::Preempt => {
+            // The prior holder whose reservation was taken over.
+            let reservation_taken = pre.holder.is_some() && post.holder != pre.holder;
+            let preempted_holder = if reservation_taken {
+                pre.holder.as_ref()
+            } else {
+                None
+            };
+            if let Some(h) = preempted_holder {
+                emit(h, ReservationChangeKind::ReservationPreempted);
+            }
+            // Registrants removed by the preempt that were not the
+            // (already-notified) holder.
+            for (id, _) in &pre.registrants {
+                if is_present(id) {
+                    continue;
+                }
+                if Some(id) == preempted_holder {
+                    continue;
+                }
+                emit(id, ReservationChangeKind::RegistrationPreempted);
+            }
+        }
+        ResvAction::Release | ResvAction::Unregister => {
+            let released = pre.holder.is_some() && post.holder.is_none();
+            if released {
+                for (id, _) in &post.registrants {
+                    emit(id, ReservationChangeKind::ReservationReleased);
+                }
+            }
         }
     }
+    out
 }
 
 // ----------------------------------------------------------------
@@ -1880,5 +2094,458 @@ mod tests {
         assert!(mgr.snapshot(0).registrants.is_empty());
         let reloaded = ReservationManager::load_from(path, one_volume(uuid, 0));
         assert!(reloaded.snapshot(0).registrants.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Proactive cross-transport notification hook (issue #67)
+    // ----------------------------------------------------------------
+
+    #[derive(Default)]
+    struct CaptureObserver {
+        seen: Mutex<Vec<ReservationChange>>,
+    }
+    impl ReservationObserver for CaptureObserver {
+        fn on_reservation_change(&self, changes: &[ReservationChange]) {
+            self.seen
+                .lock()
+                .expect("capture mutex")
+                .extend_from_slice(changes);
+        }
+    }
+    impl CaptureObserver {
+        fn take(&self) -> Vec<ReservationChange> {
+            std::mem::take(&mut self.seen.lock().expect("capture mutex"))
+        }
+    }
+
+    // REGISTER (sark != 0) + RESERVE (Acquire) fence nobody, so the hook
+    // fires nothing even though both mutate state.
+    #[test]
+    fn register_and_acquire_emit_no_changes() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let a = nexus(1, "iqn.test:a");
+        register(&mgr, &a, 0xAAAA);
+        reserve(&mgr, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        assert!(obs.take().is_empty());
+    }
+
+    // The headline #67 gap: a preempt issued over one transport surfaces
+    // the fenced registrant on the OTHER transport. NVMe host B preempts
+    // an iSCSI holder A → A gets ReservationPreempted.
+    #[test]
+    fn cross_transport_preempt_notifies_iscsi_holder() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let iscsi_a = nexus(1, "iqn.test:a");
+        let nvme_b = nvme_host(0xBB);
+        mgr.register(0, &iscsi_a, 0, 0xAAAA, true, Some(false));
+        mgr.reserve(
+            0,
+            &iscsi_a,
+            0xAAAA,
+            ReservationType::ExclusiveAccess.as_u8(),
+        );
+        mgr.register(0, &nvme_b, 0, 0xBBBB, true, Some(false));
+        let _ = obs.take(); // discard the (empty) register/acquire window
+        assert_eq!(
+            mgr.preempt(
+                0,
+                &nvme_b,
+                0xBBBB,
+                0xAAAA,
+                ReservationType::ExclusiveAccess.as_u8()
+            ),
+            PrOutOutcome::Good
+        );
+        let changes = obs.take();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].affected, iscsi_a);
+        assert_eq!(changes[0].kind, ReservationChangeKind::ReservationPreempted);
+        assert_eq!(changes[0].lun, 0);
+    }
+
+    // The pre-existing iSCSI->iSCSI gap: a RELEASE now fans
+    // ReservationReleased to surviving iSCSI registrants (was silent).
+    #[test]
+    fn iscsi_release_notifies_surviving_iscsi_registrants() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        mgr.register(0, &a, 0, 0xAAAA, true, Some(false));
+        mgr.register(0, &b, 0, 0xBBBB, true, Some(false));
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        let _ = obs.take();
+        assert_eq!(
+            mgr.release(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::Good
+        );
+        let changes = obs.take();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].affected, b);
+        assert_eq!(changes[0].kind, ReservationChangeKind::ReservationReleased);
+    }
+
+    // CLEAR surfaces BOTH transports' registrants in one slice, issuer
+    // excluded.
+    #[test]
+    fn clear_notifies_both_transports() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let iscsi_a = nexus(1, "iqn.test:a");
+        let nvme_b = nvme_host(0xBB);
+        let nvme_c = nvme_host(0xCC);
+        mgr.register(0, &iscsi_a, 0, 0xAAAA, true, Some(false));
+        mgr.register(0, &nvme_b, 0, 0xBBBB, true, Some(false));
+        mgr.register(0, &nvme_c, 0, 0xCCCC, true, Some(false));
+        mgr.reserve(0, &nvme_c, 0xCCCC, ReservationType::WriteExclusive.as_u8());
+        let _ = obs.take();
+        assert_eq!(mgr.clear(0, &nvme_c, 0xCCCC), PrOutOutcome::Good);
+        let mut got: Vec<RegistrantId> = obs
+            .take()
+            .into_iter()
+            .map(|c| {
+                assert_eq!(c.kind, ReservationChangeKind::ReservationPreempted);
+                c.affected
+            })
+            .collect();
+        got.sort();
+        let mut want = vec![iscsi_a, nvme_b]; // issuer nvme_c excluded
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    // Issuer exclusion is uniform across transports: an iSCSI issuer that
+    // clears is itself never notified, but its NVMe peer is.
+    #[test]
+    fn issuer_excluded_for_both_transports() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let iscsi_a = nexus(1, "iqn.test:a");
+        let nvme_b = nvme_host(0xBB);
+        mgr.register(0, &iscsi_a, 0, 0xAAAA, true, Some(false));
+        mgr.register(0, &nvme_b, 0, 0xBBBB, true, Some(false));
+        let _ = obs.take();
+        mgr.clear(0, &iscsi_a, 0xAAAA);
+        let changes = obs.take();
+        assert!(changes.iter().all(|c| c.affected != iscsi_a));
+        assert!(changes.iter().any(|c| c.affected == nvme_b));
+    }
+
+    // A conflicting op (preempt by an unregistered initiator) mutates
+    // nothing and must not notify.
+    #[test]
+    fn conflict_emits_no_changes() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        mgr.register(0, &a, 0, 0xAAAA, true, Some(false));
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+        let _ = obs.take();
+        assert_eq!(
+            mgr.preempt(
+                0,
+                &b,
+                0xBBBB,
+                0xAAAA,
+                ReservationType::ExclusiveAccess.as_u8()
+            ),
+            PrOutOutcome::ReservationConflict
+        );
+        assert!(obs.take().is_empty());
+    }
+
+    // persist-before-ack: a PersistFailed mutation rolls back AND must
+    // not notify peers of a fence the host was told failed.
+    #[test]
+    fn persist_failure_emits_no_changes_and_rolls_back() {
+        let dir = tmp_dir("notify-failpersist");
+        let path = dir.join("reservations.json");
+        let obs = Arc::new(CaptureObserver::default());
+        let mgr = ReservationManager::load_from(path, one_volume([0x99u8; 16], 0));
+        mgr.register_observer(obs.clone());
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        register_aptpl(&mgr, &a, 0xAAAA);
+        reserve_aptpl(&mgr, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+        register_aptpl(&mgr, &b, 0xBBBB);
+        let _ = obs.take();
+        // Make the next durable write fail (parent dir vanishes).
+        std::fs::remove_dir_all(&dir).expect("rm dir");
+        assert_eq!(
+            mgr.preempt(
+                0,
+                &b,
+                0xBBBB,
+                0xAAAA,
+                ReservationType::ExclusiveAccess.as_u8()
+            ),
+            PrOutOutcome::PersistFailed
+        );
+        assert!(obs.take().is_empty(), "no notification on PersistFailed");
+        // Rolled back: A still holds, B still fenced.
+        assert!(mgr.allow_write(0, &a));
+        assert!(!mgr.allow_write(0, &b));
+    }
+
+    // Volume-destroy (purge_lun) bypasses `mutate`; it must stay silent.
+    #[test]
+    fn purge_lun_emits_no_changes() {
+        let mgr = ReservationManager::new();
+        let obs = Arc::new(CaptureObserver::default());
+        mgr.register_observer(obs.clone());
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        mgr.register(0, &a, 0, 0xAAAA, true, Some(false));
+        mgr.register(0, &b, 0, 0xBBBB, true, Some(false));
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        let _ = obs.take();
+        mgr.purge_lun(0);
+        assert!(obs.take().is_empty(), "volume-destroy must not notify");
+    }
+
+    // Every registered observer sees the same change slice.
+    #[test]
+    fn all_observers_receive_changes() {
+        let mgr = ReservationManager::new();
+        let o1 = Arc::new(CaptureObserver::default());
+        let o2 = Arc::new(CaptureObserver::default());
+        mgr.register_observer(o1.clone());
+        mgr.register_observer(o2.clone());
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        mgr.register(0, &a, 0, 0xAAAA, true, Some(false));
+        mgr.register(0, &b, 0, 0xBBBB, true, Some(false));
+        mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        let _ = (o1.take(), o2.take());
+        mgr.release(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        assert_eq!(o1.take(), o2.take());
+    }
+
+    // ---- pure diff_reservation_changes table tests (migrated from
+    // nvme/nvm/src/aer.rs, generalized over transport) ----------------
+
+    const HOST_A: [u8; 16] = [0xAA; 16];
+    const HOST_B: [u8; 16] = [0xBB; 16];
+    const HOST_C: [u8; 16] = [0xCC; 16];
+
+    // NVMe-keyed snapshot (mirrors the old aer.rs helper).
+    fn dsnap(holder: Option<[u8; 16]>, regs: &[[u8; 16]]) -> ReservationSnapshot {
+        ReservationSnapshot {
+            generation: 0,
+            reservation_type: None,
+            holder: holder.map(RegistrantId::nvme),
+            registrants: regs.iter().map(|h| (RegistrantId::nvme(*h), 1)).collect(),
+            aptpl: false,
+        }
+    }
+    fn chg(affected: RegistrantId, kind: ReservationChangeKind) -> ReservationChange {
+        ReservationChange {
+            lun: 0,
+            affected,
+            kind,
+        }
+    }
+
+    #[test]
+    fn diff_preempt_non_holder_is_registration_preempted() {
+        let pre = dsnap(None, &[HOST_A, HOST_B]);
+        let post = dsnap(None, &[HOST_B]);
+        assert_eq!(
+            diff_reservation_changes(
+                ResvAction::Preempt,
+                0,
+                &RegistrantId::nvme(HOST_B),
+                &pre,
+                &post
+            ),
+            vec![chg(
+                RegistrantId::nvme(HOST_A),
+                ReservationChangeKind::RegistrationPreempted
+            )]
+        );
+    }
+
+    #[test]
+    fn diff_preempt_holder_is_reservation_preempted_only() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B]);
+        let post = dsnap(Some(HOST_B), &[HOST_B]);
+        assert_eq!(
+            diff_reservation_changes(
+                ResvAction::Preempt,
+                0,
+                &RegistrantId::nvme(HOST_B),
+                &pre,
+                &post
+            ),
+            vec![chg(
+                RegistrantId::nvme(HOST_A),
+                ReservationChangeKind::ReservationPreempted
+            )]
+        );
+    }
+
+    #[test]
+    fn diff_preempt_holder_plus_other_registrant() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
+        let post = dsnap(Some(HOST_B), &[HOST_B]);
+        let changes = diff_reservation_changes(
+            ResvAction::Preempt,
+            0,
+            &RegistrantId::nvme(HOST_B),
+            &pre,
+            &post,
+        );
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_A),
+            ReservationChangeKind::ReservationPreempted
+        )));
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_C),
+            ReservationChangeKind::RegistrationPreempted
+        )));
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn diff_release_fans_out_to_others() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
+        let post = dsnap(None, &[HOST_A, HOST_B, HOST_C]);
+        let changes = diff_reservation_changes(
+            ResvAction::Release,
+            0,
+            &RegistrantId::nvme(HOST_A),
+            &pre,
+            &post,
+        );
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_B),
+            ReservationChangeKind::ReservationReleased
+        )));
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_C),
+            ReservationChangeKind::ReservationReleased
+        )));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| c.affected == RegistrantId::nvme(HOST_A))
+        );
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn diff_self_unregister_holder_releases_to_survivors() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B]);
+        let post = dsnap(None, &[HOST_B]);
+        assert_eq!(
+            diff_reservation_changes(
+                ResvAction::Unregister,
+                0,
+                &RegistrantId::nvme(HOST_A),
+                &pre,
+                &post
+            ),
+            vec![chg(
+                RegistrantId::nvme(HOST_B),
+                ReservationChangeKind::ReservationReleased
+            )]
+        );
+    }
+
+    #[test]
+    fn diff_clear_preempts_all_other_registrants() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
+        let post = dsnap(None, &[]);
+        let changes = diff_reservation_changes(
+            ResvAction::Clear,
+            0,
+            &RegistrantId::nvme(HOST_A),
+            &pre,
+            &post,
+        );
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_B),
+            ReservationChangeKind::ReservationPreempted
+        )));
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_C),
+            ReservationChangeKind::ReservationPreempted
+        )));
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn diff_all_registrants_holder_rotation_emits_nothing() {
+        // Holder A unregisters; the all-registrants reservation rotates to
+        // B (post.holder still set) → nothing fans out.
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B]);
+        let post = dsnap(Some(HOST_B), &[HOST_B]);
+        assert!(
+            diff_reservation_changes(
+                ResvAction::Unregister,
+                0,
+                &RegistrantId::nvme(HOST_A),
+                &pre,
+                &post
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn diff_idempotent_reacquire_emits_nothing() {
+        let pre = dsnap(Some(HOST_A), &[HOST_A, HOST_B]);
+        let post = dsnap(Some(HOST_A), &[HOST_A, HOST_B]);
+        assert!(
+            diff_reservation_changes(
+                ResvAction::Preempt,
+                0,
+                &RegistrantId::nvme(HOST_A),
+                &pre,
+                &post
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn diff_mixed_transport_clear_surfaces_both() {
+        // An NVMe holder clears; an iSCSI peer and an NVMe peer both get
+        // ReservationPreempted — proving the diff is transport-neutral.
+        let iscsi_x = RegistrantId::iscsi(Some("iqn.test:x".into()), [7u8; 6]);
+        let pre = ReservationSnapshot {
+            generation: 0,
+            reservation_type: None,
+            holder: Some(RegistrantId::nvme(HOST_A)),
+            registrants: vec![
+                (RegistrantId::nvme(HOST_A), 1),
+                (RegistrantId::nvme(HOST_B), 1),
+                (iscsi_x.clone(), 1),
+            ],
+            aptpl: false,
+        };
+        let post = dsnap(None, &[]);
+        let changes = diff_reservation_changes(
+            ResvAction::Clear,
+            0,
+            &RegistrantId::nvme(HOST_A),
+            &pre,
+            &post,
+        );
+        assert!(changes.contains(&chg(
+            RegistrantId::nvme(HOST_B),
+            ReservationChangeKind::ReservationPreempted
+        )));
+        assert!(changes.contains(&chg(iscsi_x, ReservationChangeKind::ReservationPreempted)));
+        assert_eq!(changes.len(), 2);
     }
 }

@@ -39,12 +39,14 @@
 //! a host never receives an asynchronous notice for its own command.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use nvme_base::aer::{AEI_RESERVATION_LOG_AVAILABLE, AET_IO_COMMAND_SET, async_event_dw0};
 use nvme_base::log_page::{self, lid, resv_notif_type};
-use scsi_spc::reservations::{RegistrantId, ReservationSnapshot};
+use scsi_spc::reservations::{
+    RegistrantId, ReservationChange, ReservationChangeKind, ReservationObserver,
+};
 use tokio::sync::oneshot;
 
 /// Upper bound on queued-but-unread notifications per host. A host
@@ -422,143 +424,55 @@ impl Default for ControllerRegistry {
 }
 
 // ----------------------------------------------------------------
-// Reservation-event derivation (pure; no hub, no tokio)
+// Reservation-change sink (drives LID 0x80 + AER from the manager hook)
 // ----------------------------------------------------------------
 
-/// The reservation mutation that just succeeded. Disambiguates the
-/// notification class that two equivalent-looking snapshot diffs map
-/// to (e.g. a removed registrant means Registration Preempted under a
-/// Preempt but Reservation Preempted under a Clear).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResvAction {
-    Preempt,
-    Release,
-    Clear,
-    Unregister,
+/// [`ReservationObserver`] that turns the shared manager's neutral
+/// reservation changes into NVMe LID 0x80 + AER notifications. Registered
+/// on the [`ReservationManager`](scsi_spc::reservations::ReservationManager)
+/// at daemon boot; it fires regardless of which transport originated the
+/// change (issue #67), so an iSCSI-issued preempt now reaches a fenced
+/// NVMe host. The diff + issuer-exclusion live in the manager, so this
+/// sink only self-filters to NVMe registrants and fans each out via the
+/// unchanged [`ControllerRegistry::notify`].
+pub struct AerReservationSink {
+    registry: Arc<ControllerRegistry>,
 }
 
-fn nvme_host(id: &RegistrantId) -> Option<[u8; 16]> {
-    match id {
-        RegistrantId::NvmeHost { hostid } => Some(*hostid),
-        RegistrantId::Iscsi { .. } => None,
+impl AerReservationSink {
+    pub fn new(registry: Arc<ControllerRegistry>) -> Self {
+        Self { registry }
     }
 }
 
-fn emit(
-    out: &mut Vec<ReservationEvent>,
-    issuer: [u8; 16],
-    host_id: [u8; 16],
-    nsid: u32,
-    kind: ReservationEventKind,
-) {
-    // The command issuer learns the result from its own completion; it
-    // is never sent an asynchronous notification.
-    if host_id != issuer {
-        out.push(ReservationEvent {
-            host_id,
-            nsid,
-            kind,
-        });
-    }
-}
-
-/// Derive the reservation notifications a just-completed (outcome
-/// `Good`) reservation op generates, from the before/after snapshots,
-/// the issuing host, and the action. Pure and table-testable.
-///
-/// Rules (NVMe NVM Command Set reservation notices):
-/// - **Preempt**: the prior reservation holder that lost its
-///   reservation → Reservation Preempted; any other registrant whose
-///   registration was removed → Registration Preempted (the holder is
-///   deduped to Reservation Preempted only, never both).
-/// - **Release**: a reservation that existed and is now released with
-///   no successor → Reservation Released to every other current
-///   registrant. An all-registrants holder *rotation* keeps
-///   `post.holder` set, so it emits nothing.
-/// - **Clear**: every registration and the reservation are wiped →
-///   Reservation Preempted to every other prior registrant.
-/// - **Unregister** (self): only fans out if the departing host held a
-///   non-all-registrants reservation that is now released → Reservation
-///   Released to the survivors.
-pub fn diff_reservation_events(
-    action: ResvAction,
-    pre: &ReservationSnapshot,
-    post: &ReservationSnapshot,
-    issuer: [u8; 16],
-    nsid: u32,
-) -> Vec<ReservationEvent> {
-    let mut out = Vec::new();
-    let is_present = |id: &RegistrantId| post.registrants.iter().any(|(p, _)| p == id);
-
-    match action {
-        ResvAction::Clear => {
-            for (id, _) in &pre.registrants {
-                if let Some(h) = nvme_host(id) {
-                    emit(
-                        &mut out,
-                        issuer,
-                        h,
-                        nsid,
-                        ReservationEventKind::ReservationPreempted,
-                    );
-                }
-            }
-        }
-        ResvAction::Preempt => {
-            // The prior holder whose reservation was taken over.
-            let reservation_taken = pre.holder.is_some() && post.holder != pre.holder;
-            let preempted_holder = if reservation_taken {
-                pre.holder.as_ref().and_then(nvme_host)
-            } else {
-                None
+impl ReservationObserver for AerReservationSink {
+    fn on_reservation_change(&self, changes: &[ReservationChange]) {
+        for change in changes {
+            // iSCSI registrants are the SCSI UA sink's business.
+            let RegistrantId::NvmeHost { hostid } = &change.affected else {
+                continue;
             };
-            if let Some(h) = preempted_holder {
-                emit(
-                    &mut out,
-                    issuer,
-                    h,
-                    nsid,
-                    ReservationEventKind::ReservationPreempted,
-                );
-            }
-            // Registrants removed by the preempt that were not the
-            // (already-notified) holder.
-            for (id, _) in &pre.registrants {
-                if is_present(id) {
-                    continue;
-                }
-                if let Some(h) = nvme_host(id) {
-                    if Some(h) == preempted_holder {
-                        continue;
-                    }
-                    emit(
-                        &mut out,
-                        issuer,
-                        h,
-                        nsid,
-                        ReservationEventKind::RegistrationPreempted,
-                    );
-                }
-            }
-        }
-        ResvAction::Release | ResvAction::Unregister => {
-            let released = pre.holder.is_some() && post.holder.is_none();
-            if released {
-                for (id, _) in &post.registrants {
-                    if let Some(h) = nvme_host(id) {
-                        emit(
-                            &mut out,
-                            issuer,
-                            h,
-                            nsid,
-                            ReservationEventKind::ReservationReleased,
-                        );
-                    }
-                }
-            }
+            // Inverse of `nsid_to_lun` (nsid = lun + 1). A LUN that can't
+            // map back to a u32 NSID has no NVMe namespace, so skip it.
+            let Ok(nsid) = u32::try_from(change.lun.saturating_add(1)) else {
+                continue;
+            };
+            self.registry.notify(ReservationEvent {
+                host_id: *hostid,
+                nsid,
+                kind: map_kind(change.kind),
+            });
         }
     }
-    out
+}
+
+/// Bridge the neutral notification class onto the NVMe-wire event kind.
+fn map_kind(kind: ReservationChangeKind) -> ReservationEventKind {
+    match kind {
+        ReservationChangeKind::RegistrationPreempted => ReservationEventKind::RegistrationPreempted,
+        ReservationChangeKind::ReservationReleased => ReservationEventKind::ReservationReleased,
+        ReservationChangeKind::ReservationPreempted => ReservationEventKind::ReservationPreempted,
+    }
 }
 
 #[cfg(test)]
@@ -567,18 +481,7 @@ mod tests {
 
     const HOST_A: [u8; 16] = [0xAA; 16];
     const HOST_B: [u8; 16] = [0xBB; 16];
-    const HOST_C: [u8; 16] = [0xCC; 16];
     const NSID: u32 = 1;
-
-    fn snap(holder: Option<[u8; 16]>, regs: &[[u8; 16]]) -> ReservationSnapshot {
-        ReservationSnapshot {
-            generation: 0,
-            reservation_type: None,
-            holder: holder.map(RegistrantId::nvme),
-            registrants: regs.iter().map(|h| (RegistrantId::nvme(*h), 1)).collect(),
-            aptpl: false,
-        }
-    }
 
     // -- ControllerRegistry --------------------------------------
 
@@ -845,97 +748,89 @@ mod tests {
         assert_eq!(reg.representative_cntlid(HOST_A), c1.min(c2));
     }
 
-    // -- diff_reservation_events ---------------------------------
+    // -- AerReservationSink --------------------------------------
+    //
+    // The neutral diff + issuer-exclusion are unit-tested in
+    // `scsi_spc::reservations`. Here we only prove the sink self-filters
+    // to NVMe registrants, maps the LUN to nsid = lun + 1, and drives
+    // `notify` (a LID 0x80 entry appears for the affected NVMe host).
+
+    fn iscsi_id(tag: u8) -> RegistrantId {
+        RegistrantId::iscsi(Some("iqn.test:x".into()), [tag; 6])
+    }
 
     #[test]
-    fn preempt_non_holder_is_registration_preempted() {
-        // B preempts A's registration; no reservation held.
-        let pre = snap(None, &[HOST_A, HOST_B]);
-        let post = snap(None, &[HOST_B]);
-        let events = diff_reservation_events(ResvAction::Preempt, &pre, &post, HOST_B, NSID);
-        assert_eq!(
-            events,
-            vec![ev(HOST_A, ReservationEventKind::RegistrationPreempted)]
+    fn sink_notifies_nvme_host_and_skips_iscsi() {
+        let reg = Arc::new(ControllerRegistry::new());
+        let c = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let sink = AerReservationSink::new(Arc::clone(&reg));
+        // A mixed change set on LUN 0 (nsid 1): the NVMe host A is
+        // notified; the iSCSI registrant is the SCSI sink's job.
+        sink.on_reservation_change(&[
+            ReservationChange {
+                lun: 0,
+                affected: RegistrantId::nvme(HOST_A),
+                kind: ReservationChangeKind::ReservationPreempted,
+            },
+            ReservationChange {
+                lun: 0,
+                affected: iscsi_id(7),
+                kind: ReservationChangeKind::ReservationReleased,
+            },
+        ]);
+        let page = reg.take_log_entry(c);
+        assert_eq!(page[8], resv_notif_type::RESERVATION_PREEMPTED);
+        assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 1); // nsid = lun + 1
+        // Only the one (NVMe) entry was queued.
+        assert!(reg.take_log_entry(c).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn sink_maps_change_kind_to_event_kind() {
+        let reg = Arc::new(ControllerRegistry::new());
+        let c = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let sink = AerReservationSink::new(Arc::clone(&reg));
+        sink.on_reservation_change(&[ReservationChange {
+            lun: 6,
+            affected: RegistrantId::nvme(HOST_A),
+            kind: ReservationChangeKind::RegistrationPreempted,
+        }]);
+        let page = reg.take_log_entry(c);
+        assert_eq!(page[8], resv_notif_type::REGISTRATION_PREEMPTED);
+        assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 7);
+    }
+
+    // Issue #67 acceptance (one direction), end-to-end through the
+    // manager observer: an iSCSI-issued PREEMPT fences an NVMe holder and
+    // the AER sink fans a LID 0x80 entry to that host's controller.
+    #[test]
+    fn iscsi_preempt_notifies_nvme_host_via_observer() {
+        use scsi_spc::pr::ReservationType;
+        use scsi_spc::reservations::ReservationManager;
+
+        let aer = Arc::new(ControllerRegistry::new());
+        let mgr = ReservationManager::new();
+        mgr.register_observer(Arc::new(AerReservationSink::new(Arc::clone(&aer))));
+
+        // NVMe host A has a live controller and holds an exclusive reservation.
+        let cntlid = aer.connect_admin(HOST_A).unwrap().cntlid();
+        let nvme_a = RegistrantId::nvme(HOST_A);
+        mgr.register(0, &nvme_a, 0, 0xAAAA, true, Some(false));
+        mgr.reserve(0, &nvme_a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+
+        // An iSCSI initiator B registers, then preempts A.
+        let iscsi_b = iscsi_id(2);
+        mgr.register(0, &iscsi_b, 0, 0xBBBB, true, Some(false));
+        mgr.preempt(
+            0,
+            &iscsi_b,
+            0xBBBB,
+            0xAAAA,
+            ReservationType::ExclusiveAccess.as_u8(),
         );
-    }
 
-    #[test]
-    fn preempt_holder_is_reservation_preempted_only() {
-        // A holds; B preempts and takes over, removing A's registration.
-        // A must get Reservation Preempted (3) ONLY, never also type 1.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B]);
-        let post = snap(Some(HOST_B), &[HOST_B]);
-        let events = diff_reservation_events(ResvAction::Preempt, &pre, &post, HOST_B, NSID);
-        assert_eq!(
-            events,
-            vec![ev(HOST_A, ReservationEventKind::ReservationPreempted)]
-        );
-    }
-
-    #[test]
-    fn preempt_holder_plus_other_registrant() {
-        // A holds, C also registered; B preempts taking over and
-        // removing both A and C. A → type 3, C → type 1.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
-        let post = snap(Some(HOST_B), &[HOST_B]);
-        let events = diff_reservation_events(ResvAction::Preempt, &pre, &post, HOST_B, NSID);
-        assert!(events.contains(&ev(HOST_A, ReservationEventKind::ReservationPreempted)));
-        assert!(events.contains(&ev(HOST_C, ReservationEventKind::RegistrationPreempted)));
-        assert_eq!(events.len(), 2);
-    }
-
-    #[test]
-    fn release_fans_out_reservation_released_to_others() {
-        // A holds and releases; B and C remain registered.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
-        let post = snap(None, &[HOST_A, HOST_B, HOST_C]);
-        let events = diff_reservation_events(ResvAction::Release, &pre, &post, HOST_A, NSID);
-        assert!(events.contains(&ev(HOST_B, ReservationEventKind::ReservationReleased)));
-        assert!(events.contains(&ev(HOST_C, ReservationEventKind::ReservationReleased)));
-        // Issuer A is never notified.
-        assert!(!events.iter().any(|e| e.host_id == HOST_A));
-        assert_eq!(events.len(), 2);
-    }
-
-    #[test]
-    fn self_unregister_holder_releases_to_survivors() {
-        // A holds and unregisters; reservation releases, B survives.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B]);
-        let post = snap(None, &[HOST_B]);
-        let events = diff_reservation_events(ResvAction::Unregister, &pre, &post, HOST_A, NSID);
-        assert_eq!(
-            events,
-            vec![ev(HOST_B, ReservationEventKind::ReservationReleased)]
-        );
-    }
-
-    #[test]
-    fn clear_preempts_all_other_registrants() {
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B, HOST_C]);
-        let post = snap(None, &[]);
-        let events = diff_reservation_events(ResvAction::Clear, &pre, &post, HOST_A, NSID);
-        assert!(events.contains(&ev(HOST_B, ReservationEventKind::ReservationPreempted)));
-        assert!(events.contains(&ev(HOST_C, ReservationEventKind::ReservationPreempted)));
-        assert!(!events.iter().any(|e| e.host_id == HOST_A));
-        assert_eq!(events.len(), 2);
-    }
-
-    #[test]
-    fn all_registrants_holder_rotation_emits_nothing() {
-        // All-registrants reservation: A (holder) unregisters, the
-        // reservation rotates to B (post.holder still set) → no event.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B]);
-        let post = snap(Some(HOST_B), &[HOST_B]);
-        let events = diff_reservation_events(ResvAction::Unregister, &pre, &post, HOST_A, NSID);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn idempotent_reacquire_emits_nothing() {
-        // Re-acquire by the same holder, state unchanged.
-        let pre = snap(Some(HOST_A), &[HOST_A, HOST_B]);
-        let post = snap(Some(HOST_A), &[HOST_A, HOST_B]);
-        let events = diff_reservation_events(ResvAction::Preempt, &pre, &post, HOST_A, NSID);
-        assert!(events.is_empty());
+        let page = aer.take_log_entry(cntlid);
+        assert_eq!(page[8], resv_notif_type::RESERVATION_PREEMPTED);
+        assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 1);
     }
 }

@@ -334,7 +334,7 @@ pub(crate) fn handle_scsi_command(
     tsih: u16,
     drive_manager: Arc<DriveManager>,
     library: Arc<Mutex<Library>>,
-    ua_tracker: Arc<Mutex<UnitAttentionTracker>>,
+    ua_tracker: Arc<UnitAttentionTracker>,
     element_config: ElementAddressConfig,
     event_tx: broadcast::Sender<TapeEvent>,
     data_dir: &std::path::Path,
@@ -387,10 +387,7 @@ pub(crate) fn handle_scsi_command(
     // status — without this pop the UA we push during 0xA5/0xA6
     // never reaches the host.
     if !matches!(opcode, 0x12 | 0x03 | 0xA0) {
-        let popped = ua_tracker
-            .lock()
-            .map_err(|_| anyhow!("UA tracker mutex poisoned"))?
-            .check_and_pop_ua(tsih, lun);
+        let popped = ua_tracker.check_and_pop_ua(tsih, lun);
         if let Some(code) = popped {
             tracing::info!(
                 "Reporting Unit Attention to TSIH={} LUN={}: ASC=0x{:02x} ASCQ=0x{:02x} (preempts opcode 0x{:02x})",

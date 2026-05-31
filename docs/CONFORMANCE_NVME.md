@@ -394,8 +394,13 @@ parked AERs are released when the admin connection closes.
 When a host is fenced by another host's Reservation Acquire (Preempt),
 Release, or Clear, the loser learns *proactively* instead of only
 reactively via `Reservation Conflict` (0x83) on its next command. The
-NVMe reservation adapter diffs the shared `ReservationManager` state
-before and after each mutating op and derives the affected hosts:
+shared `ReservationManager` runs one transport-neutral observer hook
+(issue #67): on every successful, persisted mutating op it diffs the
+pre/post state, excludes the issuer, and hands the affected set to the
+NVMe sink (`nvme_nvm::AerReservationSink`), which maps each NVMe-host
+registrant to a LID 0x80 + AER notification. (Before #67 the NVMe adapter
+did this diff per-call; moving it into the manager is what lets an
+iSCSI-originated change reach NVMe hosts.) The derived classes:
 
 - **Registration Preempted (type 1)** — a non-holder registrant whose
   registration is removed by a Preempt.
@@ -437,14 +442,17 @@ reservation held by a SCSI initiator denies an NVMe host's writes via the same
 is 1:1 and an iSCSI `(IQN, ISID)` registrant never equals an NVMe HOSTID
 registrant. The *pull* reports also agree (`nvme resv-report` shows an iSCSI
 holder with `hostid = 0`, `cntlid = 0`; `sg_persist --read-reservation` shows
-the NVMe holder's key + type). What is **not** wired is *proactive*
-cross-transport notification: the diff above only fans LID 0x80 events to NVMe
-controllers, and only for NVMe-originated mutations — a reservation change made
-over iSCSI raises no NVMe AER (and no NVMe change raises a SCSI Unit Attention,
-which the SCSI path does not emit for reservations at all). A host fenced from
-across the other transport discovers it reactively (Reservation Conflict on its
-next I/O) or by polling the report. A transport-neutral `ReservationManager`
-change-observer that fans out to both paths is a tracked follow-up.
+the NVMe holder's key + type). **Proactive notification is now also
+cross-transport (issue #67):** the per-op diff lives in the shared
+`ReservationManager` observer hook described above, which fans the
+affected set to *both* the NVMe sink (LID 0x80 + AER) and the SCSI sink
+(`shared_iscsi::IscsiReservationSink`, which raises a RESERVATIONS
+PREEMPTED 0x2A/0x03 or RESERVATIONS RELEASED 0x2A/0x04 Unit Attention on
+the affected iSCSI initiator's next command). So a reservation change
+made over iSCSI now raises an NVMe AER on a fenced NVMe host, and an
+NVMe change raises a SCSI UA on a fenced iSCSI initiator. Each sink
+self-filters to its own transport's registrants; the issuer is excluded
+once, in the diff.
 
 **Persistence across a target restart (PTPL).** When a host's most-recent
 Reservation Register set CPTPL = "set PTPL", the registration and any

@@ -164,21 +164,20 @@ impl NvmeNvmDispatcher {
         // Reservation commands are never conflict-gated (their own key
         // check is the only conflict path); they dispatch directly.
         // Reservation Register / Acquire / Release may fence another
-        // host; the adapter returns the notifications that fan out, and
-        // we hand them to the AER hub (which queues a LID 0x80 entry and
-        // completes a parked AER on the affected host's admin queue).
+        // host; the resulting LID 0x80 + AER fan-out is driven by the
+        // shared `ReservationManager` observer hook (issue #67), so it
+        // fires regardless of which transport originated the change —
+        // the adapter here just returns the completion.
         let host_id = cmd.host_id.unwrap_or([0u8; 16]);
         match opcode {
             NvmOpcode::ReservationRegister => {
-                let (resp, events) = crate::reservations::reservation_register(
+                return crate::reservations::reservation_register(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
-                self.emit_reservation_events(events);
-                return resp;
             }
             NvmOpcode::ReservationReport => {
                 return crate::reservations::reservation_report(
@@ -190,26 +189,22 @@ impl NvmeNvmDispatcher {
                 );
             }
             NvmOpcode::ReservationAcquire => {
-                let (resp, events) = crate::reservations::reservation_acquire(
+                return crate::reservations::reservation_acquire(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
-                self.emit_reservation_events(events);
-                return resp;
             }
             NvmOpcode::ReservationRelease => {
-                let (resp, events) = crate::reservations::reservation_release(
+                return crate::reservations::reservation_release(
                     &self.reservations,
                     sqe.nsid,
                     host_id,
                     sqe,
                     cmd.data_out,
                 );
-                self.emit_reservation_events(events);
-                return resp;
             }
             _ => {}
         }
@@ -250,15 +245,6 @@ impl NvmeNvmDispatcher {
             NvmOpcode::DatasetManagement => self.cmd_dsm(cid, sqe, cmd.data_out, &cache).await,
             NvmOpcode::Verify => self.cmd_verify(cid, sqe, &cache).await,
             _ => NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_opcode())),
-        }
-    }
-
-    /// Hand reservation notifications to the AER hub. Synchronous and
-    /// non-blocking — each `notify` queues a LID 0x80 entry for the
-    /// affected host and completes one parked AER if present.
-    fn emit_reservation_events(&self, events: Vec<crate::aer::ReservationEvent>) {
-        for event in events {
-            self.aer.notify(event);
         }
     }
 
@@ -1039,14 +1025,22 @@ mod tests {
 
         let reg = TestRegistry::default();
         reg.register(1, cache);
+        // Wire the AER sink onto the manager exactly as the daemon does
+        // (issue #67): the LID 0x80 + AER fan-out is now observer-driven,
+        // so reservation-notification tests only fire through this path.
+        let aer = Arc::new(ControllerRegistry::new());
+        let reservations = Arc::new(ReservationManager::new());
+        reservations.register_observer(Arc::new(crate::aer::AerReservationSink::new(Arc::clone(
+            &aer,
+        ))));
         let disp = NvmeNvmDispatcher::new(
             Arc::new(reg),
             "nqn.2025-10.com.metebalci:thurvsa".into(),
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
-            Arc::new(ControllerRegistry::new()),
-            Arc::new(ReservationManager::new()),
+            aer,
+            reservations,
         );
         (tmp, disp)
     }
@@ -1778,14 +1772,19 @@ mod tests {
                 Arc::new(VolumeWriter::open(tmp.path(), name, Arc::clone(&backend)).unwrap());
             reg.register(nsid, PageCache::new(writer));
         }
+        let aer = Arc::new(ControllerRegistry::new());
+        let reservations = Arc::new(ReservationManager::new());
+        reservations.register_observer(Arc::new(crate::aer::AerReservationSink::new(Arc::clone(
+            &aer,
+        ))));
         let disp = NvmeNvmDispatcher::new(
             Arc::new(reg),
             "nqn.2025-10.com.metebalci:thurvsa".into(),
             "TESTSN".into(),
             "ThurVSA Volume".into(),
             "0.1.0".into(),
-            Arc::new(ControllerRegistry::new()),
-            Arc::new(ReservationManager::new()),
+            aer,
+            reservations,
         );
         (tmp, disp)
     }

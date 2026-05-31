@@ -127,7 +127,11 @@ on-disk paths group by purpose.
   now offload the blocking usage walk + eviction to `spawn_blocking`.
 - `shared/iscsi` (`shared-iscsi`) — iSCSI transport, CHAP auth,
   session management, unit-attention queue, login audit sink,
-  product-agnostic `ScsiHandler` trait.
+  product-agnostic `ScsiHandler` trait. `IscsiReservationSink`
+  (a `scsi_spc::ReservationObserver`) maps the shared manager's neutral
+  reservation changes to RESERVATIONS PREEMPTED / RELEASED UAs on the
+  affected initiators' sessions (resolved via `SessionManager::tsihs_for`),
+  the SCSI half of the cross-transport notification path (issue #67).
 - `shared/keystore` (`shared-keystore`) — pluggable VSA volume-DEK
   keystore. `KeyStoreBackend` trait (`generate_and_wrap` / `wrap` /
   `unwrap` / `forget` / `health_check`) + six backends: `local`
@@ -157,7 +161,11 @@ on-disk paths group by purpose.
   OTLP relabeling.
 - `scsi/spc` (`scsi-spc`) — SPC-4 baseline (sense, INQUIRY / VPD /
   mode / report-luns / PR primitives, canonical `ScsiRequest` /
-  `ScsiResponse`).
+  `ScsiResponse`). The PR `ReservationManager` owns the transport-neutral
+  reservation-change diff + observer hook (`ReservationObserver`,
+  `diff_reservation_changes`): every mutating op fires registered sinks
+  with the issuer-excluded affected set, the single source the NVMe AER
+  and iSCSI UA notification paths both consume (issue #67).
 - `shared/pool` (`shared-pool`) — content-addressed chunk pool
   (insertion APIs, namespace, object-key derivation, GC iter).
 - `shared/upload-worker` (`shared-upload-worker`) — storage-upload
@@ -222,10 +230,14 @@ on-disk paths group by purpose.
   Admin command coverage: Identify, Keep Alive, Get/Set Features
   (Number of Queues, Reservation Notification Mask FID 0x82), Get
   Log Page (Error / SMART / FW Slot / Reservation Notification LID
-  0x80), Abort. Reservation notifications are derived by diffing the
-  shared `ReservationManager` and fanned out per-controller through the
-  shared `ControllerRegistry` (the per-subsystem CNTLID allocator +
-  controller table + AER hub the transport also uses).
+  0x80), Abort. Reservation notifications are driven by the shared
+  `ReservationManager` observer hook (issue #67): `AerReservationSink`
+  consumes the manager's neutral pre/post diff and fans LID 0x80 + AER
+  per-controller through the shared `ControllerRegistry` (the
+  per-subsystem CNTLID allocator + controller table + AER hub the
+  transport also uses). Moving the diff into the manager is what makes a
+  reservation change cross-transport-visible — an iSCSI-originated change
+  now reaches NVMe hosts.
   `NvmeNvmDispatcher` impls `NvmeCommandHandler`; the
   daemon plugs `VolumeRegistry` in via the `NamespaceLookup` trait
   (mirror of `scsi-sbc::VolumeLookup`). Reaches into

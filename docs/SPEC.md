@@ -514,12 +514,25 @@ checks. The pull-side reports stay consistent too — `nvme resv-report`
 renders an iSCSI holder with `hostid = 0` / `cntlid = 0`, and SCSI READ
 RESERVATION / READ KEYS render NVMe registrants by key (READ FULL STATUS
 emits an empty iSCSI TransportID for an NVMe host, since SPC-4 has no
-NVMe-host TransportID format — a documented limitation). **Out of
-scope (issue #66):** proactive cross-transport notification — a fence
-taken over one transport raises no AER / Unit Attention on the other;
-the loser learns reactively (Reservation Conflict on its next command)
-or by polling the report. NVMe→NVMe Reservation Notifications (LID
-0x80) are unaffected.
+NVMe-host TransportID format — a documented limitation).
+
+**Proactive cross-transport notification (issue #67).** Every mutating
+reservation op runs through one transport-neutral observer hook on the
+shared `ReservationManager` (`scsi_spc::reservations`): on a successful,
+persisted mutation it diffs the pre/post state, excludes the issuer once
+(by `RegistrantId`), and fans the affected set to two sinks. The NVMe
+sink (`nvme_nvm::AerReservationSink`) drives the LID 0x80 + AER fan-out
+(replacing the per-call diff the dispatcher used to do); the SCSI sink
+(`shared_iscsi::IscsiReservationSink`) enqueues a RESERVATIONS PREEMPTED
+(`0x06/0x2A/0x03`) or RESERVATIONS RELEASED (`0x06/0x2A/0x04`) Unit
+Attention on each affected iSCSI initiator's `(TSIH, LUN)` queue,
+delivered on its next command by the dispatcher's UA-preemption rule.
+Because the diff lives in the manager, the signal fires regardless of
+originating transport: a SCSI preempt now raises an NVMe AER on a fenced
+NVMe host, an NVMe change raises a SCSI UA on a fenced iSCSI initiator,
+and the previously-absent iSCSI→iSCSI reservation UA now fires too (for
+VSA volumes and VTL tape drive + changer LUNs alike). The loser no longer
+depends solely on the reactive Reservation Conflict / report poll.
 
 The registrant identity is the **128-bit Host Identifier** from the
 Fabrics Connect data, not a per-connection handle. One NVMe host opens

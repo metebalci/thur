@@ -31,7 +31,7 @@ struct Fixture {
     _tmp: TempDir,
     facade: LibraryFacade,
     drive_manager: Arc<DriveManager>,
-    ua: Arc<Mutex<UnitAttentionTracker>>,
+    ua: Arc<UnitAttentionTracker>,
     event_tx: broadcast::Sender<TapeEvent>,
     diag: Arc<DiagnosticStore>,
     ratelimiter: AuditRateLimiter,
@@ -69,7 +69,7 @@ impl Fixture {
         Self {
             facade: LibraryFacade::new(library),
             drive_manager: Arc::new(drive_manager),
-            ua: Arc::new(Mutex::new(UnitAttentionTracker::new())),
+            ua: Arc::new(UnitAttentionTracker::new()),
             event_tx,
             diag: Arc::new(DiagnosticStore::new()),
             ratelimiter: AuditRateLimiter::new(Duration::from_secs(60)),

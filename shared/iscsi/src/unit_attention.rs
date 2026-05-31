@@ -70,6 +70,22 @@ impl UnitAttentionCode {
         asc: 0x3F,
         ascq: 0x0E,
     };
+
+    // Registrations preempted / reservation preempted by another I_T
+    // nexus (SPC-4: a PROUT PREEMPT or CLEAR removed this nexus's
+    // registration / reservation). Issue #67 — proactive reservation
+    // change notification.
+    pub const RESERVATIONS_PREEMPTED: Self = Self {
+        asc: 0x2A,
+        ascq: 0x03,
+    };
+
+    // Reservations released (SPC-4: a held persistent reservation this
+    // nexus was registered under was released). Issue #67.
+    pub const RESERVATIONS_RELEASED: Self = Self {
+        asc: 0x2A,
+        ascq: 0x04,
+    };
 }
 
 /// Map key: (session TSIH, target LUN). One UA list per nexus.

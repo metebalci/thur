@@ -28,6 +28,11 @@ pub struct Session {
     /// fence (only legitimate when the library has no partitions
     /// defined; daemon refuses sessions otherwise).
     pub partition: Option<String>,
+    /// Initiator IQN advertised at login. Recorded after the login
+    /// completes (via [`SessionManager::set_initiator_iqn`]) so the
+    /// reservation Unit-Attention sink can resolve a fenced registrant's
+    /// `(IQN, ISID)` identity back to its live TSIH(s) (issue #67).
+    pub initiator_iqn: Option<String>,
 }
 
 /// Connection - represents a single TCP connection within a session
@@ -105,6 +110,7 @@ impl SessionManager {
             created_at: Instant::now(),
             last_activity: Instant::now(),
             partition: None,
+            initiator_iqn: None,
         };
 
         let mut sessions = self
@@ -216,6 +222,43 @@ impl SessionManager {
             .lock()
             .ok()
             .and_then(|s| s.get(&tsih).and_then(|sess| sess.partition.clone()))
+    }
+
+    /// Record the initiator IQN for a session (issue #67). Called once
+    /// the login resolves the initiator name, mirroring [`set_partition`]
+    /// so [`create_session`]'s signature stays stable. No-op for an
+    /// unknown TSIH.
+    ///
+    /// [`set_partition`]: Self::set_partition
+    /// [`create_session`]: Self::create_session
+    pub fn set_initiator_iqn(&self, tsih: u16, iqn: Option<String>) {
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Some(session) = sessions.get_mut(&tsih)
+        {
+            session.initiator_iqn = iqn;
+        }
+    }
+
+    /// Live TSIH(s) whose session matches a reservation registrant's
+    /// `(IQN, ISID)` identity (issue #67). The reservation Unit-Attention
+    /// sink uses this to target the affected initiators precisely.
+    ///
+    /// `collapse_isid` mirrors the PR initiator-port policy
+    /// (`iscsi.reservations.initiator_port`): when set, a registrant's
+    /// ISID is zeroed at the dispatcher, so the registrant carries no
+    /// ISID and we match on IQN alone. When clear, both the IQN and the
+    /// real wire ISID must match. A session whose IQN was never recorded
+    /// never matches.
+    pub fn tsihs_for(&self, iqn: Option<&str>, isid: [u8; 6], collapse_isid: bool) -> Vec<u16> {
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("session manager mutex poisoned");
+        sessions
+            .values()
+            .filter(|s| s.initiator_iqn.as_deref() == iqn && (collapse_isid || s.isid == isid))
+            .map(|s| s.tsih)
+            .collect()
     }
 
     /// Update session activity timestamp
@@ -583,6 +626,54 @@ mod tests {
             CmdSnVerdict::Duplicate
         );
         assert_eq!(mgr.current_exp_cmd_sn(tsih, 0).unwrap(), 0x1002);
+    }
+
+    #[test]
+    fn test_tsihs_for_matches_iqn_and_isid() {
+        let mgr = SessionManager::new();
+        let isid_a = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let isid_b = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15];
+        let ta = mgr.create_session(isid_a);
+        let tb = mgr.create_session(isid_b);
+        mgr.set_initiator_iqn(ta, Some("iqn.test:a".into()));
+        mgr.set_initiator_iqn(tb, Some("iqn.test:b".into()));
+
+        // Non-collapse: IQN + ISID must both match.
+        assert_eq!(mgr.tsihs_for(Some("iqn.test:a"), isid_a, false), vec![ta]);
+        // Same IQN, different ISID => no match in non-collapse mode.
+        assert!(mgr.tsihs_for(Some("iqn.test:a"), isid_b, false).is_empty());
+        // Unknown IQN matches nothing.
+        assert!(mgr.tsihs_for(Some("iqn.test:z"), isid_a, false).is_empty());
+        let _ = tb;
+    }
+
+    #[test]
+    fn test_tsihs_for_collapse_matches_iqn_only() {
+        let mgr = SessionManager::new();
+        // Two sessions, same IQN, different (real wire) ISIDs — as MPIO
+        // paths look. In collapse mode the registrant's ISID is zeroed,
+        // so both live paths must be returned for the IQN.
+        let t1 = mgr.create_session([1u8; 6]);
+        let t2 = mgr.create_session([2u8; 6]);
+        mgr.set_initiator_iqn(t1, Some("iqn.test:mpio".into()));
+        mgr.set_initiator_iqn(t2, Some("iqn.test:mpio".into()));
+        let mut got = mgr.tsihs_for(Some("iqn.test:mpio"), [0u8; 6], true);
+        got.sort_unstable();
+        let mut want = vec![t1, t2];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_tsihs_for_skips_sessions_without_recorded_iqn() {
+        let mgr = SessionManager::new();
+        let t = mgr.create_session([1u8; 6]);
+        // No set_initiator_iqn => never matches an IQN-bearing query.
+        assert!(
+            mgr.tsihs_for(Some("iqn.test:a"), [1u8; 6], false)
+                .is_empty()
+        );
+        let _ = t;
     }
 
     #[test]

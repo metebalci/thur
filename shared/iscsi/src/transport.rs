@@ -1258,6 +1258,11 @@ pub async fn handle_login_phase(
                     e
                 );
             }
+            // Record the initiator IQN so the reservation UA sink can map
+            // a fenced registrant's (IQN, ISID) back to this TSIH (#67).
+            if !is_discovery && tsih != 0 {
+                session_manager.set_initiator_iqn(tsih, initiator_name.clone());
+            }
             return Ok(LoginOutcome {
                 is_discovery,
                 tsih,

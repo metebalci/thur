@@ -26,6 +26,7 @@ pub mod handler;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod metrics;
+pub mod reservation_sink;
 pub mod sense;
 pub mod session;
 pub mod transport;
@@ -33,3 +34,4 @@ pub mod unit_attention;
 
 pub use error::IscsiError;
 pub use handler::{ScsiHandler, ScsiRequest, ScsiResponse, ScsiStatus};
+pub use reservation_sink::IscsiReservationSink;

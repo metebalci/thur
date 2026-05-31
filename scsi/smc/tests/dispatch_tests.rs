@@ -39,7 +39,7 @@ struct Fixture {
     library: Arc<Mutex<Library>>,
     facade: LibraryFacade,
     drive_manager: Arc<DriveManager>,
-    ua: Arc<Mutex<UnitAttentionTracker>>,
+    ua: Arc<UnitAttentionTracker>,
     event_tx: broadcast::Sender<TapeEvent>,
     diag: Arc<DiagnosticStore>,
     ratelimiter: AuditRateLimiter,
@@ -82,7 +82,7 @@ impl Fixture {
         Self {
             facade: LibraryFacade::new(Arc::clone(&library)),
             drive_manager: Arc::new(DriveManager::new(drives as usize, tapes_dir)),
-            ua: Arc::new(Mutex::new(UnitAttentionTracker::new())),
+            ua: Arc::new(UnitAttentionTracker::new()),
             event_tx,
             diag: Arc::new(DiagnosticStore::new()),
             ratelimiter: AuditRateLimiter::new(Duration::from_secs(60)),
@@ -408,7 +408,7 @@ fn move_medium_raises_ua_only_on_affected_drives() {
         ScsiStatus::Good,
     );
 
-    let ua = fx.ua.lock().unwrap();
+    let ua = &fx.ua;
     // Drive 0 (LUN 1) is the destination — it gained a cartridge.
     let drive_0_ua = ua.check_and_pop_ua(1, 1);
     assert_eq!(drive_0_ua, Some(UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED));
@@ -453,7 +453,7 @@ fn move_medium_slot_to_slot_raises_no_drive_ua() {
         ScsiStatus::Good,
     );
 
-    let ua = fx.ua.lock().unwrap();
+    let ua = &fx.ua;
     for lun in 0..=2 {
         assert!(
             ua.check_and_pop_ua(1, lun).is_none(),

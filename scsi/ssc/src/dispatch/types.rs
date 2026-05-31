@@ -22,7 +22,7 @@ use core_mediachanger::{AuditActor, AuditChannel, AuditRateLimiter, TapeDeviceFa
 use scsi_spc::reservations::ReservationManager;
 use shared_iscsi::alua::AluaTopology;
 use shared_iscsi::unit_attention::UnitAttentionTracker;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::diagnostics::DiagnosticStore;
@@ -226,7 +226,7 @@ pub struct ScsiCtx<'a> {
     pub tsih: u16,
     pub drive_manager: &'a Arc<DriveManager>,
     pub facade: &'a dyn TapeDeviceFacade,
-    pub ua_tracker: &'a Arc<Mutex<UnitAttentionTracker>>,
+    pub ua_tracker: &'a Arc<UnitAttentionTracker>,
     pub event_tx: &'a broadcast::Sender<TapeEvent>,
     pub data_dir: &'a std::path::Path,
     pub audit_log: &'a Option<AuditChannel>,

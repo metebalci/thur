@@ -21,16 +21,22 @@
 #        b. NVMe takes Write Exclusive -> the iSCSI host's write is
 #           fenced (sense 0x18); `sg_persist --read-reservation` shows
 #           the reservation is held.
+#   4. Proactive cross-transport notification, both directions (issue #67):
+#        a. NVMe preempts an iSCSI-held reservation -> the iSCSI
+#           initiator's next command returns CHECK CONDITION / UNIT
+#           ATTENTION RESERVATIONS PREEMPTED (0x06/0x2A/0x03).
+#        b. iSCSI preempts an NVMe-held reservation -> the NVMe host's
+#           Reservation Notification log (LID 0x80) carries a Reservation
+#           Preempted entry.
 #
 # The cross-protocol coherence falls out of the single shared
 # ReservationManager keyed by LUN (issue #57): an iSCSI initiator port
 # and an NVMe host are distinct registrant identities that never
-# compare equal, so a non-holder is fenced regardless of transport.
-#
-# NOTE (documented limitation): proactive cross-transport notification
-# is out of scope (#66). The fenced host learns reactively (Conflict on
-# its next I/O) or by polling resv-report / read-reservation — both
-# asserted here. There is no cross-transport AER / Unit Attention.
+# compare equal, so a non-holder is fenced regardless of transport. The
+# proactive notification (4) is driven by one transport-neutral observer
+# hook on that shared manager (issue #67): every mutating op fans the
+# issuer-excluded affected set to the NVMe AER sink (LID 0x80) and the
+# iSCSI Unit-Attention sink, so the signal crosses the transport boundary.
 #
 # Prerequisites:
 #   - open-iscsi (iscsiadm), sg3-utils (sg_persist, sg_write_same),
@@ -81,7 +87,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_prerequisites() {
-    for t in iscsiadm sg_persist sg_write_same lsscsi nvme; do
+    for t in iscsiadm sg_persist sg_write_same sg_turs lsscsi nvme; do
         if ! command -v "$t" >/dev/null 2>&1; then
             log_error "Missing prerequisite: $t"
             exit 1
@@ -300,6 +306,92 @@ test_nvme_reservation_fences_iscsi() {
     return 0
 }
 
+# Test 3a (issue #67): NVMe preempts an iSCSI-held reservation -> the
+# iSCSI initiator's NEXT command surfaces UNIT ATTENTION RESERVATIONS
+# PREEMPTED (0x06/0x2A/0x03), proactively, instead of only a later
+# Reservation Conflict. The daemon never queues a power-on UA at login,
+# and the diff excludes the issuer, so the only UA on the iSCSI session
+# after the preempt is the one under test — a single probe sees it.
+test_nvme_preempt_raises_iscsi_ua() {
+    log_test "NVMe preempt raises RESERVATIONS PREEMPTED UA on the iSCSI initiator (#67)"
+    reset_lun_reservations
+    sg_persist --out --register --param-sark=0xA1A1 "$ISCSI_SG" >/dev/null 2>&1 \
+        || { log_error "iSCSI register failed"; return 1; }
+    sg_persist --out --reserve --param-rk=0xA1A1 --prout-type=2 "$ISCSI_SG" >/dev/null 2>&1 \
+        || { log_error "iSCSI reserve (EA) failed"; return 1; }
+    # Drain any stray UA the issuer's own ops might have left (none
+    # expected — the issuer is excluded) so the probe below is clean.
+    sg_turs "$ISCSI_SG" >/dev/null 2>&1 || true
+    log_info "  iSCSI registered + reserved (Exclusive Access)"
+
+    local dev="/dev/${NVME_DEVICE}n1"
+    nvme resv-register "$dev" --rrega=0 --nrkey=0xB2B2 >/dev/null 2>&1 \
+        || { log_error "NVMe resv-register failed"; return 1; }
+    # racqa=1 Preempt: NVMe host (key 0xB2B2) preempts the iSCSI holder
+    # (prkey 0xA1A1), taking the reservation.
+    nvme resv-acquire "$dev" --crkey=0xB2B2 --prkey=0xA1A1 --rtype=2 --racqa=1 >/dev/null 2>&1 \
+        || { log_error "NVMe resv-acquire (preempt) failed"; return 1; }
+    log_info "  NVMe preempted the iSCSI-held reservation"
+
+    # The iSCSI initiator's next command (TEST UNIT READY on the sg
+    # device) must come back CHECK CONDITION / UNIT ATTENTION with
+    # Additional Sense "Reservations preempted" (0x2A/0x03).
+    local turs
+    turs=$(sg_turs "$ISCSI_SG" 2>&1 || true)
+    if echo "$turs" | grep -qiE "Reservations preempted|0x2a.*0x03|asc=?2a.*ascq=?03"; then
+        log_info "  iSCSI initiator saw RESERVATIONS PREEMPTED (0x2A/0x03)"
+    else
+        log_error "  iSCSI initiator did not surface the RESERVATIONS PREEMPTED UA: $turs"
+        return 1
+    fi
+
+    nvme resv-release "$dev" --crkey=0xB2B2 --rtype=2 --rrela=0 >/dev/null 2>&1 || true
+    return 0
+}
+
+# Test 3b (issue #67): iSCSI preempts an NVMe-held reservation -> the
+# NVMe host's Reservation Notification log (LID 0x80) carries a
+# Reservation Preempted entry (proactive AER source), not just a later
+# Reservation Conflict.
+test_iscsi_preempt_raises_nvme_notif() {
+    log_test "iSCSI preempt raises a LID 0x80 Reservation Preempted on the NVMe host (#67)"
+    reset_lun_reservations
+    local dev="/dev/${NVME_DEVICE}n1"
+    nvme resv-register "$dev" --rrega=0 --nrkey=0xB2B2 >/dev/null 2>&1 \
+        || { log_error "NVMe resv-register failed"; return 1; }
+    nvme resv-acquire "$dev" --crkey=0xB2B2 --rtype=2 --racqa=0 >/dev/null 2>&1 \
+        || { log_error "NVMe resv-acquire (EA) failed"; return 1; }
+    # Drain the NVMe host's notification log so a stale entry can't
+    # masquerade as the one under test.
+    nvme resv-notif-log "$dev" >/dev/null 2>&1 || true
+    log_info "  NVMe registered + acquired (Exclusive Access)"
+
+    sg_persist --out --register --param-sark=0xA1A1 "$ISCSI_SG" >/dev/null 2>&1 \
+        || { log_error "iSCSI register failed"; return 1; }
+    # iSCSI host (key 0xA1A1) preempts the NVMe holder (sark 0xB2B2).
+    sg_persist --out --preempt --param-rk=0xA1A1 --param-sark=0xB2B2 --prout-type=2 \
+        "$ISCSI_SG" >/dev/null 2>&1 \
+        || { log_error "iSCSI preempt failed"; return 1; }
+    log_info "  iSCSI preempted the NVMe-held reservation"
+
+    if nvme resv-notif-log "$dev" >"$TEST_DIR/resv-notif.log" 2>&1; then
+        # The preempted holder gets Reservation Preempted (log page type 3).
+        if grep -qiE "Reservation Preempted|Type[^0-9]*:?[^0-9]*3" "$TEST_DIR/resv-notif.log"; then
+            log_info "  nvme resv-notif-log shows Reservation Preempted (type 3)"
+        else
+            log_error "  nvme resv-notif-log has no Reservation Preempted entry"
+            sed 's/^/    /' "$TEST_DIR/resv-notif.log" >&2
+            return 1
+        fi
+    else
+        log_error "  nvme resv-notif-log failed: $(cat "$TEST_DIR/resv-notif.log")"
+        return 1
+    fi
+
+    sg_persist --out --clear --param-rk=0xA1A1 "$ISCSI_SG" >/dev/null 2>&1 || true
+    return 0
+}
+
 main() {
     echo "========================================"
     echo "Thur VSA Dual-Transport (iSCSI + NVMe/TCP)"
@@ -313,7 +405,9 @@ main() {
     echo ""
 
     local passed=0 failed=0
-    for t in test_cross_transport_io test_iscsi_reservation_fences_nvme test_nvme_reservation_fences_iscsi; do
+    for t in test_cross_transport_io test_iscsi_reservation_fences_nvme \
+        test_nvme_reservation_fences_iscsi test_nvme_preempt_raises_iscsi_ua \
+        test_iscsi_preempt_raises_nvme_notif; do
         if "$t"; then ((passed++)); else ((failed++)); fi
         echo ""
     done
