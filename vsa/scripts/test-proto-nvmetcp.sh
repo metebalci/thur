@@ -95,6 +95,12 @@ USE_DHCHAP=0
 DHCHAP_KEY_STR=""
 DHCHAP_CTRL_STR=""
 
+# Snapshot the original args BEFORE the parse loop shifts them away —
+# the `keyctl session -` re-exec below (TLS runs only) needs them, and
+# by the time we reach it `$@` is empty. Without this a `--tls` run
+# silently re-execs with no args and degrades to the cleartext path.
+ORIG_ARGS=("$@")
+
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -125,7 +131,7 @@ done
 if [[ $USE_TLS -eq 1 && "${THURVSA_KEYRING_ISOLATED:-}" != "1" ]]; then
     if command -v keyctl >/dev/null 2>&1; then
         export THURVSA_KEYRING_ISOLATED=1
-        exec keyctl session - "$0" "$@"
+        exec keyctl session - "$0" "${ORIG_ARGS[@]}"
     fi
 fi
 
@@ -447,8 +453,17 @@ run_dhchap_wrong_secret() {
         log_info "could not generate a bogus key; skipping negative test"
         return
     fi
+    # In dhchap+tls mode the bogus attempt must still complete the TLS-PSK
+    # handshake (correct --tls-key) so it reaches the in-band DH-HMAC-CHAP
+    # phase and is refused THERE — which is what emits the dhchap.failure
+    # audit row. Without --tls it would die at the TLS handshake and never
+    # reach dhchap, so the audit assertion below would spuriously fail.
+    local tls_args=()
+    if [[ $USE_TLS -eq 1 ]]; then
+        tls_args+=(--tls --tls-key="$TLS_KEY_STR")
+    fi
     if nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
-        -n "$SUBNQN" --hostnqn "$HOST_NQN" --dhchap-secret "$bogus" \
+        -n "$SUBNQN" --hostnqn "$HOST_NQN" "${tls_args[@]}" --dhchap-secret "$bogus" \
         >"$TEST_DIR/nvme-connect-bogus.log" 2>&1; then
         log_fail "connect with a wrong secret SUCCEEDED (should be refused)"
         nvme disconnect -n "$SUBNQN" >/dev/null 2>&1
