@@ -200,14 +200,18 @@ impl StatusField {
         }
     }
 
-    /// Command-specific: Reservation Conflict (NVM Command Set
-    /// reservations). Returned when an I/O command is blocked by a
-    /// reservation held by another host, or when a reservation
-    /// command's key check fails — the protocol-native analog of
-    /// SCSI RESERVATION CONFLICT (0x18).
+    /// Generic: Reservation Conflict (NVM Command Set reservations,
+    /// NVMe Base §4.6.1.2.1 — Generic Command Status 0x83). Returned
+    /// when an I/O command is blocked by a reservation held by another
+    /// host, or when a reservation command's key check fails — the
+    /// protocol-native analog of SCSI RESERVATION CONFLICT (0x18). The
+    /// SCT must be Generic (0): the Linux `nvme` driver only maps
+    /// SC=0x83 to `BLK_STS_NEXUS` when SCT=0, and nvme-cli decodes the
+    /// Command-Specific 0x83 slot as an unrelated string ("Command Size
+    /// Limit Exceeded").
     pub fn reservation_conflict() -> Self {
         Self {
-            sct: StatusCodeType::CommandSpecific,
+            sct: StatusCodeType::Generic,
             sc: 0x83,
             dnr: true,
             ..Self::SUCCESS
@@ -247,12 +251,14 @@ mod tests {
     }
 
     #[test]
-    fn reservation_conflict_packs_command_specific_0x83() {
+    fn reservation_conflict_packs_generic_0x83() {
         let s = StatusField::reservation_conflict();
-        // SC 0x83 << 1 = 0x106; SCT 1 (CommandSpecific) << 9 = 0x200;
-        // DNR bit 15 = 0x8000.
-        assert_eq!(s.to_u16(), 0x8306);
-        assert_eq!(s.sct, StatusCodeType::CommandSpecific);
+        // SC 0x83 << 1 = 0x106; SCT 0 (Generic); DNR bit 15 = 0x8000.
+        // Must be Generic, not Command-Specific: the Linux nvme driver
+        // and nvme-cli only recognize SC=0x83 as Reservation Conflict
+        // when SCT=0 (NVMe Base §4.6.1.2.1).
+        assert_eq!(s.to_u16(), 0x8106);
+        assert_eq!(s.sct, StatusCodeType::Generic);
         assert_eq!(s.sc, 0x83);
     }
 }

@@ -202,9 +202,19 @@ test_cross_transport_io() {
     return 1
 }
 
+# Force the LUN to a clean reservation slate via the iSCSI sg device
+# (register-ignore a scratch key, then CLEAR wipes every registration +
+# the reservation). Keeps the two reservation tests independent so a
+# failure in one can't cascade a misleading failure into the other.
+reset_lun_reservations() {
+    sg_persist --out --register-ignore --param-sark=0xDEAD "$ISCSI_SG" >/dev/null 2>&1 || true
+    sg_persist --out --clear --param-rk=0xDEAD "$ISCSI_SG" >/dev/null 2>&1 || true
+}
+
 # Test 2a: iSCSI holds Write Exclusive -> NVMe host fenced.
 test_iscsi_reservation_fences_nvme() {
     log_test "iSCSI Write Exclusive fences the NVMe host's writes"
+    reset_lun_reservations
     sg_persist --out --register --param-sark=0xA1A1 "$ISCSI_SG" >/dev/null 2>&1 \
         || { log_error "iSCSI register failed"; return 1; }
     sg_persist --out --reserve --param-rk=0xA1A1 --prout-type=1 "$ISCSI_SG" >/dev/null 2>&1 \
@@ -252,6 +262,7 @@ test_iscsi_reservation_fences_nvme() {
 # Test 2b: NVMe holds Write Exclusive -> iSCSI host fenced.
 test_nvme_reservation_fences_iscsi() {
     log_test "NVMe Write Exclusive fences the iSCSI host's writes"
+    reset_lun_reservations
     local dev="/dev/${NVME_DEVICE}n1"
     nvme resv-register "$dev" --rrega=0 --nrkey=0xB2B2 >/dev/null 2>&1 \
         || { log_error "NVMe resv-register failed"; return 1; }
