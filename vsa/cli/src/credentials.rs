@@ -92,45 +92,104 @@ pub async fn target_clear() -> Result<()> {
     shared_cli_iscsi::target_clear(PRODUCT).await
 }
 
-// ---------- nvmetcp psks (VSA only) ----------
+// ---------- nvmetcp psks + dhchap (VSA only) ----------
+//
+// The TLS-PSK and DH-HMAC-CHAP CLI surfaces are daemon-routed mirrors:
+// build a JSON body, POST it to the admin socket, print an OK line. The
+// only per-surface differences — the API base path, the secret-format
+// validator, and the noun used in the OK messages — are captured in a
+// [`CredSurface`] descriptor so the two can't drift (issue #70). The
+// daemon enforces the actual lifecycle; this layer is presentation.
 
-pub async fn psks_list(json: bool) -> Result<()> {
+struct CredSurface {
+    /// Admin API base path, e.g. `/api/v1/nvmetcp/psks`.
+    base: &'static str,
+    /// Noun for OK messages, e.g. `PSK` / `DH-HMAC-CHAP secret`.
+    noun: &'static str,
+    /// Secret word used in the rotate messages: `key` / `secret`.
+    secret_word: &'static str,
+    /// Secret-format validator (interchange string / `DHHC-1:` secret),
+    /// returning the parser's error text on rejection.
+    validate: fn(&str) -> std::result::Result<(), String>,
+}
+
+const PSKS: CredSurface = CredSurface {
+    base: "/api/v1/nvmetcp/psks",
+    noun: "PSK",
+    secret_word: "key",
+    validate: v_interchange,
+};
+
+const DHCHAP: CredSurface = CredSurface {
+    base: "/api/v1/nvmetcp/dhchap",
+    noun: "DH-HMAC-CHAP secret",
+    secret_word: "secret",
+    validate: v_dhchap,
+};
+
+fn v_interchange(s: &str) -> std::result::Result<(), String> {
+    parse_interchange_key(s)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn v_dhchap(s: &str) -> std::result::Result<(), String> {
+    parse_dhchap_secret(s)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Discover the admin socket and refuse if the daemon is down — these
+/// credential verbs are daemon-routed only so the edit is always
+/// serialized + audited.
+async fn connect() -> Result<AdminClient> {
     let admin = AdminClient::auto_discover(PRODUCT);
     shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let resp: PsksListResponse = admin.get_json("/api/v1/nvmetcp/psks").await?;
+    Ok(admin)
+}
+
+async fn cred_list<T>(base: &str, json: bool, print_table: impl Fn(&T)) -> Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let admin = connect().await?;
+    let resp: T = admin.get_json(base).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        print_psks_table(&resp.psks);
+        print_table(&resp);
     }
     Ok(())
 }
 
-pub async fn psks_add(
+async fn cred_add(
+    s: &CredSurface,
     host_nqn: &str,
-    interchange_key: &str,
+    key: &str,
+    ctrl_key: Option<&str>,
     volumes: Option<&[String]>,
 ) -> Result<()> {
-    parse_interchange_key(interchange_key).map_err(|e| anyhow!("invalid --key: {e}"))?;
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let mut body = serde_json::json!({
-        "host_nqn": host_nqn,
-        "key": interchange_key,
-    });
+    (s.validate)(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+    if let Some(c) = ctrl_key {
+        (s.validate)(c).map_err(|e| anyhow!("invalid --ctrl-key: {e}"))?;
+    }
+    let admin = connect().await?;
+    let mut body = serde_json::json!({ "host_nqn": host_nqn, "key": key });
+    if let Some(c) = ctrl_key {
+        body["ctrl_key"] = serde_json::json!(c);
+    }
     if let Some(vs) = volumes {
         body["volumes"] = serde_json::json!(vs);
     }
-    let _: PskRow = admin.post_json("/api/v1/nvmetcp/psks", &body).await?;
-    println!("OK: PSK for host '{host_nqn}' added");
+    let _: serde_json::Value = admin.post_json(s.base, &body).await?;
+    println!("OK: {} for host '{host_nqn}' added", s.noun);
     Ok(())
 }
 
-pub async fn psks_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+async fn cred_grant(s: &CredSurface, host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
-    let _: PskRow = admin.post_json("/api/v1/nvmetcp/psks/grant", &body).await?;
+    let _: serde_json::Value = admin.post_json(&format!("{}/grant", s.base), &body).await?;
     println!(
         "OK: host '{host_nqn}' granted access to: {}",
         volumes.join(", ")
@@ -138,12 +197,11 @@ pub async fn psks_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub async fn psks_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+async fn cred_revoke(s: &CredSurface, host_nqn: &str, volumes: &[String]) -> Result<()> {
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
-    let _: PskRow = admin
-        .post_json("/api/v1/nvmetcp/psks/revoke", &body)
+    let _: serde_json::Value = admin
+        .post_json(&format!("{}/revoke", s.base), &body)
         .await?;
     println!(
         "OK: host '{host_nqn}' revoked access to: {}",
@@ -152,74 +210,107 @@ pub async fn psks_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub async fn psks_remove(host_nqn: &str) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+async fn cred_remove(s: &CredSurface, host_nqn: &str) -> Result<()> {
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn });
     admin
-        .post_unit("/api/v1/nvmetcp/psks/remove", &body)
+        .post_unit(&format!("{}/remove", s.base), &body)
         .await?;
-    println!("OK: PSK for host '{host_nqn}' removed");
+    println!("OK: {} for host '{host_nqn}' removed", s.noun);
     Ok(())
 }
 
-pub async fn psks_set_disabled(host_nqn: &str, disabled: bool) -> Result<()> {
+async fn cred_set_disabled(s: &CredSurface, host_nqn: &str, disabled: bool) -> Result<()> {
     let verb = if disabled { "disable" } else { "enable" };
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn });
-    let path = format!("/api/v1/nvmetcp/psks/{verb}");
-    admin.post_unit(&path, &body).await?;
-    println!("OK: PSK for host '{host_nqn}' {verb}d");
+    admin
+        .post_unit(&format!("{}/{verb}", s.base), &body)
+        .await?;
+    println!("OK: {} for host '{host_nqn}' {verb}d", s.noun);
     Ok(())
 }
 
-pub async fn psks_rotate(host_nqn: &str, interchange_key: &str, grace: &str) -> Result<()> {
-    parse_interchange_key(interchange_key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+async fn cred_rotate(s: &CredSurface, host_nqn: &str, key: &str, grace: &str) -> Result<()> {
+    (s.validate)(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
     let grace_secs = shared_cli_iscsi::parse_grace(grace)?;
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let admin = connect().await?;
     let body = serde_json::json!({
         "host_nqn": host_nqn,
-        "key": interchange_key,
+        "key": key,
         "grace_seconds": grace_secs,
     });
-    let row: PskRow = admin
-        .post_json("/api/v1/nvmetcp/psks/rotate", &body)
+    let row: RotateRow = admin
+        .post_json(&format!("{}/rotate", s.base), &body)
         .await?;
     let expires = row
         .previous_expires_at
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| "?".to_string());
     println!(
-        "OK: PSK for host '{host_nqn}' rotated; previous key honored until {expires} (grace {grace})"
+        "OK: {} for host '{host_nqn}' rotated; previous {} honored until {expires} (grace {grace})",
+        s.noun, s.secret_word
     );
     Ok(())
 }
 
-pub async fn psks_rotate_cancel(host_nqn: &str) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+async fn cred_rotate_cancel(s: &CredSurface, host_nqn: &str) -> Result<()> {
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn });
     admin
-        .post_unit("/api/v1/nvmetcp/psks/rotate/cancel", &body)
+        .post_unit(&format!("{}/rotate/cancel", s.base), &body)
         .await?;
-    println!("OK: PSK for host '{host_nqn}' rotation cancelled; previous key restored");
+    println!(
+        "OK: {} for host '{host_nqn}' rotation cancelled; previous {} restored",
+        s.noun, s.secret_word
+    );
     Ok(())
+}
+
+// ---------- nvmetcp psks (VSA only) ----------
+
+pub async fn psks_list(json: bool) -> Result<()> {
+    cred_list(PSKS.base, json, |r: &PsksListResponse| {
+        print_psks_table(&r.psks)
+    })
+    .await
+}
+
+pub async fn psks_add(host_nqn: &str, key: &str, volumes: Option<&[String]>) -> Result<()> {
+    cred_add(&PSKS, host_nqn, key, None, volumes).await
+}
+
+pub async fn psks_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    cred_grant(&PSKS, host_nqn, volumes).await
+}
+
+pub async fn psks_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
+    cred_revoke(&PSKS, host_nqn, volumes).await
+}
+
+pub async fn psks_remove(host_nqn: &str) -> Result<()> {
+    cred_remove(&PSKS, host_nqn).await
+}
+
+pub async fn psks_set_disabled(host_nqn: &str, disabled: bool) -> Result<()> {
+    cred_set_disabled(&PSKS, host_nqn, disabled).await
+}
+
+pub async fn psks_rotate(host_nqn: &str, key: &str, grace: &str) -> Result<()> {
+    cred_rotate(&PSKS, host_nqn, key, grace).await
+}
+
+pub async fn psks_rotate_cancel(host_nqn: &str) -> Result<()> {
+    cred_rotate_cancel(&PSKS, host_nqn).await
 }
 
 // ---------- nvmetcp dhchap (VSA only) ----------
 
 pub async fn dhchap_list(json: bool) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let resp: DhchapListResponse = admin.get_json("/api/v1/nvmetcp/dhchap").await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
-    } else {
-        print_dhchap_table(&resp.dhchap);
-    }
-    Ok(())
+    cred_list(DHCHAP.base, json, |r: &DhchapListResponse| {
+        print_dhchap_table(&r.dhchap)
+    })
+    .await
 }
 
 pub async fn dhchap_add(
@@ -228,128 +319,53 @@ pub async fn dhchap_add(
     ctrl_key: Option<&str>,
     volumes: Option<&[String]>,
 ) -> Result<()> {
-    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
-    if let Some(c) = ctrl_key {
-        parse_dhchap_secret(c).map_err(|e| anyhow!("invalid --ctrl-key: {e}"))?;
-    }
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let mut body = serde_json::json!({ "host_nqn": host_nqn, "key": key });
-    if let Some(c) = ctrl_key {
-        body["ctrl_key"] = serde_json::json!(c);
-    }
-    if let Some(vs) = volumes {
-        body["volumes"] = serde_json::json!(vs);
-    }
-    let _: DhchapRow = admin.post_json("/api/v1/nvmetcp/dhchap", &body).await?;
-    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' added");
-    Ok(())
+    cred_add(&DHCHAP, host_nqn, key, ctrl_key, volumes).await
 }
 
 pub async fn dhchap_grant(host_nqn: &str, volumes: &[String]) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
-    let _: DhchapRow = admin
-        .post_json("/api/v1/nvmetcp/dhchap/grant", &body)
-        .await?;
-    println!(
-        "OK: host '{host_nqn}' granted access to: {}",
-        volumes.join(", ")
-    );
-    Ok(())
+    cred_grant(&DHCHAP, host_nqn, volumes).await
 }
 
 pub async fn dhchap_revoke(host_nqn: &str, volumes: &[String]) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn, "volumes": volumes });
-    let _: DhchapRow = admin
-        .post_json("/api/v1/nvmetcp/dhchap/revoke", &body)
-        .await?;
-    println!(
-        "OK: host '{host_nqn}' revoked access to: {}",
-        volumes.join(", ")
-    );
-    Ok(())
+    cred_revoke(&DHCHAP, host_nqn, volumes).await
 }
 
 pub async fn dhchap_remove(host_nqn: &str) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn });
-    admin
-        .post_unit("/api/v1/nvmetcp/dhchap/remove", &body)
-        .await?;
-    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' removed");
-    Ok(())
+    cred_remove(&DHCHAP, host_nqn).await
 }
 
 pub async fn dhchap_set_disabled(host_nqn: &str, disabled: bool) -> Result<()> {
-    let verb = if disabled { "disable" } else { "enable" };
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn });
-    let path = format!("/api/v1/nvmetcp/dhchap/{verb}");
-    admin.post_unit(&path, &body).await?;
-    println!("OK: DH-HMAC-CHAP secret for host '{host_nqn}' {verb}d");
-    Ok(())
+    cred_set_disabled(&DHCHAP, host_nqn, disabled).await
 }
 
+pub async fn dhchap_rotate(host_nqn: &str, key: &str, grace: &str) -> Result<()> {
+    cred_rotate(&DHCHAP, host_nqn, key, grace).await
+}
+
+pub async fn dhchap_rotate_cancel(host_nqn: &str) -> Result<()> {
+    cred_rotate_cancel(&DHCHAP, host_nqn).await
+}
+
+// DH-HMAC-CHAP-only: controller secret (mutual auth). No PSK analog.
+
 pub async fn dhchap_set_ctrl_key(host_nqn: &str, key: &str) -> Result<()> {
-    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    (DHCHAP.validate)(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn, "ctrl_key": key });
-    let _: DhchapRow = admin
-        .post_json("/api/v1/nvmetcp/dhchap/ctrl-key/set", &body)
+    let _: serde_json::Value = admin
+        .post_json(&format!("{}/ctrl-key/set", DHCHAP.base), &body)
         .await?;
     println!("OK: controller secret set for host '{host_nqn}' (mutual auth enabled)");
     Ok(())
 }
 
 pub async fn dhchap_clear_ctrl_key(host_nqn: &str) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
+    let admin = connect().await?;
     let body = serde_json::json!({ "host_nqn": host_nqn });
     admin
-        .post_unit("/api/v1/nvmetcp/dhchap/ctrl-key/clear", &body)
+        .post_unit(&format!("{}/ctrl-key/clear", DHCHAP.base), &body)
         .await?;
     println!("OK: controller secret cleared for host '{host_nqn}' (mutual auth disabled)");
-    Ok(())
-}
-
-pub async fn dhchap_rotate(host_nqn: &str, key: &str, grace: &str) -> Result<()> {
-    parse_dhchap_secret(key).map_err(|e| anyhow!("invalid --key: {e}"))?;
-    let grace_secs = shared_cli_iscsi::parse_grace(grace)?;
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({
-        "host_nqn": host_nqn,
-        "key": key,
-        "grace_seconds": grace_secs,
-    });
-    let row: DhchapRow = admin
-        .post_json("/api/v1/nvmetcp/dhchap/rotate", &body)
-        .await?;
-    let expires = row
-        .previous_expires_at
-        .map(|t| t.to_rfc3339())
-        .unwrap_or_else(|| "?".to_string());
-    println!(
-        "OK: DH-HMAC-CHAP secret for host '{host_nqn}' rotated; previous secret honored until {expires} (grace {grace})"
-    );
-    Ok(())
-}
-
-pub async fn dhchap_rotate_cancel(host_nqn: &str) -> Result<()> {
-    let admin = AdminClient::auto_discover(PRODUCT);
-    shared_cli_iscsi::require_daemon(PRODUCT, &admin).await?;
-    let body = serde_json::json!({ "host_nqn": host_nqn });
-    admin
-        .post_unit("/api/v1/nvmetcp/dhchap/rotate/cancel", &body)
-        .await?;
-    println!("OK: DH-HMAC-CHAP rotation for host '{host_nqn}' cancelled; previous secret restored");
     Ok(())
 }
 
@@ -359,6 +375,13 @@ pub async fn dhchap_rotate_cancel(host_nqn: &str) -> Result<()> {
 // reach them without renaming.
 #[cfg(test)]
 use shared_cli_iscsi::{parse_grace, resolve_password};
+
+// Minimal rotate-response view — both surfaces' rows carry
+// `previous_expires_at`; serde ignores the rest.
+#[derive(serde::Deserialize)]
+struct RotateRow {
+    previous_expires_at: Option<DateTime<Utc>>,
+}
 
 // ---------- PSK wire/table types ----------
 
