@@ -24,6 +24,7 @@ the same commit whenever a YAML key is added or changed.**
 | `inventory.json` | `<data_dir>/library/` | VTL | JSON | daemon + `thurvtl changer` ops |
 | `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
+| `reservations.json` | `<data_dir>/` | both | JSON | daemon — persisted SCSI/NVMe PERSISTENT RESERVE state (PTPL); written on every APTPL/CPTPL-set reservation change, reloaded at start. No CLI verb; never hand-edited (a corrupt file is ignored and the daemon starts with empty reservation state). |
 
 The YAML conffile carries install-time and tuning knobs. The JSON files
 hold operationally-mutated, credential-bearing state and must never be
@@ -63,6 +64,7 @@ description — is available as `thurvtl config defaults` or
 |---|---|---|
 | `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen portal(s). Accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{address, tpgt}` objects — each entry binds its own listener and SendTargets advertises every entry as `TargetAddress=<address>,<tpgt>`, enabling multi-portal path redundancy without MC/S. Bare-string entries auto-assign sequential Target Portal Group Tags by input position (1, 2, …); object-form entries carry an explicit `tpgt`. Multiple portals sharing one TPGT (a group) is legal and is the prerequisite shape ALUA Target Port Groups will plug into; the same address listed twice is rejected. The Login Response `TargetPortalGroupTag` echoes the arrival portal's TPGT (RFC 7143 §12.10). Wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP. |
 | `iscsi.target_iqn` | `iqn.2025-10.com.metebalci:thurvtl` / `:thurvsa` | Target IQN advertised to initiators. |
+| `iscsi.reservations.initiator_port` | `iqn-isid` | Which initiator-port identity SCSI-3 persistent reservations key by. `iqn-isid` (default): the full, spec-literal iSCSI port (initiator IQN + ISID) — models per-path (`mpathpersist`-style) registration; a host reclaims a reservation across a reconnect only if it reuses its ISID (Windows / VMware / session reinstatement do). `iqn`: key by IQN alone (ISID ignored) — a host reclaims across any reconnect / target restart even if its ISID changes (open-iscsi mints a fresh ISID per login), at the cost of collapsing all of a host's concurrent sessions to one registrant. NVMe/TCP is unaffected (keys by the host-stable HOSTID). See [`docs/SPEC.md`](SPEC.md) § Persistent reservations. |
 | `iscsi.max_sessions` | `10` | Max concurrent iSCSI sessions. **VTL only.** |
 | `iscsi.session_timeout_seconds` | `300` | Per-session inactivity timeout. **VTL only.** |
 | `iscsi.auth.method` | `None` | `None` (unauthenticated) or `CHAP`. |

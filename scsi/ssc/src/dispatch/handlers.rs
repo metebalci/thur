@@ -1698,6 +1698,21 @@ fn pr_lu_not_supported() -> ScsiResp {
     )
 }
 
+/// HARDWARE ERROR / INTERNAL TARGET FAILURE (0x44) sense — the durable
+/// PTPL write failed, so the PROUT is not acknowledged GOOD.
+fn pr_internal_target_failure() -> ScsiResp {
+    ScsiResp::check_condition_with_sense(
+        scsi::sense::SenseDataBuilder::new(
+            scsi::sense::SenseKey::HardwareError,
+            scsi::sense::AdditionalSenseCode {
+                asc: 0x44,
+                ascq: 0x00,
+            },
+        )
+        .build(),
+    )
+}
+
 /// PERSISTENT RESERVE IN (SPC-4 §6.16, opcode 0x5E). Walks the shared
 /// [`scsi_spc::reservations::ReservationManager`] and answers READ KEYS
 /// / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS
@@ -1735,7 +1750,7 @@ pub fn handle_persistent_reserve_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
 /// are per-LUN, so the changer's are independent of every drive's
 /// (issue #53).
 pub fn handle_persistent_reserve_out(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    let nexus = Nexus::new(ctx.tsih, ctx.initiator_iqn.map(str::to_string));
+    let nexus = Nexus::iscsi(ctx.initiator_iqn.map(str::to_string), ctx.initiator_isid);
     // PROUT Data-Out (the 24-byte parameter list) is the drained
     // payload on the PDU, not a separate field.
     let Some(f) = reservations::parse_prout_cdb(&ctx.cdb, &ctx.pdu.data) else {
@@ -1757,6 +1772,9 @@ pub fn handle_persistent_reserve_out(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> 
         PrOutOutcome::InvalidFieldInCdb => pr_invalid_field_in_cdb(),
         PrOutOutcome::InvalidFieldInParameterList => pr_invalid_field_in_param_list(),
         PrOutOutcome::LuNotSupported => pr_lu_not_supported(),
+        // PTPL persist-before-ack failed: not GOOD — the host must know
+        // the reservation was not made durable.
+        PrOutOutcome::PersistFailed => pr_internal_target_failure(),
     })
 }
 

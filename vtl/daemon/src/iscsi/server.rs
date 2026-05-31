@@ -152,6 +152,12 @@ impl IscsiServer {
             target_iqn: self.config.iscsi.target_iqn.clone(),
             alua,
             reservations: Arc::clone(&self.state.reservations),
+            pr_collapse_isid: self
+                .config
+                .iscsi
+                .reservations
+                .initiator_port
+                .collapse_isid(),
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 

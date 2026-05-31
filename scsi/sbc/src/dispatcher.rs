@@ -72,6 +72,10 @@ pub struct SbcScsiDispatcher {
     /// `ActiveOptimized`, which is the truthful answer for a single
     /// host accessing a single advertised iSCSI portal.
     alua: Arc<AluaTopology>,
+    /// PR initiator-port policy (issue #57): when `true` the transport
+    /// collapses the ISID so reservations key by IQN alone. Sourced from
+    /// `iscsi.reservations.initiator_port`; default `false`.
+    pr_collapse_isid: bool,
 }
 
 impl SbcScsiDispatcher {
@@ -86,16 +90,32 @@ impl SbcScsiDispatcher {
             tpgt: 1,
         }];
         let alua = Arc::new(AluaTopology::from_portals(&portals, target_iqn.clone()));
-        Self::with_alua(registry, target_iqn, alua)
+        // In-memory reservation manager (PTPL not capable) + default
+        // (IQN, ISID) initiator port. Production injects a
+        // persistence-backed manager + the configured port policy via
+        // `with_alua`.
+        Self::with_alua(
+            registry,
+            target_iqn,
+            alua,
+            Arc::new(ReservationManager::new()),
+            false,
+        )
     }
 
     /// Production constructor: pass the `AluaTopology` built from the
     /// daemon's `iscsi.listen_portals` so VPD 0x83 / VPD 0x86 / REPORT
-    /// TPG reflect the real portal layout.
+    /// TPG reflect the real portal layout, the shared (PTPL-backed)
+    /// `ReservationManager` the daemon loads from
+    /// `<data_dir>/reservations.json`, and the PR initiator-port policy
+    /// (`pr_collapse_isid`) from `iscsi.reservations.initiator_port`
+    /// (issue #57).
     pub fn with_alua(
         registry: Arc<dyn VolumeLookup>,
         target_iqn: String,
         alua: Arc<AluaTopology>,
+        reservations: Arc<ReservationManager>,
+        pr_collapse_isid: bool,
     ) -> Self {
         let tokens = Arc::new(TokenManager::new());
         // Best-effort sweeper: only spawns when called from within a
@@ -121,10 +141,11 @@ impl SbcScsiDispatcher {
         Self {
             registry,
             target_iqn,
-            reservations: Arc::new(ReservationManager::new()),
+            reservations,
             caw_locks: Arc::new(CawLocks::new()),
             tokens,
             alua,
+            pr_collapse_isid,
         }
     }
 
@@ -223,6 +244,10 @@ impl shared_iscsi::ScsiHandler for SbcScsiDispatcher {
         &self.target_iqn
     }
 
+    fn pr_collapse_isid(&self) -> bool {
+        self.pr_collapse_isid
+    }
+
     async fn dispatch(&self, req: shared_iscsi::ScsiRequest<'_>) -> shared_iscsi::ScsiResponse {
         // shared-iscsi's ScsiRequest collapsed into scsi-spc's
         // (Step 5.A.2); thurvsa's local alias resolves to the same
@@ -230,14 +255,11 @@ impl shared_iscsi::ScsiHandler for SbcScsiDispatcher {
         self.dispatch(req).await
     }
 
-    fn on_session_close(&self, tsih: u16, _cid: u16) {
-        // SPC-4 §5.13.4.2: persistent reservation registrations are
-        // released when the I_T nexus that registered them goes away.
-        // The shared transport invokes this once per connection on
-        // logout / TCP drop / CmdSN-window violation; we drop every
-        // registration keyed on the (tsih, *) pair across every LUN.
-        self.reservations.drop_nexus(tsih);
-    }
+    // No `on_session_close` override: persistent reservations survive
+    // I_T nexus loss (SPC-4) and are keyed by the stable initiator port
+    // (IQN + ISID), so a logout / TCP drop must not evict them. They are
+    // removed only by an explicit PROUT or, when APTPL=0, a daemon
+    // restart (issue #57). VSA has no other per-session resources.
 }
 
 #[cfg(test)]
@@ -344,6 +366,7 @@ mod tests {
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             cid: 0,
             peer: "",
             session_partition: None,
@@ -429,6 +452,7 @@ mod tests {
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             cid: 0,
             peer: "",
             session_partition: None,
@@ -520,6 +544,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -539,6 +564,7 @@ mod tests {
                 data_in_max: 64 * 1024,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -607,6 +633,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -641,6 +668,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -676,6 +704,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -707,6 +736,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -727,6 +757,7 @@ mod tests {
                 data_in_max: 64 * 1024,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,

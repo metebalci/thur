@@ -415,6 +415,19 @@ async fn main() -> Result<()> {
     // into the upload queue ahead of fresh traffic.
     upload_worker::scan_and_enqueue_localonly(&data_dir, &registry, &upload_tx).await;
 
+    // PERSISTENT RESERVE state (PTPL, issue #57). Reload any persisted
+    // reservations from `<data_dir>/reservations.json`, keyed by stable
+    // volume UUID (resolved to the current LUN via the registry so a
+    // reused LUN never inherits a deleted volume's fence), and keep
+    // persisting APTPL/CPTPL-set mutations. Built here — after discovery
+    // populates the registry and before either transport's dispatcher —
+    // and shared by the SBC and NVMe arms (only one runs per boot, but
+    // the manager carries no single-transport assumption).
+    let reservations = Arc::new(scsi_spc::reservations::ReservationManager::load_from(
+        data_dir.join("reservations.json"),
+        Arc::new(registry::VolumeUuidResolver::new(Arc::clone(&registry))),
+    ));
+
     // Per-volume write-back flush workers. Each cache wakes on its
     // own dirty notification + a periodic tick; the workers exit
     // when `request_shutdown` is called below. JoinHandles get
@@ -498,6 +511,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
                 target_iqn.clone(),
                 alua,
+                Arc::clone(&reservations),
+                cfg.iscsi.reservations.initiator_port.collapse_isid(),
             ));
             tracing::info!(
                 "thurvsad: SBC-3 dispatcher ready ({} LUN(s))",
@@ -583,6 +598,7 @@ async fn main() -> Result<()> {
                 // visible to `nvme id-ctrl`).
                 THURVSA_VERSION_STR.to_string(),
                 Arc::clone(&aer_hub),
+                Arc::clone(&reservations),
             ));
             tracing::info!(
                 "thurvsad: NVMe NVM dispatcher ready ({} NSID(s))",
@@ -673,6 +689,7 @@ async fn main() -> Result<()> {
         backpressure_deadline,
         upload_tx: upload_tx.clone(),
         sessions: Arc::clone(&session_manager),
+        reservations: Arc::clone(&reservations),
     };
     let admin_socket = admin::admin_socket_path();
 

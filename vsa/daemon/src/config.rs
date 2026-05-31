@@ -314,6 +314,11 @@ pub struct IscsiSettings {
     pub target_iqn: Option<String>,
     #[serde(default)]
     pub auth: AuthSettings,
+    /// Persistent-reservation tuning (issue #57). `initiator_port`
+    /// selects whether reservations key by the full iSCSI port
+    /// (IQN + ISID, default) or by IQN alone.
+    #[serde(default)]
+    pub reservations: shared_iscsi::transport::ReservationSettings,
 }
 
 /// Accept either a single TCP address (scalar) or a list of portal

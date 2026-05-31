@@ -190,6 +190,20 @@ iscsi:
   listen: "0.0.0.0:3260"
   # iSCSI Qualified Name advertised to initiators.
   target_iqn: "iqn.2025-10.com.metebalci:thurvtl"
+  # Persistent-reservation (SCSI-3 PR / PTPL) tuning.
+  reservations:
+    # Which initiator-port identity persistent reservations key by:
+    #   iqn-isid (default) - the full, spec-literal iSCSI initiator port
+    #     (initiator IQN + ISID). Models per-path (mpathpersist-style)
+    #     registration; a host reclaims a reservation across a reconnect
+    #     only if it reuses its ISID (Windows / VMware / session
+    #     reinstatement do).
+    #   iqn - key by IQN alone (the ISID is ignored). A host reclaims
+    #     its reservation across any reconnect / target restart even if
+    #     its ISID changes (open-iscsi mints a fresh ISID per login), at
+    #     the cost of treating all of that host's concurrent sessions as
+    #     a single registrant. Recommended for open-iscsi clusters.
+    initiator_port: iqn-isid
   # Maximum concurrent iSCSI sessions.
   max_sessions: 10
   # Per-session inactivity timeout in seconds.

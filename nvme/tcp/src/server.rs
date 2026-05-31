@@ -575,10 +575,11 @@ where
     // Deliberately NOT touched here: reservation state. NVMe
     // reservations are keyed by HOSTID and a host spans many
     // connections; tearing down one connection must not drop the
-    // host's registration / reservation (unlike the iSCSI
-    // `on_session_close -> drop_nexus` path). Release happens only on
-    // explicit Reservation Release / Register-unregister / Preempt, or
-    // a daemon restart.
+    // host's registration / reservation. The iSCSI side now matches
+    // this: persistent registrations are keyed by the stable initiator
+    // port (IQN + ISID) and survive nexus loss too (issue #57). Release
+    // happens only on explicit Reservation Release / Register-unregister
+    // / Preempt, or — when PTPL/APTPL is not set — a daemon restart.
     commands.lock().await.clear();
     // Surrender this connection's controller association: its parked
     // AERs are released (oneshot senders drop, unblocking the delivery

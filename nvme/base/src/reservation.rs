@@ -35,8 +35,12 @@ pub const RRELA_CLEAR: u8 = 1;
 
 /// CPTPL (Change Persist Through Power Loss State), Register
 /// CDW10[31:30]. `0b00` = no change, `0b10` = clear PTPL, `0b11` =
-/// set PTPL. We don't support PTPL, so a "set" request is rejected by
-/// the adapter (mirror of the SCSI APTPL=1 reject).
+/// set PTPL. The adapter maps no-change / clear / set onto the shared
+/// manager's per-LU APTPL bit (issue #57); a set request is honored
+/// when persistence is wired and rejected otherwise (mirror of the
+/// SCSI APTPL=1 reject).
+pub const CPTPL_NO_CHANGE: u8 = 0b00;
+pub const CPTPL_CLEAR: u8 = 0b10;
 pub const CPTPL_PERSIST: u8 = 0b11;
 
 /// Reservation Status Data Structure header length (both forms).
@@ -164,14 +168,16 @@ pub fn reservation_status(
     rtype_nvme: u8,
     entries: &[ReportEntry],
     eds: bool,
+    ptpls: bool,
 ) -> Vec<u8> {
     let entry_len = if eds { REG_CTLR_EXT_LEN } else { REG_CTLR_LEN };
     let mut out = vec![0u8; STATUS_HEADER_LEN + entries.len() * entry_len];
     out[0..4].copy_from_slice(&generation.to_le_bytes());
     out[4] = rtype_nvme;
     out[5..7].copy_from_slice(&(entries.len() as u16).to_le_bytes()); // REGCTL
-    // bytes 7..9 reserved; byte 9 PTPLS = 0 (PTPL not supported);
-    // bytes 10..24 reserved.
+    // bytes 7..9 reserved; byte 9 PTPLS = current Persist Through Power
+    // Loss State for the namespace (issue #57); bytes 10..24 reserved.
+    out[9] = u8::from(ptpls);
     for (i, e) in entries.iter().enumerate() {
         let base = STATUS_HEADER_LEN + i * entry_len;
         let entry = &mut out[base..base + entry_len];
@@ -246,13 +252,13 @@ mod tests {
             hostid,
             rkey: 0xDEAD_BEEF,
         }];
-        let buf = reservation_status(7, 1, &entries, false);
+        let buf = reservation_status(7, 1, &entries, false, false);
         assert_eq!(buf.len(), STATUS_HEADER_LEN + REG_CTLR_LEN);
         // Header
         assert_eq!(&buf[0..4], &7u32.to_le_bytes()); // GEN
         assert_eq!(buf[4], 1); // RTYPE
         assert_eq!(&buf[5..7], &1u16.to_le_bytes()); // REGCTL
-        assert_eq!(buf[9], 0); // PTPLS
+        assert_eq!(buf[9], 0); // PTPLS = 0 (ptpls arg false)
         // Entry
         let e = &buf[STATUS_HEADER_LEN..];
         assert_eq!(&e[0..2], &1u16.to_le_bytes()); // CNTLID
@@ -270,8 +276,10 @@ mod tests {
             hostid,
             rkey: 0x1234_5678,
         }];
-        let buf = reservation_status(3, 2, &entries, true);
+        // ptpls=true here: PTPLS (byte 9) must reflect it.
+        let buf = reservation_status(3, 2, &entries, true, true);
         assert_eq!(buf.len(), STATUS_HEADER_LEN + REG_CTLR_EXT_LEN);
+        assert_eq!(buf[9], 1); // PTPLS = 1
         let e = &buf[STATUS_HEADER_LEN..];
         assert_eq!(&e[0..2], &1u16.to_le_bytes()); // CNTLID
         assert_eq!(e[2], 0); // not holder
@@ -281,7 +289,7 @@ mod tests {
 
     #[test]
     fn status_empty_is_header_only() {
-        let buf = reservation_status(0, 0, &[], false);
+        let buf = reservation_status(0, 0, &[], false, false);
         assert_eq!(buf.len(), STATUS_HEADER_LEN);
         assert_eq!(&buf[5..7], &0u16.to_le_bytes());
     }

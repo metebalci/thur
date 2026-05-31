@@ -18,20 +18,40 @@
 //! ## State model
 //!
 //! Per LUN, the manager tracks:
-//! - a set of **registrations** keyed by I_T nexus (TSIH +
-//!   initiator IQN) — many-to-one between nexuses and reservation
-//!   keys is supported (cooperating MPIO endpoints share a key);
+//! - a set of **registrations** keyed by the stable initiator-port
+//!   identity (iSCSI: initiator IQN + ISID; NVMe: the 128-bit HOSTID)
+//!   — many-to-one between ports and reservation keys is supported
+//!   (cooperating MPIO endpoints share a key);
 //! - at most one **reservation** naming the holder nexus, the
 //!   reservation key, and the type (0x01-0x08);
 //! - a `PR_GENERATION` counter (SPC-4 §6.13.1.1) that increments
 //!   on every successful PROUT.
 //!
-//! ## Persistence
+//! ## Persistence (PTPL)
 //!
-//! In-memory only. PTPL (persist through power loss) is advertised
-//! as not capable in REPORT CAPABILITIES, so a daemon restart is
-//! visible to initiators — they re-register on reconnect, which is
-//! the well-trodden recovery path.
+//! Registrations and reservations always survive I_T nexus loss
+//! (logout / connection drop) — they are keyed by the stable
+//! initiator-port identity, not a session handle. *Power-loss* /
+//! daemon-restart persistence (SPC-4 PTPL / NVMe CPTPL) is opt-in per
+//! logical unit:
+//!
+//! - A manager built with [`ReservationManager::new`] is in-memory only
+//!   ([`ReservationManager::ptpl_capable`] is false); PTPL_C / RESCAP
+//!   bit 0 are advertised as not capable and an `APTPL=1` / `CPTPL=set`
+//!   request is rejected. This is the unit-test / no-data-dir mode.
+//! - A manager built with [`ReservationManager::load_from`] (or
+//!   [`ReservationManager::with_persistence`]) writes each LU whose
+//!   most-recent REGISTER set `APTPL=1` (SPC-4 §5.12.3 — the most-recent
+//!   REGISTER governs the whole LU) to `<data_dir>/reservations.json`.
+//!   The durable write (serialize -> fsync file -> rename -> fsync
+//!   parent dir) completes *before* the owning PROUT / Reservation
+//!   Register is acknowledged GOOD (persist-before-ack); a write failure
+//!   surfaces as [`PrOutOutcome::PersistFailed`] rather than a false ack.
+//!   At boot the file is rehydrated fail-safe (a corrupt / unparseable /
+//!   foreign file logs a warning and starts empty — it never wedges the
+//!   daemon). The record is keyed by a stable per-entity UUID resolved
+//!   to the current LUN via an [`EntityResolver`], so a reused LUN never
+//!   inherits a defunct volume's fence.
 //!
 //! ## Scope coverage
 //!
@@ -40,30 +60,43 @@
 //! exercise them.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::pr::ReservationType;
 
 /// Registrant identity. A registration (and any reservation it
-/// holds) is named by the transport-specific identity of the host
-/// that created it:
+/// holds) is named by the **stable initiator-port identity** of the
+/// host that created it — never by an ephemeral session handle:
 ///
-/// - **iSCSI** I_T nexus: `(tsih, iqn)`. TSIH alone is sufficient for
-///   uniqueness within a running daemon (the session manager
-///   allocates them monotonically), but the IQN is preserved so READ
-///   FULL STATUS can render an iSCSI-format TransportID and audit can
-///   name the peer. Dropped on session close (see [`ReservationManager::drop_nexus`]).
+/// - **iSCSI** initiator port: `(iqn, isid)`. The SCSI TransportID for
+///   an iSCSI initiator port is the initiator IQN plus the ISID
+///   (RFC 7143 / SPC-4 §7.6.4.7). The initiator chooses its ISID and
+///   reuses it for session reinstatement, so `(IQN, ISID)` is stable
+///   across logout *and* daemon restart, and it distinguishes MPIO
+///   paths correctly. The target-assigned TSIH is deliberately **not**
+///   part of identity: it is a per-process counter reset to 1 on every
+///   daemon start, so keying registrants by it dropped every
+///   reservation on restart (issue #57) and forced re-registration
+///   after a reconnect (a deviation — SPC-4 persistent reservations
+///   survive I_T nexus loss).
 /// - **NVMe** host: the 128-bit Host Identifier from the Fabrics
 ///   Connect data. One NVMe host opens many controller/queue
 ///   associations (each its own TCP connection) under a single
-///   HOSTID, so the registrant is the *host*, not the connection —
-///   and unlike the iSCSI nexus it does **not** drop on connection
-///   teardown. A registration persists until explicit Release /
-///   Register-unregister / Preempt (or daemon restart, since PTPL is
-///   not advertised).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///   HOSTID, so the registrant is the *host*, not the connection.
+///
+/// Under both transports a registration persists until an explicit
+/// Release / unregister / Preempt / Clear (or, only when APTPL/CPTPL
+/// is not set, a daemon restart). Connection teardown never removes it.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum RegistrantId {
-    Iscsi { tsih: u16, iqn: Option<String> },
+    Iscsi { iqn: Option<String>, isid: [u8; 6] },
     NvmeHost { hostid: [u8; 16] },
 }
 
@@ -72,13 +105,13 @@ pub enum RegistrantId {
 pub type Nexus = RegistrantId;
 
 impl RegistrantId {
-    /// Build an iSCSI I_T nexus from `tsih` + the login-advertised
-    /// IQN. (Named `new` so the existing `Nexus::new` call sites in
-    /// the SCSI dispatchers keep working unchanged.)
-    pub fn new(tsih: u16, initiator_iqn: Option<String>) -> Self {
+    /// Build an iSCSI initiator-port identity from the login-advertised
+    /// IQN + ISID. The TSIH is intentionally not taken — it is not part
+    /// of the registrant identity (see the type docs).
+    pub fn iscsi(initiator_iqn: Option<String>, isid: [u8; 6]) -> Self {
         Self::Iscsi {
-            tsih,
             iqn: initiator_iqn,
+            isid,
         }
     }
 
@@ -104,6 +137,12 @@ pub enum PrOutOutcome {
     InvalidFieldInParameterList,
     /// CHECK CONDITION / ILLEGAL REQUEST — LOGICAL UNIT NOT SUPPORTED.
     LuNotSupported,
+    /// The state mutation succeeded in memory but the durable write to
+    /// the persistence file failed (PTPL persist-before-ack). The owning
+    /// PROUT / Reservation Register MUST NOT be acknowledged GOOD —
+    /// adapters map this to CHECK CONDITION / HARDWARE ERROR (SCSI:
+    /// INTERNAL TARGET FAILURE) or NVMe Internal Error.
+    PersistFailed,
 }
 
 /// Outcome of a PERSISTENT RESERVE IN. On success carries the
@@ -133,6 +172,10 @@ pub struct ReservationSnapshot {
     pub holder: Option<RegistrantId>,
     /// `(registrant, reservation key)` in stable BTreeMap order.
     pub registrants: Vec<(RegistrantId, u64)>,
+    /// Current Persist Through Power Loss state for this LU (the
+    /// most-recent REGISTER's APTPL/CPTPL). Rendered as the NVMe
+    /// Reservation Report PTPLS field.
+    pub aptpl: bool,
 }
 
 /// Parsed PERSISTENT RESERVE OUT CDB + Data-Out fields. Both
@@ -181,7 +224,7 @@ struct ReservationState {
     r#type: ReservationType,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LunState {
     /// `registrant -> reservation key`. Ordered map so READ KEYS /
     /// READ FULL STATUS render in a stable order across runs —
@@ -191,6 +234,12 @@ struct LunState {
     reservation: Option<ReservationState>,
     /// SPC-4 §6.13.1.1 PR_GENERATION. Wraps on overflow per spec.
     generation: u32,
+    /// APTPL (SCSI) / CPTPL-set (NVMe): when true this LU's PR state is
+    /// persisted across power loss / daemon restart. Set by the
+    /// most-recent REGISTER (SPC-4 §5.12.3 — the most-recent REGISTER's
+    /// APTPL governs the entire logical unit). Does not affect
+    /// persistence across nexus loss, which is unconditional.
+    aptpl: bool,
 }
 
 impl LunState {
@@ -205,6 +254,61 @@ impl LunState {
     fn is_registered(&self, id: &RegistrantId) -> bool {
         self.registration_key(id).is_some()
     }
+
+    /// A LU is written to the persistence file iff its host asked for
+    /// power-loss persistence (APTPL/CPTPL) AND it has live state.
+    /// Omitting an empty LU (post-CLEAR) or an `aptpl=false` LU from the
+    /// rewrite is exactly the "delete the on-disk record on CLEAR / on
+    /// APTPL->0" behavior (SPC-4 §5.12.3 / NVMe CPTPL clear).
+    fn persist_eligible(&self) -> bool {
+        self.aptpl && (!self.registrations.is_empty() || self.reservation.is_some())
+    }
+}
+
+/// Maps the manager's runtime per-entity key (`lun`) to a stable,
+/// restart-invariant identity (a 16-byte UUID) and back. The
+/// persistence file is keyed by the UUID, not the LUN, because a LUN
+/// number is *not* stable: thurvsa reclaims the lowest free LUN on
+/// volume delete, so persisting by LUN would let a deleted volume's
+/// fence land on whatever new volume reused its number. The resolver
+/// lets the (product-neutral) manager translate without knowing about
+/// volumes or the chassis. thurvsa implements it over its
+/// `VolumeRegistry` (manifest UUID); thurvtl uses [`LunIdentity`]
+/// because its drive / changer LUNs are themselves the stable identity.
+pub trait EntityResolver: Send + Sync {
+    /// Stable UUID for a live LUN, or `None` if the LUN is unknown
+    /// (e.g. its volume was deleted) — such records are not persisted.
+    fn uuid_for_lun(&self, lun: u64) -> Option<[u8; 16]>;
+    /// Current LUN for a persisted UUID, or `None` if the entity no
+    /// longer exists — its persisted record is then dropped at load.
+    fn lun_for_uuid(&self, uuid: &[u8; 16]) -> Option<u64>;
+}
+
+/// [`EntityResolver`] for targets where the LUN itself is the stable
+/// identity (thurvtl's fixed drive / changer LUNs, declared by the
+/// chassis topology and reconciled at every start). The UUID is just
+/// the LUN in the low 8 bytes, big-endian, with the high 8 bytes zero.
+pub struct LunIdentity;
+
+impl EntityResolver for LunIdentity {
+    fn uuid_for_lun(&self, lun: u64) -> Option<[u8; 16]> {
+        let mut u = [0u8; 16];
+        u[8..16].copy_from_slice(&lun.to_be_bytes());
+        Some(u)
+    }
+    fn lun_for_uuid(&self, uuid: &[u8; 16]) -> Option<u64> {
+        if uuid[0..8] != [0u8; 8] {
+            return None;
+        }
+        Some(u64::from_be_bytes(uuid[8..16].try_into().expect("8 bytes")))
+    }
+}
+
+/// Power-loss persistence wiring. Present iff the manager was built
+/// with a data dir; absent for the in-memory `new()` mode.
+struct Persist {
+    path: PathBuf,
+    resolver: Arc<dyn EntityResolver>,
 }
 
 /// Per-LUN registration / reservation state, mediated by a single
@@ -213,6 +317,9 @@ impl LunState {
 /// locking would just be ceremony.
 pub struct ReservationManager {
     by_lun: Mutex<BTreeMap<u64, LunState>>,
+    /// `None` = in-memory only (PTPL not capable). `Some` = persist
+    /// APTPL/CPTPL-set LUs to disk (persist-before-ack).
+    persist: Option<Persist>,
 }
 
 impl Default for ReservationManager {
@@ -222,54 +329,112 @@ impl Default for ReservationManager {
 }
 
 impl ReservationManager {
+    /// In-memory only: no power-loss persistence (PTPL advertised as not
+    /// capable; `APTPL=1` / `CPTPL=set` rejected). Used by unit tests and
+    /// any caller without a data dir.
     pub fn new() -> Self {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
+            persist: None,
         }
     }
 
-    /// Drop every registration owned by `tsih` across every LUN.
-    /// Called from `ScsiHandler::on_session_close`. SPC-4 §5.13.4.2:
-    /// when an I_T nexus disappears its registrations vanish; for
-    /// non-AR reservations held by that nexus the reservation also
-    /// releases. AR reservations persist as long as any other
-    /// registrant remains — we just rotate the recorded holder
-    /// stamp to one of the survivors.
-    pub fn drop_nexus(&self, tsih: u16) {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        for state in map.values_mut() {
-            let removed: Vec<RegistrantId> = state
-                .registrations
-                .keys()
-                .filter(|id| matches!(id, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih))
-                .cloned()
-                .collect();
-            let holder_is_tsih = state.reservation.as_ref().is_some_and(
-                |r| matches!(&r.holder, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih),
-            );
-            if removed.is_empty() && !holder_is_tsih {
-                continue;
-            }
-            for k in &removed {
-                state.registrations.remove(k);
-            }
-            if let Some(r) = state.reservation.clone()
-                && matches!(&r.holder, RegistrantId::Iscsi { tsih: t, .. } if *t == tsih)
-            {
-                if r.r#type.is_all_registrants()
-                    && let Some((id, key)) = state.registrations.iter().next()
-                {
-                    state.reservation = Some(ReservationState {
-                        holder: id.clone(),
-                        key: *key,
-                        r#type: r.r#type,
-                    });
-                } else {
-                    state.reservation = None;
-                }
-            }
-            state.bump_generation();
+    /// Persistence-enabled but starting from empty state. Mutations to
+    /// an APTPL=1 LU are written to `path` (atomic + parent-dir fsync)
+    /// before their PROUT / Reservation Register is acknowledged.
+    /// Prefer [`Self::load_from`], which also rehydrates an existing
+    /// file at boot.
+    pub fn with_persistence(path: PathBuf, resolver: Arc<dyn EntityResolver>) -> Self {
+        Self {
+            by_lun: Mutex::new(BTreeMap::new()),
+            persist: Some(Persist { path, resolver }),
         }
+    }
+
+    /// Persistence-enabled, rehydrating any existing on-disk state.
+    /// Fail-safe: a missing file starts empty (first boot); a truncated
+    /// / unparseable / unknown-version file logs a warning and starts
+    /// empty (never panics, never blocks boot). Each persisted record is
+    /// resolved UUID -> current LUN via `resolver`; a record whose entity
+    /// no longer exists is dropped (closes the LUN-reuse fencing hole).
+    pub fn load_from(path: PathBuf, resolver: Arc<dyn EntityResolver>) -> Self {
+        let by_lun = load_file(&path, resolver.as_ref());
+        Self {
+            by_lun: Mutex::new(by_lun),
+            persist: Some(Persist { path, resolver }),
+        }
+    }
+
+    /// True when power-loss persistence is wired (a data dir is present).
+    /// Gates the PTPL_C (SCSI) / RESCAP bit 0 (NVMe) advertisement and
+    /// the `APTPL=1` / `CPTPL=set` accept so the advertised capability
+    /// can never diverge from the actual behavior.
+    pub fn ptpl_capable(&self) -> bool {
+        self.persist.is_some()
+    }
+
+    /// Drop a single LUN's reservation state, in memory and on disk.
+    /// Called when a volume is deleted (thurvsa `volume destroy`): it
+    /// removes the in-memory entry so a later volume that reuses this
+    /// LUN number can't inherit the gone volume's fence (the live
+    /// counterpart of the load-time UUID validation), and rewrites the
+    /// persistence file without it. No-op when the LUN has no state.
+    pub fn purge_lun(&self, lun: u64) {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        if map.remove(&lun).is_none() {
+            return;
+        }
+        if let Some(persist) = &self.persist
+            && let Err(e) = persist_to_disk(&map, persist)
+        {
+            warn!("reservations: rewrite after purging LUN {lun} failed ({e})");
+        }
+    }
+
+    /// Run one state mutation under the lock with persist-before-ack
+    /// semantics. On a successful (`Good`) mutation that changes the
+    /// persisted set (the LU was or becomes persist-eligible), the file
+    /// is rewritten and fsynced before returning; if that durable write
+    /// fails the **in-memory mutation is rolled back** and the call maps
+    /// to [`PrOutOutcome::PersistFailed`], so the state matches what the
+    /// host was told (persist-before-ack: a fence the host believes
+    /// failed must not silently linger and fence its peers, nor would it
+    /// survive a restart). Non-`Good` outcomes never touch disk (the
+    /// handlers mutate nothing on conflict).
+    fn mutate<F>(&self, lun: u64, f: F) -> PrOutOutcome
+    where
+        F: FnOnce(&mut LunState) -> PrOutOutcome,
+    {
+        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+        let was_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
+        // Snapshot the entry (or its absence) so a failed durable write
+        // can be rolled back atomically.
+        let prior = map.get(&lun).cloned();
+        let outcome = f(map.entry(lun).or_default());
+        if outcome != PrOutOutcome::Good {
+            return outcome;
+        }
+        if let Some(persist) = &self.persist {
+            let now_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
+            if (was_eligible || now_eligible)
+                && let Err(e) = persist_to_disk(&map, persist)
+            {
+                warn!(
+                    "reservations: durable persist to {} failed ({e}); rolling back the mutation",
+                    persist.path.display()
+                );
+                match prior {
+                    Some(state) => {
+                        map.insert(lun, state);
+                    }
+                    None => {
+                        map.remove(&lun);
+                    }
+                }
+                return PrOutOutcome::PersistFailed;
+            }
+        }
+        outcome
     }
 
     /// Allow / deny a READ-side opcode. The data path calls this
@@ -334,7 +499,9 @@ impl ReservationManager {
         let body = match service_action {
             0x00 => render_read_keys(state),
             0x01 => render_read_reservation(state),
-            0x02 => render_report_capabilities(),
+            // PTPL_C reflects whether this manager can persist at all;
+            // PTPL_A reflects this LU's currently-active APTPL bit.
+            0x02 => render_report_capabilities(self.ptpl_capable(), state.is_some_and(|s| s.aptpl)),
             0x03 => render_read_full_status(state),
             _ => return PrInOutcome::InvalidFieldInCdb,
         };
@@ -388,21 +555,33 @@ impl ReservationManager {
         let spec_i_pt = (p[20] & 0x08) != 0;
         let all_tg_pt = (p[20] & 0x04) != 0;
 
-        // We don't support multi-port / SPEC_I_PT / APTPL — every
-        // initiator we care about (Windows Failover Cluster, VMware,
-        // fence_scsi, clustered backup) sets APTPL=0 and doesn't use
-        // SPEC_I_PT. Surface the truthful error so a host that does
-        // request these features doesn't proceed believing they were
-        // honored.
-        if aptpl || spec_i_pt || all_tg_pt {
+        // SPEC_I_PT and ALL_TG_PT remain unsupported (single target
+        // port, no multi-port registration) — reject them truthfully.
+        // APTPL is honored when persistence is wired; reject APTPL=1
+        // only when this manager cannot actually persist, so the
+        // advertised PTPL_C and the behavior can never diverge.
+        if spec_i_pt || all_tg_pt {
+            return PrOutOutcome::InvalidFieldInParameterList;
+        }
+        if aptpl && !self.ptpl_capable() {
             return PrOutOutcome::InvalidFieldInParameterList;
         }
 
         // Dispatch to the shared semantic ops (which lock + mutate
         // per-LUN state). These are the single code path — the NVMe
-        // adapter drives the same ops with its own parsed fields.
+        // adapter drives the same ops with its own parsed fields. The
+        // APTPL bit is meaningful only for REGISTER / REGISTER AND
+        // IGNORE EXISTING KEY (SPC-4 §6.14.3); other SAs leave the LU's
+        // persist setting untouched.
         match service_action {
-            0x00 => self.register(lun, nexus, reservation_key, service_action_key, false),
+            0x00 => self.register(
+                lun,
+                nexus,
+                reservation_key,
+                service_action_key,
+                false,
+                Some(aptpl),
+            ),
             0x01 => self.reserve(lun, nexus, reservation_key, type_byte),
             0x02 => self.release(lun, nexus, reservation_key, type_byte),
             0x03 => self.clear(lun, nexus, reservation_key),
@@ -410,7 +589,14 @@ impl ReservationManager {
             // no task-manager hook, and the visible state transition
             // is identical.
             0x04 | 0x05 => self.preempt(lun, nexus, reservation_key, service_action_key, type_byte),
-            0x06 => self.register(lun, nexus, reservation_key, service_action_key, true),
+            0x06 => self.register(
+                lun,
+                nexus,
+                reservation_key,
+                service_action_key,
+                true,
+                Some(aptpl),
+            ),
             // REGISTER AND MOVE (0x07) — single target port, rejected.
             _ => PrOutOutcome::InvalidFieldInCdb,
         }
@@ -430,7 +616,9 @@ impl ReservationManager {
 
     /// REGISTER (`sark != 0`) / unregister (`sark == 0`). `ignore`
     /// skips the existing-key check (SCSI REGISTER AND IGNORE EXISTING
-    /// KEY / NVMe IEKEY).
+    /// KEY / NVMe IEKEY). `aptpl` sets the LU's power-loss-persist bit:
+    /// `Some(v)` applies `v` (SCSI always supplies the bit; NVMe maps
+    /// CPTPL set/clear), `None` leaves it unchanged (NVMe CPTPL=no-change).
     pub fn register(
         &self,
         lun: u64,
@@ -438,27 +626,24 @@ impl ReservationManager {
         rk: u64,
         sark: u64,
         ignore: bool,
+        aptpl: Option<bool>,
     ) -> PrOutOutcome {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        prout_register(map.entry(lun).or_default(), id, rk, sark, ignore)
+        self.mutate(lun, |st| prout_register(st, id, rk, sark, ignore, aptpl))
     }
 
     /// RESERVE / NVMe Acquire (Acquire action).
     pub fn reserve(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        prout_reserve(map.entry(lun).or_default(), id, rk, type_byte)
+        self.mutate(lun, |st| prout_reserve(st, id, rk, type_byte))
     }
 
     /// RELEASE / NVMe Release (Release action).
     pub fn release(&self, lun: u64, id: &RegistrantId, rk: u64, type_byte: u8) -> PrOutOutcome {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        prout_release(map.entry(lun).or_default(), id, rk, type_byte)
+        self.mutate(lun, |st| prout_release(st, id, rk, type_byte))
     }
 
     /// CLEAR / NVMe Release (Clear action).
     pub fn clear(&self, lun: u64, id: &RegistrantId, rk: u64) -> PrOutOutcome {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        prout_clear(map.entry(lun).or_default(), id, rk)
+        self.mutate(lun, |st| prout_clear(st, id, rk))
     }
 
     /// PREEMPT / PREEMPT AND ABORT / NVMe Acquire (Preempt action).
@@ -470,8 +655,7 @@ impl ReservationManager {
         sark: u64,
         type_byte: u8,
     ) -> PrOutOutcome {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        prout_preempt(map.entry(lun).or_default(), id, rk, sark, type_byte)
+        self.mutate(lun, |st| prout_preempt(st, id, rk, sark, type_byte))
     }
 
     /// Read-only snapshot for a transport-specific reservation
@@ -485,6 +669,7 @@ impl ReservationManager {
                 reservation_type: None,
                 holder: None,
                 registrants: Vec::new(),
+                aptpl: false,
             };
         };
         ReservationSnapshot {
@@ -496,6 +681,7 @@ impl ReservationManager {
                 .iter()
                 .map(|(id, key)| (id.clone(), *key))
                 .collect(),
+            aptpl: state.aptpl,
         }
     }
 }
@@ -542,23 +728,24 @@ fn render_read_reservation(state: Option<&LunState>) -> Vec<u8> {
     out
 }
 
-fn render_report_capabilities() -> Vec<u8> {
+fn render_report_capabilities(ptpl_capable: bool, ptpl_active: bool) -> Vec<u8> {
     // SPC-4 Table 86 — REPORT CAPABILITIES parameter data.
     // 8 bytes total. We declare:
-    //   PTPL_C    = 0  (no persist-through-power-loss)
+    //   PTPL_C    = ptpl_capable (persist-through-power-loss capable;
+    //               true iff a data dir is wired — issue #57)
     //   ATP_C     = 0  (ALL_TG_PT not supported)
     //   SIP_C     = 0  (SPEC_I_PT not supported)
     //   CRH       = 0  (no compatible-reservation handling for legacy
     //                   RESERVE(6) / RELEASE(6))
     //   TMV       = 1  (TYPE_MASK valid)
-    //   PTPL_A    = 0
+    //   PTPL_A    = ptpl_active (this LU's currently-active APTPL bit)
     // TYPE_MASK exposes WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR,
     // EX_AC_AR — every type the ReservationType enum honors.
     let mut buf = vec![0u8; 8];
     buf[0] = 0x00;
     buf[1] = 0x08; // length = 8 bytes total minus the leading 0
-    buf[2] = 0x00;
-    buf[3] = 0x80; // TMV = 1
+    buf[2] = if ptpl_capable { 0x01 } else { 0x00 }; // bit0 PTPL_C
+    buf[3] = 0x80 | if ptpl_active { 0x01 } else { 0x00 }; // bit7 TMV | bit0 PTPL_A
     buf[4] = 0xEA; // bit1 WR_EX, bit3 EX_AC, bit5 WR_EX_RO, bit6 EX_AC_RO, bit7 WR_EX_AR
     buf[5] = 0x01; // bit0 EX_AC_AR
     buf
@@ -648,12 +835,18 @@ fn prout_register(
     rk: u64,
     sark: u64,
     ignore: bool,
+    aptpl: Option<bool>,
 ) -> PrOutOutcome {
     if !ignore {
         let current = state.registration_key(nexus).unwrap_or(0);
         if current != rk {
             return PrOutOutcome::ReservationConflict;
         }
+    }
+    // SPC-4 §5.12.3: the APTPL of the most-recent REGISTER (register or
+    // unregister) governs the whole LU's power-loss persistence.
+    if let Some(v) = aptpl {
+        state.aptpl = v;
     }
     if sark == 0 {
         state.registrations.remove(nexus);
@@ -808,12 +1001,219 @@ fn prout_preempt(
     PrOutOutcome::Good
 }
 
+// ----------------------------------------------------------------
+// Persistence (PTPL) — on-disk DTO + atomic write + fail-safe load
+// ----------------------------------------------------------------
+
+/// `reservations.json` schema version. Bumped only on an incompatible
+/// layout change; an unknown version loads as empty (fail-safe).
+const PERSIST_VERSION: u32 = 1;
+
+/// Whole-file document. Rewritten in full on every persist-eligible
+/// mutation (PR traffic is rare, so a small full rewrite is cheaper
+/// than incremental bookkeeping and is trivially crash-consistent).
+#[derive(Serialize, Deserialize)]
+struct PersistedFile {
+    version: u32,
+    volumes: Vec<PersistedVolume>,
+}
+
+/// One logical unit's persisted state, keyed by its stable UUID
+/// (resolved to the current LUN at load via [`EntityResolver`]). Only
+/// LUs whose most-recent REGISTER set APTPL=1 appear here.
+#[derive(Serialize, Deserialize)]
+struct PersistedVolume {
+    uuid: [u8; 16],
+    aptpl: bool,
+    generation: u32,
+    registrations: Vec<PersistedReg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation: Option<PersistedReservation>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReg {
+    id: RegistrantId,
+    key: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReservation {
+    holder: RegistrantId,
+    key: u64,
+    /// ReservationType as its SPC-4 numeric byte (`as_u8` / `from_u8`).
+    /// The numeric wire mapping stays authoritative — we deliberately
+    /// don't derive serde on the enum.
+    type_byte: u8,
+}
+
+impl PersistedVolume {
+    fn from_state(uuid: [u8; 16], state: &LunState) -> Self {
+        Self {
+            uuid,
+            aptpl: state.aptpl,
+            generation: state.generation,
+            registrations: state
+                .registrations
+                .iter()
+                .map(|(id, key)| PersistedReg {
+                    id: id.clone(),
+                    key: *key,
+                })
+                .collect(),
+            reservation: state.reservation.as_ref().map(|r| PersistedReservation {
+                holder: r.holder.clone(),
+                key: r.key,
+                type_byte: r.r#type.as_u8(),
+            }),
+        }
+    }
+
+    fn into_lun_state(self) -> LunState {
+        let registrations = self
+            .registrations
+            .into_iter()
+            .map(|r| (r.id, r.key))
+            .collect();
+        // A reservation whose persisted type byte no longer maps (only
+        // possible from a corrupt / hand-edited file) is dropped — the
+        // registrations are still honored. Fail-safe, never panic.
+        let reservation = self.reservation.and_then(|r| {
+            ReservationType::from_u8(r.type_byte).map(|t| ReservationState {
+                holder: r.holder,
+                key: r.key,
+                r#type: t,
+            })
+        });
+        LunState {
+            registrations,
+            reservation,
+            generation: self.generation,
+            aptpl: self.aptpl,
+        }
+    }
+}
+
+/// Rehydrate `path` into the per-LUN map, fail-safe. A missing file is
+/// first boot (empty, no warning); any other read / parse / version
+/// problem logs a warning and starts empty so a corrupt or foreign file
+/// can never wedge the daemon. Records whose UUID no longer resolves to
+/// a live LUN are dropped.
+fn load_file(path: &Path, resolver: &dyn EntityResolver) -> BTreeMap<u64, LunState> {
+    let mut by_lun = BTreeMap::new();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return by_lun,
+        Err(e) => {
+            warn!(
+                "reservations: cannot read {} ({e}); starting with empty reservation state",
+                path.display()
+            );
+            return by_lun;
+        }
+    };
+    let file: PersistedFile = match serde_json::from_slice(&bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "reservations: {} is unparseable ({e}); starting with empty reservation state",
+                path.display()
+            );
+            return by_lun;
+        }
+    };
+    if file.version != PERSIST_VERSION {
+        warn!(
+            "reservations: {} has unsupported version {} (expected {PERSIST_VERSION}); starting empty",
+            path.display(),
+            file.version
+        );
+        return by_lun;
+    }
+    for vol in file.volumes {
+        match resolver.lun_for_uuid(&vol.uuid) {
+            Some(lun) => {
+                by_lun.insert(lun, vol.into_lun_state());
+            }
+            None => warn!(
+                "reservations: dropping persisted record for volume {} (no current LUN)",
+                hex16(&vol.uuid)
+            ),
+        }
+    }
+    by_lun
+}
+
+/// Serialize every persist-eligible LU and write `path` atomically:
+/// write a temp file, fsync it, chmod 0640, rename over the target,
+/// then fsync the parent directory so the rename itself is durable
+/// across power loss. The caller holds the `by_lun` lock.
+fn persist_to_disk(map: &BTreeMap<u64, LunState>, persist: &Persist) -> std::io::Result<()> {
+    let volumes: Vec<PersistedVolume> = map
+        .iter()
+        .filter(|(_, st)| st.persist_eligible())
+        // Skip LUs the resolver can't map to a UUID (e.g. a synthetic
+        // call site) — they simply aren't persisted.
+        .filter_map(|(lun, st)| {
+            persist
+                .resolver
+                .uuid_for_lun(*lun)
+                .map(|uuid| PersistedVolume::from_state(uuid, st))
+        })
+        .collect();
+    let file = PersistedFile {
+        version: PERSIST_VERSION,
+        volumes,
+    };
+
+    let path = &persist.path;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        serde_json::to_writer(&mut w, &file).map_err(std::io::Error::other)?;
+        w.flush()?;
+        w.into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Parent-dir fsync — the one true power-loss-durability gap the
+    // VolumeManifest recipe doesn't cover. Best-effort: a parent we
+    // can't open isn't worth failing the (already-renamed) write over.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Lowercase hex of a 16-byte UUID for log lines (plain ASCII).
+fn hex16(uuid: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in uuid {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn nexus(tsih: u16, iqn: &str) -> Nexus {
-        Nexus::new(tsih, Some(iqn.to_string()))
+    // Build an iSCSI registrant. `tag` seeds a distinct ISID so the
+    // two-/three-initiator tests keep distinct registrant identities
+    // (the old `tsih` argument played that role before identity moved
+    // to (IQN, ISID)).
+    fn nexus(tag: u16, iqn: &str) -> Nexus {
+        Nexus::iscsi(Some(iqn.to_string()), [tag as u8; 6])
     }
 
     fn params(rk: u64, sark: u64, aptpl: bool) -> Vec<u8> {
@@ -859,7 +1259,8 @@ mod tests {
         };
         assert_eq!(body.len(), 8);
         assert_eq!(body[1], 0x08);
-        assert_eq!(body[3], 0x80); // TMV
+        assert_eq!(body[2], 0x00); // PTPL_C = 0 (in-memory manager not capable)
+        assert_eq!(body[3], 0x80); // TMV, PTPL_A = 0
         assert_eq!(body[4], 0xEA);
         assert_eq!(body[5], 0x01);
     }
@@ -947,20 +1348,46 @@ mod tests {
     }
 
     #[test]
-    fn drop_nexus_removes_all_registrations_for_tsih() {
+    fn registration_survives_session_loss_no_eviction() {
+        // SPC-4 §5.12: a persistent registration is removed only by an
+        // explicit PROUT (Release / unregister / Preempt / Clear) — never
+        // by I_T nexus loss. There is no longer a drop-on-logout path;
+        // a reconnecting initiator keeps its registration.
         let mgr = ReservationManager::new();
         let na = nexus(1, "iqn.test:a");
-        let nb = nexus(2, "iqn.test:b");
         register(&mgr, &na, 0xAAAA);
-        register(&mgr, &nb, 0xBBBB);
-        reserve(&mgr, &na, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
-        mgr.drop_nexus(1);
-        // A's key is gone; B remains.
+        reserve(&mgr, &na, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        // A non-holder is fenced; the same initiator port (rebuilt as if
+        // after a reconnect — identical IQN + ISID, irrespective of any
+        // new TSIH) is still recognised as the holder.
+        let nb = nexus(2, "iqn.test:b");
+        assert!(!mgr.allow_write(0, &nb));
+        let a_again = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        assert!(mgr.allow_write(0, &a_again));
+    }
+
+    #[test]
+    fn mpio_two_isids_one_iqn_are_distinct() {
+        // Two sessions from one initiator IQN over different ISIDs are
+        // distinct initiator ports => distinct registrants. They
+        // round-trip independently.
+        let mgr = ReservationManager::new();
+        let path_a = Nexus::iscsi(Some("iqn.test:host".into()), [0xA1; 6]);
+        let path_b = Nexus::iscsi(Some("iqn.test:host".into()), [0xB2; 6]);
+        register(&mgr, &path_a, 0xAAAA);
+        register(&mgr, &path_b, 0xBBBB);
         let body = read_keys(&mgr);
-        assert_eq!(body.len(), 16);
-        assert_eq!(&body[8..16], &0xBBBBu64.to_be_bytes());
-        // Reservation released because A held a non-AR type.
-        assert!(mgr.allow_write(0, &nb));
+        // Two distinct keys listed.
+        assert_eq!(body.len(), 24);
+        reserve(
+            &mgr,
+            &path_a,
+            0xAAAA,
+            ReservationType::ExclusiveAccess.as_u8(),
+        );
+        // path_b is a different port: under EXCLUSIVE ACCESS it is fenced.
+        assert!(!mgr.allow_write(0, &path_b));
+        assert!(mgr.allow_write(0, &path_a));
     }
 
     #[test]
@@ -997,7 +1424,10 @@ mod tests {
     }
 
     #[test]
-    fn prout_aptpl_rejected_as_invalid_param_list() {
+    fn prout_aptpl_rejected_when_not_capable() {
+        // An in-memory manager (no data dir) advertises PTPL_C=0 and so
+        // must reject APTPL=1 rather than silently fail to persist —
+        // advertisement and behavior stay consistent.
         let mgr = ReservationManager::new();
         let n = nexus(1, "iqn.test:a");
         let out = mgr.prout(0, 0x06, 0, 0, &params(0, 0xAAAA, true), 24, &n, true);
@@ -1051,7 +1481,10 @@ mod tests {
     fn nvme_register_then_snapshot_lists_key() {
         let mgr = ReservationManager::new();
         let a = nvme_host(0xA1);
-        assert_eq!(mgr.register(0, &a, 0, 0xAAAA, true), PrOutOutcome::Good);
+        assert_eq!(
+            mgr.register(0, &a, 0, 0xAAAA, true, None),
+            PrOutOutcome::Good
+        );
         let snap = mgr.snapshot(0);
         assert_eq!(snap.registrants, vec![(a, 0xAAAA)]);
         assert!(snap.holder.is_none());
@@ -1063,8 +1496,8 @@ mod tests {
         let mgr = ReservationManager::new();
         let a = nvme_host(0xA1);
         let b = nvme_host(0xB2);
-        mgr.register(0, &a, 0, 0xAAAA, true);
-        mgr.register(0, &b, 0, 0xBBBB, true);
+        mgr.register(0, &a, 0, 0xAAAA, true, None);
+        mgr.register(0, &b, 0, 0xBBBB, true, None);
         assert_eq!(
             mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
             PrOutOutcome::Good
@@ -1089,26 +1522,24 @@ mod tests {
     }
 
     #[test]
-    fn drop_nexus_leaves_nvme_registration_intact() {
-        // The crux of issue #54: a connection teardown
-        // (`drop_nexus`) is iSCSI-only. An NVMe host's registration
-        // must survive it — NVMe reservations are released only by
-        // explicit Release / unregister / preempt.
+    fn iscsi_and_nvme_registrants_coexist_distinctly() {
+        // An iSCSI initiator port and an NVMe host are distinct identity
+        // namespaces — they never collide as the "same" registrant, and
+        // both persist across connection teardown (nothing evicts them).
         let mgr = ReservationManager::new();
-        let iscsi = Nexus::new(7, Some("iqn.test:a".into()));
+        let iscsi = Nexus::iscsi(Some("iqn.test:a".into()), [7u8; 6]);
         let host = nvme_host(0xC3);
-        mgr.register(0, &iscsi, 0, 0x1111, true);
-        mgr.register(0, &host, 0, 0x2222, true);
+        mgr.register(0, &iscsi, 0, 0x1111, true, None);
+        mgr.register(0, &host, 0, 0x2222, true, None);
         mgr.reserve(0, &host, 0x2222, ReservationType::ExclusiveAccess.as_u8());
 
-        mgr.drop_nexus(7); // tear down the iSCSI nexus
-
         let snap = mgr.snapshot(0);
-        // iSCSI registration gone; NVMe registration + its
-        // reservation survive.
-        assert_eq!(snap.registrants, vec![(host.clone(), 0x2222)]);
+        assert_eq!(snap.registrants.len(), 2);
         assert_eq!(snap.holder, Some(host.clone()));
-        assert!(!mgr.allow_write(0, &Nexus::new(8, None)));
+        // The NVMe host holds EXCLUSIVE ACCESS: the iSCSI port (a
+        // registrant, but not the holder, of a non-*RO/*AR type) is
+        // fenced from both reads and writes.
+        assert!(!mgr.allow_write(0, &iscsi));
         assert!(mgr.allow_write(0, &host));
     }
 
@@ -1117,8 +1548,8 @@ mod tests {
         let mgr = ReservationManager::new();
         let a = nvme_host(0xA1);
         let b = nvme_host(0xB2);
-        mgr.register(0, &a, 0, 0xAAAA, true);
-        mgr.register(0, &b, 0, 0xBBBB, true);
+        mgr.register(0, &a, 0, 0xAAAA, true, None);
+        mgr.register(0, &b, 0, 0xBBBB, true, None);
         mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
         // B preempts A's reservation (SARK = A's key).
         assert_eq!(
@@ -1143,7 +1574,7 @@ mod tests {
     fn nvme_release_clears_reservation() {
         let mgr = ReservationManager::new();
         let a = nvme_host(0xA1);
-        mgr.register(0, &a, 0, 0xAAAA, true);
+        mgr.register(0, &a, 0, 0xAAAA, true, None);
         mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
         assert_eq!(
             mgr.release(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8()),
@@ -1152,5 +1583,257 @@ mod tests {
         assert!(mgr.snapshot(0).holder.is_none());
         // Registration persists after release (NVMe Release ≠ unregister).
         assert_eq!(mgr.snapshot(0).registrants, vec![(a, 0xAAAA)]);
+    }
+
+    // ----------------------------------------------------------------
+    // Persistence (PTPL) — issue #57
+    // ----------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Configurable test resolver: a list of (uuid, lun) bindings.
+    struct MapResolver(Vec<([u8; 16], u64)>);
+    impl EntityResolver for MapResolver {
+        fn uuid_for_lun(&self, lun: u64) -> Option<[u8; 16]> {
+            self.0.iter().find(|(_, l)| *l == lun).map(|(u, _)| *u)
+        }
+        fn lun_for_uuid(&self, uuid: &[u8; 16]) -> Option<u64> {
+            self.0.iter().find(|(u, _)| u == uuid).map(|(_, l)| *l)
+        }
+    }
+
+    fn one_volume(uuid: [u8; 16], lun: u64) -> Arc<dyn EntityResolver> {
+        Arc::new(MapResolver(vec![(uuid, lun)]))
+    }
+
+    /// A unique temp dir for one test (no `tempfile` dep in scsi-spc).
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("thur-resv-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    // PROUT with an explicit APTPL bit (the `params` helper already
+    // takes `aptpl`); register + reserve with APTPL=1.
+    fn register_aptpl(mgr: &ReservationManager, n: &Nexus, key: u64) {
+        assert_eq!(
+            mgr.prout(0, 0x06, 0, 0, &params(0, key, true), 24, n, true),
+            PrOutOutcome::Good
+        );
+    }
+    fn reserve_aptpl(mgr: &ReservationManager, n: &Nexus, key: u64, type_byte: u8) {
+        assert_eq!(
+            mgr.prout(0, 0x01, 0, type_byte, &params(key, 0, true), 24, n, true),
+            PrOutOutcome::Good
+        );
+    }
+
+    #[test]
+    fn ptpl_capability_reflects_persistence_wiring() {
+        let dir = tmp_dir("cap");
+        let path = dir.join("reservations.json");
+        let mem = ReservationManager::new();
+        assert!(!mem.ptpl_capable());
+        let durable = ReservationManager::load_from(path, one_volume([0u8; 16], 0));
+        assert!(durable.ptpl_capable());
+        // PTPL_C bit (byte 2 bit 0) follows capability.
+        let cap = |m: &ReservationManager| match m.prin(0, 0x02, true) {
+            PrInOutcome::Good(b) => b[2] & 0x01,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cap(&mem), 0x00);
+        assert_eq!(cap(&durable), 0x01);
+    }
+
+    #[test]
+    fn save_then_load_preserves_conflict() {
+        let dir = tmp_dir("save-load");
+        let path = dir.join("reservations.json");
+        let uuid = [0x11u8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        {
+            let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid, 0));
+            register_aptpl(&mgr, &a, 0xAAAA);
+            reserve_aptpl(&mgr, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        }
+        // Fresh manager, same file => state survives the "restart".
+        let mgr = ReservationManager::load_from(path, one_volume(uuid, 0));
+        let b = Nexus::iscsi(Some("iqn.test:b".into()), [2u8; 6]);
+        assert!(
+            !mgr.allow_write(0, &b),
+            "non-holder still fenced after reload"
+        );
+        assert!(
+            mgr.allow_write(0, &a),
+            "holder still permitted after reload"
+        );
+        // READ KEYS still lists A's key; PR_GENERATION preserved (not reset).
+        let body = match mgr.prin(0, 0x00, true) {
+            PrInOutcome::Good(b) => b,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(&body[8..16], &0xAAAAu64.to_be_bytes());
+        let snap = mgr.snapshot(0);
+        assert_eq!(
+            snap.generation, 2,
+            "generation preserved, not bumped on reload"
+        );
+    }
+
+    #[test]
+    fn reload_rematches_by_port_not_session() {
+        // Persist under one "session"; a command from a *different* TSIH
+        // (irrelevant now) but the same (IQN, ISID) is the holder after
+        // reload. The whole point of keying by initiator port.
+        let dir = tmp_dir("rematch");
+        let path = dir.join("reservations.json");
+        let uuid = [0x22u8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [0x5A; 6]);
+        {
+            let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid, 0));
+            register_aptpl(&mgr, &a, 0xAAAA);
+            reserve_aptpl(&mgr, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8());
+        }
+        let mgr = ReservationManager::load_from(path, one_volume(uuid, 0));
+        let a_reconnected = Nexus::iscsi(Some("iqn.test:a".into()), [0x5A; 6]);
+        assert!(mgr.allow_write(0, &a_reconnected));
+        // A different ISID under the same IQN is a different port: fenced.
+        let other_path = Nexus::iscsi(Some("iqn.test:a".into()), [0x99; 6]);
+        assert!(!mgr.allow_write(0, &other_path));
+    }
+
+    #[test]
+    fn aptpl_false_not_persisted() {
+        let dir = tmp_dir("noaptpl");
+        let path = dir.join("reservations.json");
+        let uuid = [0x33u8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        {
+            let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid, 0));
+            // APTPL=0 register + reserve: lives in memory, not on disk.
+            register(&mgr, &a, 0xAAAA);
+            reserve(&mgr, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        }
+        // No file written (or empty) => reload sees nothing.
+        let mgr = ReservationManager::load_from(path, one_volume(uuid, 0));
+        let b = Nexus::iscsi(Some("iqn.test:b".into()), [2u8; 6]);
+        assert!(mgr.allow_write(0, &b), "no fence survived APTPL=0 restart");
+        assert!(mgr.snapshot(0).registrants.is_empty());
+    }
+
+    #[test]
+    fn clear_erases_record() {
+        let dir = tmp_dir("clear");
+        let path = dir.join("reservations.json");
+        let uuid = [0x44u8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        {
+            let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid, 0));
+            register_aptpl(&mgr, &a, 0xAAAA);
+            reserve_aptpl(&mgr, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+            // CLEAR wipes everything and must erase the on-disk record.
+            assert_eq!(mgr.clear(0, &a, 0xAAAA), PrOutOutcome::Good);
+        }
+        let mgr = ReservationManager::load_from(path, one_volume(uuid, 0));
+        let b = Nexus::iscsi(Some("iqn.test:b".into()), [2u8; 6]);
+        assert!(mgr.allow_write(0, &b), "cleared fence must not resurrect");
+        assert!(mgr.snapshot(0).registrants.is_empty());
+    }
+
+    #[test]
+    fn reload_torn_file_starts_empty() {
+        let dir = tmp_dir("torn");
+        let path = dir.join("reservations.json");
+        std::fs::write(&path, b"{ this is not json ...").unwrap();
+        // Must not panic; starts empty.
+        let mgr = ReservationManager::load_from(path, one_volume([0x55u8; 16], 0));
+        assert!(mgr.snapshot(0).registrants.is_empty());
+        // And it's usable afterward.
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        register_aptpl(&mgr, &a, 0xAAAA);
+        assert_eq!(mgr.snapshot(0).registrants.len(), 1);
+    }
+
+    #[test]
+    fn lun_reuse_not_fenced() {
+        // Persist a fence for volume-A on LUN 3. Volume A is then deleted
+        // and a new volume B reuses LUN 3. On reload, A's UUID resolves
+        // to no LUN => its record is dropped => B is NOT fenced.
+        let dir = tmp_dir("reuse");
+        let path = dir.join("reservations.json");
+        let uuid_a = [0xAAu8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        {
+            let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid_a, 3));
+            assert_eq!(
+                mgr.prout(3, 0x06, 0, 0, &params(0, 0xAAAA, true), 24, &a, true),
+                PrOutOutcome::Good
+            );
+            assert_eq!(
+                mgr.prout(
+                    3,
+                    0x01,
+                    0,
+                    ReservationType::WriteExclusive.as_u8(),
+                    &params(0xAAAA, 0, true),
+                    24,
+                    &a,
+                    true
+                ),
+                PrOutOutcome::Good
+            );
+        }
+        // A gone; B (uuid_b) now owns LUN 3. A's UUID maps to no LUN.
+        let uuid_b = [0xBBu8; 16];
+        let resolver: Arc<dyn EntityResolver> = Arc::new(MapResolver(vec![(uuid_b, 3)]));
+        let mgr = ReservationManager::load_from(path, resolver);
+        let other = Nexus::iscsi(Some("iqn.test:other".into()), [9u8; 6]);
+        assert!(
+            mgr.allow_write(3, &other),
+            "reused LUN must not inherit gone volume's fence"
+        );
+        assert!(mgr.snapshot(3).registrants.is_empty());
+    }
+
+    #[test]
+    fn persist_failure_returns_check_condition_and_rolls_back() {
+        // Point persistence at an unwritable path (parent dir absent) so
+        // the durable write fails: a persist-eligible mutation must NOT
+        // ack Good — it returns PersistFailed (persist-before-ack) — AND
+        // it must NOT leave the mutation applied in memory (no ghost
+        // fence the host was told failed).
+        let dir = tmp_dir("failpersist");
+        let bad = dir.join("does-not-exist").join("reservations.json");
+        let mgr = ReservationManager::load_from(bad, one_volume([0x66u8; 16], 0));
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        // APTPL=1 register => persist-eligible => write fails => PersistFailed.
+        let out = mgr.prout(0, 0x06, 0, 0, &params(0, 0xAAAA, true), 24, &a, true);
+        assert_eq!(out, PrOutOutcome::PersistFailed);
+        // Rolled back: no registration lingers, so a peer is not fenced.
+        assert!(
+            mgr.snapshot(0).registrants.is_empty(),
+            "failed persist must not leave a ghost registration"
+        );
+        let b = Nexus::iscsi(Some("iqn.test:b".into()), [2u8; 6]);
+        assert!(mgr.allow_write(0, &b), "no ghost fence after PersistFailed");
+    }
+
+    #[test]
+    fn purge_lun_drops_state_in_memory_and_on_disk() {
+        let dir = tmp_dir("purge");
+        let path = dir.join("reservations.json");
+        let uuid = [0x77u8; 16];
+        let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+        let mgr = ReservationManager::load_from(path.clone(), one_volume(uuid, 0));
+        register_aptpl(&mgr, &a, 0xAAAA);
+        reserve_aptpl(&mgr, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8());
+        mgr.purge_lun(0);
+        // In-memory state gone (so a reused LUN starts clean), and a
+        // fresh reload sees nothing either.
+        assert!(mgr.snapshot(0).registrants.is_empty());
+        let reloaded = ReservationManager::load_from(path, one_volume(uuid, 0));
+        assert!(reloaded.snapshot(0).registrants.is_empty());
     }
 }

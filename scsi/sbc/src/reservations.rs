@@ -30,7 +30,7 @@ pub use scsi_spc::reservations::{Nexus, ReservationManager};
 /// handler. (A free fn rather than `Nexus::from_request` because
 /// `Nexus` is now foreign to this crate.)
 pub fn nexus_from_request(req: &ScsiRequest<'_>) -> Nexus {
-    Nexus::new(req.tsih, req.initiator_iqn.map(str::to_owned))
+    Nexus::iscsi(req.initiator_iqn.map(str::to_owned), req.initiator_isid)
 }
 
 /// SBC-flavored wrappers over the neutral PR core. Exposed as a
@@ -108,5 +108,8 @@ fn map_prout(outcome: PrOutOutcome) -> ScsiResponse {
             ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST)
         }
         PrOutOutcome::LuNotSupported => ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
+        // PTPL persist-before-ack failed: do not ack GOOD — the host
+        // must know the fence was not made durable.
+        PrOutOutcome::PersistFailed => ScsiResponse::check(SenseData::INTERNAL_TARGET_FAILURE),
     }
 }

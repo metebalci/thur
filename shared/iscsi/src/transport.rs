@@ -783,6 +783,11 @@ pub struct LoginOutcome {
     pub cid: u16,
     pub statsn: u32,
     pub initiator_iqn: Option<String>,
+    /// ISID from the login PDU BHS. Threaded into every
+    /// `ScsiRequest::initiator_isid` so the SCSI surface can key
+    /// persistent reservations by the stable iSCSI initiator port
+    /// (IQN + ISID) rather than the ephemeral TSIH (issue #57).
+    pub isid: [u8; 6],
     pub authenticated_partition: Option<String>,
     /// Volume-name set this session is admitted to (VSA only). `None`
     /// = no admission fence. Carried from CHAP login into the FFP
@@ -1259,6 +1264,7 @@ pub async fn handle_login_phase(
                 cid,
                 statsn,
                 initiator_iqn: initiator_name,
+                isid,
                 authenticated_partition: chap.authenticated_partition,
                 authenticated_volumes: chap.authenticated_volumes,
                 peer_max_recv_data_segment_length,
@@ -1424,6 +1430,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         cid,
         mut statsn,
         initiator_iqn,
+        isid,
         authenticated_partition,
         authenticated_volumes,
         peer_max_recv_data_segment_length,
@@ -1435,6 +1442,15 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         handler: Arc::clone(&handler),
         tsih,
         cid,
+    };
+
+    // PR initiator-port policy (issue #57): when the product collapses
+    // the ISID, every command's nexus keys by IQN alone. Hoisted once —
+    // it's a fixed per-handler setting.
+    let pr_isid = if handler.pr_collapse_isid() {
+        [0u8; 6]
+    } else {
+        isid
     };
 
     // Split the socket so the PDU reader task can drain the read half
@@ -1646,6 +1662,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     data_out: &pdu.data,
                     data_in_max: edtl as usize,
                     initiator_iqn: initiator_iqn.as_deref(),
+                    initiator_isid: pr_isid,
                     peer,
                     session_partition: authenticated_partition.as_deref(),
                     session_volumes: authenticated_volumes.as_deref(),
@@ -1833,6 +1850,50 @@ fn build_target_addresses(advertised: &[Portal], local: SocketAddr) -> Vec<(Stri
     out
 }
 
+/// Which iSCSI initiator-port identity the SCSI layer keys persistent
+/// reservations by (issue #57). The ISID enters the SCSI nexus only via
+/// [`ScsiRequest::initiator_isid`]; this selects whether the real ISID
+/// or a fixed constant reaches it.
+///
+/// - [`IqnIsid`](Self::IqnIsid) (default): the full, spec-literal iSCSI
+///   initiator port — initiator IQN + ISID. Models per-path
+///   (`mpathpersist`-style) registration; a host reclaims a reservation
+///   across a reconnect only if it reuses its ISID (Windows / VMware /
+///   session reinstatement do; open-iscsi mints a fresh ISID per
+///   manual login).
+/// - [`Iqn`](Self::Iqn): collapse the ISID to a fixed safe constant
+///   (all-zero) before it reaches the SCSI layer, so a registrant keys
+///   by IQN alone. A host reclaims its reservation across any
+///   reconnect / target restart regardless of ISID churn, at the cost
+///   of treating all of that host's concurrent sessions as one
+///   registrant. Opt-in via the `iscsi.reservations.initiator_port`
+///   conffile key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrInitiatorPort {
+    #[default]
+    IqnIsid,
+    Iqn,
+}
+
+impl PrInitiatorPort {
+    /// Whether to zero the ISID before it reaches the SCSI nexus.
+    pub fn collapse_isid(self) -> bool {
+        matches!(self, Self::Iqn)
+    }
+}
+
+/// The `iscsi.reservations:` conffile block (shared by both products).
+/// Optional — when omitted, the defaults apply (full IQN + ISID
+/// initiator port).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReservationSettings {
+    /// Which initiator-port identity persistent reservations key by.
+    /// See [`PrInitiatorPort`].
+    #[serde(default)]
+    pub initiator_port: PrInitiatorPort,
+}
+
 pub struct ServerConfig {
     /// One or more iSCSI TCP portals to bind. Each entry binds its own
     /// [`TcpListener`]; SendTargets discovery enumerates every entry
@@ -2009,6 +2070,28 @@ mod tests {
         let ttt = derive_r2t_ttt(0x7FFFFFFF, 0);
         assert_ne!(ttt, 0xFFFFFFFF);
         assert_eq!(ttt, 0x80000000);
+    }
+
+    #[test]
+    fn pr_initiator_port_default_and_collapse() {
+        // Default keeps the full (IQN, ISID) port.
+        assert_eq!(PrInitiatorPort::default(), PrInitiatorPort::IqnIsid);
+        assert!(!PrInitiatorPort::IqnIsid.collapse_isid());
+        assert!(PrInitiatorPort::Iqn.collapse_isid());
+    }
+
+    #[test]
+    fn reservation_settings_parse_kebab_case() {
+        // Conffile values are kebab-case ("iqn" / "iqn-isid"); an
+        // omitted block / field defaults to the full initiator port.
+        // (serde_json exercises the same rename as the YAML conffile.)
+        let s: ReservationSettings = serde_json::from_str(r#"{"initiator_port":"iqn"}"#).unwrap();
+        assert_eq!(s.initiator_port, PrInitiatorPort::Iqn);
+        let s: ReservationSettings =
+            serde_json::from_str(r#"{"initiator_port":"iqn-isid"}"#).unwrap();
+        assert_eq!(s.initiator_port, PrInitiatorPort::IqnIsid);
+        let s: ReservationSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.initiator_port, PrInitiatorPort::IqnIsid);
     }
 
     #[test]

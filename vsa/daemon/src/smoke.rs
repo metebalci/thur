@@ -161,6 +161,7 @@ fn req<'a>(lun: u64, cdb: &'a [u8], data_out: &'a [u8], data_in_max: usize) -> S
         data_in_max,
         tsih: 0,
         initiator_iqn: None,
+        initiator_isid: [0u8; 6],
         cid: 0,
         peer: "smoke",
         session_partition: None,

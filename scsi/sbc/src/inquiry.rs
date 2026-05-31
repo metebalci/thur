@@ -527,6 +527,7 @@ mod tests {
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             cid: 0,
             peer: "",
             session_partition: None,

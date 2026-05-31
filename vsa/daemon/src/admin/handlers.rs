@@ -104,6 +104,11 @@ pub struct AdminState {
     /// `Arc<SessionManager>` so the monitor handler can read
     /// `session_count` without going through the HTTP listener state.
     pub sessions: Arc<shared_iscsi::session::SessionManager>,
+    /// Shared PERSISTENT RESERVE manager (the same `Arc` the SCSI /
+    /// NVMe dispatcher holds). `volume destroy` purges the deleted
+    /// volume's LUN from it so a later LUN reuse can't inherit a gone
+    /// volume's fence (PTPL, issue #57).
+    pub reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
 // `system.monitor` per-tick view. The handler in `shared-admin-monitor`
@@ -749,6 +754,12 @@ pub async fn destroy(
     let uuid_hex = hex::encode(uuid);
     let encryption = cache.manifest().encryption.clone();
     drop(cache);
+
+    // Purge any PERSISTENT RESERVE state on this LUN: the volume is
+    // gone, so its registrations / reservation must not linger to fence
+    // a future volume that reuses this LUN number (PTPL, issue #57).
+    // Removes the in-memory entry and rewrites reservations.json.
+    state.reservations.purge_lun(lun);
 
     // Wipe the at-rest key first — once the volume dir is gone the
     // keystore entry is orphaned and an operator would have to clean

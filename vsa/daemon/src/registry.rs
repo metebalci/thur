@@ -193,6 +193,34 @@ impl nvme_nvm::NamespaceLookup for VolumeRegistry {
     }
 }
 
+/// Resolves a runtime LUN to its volume's stable manifest UUID and
+/// back, for `scsi_spc::reservations` PTPL persistence (issue #57).
+/// The persisted reservation record is keyed by the volume UUID, not
+/// the LUN, because `next_free_lun` reclaims the lowest free LUN on
+/// delete — keying by LUN would let a deleted volume's fence land on
+/// whatever new volume reused its number. A persisted record whose
+/// UUID no longer resolves is dropped at load.
+pub struct VolumeUuidResolver(Arc<VolumeRegistry>);
+
+impl VolumeUuidResolver {
+    pub fn new(registry: Arc<VolumeRegistry>) -> Self {
+        Self(registry)
+    }
+}
+
+impl scsi_spc::reservations::EntityResolver for VolumeUuidResolver {
+    fn uuid_for_lun(&self, lun: u64) -> Option<[u8; 16]> {
+        self.0.get(lun).map(|c| c.manifest().uuid)
+    }
+    fn lun_for_uuid(&self, uuid: &[u8; 16]) -> Option<u64> {
+        self.0
+            .entries()
+            .into_iter()
+            .find(|(_, c)| &c.manifest().uuid == uuid)
+            .map(|(lun, _)| lun)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

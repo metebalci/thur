@@ -77,6 +77,13 @@ pub struct ScsiRequest<'a> {
     /// IQN the initiator advertised at login. `None` until the login
     /// phase captures `InitiatorName=`.
     pub initiator_iqn: Option<&'a str>,
+    /// ISID (initiator session id, 6 bytes) from the login PDU BHS.
+    /// Together with `initiator_iqn` this forms the stable iSCSI
+    /// initiator-port identity used to key persistent reservations
+    /// (`scsi_spc::reservations::RegistrantId::Iscsi`) — stable across
+    /// logout and daemon restart, unlike the ephemeral TSIH. Synthetic
+    /// / non-iSCSI call sites (CLI tests, discovery) pass all-zero.
+    pub initiator_isid: [u8; 6],
     /// Peer socket address ("ip:port"). Pass-through for audit logging.
     pub peer: &'a str,
     /// Logical partition the session was bound to (CHAP user →

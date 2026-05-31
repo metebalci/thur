@@ -1913,6 +1913,7 @@ mod tests {
             data_in_max,
             tsih: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             cid: 0,
             peer: "",
             session_partition: None,
@@ -1924,7 +1925,7 @@ mod tests {
     /// in this module exercises the data path against an empty
     /// `ReservationManager`, so the nexus identity doesn't matter.
     fn test_nexus() -> Nexus {
-        Nexus::new(0, None)
+        Nexus::iscsi(None, [0u8; 6])
     }
 
     fn test_mgr() -> ReservationManager {
@@ -4042,6 +4043,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -4065,6 +4067,7 @@ mod tests {
                 data_in_max: 1024,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -4092,6 +4095,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -4127,6 +4131,7 @@ mod tests {
                 data_in_max: 1024,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,
@@ -4171,6 +4176,7 @@ mod tests {
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
+                initiator_isid: [0u8; 6],
                 cid: 0,
                 peer: "",
                 session_partition: None,

@@ -146,8 +146,12 @@ pub struct DaemonState {
     /// Persistent-reservation state machine (SPC-4 PERSISTENT RESERVE
     /// IN / OUT), shared with the block side via `scsi-spc`. Held here
     /// so registrations survive across per-connection dispatch tasks;
-    /// cloned into the iSCSI handler at server start. In-memory only —
-    /// a daemon restart drops every registration (PTPL not advertised).
+    /// cloned into the iSCSI handler at server start. Persisted to
+    /// `<data_dir>/reservations.json` and reloaded at start, so an
+    /// APTPL=1 reservation survives a daemon restart (PTPL, issue #57).
+    /// The drive LUNs (1..N) and the changer LUN 0 share this one
+    /// manager; the drive / changer LUN is itself the stable identity,
+    /// so `LunIdentity` maps it 1:1.
     pub reservations: Arc<scsi_spc::reservations::ReservationManager>,
 }
 
@@ -179,6 +183,14 @@ impl DaemonState {
             Arc::new(dm)
         };
 
+        // PTPL (issue #57): reload any persisted reservation state and
+        // keep persisting APTPL=1 mutations. Bound before the struct
+        // literal moves `cfg.data_dir`.
+        let reservations = Arc::new(scsi_spc::reservations::ReservationManager::load_from(
+            cfg.data_dir.join("reservations.json"),
+            Arc::new(scsi_spc::reservations::LunIdentity),
+        ));
+
         Self {
             data_dir: cfg.data_dir,
             library: cfg.library,
@@ -203,7 +215,7 @@ impl DaemonState {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             pool_budgets,
-            reservations: Arc::new(scsi_spc::reservations::ReservationManager::new()),
+            reservations,
         }
     }
 }

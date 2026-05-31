@@ -4163,6 +4163,8 @@ name = "scsi-spc"
 version = "0.1.0-dev.4"
 dependencies = [
  "blake3",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

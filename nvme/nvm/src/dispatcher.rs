@@ -101,12 +101,11 @@ pub struct NvmeNvmDispatcher {
     /// Alive admin commands when they arrive — so this is purely
     /// host-visible state.
     kato_ms: AtomicU32,
-    /// Shared reservation state machine, keyed by HOSTID. Built per
-    /// dispatcher (mirror of `SbcScsiDispatcher`); since iSCSI and
-    /// NVMe/TCP are mutually exclusive per daemon there's no
-    /// cross-transport sharing. In-memory only — a daemon restart
-    /// drops every registration (PTPL not advertised), so hosts
-    /// re-register on reconnect.
+    /// Shared reservation state machine, keyed by HOSTID. Injected by
+    /// the daemon (`load_from(<data_dir>/reservations.json, ...)`) so
+    /// CPTPL-set reservations survive a daemon restart (issue #57); the
+    /// test fixtures pass an in-memory `new()` manager (PTPL not
+    /// capable). iSCSI and NVMe/TCP are mutually exclusive per daemon.
     reservations: Arc<ReservationManager>,
     /// Per-subsystem controller registry + AER hub. Shared (one `Arc`)
     /// with the NVMe/TCP transport: the transport allocates CNTLIDs at
@@ -128,6 +127,7 @@ impl NvmeNvmDispatcher {
         controller_mn: String,
         controller_fr: String,
         aer: Arc<ControllerRegistry>,
+        reservations: Arc<ReservationManager>,
     ) -> Self {
         Self {
             registry,
@@ -138,7 +138,7 @@ impl NvmeNvmDispatcher {
             num_io_sqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
             num_io_cqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
             kato_ms: AtomicU32::new(0),
-            reservations: Arc::new(ReservationManager::new()),
+            reservations,
             aer,
         }
     }
@@ -220,7 +220,7 @@ impl NvmeNvmDispatcher {
         // Command Set does not restrict it (it commits already-
         // accepted writes), which differs from SCSI SYNCHRONIZE CACHE.
         let registrant = RegistrantId::nvme(host_id);
-        let lun = u64::from(sqe.nsid);
+        let lun = crate::reservations::nsid_to_lun(sqe.nsid);
         let denied = match opcode {
             NvmOpcode::Read | NvmOpcode::Compare | NvmOpcode::Verify => {
                 !self.reservations.allow_read(lun, &registrant)
@@ -509,7 +509,7 @@ impl NvmeNvmDispatcher {
                 let size_bytes = cache.size_bytes();
                 let lba_bytes = cache.sector_size() as u32;
                 let nguid = cache.manifest().uuid;
-                let id = match IdentifyNamespace::from_volume(size_bytes, lba_bytes, nguid) {
+                let mut id = match IdentifyNamespace::from_volume(size_bytes, lba_bytes, nguid) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(
@@ -527,6 +527,13 @@ impl NvmeNvmDispatcher {
                         ));
                     }
                 };
+                // RESCAP bit 0 (PTPL) follows whether reservation state
+                // is actually persisted across power loss (issue #57) —
+                // set only when the manager is persistence-capable so the
+                // advertised capability can't diverge from behavior.
+                if self.reservations.ptpl_capable() {
+                    id.rescap |= 0x01;
+                }
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), id.to_bytes().to_vec())
             }
             CNS::ActiveNamespaceList => {
@@ -895,10 +902,10 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
         // so the write-side gate applies. A host that can't write
         // can't CAW.
         let registrant = RegistrantId::nvme(compare.host_id.unwrap_or([0u8; 16]));
-        if !self
-            .reservations
-            .allow_write(u64::from(compare.sqe.nsid), &registrant)
-        {
+        if !self.reservations.allow_write(
+            crate::reservations::nsid_to_lun(compare.sqe.nsid),
+            &registrant,
+        ) {
             return (
                 Cqe::failure(compare_cid, 0, 0, StatusField::reservation_conflict()),
                 Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
@@ -1037,6 +1044,7 @@ mod tests {
             "ThurVSA Volume".into(),
             "0.1.0".into(),
             Arc::new(ControllerRegistry::new()),
+            Arc::new(ReservationManager::new()),
         );
         (tmp, disp)
     }
@@ -1775,6 +1783,7 @@ mod tests {
             "ThurVSA Volume".into(),
             "0.1.0".into(),
             Arc::new(ControllerRegistry::new()),
+            Arc::new(ReservationManager::new()),
         );
         (tmp, disp)
     }

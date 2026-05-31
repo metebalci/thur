@@ -521,6 +521,13 @@ impl SenseData {
     pub const INVALID_FIELD_IN_PARAMETER_LIST: Self =
         Self::new(SenseKey::IllegalRequest, 0x26, 0x00);
 
+    /// ASC/ASCQ 0x44/0x00 — INTERNAL TARGET FAILURE (HARDWARE ERROR).
+    /// Surfaced when a durable PERSISTENT RESERVE OUT cannot commit its
+    /// state to disk (PTPL persist-before-ack): the mutation is not
+    /// acknowledged GOOD so the host knows the fence was not made
+    /// durable.
+    pub const INTERNAL_TARGET_FAILURE: Self = Self::new(SenseKey::HardwareError, 0x44, 0x00);
+
     /// ASC/ASCQ 0x2A/0x09 — CAPACITY DATA HAS CHANGED. UA-class.
     pub const CAPACITY_DATA_HAS_CHANGED: Self = Self::new(SenseKey::UnitAttention, 0x2A, 0x09);
 

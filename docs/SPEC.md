@@ -343,8 +343,8 @@ the per-product identity and are validated at startup.
 | 0x4D | LOG SENSE | Page 0x00 (Supported Log Pages) only, listing just 0x00 itself — the SBC-3 / SPC-4 SAS-vintage log pages (temperature, retry counters, etc.) don't apply to a virtual block target. Other page codes / non-zero subpages → INVALID FIELD IN CDB per SPC-4 §7.2.5. |
 | 0x55 | MODE SELECT(10) | Same semantics as 0x15. Honors the LONGLBA bit on header byte 4 to pick the long-form vs short-form block descriptor. |
 | 0x5A | MODE SENSE(10) | Same coverage as 0x1A. |
-| 0x5E | PERSISTENT RESERVE IN | Service actions 0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES, 0x03 READ FULL STATUS. PR_GENERATION counter; in-memory state. REPORT CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01` (WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR, EX_AC_AR), TMV=1, PTPL_C=0. READ FULL STATUS renders an iSCSI format-0 TransportID per registrant (initiator IQN, NUL-padded). See *Persistent reservations* below for the shared state model. |
-| 0x5F | PERSISTENT RESERVE OUT | Service actions 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT (collapses to PREEMPT — no taskman hook), 0x06 REGISTER AND IGNORE EXISTING KEY. SA 0x07 REGISTER AND MOVE rejected. APTPL=1 / SPEC_I_PT=1 / ALL_TG_PT=1 in the parameter list reject as INVALID FIELD IN PARAMETER LIST. SCOPE must be 0x00 (LU_SCOPE) for SAs other than REGISTER variants. |
+| 0x5E | PERSISTENT RESERVE IN | Service actions 0x00 READ KEYS, 0x01 READ RESERVATION, 0x02 REPORT CAPABILITIES, 0x03 READ FULL STATUS. PR_GENERATION counter. REPORT CAPABILITIES advertises TYPE_MASK = `0xEA, 0x01` (WR_EX, EX_AC, WR_EX_RO, EX_AC_RO, WR_EX_AR, EX_AC_AR), TMV=1, PTPL_C=1 (state persisted across power loss), PTPL_A = the LU's active APTPL. READ FULL STATUS renders an iSCSI format-0 TransportID per registrant (initiator IQN, NUL-padded). See *Persistent reservations* below for the shared state model. |
+| 0x5F | PERSISTENT RESERVE OUT | Service actions 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT (collapses to PREEMPT — no taskman hook), 0x06 REGISTER AND IGNORE EXISTING KEY. SA 0x07 REGISTER AND MOVE rejected. APTPL=1 honored (persist the LU across power loss); SPEC_I_PT=1 / ALL_TG_PT=1 reject as INVALID FIELD IN PARAMETER LIST. SCOPE must be 0x00 (LU_SCOPE) for SAs other than REGISTER variants. |
 | 0x83 sa 0x00 | EXTENDED COPY (LID1) | SPC-3 §6.3 EXTENDED COPY service action 0x00 — the VMware VAAI "Hardware Accelerated Copy" primitive. Parameter list = 16-byte header (target descriptor list length, segment descriptor list length, inline data length must be 0) + N × 32-byte identification target descriptors (type 0xE4, designator type 0x03 NAA only — 8 bytes binary; T10 designators rejected because they don't fit the descriptor's 20-byte designator slot) + M × 28-byte block-to-block segment descriptors (type 0x02; src CSCD index, dst CSCD index, 16-bit block count, 64-bit src LBA, 64-bit dst LBA). LID4 (sa 0x01) rejects as INVALID FIELD IN CDB; ODX service actions (sa 0x10 POPULATE TOKEN and sa 0x11 WRITE USING TOKEN) are dispatched separately — see below. Other target descriptor types and other segment descriptor types reject as INVALID FIELD IN PARAMETER LIST. Per-segment routing: when src and dst resolve to volumes sharing a chunk pool (same backend + matching `DedupScope` namespace), LBAs and block count are all whole multiples of the volume's page size, and src/dst byte ranges don't overlap → page-index hash clone fast path (`PageCache::clone_page_range_into`) — zero chunk-pool I/O, no backend round-trip. Cross-LUN clones reach the fast path under those same conditions. Otherwise → 1 MiB-bounded streaming bytes copy. Destination LUN reservation-gated; WORM destination volumes refuse with WRITE PROTECTED. Synchronous: the whole copy completes before GOOD returns. RECEIVE COPY RESULTS SA 0x00 reports "completed without errors" for any list ID. |
 | 0x83 sa 0x10 | POPULATE TOKEN (ODX) | Hyper-V Offloaded Data Transfer step 1. CDB carries a 32-bit LIST IDENTIFIER (bytes 2-5) and a 32-bit PARAMETER LIST LENGTH (bytes 10-13). Parameter list (≥ 16 bytes): 2-byte ROD TOKEN DATA LENGTH (= plist_len − 2) + 1-byte IMMED flag (ignored — always sync) + 1 reserved + 4-byte INACTIVITY TIMEOUT (seconds, 0 → default 300 s; clamped to 600 s max) + 6 reserved + 2-byte BLOCK DEVICE RANGE DESCRIPTORS LIST LENGTH + N × 16-byte BDRD `{LBA u64, NUMBER OF BLOCKS u32, reserved u32}`. Source LUN is the addressed LUN; no CSCD descriptors. Max N = 8 (matches VPD 0x8F descriptor 0x0000). Every range must be page-aligned (LBA + blocks are whole multiples of `sectors-per-page`); misalignment → INVALID FIELD IN PARAMETER LIST. The handler flushes any in-range dirty pages, walks the page index to collect per-page hashes, pins every unique chunk via `shared_pool::ChunkPool::pin` (eviction + manifest-walking GC skip pinned chunks), mints a 512-byte ROD token (`OsRng`), and records `{list_id → Done, transfer_blocks, token}` in the per-dispatcher token manager. Sync-inline (returns GOOD as soon as the token + job are recorded). |
 | 0x83 sa 0x11 | WRITE USING TOKEN (ODX) | Hyper-V Offloaded Data Transfer step 2. CDB carries a 32-bit LIST IDENTIFIER + 32-bit PARAMETER LIST LENGTH. Parameter list (≥ 536 bytes): 2-byte PARAMETER DATA LENGTH + 1-byte IMMED + 1 + 12 reserved + 512-byte ROD TOKEN (bytes 16-527) + 2-byte BDRD LIST LENGTH (bytes 528-529) + 6 reserved + N × 16-byte BDRDs (destination LBAs). Destination LUN is the addressed LUN. Token miss → ASC 0x23/0x07 (TOKEN INVALID); past-deadline token → ASC 0x23/0x05 (TOKEN NOT MAINTAINED); page-size mismatch between source-at-snapshot-time and destination → INVALID FIELD IN PARAMETER LIST; pool mismatch (different backend or `DedupScope` namespace) → INVALID FIELD IN PARAMETER LIST (no slow-path fallback for ODX — XCOPY is the bytes-copy primitive). Destination ranges must be page-aligned; misalignment → INVALID FIELD IN PARAMETER LIST. The handler validates total destination pages match the snapshot's source pages, rebinds each destination page-index slot to the snapshot's hash (sparse-hole snapshots clear the slot), invalidates any cached destination entry, and records `{list_id → Done, transfer_blocks}` in the token manager. WORM destinations refuse with WRITE PROTECTED; reservation-gated. |
@@ -376,9 +376,30 @@ the data-path opcodes each gates differ (block READ/WRITE/SYNC vs tape
 medium read/write — see the tape note at the end of this section).
 
 The state model is per-LUN. Each LUN carries a set of registrations,
-each keyed by an I_T nexus `(tsih, initiator_iqn)`; at most one active
-reservation, described by `{holder, key, type}`; and a `PR_GENERATION`
-counter (SPC-4 §6.13.1.1) that wraps on overflow.
+each keyed by the **stable initiator-port identity** — for iSCSI the
+initiator IQN plus its ISID (the SCSI TransportID identity, RFC 7143 /
+SPC-4 §7.6.4.7), for NVMe the 128-bit HOSTID — never the ephemeral,
+target-assigned TSIH (which is reset to 1 on every daemon start, so
+keying by it dropped every reservation on restart and forced a
+re-register after any reconnect). Each LUN also carries at most one
+active reservation, described by `{holder, key, type}`; a
+`PR_GENERATION` counter (SPC-4 §6.13.1.1) that wraps on overflow; and an
+APTPL bit (the most-recent REGISTER's, SPC-4 §5.12.3) gating power-loss
+persistence.
+
+The iSCSI initiator-port identity is selectable via
+`iscsi.reservations.initiator_port`. The default `iqn-isid` uses the
+full `(IQN, ISID)` port (per-path / `mpathpersist`-style registration);
+a host then reclaims its reservation across a reconnect only if it
+presents the same ISID — Windows / VMware and session reinstatement do,
+but Linux open-iscsi mints a fresh ISID on every login, so a
+reconnecting open-iscsi host is a *new* port and must re-register.
+Setting `iqn` collapses the ISID to a fixed constant so registrants key
+by IQN alone: the host reclaims across any reconnect / target restart
+regardless of ISID churn, at the cost of treating all of that host's
+concurrent sessions as one registrant. The NVMe side is unaffected (the
+HOSTID is host-stable). In both modes a non-holder stays fenced across a
+restart — the choice only governs whether the *holder* re-matches.
 
 A registration key is a 64-bit value the initiator picks. The same key
 value may legitimately appear on more than one nexus — that is how
@@ -400,12 +421,17 @@ The reservation TYPE byte takes the following SBC-3 values:
   returns SCSI status 0x18 (RESERVATION CONFLICT) and no sense data —
   per SPC-4 §6.16 the status code alone carries the signal.
 
-Two reservation TYPEs in the table — the All-Registrants (`AR`)
-variants — behave differently when the holder goes away. For an AR
-type, dropping the holder's I_T nexus (a logout, a TCP drop, or
-`on_session_close`) does not release the reservation; the recorded
-holder simply rotates to one of the surviving registrants. Every
-non-AR type releases its reservation when the holder disappears.
+Persistent registrations and reservations survive I_T nexus loss
+unconditionally (SPC-4): a logout / TCP drop never evicts them, so a
+reconnecting initiator reusing its ISID is still its registrant / holder
+and need not re-register. A registration is removed only by an explicit
+PROUT (RELEASE / unregister / PREEMPT / CLEAR) or — when APTPL = 0 — a
+daemon restart. (`on_session_close` consequently touches no reservation
+state; the unregister-on-holder and AR-holder-rotation transitions
+below happen only on those explicit PROUTs.) Unregistering the holder of
+a non-AR reservation releases it; unregistering the holder of an
+All-Registrants (`AR`) reservation rotates the recorded holder to a
+surviving registrant instead.
 
 The PROUT parameter list has a fixed 24-byte baseline:
 
@@ -414,8 +440,10 @@ byte  0..7    RESERVATION KEY (u64 BE)
 byte  8..15   SERVICE ACTION RESERVATION KEY (u64 BE)
 byte 16..19   scope-specific address (obsolete; must be 0)
 byte 20       SPEC_I_PT (bit 3) | ALL_TG_PT (bit 2) | APTPL (bit 0)
-              — every bit must be 0; non-zero rejects with
-                INVALID FIELD IN PARAMETER LIST
+              — SPEC_I_PT / ALL_TG_PT must be 0 (non-zero rejects with
+                INVALID FIELD IN PARAMETER LIST, no multi-port);
+                APTPL = 1 is honored on REGISTER / REGISTER AND IGNORE
+                EXISTING KEY (persist the LU across power loss)
 byte 21       reserved
 byte 22..23   obsolete (extent length)
 ```
@@ -423,13 +451,26 @@ byte 22..23   obsolete (extent length)
 On the PRIN side, the response headers for READ KEYS, READ
 RESERVATION, and READ FULL STATUS are 8 bytes: `PR_GENERATION (u32
 BE)` followed by `ADDITIONAL LENGTH (u32 BE)`. REPORT CAPABILITIES is
-a fixed 8-byte payload with byte 0 = 0x00, byte 1 = 0x08, byte 3 =
-0x80 (TMV=1), and bytes 4..5 = TYPE_MASK.
+a fixed 8-byte payload with byte 0 = 0x00, byte 1 = 0x08, byte 2 =
+PTPL_C (bit 0), byte 3 = `0x80` (TMV=1) | PTPL_A (bit 0, the LU's
+active APTPL), and bytes 4..5 = TYPE_MASK.
 
-Reservation state is held in memory only, so a daemon restart drops
-every registration. That is not a hidden behavior — REPORT
-CAPABILITIES advertises `PTPL_C = 0` precisely so that initiators know
-to re-register on reconnect.
+Reservation state is persisted across power loss / daemon restart when
+the LU's most-recent REGISTER set APTPL = 1. The on-disk form is a
+single `<data_dir>/reservations.json` (mode 0640), keyed by the stable
+per-entity UUID — the VSA volume manifest UUID, or the fixed drive /
+changer LUN on VTL — and resolved back to the current LUN at reload, so
+a reused LUN number never inherits a deleted volume's fence; a record
+whose UUID no longer resolves is dropped. The durable write (serialize
+→ fsync temp file → rename → fsync parent dir) completes **before** the
+PROUT is acknowledged GOOD (persist-before-ack); a write failure returns
+CHECK CONDITION / HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44). Setting
+APTPL back to 0, or CLEAR, erases the LU's on-disk record in the same
+rewrite. REPORT CAPABILITIES advertises `PTPL_C = 1` accordingly (it is
+cleared only when the manager is built without a data dir, which never
+happens in a real install). The file is reloaded fail-safe at start: a
+missing file is first boot; a truncated / unparseable / unknown-version
+file logs a warning and starts empty rather than wedging the daemon.
 
 On the **thurvtl tape drive LUN** the same state machine applies, with
 tape-shaped data-path enforcement (issue #16): the write gate fences
@@ -463,11 +504,13 @@ own manager instance.
 The registrant identity is the **128-bit Host Identifier** from the
 Fabrics Connect data, not a per-connection handle. One NVMe host opens
 many TCP connections (admin queue + I/O queues) under one HOSTID, so a
-single connection teardown does **not** drop the registration — there
-is no `on_session_close`/`drop_nexus` equivalent on the NVMe side. A
+single connection teardown does **not** drop the registration. A
 reservation is released only by an explicit Reservation Release,
-Reservation Register (unregister), or Preempt, or by a daemon restart
-(state is in-memory; see PTPL below).
+Reservation Register (unregister), or Preempt — or, when CPTPL was not
+set, a daemon restart (see PTPL below). The iSCSI side now matches this
+posture: it keys registrants by the initiator IQN + ISID, not the
+ephemeral TSIH, so its registrations also survive nexus loss and there
+is no longer any session-close eviction on either transport.
 
 NVMe numbers the six reservation types 1..6, mapping onto the SCSI
 TYPE byte (same semantics as the table above):
@@ -481,8 +524,10 @@ TYPE byte (same semantics as the table above):
   | 5 | 0x07 | Write Exclusive — All Registrants |
   | 6 | 0x08 | Exclusive Access — All Registrants |
 
-Advertisement: Identify Namespace **RESCAP** (byte 31) = `0x7E` (all
-six types, PTPL bit 0 clear); Identify Controller **ONCS** (bytes
+Advertisement: Identify Namespace **RESCAP** (byte 31) = `0x7F` (all
+six types + PTPL bit 0 — state persisted across power loss; clears to
+`0x7E` only when the manager is built without a data dir, which never
+happens in a real install); Identify Controller **ONCS** (bytes
 520..522) bit 5 = Reservations supported. Without these a host never
 issues the reservation command set.
 
@@ -491,7 +536,8 @@ CDW10[3]:
 
 ```text
 Reservation Register (0x0D): RREGA 0 Register / 1 Unregister / 2 Replace
-  CDW10[31:30] CPTPL  — 0b11 (set PTPL) rejected, Invalid Field
+  CDW10[31:30] CPTPL  — 0b00 no change / 0b10 clear PTPL / 0b11 set PTPL
+                        (set persists the LU; see PTPL below)
   data-out (16 B): CRKEY (u64 LE) + NRKEY (u64 LE)
 Reservation Acquire (0x11):  RACQA 0 Acquire / 1 Preempt / 2 Preempt-and-Abort
   CDW10[15:8] RTYPE
@@ -509,7 +555,8 @@ Acquire from an unregistered host returns Reservation Conflict.
 
 The Reservation Report returns the **Reservation Status Data
 Structure**: a 24-byte header (GEN u32 LE at 0..4, RTYPE at 4, REGCTL
-u16 LE at 5..7, PTPLS = 0 at 9) followed by one registered-controller
+u16 LE at 5..7, PTPLS at 9 = the namespace's current Persist Through
+Power Loss state) followed by one registered-controller
 entry per registrant HOSTID. The short form (EDS = 0, 24 bytes each)
 carries CNTLID (0..2), RCSTS bit 0 = holds-reservation (2), the low 64
 bits of HOSTID (5..13), and RKEY (13..21). The extended form
@@ -527,11 +574,16 @@ covers Write 0x01 / Write Zeroes 0x08 / Dataset Management 0x09
 NVM Command Set does not restrict it (it commits already-accepted
 writes), which is a deliberate asymmetry with SCSI SYNCHRONIZE CACHE.
 
-PTPL: not supported. RESCAP bit 0 = 0, reservation state is in-memory,
-and a daemon restart drops every registration (hosts re-register on
-reconnect) — the same `PTPL_C = 0` posture as the SCSI side. A
-Reservation Register requesting CPTPL = set-PTPL is rejected with
-Invalid Field.
+PTPL: supported. RESCAP bit 0 = 1. A Reservation Register with
+CPTPL = set-PTPL persists the namespace's registrations + reservation to
+`<data_dir>/reservations.json` (the same UUID-keyed, persist-before-ack
+store the SCSI APTPL path uses — see *Persistent reservations* above)
+before the command completes; a durable-write failure returns Internal
+Error. CPTPL = clear-PTPL erases the on-disk record. The reloaded state
+is authoritative after a restart: a non-holder is fenced immediately and
+the prior holder (same HOSTID) need not re-register — a blind
+`RREGA_REGISTER` with `CRKEY = 0` correctly gets Reservation Conflict; a
+host that means to rotate its key uses IEKEY = 1.
 
 Reservation notifications (proactive fencing): in addition to the
 synchronous Reservation Conflict gate, a fenced host is told

@@ -126,6 +126,7 @@ impl Fixture {
             audit_log: &self.audit_log,
             audit_ratelimiter: &self.ratelimiter,
             initiator_iqn,
+            initiator_isid: [0u8; 6],
             peer: "test",
             diagnostic_store: &self.diag,
             session_partition: None,

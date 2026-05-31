@@ -232,6 +232,12 @@ pub struct ScsiCtx<'a> {
     pub audit_log: &'a Option<AuditChannel>,
     pub audit_ratelimiter: &'a AuditRateLimiter,
     pub initiator_iqn: Option<&'a str>,
+    /// ISID (initiator session id) from the login PDU. With
+    /// `initiator_iqn` it forms the stable iSCSI initiator-port identity
+    /// the PR gate / 0x5E / 0x5F handlers build a
+    /// [`Nexus`](scsi_spc::reservations::Nexus) from. Synthetic call
+    /// sites (CLI SCSI tests, in-process smoke) pass all-zero.
+    pub initiator_isid: [u8; 6],
     pub peer: &'a str,
     /// Per-LUN ring buffer of self-test results. SEND DIAGNOSTIC reads
     /// `last(lun)`; RECEIVE DIAGNOSTIC RESULTS page 0x10 walks
@@ -264,8 +270,8 @@ pub struct ScsiCtx<'a> {
     /// side via `scsi-spc`. The PR enforcement gate in
     /// [`dispatch_drive_lun`](crate::dispatch::dispatch_drive_lun)
     /// and the 0x5E / 0x5F handlers build a
-    /// [`Nexus`](scsi_spc::reservations::Nexus) from `tsih` +
-    /// `initiator_iqn` and consult this. One instance per daemon,
+    /// [`Nexus`](scsi_spc::reservations::Nexus) from `initiator_iqn` +
+    /// `initiator_isid` and consult this. One instance per daemon,
     /// outliving every command.
     pub reservations: &'a Arc<ReservationManager>,
 }

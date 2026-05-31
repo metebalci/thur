@@ -116,6 +116,7 @@ impl Fixture {
             audit_log: &self.audit_log,
             audit_ratelimiter: &self.ratelimiter,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             peer: "test",
             diagnostic_store: &self.diag,
             session_partition: None,
@@ -130,8 +131,12 @@ impl Fixture {
         }
     }
 
-    /// Like [`Fixture::ctx`] but with a caller-chosen TSIH so a test
-    /// can drive distinct I_T nexuses through the reservation gate.
+    /// Like [`Fixture::ctx`] but with a caller-chosen initiator port so
+    /// a test can drive distinct I_T nexuses through the reservation
+    /// gate. The reservation identity is now `(IQN, ISID)`, so the
+    /// `tsih` argument seeds a distinct ISID (it no longer keys the
+    /// registrant); [`Fixture::reserve_changer`] seeds its ISID the same
+    /// way so the two line up.
     fn ctx_tsih<'a>(
         &'a self,
         pdu: &'a mut Pdu,
@@ -141,6 +146,7 @@ impl Fixture {
     ) -> SmcScsiCtx<'a> {
         let mut ctx = self.ctx(pdu, cdb, lun);
         ctx.inner.tsih = tsih;
+        ctx.inner.initiator_isid = [tsih as u8; 6];
         ctx
     }
 
@@ -148,7 +154,7 @@ impl Fixture {
     /// changer LUN (LUN 0) for the nexus identified by `tsih`. Used to
     /// set up the reservation a test then probes for fencing.
     fn reserve_changer(&self, tsih: u16, sark: u64, type_byte: u8) {
-        let nexus = Nexus::new(tsih, None);
+        let nexus = Nexus::iscsi(None, [tsih as u8; 6]);
         // REGISTER AND IGNORE EXISTING KEY (SA 0x06): RESERVATION KEY 0,
         // SERVICE ACTION RESERVATION KEY = sark.
         let reg = prout_params(0, sark);

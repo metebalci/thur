@@ -102,7 +102,7 @@ expose must answer.
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
 | 0x5A | MODE SENSE(10) | 🟩 Yes | O | |
 | 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1) and the medium changer (LUN 0) — reservation state is keyed per-LUN, so the changer's is independent of the drives'. |
-| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). PTPL / SPEC_I_PT / ALL_TG_PT bits reject as INVALID FIELD IN PARAMETER LIST. State in-memory; PTPL_C = 0 in REPORT CAPABILITIES. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
+| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). APTPL = 1 is honored (state persisted to `<data_dir>/reservations.json`, reloaded at start) and PTPL_C = 1 in REPORT CAPABILITIES; SPEC_I_PT / ALL_TG_PT still reject as INVALID FIELD IN PARAMETER LIST. A durable-write failure on a persist-eligible mutation returns CHECK CONDITION / HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44) rather than a false GOOD. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
 | 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 | 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
@@ -158,28 +158,48 @@ persistent reservations to decide which node owns a LUN:
 - **PRIN (0x5E) READ KEYS / READ RESERVATION / READ FULL STATUS**
   walk live `ReservationManager` state. **REPORT CAPABILITIES**
   advertises the full SBC-3 type matrix (WR_EX / EX_AC / WR_EX_RO /
-  EX_AC_RO / WR_EX_AR / EX_AC_AR — TYPE_MASK = `0xEA, 0x01`) and
-  clears PTPL_C (in-memory state only).
+  EX_AC_RO / WR_EX_AR / EX_AC_AR — TYPE_MASK = `0xEA, 0x01`) and sets
+  PTPL_C = 1 (the daemon persists reservation state across power loss);
+  PTPL_A reflects the LU's currently-active APTPL bit.
 - **PROUT (0x5F) REGISTER, RESERVE, RELEASE, CLEAR, PREEMPT,
   PREEMPT AND ABORT, REGISTER AND IGNORE EXISTING KEY** mutate state
-  per SPC-4 §6.14. Registrations keyed by I_T nexus `(tsih,
-  initiator_iqn)`. Data-path enforcement: WRITE (10/16), SYNCHRONIZE
-  CACHE (10/16), READ (10/16) consult `ReservationManager::allow_write`
-  / `allow_read` and surface RESERVATION CONFLICT (status 0x18, no
-  sense) when blocked.
+  per SPC-4 §6.14. Registrations are keyed by the **stable iSCSI
+  initiator port** — the initiator IQN plus its ISID (the SCSI
+  TransportID identity, RFC 7143 / SPC-4 §7.6.4.7) — **not** the
+  ephemeral, target-assigned TSIH. That identity round-trips across
+  logout and daemon restart and distinguishes MPIO paths.
+  `iscsi.reservations.initiator_port: iqn` collapses the ISID so
+  registrants key by IQN alone — a host then reclaims its reservation
+  across a reconnect even if its ISID changes (Linux open-iscsi mints a
+  fresh ISID per login); the default `iqn-isid` keeps the full port.
+  Data-path
+  enforcement: WRITE (10/16), SYNCHRONIZE CACHE (10/16), READ (10/16)
+  consult `ReservationManager::allow_write` / `allow_read` and surface
+  RESERVATION CONFLICT (status 0x18, no sense) when blocked.
 - **REGISTER AND MOVE (SA 0x07)** rejected — thurvsa is single-port.
-- **APTPL = 1, SPEC_I_PT = 1, ALL_TG_PT = 1** reject as INVALID
-  FIELD IN PARAMETER LIST.
-- **Session close** (`ScsiHandler::on_session_close`) calls
-  `ReservationManager::drop_nexus(tsih)`: non-AR reservations held
-  by the dropped nexus are released; AR reservations rotate the
-  recorded holder to a surviving registrant.
+- **APTPL = 1** is honored: the LU's registrations + reservation are
+  written to `<data_dir>/reservations.json` (atomic temp-file write +
+  rename + parent-dir fsync) **before** the PROUT is acknowledged GOOD
+  (persist-before-ack); a write failure returns CHECK CONDITION /
+  HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44). Setting APTPL back to 0
+  (or CLEAR) erases the on-disk record in the same durable rewrite.
+  **SPEC_I_PT = 1, ALL_TG_PT = 1** still reject as INVALID FIELD IN
+  PARAMETER LIST (no multi-port registration).
+- **Persistence across nexus loss is unconditional.** A persistent
+  registration is removed only by an explicit PROUT (RELEASE /
+  unregister / PREEMPT / CLEAR) or — when APTPL = 0 — a daemon restart.
+  A logout / TCP drop no longer evicts it (SPC-4: persistent
+  reservations survive I_T nexus loss), so a reconnecting initiator
+  reusing its ISID is still the holder and need not re-register.
+  `on_session_close` therefore touches no reservation state.
 
 **thurvtld (tape)** implements the same PR family on the **drive LUN**
 (LUN ≥ 1), reusing the shared `ReservationManager` (issue #16). PRIN /
-PROUT service actions, the I_T-nexus keying, the APTPL / SPEC_I_PT /
-ALL_TG_PT rejections, and the session-close `drop_nexus` are identical
-to the block side. The differences are tape-shaped:
+PROUT service actions, the (IQN, ISID) initiator-port keying, the APTPL
+persistence, the SPEC_I_PT / ALL_TG_PT rejections, and the survive-
+nexus-loss behavior are identical to the block side; the drive / changer
+LUN is itself the stable persistence identity. The differences are
+tape-shaped:
 
 - **Data-path enforcement** fences the medium opcodes: WRITE(6) 0x0A,
   WRITE FILEMARKS 0x10 / 0x80, ERASE 0x19, FORMAT MEDIUM 0x04
@@ -856,7 +876,8 @@ REGISTER AND IGNORE EXISTING KEY, truthful PRIN, and RESERVATION
 CONFLICT (status 0x18) on medium read/write opcodes for a non-permitted
 nexus. PROUT (0x5F) appears in the drive's REPORT SUPPORTED OPERATION
 CODES. The full behavior — service actions, the enforcement opcode
-set, session-close `drop_nexus` — is in
+set, the (IQN, ISID) initiator-port keying, APTPL persistence, and the
+survive-nexus-loss semantics — is in
 [Part 1](#part-1-spc-4-sam-5-and-iscsi)
 § *Reservations — thurvtl tape vs thurvsa block*.
 
@@ -1244,7 +1265,6 @@ here — they are in
 |------|-----|
 | Legacy SPC-2 RESERVE / RELEASE (6 / 10) absent | SBC-3 doesn't require them; Windows / VMware / Linux clusters use the SCSI-3 PR family exclusively. |
 | PROUT REGISTER AND MOVE (SA 0x07) rejected | thurvsa is single-port; the multi-port SA has no analog. |
-| PTPL persistence absent | PTPL_C cleared in REPORT CAPABILITIES; in-memory state only. Initiators re-register on daemon restart. |
 | MAXIMUM WRITE SAME LENGTH = 0 | No specific limit advertised. The host-side block layer or VAAI module sets its own ceiling. |
 | LBP soft-threshold notification absent | THRESHOLD EXPONENT = 0 in VPD 0xB2; thin-provisioning is bounded by the storage backend's capacity, not a local pool watermark. |
 | TASK MANAGEMENT FUNCTIONS via REPORT SUPPORTED TMF only | ATS / ATSS / CTSS / LURS / ITNRS advertised via MAINTENANCE IN SA 0x0D; the actual TMF dispatch is shared-iscsi's responsibility. |

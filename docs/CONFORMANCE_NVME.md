@@ -68,8 +68,8 @@ are indistinguishable at the chunk level.
 | 0x08 | Write Zeroes | 🟩 Yes | O | Lowered to `PageCache::write_bytes(..., &vec![0; nlb * lba_bytes])`. Sub-page zeroing via cache RMW. WORM refuses with a media-error status. |
 | 0x09 | Dataset Management | 🟩 Partial | O | AD (Deallocate, CDW11 bit 2) only — each 16-byte range descriptor calls `PageCache::unmap_bytes(slba * lba_bytes, nlb * lba_bytes)`. Without AD, IDR / IDW hint passes return success as a no-op. |
 | 0x0C | Verify | 🟩 Yes | O | Routes to `PageCache::read_bytes` and discards the payload — surfaces medium errors without returning data. Sparse-hole pages succeed. |
-| 0x0D | Reservation Register | 🟩 Yes | O | RREGA Register / Unregister / Replace, with IEKEY. Backed by the shared `scsi_spc::reservations::ReservationManager` keyed by the 128-bit HOSTID from Fabrics Connect (`nvme_nvm::reservations`). CPTPL = "set PTPL" (0b11) rejected with `Invalid Field` — PTPL is not advertised (RESCAP bit 0 = 0), mirroring the SCSI side's APTPL reject. |
-| 0x0E | Reservation Report | 🟩 Yes | O | Reservation Status Data Structure from a snapshot of the shared state. EDS (CDW11 bit 0) selects the extended 64-byte-per-controller form (full 128-bit HOSTID) vs the 24-byte form (low 64 bits). One registered-controller entry per HOSTID; CNTLID is the registrant's representative live controller (its lowest CNTLID), or `0` if the host has a persisted registration but no live controller. The fencing identity remains the HOSTID, not the CNTLID. |
+| 0x0D | Reservation Register | 🟩 Yes | O | RREGA Register / Unregister / Replace, with IEKEY + CPTPL. Backed by the shared `scsi_spc::reservations::ReservationManager` keyed by the 128-bit HOSTID from Fabrics Connect (`nvme_nvm::reservations`). CPTPL = "set PTPL" (0b11) sets the namespace PTPL state and persists the registration to `<data_dir>/reservations.json` before the command completes (persist-before-ack; a durable-write failure returns `Internal Error`); "clear PTPL" (0b10) clears it; "no change" (0b00) leaves it. PTPL is advertised (RESCAP bit 0 = 1). |
+| 0x0E | Reservation Report | 🟩 Yes | O | Reservation Status Data Structure from a snapshot of the shared state. EDS (CDW11 bit 0) selects the extended 64-byte-per-controller form (full 128-bit HOSTID) vs the 24-byte form (low 64 bits). PTPLS (byte 9) reflects the namespace's current Persist Through Power Loss state. One registered-controller entry per HOSTID; CNTLID is the registrant's representative live controller (its lowest CNTLID), or `0` if the host has a persisted registration but no live controller. The fencing identity remains the HOSTID, not the CNTLID. |
 | 0x11 | Reservation Acquire | 🟩 Yes | O | RACQA Acquire / Preempt / Preempt-and-Abort. RTYPE 1..6 maps to the six SCSI reservation types. Acquire from an unregistered host returns `Reservation Conflict`. Preempt and Preempt-and-Abort collapse (no task-manager hook), matching the SCSI side. |
 | 0x15 | Reservation Release | 🟩 Yes | O | RRELA Release / Clear. A non-holder's data-path command (Read / Compare / Verify gated by `allow_read`; Write / Write Zeroes / DSM-deallocate / fused Compare+Write by `allow_write`) is rejected with `Reservation Conflict` (SCT=Command-Specific, SC=0x83). Flush is deliberately **not** gated (the NVM Command Set does not restrict it). |
 | — | Fused Compare + Write (0x05 FUSE=01 → 0x01 FUSE=10) | 🟩 Yes | O | Both halves accumulated by the transport (`nvme-tcp::server`), atomic compare-and-swap via `NvmeCommandHandler::handle_fused_compare_write` → `PageCache::compare_and_write_bytes`. Two CQEs per NVMe Base §4.2.6. Mismatch returns `Compare Failure` on the Compare CQE + `Aborted due to failed fused` (SC=0x0A) on the Write CQE. Sub-LBA CAW (single-sector VMFS heartbeat) honored end-to-end. |
@@ -117,7 +117,7 @@ rather than via these commands, so a host that submits them receives
 
 | CNS | Name | Status | Notes |
 |----:|------|--------|-------|
-| 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; RESCAP (byte 31) = `0x7E` (all six reservation types, PTPL bit 0 clear); VWC bit 0 set (so Linux issues Flush). |
+| 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; RESCAP (byte 31) = `0x7F` (all six reservation types + PTPL bit 0; the daemon persists reservation state across power loss — bit 0 is cleared to `0x7E` only if the manager is built without a data dir, which never happens in a real install); VWC bit 0 set (so Linux issues Flush). |
 | 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID = the per-controller ID assigned at Connect (distinct per association), CMIC (byte 76) bit 1 set (subsystem may contain two or more controllers; bits 0/3 clear — single port, no ANA), VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
 | 0x02 | Active Namespace ID List | 🟩 Yes | Up to 1024 u32 NSIDs greater than `SQE.NSID`, zero-padded. |
 | 0x03 | Namespace ID Descriptor List | 🟩 Yes | Two descriptors: NIDT=0x02 NGUID (from volume UUID), then NIDT=0x04 CSI=0x00 (NVM). Linux nvme-tcp issues this right after CNS 0x00 and silently fails namespace attach without a CSI descriptor. |
@@ -299,7 +299,6 @@ reasoning for each. SCSI-side cross-cutting departures are in
 | Async events other than reservation notifications | AER (Admin 0x0C) is implemented, but the only event source wired is reservation notifications (LID 0x80 — see *Reservation notifications* below). Namespace-attribute (the Notice-type events behind FID 0x0B Async Event Configuration), firmware-activation, and thermal notices are not produced — VSA has no firmware mechanism or thermal sensors, and namespaces are bound at `volume create`. The generic AER plumbing is reusable when a namespace-change source lands. |
 | Discovery controller absent | Hosts connect direct to the subsystem NQN; operators distribute the address / port / NQN out of band. A discovery listener lands when multi-subsystem deployments become a documented use case. |
 | DH-HMAC-CHAP (NVMe Base §8.13.5, Fabrics 0x05 / 0x06) | The non-TLS auth alternative — auth exchange encrypted, data stream not. Lands only if a deployment can't terminate TLS at the target. |
-| PTPL (persist through power loss) | RESCAP bit 0 = 0; reservation state is in-memory only and a daemon restart drops it (hosts re-register on reconnect), matching the SCSI side's `PTPL_C = 0`. A Reservation Register with CPTPL = "set PTPL" is rejected with `Invalid Field`. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
 | PCIe-only admin opcodes (0x00 / 0x01 / 0x04 / 0x05 / 0x7C) | Fabrics queue creation happens via Connect; doorbells are a PCIe concept. `Invalid Command Opcode` is the correct fabrics behavior. |
@@ -426,6 +425,23 @@ notifications. One deliberate simplification: a host's *own* other
 controllers are not notified of its commands (the issuer is excluded at
 the host level, not the controller level) — a rare case for a
 single-host-multi-controller setup releasing its own reservation.
+
+**Persistence across a target restart (PTPL).** When a host's most-recent
+Reservation Register set CPTPL = "set PTPL", the registration and any
+reservation are written to `<data_dir>/reservations.json` before the
+command completes and reloaded at the next daemon start (RESCAP bit 0 =
+1, Reservation Report PTPLS = 1). The reloaded state is **authoritative**:
+after a target restart a non-holder is fenced immediately with no
+re-registration, and the prior holder — reconnecting under the same
+HOSTID — is still the holder. A host must therefore **not** blind-register
+after a restart: a plain `RREGA_REGISTER` (IEKEY = 0) with `CRKEY = 0`
+gets Reservation Conflict, because a registration already exists for that
+HOSTID and the CRKEY must match the current key. To deliberately rotate
+its key a host uses `Register and Ignore Existing Key` (IEKEY = 1), which
+rebinds the HOSTID to the new key and re-persists. Linux `nvme` does not
+auto-register, so the common path is clean. The HOSTID is host-stable, so
+no identity fixup is needed on reload (unlike the iSCSI side, which keys
+by the initiator IQN + ISID rather than the ephemeral TSIH).
 
 ### Is DH-HMAC-CHAP used in practice?
 

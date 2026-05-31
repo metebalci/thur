@@ -576,6 +576,7 @@ mod tests {
             reservation_type: None,
             holder: holder.map(RegistrantId::nvme),
             registrants: regs.iter().map(|h| (RegistrantId::nvme(*h), 1)).collect(),
+            aptpl: false,
         }
     }
 

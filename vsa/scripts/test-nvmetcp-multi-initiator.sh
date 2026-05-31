@@ -198,6 +198,25 @@ start_daemon() {
     exit 1
 }
 
+# Stop and re-launch the daemon against the SAME data dir + config
+# (same port), appending to the existing log. Used by the PTPL
+# restart-survival phase (issue #57).
+restart_daemon() {
+    stop_thur_daemon
+    log_info "Restarting thurvsad (NVMe/TCP) against the same data dir..."
+    RUST_LOG="info" "$DAEMON_PATH" --config "$TEST_CONFIG" >> "$TEST_DIR/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 30); do
+        if ss -tln 2>/dev/null | grep -q ":$NVMETCP_PORT\b"; then
+            log_info "Daemon back up (PID: $DAEMON_PID)"
+            return 0
+        fi
+        sleep 0.2
+    done
+    log_error "Daemon failed to rebind port $NVMETCP_PORT after restart"
+    return 1
+}
+
 create_volume() {
     log_info "Creating test volume..."
     "$CLI_PATH" --config "$TEST_CONFIG" --user root volume create test-vol \
@@ -394,6 +413,72 @@ test_conflict_status() {
     fi
 }
 
+# PTPL (issue #57): a CPTPL=set reservation must survive a daemon
+# restart. Establishes a clean Write Exclusive reservation held by host
+# A with CPTPL=set (the CLEAR + re-register makes it independent of any
+# prior test's state), confirms reservations.json was written, then
+# disconnects the whole subsystem, restarts the daemon against the same
+# data dir, and reconnects. The reloaded state is authoritative: the
+# Reservation Report still shows A's key (the host did NOT re-register)
+# and, in two-device mode, host B's block write is still fenced. The
+# HOSTID is host-stable, so no identity fixup is needed on reconnect.
+test_ptpl_survives_restart() {
+    log_info "PTPL: CPTPL=set reservation survives a daemon restart (issue #57)"
+    local dev_a dev_b
+    dev_a=$(connect_host "$HOST_A_NQN" "$HOST_A_ID")
+    [[ -n "$dev_a" ]] || dev_a=$(list_ns_devs | head -1)
+    [[ -n "$dev_a" ]] || { log_fail "PTPL: no namespace device for host A"; return; }
+
+    # Force a clean state: register A ignoring any existing key, CLEAR
+    # everything, then register A fresh with CPTPL=set + acquire WE.
+    nvme resv-register "$dev_a" --rrega=0 --iekey=1 --nrkey="$KEY_A" >>"$TEST_DIR/ptpl.log" 2>&1
+    nvme resv-release "$dev_a" --crkey="$KEY_A" --rrela=1 >>"$TEST_DIR/ptpl.log" 2>&1
+    nvme resv-register "$dev_a" --rrega=0 --nrkey="$KEY_A" --cptpl=3 >>"$TEST_DIR/ptpl.log" 2>&1 \
+        || { log_fail "PTPL: host A register (CPTPL=set) failed"; cat "$TEST_DIR/ptpl.log"; return; }
+    nvme resv-acquire "$dev_a" --crkey="$KEY_A" --rtype=1 --racqa=0 >>"$TEST_DIR/ptpl.log" 2>&1 \
+        || { log_fail "PTPL: host A acquire failed"; cat "$TEST_DIR/ptpl.log"; return; }
+    log_pass "host A registered (CPTPL=set) + acquired Write Exclusive"
+
+    if [[ -f "$TEST_DIR/data/reservations.json" ]]; then
+        log_pass "reservations.json written (CPTPL=set persisted)"
+    else
+        log_fail "reservations.json missing despite CPTPL=set"
+        return
+    fi
+
+    # Tear the whole subsystem down and restart the daemon, then
+    # reconnect. No reservation command is issued before the checks.
+    nvme disconnect -n "$SUBNQN" >/dev/null 2>&1 || true
+    sleep 0.5
+    restart_daemon || { log_fail "PTPL: daemon restart failed"; return; }
+    dev_a=$(connect_host "$HOST_A_NQN" "$HOST_A_ID")
+    [[ -n "$dev_a" ]] || dev_a=$(list_ns_devs | head -1)
+    [[ -n "$dev_a" ]] || { log_fail "PTPL: host A reconnect yielded no device"; return; }
+
+    nvme resv-report "$dev_a" --numd=256 >"$TEST_DIR/report-ptpl.log" 2>&1
+    if grep -qi "a1a1" "$TEST_DIR/report-ptpl.log"; then
+        log_pass "Reservation Report shows A's key after restart (no re-registration)"
+    else
+        log_fail "A's reservation did not survive the restart"
+        cat "$TEST_DIR/report-ptpl.log"
+        return
+    fi
+
+    # Two-device mode: B's WRITE must still be fenced. Coalesced
+    # topology can't drive a second initiator's block I/O — skip, not pass.
+    dev_b=$(connect_host "$HOST_B_NQN" "$HOST_B_ID")
+    if [[ -n "$dev_b" && "$dev_b" != "$dev_a" ]]; then
+        if dd if=/dev/zero of="$dev_b" bs=4096 count=1 oflag=direct conv=fsync \
+            status=none 2>/dev/null; then
+            log_fail "host B WRITE succeeded after restart but should be fenced"
+        else
+            log_pass "host B WRITE still RESERVATION CONFLICT after restart"
+        fi
+    else
+        log_skip "coalesced topology: post-restart block fencing needs independent devices"
+    fi
+}
+
 main() {
     [[ -z "$NVMETCP_PORT" ]] && NVMETCP_PORT=$(free_port)
     [[ -z "$HTTP_PORT" ]] && HTTP_PORT=$(free_port)
@@ -420,6 +505,9 @@ main() {
         log_pass "host B connected (kernel coalesced onto $dev_a)"
         test_conflict_status "$dev_a"
     fi
+
+    echo
+    test_ptpl_survives_restart
 
     echo
     echo "===================="

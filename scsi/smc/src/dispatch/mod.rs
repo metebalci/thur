@@ -93,7 +93,7 @@ pub fn pr_enforce(ctx: &SmcScsiCtx<'_>) -> Option<ScsiResp> {
     if matches!(gate, PrGate::None) {
         return None;
     }
-    let nexus = Nexus::new(ctx.tsih, ctx.initiator_iqn.map(str::to_string));
+    let nexus = Nexus::iscsi(ctx.initiator_iqn.map(str::to_string), ctx.initiator_isid);
     let lun = ctx.lun as u64;
     let allowed = match gate {
         PrGate::Write => ctx.reservations.allow_write(lun, &nexus),

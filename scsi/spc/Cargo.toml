@@ -14,3 +14,8 @@ tracing = "0.1"
 # BLAKE3 underpins the NAA-3 + Logical Unit Group designator helpers
 # in `naa.rs` (VPD 0x83 stable identifiers derived from chassis serial).
 blake3 = "1"
+# serde derives the on-disk reservation-persistence DTO (PTPL, issue
+# #57); `RegistrantId` is Serialize/Deserialize so the persisted record
+# round-trips the initiator-port identity.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

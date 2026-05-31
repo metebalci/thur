@@ -111,6 +111,15 @@ http:
   listen: "127.0.0.1:$HTTP_PORT"
 iscsi:
   listen: "127.0.0.1:$ISCSI_PORT"
+  # Key reservations by IQN alone (issue #57). open-iscsi mints a fresh
+  # ISID on every login, so under the default "iqn-isid" a reconnecting
+  # holder would be a new initiator port and couldn't reclaim its own
+  # reservation. "iqn" is the right setting for open-iscsi clusters and
+  # is what the restart-survival leg below relies on. (The default
+  # "iqn-isid" still survives the restart and fences non-holders; it
+  # just won't re-match the holder across an ISID change.)
+  reservations:
+    initiator_port: iqn
 storage:
   backends:
     local:
@@ -215,6 +224,120 @@ test_pr_reservation_conflict_between_initiators() {
     return 0
 }
 
+# PTPL (issue #57): an APTPL=1 reservation must survive a daemon
+# restart. A registers WITH APTPL + reserves Write Exclusive, both
+# initiators log out, the daemon is stopped and restarted against the
+# SAME data dir + config, then both re-login. The reservation must be
+# reloaded from <data_dir>/reservations.json: B's write still conflicts
+# and READ KEYS still lists A's key — with NO re-registration. A's own
+# write succeeding after reconnect proves the holder is re-matched by
+# its persisted port identity rather than the per-process TSIH the
+# restart reset. The daemon runs in `initiator_port: iqn` mode (see the
+# config), so the re-match is by IQN — necessary because open-iscsi
+# mints a fresh ISID on every login, so the default `iqn-isid` mode
+# would treat the reconnect as a new port (which is spec-correct, just
+# not reclaim-friendly for open-iscsi).
+test_pr_survives_daemon_restart() {
+    log_test "PTPL: APTPL=1 reservation survives a daemon restart (issue #57)"
+
+    # Reuse the single matrix-test volume (LUN 0) so device selection
+    # stays unambiguous — a second volume would surface two new sg
+    # devices per login and the `head -1` pick would be a coin flip.
+    # The matrix test's registrations now persist across logout, so we
+    # reset to a clean slate first: REGISTER AND IGNORE a scratch key,
+    # then CLEAR, before establishing the APTPL reservation under test.
+    create_iface "$IFACE_A" "$INIT_A_NAME"
+    create_iface "$IFACE_B" "$INIT_B_NAME"
+
+    local before="${TEST_DIR}/sg-ptpl-before.txt"
+    local after_a="${TEST_DIR}/sg-ptpl-after-a.txt"
+    local after_b="${TEST_DIR}/sg-ptpl-after-b.txt"
+    lsscsi -g | awk '/THUR VSA/{print $NF}' > "$before"
+
+    local dev_a dev_b
+    dev_a=$(login_via_iface "$IFACE_A" "$before" "$after_a")
+    [[ -n "$dev_a" ]] || { log_error "A login: no new device"; return 1; }
+    dev_b=$(login_via_iface "$IFACE_B" "$after_a" "$after_b")
+    [[ -n "$dev_b" ]] || { log_error "B login: no new device"; return 1; }
+
+    # Clean slate: force A registered with a scratch key (ignoring any
+    # surviving matrix-test state), then CLEAR the whole LUN.
+    sg_persist --out --register-ignore --param-sark=0xCAFE "$dev_a" >/dev/null 2>&1 \
+        || { log_error "A register-ignore (reset) failed"; return 1; }
+    sg_persist --out --clear --param-rk=0xCAFE "$dev_a" >/dev/null 2>&1 \
+        || { log_error "CLEAR (reset) failed"; return 1; }
+
+    # A registers WITH APTPL (--param-aptpl) then reserves Write
+    # Exclusive; B registers (also APTPL) so its key persists too.
+    sg_persist --out --register --param-sark=0xA1A1 --param-aptpl "$dev_a" >/dev/null 2>&1 \
+        || { log_error "A register (APTPL) failed"; return 1; }
+    sg_persist --out --reserve --param-rk=0xA1A1 --prout-type=1 "$dev_a" >/dev/null 2>&1 \
+        || { log_error "A reserve failed"; return 1; }
+    sg_persist --out --register --param-sark=0xB2B2 --param-aptpl "$dev_b" >/dev/null 2>&1 \
+        || { log_error "B register (APTPL) failed"; return 1; }
+    log_info "  ✓ A reserved (Write Exclusive, APTPL=1); B registered (APTPL=1)"
+
+    # The on-disk store must exist now.
+    if [[ ! -f "${TEST_DIR}/data/reservations.json" ]]; then
+        log_error "  ✗ reservations.json not written despite APTPL=1"
+        return 1
+    fi
+    log_info "  ✓ reservations.json present"
+
+    # Log both out and restart the daemon against the same data dir +
+    # config (same ports). DAEMON_LOG_MODE=append keeps one log.
+    logout_via_iface "$IFACE_A"
+    logout_via_iface "$IFACE_B"
+    log_info "  restarting daemon..."
+    stop_thur_daemon
+    DAEMON_LOG_MODE=append TEST_CONFIG="${TEST_DIR}/config.yaml" start_thur_daemon
+
+    # Re-login both initiators. open-iscsi mints a fresh ISID per login,
+    # but the daemon runs in `initiator_port: iqn` mode (see the config),
+    # so both reconnect as the same IQN-keyed registrants they were
+    # before. No re-registration is issued between restart and the checks.
+    lsscsi -g | awk '/THUR VSA/{print $NF}' > "$before"
+    dev_a=$(login_via_iface "$IFACE_A" "$before" "$after_a")
+    [[ -n "$dev_a" ]] || { log_error "A re-login: no device"; return 1; }
+    dev_b=$(login_via_iface "$IFACE_B" "$after_a" "$after_b")
+    [[ -n "$dev_b" ]] || { log_error "B re-login: no device"; return 1; }
+    log_info "  re-logged in: A=$dev_a B=$dev_b"
+
+    # 1. READ KEYS still lists A's key (the registration was reloaded).
+    local pr_keys
+    pr_keys=$(sg_persist --in --read-keys "$dev_a" 2>&1 | grep -oE '0x[0-9a-fA-F]+' | tr '\n' ' ')
+    if [[ "$pr_keys" != *"0xa1a1"* ]]; then
+        log_error "  ✗ A's key not present after restart (got: $pr_keys)"
+        return 1
+    fi
+    log_info "  ✓ A's key survived the restart (no re-registration): $pr_keys"
+
+    # 2. B's WRITE still returns RESERVATION CONFLICT.
+    local write_log
+    write_log=$(sg_write_same --lba=0 --num=1 --in=/dev/zero "$dev_b" 2>&1 || true)
+    if echo "$write_log" | grep -qiE "Reservation conflict|reservation_conflict|sense.*0x18"; then
+        log_info "  ✓ B's WRITE still RESERVATION CONFLICT after restart"
+    else
+        log_error "  ✗ B's WRITE did not conflict after restart"
+        echo "$write_log" | head -5 | sed 's/^/    /' >&2
+        return 1
+    fi
+
+    # 3. A (the holder, reconnected under the same IQN+ISID) may write —
+    # proof the holder is matched by stable port identity, not the
+    # restart-reset TSIH. No re-registration was done.
+    if sg_write_same --lba=0 --num=1 --in=/dev/zero "$dev_a" >/dev/null 2>&1; then
+        log_info "  ✓ A (holder) can still write after restart — re-matched by IQN-keyed port"
+    else
+        log_error "  ✗ A could not write after restart — holder not re-matched by port identity"
+        return 1
+    fi
+
+    logout_via_iface "$IFACE_A"
+    logout_via_iface "$IFACE_B"
+    return 0
+}
+
 main() {
     echo "========================================"
     echo "Thur VSA Multi-Initiator iSCSI"
@@ -227,6 +350,12 @@ main() {
 
     local passed=0 failed=0
     if test_pr_reservation_conflict_between_initiators; then
+        ((passed++))
+    else
+        ((failed++))
+    fi
+    echo ""
+    if test_pr_survives_daemon_restart; then
         ((passed++))
     else
         ((failed++))

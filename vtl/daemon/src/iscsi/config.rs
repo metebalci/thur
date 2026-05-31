@@ -45,6 +45,11 @@ pub struct IscsiSettings {
     pub listen_portals: Vec<shared_iscsi::transport::Portal>,
     #[serde(default = "default_target_iqn")]
     pub target_iqn: String,
+    /// Persistent-reservation tuning (issue #57). `initiator_port`
+    /// selects whether reservations key by the full iSCSI port
+    /// (IQN + ISID, default) or by IQN alone.
+    #[serde(default)]
+    pub reservations: shared_iscsi::transport::ReservationSettings,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: u32,
     #[serde(default = "default_session_timeout")]
@@ -79,6 +84,7 @@ impl Default for IscsiSettings {
         Self {
             listen_portals: default_listen_portals(),
             target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
+            reservations: shared_iscsi::transport::ReservationSettings::default(),
             max_sessions: 10,
             session_timeout_seconds: 300,
             auth: AuthSettings::default(),
@@ -276,6 +282,7 @@ mod tests {
                 },
             ],
             target_iqn: "iqn.2025-10.com.example:vtl".to_string(),
+            reservations: shared_iscsi::transport::ReservationSettings::default(),
             max_sessions: 64,
             session_timeout_seconds: 120,
             auth: AuthSettings::default(),

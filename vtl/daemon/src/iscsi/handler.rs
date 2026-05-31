@@ -80,9 +80,13 @@ pub struct IscsiLibraryHandler {
     /// Persistent-reservation state machine (shared with the block
     /// side via `scsi-spc`). Threaded into the SCSI dispatcher's
     /// `ScsiCtx::reservations` for PROUT / PRIN + the drive-LUN
-    /// enforcement gate; `on_session_close` drops the departing
-    /// nexus's registrations here.
+    /// enforcement gate. Registrations persist across nexus loss
+    /// (issue #57), so `on_session_close` no longer evicts them here.
     pub(crate) reservations: Arc<scsi_spc::reservations::ReservationManager>,
+    /// PR initiator-port policy (issue #57): when `true` the transport
+    /// collapses the ISID so reservations key by IQN alone. Sourced from
+    /// `iscsi.reservations.initiator_port`; default `false`.
+    pub(crate) pr_collapse_isid: bool,
 }
 
 impl IscsiLibraryHandler {
@@ -119,15 +123,22 @@ impl ScsiHandler for IscsiLibraryHandler {
         &self.target_iqn
     }
 
+    fn pr_collapse_isid(&self) -> bool {
+        self.pr_collapse_isid
+    }
+
     fn on_session_close(&self, tsih: u16, _cid: u16) {
         // Release every drive lock the session held, then drop
         // PREVENT/ALLOW state. Same teardown the old SessionGuard
         // ran when the connection's TCP stream closed.
         self.drive_manager.release_session_locks(tsih);
         self.drive_manager.clear_prevent_for_session(tsih);
-        // SPC-4 §5.13.4.2: persistent-reservation registrations are
-        // released when the I_T nexus that registered them goes away.
-        self.reservations.drop_nexus(tsih);
+        // Persistent-reservation registrations are NOT released here:
+        // SPC-4 persistent reservations survive I_T nexus loss and are
+        // keyed by the stable initiator port (IQN + ISID), not the
+        // ephemeral TSIH. They are removed only by an explicit PROUT
+        // (Release / unregister / Preempt / Clear) or, when APTPL=0, a
+        // daemon restart (issue #57).
     }
 
     async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
@@ -213,6 +224,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         let audit = self.audit_log.clone();
         let ratelim = Arc::clone(&self.audit_ratelimiter);
         let iqn = req.initiator_iqn.map(str::to_string);
+        let isid = req.initiator_isid;
         let peer = req.peer.to_string();
         let partition = req.session_partition.map(str::to_string);
         let diag = Arc::clone(&self.diagnostic_store);
@@ -233,6 +245,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 &audit,
                 ratelim,
                 iqn.as_deref(),
+                isid,
                 &peer,
                 partition,
                 diag,

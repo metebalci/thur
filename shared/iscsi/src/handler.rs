@@ -46,6 +46,17 @@ pub trait ScsiHandler: Send + Sync + 'static {
     /// release today.
     fn on_session_close(&self, _tsih: u16, _cid: u16) {}
 
+    /// Whether the transport should collapse the iSCSI ISID to a fixed
+    /// constant before it reaches the SCSI layer
+    /// ([`ScsiRequest::initiator_isid`]), so persistent reservations key
+    /// by initiator IQN alone (issue #57 — see
+    /// [`crate::transport::PrInitiatorPort`]). Default `false` (keep the
+    /// full IQN + ISID initiator port); each product overrides it from
+    /// its `iscsi.reservations.initiator_port` conffile key.
+    fn pr_collapse_isid(&self) -> bool {
+        false
+    }
+
     /// Run one SCSI command end-to-end. Implementations may pre-/
     /// post-process around the actual dispatch (thurvtl does cloud
     /// chunk prefetch on READ, MOVE MEDIUM legal-hold sentinel
@@ -142,6 +153,7 @@ mod tests {
             data_out: &[],
             data_in_max: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             peer: "127.0.0.1:1",
             session_partition: None,
             session_volumes: None,
@@ -165,6 +177,7 @@ mod tests {
             data_out: &[],
             data_in_max: 0,
             initiator_iqn: None,
+            initiator_isid: [0u8; 6],
             peer: "p",
             session_partition: None,
             session_volumes: None,
