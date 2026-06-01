@@ -230,7 +230,8 @@ pub(crate) fn naa_locally_assigned(uuid: &[u8; 16]) -> [u8; 8] {
 ///          COPY) with service actions 0x00 (LID1), 0x10 (POPULATE
 ///          TOKEN) and 0x11 (WRITE USING TOKEN); opcode 0x84
 ///          (RECEIVE COPY RESULTS) with service actions 0x00
-///          (COPY STATUS), 0x03 (OPERATING PARAMETERS) and 0x07
+///          (COPY STATUS), 0x01 (RECEIVE DATA), 0x03 (OPERATING
+///          PARAMETERS), 0x04 (FAILED SEGMENT DETAILS) and 0x07
 ///          (RECEIVE ROD TOKEN INFORMATION). Without the right
 ///          (opcode, SA) entries, neither ESXi nor Windows will
 ///          try the corresponding offload.
@@ -315,8 +316,12 @@ fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
     commands.extend_from_slice(&[0x83, 0x00, 0x11, 0x00]);
     // (0x84, 0x00) — RECEIVE COPY RESULTS / COPY STATUS
     commands.extend_from_slice(&[0x84, 0x00, 0x00, 0x00]);
+    // (0x84, 0x01) — RECEIVE COPY RESULTS / RECEIVE DATA
+    commands.extend_from_slice(&[0x84, 0x00, 0x01, 0x00]);
     // (0x84, 0x03) — RECEIVE COPY RESULTS / OPERATING PARAMETERS
     commands.extend_from_slice(&[0x84, 0x00, 0x03, 0x00]);
+    // (0x84, 0x04) — RECEIVE COPY RESULTS / FAILED SEGMENT DETAILS
+    commands.extend_from_slice(&[0x84, 0x00, 0x04, 0x00]);
     // (0x84, 0x07) — RECEIVE ROD TOKEN INFORMATION   [ODX]
     commands.extend_from_slice(&[0x84, 0x00, 0x07, 0x00]);
     push_tpc_descriptor(&mut page, 0x0001, &{
@@ -802,10 +807,10 @@ mod tests {
         // ESXi VAAI XCOPY and Windows Hyper-V ODX both gate on this
         // page. Required descriptor sequence: 0x0000 ROD LIMITS (for
         // ODX), 0x0001 SUPPORTED COMMANDS (with opcodes 0x83 SAs
-        // 0x00 / 0x10 / 0x11 and 0x84 SAs 0x00 / 0x03 / 0x07),
-        // 0x0004 PARAMETER DATA, 0x0008 SUPPORTED DESCRIPTORS (with
-        // type codes 0xE4 / 0x02 / 0x00), and 0x8001 GENERAL COPY
-        // OPERATIONS.
+        // 0x00 / 0x10 / 0x11 and 0x84 SAs 0x00 / 0x01 / 0x03 / 0x04
+        // / 0x07), 0x0004 PARAMETER DATA, 0x0008 SUPPORTED
+        // DESCRIPTORS (with type codes 0xE4 / 0x02 / 0x00), and
+        // 0x8001 GENERAL COPY OPERATIONS.
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path()).await;
         let cdb = [0x12u8, 0x01, 0x8F, 0x00, 0x80, 0];
@@ -856,7 +861,9 @@ mod tests {
             (0x83, 0x0010),
             (0x83, 0x0011),
             (0x84, 0x0000),
+            (0x84, 0x0001),
             (0x84, 0x0003),
+            (0x84, 0x0004),
             (0x84, 0x0007),
         ] {
             assert!(

@@ -27,7 +27,8 @@
 #     0x89 COMPARE AND WRITE       (success + MISCOMPARE)
 #     0x42 UNMAP                   (sub-page sector zero + page-index drop)
 #     0x83 EXTENDED COPY           (VAAI XCOPY, same-LUN page-aligned fast path)
-#     0x84 RECEIVE COPY RESULTS    (COPY STATUS + OPERATING PARAMETERS)
+#     0x84 RECEIVE COPY RESULTS    (COPY STATUS + RECEIVE DATA + OPERATING
+#                                   PARAMETERS + FAILED SEGMENT DETAILS)
 #   SBC-3 reservations:
 #     0x5E / 0x5F PERSISTENT RESERVE IN / OUT
 #       (single-host scope — see cross-nexus-conflict caveat below)
@@ -957,13 +958,53 @@ t_inquiry_vpd_third_party_copy_advertises_odx() {
     # (op, sa_hi, sa_lo, reserved). Grep for "83 00 10" / "83 00 11" /
     # "84 00 07" (whitespace separated in sg_inq -H output).
     local missing=0
-    for pat in '83 00 10' '83 00 11' '84 00 07'; do
+    for pat in '83 00 10' '83 00 11' '84 00 01' '84 00 04' '84 00 07'; do
         if ! echo "$hex" | grep -q "$pat"; then
             log_error "VPD 0x8F missing SUPPORTED COMMANDS entry: $pat"
             missing=1
         fi
     done
     return $missing
+}
+
+t_receive_copy_results_extended_service_actions() {
+    # The full LID1 RECEIVE COPY RESULTS surface: RECEIVE DATA
+    # (sa 0x01) and FAILED SEGMENT DETAILS (sa 0x04). Both succeed
+    # (GOOD) and report "no held data" / "no failed segment" since
+    # XCOPY runs synchronously. Service action 0x05 is reserved in
+    # SPC-4 and must reject with CHECK CONDITION.
+    if ! command -v sg_raw >/dev/null 2>&1; then
+        log_info "sg_raw not present; skipping RECEIVE COPY RESULTS extended SAs"
+        return 0
+    fi
+    # sa 0x01 RECEIVE DATA — 4-byte AVAILABLE DATA header = 0.
+    local rd_out="$TEST_DIR/rcr-recv-data.bin"
+    sg_raw -r 256 -o "$rd_out" "$RW_DEVICE" \
+        84 01 00 00 00 00 00 00 00 00 00 00 01 00 00 00 >/dev/null 2>&1 \
+        || { log_error "RECEIVE COPY RESULTS sa 0x01 (RECEIVE DATA) rejected"; return 1; }
+    local avail
+    avail=$(xxd -s 0 -l 4 -p "$rd_out")
+    [[ "$avail" == "00000000" ]] || { log_error "RECEIVE DATA AVAILABLE DATA=$avail, expected 0"; return 1; }
+
+    # sa 0x04 FAILED SEGMENT DETAILS — 60-byte header, command
+    # status (byte 56) = 0, sense data length (bytes 58-59) = 0.
+    local fsd_out="$TEST_DIR/rcr-failed-seg.bin"
+    sg_raw -r 256 -o "$fsd_out" "$RW_DEVICE" \
+        84 04 00 00 00 00 00 00 00 00 00 00 01 00 00 00 >/dev/null 2>&1 \
+        || { log_error "RECEIVE COPY RESULTS sa 0x04 (FAILED SEGMENT DETAILS) rejected"; return 1; }
+    local status sense_len
+    status=$(xxd -s 56 -l 1 -p "$fsd_out")
+    sense_len=$(xxd -s 58 -l 2 -p "$fsd_out")
+    [[ "$status" == "00" ]] || { log_error "FAILED SEGMENT command status=$status, expected 00"; return 1; }
+    [[ "$sense_len" == "0000" ]] || { log_error "FAILED SEGMENT sense length=$sense_len, expected 0000"; return 1; }
+
+    # sa 0x05 is reserved — sg_raw should report CHECK CONDITION.
+    if sg_raw -r 256 "$RW_DEVICE" \
+        84 05 00 00 00 00 00 00 00 00 00 00 01 00 00 00 >/dev/null 2>&1; then
+        log_error "RECEIVE COPY RESULTS sa 0x05 (reserved) accepted; expected CHECK CONDITION"
+        return 1
+    fi
+    return 0
 }
 
 t_report_supported_opcodes_lists_odx() {
@@ -1215,6 +1256,7 @@ main() {
     run_test "EXTENDED COPY same-LUN intra-volume round-trip"     t_xcopy_same_lun_intra_volume_copy
     # Group M — Hyper-V ODX (POPULATE TOKEN / WRITE USING TOKEN)
     run_test "VPD 0x8F advertises ODX (descriptor 0x0000 + SAs)"  t_inquiry_vpd_third_party_copy_advertises_odx
+    run_test "RECEIVE COPY RESULTS RECEIVE DATA / FAILED SEG SAs"  t_receive_copy_results_extended_service_actions
     run_test "REPORT SUPPORTED OPCODES includes 0x83 / 0x84"      t_report_supported_opcodes_lists_odx
     run_test "POPULATE TOKEN + RECEIVE ROD TOKEN INFORMATION"     t_odx_populate_token_returns_token
     run_test "WRITE USING TOKEN same-LUN round-trip"              t_odx_write_using_token_round_trip

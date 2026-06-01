@@ -1058,19 +1058,30 @@ async fn extended_copy_execute(
 
 /// RECEIVE COPY RESULTS — opcode 0x84. Companion to EXTENDED COPY.
 ///
-/// Two service actions implemented:
+/// Service actions implemented (SPC-4 §6.20; the full LID1 set plus
+/// the ODX token-info action):
 ///   - 0x00 COPY STATUS — synchronous XCOPY always completes before
 ///     EXTENDED COPY returns, so any list ID the host queries gets
 ///     "operation completed without errors" with zero per-segment
 ///     accounting. ESXi rarely polls.
+///   - 0x01 RECEIVE DATA — retrieves held data produced by
+///     inline-data / host-bound segment descriptors. We accept
+///     neither, so there is never held data: the response is the
+///     bare AVAILABLE DATA = 0 header.
 ///   - 0x03 OPERATING PARAMETERS — what the host actually relies on
 ///     to gate VAAI: the per-XCOPY limits and the descriptor types
 ///     we accept. Numbers match VPD 0x8F's descriptor 0x0004 and
 ///     0x8001 advertisements.
+///   - 0x04 FAILED SEGMENT DETAILS — per-LIST IDENTIFIER failure
+///     record. Synchronous XCOPY surfaces a failing segment inline
+///     as CHECK CONDITION on the EXTENDED COPY itself and retains no
+///     per-list record, so this always reports "no failed segment".
+///   - 0x07 RECEIVE ROD TOKEN INFORMATION — ODX token-info channel
+///     (handled next to the token manager below).
 ///
-/// Other service actions (RECEIVE DATA, COPY ALL, FAILED SEGMENT
-/// DETAILS) aren't implemented; initiators that need them fall back
-/// to host-side accounting.
+/// Service action 0x05 is reserved in SPC-4 (there is no "operations
+/// count" action); like every other unimplemented SA it rejects with
+/// INVALID FIELD IN CDB.
 pub(super) fn receive_copy_results(
     req: &ScsiRequest<'_>,
     tokens: &Arc<TokenManager>,
@@ -1083,7 +1094,9 @@ pub(super) fn receive_copy_results(
         u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
     let body = match sa {
         0x00 => build_copy_status_response(),
+        0x01 => build_receive_data_response(),
         0x03 => build_operating_parameters_response(),
+        0x04 => build_failed_segment_details_response(),
         0x07 => {
             let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
             build_rrti_response(tokens.job_result(list_id))
@@ -1346,6 +1359,36 @@ fn build_copy_status_response() -> Vec<u8> {
     // byte 7: TRANSFER COUNT UNITS = 0.
     // bytes 8-11: TRANSFER COUNT = 0 (not tracked).
     // bytes 12-15: reserved.
+    data
+}
+
+/// Build the SPC-4 §6.20.2 RECEIVE DATA response (RECEIVE COPY
+/// RESULTS service action 0x01). RECEIVE DATA returns "held data"
+/// produced by inline-data or host-bound segment descriptors. We
+/// reject inline data (MAXIMUM INLINE DATA LENGTH = 0 in VPD 0x8F /
+/// OPERATING PARAMETERS) and implement no held-data-producing
+/// segment type, so there is never held data to return: the
+/// response is the 4-byte AVAILABLE DATA header set to zero.
+fn build_receive_data_response() -> Vec<u8> {
+    // bytes 0-3: AVAILABLE DATA = 0 (no held data follows).
+    vec![0u8; 4]
+}
+
+/// Build the SPC-4 §6.20.4 FAILED SEGMENT DETAILS response (RECEIVE
+/// COPY RESULTS service action 0x04). The fixed copy-results header
+/// is 60 bytes: the per-segment failure fields land at byte 56
+/// (EXTENDED COPY COMMAND STATUS) and bytes 58-59 (SENSE DATA
+/// LENGTH), with sense data — when present — at byte 60+. Our XCOPY
+/// is synchronous and surfaces a failing segment inline as CHECK
+/// CONDITION on the EXTENDED COPY command itself; it keeps no
+/// per-LIST IDENTIFIER failure record, so this always reports "no
+/// failed segment": command status 0, SENSE DATA LENGTH 0, no sense.
+fn build_failed_segment_details_response() -> Vec<u8> {
+    let mut data = vec![0u8; 60];
+    // bytes 0-3: AVAILABLE DATA = 56 (bytes following these four).
+    data[0..4].copy_from_slice(&56u32.to_be_bytes());
+    // byte 56: EXTENDED COPY COMMAND STATUS = 0 (no error).
+    // bytes 58-59: SENSE DATA LENGTH = 0 (no sense data follows).
     data
 }
 
@@ -3945,6 +3988,58 @@ mod tests {
         let cdb = rcr_cdb(0x08, 256);
         let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
         assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_reserved_sa_05_rejected() {
+        // SPC-4 reserves RECEIVE COPY RESULTS service action 0x05 —
+        // there is no "operations count" action. It must reject like
+        // any other unimplemented SA.
+        let cdb = rcr_cdb(0x05, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_CDB));
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_receive_data_is_empty() {
+        // We hold no inline / host-bound data, so RECEIVE DATA
+        // (SA 0x01) returns the bare AVAILABLE DATA = 0 header.
+        let cdb = rcr_cdb(0x01, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
+        assert!(r.sense.is_none());
+        assert_eq!(r.data_in.len(), 4);
+        assert_eq!(
+            u32::from_be_bytes([r.data_in[0], r.data_in[1], r.data_in[2], r.data_in[3]]),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_failed_segment_details_reports_no_failure() {
+        // Synchronous XCOPY retains no per-list failure record, so
+        // FAILED SEGMENT DETAILS (SA 0x04) reports command status 0
+        // and zero sense data in the 60-byte fixed header.
+        let cdb = rcr_cdb(0x04, 256);
+        let r = receive_copy_results(&req(&cdb, &[], 256), &test_tokens());
+        assert!(r.sense.is_none());
+        let d = &r.data_in;
+        assert_eq!(d.len(), 60);
+        // bytes 0-3 AVAILABLE DATA = 56 (bytes following).
+        assert_eq!(u32::from_be_bytes([d[0], d[1], d[2], d[3]]), 56);
+        // byte 56 EXTENDED COPY COMMAND STATUS = 0 (no error).
+        assert_eq!(d[56], 0);
+        // bytes 58-59 SENSE DATA LENGTH = 0.
+        assert_eq!(u16::from_be_bytes([d[58], d[59]]), 0);
+    }
+
+    #[tokio::test]
+    async fn receive_copy_results_alloc_len_truncates_failed_segment_details() {
+        // A short allocation length truncates the body, as for every
+        // other RCR service action.
+        let cdb = rcr_cdb(0x04, 16);
+        let r = receive_copy_results(&req(&cdb, &[], 16), &test_tokens());
+        assert!(r.sense.is_none());
+        assert_eq!(r.data_in.len(), 16);
     }
 
     // ----------------------------------------------------------------
