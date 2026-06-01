@@ -785,8 +785,27 @@ pub(super) async fn extended_copy(
         0x00 => extended_copy_lid1(req, registry, nexus, reservations).await,
         0x10 => populate_token(req, registry, nexus, tokens).await,
         0x11 => write_using_token(req, registry, nexus, reservations, tokens).await,
+        0x12 => cancel_rod_token(req, tokens),
         _ => ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
     }
+}
+
+/// CANCEL ROD TOKEN (EXTENDED COPY service action 0x12, SPC-4 §6.5).
+/// Invalidates the ROD token minted by the POPULATE TOKEN whose LIST
+/// IDENTIFIER matches the one in this CDB (bytes 6-9, the 0x83
+/// token-operation layout), releasing the token's chunk pins so
+/// eviction + GC can reclaim them ahead of the inactivity TTL.
+///
+/// We identify the token to cancel by LIST IDENTIFIER. SPC-4 also
+/// allows a parameter list carrying the ROD token itself; we accept
+/// (and ignore) any parameter list and key off the list ID, which is
+/// unambiguous in the CDB. Cancelling a token the copy manager no
+/// longer holds — unknown / already-expired / never-minted list ID —
+/// is a GOOD no-op per SPC-4, not an error.
+fn cancel_rod_token(req: &ScsiRequest<'_>, tokens: &Arc<TokenManager>) -> ScsiResponse {
+    let list_id = u32::from_be_bytes([req.cdb[6], req.cdb[7], req.cdb[8], req.cdb[9]]);
+    let _ = tokens.cancel(list_id);
+    ScsiResponse::good(Vec::new())
 }
 
 async fn extended_copy_lid1(
@@ -1499,7 +1518,11 @@ async fn populate_token(
         Some(c) => c,
         None => return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
     };
-    let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
+    // LIST IDENTIFIER sits at CDB bytes 6-9 for the 0x83 token
+    // operations (POPULATE / WRITE USING / CANCEL ROD TOKEN); bytes
+    // 2-5 are reserved. RECEIVE ROD TOKEN INFORMATION (0x84 sa 0x07)
+    // is the one that carries it at bytes 2-5.
+    let list_id = u32::from_be_bytes([req.cdb[6], req.cdb[7], req.cdb[8], req.cdb[9]]);
     let plist_len =
         u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
     if plist_len == 0 {
@@ -1655,7 +1678,9 @@ async fn write_using_token(
     if !reservations.allow_write(req.lun, &nexus) {
         return ScsiResponse::reservation_conflict();
     }
-    let list_id = u32::from_be_bytes([req.cdb[2], req.cdb[3], req.cdb[4], req.cdb[5]]);
+    // LIST IDENTIFIER at CDB bytes 6-9 (0x83 token-operation
+    // layout); see the note in `populate_token`.
+    let list_id = u32::from_be_bytes([req.cdb[6], req.cdb[7], req.cdb[8], req.cdb[9]]);
     let plist_len =
         u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
     if plist_len == 0 {
@@ -1949,8 +1974,17 @@ mod tests {
     }
 
     fn req<'a>(cdb: &'a [u8], data_out: &'a [u8], data_in_max: usize) -> ScsiRequest<'a> {
+        req_lun(0, cdb, data_out, data_in_max)
+    }
+
+    fn req_lun<'a>(
+        lun: u64,
+        cdb: &'a [u8],
+        data_out: &'a [u8],
+        data_in_max: usize,
+    ) -> ScsiRequest<'a> {
         ScsiRequest {
-            lun: 0,
+            lun,
             cdb,
             data_out,
             data_in_max,
@@ -4046,13 +4080,17 @@ mod tests {
     // ODX (POPULATE TOKEN / WRITE USING TOKEN / RRTI sa 0x07)
     // ----------------------------------------------------------------
 
-    /// 16-byte ODX CDB: opcode + service action in byte 1, LIST
-    /// IDENTIFIER in bytes 2..6, PARAMETER LIST LENGTH in bytes 10..14.
+    /// 16-byte ODX CDB. The LIST IDENTIFIER offset is opcode-
+    /// dependent: 0x83 token operations (POPULATE / WRITE USING /
+    /// CANCEL ROD TOKEN) carry it at bytes 6-9 (bytes 2-5 reserved),
+    /// while RECEIVE ROD TOKEN INFORMATION (0x84) carries it at bytes
+    /// 2-5. PARAMETER LIST / ALLOCATION LENGTH is at bytes 10-13.
     fn odx_cdb(opcode: u8, sa: u8, list_id: u32, plist_len: u32) -> [u8; 16] {
         let mut cdb = [0u8; 16];
         cdb[0] = opcode;
         cdb[1] = sa & 0x1F;
-        cdb[2..6].copy_from_slice(&list_id.to_be_bytes());
+        let lid_off = if opcode == 0x84 { 2 } else { 6 };
+        cdb[lid_off..lid_off + 4].copy_from_slice(&list_id.to_be_bytes());
         cdb[10..14].copy_from_slice(&plist_len.to_be_bytes());
         cdb
     }
@@ -4248,6 +4286,94 @@ mod tests {
             rrti_w.data_in[23],
         ]);
         assert_eq!(transfer, 2 * SECTORS_PER_PAGE as u64);
+    }
+
+    #[tokio::test]
+    async fn odx_cancel_rod_token_invalidates_minted_token() {
+        // POPULATE TOKEN → CANCEL ROD TOKEN (same LIST IDENTIFIER) →
+        // the minted token is gone: RRTI reports no operation, and a
+        // WRITE USING TOKEN carrying that token now rejects TOKEN
+        // INVALID. A second CANCEL of the same (now-unknown) list ID
+        // is a GOOD no-op.
+        let (_tmp, src, dst) = fresh_two_volumes_global("src_cancel", "dst_cancel").await;
+        src.write_bytes(0, &page_pattern(0x33)).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src.clone());
+            r.register(1, dst.clone());
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+        let list_id: u32 = 0x0BAD_F00D;
+
+        // POPULATE TOKEN over LUN 0, one page.
+        let pt_params = populate_token_param_list(&[(0, SECTORS_PER_PAGE as u32)]);
+        let pt_cdb = odx_cdb(0x83, 0x10, list_id, pt_params.len() as u32);
+        let r = extended_copy(
+            &req_lun(0, &pt_cdb, &pt_params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert!(r.sense.is_none(), "POPULATE TOKEN: {:?}", r.sense);
+
+        // Fetch the token before cancelling.
+        let rrti_cdb = odx_cdb(0x84, 0x07, list_id, 1024);
+        let rrti = receive_copy_results(&req_lun(0, &rrti_cdb, &[], 1024), &tokens);
+        assert_eq!(rrti.data_in[5], 0x02, "token minted (status Done)");
+        let token = rod_token_from_rrti(&rrti.data_in);
+
+        // CANCEL ROD TOKEN for the same list id (zero-length plist).
+        let cancel_cdb = odx_cdb(0x83, 0x12, list_id, 0);
+        let c = extended_copy(
+            &req_lun(0, &cancel_cdb, &[], 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert!(c.sense.is_none(), "CANCEL ROD TOKEN: {:?}", c.sense);
+
+        // RRTI now reports "no operation in progress" (status 0x00).
+        let rrti2 = receive_copy_results(&req_lun(0, &rrti_cdb, &[], 1024), &tokens);
+        assert_eq!(rrti2.data_in[5], 0x00, "job forgotten after cancel");
+
+        // WRITE USING TOKEN with the cancelled token rejects TOKEN
+        // INVALID (ASC 0x23 / ASCQ 0x07).
+        let wut_params = write_using_token_param_list(&token, &[(0, SECTORS_PER_PAGE as u32)]);
+        let wut_cdb = odx_cdb(0x83, 0x11, list_id + 1, wut_params.len() as u32);
+        let w = extended_copy(
+            &req_lun(1, &wut_cdb, &wut_params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert_eq!(
+            w.sense,
+            Some(SenseData::new(
+                scsi_spc::sense::SenseKey::IllegalRequest,
+                0x23,
+                0x07
+            )),
+            "cancelled token must read as INVALID"
+        );
+
+        // Cancelling the now-unknown list id again is a GOOD no-op.
+        let c2 = extended_copy(
+            &req_lun(0, &cancel_cdb, &[], 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        assert!(c2.sense.is_none(), "re-CANCEL no-op: {:?}", c2.sense);
     }
 
     #[tokio::test]

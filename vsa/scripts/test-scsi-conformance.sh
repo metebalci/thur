@@ -1049,10 +1049,11 @@ t_odx_populate_token_returns_token() {
     printf '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00' >> "$pt_plist"
     # POPULATE TOKEN CDB (16 bytes):
     #   byte 0 0x83 / byte 1 0x10 SA
-    #   bytes 2-5 LIST IDENTIFIER = 0xCAFEBABE
+    #   bytes 2-5 reserved
+    #   bytes 6-9 LIST IDENTIFIER = 0xCAFEBABE (0x83 token-op layout)
     #   bytes 10-13 PARAMETER LIST LENGTH = 32 BE32
     sg_raw -s 32 -i "$pt_plist" "$RW_DEVICE" \
-        83 10 CA FE BA BE 00 00 00 00 00 00 00 20 00 00 >/dev/null 2>&1 || return 1
+        83 10 00 00 00 00 CA FE BA BE 00 00 00 20 00 00 >/dev/null 2>&1 || return 1
 
     # RECEIVE ROD TOKEN INFORMATION (opcode 0x84 sa 0x07):
     #   bytes 2-5 LIST IDENTIFIER (same as POPULATE TOKEN above)
@@ -1100,15 +1101,55 @@ t_odx_write_using_token_round_trip() {
         printf '\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x10\x00\x00\x00\x00'
     } > "$wut_plist"
     # WRITE USING TOKEN CDB (16 bytes):
+    #   bytes 6-9 LIST IDENTIFIER = 0xDEADBEEF (0x83 token-op layout)
     #   bytes 10-13 PARAMETER LIST LENGTH = 552 BE32
     sg_raw -s 552 -i "$wut_plist" "$RW_DEVICE" \
-        83 11 DE AD BE EF 00 00 00 00 00 00 02 28 00 00 >/dev/null 2>&1 || return 1
+        83 11 00 00 00 00 DE AD BE EF 00 00 02 28 00 00 >/dev/null 2>&1 || return 1
 
     # Read source + dest ranges and compare.
     blockdev --flushbufs "$RW_DEVICE" 2>/dev/null || true
     sg_dd if="$RW_DEVICE" of="$TEST_DIR/odx-src.bin" bs="$SECTOR_SIZE" count=16 skip=0  iflag=direct 2>&1 || return 1
     sg_dd if="$RW_DEVICE" of="$TEST_DIR/odx-dst.bin" bs="$SECTOR_SIZE" count=16 skip=32 iflag=direct 2>&1 || return 1
     cmp "$TEST_DIR/odx-src.bin" "$TEST_DIR/odx-dst.bin"
+}
+
+t_odx_cancel_rod_token() {
+    # POPULATE TOKEN with a fresh LIST IDENTIFIER, CANCEL ROD TOKEN
+    # (sa 0x12) for it, then prove the token is gone: RRTI for the
+    # same list id reports COPY OPERATION STATUS = 0x00 (no operation
+    # in progress). All three 0x83 token ops carry the LIST IDENTIFIER
+    # at CDB bytes 6-9; RRTI (0x84) carries it at bytes 2-5.
+    if ! command -v sg_raw >/dev/null 2>&1; then
+        log_info "sg_raw not present; skipping CANCEL ROD TOKEN"
+        return 0
+    fi
+    # POPULATE TOKEN over page 0 (one page = 16 sectors); a sparse
+    # range still mints a valid token, which is all we need to cancel.
+    local pt_plist="$TEST_DIR/odx-cancel-plist.bin"
+    printf '\x00\x1e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10' > "$pt_plist"
+    printf '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00' >> "$pt_plist"
+    sg_raw -s 32 -i "$pt_plist" "$RW_DEVICE" \
+        83 10 00 00 00 00 0B AD F0 0D 00 00 00 20 00 00 >/dev/null 2>&1 \
+        || { log_error "POPULATE TOKEN (for cancel) rejected"; return 1; }
+
+    # CANCEL ROD TOKEN, same list id at bytes 6-9, zero-length plist.
+    sg_raw "$RW_DEVICE" \
+        83 12 00 00 00 00 0B AD F0 0D 00 00 00 00 00 00 >/dev/null 2>&1 \
+        || { log_error "CANCEL ROD TOKEN rejected"; return 1; }
+
+    # RRTI for the cancelled list id (bytes 2-5) reports no operation.
+    local rrti_out="$TEST_DIR/odx-cancel-rrti.bin"
+    sg_raw -r 1024 -o "$rrti_out" "$RW_DEVICE" \
+        84 07 0B AD F0 0D 00 00 00 00 00 00 04 00 00 00 >/dev/null 2>&1 || return 1
+    local op_status
+    op_status=$(xxd -s 5 -l 1 -p "$rrti_out")
+    [[ "$op_status" == "00" ]] || { log_error "post-cancel RRTI status=$op_status, expected 00"; return 1; }
+
+    # Cancelling the now-unknown list id again is a GOOD no-op.
+    sg_raw "$RW_DEVICE" \
+        83 12 00 00 00 00 0B AD F0 0D 00 00 00 00 00 00 >/dev/null 2>&1 \
+        || { log_error "re-CANCEL of unknown token should be GOOD"; return 1; }
+    return 0
 }
 
 t_xcopy_same_lun_intra_volume_copy() {
@@ -1260,6 +1301,7 @@ main() {
     run_test "REPORT SUPPORTED OPCODES includes 0x83 / 0x84"      t_report_supported_opcodes_lists_odx
     run_test "POPULATE TOKEN + RECEIVE ROD TOKEN INFORMATION"     t_odx_populate_token_returns_token
     run_test "WRITE USING TOKEN same-LUN round-trip"              t_odx_write_using_token_round_trip
+    run_test "CANCEL ROD TOKEN frees token (RRTI no-op after)"    t_odx_cancel_rod_token
     # Group N — ALUA (issue #43)
     run_test "INQUIRY std byte 5 TPGS=01b (implicit)"             t_inquiry_standard_tpgs_implicit
     run_test "INQUIRY VPD 0x86 (Extended INQUIRY Data) present"   t_inquiry_vpd_extended_is_published

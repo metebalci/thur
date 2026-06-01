@@ -299,6 +299,45 @@ impl TokenManager {
         jobs.get(&list_id).cloned()
     }
 
+    /// Cancel the ROD token minted by the POPULATE TOKEN job under
+    /// `list_id` (CANCEL ROD TOKEN, EXTENDED COPY sa 0x12). Drops the
+    /// token's entry — releasing its `PoolPinGuard`s so eviction + GC
+    /// can reclaim the referenced chunks — and forgets the job so a
+    /// later RRTI reports "no operation in progress". Returns whether
+    /// a token was actually freed; cancelling an unknown / already-
+    /// expired / non-POPULATE-TOKEN list ID is a no-op (SPC-4 §6.5
+    /// makes cancelling a token the copy manager no longer holds a
+    /// GOOD no-op, not an error).
+    pub fn cancel(&self, list_id: u32) -> bool {
+        let token = {
+            let mut jobs = match self.jobs.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            // Only POPULATE TOKEN jobs own a ROD token; a WRITE USING
+            // TOKEN job under this ID carries `token: None` and is
+            // left untouched.
+            match jobs.get(&list_id).and_then(|j| j.token) {
+                Some(t) => {
+                    jobs.remove(&list_id);
+                    Some(t)
+                }
+                None => None,
+            }
+        };
+        match token {
+            Some(t) => {
+                let mut tokens = match self.tokens.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                // Drop releases the pins held in the TokenState.
+                tokens.remove(&t).is_some()
+            }
+            None => false,
+        }
+    }
+
     /// Drop every entry whose deadline has passed. Called by the
     /// sweeper task on its interval; safe to call manually from
     /// tests.
@@ -404,5 +443,35 @@ mod tests {
         assert_eq!(job.transfer_blocks, 128);
         assert!(job.token.is_none());
         assert_eq!(job.status, JobStatus::Done);
+    }
+
+    #[test]
+    fn cancel_removes_token_and_job() {
+        let mgr = TokenManager::new();
+        let token = mgr.mint_token(
+            0x55,
+            dummy_state(Instant::now() + Duration::from_secs(60), 16),
+        );
+        assert!(mgr.snapshot_for(&token).is_some());
+        assert!(mgr.job_result(0x55).is_some());
+        assert!(mgr.cancel(0x55), "cancel freed the token");
+        assert!(mgr.snapshot_for(&token).is_none(), "token entry dropped");
+        assert!(mgr.job_result(0x55).is_none(), "job forgotten");
+    }
+
+    #[test]
+    fn cancel_unknown_list_id_is_noop() {
+        let mgr = TokenManager::new();
+        assert!(!mgr.cancel(0x1234));
+    }
+
+    #[test]
+    fn cancel_write_using_token_job_leaves_it_untouched() {
+        // A WRITE USING TOKEN job owns no ROD token, so CANCEL ROD
+        // TOKEN against its list ID must be a no-op and not evict it.
+        let mgr = TokenManager::new();
+        mgr.record_write_outcome(0x77, JobStatus::Done, 128, Duration::from_secs(60));
+        assert!(!mgr.cancel(0x77));
+        assert!(mgr.job_result(0x77).is_some());
     }
 }
