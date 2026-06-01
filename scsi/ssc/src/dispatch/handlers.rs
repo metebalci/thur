@@ -472,14 +472,32 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             // crossed — surfaces in bareos as the spurious
             // "files mismatch! Volume=8388607" diagnostic (issue #33).
             // EOD code (0x03) has no residual concept.
+            //
+            // The sense is direction-aware (SSC-4 §7.5). A *forward*
+            // shortfall ran past recorded data: End-of-data (Blank
+            // Check, 00/05) — the issue #33 path above. A *backward*
+            // shortfall can only mean Beginning-of-Partition was reached
+            // before the requested marks were crossed: NO SENSE + 00/04
+            // (issue #73). EOD never legitimately arises from backward
+            // motion, and reporting Blank Check on it breaks the Linux
+            // `st` driver's `MTBSF` reposition (turns a spec-conformant
+            // backward space into a command failure).
             if (code == 0x00 || code == 0x01) && (moved as i32) != count {
                 let residual = count.wrapping_sub(moved as i32) as u32;
-                let sense = scsi::sense::SenseDataBuilder::new(
-                    scsi::sense::SenseKey::BlankCheck,
-                    scsi::sense::ASC_EOD_DETECTED,
-                )
-                .with_information(residual)
-                .build();
+                let (key, asc) = if count < 0 {
+                    (
+                        scsi::sense::SenseKey::NoSense,
+                        scsi::sense::ASC_BOT_DETECTED,
+                    )
+                } else {
+                    (
+                        scsi::sense::SenseKey::BlankCheck,
+                        scsi::sense::ASC_EOD_DETECTED,
+                    )
+                };
+                let sense = scsi::sense::SenseDataBuilder::new(key, asc)
+                    .with_information(residual)
+                    .build();
                 return Ok(ScsiResp::check_condition_with_sense(sense));
             }
             Ok(ScsiResp::good())
@@ -528,16 +546,26 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 new_lba,
                 reason: core_mediachanger::PositionChangeReason::Space,
             });
-            // Same residual semantics as SPACE(6) — see commentary
-            // there for the bareos / Linux-st context.
+            // Same residual + direction-aware sense as SPACE(6) — see
+            // commentary there for the bareos / Linux-st / issue #73
+            // context. Forward shortfall = EOD (Blank Check, 00/05);
+            // backward shortfall = BOP (NO SENSE, 00/04).
             if (code == 0x00 || code == 0x01) && moved != count {
                 let residual = (count.wrapping_sub(moved) & 0xFFFF_FFFF) as u32;
-                let sense = scsi::sense::SenseDataBuilder::new(
-                    scsi::sense::SenseKey::BlankCheck,
-                    scsi::sense::ASC_EOD_DETECTED,
-                )
-                .with_information(residual)
-                .build();
+                let (key, asc) = if count < 0 {
+                    (
+                        scsi::sense::SenseKey::NoSense,
+                        scsi::sense::ASC_BOT_DETECTED,
+                    )
+                } else {
+                    (
+                        scsi::sense::SenseKey::BlankCheck,
+                        scsi::sense::ASC_EOD_DETECTED,
+                    )
+                };
+                let sense = scsi::sense::SenseDataBuilder::new(key, asc)
+                    .with_information(residual)
+                    .build();
                 return Ok(ScsiResp::check_condition_with_sense(sense));
             }
             Ok(ScsiResp::good())

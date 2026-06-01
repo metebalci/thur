@@ -216,6 +216,44 @@ fn test_space_filemarks() {
 }
 
 #[test]
+fn test_space_backward_filemarks_adjacent_to_bop() {
+    // Issue #73: two *adjacent* filemarks (no data records between),
+    // then backward spacing that runs short of the requested count
+    // because Beginning-of-Partition is reached. The core reports the
+    // shortfall faithfully via the returned `moved`; the SSC dispatch
+    // layer is what maps a backward shortfall to BOP (00/04) vs the
+    // forward End-of-data case (00/05). Prior coverage only exercised
+    // forward spacing with data blocks between filemarks.
+    let dir = create_test_dir();
+    let mut cart = create_test_cartridge(&dir, "BSF73");
+
+    // Lay down two adjacent filemarks: FM@LBA0, FM@LBA1.
+    cart.rewind();
+    cart.write_filemark().unwrap();
+    cart.write_filemark().unwrap();
+    assert_eq!(cart.position(), 2, "head past both filemarks");
+
+    // Forward 1 filemark lands the head between the two (LBA 1) — the
+    // position the kernel `st` driver sits at before `mt bsf 1`.
+    cart.rewind();
+    assert_eq!(cart.space_filemarks(1), 1, "crossed FM@LBA0");
+    assert_eq!(cart.position(), 1, "head between the two filemarks");
+
+    // Backward 2 filemarks: only FM@LBA0 lies behind, so the head
+    // crosses it, hits BOP, and under-travels (moved = -1 of -2).
+    assert_eq!(
+        cart.space_filemarks(-2),
+        -1,
+        "crossed one filemark before BOP",
+    );
+    assert_eq!(cart.position(), 0, "head parked at BOP");
+
+    // A further backward space from BOP crosses nothing.
+    assert_eq!(cart.space_filemarks(-1), 0, "no filemark behind BOP");
+    assert_eq!(cart.position(), 0);
+}
+
+#[test]
 fn test_manifest_persistence() {
     let dir = create_test_dir();
     let label = "PERSIST001";

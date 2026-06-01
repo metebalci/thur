@@ -451,6 +451,117 @@ fn write_filemarks_and_space_succeed() {
     ));
 }
 
+/// Issue #73. A *backward* SPACE FILEMARKS that reaches
+/// Beginning-of-Partition before crossing the requested marks must
+/// terminate CHECK CONDITION with NO SENSE + 00/04
+/// (Beginning-of-Partition/Medium detected), never Blank Check +
+/// 00/05 (End-of-data) — EOD is a forward-only condition. Reproduces
+/// the kernel `st` `mt bsf 1` decomposition: two adjacent filemarks,
+/// head positioned between them, then SPACE FILEMARKS count=-2.
+#[test]
+fn space_backward_filemark_shortfall_reports_bop() {
+    let fx = Fixture::new();
+
+    // Two adjacent filemarks at LBA 0 and LBA 1 (head ends at LBA 2).
+    let mut c = cdb(0x10);
+    c[4] = 2;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_write_filemarks_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // Rewind, then forward-space 1 filemark to land between the two
+    // (head = LBA 1), exactly where the kernel sits before `bsf 1`.
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+    let mut c = cdb(0x11);
+    c[1] = 0x01; // filemarks
+    c[4] = 1; // count = +1
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_space_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // SPACE FILEMARKS count = -2 (24-bit signed 0xFFFFFE). Only one
+    // filemark lies behind, so the head crosses it, hits BOP, and the
+    // op under-travels (moved = -1, requested -2).
+    let mut c = cdb(0x11);
+    c[1] = 0x01;
+    c[2] = 0xFF;
+    c[3] = 0xFF;
+    c[4] = 0xFE;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_6(&mut ctx).unwrap();
+
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("backward BOP shortfall must carry sense");
+    assert_eq!(sense[0] & 0x7f, 0x70, "fixed-format sense");
+    assert_eq!(sense[0] & 0x80, 0x80, "INFO valid bit set");
+    assert_eq!(
+        sense[2] & 0x0f,
+        0x00,
+        "sense key = NO SENSE (not Blank Check)"
+    );
+    assert_eq!(sense[12], 0x00, "ASC = 0x00");
+    assert_eq!(
+        sense[13], 0x04,
+        "ASCQ = 0x04 (BEGINNING-OF-PARTITION DETECTED)"
+    );
+    // Residual = count(-2) - moved(-1) = -1 = 0xFFFFFFFF.
+    assert_eq!(
+        [sense[3], sense[4], sense[5], sense[6]],
+        [0xFF, 0xFF, 0xFF, 0xFF],
+        "INFORMATION = residual (-1)",
+    );
+}
+
+/// Forward shortfall stays End-of-data (issue #33 MTEOM/Bareos path) —
+/// the direction guard added for issue #73 must not regress it.
+#[test]
+fn space_forward_filemark_shortfall_reports_eod() {
+    let fx = Fixture::new();
+
+    // One filemark at LBA 0 (head ends at LBA 1).
+    let mut c = cdb(0x10);
+    c[4] = 1;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_write_filemarks_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // Rewind, then forward-space 5 filemarks — only one exists, so the
+    // op crosses it and runs into EOD (moved = 1, requested 5).
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+    let mut c = cdb(0x11);
+    c[1] = 0x01;
+    c[4] = 5;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_6(&mut ctx).unwrap();
+
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("forward EOD shortfall must carry sense");
+    assert_eq!(sense[2] & 0x0f, 0x08, "sense key = BLANK CHECK");
+    assert_eq!(sense[12], 0x00, "ASC = 0x00");
+    assert_eq!(sense[13], 0x05, "ASCQ = 0x05 (END-OF-DATA DETECTED)");
+    // Residual = count(5) - moved(1) = 4.
+    assert_eq!(
+        [sense[3], sense[4], sense[5], sense[6]],
+        [0x00, 0x00, 0x00, 0x04],
+        "INFORMATION = residual (4)",
+    );
+}
+
 #[test]
 fn prevent_allow_medium_removal_toggles() {
     let fx = Fixture::new();

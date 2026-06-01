@@ -552,13 +552,31 @@ t_tape_read_block_limits() {
     echo "$out" | grep -q 'SCSI Status: Good'
 }
 
-# WRITE FILEMARKS (16) — write 1 filemark via the 16-byte CDB.
+# WRITE FILEMARKS (16) — write 1 filemark via the 16-byte CDB. Per
+# SSC-4 §7.4 (Table 75) the TRANSFER LENGTH is the 4-byte field at
+# cdb[12..16], so the count of 1 goes in the final byte (cdb[15]). The
+# earlier CDB placed it at cdb[10] — a reserved byte under the spec'd
+# layout — so it silently wrote zero filemarks, which in turn starved
+# the SPACE(16) backward test below of a mark to cross.
 t_tape_write_filemarks_16() {
-    sg_raw "$TAPE_SG_DEVICE" 80 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00
+    sg_raw "$TAPE_SG_DEVICE" 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01
 }
-# SPACE (16) — space backwards 1 filemark via 16-byte CDB.
+# SPACE (16) — space backwards 1 filemark via 16-byte CDB. Relies on the
+# WRITE FILEMARKS(16) above having laid one filemark at the head, so this
+# fully crosses it (no shortfall) and completes GOOD.
 t_tape_space_16_backward_filemark() {
     sg_raw "$TAPE_SG_DEVICE" 91 01 00 00 ff ff ff ff ff ff ff ff 00 00 00 00
+}
+# SPACE (16) backward into BOP (issue #73). Rewind to BOT so nothing lies
+# behind the head, then space back one filemark. The op under-travels
+# (Beginning-of-Partition reached before any mark is crossed) and must
+# terminate CHECK CONDITION with NO SENSE + Beginning-of-Partition/Medium
+# detected (00/04) — never Blank Check + End-of-data (00/05), which is a
+# forward-only condition.
+t_tape_space_16_backward_to_bop() {
+    mt -f "$TAPE_NST_DEVICE" rewind || return 1
+    expect_check_cond "$TAPE_SG_DEVICE" "No Sense" "Beginning-of-partition" \
+        91 01 00 00 ff ff ff ff ff ff ff ff 00 00 00 00
 }
 # LOCATE (16) — seek to LBA 0 via 16-byte CDB.
 t_tape_locate_16_lba0() {
@@ -1340,6 +1358,7 @@ main() {
     run_test "LOCATE(10) to LBA 0"                            t_tape_locate10_lba0
     run_test "WRITE FILEMARKS (16, 1 mark)"                   t_tape_write_filemarks_16
     run_test "SPACE (16) backward filemark"                   t_tape_space_16_backward_filemark
+    run_test "SPACE (16) backward into BOP (NoSense/00:04)"    t_tape_space_16_backward_to_bop
     run_test "LOCATE(16) to LBA 0"                            t_tape_locate_16_lba0
     run_test "WRITE + REWIND + READ + verify"                 t_tape_write_then_read
     run_test "VERIFY (6, 1 block)"                            t_tape_verify_6
