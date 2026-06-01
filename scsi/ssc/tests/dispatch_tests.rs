@@ -1682,6 +1682,141 @@ fn write_attribute_on_changer_lun_is_refused() {
     );
 }
 
+/// Build a WRITE ATTRIBUTE parameter list (4-byte be32 length header +
+/// 5-byte descriptors).
+fn write_attr_param_list(records: &[(u16, u8, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (id, ctrl, val) in records {
+        body.extend_from_slice(&id.to_be_bytes());
+        body.push(*ctrl);
+        body.extend_from_slice(&(val.len() as u16).to_be_bytes());
+        body.extend_from_slice(val);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Find `(control, value)` for `wanted_id` in a READ ATTRIBUTE VALUES
+/// response (4-byte header, then id(2)+control(1)+length(2)+value).
+fn find_read_attr(data: &[u8], wanted_id: u16) -> Option<(u8, Vec<u8>)> {
+    let mut pos = 4;
+    while pos + 5 <= data.len() {
+        let id = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let ctrl = data[pos + 2];
+        let len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
+        let vs = pos + 5;
+        if id == wanted_id {
+            return data.get(vs..vs + len).map(|v| (ctrl, v.to_vec()));
+        }
+        pos = vs + len;
+    }
+    None
+}
+
+/// READ ATTRIBUTE CDB for SA 0x00 (VALUES), all attributes, big alloc.
+fn read_attr_values_cdb() -> [u8; 16] {
+    let mut c = cdb(0x8C);
+    c[1] = 0x00; // service action: attribute values
+    c[10..14].copy_from_slice(&65536u32.to_be_bytes()); // alloc length
+    c
+}
+
+/// Issue #60 acceptance (in-process): WRITE a host application
+/// attribute, then READ ATTRIBUTE returns it with the persisted value.
+#[test]
+fn write_then_read_attribute_round_trips() {
+    let fx = Fixture::new();
+
+    // WRITE ATTRIBUTE 0x0801 (application name) = "Bareos".
+    let params = write_attr_param_list(&[(0x0801, 0x01, b"Bareos")]);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
+    assert_eq!(
+        handlers::handle_write_attribute(&mut wctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // READ ATTRIBUTE back.
+    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, &[]);
+    let mut rctx = fx.ctx(&mut rp, read_attr_values_cdb());
+    let resp = handlers::handle_read_attribute(&mut rctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+
+    let (ctrl, val) = find_read_attr(&resp.data_out, 0x0801).expect("written attribute reads back");
+    assert_eq!(val, b"Bareos".to_vec());
+    // Host attribute: read-only bit (0x80) clear.
+    assert_eq!(ctrl & 0x80, 0);
+}
+
+/// A WRITE ATTRIBUTE targeting a device/medium read-only id is
+/// rejected with CHECK CONDITION / ILLEGAL REQUEST / INVALID FIELD IN
+/// PARAMETER LIST (5h/26h/00h), and nothing is persisted.
+#[test]
+fn write_attribute_readonly_id_rejected() {
+    let fx = Fixture::new();
+
+    // 0x0400 = MEDIUM MANUFACTURER, device/medium-owned read-only.
+    let params = write_attr_param_list(&[(0x0400, 0x01, b"EVILCORP")]);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
+    let resp = handlers::handle_write_attribute(&mut wctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+
+    let sense = resp.sense.expect("sense present on rejection");
+    assert_eq!(sense[2] & 0x0F, 0x05, "sense key ILLEGAL REQUEST");
+    assert_eq!(sense[12], 0x26, "ASC INVALID FIELD IN PARAMETER LIST");
+    assert_eq!(sense[13], 0x00, "ASCQ");
+
+    // Nothing persisted: 0x0400 still reads back as the synthesized
+    // manufacturer, not "EVILCORP".
+    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, &[]);
+    let mut rctx = fx.ctx(&mut rp, read_attr_values_cdb());
+    let rresp = handlers::handle_read_attribute(&mut rctx).unwrap();
+    let (_, val) = find_read_attr(&rresp.data_out, 0x0400).expect("manufacturer present");
+    assert_ne!(val, b"EVILCORP".to_vec());
+}
+
+/// A well-formed empty parameter list (4-byte zero header, no
+/// descriptors) is a GOOD no-op.
+#[test]
+fn write_attribute_proper_empty_list_is_good() {
+    let fx = Fixture::new();
+    let params = [0u8, 0, 0, 0]; // declared length 0
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
+    assert_eq!(
+        handlers::handle_write_attribute(&mut wctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+}
+
+/// When the apply fails because another session holds the drive lock,
+/// WRITE ATTRIBUTE surfaces NOT READY (the real cause), not INVALID
+/// FIELD IN PARAMETER LIST — the parameter list was well-formed.
+#[test]
+fn write_attribute_drive_reserved_surfaces_not_ready() {
+    let fx = Fixture::new();
+
+    // Lock drive 0 to a different session (TSIH 2) by persisting a
+    // valid attribute through it.
+    fx.drive_manager
+        .write_cartridge_mam_attribute(0, 2, 0x0801, 0x01, b"x".to_vec())
+        .expect("lock drive to TSIH 2");
+
+    // ctx() drives TSIH 1 -> with_drive rejects with DriveReserved.
+    let params = write_attr_param_list(&[(0x0801, 0x01, b"Bareos")]);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
+    let resp = handlers::handle_write_attribute(&mut wctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+
+    let sense = resp.sense.expect("sense present");
+    assert_eq!(sense[2] & 0x0F, 0x02, "sense key NOT READY");
+    assert_eq!(sense[12], 0x04, "ASC LU NOT READY (not 0x26 INVALID FIELD)");
+}
+
 /// MODE SELECT(6) with an empty parameter list: zero pages parsed,
 /// no side effects, GOOD.
 #[test]

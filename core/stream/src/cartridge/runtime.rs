@@ -28,6 +28,36 @@ use super::{Partition, PendingPartitionLayout};
 use crate::errors::{Result, SmcError};
 use crate::index_backup::IndexEpoch;
 
+/// One host-written MAM attribute (SCSI WRITE ATTRIBUTE 0x8D),
+/// persisted in the runtime sidecar so it survives UNLOAD/reload.
+/// The value bytes are hex-encoded in JSON (`mam_value_hex` below) to
+/// stay human-readable and avoid serde_json's per-byte numeric-array
+/// bloat — the same lowercase-hex convention the manifest uses for
+/// its UUID.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub(super) struct MamAttrValue {
+    /// SSC-4 attribute format code: 0 = binary, 1 = ASCII, 2 = text.
+    pub format: u8,
+    /// Raw attribute value as written by the host.
+    #[serde(with = "mam_value_hex")]
+    pub value: Vec<u8>,
+}
+
+/// Lowercase-hex serde for a MAM attribute value. `hex::encode` /
+/// `hex::decode` are available without the crate's `serde` feature,
+/// so this keeps `hex = "0.4"` (default features) as the only dep.
+mod mam_value_hex {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(&s).map_err(D::Error::custom)
+    }
+}
+
 /// On-disk runtime state for one cartridge. Persisted alongside
 /// `manifest.json` in the cartridge root; rewritten at every
 /// runtime-mutating boundary (`Cartridge::persist_runtime`).
@@ -67,6 +97,17 @@ pub(super) struct Runtime {
     /// `docs/SPEC.md` § Index Page Backup.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub index_epoch: BTreeMap<String, IndexEpoch>,
+
+    /// Host-written MAM attributes (SCSI WRITE ATTRIBUTE 0x8D), keyed
+    /// by attribute id. Only host-writable ids (SSC-4 ranges
+    /// 0x0800-0x0BFF and 0x1400-0x17FF) land here; device/medium
+    /// read-only ids are rejected at the SCSI layer and never reach
+    /// this map. `BTreeMap` keeps the ascending-id order READ
+    /// ATTRIBUTE requires. Survives UNLOAD/reload; cleared on ERASE /
+    /// FORMAT MEDIUM. `#[serde(default)]` so pre-#60 `runtime.json`
+    /// files load with an empty map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mam_attributes: BTreeMap<u16, MamAttrValue>,
 
     /// Lifetime host bytes written into this cartridge — pre-dedup,
     /// pre-compression, pre-encryption. Monotonic for the cartridge's
@@ -118,6 +159,7 @@ impl Runtime {
             pending_partition_layout: None,
             set_capacity_proportion: u16::MAX,
             index_epoch: BTreeMap::new(),
+            mam_attributes: BTreeMap::new(),
             host_bytes_written: 0,
             host_bytes_read: 0,
             backend_bytes_written: 0,
@@ -197,5 +239,48 @@ mod tests {
         assert_eq!(loaded.host_bytes_read, 0);
         assert_eq!(loaded.backend_bytes_written, 0);
         assert_eq!(loaded.backend_bytes_read, 0);
+        // No mam_attributes field on a legacy sidecar -> empty map.
+        assert!(loaded.mam_attributes.is_empty());
+    }
+
+    #[test]
+    fn mam_attributes_round_trip_as_hex() {
+        let dir = TempDir::new().unwrap();
+        let mut r = Runtime::new_blank();
+        r.mam_attributes.insert(
+            0x0801,
+            MamAttrValue {
+                format: 1,
+                value: b"Bareos".to_vec(),
+            },
+        );
+        // A binary value with bytes that are not valid ASCII, to prove
+        // the hex round-trip is byte-exact (not lossy text coercion).
+        r.mam_attributes.insert(
+            0x1400,
+            MamAttrValue {
+                format: 0,
+                value: vec![0x00, 0xFF, 0xAB, 0x10],
+            },
+        );
+        r.persist(dir.path()).unwrap();
+
+        // Value bytes are stored as a lowercase-hex string, not a JSON
+        // numeric array.
+        let raw = std::fs::read_to_string(dir.path().join("runtime.json")).unwrap();
+        assert!(raw.contains("00ffab10"), "value should be hex: {raw}");
+
+        let loaded = Runtime::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.mam_attributes.get(&0x0801).unwrap(),
+            &MamAttrValue {
+                format: 1,
+                value: b"Bareos".to_vec()
+            }
+        );
+        assert_eq!(
+            loaded.mam_attributes.get(&0x1400).unwrap().value,
+            vec![0x00, 0xFF, 0xAB, 0x10]
+        );
     }
 }

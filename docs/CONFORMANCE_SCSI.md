@@ -648,8 +648,8 @@ this file; SSC-4 / SMC-3 in Part 2; SBC-3 in Part 3; NVMe in
 
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
-| 0x8C | READ ATTRIBUTE | 🟩 Partial | O | SA 0x00 (attribute values) returns six MAM attributes: 0x0000 Remaining Capacity, 0x0001 Maximum Capacity, 0x0003 Load Count, 0x0400 Manufacturer, 0x0401 Serial Number, 0x0806 Barcode. SA 0x05 (supported list) returns the same six. SAs 0x01 / 0x02 return CHECK CONDITION. The remaining SSC-4 Annex A MAM attributes (TapeAlert 0x0002, MAM space 0x0004, density 0x0006, init count 0x0007, byte counters 0x0220–0x0223, encryption-position 0x0224–0x0225, manufacture date 0x0406, application name/version/vendor 0x0800–0x0802, etc.) are not implemented. |
-| 0x8D | WRITE ATTRIBUTE | 🟩 No-op | O | Parameter list parsed and shape-validated; values discarded — MAM attributes not persisted. Backup software's calls succeed but attributes don't survive UNLOAD. |
+| 0x8C | READ ATTRIBUTE | 🟩 Partial | O | SA 0x00 (attribute values) returns the synthesized device/medium attributes — 0x0000 Remaining Capacity, 0x0001 Maximum Capacity, 0x0003 Load Count, 0x0400 Manufacturer, 0x0401 Serial Number (all served read-only) — *merged with any host-written attributes persisted on the cartridge* (see WRITE ATTRIBUTE), in ascending-id order. SA 0x05 (supported list) returns those synthesized ids plus every persisted host id. SAs 0x01 / 0x02 return CHECK CONDITION. The response uses a 4-byte big-endian AVAILABLE DATA header and the SSC-4 5-byte attribute descriptor (`id(2) + control(1: bit 7 read-only, bits 1–0 format) + length(2) + value`). Barcode 0x0806 is *not* synthesized — like a real LTO-CM it is absent until a host writes it (the authoritative barcode is the changer's volume tag from READ ELEMENT STATUS). The remaining SSC-4 Annex A device/medium attributes (TapeAlert 0x0002, MAM space 0x0004, density 0x0006, init count 0x0007, byte counters 0x0220–0x0223, encryption-position 0x0224–0x0225, manufacture date 0x0406) are not synthesized. |
+| 0x8D | WRITE ATTRIBUTE | 🟩 Yes | O | Host-range attributes (SSC-4 host ranges 0x0800–0x0BFF and 0x1400–0x17FF — e.g. application vendor/name/version 0x0800–0x0802, barcode 0x0806) are persisted to the cartridge's `runtime.json` sidecar and survive UNLOAD/reload; a zero-length write deletes the id. They are cleared on ERASE / FORMAT MEDIUM. Device/medium read-only ids (0x0000, 0x0001, 0x0003, 0x0400, 0x0401) and ids outside the host ranges are rejected, all-or-nothing, with CHECK CONDITION / ILLEGAL REQUEST / INVALID FIELD IN PARAMETER LIST (5h/26h/00h). An empty parameter list is a GOOD no-op. |
 
 ### Drive-side mode pages (LUN ≥ 1)
 
@@ -960,6 +960,34 @@ order. The whole feature is opt-in per cartridge — `cartridge create
 `manifest.encryption`. The deeper treatment is in
 [`CARTRIDGE.md`](CARTRIDGE.md) § *At-rest encryption (appliance-side)*
 and [`AUTH.md`](AUTH.md) § *VTL keystore backends*.
+
+#### MAM attributes — host writes persisted in a sidecar
+
+A real LTO drive stores host-written MAM attributes in the cartridge's
+on-medium Medium Auxiliary Memory chip (LTO-CM). VTL has no CM chip, so
+it persists host-written attributes in the cartridge's `runtime.json`
+sidecar instead (issue #60); functionally the host sees the same
+contract — WRITE ATTRIBUTE of a host-range id (0x0800–0x0BFF,
+0x1400–0x17FF, including barcode 0x0806) round-trips through
+UNLOAD/reload via READ ATTRIBUTE, and a zero-length write deletes the
+id. The device/medium attributes (capacity, load count, medium
+manufacturer 0x0400 / serial 0x0401) are synthesized read-only, as on
+real hardware.
+
+The barcode is worth a word, because it lives on two surfaces that a
+real library keeps separate and so do we. The **authoritative**
+cartridge barcode is the medium changer's volume tag — what READ
+ELEMENT STATUS reports — which on real hardware is the robot's optical
+read of the printed label and in VTL is the cartridge label, fixed
+out-of-band at `cartridge create`. The drive cannot write it (a drive
+has no optical reader, and you cannot rewrite a printed label over
+SCSI). **MAM attribute 0x0806** is the separate, host-writable copy of
+the barcode that an application records on the medium itself; like a
+real CM it starts absent and is populated only if a host writes it
+(typically the backup app's label step copies the value it read from
+READ ELEMENT STATUS into 0x0806). VTL therefore does not synthesize
+0x0806 and does not couple it to the volume tag — the two may differ,
+exactly as they may on real hardware.
 
 ### Things real LTO hardware does that we don't model
 

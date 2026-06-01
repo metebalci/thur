@@ -1228,11 +1228,18 @@ pub fn handle_read_attribute(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         _ => None,
     };
 
+    // Host-written MAM attributes persisted on the loaded cartridge,
+    // merged with the synthesized device/medium attributes above.
+    let persisted = drive_manager
+        .get_cartridge_mam_attributes((lun - 1) as usize)
+        .unwrap_or_default();
+
     match scsi::attributes::handle_read_attribute(
         service_action,
         element_address,
         first_attribute,
         mam_info,
+        &persisted,
     ) {
         Ok(data) => {
             tracing::debug!("READ ATTRIBUTE response: {} bytes", data.len());
@@ -1250,20 +1257,65 @@ pub fn handle_read_attribute(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
 }
 
 pub fn handle_write_attribute(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
-    // WRITE ATTRIBUTE — accept attribute writes from backup software.
-    // We validate the parameter list shape but don't yet persist
-    // attribute values into the cartridge manifest (most software
-    // writes host-private metadata that doesn't need to round-trip).
+    // WRITE ATTRIBUTE — persist host-written MAM attributes onto the
+    // loaded cartridge so they survive UNLOAD/reload (issue #60).
+    // Device/medium read-only ids are rejected; host-range ids
+    // (0x0800-0x0BFF, 0x1400-0x17FF) are persisted. All-or-nothing:
+    // a single bad descriptor rejects the whole command.
     if ctx.is_changer_lun() {
         return Ok(ScsiResp::check_condition());
     }
-    match scsi::attributes::handle_write_attribute(&ctx.pdu.data) {
-        Ok(()) => Ok(ScsiResp::good()),
+    let lun = ctx.lun;
+    let tsih = ctx.tsih;
+
+    // Parse the parameter list into (id, format, value) records. A
+    // malformed list is INVALID FIELD IN PARAMETER LIST.
+    let records = match scsi::attributes::handle_write_attribute(&ctx.pdu.data) {
+        Ok(records) => records,
         Err(e) => {
-            tracing::warn!("WRITE ATTRIBUTE error: {}", e);
-            Ok(ScsiResp::check_condition())
+            tracing::warn!("WRITE ATTRIBUTE parse error: {}", e);
+            return Ok(pr_invalid_field_in_param_list());
+        }
+    };
+
+    // Empty list -> GOOD no-op (host probing the command path).
+    if records.is_empty() {
+        return Ok(ScsiResp::good());
+    }
+
+    // Validate every record before persisting any: reject device/
+    // medium read-only ids and ids outside the host-writable ranges.
+    for (id, _, _) in &records {
+        if !scsi::attributes::is_host_writable_mam(*id) {
+            tracing::warn!(
+                "WRITE ATTRIBUTE: rejecting read-only / out-of-range attribute 0x{:04x}",
+                id
+            );
+            return Ok(pr_invalid_field_in_param_list());
         }
     }
+
+    // Apply each record. The parameter list itself is already
+    // validated above, so a failure here is an apply-side condition,
+    // not a malformed list: route it through the SmcError mapper like
+    // every other `with_drive` caller in this file. NoCartridgeLoaded
+    // -> NOT READY / MEDIUM NOT PRESENT, DriveReserved -> NOT READY,
+    // an I/O / serialization failure -> HARDWARE ERROR.
+    let drive_id = (lun - 1) as usize;
+    for (id, format, value) in records {
+        if let Err(e) = ctx
+            .drive_manager
+            .write_cartridge_mam_attribute(drive_id, tsih, id, format, value)
+        {
+            tracing::warn!("WRITE ATTRIBUTE: persist failed for 0x{:04x}: {:?}", id, e);
+            return Ok(ScsiResp::check_condition_for(&e));
+        }
+    }
+    tracing::info!(
+        "WRITE ATTRIBUTE: persisted attribute(s) on drive {}",
+        drive_id
+    );
+    Ok(ScsiResp::good())
 }
 
 pub fn handle_write_buffer(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {

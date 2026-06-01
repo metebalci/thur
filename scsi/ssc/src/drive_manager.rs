@@ -681,6 +681,40 @@ impl DriveManager {
         Some((max_bytes, remaining))
     }
 
+    /// Host-written MAM attributes for the cartridge loaded in
+    /// `drive_id`, as `(id, format, value)` tuples in ascending-id
+    /// order. `None` if the drive has no cartridge. Read-only access
+    /// (no session lock) — mirrors [`Self::get_cartridge_capacity`];
+    /// READ ATTRIBUTE is a non-mutating command.
+    pub fn get_cartridge_mam_attributes(&self, drive_id: usize) -> Option<Vec<(u16, u8, Vec<u8>)>> {
+        let drive = self
+            .drives
+            .get(&drive_id)?
+            .lock()
+            .expect("drive mutex poisoned");
+        let cart = drive.cartridge.as_ref()?;
+        Some(cart.mam_attributes())
+    }
+
+    /// Persist one host WRITE ATTRIBUTE record onto the cartridge
+    /// loaded in `drive_id`. Routed through [`Self::with_drive`] so the
+    /// per-session TSIH lock applies and `NoCartridgeLoaded` surfaces
+    /// when no medium is present. The caller (the SCSI layer) must
+    /// already have rejected device/medium read-only ids; an empty
+    /// `value` deletes the id.
+    pub fn write_cartridge_mam_attribute(
+        &self,
+        drive_id: usize,
+        tsih: u16,
+        id: u16,
+        format: u8,
+        value: Vec<u8>,
+    ) -> Result<(), SmcError> {
+        self.with_drive(drive_id, tsih, |cart| {
+            cart.write_mam_attribute(id, format, value)
+        })
+    }
+
     /// Clean up stale locks (older than timeout_seconds). Locks each
     /// drive individually — never holds two drive locks at once.
     pub fn cleanup_stale_locks(&self, timeout_seconds: u64) {

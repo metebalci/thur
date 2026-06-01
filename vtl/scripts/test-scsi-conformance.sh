@@ -623,6 +623,44 @@ t_tape_write_attribute_empty() {
     printf '\x00\x00\x00\x00' > "$payload"
     sg_raw -s 4 -i "$payload" "$TAPE_SG_DEVICE" 8d 01 00 00 00 00 00 00 00 00 00 00 00 04 00 00
 }
+# WRITE ATTRIBUTE — host application attribute 0x0801 = "Bareos".
+# Parameter list: 4-byte body-length header (0x0b=11) + one 5-byte
+# descriptor (id 08 01, control 01=ASCII, length 00 06) + "Bareos".
+# Total data-out = 15 (0x0f) bytes; CDB byte 13 carries that length.
+t_tape_write_attribute_host() {
+    local payload="$TEST_DIR/host_attr.bin"
+    printf '\x00\x00\x00\x0b\x08\x01\x01\x00\x06Bareos' > "$payload"
+    sg_raw -s 15 -i "$payload" "$TAPE_SG_DEVICE" 8d 01 00 00 00 00 00 00 00 00 00 00 00 0f 00 00
+}
+# Issue #60 acceptance: a host attribute written above survives an
+# UNLOAD/LOAD cycle and reads back via READ ATTRIBUTE. Self-contained:
+# write, unload to slot 1, reload into drive 0, clear the post-load
+# Unit Attention, then read and grep the value. Leaves the cartridge
+# loaded in drive 0 (the state it found it in).
+t_tape_write_attribute_roundtrip_reload() {
+    t_tape_write_attribute_host || return 1
+    mtx -f "$CHANGER_DEVICE" unload 1 0 >/dev/null 2>&1 || return 1
+    mtx -f "$CHANGER_DEVICE" load   1 0 >/dev/null 2>&1 || return 1
+    sleep 2
+    sg_turs "$TAPE_SG_DEVICE" >/dev/null 2>&1 || true
+    sg_turs "$TAPE_SG_DEVICE" >/dev/null 2>&1 || true
+    # sg_read_attr renders 0x0801 as the application-name ASCII string;
+    # also accept the raw hex of "Bareos" as a version-robust fallback.
+    sg_read_attr "$TAPE_SG_DEVICE" 2>&1 | grep -qiE 'Bareos|42 *61 *72 *65 *6f *73'
+}
+# WRITE ATTRIBUTE targeting a device/medium read-only id (0x0400
+# MEDIUM MANUFACTURER) must be rejected with ILLEGAL REQUEST / INVALID
+# FIELD IN PARAMETER LIST (5h/26h/00h) and persist nothing.
+t_tape_write_attribute_readonly_rejected() {
+    local payload="$TEST_DIR/readonly_attr.bin"
+    # body-length 6 + descriptor (id 04 00, control 01, length 00 01) + "X"
+    printf '\x00\x00\x00\x06\x04\x00\x01\x00\x01X' > "$payload"
+    local out
+    out=$(sg_raw -s 10 -i "$payload" "$TAPE_SG_DEVICE" 8d 01 00 00 00 00 00 00 00 00 00 00 00 0a 00 00 2>&1)
+    echo "$out"
+    echo "$out" | grep -iqE 'Illegal Request' && \
+        echo "$out" | grep -iqE 'Invalid field in parameter list'
+}
 # REPORT SUPPORTED OPCODES (service action 0x0C) — confirm a non-empty list.
 t_tape_report_supported_opcodes() {
     local out
@@ -1231,6 +1269,9 @@ main() {
     run_test "REPORT DENSITY SUPPORT (tape)"                  t_tape_report_density_support
     run_test "READ ATTRIBUTE (tape)"                          t_tape_read_attribute
     run_test "WRITE ATTRIBUTE (tape, empty list)"             t_tape_write_attribute_empty
+    run_test "WRITE ATTRIBUTE (tape, host attr 0x0801)"       t_tape_write_attribute_host
+    run_test "WRITE/READ ATTRIBUTE round-trip over reload"    t_tape_write_attribute_roundtrip_reload
+    run_test "WRITE ATTRIBUTE (tape, read-only id rejected)"  t_tape_write_attribute_readonly_rejected
     run_test "REPORT SUPPORTED OPCODES (tape)"                t_tape_report_supported_opcodes
     run_test "LOG SELECT (tape, PCR)"                         t_log_select_tape
     run_test "SEND DIAGNOSTIC (tape)"                         t_send_diagnostic_tape

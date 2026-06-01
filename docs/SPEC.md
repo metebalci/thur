@@ -255,7 +255,8 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
 | 0x44 | REPORT DENSITY SUPPORT | LTO-7 / LTO-8 descriptors |
 | 0x80 | WRITE FILEMARKS(16) | TRANSFER LENGTH at cdb[12..16] (4-byte BE u32) per SSC-4 §7.4 |
 | 0x82 | ALLOW OVERWRITE | Volatile, cleared on UNLOAD |
-| 0x8C | READ ATTRIBUTE | Barcode, serial, capacity |
+| 0x8C | READ ATTRIBUTE | SA 0x00 values + SA 0x05 supported list. 4-byte BE AVAILABLE DATA header; 5-byte descriptor `id(2)+control(1: bit7 read-only, bits1–0 format)+length(2)+value`. Synthesized read-only ids (0x0000/0x0001 capacity, 0x0003 load count, 0x0400 manufacturer, 0x0401 serial) merged with persisted host attributes, ascending by id. Barcode 0x0806 is host-writable, not synthesized. |
+| 0x8D | WRITE ATTRIBUTE | Persists host-range ids (0x0800–0x0BFF incl. 0x0806 barcode, 0x1400–0x17FF) to `runtime.json` `mam_attributes`; zero-length write deletes. Read-only (0x0000/0x0001/0x0003/0x0400/0x0401) / out-of-range ids → CHECK CONDITION 5h/26h/00h (all-or-nothing). Empty list = GOOD no-op. |
 | 0x8F | VERIFY(16) | |
 | 0x91 | SPACE(16) | |
 | 0x92 | LOCATE(16) | CP bit honored for partition switch |
@@ -1215,7 +1216,7 @@ while object-level ops (`PutObject`/`GetObject`/`DeleteObject`) target
 ├── tapes/
 │   ├── BARCODE1/
 │   │   ├── manifest.json       # Creation-frozen identity: chunking mode, cartridge UUID, capacity, backend, WORM, dedup
-│   │   ├── runtime.json        # Daemon-mutated runtime: partitions, active partition, byte counters, index_epoch, SET CAPACITY
+│   │   ├── runtime.json        # Daemon-mutated runtime: partitions, active partition, byte counters, index_epoch, SET CAPACITY, host MAM attributes
 │   │   ├── chunks.idx          # Per-cartridge chunk index (64-byte records)
 │   │   ├── blocks-p0.idx       # Block index for partition 0 (16-byte records)
 │   │   ├── blocks-p1.idx       # Block index for partition 1 (LTFS only)
@@ -1409,6 +1410,9 @@ per-write.
     "chunks":    { "pages": 1,  "page_size": 1048576, "epoch": 7,  "file_size": 4128 },
     "blocks-p0": { "pages": 4,  "page_size": 1048576, "epoch": 7,  "file_size": 3145760 }
   },
+  "mam_attributes": {               // host-written MAM attributes (WRITE ATTRIBUTE 0x8D); key = id; omitted when empty
+    "2049": { "format": 1, "value": "426172656f73" } // 0x0801 application name = "Bareos" (value = lowercase hex)
+  },
   "host_bytes_written":   5368709120, // lifetime host writes; pre-dedup, pre-compression; reset on ERASE
   "host_bytes_read":      4294967296, // lifetime plaintext bytes served to the host on READ
   "backend_bytes_written": 2147483648, // lifetime on-wire bytes PUT to backend; post-dedup, post-compression
@@ -1418,7 +1422,7 @@ per-write.
 
 `runtime.json` is rewritten at every runtime-mutating boundary — a
 cross-partition LOCATE, MODE SELECT 0x11, FORMAT MEDIUM, ERASE, SET
-CAPACITY, a manifest backup — through `Cartridge::persist_runtime`,
+CAPACITY, WRITE ATTRIBUTE, a manifest backup — through `Cartridge::persist_runtime`,
 which does an atomic tmp+fsync+rename. It is rewritten once more when
 the cartridge is unloaded (a MOVE MEDIUM out of a drive drops the
 in-memory `Cartridge`), so the byte counters below survive a pure
@@ -1447,6 +1451,20 @@ are monotonic — never decremented on an overwrite, a rewind, or ALLOW
 OVERWRITE. ERASE and FORMAT MEDIUM reset all four to 0, because the
 medium is now logically blank. Restore-archive preserves the source
 cartridge's values.
+
+`mam_attributes` holds the host-written MAM attributes from SCSI WRITE
+ATTRIBUTE (0x8D), keyed by attribute id (decimal in JSON). Each value
+records the SSC-4 `format` code (0 = binary, 1 = ASCII, 2 = text) and
+the raw `value` bytes as a lowercase-hex string. Only host-range ids
+(0x0800–0x0BFF, 0x1400–0x17FF) are stored here — device/medium
+read-only ids are rejected at the SCSI layer and never reach the
+sidecar. READ ATTRIBUTE (0x8C) merges these with the synthesized
+device/medium attributes in ascending-id order. Like the byte
+counters, the map is cleared on ERASE and FORMAT MEDIUM (blank medium);
+a zero-length WRITE ATTRIBUTE deletes one id. The field is omitted from
+the JSON when empty, so a pre-#60 sidecar reads back as no attributes.
+See [`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md) § *Read-attribute /
+write-attribute* for the wire format and the read-only id set.
 
 `uuid` is sticky: 16 random bytes drawn from the OS CSPRNG at create
 time and never modified afterward. It is mixed into the per-block

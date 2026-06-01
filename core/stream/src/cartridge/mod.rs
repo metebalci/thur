@@ -26,7 +26,7 @@ mod indexing;
 // the manifest in Commit 2 of plan-for-the-change-compiled-sutherland.md
 // so manifest.json is creation-frozen.
 mod runtime;
-use runtime::Runtime;
+use runtime::{MamAttrValue, Runtime};
 
 use crate::block_index::{BlockIndexFile, BlockRec, EncryptionTag, derive_iv};
 use crate::chunk_index::{ChunkIndexFile, ChunkRec, LocationTag};
@@ -2270,6 +2270,36 @@ impl Cartridge {
         self.runtime.backend_bytes_read
     }
 
+    /// Snapshot of the host-written MAM attributes for READ ATTRIBUTE,
+    /// as `(id, format, value)` tuples in ascending-id order (the
+    /// `BTreeMap` iteration order, which is the order SSC-4 requires
+    /// in the response). Only host-writable ids are ever present —
+    /// device/medium read-only ids are rejected before they reach
+    /// [`Self::write_mam_attribute`].
+    pub fn mam_attributes(&self) -> Vec<(u16, u8, Vec<u8>)> {
+        self.runtime
+            .mam_attributes
+            .iter()
+            .map(|(id, v)| (*id, v.format, v.value.clone()))
+            .collect()
+    }
+
+    /// Apply one host WRITE ATTRIBUTE record, persisting through the
+    /// runtime sidecar so it survives UNLOAD. An empty `value` deletes
+    /// the id (the SSC-4 "nonexistent" transition). The caller (the
+    /// SCSI layer) is responsible for rejecting device/medium
+    /// read-only ids — this setter trusts that `id` is host-writable.
+    pub fn write_mam_attribute(&mut self, id: u16, format: u8, value: Vec<u8>) -> Result<()> {
+        if value.is_empty() {
+            self.runtime.mam_attributes.remove(&id);
+        } else {
+            self.runtime
+                .mam_attributes
+                .insert(id, MamAttrValue { format, value });
+        }
+        self.persist_runtime()
+    }
+
     /// Add `n` to the lifetime `backend_bytes_read` counter. Called
     /// by the daemon's live-session iSCSI prefetch hook, which
     /// downloads a missing chunk into the pool *outside* the sync
@@ -2443,6 +2473,8 @@ impl Cartridge {
         // Erase blanks the medium, so the host's lifetime write
         // counter on this cartridge resets to 0.
         self.runtime.host_bytes_written = 0;
+        // A blank medium has no host-written MAM attributes.
+        self.runtime.mam_attributes.clear();
         self.persist_runtime()?;
         Ok(())
     }
@@ -2863,6 +2895,9 @@ impl Cartridge {
                 // Format wipes the medium, so the host write counter
                 // resets to 0.
                 self.runtime.host_bytes_written = 0;
+                // A freshly formatted medium has no host-written MAM
+                // attributes.
+                self.runtime.mam_attributes.clear();
                 self.persist_runtime()?;
                 Ok(())
             }
@@ -2933,6 +2968,9 @@ impl Cartridge {
                 // Format wipes the medium, so the host write counter
                 // resets to 0.
                 self.runtime.host_bytes_written = 0;
+                // A freshly formatted medium has no host-written MAM
+                // attributes.
+                self.runtime.mam_attributes.clear();
                 self.persist_runtime()?;
                 Ok(())
             }
@@ -3180,5 +3218,62 @@ mod media_helper_tests {
         // Unknown generations: 0.
         assert_eq!(lto_default_capacity_gb(0), 0);
         assert_eq!(lto_default_capacity_gb(9), 0);
+    }
+}
+
+#[cfg(test)]
+mod mam_attribute_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_cart(dir: &TempDir) -> Cartridge {
+        Cartridge::open(
+            dir.path(),
+            "TAPE01",
+            CartridgeOpenMode::Create {
+                backend: "primary".to_string(),
+                worm: false,
+                dedup: DedupScope::Global,
+            },
+        )
+        .expect("cartridge created")
+    }
+
+    #[test]
+    fn write_then_read_round_trips_through_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut cart = create_cart(&dir);
+            cart.write_mam_attribute(0x0801, 1, b"Bareos".to_vec())
+                .unwrap();
+            cart.write_mam_attribute(0x0800, 1, b"MB".to_vec()).unwrap();
+        }
+        // Reopen — simulates UNLOAD then LOAD.
+        let cart = Cartridge::open(dir.path(), "TAPE01", CartridgeOpenMode::Open)
+            .expect("cartridge reopens");
+        let attrs = cart.mam_attributes();
+        // Ascending id order: 0x0800 before 0x0801.
+        assert_eq!(attrs[0].0, 0x0800);
+        assert_eq!(attrs[1].0, 0x0801);
+        assert_eq!(attrs[1].2, b"Bareos".to_vec());
+    }
+
+    #[test]
+    fn empty_value_deletes_the_attribute() {
+        let dir = TempDir::new().unwrap();
+        let mut cart = create_cart(&dir);
+        cart.write_mam_attribute(0x0801, 1, b"x".to_vec()).unwrap();
+        assert_eq!(cart.mam_attributes().len(), 1);
+        cart.write_mam_attribute(0x0801, 1, Vec::new()).unwrap();
+        assert!(cart.mam_attributes().is_empty());
+    }
+
+    #[test]
+    fn erase_clears_host_attributes() {
+        let dir = TempDir::new().unwrap();
+        let mut cart = create_cart(&dir);
+        cart.write_mam_attribute(0x0801, 1, b"x".to_vec()).unwrap();
+        cart.erase().unwrap();
+        assert!(cart.mam_attributes().is_empty());
     }
 }
