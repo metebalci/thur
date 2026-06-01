@@ -623,35 +623,68 @@ t_tape_write_attribute_empty() {
     printf '\x00\x00\x00\x00' > "$payload"
     sg_raw -s 4 -i "$payload" "$TAPE_SG_DEVICE" 8d 01 00 00 00 00 00 00 00 00 00 00 00 04 00 00
 }
+# READ ATTRIBUTE (SA 0x00 values, big alloc) into a binary file, so the
+# assertion checks the wire bytes directly rather than depending on
+# sg_read_attr's textual rendering. CDB: 8c 00 .. alloc=0x0400 at [10..14].
+# Returns non-zero on CHECK CONDITION (e.g. a pending Unit Attention).
+read_attr_into() {
+    sg_raw -r 1024 -o "$1" "$TAPE_SG_DEVICE" \
+        8c 00 00 00 00 00 00 00 00 00 00 00 04 00 00 00 >/dev/null 2>&1
+}
+# Drain pending Unit Attentions on the tape drive. The daemon pops one
+# UA per non-exempt command and the medium-change UA after a reload is
+# delivered on the *next* command — so a plain sg_turs is unreliable
+# (it can miss the device-reenumeration window). Instead we drive the
+# real READ ATTRIBUTE command in a loop: each call that hits a UA
+# returns CHECK CONDITION (empty file) and pops one UA; once the queue
+# is clear the read succeeds (>=4-byte header). Bounded; best-effort.
+drain_tape_ua() {
+    local junk="$TEST_DIR/ua_drain.bin" i
+    for i in 1 2 3 4 5 6 7 8; do
+        if read_attr_into "$junk" && [[ -s "$junk" ]]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 0
+}
 # WRITE ATTRIBUTE — host application attribute 0x0801 = "Bareos".
 # Parameter list: 4-byte body-length header (0x0b=11) + one 5-byte
 # descriptor (id 08 01, control 01=ASCII, length 00 06) + "Bareos".
 # Total data-out = 15 (0x0f) bytes; CDB byte 13 carries that length.
 t_tape_write_attribute_host() {
+    drain_tape_ua
     local payload="$TEST_DIR/host_attr.bin"
     printf '\x00\x00\x00\x0b\x08\x01\x01\x00\x06Bareos' > "$payload"
     sg_raw -s 15 -i "$payload" "$TAPE_SG_DEVICE" 8d 01 00 00 00 00 00 00 00 00 00 00 00 0f 00 00
 }
 # Issue #60 acceptance: a host attribute written above survives an
 # UNLOAD/LOAD cycle and reads back via READ ATTRIBUTE. Self-contained:
-# write, unload to slot 1, reload into drive 0, clear the post-load
-# Unit Attention, then read and grep the value. Leaves the cartridge
-# loaded in drive 0 (the state it found it in).
+# write, unload to slot 1, reload into drive 0, then read in a retry
+# loop that doubles as the UA drain (the first reads after the reload
+# pop the medium-change UAs), and confirm "Bareos" is in the raw bytes.
+# Leaves the cartridge loaded in drive 0.
 t_tape_write_attribute_roundtrip_reload() {
     t_tape_write_attribute_host || return 1
     mtx -f "$CHANGER_DEVICE" unload 1 0 >/dev/null 2>&1 || return 1
     mtx -f "$CHANGER_DEVICE" load   1 0 >/dev/null 2>&1 || return 1
     sleep 2
-    sg_turs "$TAPE_SG_DEVICE" >/dev/null 2>&1 || true
-    sg_turs "$TAPE_SG_DEVICE" >/dev/null 2>&1 || true
-    # sg_read_attr renders 0x0801 as the application-name ASCII string;
-    # also accept the raw hex of "Bareos" as a version-robust fallback.
-    sg_read_attr "$TAPE_SG_DEVICE" 2>&1 | grep -qiE 'Bareos|42 *61 *72 *65 *6f *73'
+    local out="$TEST_DIR/readattr_roundtrip.bin" i
+    for i in 1 2 3 4 5 6 7 8; do
+        if read_attr_into "$out" && [[ -s "$out" ]]; then
+            break
+        fi
+        sleep 0.5
+    done
+    grep -qa 'Bareos' "$out"
 }
 # WRITE ATTRIBUTE targeting a device/medium read-only id (0x0400
 # MEDIUM MANUFACTURER) must be rejected with ILLEGAL REQUEST / INVALID
-# FIELD IN PARAMETER LIST (5h/26h/00h) and persist nothing.
+# FIELD IN PARAMETER LIST (5h/26h/00h) and persist nothing. Drain any
+# pending UA first so the sense we observe is the rejection, not a
+# leftover medium-change UA from a preceding reload.
 t_tape_write_attribute_readonly_rejected() {
+    drain_tape_ua
     local payload="$TEST_DIR/readonly_attr.bin"
     # body-length 6 + descriptor (id 04 00, control 01, length 00 01) + "X"
     printf '\x00\x00\x00\x06\x04\x00\x01\x00\x01X' > "$payload"
