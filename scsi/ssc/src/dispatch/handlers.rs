@@ -1468,7 +1468,13 @@ pub fn handle_log_sense(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         .drive_mfg_serial(drive_id as u32)
         .unwrap_or_else(|| drive_mfg_serial_fallback(lun));
 
-    match scsi::log_pages::handle_log_sense(page_code, subpage_code, pc, &mfg_serial) {
+    // Live activity counters (loads / mounts / bytes) for the
+    // statistics pages — sourced from the drive's NVRAM + loaded
+    // cartridge runtime. All zero when no cartridge is loaded except
+    // the drive-scoped lifetime volume loads.
+    let counters = ctx.drive_manager.log_sense_counters(drive_id);
+
+    match scsi::log_pages::handle_log_sense(page_code, subpage_code, pc, &mfg_serial, &counters) {
         Ok(data) => {
             tracing::debug!("LOG SENSE response: {} bytes", data.len());
             Ok(ScsiResp {

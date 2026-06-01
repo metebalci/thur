@@ -40,6 +40,20 @@ pub struct DriveState {
     /// [`DrivePageStore`] and `docs/SPEC.md` § "MODE SELECT round-trip".
     #[serde(default, skip_serializing_if = "DrivePageStore::is_empty")]
     pub mode_pages: DrivePageStore,
+
+    /// Drive-lifetime count of volume loads — every cartridge ever
+    /// loaded into this drive, across cartridge swaps and daemon
+    /// restarts. Bumped once per `DriveManager::load_cartridge`.
+    /// Surfaced via LOG SENSE page 0x14 (Device Statistics) parameter
+    /// 0x0000 "Lifetime Volume Loads". Persisted here (the emulated
+    /// drive NVRAM) rather than on any cartridge, since it's a
+    /// property of the drive, not of any one volume.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub lifetime_volume_loads: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 impl DriveState {
@@ -50,7 +64,7 @@ impl DriveState {
     /// True iff every field is at its default — used to skip writes
     /// when the drive has no host-set state to persist.
     pub fn is_empty(&self) -> bool {
-        self.mode_pages.is_empty()
+        self.mode_pages.is_empty() && self.lifetime_volume_loads == 0
     }
 }
 
@@ -105,6 +119,25 @@ mod tests {
             .mode_pages
             .set(0x10, 0x01, vec![0xAB]);
         assert!(!lib.is_empty());
+    }
+
+    #[test]
+    fn lifetime_volume_loads_makes_drive_state_non_empty() {
+        let mut ds = DriveState::new();
+        assert!(ds.is_empty());
+        ds.lifetime_volume_loads = 3;
+        assert!(!ds.is_empty());
+    }
+
+    #[test]
+    fn lifetime_volume_loads_survives_a_serde_round_trip() {
+        let mut lib = LibraryDriveState::new();
+        let mut ds = DriveState::new();
+        ds.lifetime_volume_loads = 42;
+        lib.drives.insert(1, ds);
+        let json = serde_json::to_string(&lib).expect("serialize");
+        let back: LibraryDriveState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.drives.get(&1).unwrap().lifetime_volume_loads, 42);
     }
 
     #[test]

@@ -683,19 +683,19 @@ an initiator needs a way to discover what is there.
 | 0x02 | Write Errors | 🟩 Stub | O | All counters zero. |
 | 0x03 | Read Errors | 🟩 Stub | O | |
 | 0x06 | Non-Medium Errors | 🟩 Stub | O | |
-| 0x0C | Sequential Access Device | 🟩 Stub | O | |
+| 0x0C | Sequential Access Device | 🟩 Yes | O | Live byte counters for the loaded cartridge (received-from / written-to / read-from media + transferred-to-initiator). Partition-capacity hints zero. |
 | 0x0D | Temperature | 🟩 Stub | O | Fixed 25 °C. |
 | 0x11 | DT Device Status | 🟩 Stub | O | |
 | 0x12 | Tape Alert Response | 🟩 Stub | O | |
-| 0x14 | Device Statistics | 🟩 Stub | O | Mirrors VPD 0xB1 serial in param 0x0040. |
+| 0x14 | Device Statistics | 🟩 Yes | O | Live Lifetime Volume Loads (param 0x0000, drive-scoped). Mirrors VPD 0xB1 serial in param 0x0040. Unmodeled counters (power-on hours, etc.) zero. |
 | 0x16 | Last n Error Events | 🟩 Stub | O | Empty (no fault history). |
-| 0x17 | Volume Statistics | 🟩 Stub | O | |
+| 0x17 | Volume Statistics | 🟩 Yes | O | Validity=1 + live Volume Mounts when a volume is loaded; Validity=0 when empty. Error counters zero. |
 | 0x1A | Power Condition Transitions | 🟩 Stub | O | |
-| 0x1B | Data Compression | 🟩 Stub | O | 1:1 ratio reported. |
+| 0x1B | Data Compression | 🟩 Yes | O | 1:1 ratio; live cumulative byte counters (MB + remainder split) for the loaded cartridge. |
 | 0x2E | TapeAlert | 🟩 Yes | O | All 64 flags reported, all clear (healthy drive). |
-| 0x30 | Tape Usage (legacy) | 🟩 Stub | — | Legacy; emitted for old initiators. |
+| 0x30 | Tape Usage (legacy) | 🟩 Yes | — | Legacy; thread count (loads) live from the loaded volume's mount count. Data-set / error counters zero. |
 | 0x31 | Tape Capacity (legacy) | 🟩 Stub | — | Legacy. |
-| 0x32 | Data Compression (legacy) | 🟩 Stub | — | Legacy; deprecated by 0x1B. |
+| 0x32 | Data Compression (legacy) | 🟩 Yes | — | Legacy mirror of 0x1B; live byte counters. |
 
 ### LTO behaviors
 

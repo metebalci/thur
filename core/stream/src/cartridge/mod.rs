@@ -2311,6 +2311,22 @@ impl Cartridge {
         self.runtime.backend_bytes_read = self.runtime.backend_bytes_read.saturating_add(n);
     }
 
+    /// Record one mount (volume loaded into a drive). Bumps the
+    /// lifetime mount count and persists `runtime.json`. Called once
+    /// per `DriveManager::load_cartridge`; monotonic for the
+    /// cartridge's whole life (survives ERASE / FORMAT MEDIUM — a
+    /// mount is a physical event, not a property of the medium's
+    /// contents). Surfaced via LOG SENSE 0x17 / 0x30.
+    pub fn record_mount(&mut self) -> Result<()> {
+        self.runtime.mount_count = self.runtime.mount_count.saturating_add(1);
+        self.persist_runtime()
+    }
+
+    /// Lifetime mount count — see [`Self::record_mount`].
+    pub fn mount_count(&self) -> u64 {
+        self.runtime.mount_count
+    }
+
     /// Get remaining capacity in bytes (None if unlimited).
     /// Honors any host-set SET CAPACITY proportion.
     pub fn remaining_capacity_bytes(&self) -> Option<u64> {

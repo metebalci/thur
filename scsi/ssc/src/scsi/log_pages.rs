@@ -31,6 +31,36 @@ pub enum LogPageCode {
     DataCompressionDeprecated = 0x32,
 }
 
+/// Live activity counters threaded into the LOG SENSE statistics
+/// pages (0x0C / 0x14 / 0x17 / 0x1B / 0x30 / 0x32). Assembled by
+/// [`crate::drive_manager::DriveManager::log_sense_counters`] from the
+/// loaded cartridge's `runtime.json` byte/mount counters plus the
+/// drive's persisted NVRAM load count. All zero when no cartridge is
+/// loaded *except* `lifetime_volume_loads`, which is drive-scoped and
+/// survives cartridge swaps. Error / fault counters are deliberately
+/// not represented here — a virtual drive has none, so they stay zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogSenseCounters {
+    /// Drive-lifetime volume loads → page 0x14 parameter 0x0000.
+    pub lifetime_volume_loads: u64,
+    /// `Some(mounts)` when a volume is mounted (→ 0x17 Validity=1 +
+    /// Volume Mounts, 0x30 thread count); `None` when the drive is
+    /// empty (→ 0x17 Validity=0, every per-volume counter zero).
+    pub volume_mounts: Option<u64>,
+    /// Host bytes written, pre dedup/compress → "Transferred from
+    /// Server" (0x1B/0x32) / "Received From Initiator" (0x0C).
+    pub host_bytes_written: u64,
+    /// Host bytes read, post decrypt/decompress → "Transferred to
+    /// Server" (0x1B/0x32) / "Transferred To Initiator" (0x0C).
+    pub host_bytes_read: u64,
+    /// On-media bytes written, post dedup/compress → "Written to
+    /// Tape" (0x1B/0x32) / "Written To Media" (0x0C).
+    pub backend_bytes_written: u64,
+    /// On-media bytes read → "Read from Tape" (0x1B/0x32) / "Read
+    /// From Media" (0x0C).
+    pub backend_bytes_read: u64,
+}
+
 /// Handle LOG SENSE for the medium changer (LUN 0). The changer
 /// advertises a deliberately narrow set: Supported (0x00), Temperature
 /// (0x0D), and TapeAlert (0x2E). Vendor-specific log pages (vendor
@@ -75,6 +105,7 @@ pub fn handle_log_sense(
     subpage_code: u8,
     pc: u8, // Page Control (0 = threshold, 1 = cumulative, 2 = default, 3 = current threshold)
     mfg_serial: &str,
+    counters: &LogSenseCounters,
 ) -> Result<Vec<u8>, String> {
     tracing::debug!(
         "LOG SENSE: page_code=0x{:02x}, subpage=0x{:02x}, PC={}",
@@ -106,10 +137,10 @@ pub fn handle_log_sense(
         }
         0x0C => {
             // Sequential Access Device (SSC-5 §8.5; supersedes the legacy
-            // 0x30 Tape Usage page). Bytes-transferred counters and
-            // partition-capacity hints. Virtual drive — counters all zero,
-            // capacity hints zero (we don't model partition capacity yet).
-            add_sequential_access_device_log(&mut response);
+            // 0x30 Tape Usage page). Bytes-transferred counters (live,
+            // from the loaded cartridge) and partition-capacity hints
+            // (zero — we don't model partition capacity yet).
+            add_sequential_access_device_log(&mut response, counters);
         }
         0x0D => {
             // Temperature
@@ -128,10 +159,11 @@ pub fn handle_log_sense(
             add_tape_alert_response_log(&mut response);
         }
         0x14 => {
-            // Device Statistics (SSC-5 §8.5). Lifetime counters that backup
-            // software polls for drive-health reporting. Virtual drive — every
-            // counter reads zero.
-            add_device_statistics_log(&mut response, mfg_serial);
+            // Device Statistics (SSC-5 §8.5). Lifetime drive counters that
+            // backup software polls for drive-health reporting. Lifetime
+            // Volume Loads is live (drive NVRAM); the unmodeled counters
+            // (power-on hours, cleaning ops, metres of tape) stay zero.
+            add_device_statistics_log(&mut response, mfg_serial, counters);
         }
         0x16 => {
             // Last n Error Events (SSC-5 §8.6). Vendor-recorded error history;
@@ -141,10 +173,10 @@ pub fn handle_log_sense(
         }
         0x17 => {
             // Volume Statistics (SSC-5 §8.7). Per-mounted-volume counters.
-            // Validity=0 with all-zero counters is the correct shape when no
-            // volume is mounted; the same shape is also acceptable for a
-            // mounted volume on a virtual drive that doesn't track these.
-            add_volume_statistics_log(&mut response);
+            // Validity=1 + live Volume Mounts when a volume is loaded;
+            // Validity=0 with all-zero counters when the drive is empty.
+            // Volume-scoped error counters stay zero (virtual drive).
+            add_volume_statistics_log(&mut response, counters);
         }
         0x1A => {
             // Power Condition Transitions (SPC-4 §7.3.16). Cumulative count
@@ -157,17 +189,18 @@ pub fn handle_log_sense(
             // Write compression ratios + cumulative bytes transferred. We
             // report 1:1 ratio (0x0100 = 1.00) since the SCSI surface doesn't
             // show drive-level compression as a ratio change — block payloads
-            // are decompressed before MODE SENSE / LOG SENSE see them. All
-            // byte counters zero on the virtual drive.
-            add_data_compression_log(&mut response);
+            // are decompressed before MODE SENSE / LOG SENSE see them. The
+            // cumulative byte counters are live (from the loaded cartridge).
+            add_data_compression_log(&mut response, counters);
         }
         0x30 => {
             // Tape Usage (legacy; deprecated by SSC-5 in favor of
             // 0x14 Device Statistics + 0x0C Sequential Access Device).
             // Legacy backup software (older NetBackup, Bareos) still polls
-            // this page during drive-capability detection. Counters all
-            // zero on a virtual drive.
-            add_tape_usage_legacy_log(&mut response);
+            // this page during drive-capability detection. Thread count
+            // (loads) is live (loaded volume's mount count); the data-set
+            // / retry / error counters stay zero on a virtual drive.
+            add_tape_usage_legacy_log(&mut response, counters);
         }
         0x31 => {
             // Tape Capacity (legacy). Per-partition remaining /
@@ -180,8 +213,8 @@ pub fn handle_log_sense(
             // Data Compression (legacy; deprecated by SSC-5 in
             // favor of 0x1B). Same per-counter shape as 0x1B but with the
             // older parameter codes some pre-LTO-7 backup software keys on.
-            // 1:1 ratio (0x0100), all byte counters zero — mirrors 0x1B.
-            add_data_compression_legacy_log(&mut response);
+            // 1:1 ratio (0x0100), live byte counters — mirrors 0x1B.
+            add_data_compression_legacy_log(&mut response, counters);
         }
         0x2E => {
             // TapeAlert (SSC-3 / TapeAlert spec) — 64 boolean flags, one per
@@ -330,12 +363,19 @@ fn add_tape_alert_response_log(_response: &mut Vec<u8>) {
 /// Page 0x14: Device Statistics (SSC-5 §8.5)
 ///
 /// Lifetime drive counters polled by backup software for health reporting.
-/// thurvtl is a virtual drive — every counter reads zero. The parameter
-/// list and per-parameter widths follow SSC-5 so sg_logs and TapeAlert-aware
-/// monitoring decode the page cleanly.
-fn add_device_statistics_log(response: &mut Vec<u8>, mfg_serial: &str) {
-    // 0x0000 Lifetime Volume Loads — 8-byte counter
-    add_log_parameter(response, 0x0000, &[0u8; 8]);
+/// Parameter 0x0000 Lifetime Volume Loads is live (drive-scoped NVRAM,
+/// surviving cartridge swaps); the unmodeled counters (0x0001-0x0007:
+/// cleaning ops, power-on hours, medium-motion hours, metres of tape) stay
+/// zero on a virtual drive. The parameter list and per-parameter widths
+/// follow SSC-5 so sg_logs and TapeAlert-aware monitoring decode the page
+/// cleanly.
+fn add_device_statistics_log(
+    response: &mut Vec<u8>,
+    mfg_serial: &str,
+    counters: &LogSenseCounters,
+) {
+    // 0x0000 Lifetime Volume Loads — 8-byte counter (live, drive NVRAM)
+    add_counter8(response, 0x0000, counters.lifetime_volume_loads);
     // 0x0001 Lifetime Cleaning Operations — 8-byte counter
     add_log_parameter(response, 0x0001, &[0u8; 8]);
     // 0x0002 Lifetime Power On Hours — 4-byte counter
@@ -368,19 +408,20 @@ fn add_last_n_error_events_log(_response: &mut Vec<u8>) {
 /// Page 0x0C: Sequential Access Device (SSC-5 §8.5)
 ///
 /// Cumulative bytes-transferred counters and partition-capacity hints.
-/// Supersedes the deprecated 0x30 Tape Usage page. thurvtl is a virtual
-/// drive and doesn't track per-LUN byte counters or model partition
-/// capacity yet, so every parameter reads zero. The parameter list shape
+/// Supersedes the deprecated 0x30 Tape Usage page. The four byte counters
+/// (0x0000-0x0003) are live for the loaded cartridge; the partition-capacity
+/// hints (0x0004-0x0008) stay zero (no partition-capacity model). Every
+/// parameter reads zero when no cartridge is loaded. The parameter list shape
 /// follows SSC-5 so sg_logs decodes the page cleanly.
-fn add_sequential_access_device_log(response: &mut Vec<u8>) {
-    // 0x0000 Data Bytes Received From Initiator — 8-byte counter
-    add_log_parameter(response, 0x0000, &[0u8; 8]);
-    // 0x0001 Data Bytes Written To Media — 8-byte counter
-    add_log_parameter(response, 0x0001, &[0u8; 8]);
-    // 0x0002 Data Bytes Read From Media — 8-byte counter
-    add_log_parameter(response, 0x0002, &[0u8; 8]);
-    // 0x0003 Data Bytes Transferred To Initiator — 8-byte counter
-    add_log_parameter(response, 0x0003, &[0u8; 8]);
+fn add_sequential_access_device_log(response: &mut Vec<u8>, counters: &LogSenseCounters) {
+    // 0x0000 Data Bytes Received From Initiator — 8-byte counter (live)
+    add_counter8(response, 0x0000, counters.host_bytes_written);
+    // 0x0001 Data Bytes Written To Media — 8-byte counter (live)
+    add_counter8(response, 0x0001, counters.backend_bytes_written);
+    // 0x0002 Data Bytes Read From Media — 8-byte counter (live)
+    add_counter8(response, 0x0002, counters.backend_bytes_read);
+    // 0x0003 Data Bytes Transferred To Initiator — 8-byte counter (live)
+    add_counter8(response, 0x0003, counters.host_bytes_read);
     // 0x0004 Native Capacity From BOP to Current Position (MB) — 8-byte
     add_log_parameter(response, 0x0004, &[0u8; 8]);
     // 0x0005 Native Capacity Between Current Position and EOD (MB) — 8-byte
@@ -401,27 +442,38 @@ fn add_sequential_access_device_log(response: &mut Vec<u8>) {
 /// as a payload-size change — block payloads are decompressed before
 /// LOG SENSE / MODE SENSE see them. All byte counters zero on the virtual
 /// drive.
-fn add_data_compression_log(response: &mut Vec<u8>) {
+fn add_data_compression_log(response: &mut Vec<u8>, counters: &LogSenseCounters) {
     // 0x0000 Read Compression Ratio (×100) — 2 bytes. 0x0100 = 1.00.
     add_log_parameter(response, 0x0000, &[0x01, 0x00]);
     // 0x0001 Write Compression Ratio (×100) — 2 bytes
     add_log_parameter(response, 0x0001, &[0x01, 0x00]);
+    // Each byte total is split into an MB parameter (whole-megabyte
+    // quotient) and a Bytes parameter (sub-MB remainder) so neither
+    // 4-byte field overflows: total = MB * 1_000_000 + Bytes.
+    // "Transferred to Server" is the read direction (host bytes read).
+    let (rd_mb, rd_b) = mb_and_remainder(counters.host_bytes_read);
     // 0x0002 Megabytes Transferred to Server — 4 bytes
-    add_log_parameter(response, 0x0002, &[0u8; 4]);
+    add_counter_parameter(response, 0x0002, rd_mb as u64);
     // 0x0003 Bytes Transferred to Server — 4 bytes
-    add_log_parameter(response, 0x0003, &[0u8; 4]);
+    add_counter_parameter(response, 0x0003, rd_b as u64);
+    // "Read From Tape" is the on-media read (backend bytes read).
+    let (rdt_mb, rdt_b) = mb_and_remainder(counters.backend_bytes_read);
     // 0x0004 Megabytes Read From Tape — 4 bytes
-    add_log_parameter(response, 0x0004, &[0u8; 4]);
+    add_counter_parameter(response, 0x0004, rdt_mb as u64);
     // 0x0005 Bytes Read From Tape — 4 bytes
-    add_log_parameter(response, 0x0005, &[0u8; 4]);
+    add_counter_parameter(response, 0x0005, rdt_b as u64);
+    // "Transferred From Server" is the write direction (host bytes written).
+    let (wr_mb, wr_b) = mb_and_remainder(counters.host_bytes_written);
     // 0x0006 Megabytes Transferred From Server — 4 bytes
-    add_log_parameter(response, 0x0006, &[0u8; 4]);
+    add_counter_parameter(response, 0x0006, wr_mb as u64);
     // 0x0007 Bytes Transferred From Server — 4 bytes
-    add_log_parameter(response, 0x0007, &[0u8; 4]);
+    add_counter_parameter(response, 0x0007, wr_b as u64);
+    // "Written To Tape" is the on-media write (backend bytes written).
+    let (wrt_mb, wrt_b) = mb_and_remainder(counters.backend_bytes_written);
     // 0x0008 Megabytes Written To Tape — 4 bytes
-    add_log_parameter(response, 0x0008, &[0u8; 4]);
+    add_counter_parameter(response, 0x0008, wrt_mb as u64);
     // 0x0009 Bytes Written To Tape — 4 bytes
-    add_log_parameter(response, 0x0009, &[0u8; 4]);
+    add_counter_parameter(response, 0x0009, wrt_b as u64);
 }
 
 /// Page 0x1A: Power Condition Transitions (SPC-4 §7.3.16)
@@ -454,11 +506,13 @@ fn add_power_condition_transitions_log(response: &mut Vec<u8>) {
 /// Per-mounted-volume counters. With no volume mounted (or on a virtual drive
 /// that doesn't track these), Validity=0 with all-zero counters is the
 /// correct shape.
-fn add_volume_statistics_log(response: &mut Vec<u8>) {
-    // 0x0000 Validity flag — 1 byte (0 = parameters not valid)
-    add_log_parameter(response, 0x0000, &[0u8]);
-    // 0x0001 Volume Mounts — 8-byte counter
-    add_log_parameter(response, 0x0001, &[0u8; 8]);
+fn add_volume_statistics_log(response: &mut Vec<u8>, counters: &LogSenseCounters) {
+    // 0x0000 Validity flag — 1 byte (1 = parameters valid, i.e. a
+    // volume is mounted; 0 = no volume → the rest are not meaningful)
+    let validity = u8::from(counters.volume_mounts.is_some());
+    add_log_parameter(response, 0x0000, &[validity]);
+    // 0x0001 Volume Mounts — 8-byte counter (live mount count)
+    add_counter8(response, 0x0001, counters.volume_mounts.unwrap_or(0));
     // 0x0002 Volume Recovered Write Data Errors — 8-byte counter
     add_log_parameter(response, 0x0002, &[0u8; 8]);
     // 0x0003 Volume Unrecovered Write Data Errors — 8-byte counter
@@ -483,9 +537,10 @@ fn add_volume_statistics_log(response: &mut Vec<u8>) {
 /// Parameter codes + widths follow the SSC legacy 0x30/0x31/0x32
 /// family. thurvtl is a virtual drive — every
 /// counter zero.
-fn add_tape_usage_legacy_log(response: &mut Vec<u8>) {
-    // 0x0001 Thread count (loads) — 8-byte counter
-    add_log_parameter(response, 0x0001, &[0u8; 8]);
+fn add_tape_usage_legacy_log(response: &mut Vec<u8>, counters: &LogSenseCounters) {
+    // 0x0001 Thread count (loads) — 8-byte counter (live: the loaded
+    // volume's mount count; 0 when no volume is mounted)
+    add_counter8(response, 0x0001, counters.volume_mounts.unwrap_or(0));
     // 0x0002 Total data sets written — 8-byte counter
     add_log_parameter(response, 0x0002, &[0u8; 8]);
     // 0x0003 Total write retries — 4-byte counter
@@ -530,27 +585,33 @@ fn add_tape_capacity_legacy_log(response: &mut Vec<u8>) {
 /// pre-LTO-7 backup software keys on. 1:1 ratio (0x0100) reflects the
 /// same fact: the SCSI surface doesn't observe drive compression as a
 /// payload-size change. All byte counters zero on the virtual drive.
-fn add_data_compression_legacy_log(response: &mut Vec<u8>) {
+fn add_data_compression_legacy_log(response: &mut Vec<u8>, counters: &LogSenseCounters) {
+    // Identical parameter codes / widths / counter mapping as 0x1B —
+    // see `add_data_compression_log` for the MB/Bytes split rationale.
     // 0x0000 Read compression ratio (×100) — 2 bytes, 0x0100 = 1.00
     add_log_parameter(response, 0x0000, &[0x01, 0x00]);
     // 0x0001 Write compression ratio (×100) — 2 bytes
     add_log_parameter(response, 0x0001, &[0x01, 0x00]);
+    let (rd_mb, rd_b) = mb_and_remainder(counters.host_bytes_read);
     // 0x0002 MB transferred to server — 4 bytes
-    add_log_parameter(response, 0x0002, &[0u8; 4]);
+    add_counter_parameter(response, 0x0002, rd_mb as u64);
     // 0x0003 Bytes transferred to server — 4 bytes
-    add_log_parameter(response, 0x0003, &[0u8; 4]);
+    add_counter_parameter(response, 0x0003, rd_b as u64);
+    let (rdt_mb, rdt_b) = mb_and_remainder(counters.backend_bytes_read);
     // 0x0004 MB read from tape — 4 bytes
-    add_log_parameter(response, 0x0004, &[0u8; 4]);
+    add_counter_parameter(response, 0x0004, rdt_mb as u64);
     // 0x0005 Bytes read from tape — 4 bytes
-    add_log_parameter(response, 0x0005, &[0u8; 4]);
+    add_counter_parameter(response, 0x0005, rdt_b as u64);
+    let (wr_mb, wr_b) = mb_and_remainder(counters.host_bytes_written);
     // 0x0006 MB transferred from server — 4 bytes
-    add_log_parameter(response, 0x0006, &[0u8; 4]);
+    add_counter_parameter(response, 0x0006, wr_mb as u64);
     // 0x0007 Bytes transferred from server — 4 bytes
-    add_log_parameter(response, 0x0007, &[0u8; 4]);
+    add_counter_parameter(response, 0x0007, wr_b as u64);
+    let (wrt_mb, wrt_b) = mb_and_remainder(counters.backend_bytes_written);
     // 0x0008 MB written to tape — 4 bytes
-    add_log_parameter(response, 0x0008, &[0u8; 4]);
+    add_counter_parameter(response, 0x0008, wrt_mb as u64);
     // 0x0009 Bytes written to tape — 4 bytes
-    add_log_parameter(response, 0x0009, &[0u8; 4]);
+    add_counter_parameter(response, 0x0009, wrt_b as u64);
 }
 
 // ============================================================================
@@ -565,11 +626,32 @@ fn add_log_parameter(response: &mut Vec<u8>, param_code: u16, data: &[u8]) {
     response.extend_from_slice(data); // Parameter data
 }
 
-/// Add a counter parameter (4-byte or 8-byte counter)
+/// Add a 4-byte counter parameter. The value is truncated to 32 bits
+/// — used only for parameters the spec fixes at 4 bytes (the
+/// Data Compression MB/remainder fields, which never exceed 32 bits by
+/// construction).
 fn add_counter_parameter(response: &mut Vec<u8>, param_code: u16, value: u64) {
-    // Use 4-byte counter for MVP (sufficient for counters)
     let value_bytes = (value as u32).to_be_bytes();
     add_log_parameter(response, param_code, &value_bytes);
+}
+
+/// Add an 8-byte counter parameter — the width SSC-5 fixes for the
+/// load / mount / bytes-transferred counters (0x14 / 0x17 / 0x0C / 0x30).
+fn add_counter8(response: &mut Vec<u8>, param_code: u16, value: u64) {
+    add_log_parameter(response, param_code, &value.to_be_bytes());
+}
+
+/// Split a byte total into the (megabytes, sub-MB-remainder) pair the
+/// Data Compression log page (0x1B / 0x32) reports as two adjacent
+/// 4-byte parameters: `total = mb * 1_000_000 + remainder`. Using
+/// decimal megabytes (10^6) matches how LTO drives label these fields.
+/// The remainder is always `< 1_000_000` so it fits a 4-byte field;
+/// the MB quotient is clamped to `u32::MAX` (~4.29 PB, far past any
+/// virtual cartridge).
+fn mb_and_remainder(total: u64) -> (u32, u32) {
+    let mb = (total / 1_000_000).min(u32::MAX as u64) as u32;
+    let remainder = (total % 1_000_000) as u32;
+    (mb, remainder)
 }
 
 #[cfg(test)]
@@ -578,7 +660,13 @@ mod tests {
 
     #[test]
     fn test_log_sense_supported_pages() {
-        let result = handle_log_sense(0x00, 0x00, 0x01, "THUR-MFG-001");
+        let result = handle_log_sense(
+            0x00,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        );
         assert!(result.is_ok());
         let data = result.unwrap();
 
@@ -590,7 +678,13 @@ mod tests {
 
     #[test]
     fn test_log_sense_write_errors() {
-        let result = handle_log_sense(0x02, 0x00, 0x01, "THUR-MFG-001");
+        let result = handle_log_sense(
+            0x02,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        );
         assert!(result.is_ok());
         let data = result.unwrap();
 
@@ -601,7 +695,13 @@ mod tests {
 
     #[test]
     fn test_log_sense_read_errors() {
-        let result = handle_log_sense(0x03, 0x00, 0x01, "THUR-MFG-001");
+        let result = handle_log_sense(
+            0x03,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        );
         assert!(result.is_ok());
         let data = result.unwrap();
 
@@ -611,7 +711,13 @@ mod tests {
 
     #[test]
     fn test_log_sense_temperature() {
-        let result = handle_log_sense(0x0D, 0x00, 0x01, "THUR-MFG-001");
+        let result = handle_log_sense(
+            0x0D,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        );
         assert!(result.is_ok());
         let data = result.unwrap();
 
@@ -622,13 +728,26 @@ mod tests {
 
     #[test]
     fn test_log_sense_unsupported() {
-        let result = handle_log_sense(0xFF, 0x00, 0x01, "THUR-MFG-001");
+        let result = handle_log_sense(
+            0xFF,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_log_sense_device_statistics() {
-        let result = handle_log_sense(0x14, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x14,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x14);
         assert_eq!(result[1], 0x00);
         // 4-byte page header + parameter list
@@ -642,7 +761,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_last_n_error_events() {
-        let result = handle_log_sense(0x16, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x16,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         // Header-only response; no parameters.
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], 0x16);
@@ -651,7 +777,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_volume_statistics() {
-        let result = handle_log_sense(0x17, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x17,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x17);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -662,7 +795,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_supported_pages_lists_new_pages() {
-        let data = handle_log_sense(0x00, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let data = handle_log_sense(
+            0x00,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         // Each entry is a 5-byte log parameter (4-byte header + 1-byte data).
         // Walk the list and check 0x0C / 0x12 / 0x14 / 0x16 / 0x17 / 0x1A / 0x1B appear.
         let mut found = [false; 7];
@@ -689,7 +829,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_tape_usage_legacy() {
-        let result = handle_log_sense(0x30, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x30,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x30);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -700,7 +847,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_tape_capacity_legacy() {
-        let result = handle_log_sense(0x31, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x31,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x31);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -710,7 +864,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_data_compression_legacy() {
-        let result = handle_log_sense(0x32, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x32,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x32);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -721,7 +882,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_power_condition_transitions() {
-        let result = handle_log_sense(0x1A, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x1A,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x1A);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -734,7 +902,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_tape_alert_response() {
-        let result = handle_log_sense(0x12, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x12,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         // Header-only response; no parameters. Mirrors the 0x16 shape — "no
         // events recorded" is the truthful answer for a virtual drive.
         assert_eq!(result.len(), 4);
@@ -744,7 +919,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_sequential_access_device() {
-        let result = handle_log_sense(0x0C, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x0C,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x0C);
         assert_eq!(result[1], 0x00);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
@@ -756,7 +938,14 @@ mod tests {
 
     #[test]
     fn test_log_sense_data_compression() {
-        let result = handle_log_sense(0x1B, 0x00, 0x01, "THUR-MFG-001").unwrap();
+        let result = handle_log_sense(
+            0x1B,
+            0x00,
+            0x01,
+            "THUR-MFG-001",
+            &LogSenseCounters::default(),
+        )
+        .unwrap();
         assert_eq!(result[0], 0x1B);
         let page_len = u16::from_be_bytes([result[2], result[3]]) as usize;
         assert_eq!(page_len, result.len() - 4);
@@ -764,5 +953,126 @@ mod tests {
         assert_eq!(&result[4..6], &[0x00, 0x00]); // param code
         assert_eq!(result[7], 2); // length
         assert_eq!(&result[8..10], &[0x01, 0x00]); // 1:1 ratio
+    }
+
+    // -- live-counter coverage (issue #61) --
+
+    /// Walk a LOG SENSE page body into a `code -> value-bytes` map.
+    fn parse_params(data: &[u8]) -> std::collections::HashMap<u16, Vec<u8>> {
+        let mut m = std::collections::HashMap::new();
+        let mut i = 4; // skip the 4-byte page header
+        while i + 4 <= data.len() {
+            let code = u16::from_be_bytes([data[i], data[i + 1]]);
+            let len = data[i + 3] as usize;
+            let start = i + 4;
+            let end = start + len;
+            if end > data.len() {
+                break;
+            }
+            m.insert(code, data[start..end].to_vec());
+            i = end;
+        }
+        m
+    }
+
+    fn be_u64(bytes: &[u8]) -> u64 {
+        let mut buf = [0u8; 8];
+        buf[8 - bytes.len()..].copy_from_slice(bytes);
+        u64::from_be_bytes(buf)
+    }
+
+    /// host_bytes_read = 1 MB exactly; host_bytes_written = 2 MB + 500_123 B;
+    /// backend_bytes_written = 999_999 B (sub-MB); backend_bytes_read = 4 MB.
+    fn sample_counters() -> LogSenseCounters {
+        LogSenseCounters {
+            lifetime_volume_loads: 5,
+            volume_mounts: Some(3),
+            host_bytes_written: 2_500_123,
+            host_bytes_read: 1_000_000,
+            backend_bytes_written: 999_999,
+            backend_bytes_read: 4_000_000,
+        }
+    }
+
+    #[test]
+    fn mb_and_remainder_splits_on_decimal_megabytes() {
+        assert_eq!(mb_and_remainder(0), (0, 0));
+        assert_eq!(mb_and_remainder(999_999), (0, 999_999));
+        assert_eq!(mb_and_remainder(1_000_000), (1, 0));
+        assert_eq!(mb_and_remainder(2_500_123), (2, 500_123));
+        // Clamp: a value past u32::MAX megabytes saturates the MB field
+        // and the remainder is always < 1_000_000.
+        let (mb, rem) = mb_and_remainder(u64::MAX);
+        assert_eq!(mb, u32::MAX);
+        assert!(rem < 1_000_000);
+    }
+
+    #[test]
+    fn device_statistics_reports_live_lifetime_volume_loads() {
+        let data = handle_log_sense(0x14, 0x00, 0x01, "MFG", &sample_counters()).unwrap();
+        let params = parse_params(&data);
+        // 0x0000 Lifetime Volume Loads, 8-byte counter.
+        assert_eq!(be_u64(&params[&0x0000]), 5);
+        // mfg serial still mirrored in 0x0040.
+        assert_eq!(params[&0x0040], b"MFG");
+    }
+
+    #[test]
+    fn volume_statistics_validity_follows_mount_presence() {
+        // Mounted: validity = 1, Volume Mounts = live count.
+        let data = handle_log_sense(0x17, 0x00, 0x01, "MFG", &sample_counters()).unwrap();
+        let params = parse_params(&data);
+        assert_eq!(params[&0x0000], vec![1]); // validity
+        assert_eq!(be_u64(&params[&0x0001]), 3); // volume mounts
+
+        // Empty drive: validity = 0, every per-volume counter zero.
+        let empty =
+            handle_log_sense(0x17, 0x00, 0x01, "MFG", &LogSenseCounters::default()).unwrap();
+        let p = parse_params(&empty);
+        assert_eq!(p[&0x0000], vec![0]);
+        assert_eq!(be_u64(&p[&0x0001]), 0);
+    }
+
+    #[test]
+    fn tape_usage_thread_count_is_live_mount_count() {
+        let data = handle_log_sense(0x30, 0x00, 0x01, "MFG", &sample_counters()).unwrap();
+        let params = parse_params(&data);
+        // 0x0001 thread count == mount count; data-set / error counters stay zero.
+        assert_eq!(be_u64(&params[&0x0001]), 3);
+        assert_eq!(be_u64(&params[&0x0002]), 0); // total data sets written
+        assert_eq!(be_u64(&params[&0x0009]), 0); // unrecovered read errors
+    }
+
+    #[test]
+    fn sequential_access_device_reports_live_byte_counters() {
+        let data = handle_log_sense(0x0C, 0x00, 0x01, "MFG", &sample_counters()).unwrap();
+        let params = parse_params(&data);
+        assert_eq!(be_u64(&params[&0x0000]), 2_500_123); // received from initiator
+        assert_eq!(be_u64(&params[&0x0001]), 999_999); // written to media
+        assert_eq!(be_u64(&params[&0x0002]), 4_000_000); // read from media
+        assert_eq!(be_u64(&params[&0x0003]), 1_000_000); // transferred to initiator
+    }
+
+    #[test]
+    fn data_compression_splits_byte_counters_into_mb_and_remainder() {
+        for page in [0x1Bu8, 0x32] {
+            let data = handle_log_sense(page, 0x00, 0x01, "MFG", &sample_counters()).unwrap();
+            let params = parse_params(&data);
+            // Ratios unchanged (1:1).
+            assert_eq!(params[&0x0000], vec![0x01, 0x00]);
+            assert_eq!(params[&0x0001], vec![0x01, 0x00]);
+            // Transferred to Server == host_bytes_read (1 MB, 0 B).
+            assert_eq!(be_u64(&params[&0x0002]), 1);
+            assert_eq!(be_u64(&params[&0x0003]), 0);
+            // Read From Tape == backend_bytes_read (4 MB, 0 B).
+            assert_eq!(be_u64(&params[&0x0004]), 4);
+            assert_eq!(be_u64(&params[&0x0005]), 0);
+            // Transferred From Server == host_bytes_written (2 MB, 500_123 B).
+            assert_eq!(be_u64(&params[&0x0006]), 2);
+            assert_eq!(be_u64(&params[&0x0007]), 500_123);
+            // Written To Tape == backend_bytes_written (0 MB, 999_999 B).
+            assert_eq!(be_u64(&params[&0x0008]), 0);
+            assert_eq!(be_u64(&params[&0x0009]), 999_999);
+        }
     }
 }

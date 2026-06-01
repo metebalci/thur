@@ -873,6 +873,14 @@ in the following steps:
   freely re-writable; for that reason it gets the same local-only
   treatment as `lru.idx`. A missing or corrupt file simply yields
   empty state, and the page builders then emit defaults.
+- **Lifetime Volume Loads.** The same `drive_state.json` per-drive
+  record also carries `lifetime_volume_loads` — a drive-scoped count
+  bumped once per `DriveManager::load_cartridge` (independently of any
+  SP=1 mode page) and persisted on each load (best-effort: a write
+  failure logs a warning but doesn't fail the mount). It is the source
+  for LOG SENSE 0x14 Device Statistics parameter 0x0000 and survives
+  cartridge swaps + daemon restarts. A drive with a non-zero load count
+  is persisted even when it has no saved mode pages.
 - **MODE SENSE replay.** When building a page under PC=Current or
   PC=Saved, the page builders consult `mode_pages_state` first and
   fall back to defaults only if nothing is saved. Page 0x0F is the one
@@ -916,19 +924,19 @@ polls just 00, 0D, and 2E on the changer.
 | 0x02 | Write Errors |
 | 0x03 | Read Errors |
 | 0x06 | Non-Medium Errors |
-| 0x0C | Sequential Access Device (SSC-5 §8.5; bytes-transferred counters + partition-capacity hints, all zero on a virtual drive) |
+| 0x0C | Sequential Access Device (SSC-5 §8.5). Four 8-byte bytes-transferred counters are live for the loaded cartridge — 0x0000 Received From Initiator = host bytes written, 0x0001 Written To Media = backend (on-wire) bytes written, 0x0002 Read From Media = backend bytes read, 0x0003 Transferred To Initiator = host bytes read. Partition-capacity hints (0x0004-0x0008) stay zero (no partition-capacity model). All zero when no cartridge is loaded. |
 | 0x0D | Temperature |
 | 0x11 | DT Device Status (legacy enum name `TapeUsage`; SSC-4 §8.2.3 calls it DT Device Status) |
 | 0x12 | Tape Alert Response (SSC-3 §8.2.4; host-poll companion to 0x2E. Empty parameter list — virtual drive has no alert history) |
-| 0x14 | Device Statistics (SSC-5 §8.5; lifetime drive counters, all zero on a virtual drive). Parameter 0x0040 (Drive Manufacturer's Serial Number) mirrors INQUIRY VPD 0xB1. |
+| 0x14 | Device Statistics (SSC-5 §8.5; lifetime drive counters). Parameter 0x0000 Lifetime Volume Loads is live — a drive-scoped count (every cartridge ever loaded into this drive), persisted in `drive_state.json` and surviving cartridge swaps + daemon restarts. The unmodeled counters (power-on hours, cleaning ops, metres of tape) stay zero. Parameter 0x0040 (Drive Manufacturer's Serial Number) mirrors INQUIRY VPD 0xB1. |
 | 0x16 | Last n Error Events (SSC-5 §8.6; empty parameter list — virtual drive doesn't fault) |
-| 0x17 | Volume Statistics (SSC-5 §8.7; per-mounted-volume counters, Validity=0 / counters=0) |
+| 0x17 | Volume Statistics (SSC-5 §8.7; per-mounted-volume counters). With a volume loaded, parameter 0x0000 Validity = 1 and parameter 0x0001 Volume Mounts = the loaded cartridge's lifetime mount count (persisted in `runtime.json`, bumped once per drive load, surviving ERASE / FORMAT). Empty drive → Validity = 0, every per-volume counter 0. Volume-scoped error counters (0x0002-0x0007) stay zero. |
 | 0x1A | Power Condition Transitions (SPC-4 §7.3.16; six 4-byte counters for transitions into Active / Idle_a / Idle_b / Idle_c / Standby_y / Standby_z, all zero on a virtual drive) |
-| 0x1B | Data Compression (SSC-5; replaces deprecated 0x32). Read/Write compression ratios reported as 0x0100 (1:1) — the SCSI surface doesn't see drive compression as a payload-size change. Cumulative byte counters all zero. |
+| 0x1B | Data Compression (SSC-5; replaces deprecated 0x32). Read/Write compression ratios reported as 0x0100 (1:1) — the SCSI surface doesn't see drive compression as a payload-size change. The cumulative byte counters are live for the loaded cartridge: each is a (MB, sub-MB-remainder) pair of 4-byte parameters where `total = MB * 1,000,000 + Bytes`. "Transferred to/from Server" = host bytes read/written; "Read/Written … Tape" = backend (on-wire) bytes read/written. All zero when no cartridge is loaded. |
 | 0x2E | TapeAlert |
-| 0x30 | Tape Usage (legacy; deprecated by SSC-5 in favor of 0x14 + 0x0C, but legacy backup software still polls). All counters zero on a virtual drive. |
+| 0x30 | Tape Usage (legacy; deprecated by SSC-5 in favor of 0x14 + 0x0C, but legacy backup software still polls). Parameter 0x0001 thread count (loads) = the loaded cartridge's mount count (0 when no cartridge). Data-set / retry / error counters stay zero on a virtual drive. |
 | 0x31 | Tape Capacity (legacy; per-partition remaining/maximum MB, all zero — same shape 0x0C reports) |
-| 0x32 | Data Compression (legacy; deprecated by SSC-5 in favor of 0x1B). Same per-counter shape as 0x1B with the older parameter codes pre-LTO-7 backup software keys on. 1:1 ratio (0x0100), all byte counters zero. |
+| 0x32 | Data Compression (legacy; deprecated by SSC-5 in favor of 0x1B). Same per-counter shape, parameter codes, and live (MB, remainder) byte-counter mapping as 0x1B — the older codes pre-LTO-7 backup software keys on. 1:1 ratio (0x0100). |
 
 #### Medium changer (LUN 0)
 
@@ -1278,7 +1286,7 @@ while object-level ops (`PutObject`/`GetObject`/`DeleteObject`) target
 ├── tapes/
 │   ├── BARCODE1/
 │   │   ├── manifest.json       # Creation-frozen identity: chunking mode, cartridge UUID, capacity, backend, WORM, dedup
-│   │   ├── runtime.json        # Daemon-mutated runtime: partitions, active partition, byte counters, index_epoch, SET CAPACITY, host MAM attributes
+│   │   ├── runtime.json        # Daemon-mutated runtime: partitions, active partition, byte + mount counters, index_epoch, SET CAPACITY, host MAM attributes
 │   │   ├── chunks.idx          # Per-cartridge chunk index (64-byte records)
 │   │   ├── blocks-p0.idx       # Block index for partition 0 (16-byte records)
 │   │   ├── blocks-p1.idx       # Block index for partition 1 (LTFS only)
@@ -1475,6 +1483,7 @@ per-write.
   "mam_attributes": {               // host-written MAM attributes (WRITE ATTRIBUTE 0x8D); key = id; omitted when empty
     "2049": { "format": 1, "value": "426172656f73" } // 0x0801 application name = "Bareos" (value = lowercase hex)
   },
+  "mount_count":           7,         // lifetime volume mounts (drive loads); bumped per load; surfaced via LOG SENSE 0x17/0x30; survives ERASE
   "host_bytes_written":   5368709120, // lifetime host writes; pre-dedup, pre-compression; reset on ERASE
   "host_bytes_read":      4294967296, // lifetime plaintext bytes served to the host on READ
   "backend_bytes_written": 2147483648, // lifetime on-wire bytes PUT to backend; post-dedup, post-compression
@@ -1510,9 +1519,19 @@ prefetch hook and the async refetch path. The gap between a host
 counter and its backend counterpart is the dedup + compression saving
 on the write side and the cache hit rate on the read side. All four
 are monotonic — never decremented on an overwrite, a rewind, or ALLOW
-OVERWRITE. ERASE and FORMAT MEDIUM reset all four to 0, because the
-medium is now logically blank. Restore-archive preserves the source
-cartridge's values.
+OVERWRITE. ERASE and FORMAT MEDIUM reset `host_bytes_written` to 0,
+because the medium is now logically blank. Restore-archive preserves the
+source cartridge's values.
+
+`mount_count` is a separate lifetime counter: the number of times the
+volume has been mounted (loaded into any drive), bumped once per
+`DriveManager::load_cartridge`. Unlike the byte counters it is **not**
+reset by ERASE / FORMAT MEDIUM — a mount is a physical event, not a
+property of the medium's contents. It is surfaced via LOG SENSE 0x17
+Volume Statistics (Volume Mounts) and 0x30 Tape Usage (thread count).
+The drive-side companion, *Lifetime Volume Loads* (LOG SENSE 0x14), is a
+per-drive count kept in `drive_state.json` rather than on any one
+cartridge.
 
 `mam_attributes` holds the host-written MAM attributes from SCSI WRITE
 ATTRIBUTE (0x8D), keyed by attribute id (decimal in JSON). Each value

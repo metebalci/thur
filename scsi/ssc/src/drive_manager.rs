@@ -576,6 +576,20 @@ impl DriveManager {
             cartridge.set_ghost_list(gl.clone());
         }
 
+        // Lifetime mount/load counters (LOG SENSE 0x14 / 0x17 / 0x30).
+        // Best-effort persistence: a failed runtime.json / drive_state.json
+        // write must not block the mount — the in-memory counts are already
+        // bumped, so LOG SENSE reflects this mount for the rest of the load
+        // even if the durable write fails (mirrors the drive-state NVRAM
+        // degrade-gracefully policy).
+        if let Err(e) = cartridge.record_mount() {
+            warn!(
+                "mount-count persist failed for cartridge {}: {} (in-memory count unaffected)",
+                cartridge_label, e
+            );
+        }
+        drive.state.lifetime_volume_loads = drive.state.lifetime_volume_loads.saturating_add(1);
+
         drive.cartridge = Some(cartridge);
         info!(
             "Loaded cartridge {} into drive {} (DCE off; algorithm: {}, zstd_level: {} - host turns DCE on via MODE SELECT page 0x0F)",
@@ -584,6 +598,11 @@ impl DriveManager {
             self.drive_compression_algorithm,
             self.drive_compression_zstd_level
         );
+        // Drop the per-drive guard before persisting — `persist_drive_state`
+        // re-locks every drive Arc to snapshot, so holding this lock here
+        // would deadlock.
+        drop(drive);
+        self.persist_drive_state();
         Ok(())
     }
 
@@ -679,6 +698,34 @@ impl DriveManager {
         let used_bytes = cart.used_capacity_bytes();
         let remaining = max_bytes.saturating_sub(used_bytes);
         Some((max_bytes, remaining))
+    }
+
+    /// Live activity counters for the drive's LOG SENSE statistics
+    /// pages (0x0C / 0x14 / 0x17 / 0x1B / 0x30 / 0x32). The drive-scoped
+    /// `lifetime_volume_loads` is always available (NVRAM); the
+    /// per-volume mount/byte counters come from the loaded cartridge
+    /// and are zeroed (mounts → `None`) when the drive is empty.
+    /// Read-only (no session lock), mirroring
+    /// [`Self::get_cartridge_capacity`] — LOG SENSE is non-mutating.
+    /// An unknown `drive_id` returns all-zero counters.
+    pub fn log_sense_counters(&self, drive_id: usize) -> crate::scsi::log_pages::LogSenseCounters {
+        use crate::scsi::log_pages::LogSenseCounters;
+        let Some(drive) = self.drives.get(&drive_id) else {
+            return LogSenseCounters::default();
+        };
+        let drive = drive.lock().expect("drive mutex poisoned");
+        let mut counters = LogSenseCounters {
+            lifetime_volume_loads: drive.state.lifetime_volume_loads,
+            ..LogSenseCounters::default()
+        };
+        if let Some(cart) = drive.cartridge.as_ref() {
+            counters.volume_mounts = Some(cart.mount_count());
+            counters.host_bytes_written = cart.host_bytes_written();
+            counters.host_bytes_read = cart.host_bytes_read();
+            counters.backend_bytes_written = cart.backend_bytes_written();
+            counters.backend_bytes_read = cart.backend_bytes_read();
+        }
+        counters
     }
 
     /// Host-written MAM attributes for the cartridge loaded in
@@ -1033,6 +1080,141 @@ mod tests {
         let label = mgr.unload_cartridge(0).unwrap();
         assert_eq!(label, "TEST001");
         assert!(!mgr.has_cartridge(0).unwrap());
+    }
+
+    #[test]
+    fn log_sense_counters_track_loads_mounts_and_writes() {
+        // End-to-end coverage for issue #61: a load bumps the
+        // drive-lifetime load count + the volume's mount count, a write
+        // bumps the host byte counter, and all three surface through
+        // `log_sense_counters`. Mount count persists across unload/reload.
+        // Nested tapes dir so drive_state.json lands under this temp
+        // dir (it derives from tapes_root's parent), keeping the
+        // persisted load count isolated from other tests.
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(1, tapes_root.clone());
+
+        Cartridge::open(
+            &tapes_root,
+            "CNT001",
+            CartridgeOpenMode::Create {
+                backend: "primary".to_string(),
+                worm: false,
+                dedup: core_mediachanger::DedupScope::Local,
+            },
+        )
+        .unwrap();
+
+        // Empty drive: everything zero, no volume mounted.
+        let empty = mgr.log_sense_counters(0);
+        assert_eq!(empty.lifetime_volume_loads, 0);
+        assert_eq!(empty.volume_mounts, None);
+        assert_eq!(empty.host_bytes_written, 0);
+
+        // First load: drive load count and volume mount count both 1.
+        mgr.load_cartridge(0, "CNT001").unwrap();
+        let after_load = mgr.log_sense_counters(0);
+        assert_eq!(after_load.lifetime_volume_loads, 1);
+        assert_eq!(after_load.volume_mounts, Some(1));
+        assert_eq!(after_load.host_bytes_written, 0);
+
+        // Write data: host byte counter goes non-zero.
+        mgr.with_drive(0, 1, |cart| {
+            cart.write_data(bytes::Bytes::from_static(b"hello tape"))?;
+            Ok(())
+        })
+        .unwrap();
+        let after_write = mgr.log_sense_counters(0);
+        assert_eq!(after_write.host_bytes_written, b"hello tape".len() as u64);
+
+        // Unload + reload: drive loads → 2, the volume's mount count is
+        // persisted (→ 2), and the byte counter survives reload.
+        mgr.unload_cartridge(0).unwrap();
+        let empty_again = mgr.log_sense_counters(0);
+        assert_eq!(empty_again.lifetime_volume_loads, 1); // drive count unchanged by unload
+        assert_eq!(empty_again.volume_mounts, None); // no volume mounted now
+
+        mgr.load_cartridge(0, "CNT001").unwrap();
+        let reloaded = mgr.log_sense_counters(0);
+        assert_eq!(reloaded.lifetime_volume_loads, 2);
+        assert_eq!(reloaded.volume_mounts, Some(2));
+        assert_eq!(reloaded.host_bytes_written, b"hello tape".len() as u64);
+    }
+
+    #[test]
+    fn log_sense_pages_report_nonzero_after_writes() {
+        // Acceptance criterion (issue #61): after a load + writes, the
+        // *actual* LOG SENSE page responses (not just the
+        // `log_sense_counters()` aggregation) carry non-zero load / mount /
+        // byte counters. Drives the full path:
+        // load_cartridge -> log_sense_counters -> handle_log_sense -> wire bytes.
+        use crate::scsi::log_pages::handle_log_sense;
+
+        // Walk a LOG SENSE page body for the value bytes of one parameter.
+        fn find_param(data: &[u8], code: u16) -> Option<Vec<u8>> {
+            let mut i = 4; // skip the 4-byte page header
+            while i + 4 <= data.len() {
+                let c = u16::from_be_bytes([data[i], data[i + 1]]);
+                let len = data[i + 3] as usize;
+                let start = i + 4;
+                let end = start + len;
+                if end > data.len() {
+                    break;
+                }
+                if c == code {
+                    return Some(data[start..end].to_vec());
+                }
+                i = end;
+            }
+            None
+        }
+        fn be_u64(bytes: Vec<u8>) -> u64 {
+            let mut buf = [0u8; 8];
+            buf[8 - bytes.len()..].copy_from_slice(&bytes);
+            u64::from_be_bytes(buf)
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(1, tapes_root.clone());
+
+        Cartridge::open(
+            &tapes_root,
+            "PAG001",
+            CartridgeOpenMode::Create {
+                backend: "primary".to_string(),
+                worm: false,
+                dedup: core_mediachanger::DedupScope::Local,
+            },
+        )
+        .unwrap();
+
+        mgr.load_cartridge(0, "PAG001").unwrap();
+        mgr.with_drive(0, 1, |cart| {
+            cart.write_data(bytes::Bytes::from_static(b"payload bytes"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let counters = mgr.log_sense_counters(0);
+        let written = b"payload bytes".len() as u64;
+
+        // 0x14 Device Statistics: Lifetime Volume Loads (0x0000) non-zero.
+        let dev = handle_log_sense(0x14, 0x00, 0x01, "MFG", &counters).unwrap();
+        assert_eq!(find_param(&dev, 0x0000).map(be_u64), Some(1));
+
+        // 0x17 Volume Statistics: Validity=1, Volume Mounts (0x0001) non-zero.
+        let vol = handle_log_sense(0x17, 0x00, 0x01, "MFG", &counters).unwrap();
+        assert_eq!(find_param(&vol, 0x0000), Some(vec![1]));
+        assert_eq!(find_param(&vol, 0x0001).map(be_u64), Some(1));
+
+        // 0x0C Sequential Access Device: Received From Initiator (0x0000)
+        // equals the host bytes just written.
+        let seq = handle_log_sense(0x0C, 0x00, 0x01, "MFG", &counters).unwrap();
+        assert_eq!(find_param(&seq, 0x0000).map(be_u64), Some(written));
     }
 
     #[test]

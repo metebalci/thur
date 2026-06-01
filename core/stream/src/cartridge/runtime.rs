@@ -109,6 +109,17 @@ pub(super) struct Runtime {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mam_attributes: BTreeMap<u16, MamAttrValue>,
 
+    /// Lifetime count of times this volume has been mounted (loaded
+    /// into any drive). Bumped once per `DriveManager::load_cartridge`;
+    /// monotonic for the cartridge's whole life — survives ERASE /
+    /// FORMAT MEDIUM (a mount is a physical event, not a property of
+    /// the medium's contents). Surfaced via LOG SENSE 0x17 Volume
+    /// Statistics (Volume Mounts) and 0x30 Tape Usage (thread count).
+    /// `#[serde(default)]` so a pre-counter `runtime.json` reads back
+    /// as 0.
+    #[serde(default)]
+    pub mount_count: u64,
+
     /// Lifetime host bytes written into this cartridge — pre-dedup,
     /// pre-compression, pre-encryption. Monotonic for the cartridge's
     /// life; reset to 0 on ERASE / FORMAT MEDIUM.
@@ -160,6 +171,7 @@ impl Runtime {
             set_capacity_proportion: u16::MAX,
             index_epoch: BTreeMap::new(),
             mam_attributes: BTreeMap::new(),
+            mount_count: 0,
             host_bytes_written: 0,
             host_bytes_read: 0,
             backend_bytes_written: 0,
@@ -210,12 +222,14 @@ mod tests {
     fn round_trip_preserves_all_four_counters() {
         let dir = TempDir::new().unwrap();
         let mut r = Runtime::new_blank();
+        r.mount_count = 7;
         r.host_bytes_written = 123_456;
         r.host_bytes_read = 789_012;
         r.backend_bytes_written = 64_000;
         r.backend_bytes_read = 32_000;
         r.persist(dir.path()).unwrap();
         let loaded = Runtime::load(dir.path()).unwrap();
+        assert_eq!(loaded.mount_count, 7);
         assert_eq!(loaded.host_bytes_written, 123_456);
         assert_eq!(loaded.host_bytes_read, 789_012);
         assert_eq!(loaded.backend_bytes_written, 64_000);
@@ -239,6 +253,8 @@ mod tests {
         assert_eq!(loaded.host_bytes_read, 0);
         assert_eq!(loaded.backend_bytes_written, 0);
         assert_eq!(loaded.backend_bytes_read, 0);
+        // No mount_count field on a legacy sidecar -> 0.
+        assert_eq!(loaded.mount_count, 0);
         // No mam_attributes field on a legacy sidecar -> empty map.
         assert!(loaded.mam_attributes.is_empty());
     }
