@@ -791,3 +791,30 @@ fn test_standard_manifest_omits_media_type_field() {
         body
     );
 }
+
+#[test]
+fn test_reset_stats_at_zeros_counters_on_disk() {
+    // Operator `cartridge reset-stats` on an UNLOADED cartridge: edit
+    // runtime.json in place, zeroing mount + byte counters while
+    // leaving the data path intact.
+    let dir = create_test_dir();
+    let mut cartridge = create_test_cartridge(&dir, "RESETAT01");
+    cartridge.record_mount().unwrap();
+    cartridge
+        .write_data(Bytes::from(vec![0x7u8; 4096]))
+        .unwrap();
+    assert!(cartridge.mount_count() >= 1);
+    assert!(cartridge.host_bytes_written() > 0);
+    // Drop persists the runtime sidecar (primary handle).
+    drop(cartridge);
+
+    let tapes = dir.path().join("tapes");
+    Cartridge::reset_stats_at(&tapes.join("RESETAT01")).unwrap();
+
+    // Reopen and confirm the counters are zero and the cartridge still
+    // opens cleanly (data/partitions intact — not an ERASE).
+    let reopened = Cartridge::open(&tapes, "RESETAT01", CartridgeOpenMode::Open)
+        .expect("reopen after reset_stats_at");
+    assert_eq!(reopened.mount_count(), 0);
+    assert_eq!(reopened.host_bytes_written(), 0);
+}

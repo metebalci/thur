@@ -337,6 +337,13 @@ enum SystemAction {
     /// PUT/GET rate over the last 60s, audit events over the last 5m.
     Monitor,
 
+    /// Reset all activity stats to their initial state.
+    ///
+    /// Zeroes every drive's Lifetime Volume Loads and every
+    /// cartridge's mount + byte counters (LOG SENSE 0x0C / 0x14 /
+    /// 0x17 / 0x1B / 0x30). Data is untouched — distinct from ERASE.
+    ResetStats,
+
     /// Library-wide consistency check.
     Verify {
         /// Skip the storage-backend sweep (local-only audit).
@@ -762,6 +769,17 @@ enum CartridgeAction {
         json: bool,
     },
 
+    /// Reset a cartridge's activity stats to zero.
+    ///
+    /// Zeroes the mount count and the four lifetime byte counters
+    /// surfaced via LOG SENSE (0x17 / 0x1B / 0x0C / 0x30). Data,
+    /// partitions, and MAM attributes are untouched — distinct from
+    /// ERASE. Works whether or not the cartridge is loaded.
+    ResetStats {
+        /// Cartridge barcode.
+        barcode: String,
+    },
+
     /// Per-cartridge legal hold (cloud-native).
     ///
     /// Provider primitives are the only source of truth — no local
@@ -897,6 +915,20 @@ enum DriveAction {
         /// Emit the structured result as JSON for automation.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Reset a drive's lifetime stats to zero.
+    ///
+    /// Zeroes the drive's Lifetime Volume Loads counter (LOG SENSE
+    /// 0x14). Loaded-cartridge counters are untouched. Pass a drive
+    /// id, or --all for every drive.
+    ResetStats {
+        /// Drive ID (0-based). Omit when using --all.
+        drive: Option<u16>,
+
+        /// Reset every drive.
+        #[arg(long)]
+        all: bool,
     },
 }
 

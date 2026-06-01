@@ -728,6 +728,53 @@ impl DriveManager {
         counters
     }
 
+    /// Reset one drive's lifetime statistics (the drive-scoped
+    /// `lifetime_volume_loads` NVRAM counter) to zero and persist
+    /// `drive_state.json`. Operator action — does not touch any loaded
+    /// cartridge's counters (those reset via
+    /// [`Self::reset_loaded_cartridge_stats`] /
+    /// `Cartridge::reset_stats_at`). `Ok` even if the drive's stats
+    /// were already zero; errors only on an unknown `drive_id`.
+    pub fn reset_drive_stats(&self, drive_id: usize) -> Result<(), SmcError> {
+        {
+            let mut drive = self.drive_lock(drive_id)?;
+            drive.state.lifetime_volume_loads = 0;
+        }
+        // Drop the guard before persisting — `persist_drive_state`
+        // re-locks every drive Arc (same rule as `load_cartridge`).
+        self.persist_drive_state();
+        Ok(())
+    }
+
+    /// Reset every drive's lifetime statistics. Returns the drive
+    /// count. Used by `system reset-stats`.
+    pub fn reset_all_drive_stats(&self) -> usize {
+        for drive_arc in self.drives.values() {
+            if let Ok(mut drive) = drive_arc.lock() {
+                drive.state.lifetime_volume_loads = 0;
+            }
+        }
+        self.persist_drive_state();
+        self.drives.len()
+    }
+
+    /// Reset the LOG SENSE statistics of the cartridge currently
+    /// loaded in `drive_id` (mount count + the four byte counters),
+    /// persisting its `runtime.json`. Returns `Ok(true)` if a cartridge
+    /// was present and reset, `Ok(false)` if the drive is empty. Locks
+    /// the drive directly (no session stamp) — mutation is serialized
+    /// against concurrent SCSI ops on that drive by the same mutex.
+    pub fn reset_loaded_cartridge_stats(&self, drive_id: usize) -> Result<bool, SmcError> {
+        let mut drive = self.drive_lock(drive_id)?;
+        match drive.cartridge.as_mut() {
+            Some(cart) => {
+                cart.reset_stats()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Host-written MAM attributes for the cartridge loaded in
     /// `drive_id`, as `(id, format, value)` tuples in ascending-id
     /// order. `None` if the drive has no cartridge. Read-only access
@@ -1215,6 +1262,86 @@ mod tests {
         // equals the host bytes just written.
         let seq = handle_log_sense(0x0C, 0x00, 0x01, "MFG", &counters).unwrap();
         assert_eq!(find_param(&seq, 0x0000).map(be_u64), Some(written));
+    }
+
+    #[test]
+    fn reset_stats_zeros_drive_and_cartridge_counters() {
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(1, tapes_root.clone());
+
+        Cartridge::open(
+            &tapes_root,
+            "RST001",
+            CartridgeOpenMode::Create {
+                backend: "primary".to_string(),
+                worm: false,
+                dedup: core_mediachanger::DedupScope::Local,
+            },
+        )
+        .unwrap();
+
+        mgr.load_cartridge(0, "RST001").unwrap();
+        mgr.with_drive(0, 1, |cart| {
+            cart.write_data(bytes::Bytes::from_static(b"data"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let before = mgr.log_sense_counters(0);
+        assert_eq!(before.lifetime_volume_loads, 1);
+        assert_eq!(before.volume_mounts, Some(1));
+        assert!(before.host_bytes_written > 0);
+
+        // Cartridge reset zeros the volume counters but leaves the
+        // drive's lifetime load count alone.
+        assert!(mgr.reset_loaded_cartridge_stats(0).unwrap());
+        let after_cart = mgr.log_sense_counters(0);
+        assert_eq!(after_cart.volume_mounts, Some(0));
+        assert_eq!(after_cart.host_bytes_written, 0);
+        assert_eq!(after_cart.lifetime_volume_loads, 1);
+
+        // Drive reset zeros the drive's lifetime load count.
+        mgr.reset_drive_stats(0).unwrap();
+        assert_eq!(mgr.log_sense_counters(0).lifetime_volume_loads, 0);
+    }
+
+    #[test]
+    fn reset_loaded_cartridge_stats_on_empty_drive_is_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(1, tapes_root);
+        assert!(!mgr.reset_loaded_cartridge_stats(0).unwrap());
+    }
+
+    #[test]
+    fn reset_all_drive_stats_zeros_every_drive() {
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(2, tapes_root.clone());
+        for bc in ["RA001", "RA002"] {
+            Cartridge::open(
+                &tapes_root,
+                bc,
+                CartridgeOpenMode::Create {
+                    backend: "primary".to_string(),
+                    worm: false,
+                    dedup: core_mediachanger::DedupScope::Local,
+                },
+            )
+            .unwrap();
+        }
+        mgr.load_cartridge(0, "RA001").unwrap();
+        mgr.load_cartridge(1, "RA002").unwrap();
+        assert_eq!(mgr.log_sense_counters(0).lifetime_volume_loads, 1);
+        assert_eq!(mgr.log_sense_counters(1).lifetime_volume_loads, 1);
+
+        assert_eq!(mgr.reset_all_drive_stats(), 2);
+        assert_eq!(mgr.log_sense_counters(0).lifetime_volume_loads, 0);
+        assert_eq!(mgr.log_sense_counters(1).lifetime_volume_loads, 0);
     }
 
     #[test]

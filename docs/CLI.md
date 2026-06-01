@@ -10,10 +10,10 @@ orientation is in [`../CLAUDE.md`](../CLAUDE.md) § CLI Surface.
 ```
 library    init / info / modify / monitor / self-test / restore / restore-archive / partition
            partition list / create / modify / delete
-cartridge  create / archive / migrate / import / export / list / info / legal-hold / key
+cartridge  create / archive / migrate / import / export / list / info / reset-stats / legal-hold / key
 changer    inventory / move / load / unload [--force]
-drive      status / self-test
-system     gc / verify / stats / daemon-health
+drive      status / self-test / reset-stats [ID|--all]
+system     gc / verify / stats / reset-stats / daemon-health
            audit {tail,export,verify,verify-offline,rotate} / storage {check,benchmark}
            regenerate-cert / alerting {list,test}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
@@ -113,11 +113,12 @@ the 0640 conffile.
   cross-region DR runbook is in [`SPEC.md`](SPEC.md) § Cross-region DR.
 
 - **Daemon-routed (live):** all cartridge ops except `key` (including
-  `archive`, `migrate`, `import`, `export`, and `legal-hold`);
-  `library restore-archive`; all changer ops (including `unload
-  --force`); `drive status` and `drive self-test`; `library info`,
+  `archive`, `migrate`, `import`, `export`, `reset-stats`, and
+  `legal-hold`); `library restore-archive`; all changer ops (including
+  `unload --force`); `drive status`, `drive self-test`, and `drive
+  reset-stats`; `library info`,
   `library monitor`, and `library self-test`; the live `system` ops
-  (`gc`, `verify`, `stats`, `daemon-health`, `audit
+  (`gc`, `verify`, `stats`, `reset-stats`, `daemon-health`, `audit
   {tail,export,verify,rotate}`, `storage check`, and `alerting`);
   and all `iscsi` verbs. These commands never read
   `thurvtl.yaml` — the CLI connects to `/run/thurvtl/admin.sock` (or
@@ -190,6 +191,17 @@ can replay the full transcript.
   `pages.idx` instead, sizes chunks from the local pool, and omits the
   location breakdown (`pages.idx` records no local/backend tag); the
   dedup math is shared (`shared-dedup-stats`).
+
+- **`reset-stats`** — zero the activity odometers surfaced via LOG
+  SENSE, an operator action distinct from ERASE (no data, partition, or
+  MAM-attribute is touched). `drive reset-stats [ID|--all]` zeros a
+  drive's *Lifetime Volume Loads* (LOG SENSE 0x14, drive NVRAM).
+  `cartridge reset-stats BARCODE` zeros that cartridge's mount count +
+  four byte counters (0x17 / 0x1B / 0x0C / 0x30) — in-memory if loaded,
+  on its `runtime.json` sidecar otherwise. `system reset-stats` fans
+  out to every drive and every cartridge in one sweep. There is no host
+  (SCSI) path to reset these: they are lifetime counters, and LOG SELECT
+  (0x4C) stays a no-op, matching real LTO.
 
 ## GC
 

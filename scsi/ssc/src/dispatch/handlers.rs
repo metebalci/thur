@@ -2459,10 +2459,13 @@ fn apply_mode_select_outcome(
 
 /// LOG SELECT — backup software occasionally uses this to clear log
 /// counters (PCR=1) or to select a saved/default page-control value
-/// for subsequent LOG SENSE calls. Neither tape product keeps
-/// persistent log counters, so this accepts the request unconditionally
-/// and treats it as a no-op. The PCR bit and parameter list are
-/// ignored.
+/// for subsequent LOG SENSE calls. Accepted unconditionally and treated
+/// as a no-op: the PCR bit and parameter list are ignored. The
+/// statistics our LOG SENSE pages report (Lifetime Volume Loads, Volume
+/// Mounts, the cumulative byte counters) are deliberately *lifetime*
+/// odometers, which real LTO drives do not let a host zero via LOG
+/// SELECT. Resetting them is an out-of-band operator action instead
+/// (`thurvtl {drive,cartridge,system} reset-stats`).
 pub fn handle_log_select(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     let cdb = ctx.cdb;
     let lun = ctx.lun;

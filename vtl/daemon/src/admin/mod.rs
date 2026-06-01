@@ -111,7 +111,20 @@ pub async fn run_admin_server(socket_path: PathBuf, daemon_state: Arc<DaemonStat
             axum::routing::post(handlers::changer_unload),
         )
         .route("/api/v1/drives", get(handlers::drives_list))
+        .route(
+            "/api/v1/drives/reset-stats",
+            post(handlers::drive_reset_stats),
+        )
         .route("/api/v1/drives/:id", get(handlers::drive_status))
+        // reset LOG SENSE statistics counters (operator action)
+        .route(
+            "/api/v1/cartridges/:barcode/reset-stats",
+            post(handlers::cartridge_reset_stats),
+        )
+        .route(
+            "/api/v1/system/reset-stats",
+            post(handlers::system_reset_stats),
+        )
         // iSCSI CHAP users
         .route(
             "/api/v1/iscsi/users",

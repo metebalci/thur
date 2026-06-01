@@ -434,6 +434,17 @@ _arguments "${_arguments_options[@]}" : \
 ':identifier -- Cartridge barcode or slot ID:_default' \
 && ret=0
 ;;
+(reset-stats)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':barcode -- Cartridge barcode:_default' \
+&& ret=0
+;;
 (legal-hold)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -637,6 +648,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (info)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reset-stats)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -856,6 +871,18 @@ _arguments "${_arguments_options[@]}" : \
 ':drive -- Drive ID (0-based):_default' \
 && ret=0
 ;;
+(reset-stats)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--all[Reset every drive]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::drive -- Drive ID (0-based). Omit when using --all:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvtl__subcmd__drive__subcmd__help_commands" \
@@ -873,6 +900,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (self-test)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reset-stats)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1141,6 +1172,16 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (monitor)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(reset-stats)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -1419,6 +1460,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (monitor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reset-stats)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2041,6 +2086,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(reset-stats)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (legal-hold)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvtl__subcmd__help__subcmd__cartridge__subcmd__legal-hold_commands" \
@@ -2149,6 +2198,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(reset-stats)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -2238,6 +2291,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (monitor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reset-stats)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2454,6 +2511,7 @@ _thurvtl__subcmd__cartridge_commands() {
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
+'reset-stats:Reset a cartridge'\''s activity stats to zero' \
 'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -2485,6 +2543,7 @@ _thurvtl__subcmd__cartridge__subcmd__help_commands() {
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
+'reset-stats:Reset a cartridge'\''s activity stats to zero' \
 'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -2572,6 +2631,11 @@ _thurvtl__subcmd__cartridge__subcmd__help__subcmd__list_commands() {
 _thurvtl__subcmd__cartridge__subcmd__help__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl cartridge help migrate commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__cartridge__subcmd__help__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__cartridge__subcmd__help__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl cartridge help reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__cartridge__subcmd__import_commands] )) ||
 _thurvtl__subcmd__cartridge__subcmd__import_commands() {
@@ -2690,6 +2754,11 @@ _thurvtl__subcmd__cartridge__subcmd__list_commands() {
 _thurvtl__subcmd__cartridge__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl cartridge migrate commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__cartridge__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__cartridge__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl cartridge reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__changer_commands] )) ||
 _thurvtl__subcmd__changer_commands() {
@@ -2818,6 +2887,7 @@ _thurvtl__subcmd__drive_commands() {
     local commands; commands=(
 'status:Show drive status and current operation' \
 'self-test:Run the SPC-4 self-test against a drive LUN' \
+'reset-stats:Reset a drive'\''s lifetime stats to zero' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl drive commands' commands "$@"
@@ -2827,6 +2897,7 @@ _thurvtl__subcmd__drive__subcmd__help_commands() {
     local commands; commands=(
 'status:Show drive status and current operation' \
 'self-test:Run the SPC-4 self-test against a drive LUN' \
+'reset-stats:Reset a drive'\''s lifetime stats to zero' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl drive help commands' commands "$@"
@@ -2835,6 +2906,11 @@ _thurvtl__subcmd__drive__subcmd__help_commands() {
 _thurvtl__subcmd__drive__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl drive help help commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__drive__subcmd__help__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__drive__subcmd__help__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl drive help reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__drive__subcmd__help__subcmd__self-test_commands] )) ||
 _thurvtl__subcmd__drive__subcmd__help__subcmd__self-test_commands() {
@@ -2845,6 +2921,11 @@ _thurvtl__subcmd__drive__subcmd__help__subcmd__self-test_commands() {
 _thurvtl__subcmd__drive__subcmd__help__subcmd__status_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl drive help status commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__drive__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__drive__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl drive reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__drive__subcmd__self-test_commands] )) ||
 _thurvtl__subcmd__drive__subcmd__self-test_commands() {
@@ -2880,6 +2961,7 @@ _thurvtl__subcmd__help__subcmd__cartridge_commands() {
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
+'reset-stats:Reset a cartridge'\''s activity stats to zero' \
 'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
     )
@@ -2962,6 +3044,11 @@ _thurvtl__subcmd__help__subcmd__cartridge__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help cartridge migrate commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__help__subcmd__cartridge__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__help__subcmd__cartridge__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help cartridge reset-stats commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__help__subcmd__changer_commands] )) ||
 _thurvtl__subcmd__help__subcmd__changer_commands() {
     local commands; commands=(
@@ -3021,8 +3108,14 @@ _thurvtl__subcmd__help__subcmd__drive_commands() {
     local commands; commands=(
 'status:Show drive status and current operation' \
 'self-test:Run the SPC-4 self-test against a drive LUN' \
+'reset-stats:Reset a drive'\''s lifetime stats to zero' \
     )
     _describe -t commands 'thurvtl help drive commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__drive__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__help__subcmd__drive__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help drive reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__drive__subcmd__self-test_commands] )) ||
 _thurvtl__subcmd__help__subcmd__drive__subcmd__self-test_commands() {
@@ -3195,6 +3288,7 @@ _thurvtl__subcmd__help__subcmd__system_commands() {
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
+'reset-stats:Reset all activity stats to their initial state' \
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
@@ -3275,6 +3369,11 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__monitor_commands() {
 _thurvtl__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system regenerate-cert commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__stats_commands() {
@@ -3762,6 +3861,7 @@ _thurvtl__subcmd__system_commands() {
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
+'reset-stats:Reset all activity stats to their initial state' \
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
@@ -3911,6 +4011,7 @@ _thurvtl__subcmd__system__subcmd__help_commands() {
 'stats:Dedup ratio, per-cartridge contribution, HEAD-skip rate' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
+'reset-stats:Reset all activity stats to their initial state' \
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
@@ -3998,6 +4099,11 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help regenerate-cert commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help reset-stats commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands() {
     local commands; commands=()
@@ -4059,6 +4165,11 @@ _thurvtl__subcmd__system__subcmd__monitor_commands() {
 _thurvtl__subcmd__system__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system regenerate-cert commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__reset-stats_commands] )) ||
+_thurvtl__subcmd__system__subcmd__reset-stats_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system reset-stats commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__system__subcmd__stats_commands() {

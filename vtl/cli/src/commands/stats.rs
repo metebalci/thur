@@ -180,6 +180,34 @@ fn print_skipped(r: &StatsReport) {
     println!();
 }
 
+#[derive(Deserialize)]
+struct SystemResetStatsResp {
+    drives: usize,
+    cartridges: usize,
+    errors: Vec<String>,
+}
+
+/// `thurvtl system reset-stats` — zero every drive's lifetime stats and
+/// every cartridge's mount + byte counters. Plain daemon-routed POST
+/// (not a job — the sweep is bounded by the inventory size).
+pub async fn cmd_reset_stats() -> Result<()> {
+    let client = AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
+    let resp: SystemResetStatsResp = client
+        .post_json("/api/v1/system/reset-stats", &serde_json::json!({}))
+        .await?;
+    println!(
+        "OK: reset stats for {} drive(s) and {} cartridge(s)",
+        resp.drives, resp.cartridges
+    );
+    for e in &resp.errors {
+        eprintln!("  warning: {}", e);
+    }
+    if !resp.errors.is_empty() {
+        anyhow::bail!("{} cartridge(s) failed to reset", resp.errors.len());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

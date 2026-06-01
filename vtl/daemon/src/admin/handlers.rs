@@ -2301,6 +2301,337 @@ pub async fn drive_status(
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// reset-stats — operator zeroing of LOG SENSE statistics counters
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DriveResetStatsRequest {
+    /// Drive id whose lifetime stats to reset. Ignored when `all` is set.
+    pub drive: Option<u32>,
+    /// Reset every drive's lifetime stats.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Serialize)]
+pub struct DriveResetStatsOk {
+    pub affected_drives: usize,
+}
+
+/// POST /api/v1/drives/reset-stats — zero the drive-scoped
+/// `lifetime_volume_loads` NVRAM counter for one drive (`drive`) or
+/// every drive (`all: true`). Does not touch any loaded cartridge's
+/// counters — those are reset via the cartridge / system endpoints.
+pub async fn drive_reset_stats(
+    State(state): State<AdminState>,
+    cred: PeerCred,
+    Json(req): Json<DriveResetStatsRequest>,
+) -> impl IntoResponse {
+    let actor = AuditActor::cli(cred.audit_descriptor());
+    let dm = &state.daemon.drive_manager;
+    let params = serde_json::json!({"drive": req.drive, "all": req.all});
+
+    // Mutually-exclusive args — enforced here too, not just in the CLI:
+    // the admin socket is directly reachable, so the daemon must reject
+    // the conflicting / empty combinations rather than silently pick one.
+    let bad_args = match (req.all, req.drive) {
+        (true, Some(_)) => Some("specify a drive id or all=true, not both"),
+        (false, None) => Some("specify a drive id or all=true"),
+        _ => None,
+    };
+    if let Some(msg) = bad_args {
+        audit_append(
+            &state.daemon,
+            "drive.reset_stats",
+            actor,
+            params,
+            AuditResult::Error(msg.to_string()),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response();
+    }
+
+    if req.all {
+        let n = dm.reset_all_drive_stats();
+        audit_append(
+            &state.daemon,
+            "drive.reset_stats",
+            actor,
+            params,
+            AuditResult::Ok,
+        );
+        info!("admin: drive reset-stats (all) -> {} drive(s)", n);
+        return Json(DriveResetStatsOk { affected_drives: n }).into_response();
+    }
+
+    // Validated above: when not `all`, `drive` is Some.
+    let Some(id) = req.drive else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "specify a drive id or all=true"})),
+        )
+            .into_response();
+    };
+    match dm.reset_drive_stats(id as usize) {
+        Ok(()) => {
+            audit_append(
+                &state.daemon,
+                "drive.reset_stats",
+                actor,
+                params,
+                AuditResult::Ok,
+            );
+            info!("admin: drive reset-stats (drive={})", id);
+            Json(DriveResetStatsOk { affected_drives: 1 }).into_response()
+        }
+        Err(e) => {
+            // An unknown drive id is a missing resource (404),
+            // consistent with `drive_status` and `cartridge_reset_stats`;
+            // anything else is a genuine server fault (500).
+            let code = if matches!(e, core_mediachanger::errors::SmcError::InvalidDrive(_)) {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            audit_append(
+                &state.daemon,
+                "drive.reset_stats",
+                actor,
+                params,
+                AuditResult::Error(e.to_string()),
+            );
+            (code, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CartridgeResetStatsOk {
+    pub barcode: String,
+    /// Whether the cartridge was loaded in a drive (reset in-memory)
+    /// vs sitting in a slot (reset on disk).
+    pub loaded: bool,
+}
+
+/// POST /api/v1/cartridges/:barcode/reset-stats — zero one cartridge's
+/// mount count + four byte counters. If the cartridge is loaded in a
+/// drive, the in-memory `Cartridge` (authoritative) is reset; otherwise
+/// the on-disk `runtime.json` sidecar is edited in place. Leaves all
+/// data / partitions / MAM attributes intact (distinct from ERASE).
+pub async fn cartridge_reset_stats(
+    State(state): State<AdminState>,
+    cred: PeerCred,
+    AxumPath(barcode): AxumPath<String>,
+) -> impl IntoResponse {
+    use core_mediachanger::errors::SmcError;
+    let actor = AuditActor::cli(cred.audit_descriptor());
+    let tapes_root = state.daemon.data_dir.join("tapes");
+
+    // Map a disk-path failure to an HTTP status: a missing / corrupt
+    // runtime.json sidecar (`InvalidOp`) is a data-integrity conflict
+    // (409), not a transient server fault (500).
+    let disk_status = |e: &SmcError| match e {
+        SmcError::InvalidOp(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    enum Hit {
+        NotFound,
+        Loaded,
+        Slot,
+    }
+
+    // Resolve + reset inside ONE library-lock critical section. MOVE
+    // MEDIUM / load / unload all take this lock, so holding it across
+    // the reset freezes the drive<->cartridge map — a concurrent move
+    // can't make us zero the wrong tape or silently skip the reset.
+    let outcome: Result<Hit, (StatusCode, String)> = (|| {
+        let lib = state.daemon.library.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "library mutex poisoned".to_string(),
+            )
+        })?;
+        let in_drive = lib
+            .drives()
+            .iter()
+            .find(|d| d.barcode.as_deref() == Some(barcode.as_str()))
+            .map(|d| d.id);
+        if let Some(drive_id) = in_drive {
+            let was = state
+                .daemon
+                .drive_manager
+                .reset_loaded_cartridge_stats(drive_id as usize)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if was {
+                return Ok(Hit::Loaded);
+            }
+            // We hold the library lock, so the tape can't have left the
+            // drive between the lookup and the reset; this branch is
+            // purely defensive — fall through to the on-disk path.
+        }
+        let in_slot = lib
+            .storage_slots()
+            .iter()
+            .any(|s| s.barcode.as_deref() == Some(barcode.as_str()))
+            || lib
+                .mail_slots()
+                .iter()
+                .any(|m| m.barcode.as_deref() == Some(barcode.as_str()));
+        if in_drive.is_none() && !in_slot {
+            return Ok(Hit::NotFound);
+        }
+        Cartridge::reset_stats_at(&tapes_root.join(&barcode))
+            .map_err(|e| (disk_status(&e), e.to_string()))?;
+        Ok(Hit::Slot)
+    })();
+
+    match outcome {
+        Ok(Hit::NotFound) => {
+            audit_append(
+                &state.daemon,
+                "cartridge.reset_stats",
+                actor,
+                serde_json::json!({"barcode": barcode}),
+                AuditResult::Error("cartridge not found".to_string()),
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("cartridge '{}' not found", barcode)})),
+            )
+                .into_response()
+        }
+        Ok(hit) => {
+            let loaded = matches!(hit, Hit::Loaded);
+            audit_append(
+                &state.daemon,
+                "cartridge.reset_stats",
+                actor,
+                serde_json::json!({"barcode": barcode, "loaded": loaded}),
+                AuditResult::Ok,
+            );
+            info!(
+                "admin: cartridge reset-stats {} (loaded={})",
+                barcode, loaded
+            );
+            Json(CartridgeResetStatsOk { barcode, loaded }).into_response()
+        }
+        Err((code, msg)) => {
+            audit_append(
+                &state.daemon,
+                "cartridge.reset_stats",
+                actor,
+                serde_json::json!({"barcode": barcode}),
+                AuditResult::Error(msg.clone()),
+            );
+            (code, Json(serde_json::json!({"error": msg}))).into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct SystemResetStatsOk {
+    pub drives: usize,
+    pub cartridges: usize,
+    /// Per-cartridge failures (barcode: error); empty on full success.
+    pub errors: Vec<String>,
+}
+
+/// POST /api/v1/system/reset-stats — reset every drive's lifetime stats
+/// and every cartridge's mount + byte counters in one sweep. Loaded
+/// cartridges are reset in-memory; the rest on disk. Per-cartridge
+/// failures are collected (not fatal) so one unreadable sidecar doesn't
+/// abort the whole sweep.
+pub async fn system_reset_stats(
+    State(state): State<AdminState>,
+    cred: PeerCred,
+) -> impl IntoResponse {
+    let actor = AuditActor::cli(cred.audit_descriptor());
+    let tapes_root = state.daemon.data_dir.join("tapes");
+
+    // Whole sweep under the library lock so the drive<->cartridge map
+    // can't shift mid-sweep (MOVE MEDIUM / load / unload all take it):
+    // a loaded cartridge stays loaded, so we never zero the wrong tape.
+    // The snapshot is collected into an owned list first, then reset
+    // while still holding the lock.
+    let (drives, count, errors) = {
+        let lib = state
+            .daemon
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dm = &state.daemon.drive_manager;
+        let drives = dm.reset_all_drive_stats();
+
+        let mut targets: Vec<(String, Option<u32>)> = Vec::new();
+        for d in lib.drives() {
+            if let Some(b) = d.barcode.as_deref() {
+                targets.push((b.to_string(), Some(d.id)));
+            }
+        }
+        for s in lib.storage_slots() {
+            if let Some(b) = s.barcode.as_deref() {
+                targets.push((b.to_string(), None));
+            }
+        }
+        for s in lib.mail_slots() {
+            if let Some(b) = s.barcode.as_deref() {
+                targets.push((b.to_string(), None));
+            }
+        }
+
+        let mut count = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for (barcode, loaded_drive) in &targets {
+            let r: Result<(), String> = if let Some(id) = loaded_drive {
+                match dm.reset_loaded_cartridge_stats(*id as usize) {
+                    Ok(true) => Ok(()),
+                    // Lock held → shouldn't happen; defensively reset on disk.
+                    Ok(false) => Cartridge::reset_stats_at(&tapes_root.join(barcode))
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                Cartridge::reset_stats_at(&tapes_root.join(barcode)).map_err(|e| e.to_string())
+            };
+            match r {
+                Ok(()) => count += 1,
+                Err(e) => errors.push(format!("{}: {}", barcode, e)),
+            }
+        }
+        (drives, count, errors)
+    };
+
+    let audit_result = if errors.is_empty() {
+        AuditResult::Ok
+    } else {
+        AuditResult::Error(format!("{} cartridge(s) failed", errors.len()))
+    };
+    audit_append(
+        &state.daemon,
+        "system.reset_stats",
+        actor,
+        serde_json::json!({"drives": drives, "cartridges": count, "errors": errors.len()}),
+        audit_result,
+    );
+    info!(
+        "admin: system reset-stats -> {} drive(s), {} cartridge(s), {} error(s)",
+        drives,
+        count,
+        errors.len()
+    );
+    Json(SystemResetStatsOk {
+        drives,
+        cartridges: count,
+        errors,
+    })
+    .into_response()
+}
+
 /// Best-effort read of `next_lba` and total block count from a
 /// loaded cartridge's manifest. Errors collapse to `(None, None)` —
 /// drive status is informational and shouldn't fail just because a

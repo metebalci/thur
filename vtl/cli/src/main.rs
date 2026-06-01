@@ -301,6 +301,9 @@ async fn main() -> Result<()> {
             CartridgeAction::Info { identifier, json } => {
                 commands::cartridge::cmd_info(&identifier, json).await?;
             }
+            CartridgeAction::ResetStats { barcode } => {
+                commands::cartridge::cmd_reset_stats(&barcode).await?;
+            }
             CartridgeAction::LegalHold { action } => match action {
                 LegalHoldAction::Set {
                     barcode,
@@ -361,6 +364,9 @@ async fn main() -> Result<()> {
             DriveAction::SelfTest { drive, json } => {
                 let exit_code = commands::self_test::cmd_drive_self_test(drive, json).await?;
                 std::process::exit(exit_code);
+            }
+            DriveAction::ResetStats { drive, all } => {
+                commands::drive::cmd_reset_stats(drive, all).await?;
             }
         },
         Commands::Library { action } => match action {
@@ -514,6 +520,9 @@ async fn main() -> Result<()> {
             SystemAction::Monitor => {
                 let code = shared_cli_system::cmd_monitor(&shared_naming::TAPE_LIBRARY).await?;
                 std::process::exit(i32::from(code));
+            }
+            SystemAction::ResetStats => {
+                commands::stats::cmd_reset_stats().await?;
             }
             SystemAction::Verify {
                 skip_storage,
@@ -982,6 +991,59 @@ mod cli_parse_tests {
                     drive: 0,
                     json: false
                 }
+            }
+        ));
+    }
+
+    // ---- reset-stats ----
+
+    #[test]
+    fn drive_reset_stats_parses_id_and_all() {
+        let cli = parse(["thurvtl", "drive", "reset-stats", "1"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Drive {
+                action: DriveAction::ResetStats {
+                    drive: Some(1),
+                    all: false
+                }
+            }
+        ));
+        let all = parse(["thurvtl", "drive", "reset-stats", "--all"]);
+        assert!(matches!(
+            all.command,
+            Commands::Drive {
+                action: DriveAction::ResetStats {
+                    drive: None,
+                    all: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn cartridge_reset_stats_parses_barcode() {
+        let cli = parse(["thurvtl", "cartridge", "reset-stats", "TST001L8"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Cartridge {
+                action: CartridgeAction::ResetStats { barcode },
+            } if barcode == "TST001L8"
+        ));
+    }
+
+    #[test]
+    fn cartridge_reset_stats_requires_barcode() {
+        assert!(Cli::try_parse_from(["thurvtl", "cartridge", "reset-stats"]).is_err());
+    }
+
+    #[test]
+    fn system_reset_stats_parses() {
+        let cli = parse(["thurvtl", "system", "reset-stats"]);
+        assert!(matches!(
+            cli.command,
+            Commands::System {
+                action: SystemAction::ResetStats,
             }
         ));
     }

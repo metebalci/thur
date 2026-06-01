@@ -45,3 +45,36 @@ pub async fn cmd_status(drive: u16, json: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Serialize)]
+struct DriveResetStatsBody {
+    drive: Option<u32>,
+    all: bool,
+}
+
+#[derive(Deserialize)]
+struct DriveResetStatsResp {
+    affected_drives: usize,
+}
+
+pub async fn cmd_reset_stats(drive: Option<u16>, all: bool) -> Result<()> {
+    if all && drive.is_some() {
+        anyhow::bail!("pass a drive id or --all, not both");
+    }
+    if !all && drive.is_none() {
+        anyhow::bail!("specify a drive id or --all");
+    }
+    let client = shared_admin_client::AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
+    let body = DriveResetStatsBody {
+        drive: drive.map(u32::from),
+        all,
+    };
+    let resp: DriveResetStatsResp = client
+        .post_json("/api/v1/drives/reset-stats", &body)
+        .await?;
+    match drive {
+        Some(id) => println!("OK: reset stats for drive {}", id),
+        None => println!("OK: reset stats for all {} drive(s)", resp.affected_drives),
+    }
+    Ok(())
+}

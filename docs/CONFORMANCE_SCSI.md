@@ -99,7 +99,7 @@ expose must answer.
 | 0x1E | PREVENT/ALLOW MEDIUM REMOVAL | 🟩 Yes | O | thurvtl tape: per-I_T-nexus state. Bit 0 (data-transport) gates SCSI UNLOAD on the drive and MOVE MEDIUM with that drive as source — refused with ILLEGAL REQUEST + 0x53/0x02. Bit 1 (mechanical) gates the admin `POST /api/v1/changer/unload` endpoint — refused with HTTP 409 + `refused: "mechanical_eject_prevented"`; `force: true` overrides. The two bits are independent. State cleared when the I_T nexus ends. Issued against changer LUN: accepted, no enforcement. thurvsa block: accept-and-GOOD regardless of bit 0 / bit 1. |
 | 0x3B | WRITE BUFFER | 🟩 Stub | O | Firmware-download surface accepted, ignored. (thurvtl only; thurvsa rejects with INVALID OPERATION CODE.) |
 | 0x3C | READ BUFFER | 🟩 Stub | O | Returns zeros. (thurvtl only.) |
-| 0x4C | LOG SELECT | 🟩 No-op | O | No persistent log-page state to set. |
+| 0x4C | LOG SELECT | 🟩 No-op | O | Accepted; PCR and parameter list ignored. The live LOG SENSE counters are lifetime odometers, which real LTO drives don't let a host zero via LOG SELECT — they reset only through the operator CLI (`reset-stats`). |
 | 0x4D | LOG SENSE | 🟩 Yes | O | thurvtl tape: see per-LUN log-page tables. thurvsa block: page 0x00 only, listing just 0x00 itself. Other page codes return INVALID FIELD IN CDB. |
 | 0x55 | MODE SELECT(10) | 🟩 Partial | O | Same coverage as 0x15 (round-trip + SP=1 persistence + SPF=1 subpage parsing). thurvsa block: same validate-and-accept-if-matches semantics. |
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |

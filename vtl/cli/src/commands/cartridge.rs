@@ -592,6 +592,31 @@ fn print_legal_hold_mutate(verb: &str, barcode: &str, resp: &LegalHoldMutateResp
     }
 }
 
+#[derive(serde::Deserialize)]
+struct CartridgeResetStatsResp {
+    barcode: String,
+    loaded: bool,
+}
+
+pub async fn cmd_reset_stats(barcode: &str) -> Result<()> {
+    let client = shared_admin_client::AdminClient::auto_discover(&shared_naming::TAPE_LIBRARY);
+    let path = format!(
+        "/api/v1/cartridges/{}/reset-stats",
+        shared_admin_client::urlencode(barcode)
+    );
+    let resp: CartridgeResetStatsResp = client.post_json(&path, &serde_json::json!({})).await?;
+    println!(
+        "OK: reset stats for cartridge {} ({})",
+        resp.barcode,
+        if resp.loaded {
+            "loaded in drive"
+        } else {
+            "in slot"
+        }
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

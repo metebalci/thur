@@ -2327,6 +2327,41 @@ impl Cartridge {
         self.runtime.mount_count
     }
 
+    /// Reset this cartridge's LOG SENSE statistics to their initial
+    /// (zero) state: the lifetime mount count and the four lifetime
+    /// byte counters. Persists `runtime.json`. Operator action (CLI
+    /// `cartridge reset-stats` / `system reset-stats`) — distinct from
+    /// ERASE, which wipes data; this zeroes the odometers only and
+    /// leaves every block, partition, and MAM attribute intact. Used
+    /// for the cartridge currently loaded in a drive; the on-disk
+    /// equivalent for an unloaded cartridge is [`Self::reset_stats_at`].
+    pub fn reset_stats(&mut self) -> Result<()> {
+        self.runtime.mount_count = 0;
+        self.runtime.host_bytes_written = 0;
+        self.runtime.host_bytes_read = 0;
+        self.runtime.backend_bytes_written = 0;
+        self.runtime.backend_bytes_read = 0;
+        self.persist_runtime()
+    }
+
+    /// Reset an *unloaded* cartridge's LOG SENSE statistics in place,
+    /// editing only its `runtime.json` sidecar — no full cartridge
+    /// open (no chunk store, no DEK). `root` is the cartridge
+    /// directory (`<tapes_root>/<barcode>`). Zeroes the same five
+    /// counters as [`Self::reset_stats`]; every other runtime field
+    /// (partitions, active partition, SET CAPACITY, index epoch, MAM
+    /// attributes) is preserved. Errors if the sidecar is missing or
+    /// unreadable.
+    pub fn reset_stats_at(root: &std::path::Path) -> Result<()> {
+        let mut runtime = Runtime::load(root)?;
+        runtime.mount_count = 0;
+        runtime.host_bytes_written = 0;
+        runtime.host_bytes_read = 0;
+        runtime.backend_bytes_written = 0;
+        runtime.backend_bytes_read = 0;
+        runtime.persist(root)
+    }
+
     /// Get remaining capacity in bytes (None if unlimited).
     /// Honors any host-set SET CAPACITY proportion.
     pub fn remaining_capacity_bytes(&self) -> Option<u64> {
