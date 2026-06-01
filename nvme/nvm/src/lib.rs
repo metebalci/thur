@@ -39,6 +39,7 @@ use std::sync::Arc;
 use core_block::PageCache;
 
 pub mod aer;
+pub mod discovery;
 pub mod dispatcher;
 pub mod handler;
 pub mod opcode;
@@ -48,6 +49,7 @@ pub use aer::{
     AerCompletion, AerReservationSink, ConnToken, ConnectError, ControllerRegistry,
     ReservationEvent, ReservationEventKind,
 };
+pub use discovery::DiscoveryHandler;
 pub use dispatcher::NvmeNvmDispatcher;
 pub use handler::{AdminCommand, IoCommand, NvmeCommandHandler, NvmeResponse};
 pub use opcode::NvmOpcode;

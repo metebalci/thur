@@ -304,7 +304,7 @@ operator surface in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
 | Item | Status | Spec | Notes |
 |------|--------|:----:|-------|
 | Subsystem NQN | 🟩 Yes | M | `nqn.2025-10.com.metebalci:thurvsa`, single source of truth in `shared_naming::DISK.nqn`; operator override via `nvmetcp.subnqn`. |
-| Discovery controller (`nqn.2014-08.org.nvmexpress.discovery`) | 🟨 No | O | Hosts connect direct to the subsystem NQN. |
+| Discovery controller (`nqn.2014-08.org.nvmexpress.discovery`) | 🟩 Yes | O | Direct Discovery controller on a dedicated listener (default `:8009`, `nvmetcp.discovery`, default on). Answers Identify (CNTLTYPE=Discovery) + Get Log Page LID 0x70 listing this subsystem. Cleartext + unauthenticated; the log record advertises the I/O subsystem's TLS requirement via TREQ/TSAS.SECTYPE. `nvme discover` / `nvme connect-all`. |
 | NSID encoding | 🟩 Yes | M | `nsid = lun + 1`. NSID 0 reserved per NVMe Base §6. |
 | NGUID in Identify Namespace (bytes 104..120) | 🟩 Yes | O | Populated from the per-volume UUID, so Linux generates a stable `/dev/disk/by-id/nvme-<wwid>` that survives NSID renumber. Symmetric with the SBC-3 side's INQUIRY VPD 0x80 / 0x83. |
 | EUI-64 in Identify Namespace | 🟨 No | O | NGUID alone is sufficient — Linux's wwid resolution picks the first non-zero of (NGUID, EUI-64). |
@@ -326,7 +326,7 @@ reasoning for each. SCSI-side cross-cutting departures are in
 | Header / data digests (CRC32C, NVMe-TCP §3.5) | Negotiate `dgst=0`. TCP provides a checksum and TLS-PSK provides AEAD over the whole stream. Symmetric with the iSCSI transport, which also negotiates `HeaderDigest=None` / `DataDigest=None`. CRC32C is implemented elsewhere — SSC LTO-7+ Logical Block Protection appends a per-tape-block CRC32C trailer (`core/mediachanger/src/lbp.rs`) — distinct from the transport-frame digest. Hosts that require transport digests see negotiation fail and pick a different target. |
 | Multi-outstanding R2T per command | Single-R2T-per-command is bandwidth-equivalent for any transfer that fits the network's bandwidth-delay product. Lift only if a benchmark shows the round-trip is the bottleneck on a high-latency link. |
 | Async events other than reservation notifications | AER (Admin 0x0C) is implemented, but the only event source wired is reservation notifications (LID 0x80 — see *Reservation notifications* below). Namespace-attribute (the Notice-type events behind FID 0x0B Async Event Configuration), firmware-activation, and thermal notices are not produced — VSA has no firmware mechanism or thermal sensors, and namespaces are bound at `volume create`. The generic AER plumbing is reusable when a namespace-change source lands. |
-| Discovery controller absent | Hosts connect direct to the subsystem NQN; operators distribute the address / port / NQN out of band. A discovery listener lands when multi-subsystem deployments become a documented use case. |
+| Centralized Discovery Controller (CDC) + discovery-log-change AENs | The direct Discovery controller (`nqn.2014-08.org.nvmexpress.discovery`, default on — see *Discovery, NQN, identifiers* above) covers `nvme discover` / `nvme connect-all` for the single-subsystem deployment. A CDC and proactive discovery-log-change async events land when multi-subsystem fleet discovery becomes a documented use case. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
 | PCIe-only admin opcodes (0x00 / 0x01 / 0x04 / 0x05 / 0x7C) | Fabrics queue creation happens via Connect; doorbells are a PCIe concept. `Invalid Command Opcode` is the correct fabrics behavior. |
@@ -382,12 +382,15 @@ probing host to use the management plane.
   + CNS 0x03 per NSID for size, LBA format, and CSI. Linux nvme-tcp
   does this automatically on `nvme connect`. The iSCSI analog is
   REPORT LUNS (SPC-4 0xA0) after login.
-- **Multi-target / multi-subsystem discovery**: not implemented on
-  the NVMe side. We don't ship a Discovery Controller
-  (`nqn.2014-08.org.nvmexpress.discovery`), so the operator
-  distributes the subsystem NQN + IP + port out of band. The iSCSI
-  side does answer SendTargets discovery, but again returns the
-  single target.
+- **Discovery controller**: yes. A direct Discovery controller
+  (`nqn.2014-08.org.nvmexpress.discovery`) on a dedicated listener
+  (default `:8009`, `nvmetcp.discovery`, default on) answers
+  `nvme discover` / `nvme connect-all` with the Discovery Log Page
+  (LID 0x70) listing this subsystem's NQN + address + port, so the
+  operator no longer has to distribute them out of band. The iSCSI
+  analog is SendTargets. Both return the single subsystem/target —
+  multi-subsystem fleet discovery (a Centralized Discovery
+  Controller) is the future layer above this.
 
 Operators get a multi-volume view via the admin Unix socket
 (`GET /api/v1/volumes` / `thurvsa volume list`) — a

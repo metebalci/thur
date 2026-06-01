@@ -337,9 +337,45 @@ value is validated at startup (`nqn.` prefix, ASCII, ≤ 223 chars) and feeds
 the Connect SUBNQN admission check, the Identify Controller SUBNQN field, and
 the TLS-PSK derivation.
 
-A future Discovery service (with its own separate NQN, typically
-`nqn.2014-08.org.nvmexpress.discovery`) is a layer above this. We do not ship
-a discovery controller today; hosts connect directly to the subsystem NQN.
+### Discovery controller
+
+A direct Discovery controller (NVMe-oF §1.5.7) lets hosts run `nvme discover` /
+`nvme connect-all` instead of being handed the SUBNQN / address / port out of
+band — the NVMe analog of the iSCSI SendTargets surface. It answers the
+well-known NQN `nqn.2014-08.org.nvmexpress.discovery`.
+
+Rather than multiplex two NQNs on one socket, the daemon binds a **second
+listener** (default `0.0.0.0:8009`, the IANA discovery port; `nvmetcp.discovery`
+in `thurvsa.yaml`, default on whenever `nvmetcp` is enabled) with a dedicated
+`DiscoveryHandler` (`nvme-nvm`). Because the handler's `subnqn()` returns the
+discovery NQN, the existing `nvme-tcp` Connect path admits the host and the whole
+ICReq → Connect → Property Get/Set → command-loop machinery is reused unchanged.
+The handler answers Identify Controller (CNTLTYPE = Discovery, byte 111 = 2) and
+Get Log Page **LID 0x70** (the Discovery Log Page), and nothing else.
+
+The Discovery Log Page lists the one I/O subsystem above: `TRTYPE=tcp`, the
+subsystem NQN, `TRSVCID` = the I/O port (4420), and `TRADDR`. When the I/O
+listener is bound to a concrete IP that address is advertised verbatim; for a
+wildcard bind (`0.0.0.0` / `::`) the entry reflects the address each discovery
+request actually landed on (the transport threads the connection's local address
+into the handler), so a host that discovered via one interface gets a reachable
+address back. `GENCTR` is a constant — `nvme discover` reads the page twice
+(header to learn `NUMREC`, then the full page) and retries if it changes.
+
+**Security.** The Discovery listener is deliberately cleartext and
+unauthenticated — the spec/industry default (Linux, SPDK, and most arrays ship
+unauthenticated discovery) and the analog of our unauthenticated iSCSI
+SendTargets. The base spec permits this: the Discovery Log record carries `TREQ`
++ `TSAS.SECTYPE` precisely so an insecure discovery controller can advertise that
+the *referenced* subsystem requires TLS. We set `SECTYPE = TLS 1.3` /
+`TREQ = required` when `nvmetcp.tls.mode: psk`, so the host uses TLS for the real
+Connect, and `NONE` / `not required` otherwise. No volume names leak at discovery
+— per-volume admission stays at the I/O-subsystem Connect, whose
+Active-Namespace-List is already admission-fenced (TLS-PSK / DH-HMAC-CHAP). A
+hardened deployment that wants discovery itself secured (it is MITM-able, which
+is why NVMe 2.0 added the Centralized Discovery Controller) can set
+`nvmetcp.discovery.enabled: false` and distribute the address out of band as
+before.
 
 ## Testing
 
@@ -628,12 +664,10 @@ reports stay coherent (see *Cross-protocol reservation coherence* above); only
 the proactive signal is per-transport. Wiring a transport-neutral
 `ReservationManager` change-observer is a tracked follow-up.
 
-### Discovery controller
-
-Hosts connect directly to the subsystem NQN; we do not ship a separate
-discovery NQN (`nqn.2014-08.org.nvmexpress.discovery`). Operators distribute
-the address, port, and NQN out of band. A discovery controller lands when
-multi-subsystem deployments become a documented use case.
+(The Discovery controller is now implemented — see *NQN / discovery* §
+*Discovery controller* above. Still out of scope there: a Centralized Discovery
+Controller and discovery-log-change AENs; the single-subsystem direct Discovery
+controller covers the `nvme discover` / `nvme connect-all` use case.)
 
 ### Secure-channel concatenation (DH-HMAC-CHAP `sc_c` ≠ 0)
 

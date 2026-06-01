@@ -141,6 +141,24 @@ iscsi:
 #     # Override the identity-file path. Default:
 #     # <data_dir>/nvmetcp-dhchap.json.
 #     # identity_file: "/etc/thurvsa/nvmetcp-dhchap.json"
+#
+#   # Discovery controller (`nvme discover` / `nvme connect-all`). A
+#   # direct Discovery controller answering the well-known NQN
+#   # nqn.2014-08.org.nvmexpress.discovery, so hosts enumerate this
+#   # subsystem instead of being handed the SUBNQN / address / port out
+#   # of band (the NVMe analog of iSCSI SendTargets). The listener is
+#   # always cleartext + unauthenticated; the Discovery Log record
+#   # advertises whether the I/O subsystem requires TLS (tracks
+#   # tls.mode) so the host secures the real Connect. Volume names do
+#   # not leak here — admission stays at the I/O-subsystem Connect.
+#   discovery:
+#     # Enable the Discovery listener. Defaults to true whenever the
+#     # nvmetcp transport is enabled; set false to drop the listener.
+#     enabled: true
+#     # Discovery listen address. Defaults to 0.0.0.0:8009 (the
+#     # IANA-registered NVMe discovery port; no clash with the I/O
+#     # listener on 4420 or iSCSI on 3260).
+#     listen: "0.0.0.0:8009"
 
 # Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
 # applied per cloud backend. `size_gb` here is the **per-backend

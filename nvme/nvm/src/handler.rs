@@ -38,6 +38,12 @@ pub struct AdminCommand<'a> {
     /// Controller, FID 0x82 mask, LID 0x80 log). `None` only outside a
     /// real connection (tests).
     pub cntlid: Option<u16>,
+    /// Local socket address this connection landed on, captured by the
+    /// transport at accept. The Discovery controller reflects its IP
+    /// into the Discovery Log Page TRADDR when the I/O listener is
+    /// bound to a wildcard address. `None` outside a real connection
+    /// (tests) and on the I/O path (the NVM dispatcher ignores it).
+    pub local_addr: Option<std::net::SocketAddr>,
 }
 
 /// I/O command coming in on a non-zero queue (qid > 0). Same shape

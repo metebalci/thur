@@ -86,6 +86,8 @@ This section is consulted only when `nvmetcp` is listed in `transports`.
 | `nvmetcp.tls.identity_file` | `<data_dir>/nvmetcp-psks.json` | Path to the TLS-PSK host-identity file. |
 | `nvmetcp.auth.mode` | `none` | `none` or `dhchap` (DH-HMAC-CHAP in-band host auth, NVMe Base §8.13). Orthogonal to `tls.mode`: `dhchap` + `psk` = "dhchap+tls". |
 | `nvmetcp.auth.identity_file` | `<data_dir>/nvmetcp-dhchap.json` | Path to the DH-HMAC-CHAP host-secret file. |
+| `nvmetcp.discovery.enabled` | `true` | Bind a Discovery controller (well-known NQN `nqn.2014-08.org.nvmexpress.discovery`) so `nvme discover` / `nvme connect-all` work. Default on whenever `nvmetcp` is enabled; set `false` to drop the listener. The listener is always cleartext + unauthenticated (the NVMe analog of iSCSI SendTargets); the Discovery Log record advertises whether the I/O subsystem requires TLS (tracks `tls.mode`). Volume names do not leak — admission stays at the I/O Connect. |
+| `nvmetcp.discovery.listen` | `0.0.0.0:8009` | Discovery listen address (IANA-registered NVMe discovery port; no clash with the I/O listener on 4420 or iSCSI on 3260). |
 
 ### `memory_buffers` — VTL only
 

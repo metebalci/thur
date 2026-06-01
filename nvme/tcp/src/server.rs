@@ -185,6 +185,11 @@ pub async fn accept_loop(
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Local address this connection landed on, captured before any
+        // TLS wrap. The Discovery controller reflects its IP into the
+        // Discovery Log Page TRADDR when the I/O listener is bound to a
+        // wildcard address (the I/O dispatcher ignores it).
+        let local_addr = stream.local_addr().ok();
         let handler = Arc::clone(&handler);
         let regs = Arc::clone(&controller_regs);
         let aer = Arc::clone(&aer);
@@ -198,6 +203,7 @@ pub async fn accept_loop(
                     serve_connection(
                         stream,
                         peer,
+                        local_addr,
                         handler,
                         regs,
                         aer,
@@ -217,6 +223,7 @@ pub async fn accept_loop(
                         serve_connection(
                             tls_stream,
                             peer,
+                            local_addr,
                             handler,
                             regs,
                             aer,
@@ -404,6 +411,7 @@ type CommandTable = Arc<Mutex<HashMap<u16, mpsc::Sender<H2CDataChunk>>>>;
 async fn serve_connection<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
+    local_addr: Option<std::net::SocketAddr>,
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
     aer: Arc<ControllerRegistry>,
@@ -713,6 +721,7 @@ where
     let mut reader = tokio::spawn(reader_task(
         read_half,
         peer,
+        local_addr,
         Arc::clone(&handler),
         Arc::clone(&controller_regs),
         Arc::clone(&aer),
@@ -780,6 +789,7 @@ where
 async fn reader_task<R>(
     mut read: R,
     peer: std::net::SocketAddr,
+    local_addr: Option<std::net::SocketAddr>,
     handler: Arc<dyn NvmeCommandHandler>,
     controller_regs: Arc<ControllerRegs>,
     aer: Arc<ControllerRegistry>,
@@ -1152,6 +1162,7 @@ where
                     outbound_clone,
                     commands_clone,
                     peer,
+                    local_addr,
                     admission_clone,
                     host_id,
                     cntlid,
@@ -1274,6 +1285,7 @@ async fn handle_command(
     outbound: mpsc::Sender<OutboundPdu>,
     commands: CommandTable,
     peer: std::net::SocketAddr,
+    local_addr: Option<std::net::SocketAddr>,
     admission_volumes: Option<Arc<Vec<String>>>,
     host_id: [u8; 16],
     cntlid: u16,
@@ -1399,6 +1411,7 @@ async fn handle_command(
                 data_in_max: u32::MAX,
                 session_volumes: admission_slice,
                 cntlid: Some(cntlid),
+                local_addr,
             })
             .await
     } else {
@@ -2156,6 +2169,116 @@ mod tests {
             .await;
         });
         port
+    }
+
+    /// Spawn the server on `127.0.0.1:0` with an arbitrary boxed
+    /// handler (the Discovery controller test uses a `DiscoveryHandler`
+    /// rather than the `StubHandler`).
+    async fn spawn_handler(h: Arc<dyn NvmeCommandHandler>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let regs = Arc::new(ControllerRegs::new());
+        let aer = Arc::new(ControllerRegistry::new());
+        tokio::spawn(async move {
+            let _ = accept_loop(
+                listener,
+                h,
+                regs,
+                aer,
+                None,
+                None,
+                None,
+                Arc::new(NoopLoginAudit),
+            )
+            .await;
+        });
+        port
+    }
+
+    /// End-to-end Discovery controller: Connect to the well-known
+    /// discovery NQN, Identify (expect CNTLTYPE = Discovery), then a
+    /// full Get Log Page 0x70. Proves the `local_addr` thread-through —
+    /// the I/O bind is wildcard (`io_traddr = None`), so the log entry's
+    /// TRADDR must reflect the loopback address the connection landed on.
+    #[tokio::test]
+    async fn discovery_controller_lists_subsystem_with_reflected_traddr() {
+        use nvme_base::identify::DISCOVERY_NQN;
+        use nvme_base::log_page::{disc_sectype, disc_treq};
+        use nvme_nvm::DiscoveryHandler;
+
+        let handler: Arc<dyn NvmeCommandHandler> = Arc::new(DiscoveryHandler::new(
+            "nqn.2025-10.com.metebalci:thurvsa".into(),
+            4420,
+            None, // wildcard I/O bind → reflect local_addr
+            disc_sectype::NONE,
+            disc_treq::NOT_REQUIRED,
+            "TESTSN".into(),
+            "ThurVSA Discovery".into(),
+            "0.1.0".into(),
+        ));
+        let port = spawn_handler(handler).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu()).await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // ICResp
+
+        // Connect to the well-known discovery NQN on the admin queue.
+        stream
+            .write_all(&build_connect_pdu(DISCOVERY_NQN, 0))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let connect_resp = read_pdu_async(&mut stream).await;
+        assert_eq!(connect_resp.header.pdu_type, pdu::PduType::CapsuleResp);
+
+        // Identify Controller — CNTLTYPE at byte 111 must be 2 (Discovery).
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::Identify as u8;
+        sqe[2] = 0x10; // CID
+        sqe[40] = nvme_base::identify::CNS::Controller as u8;
+        stream
+            .write_all(&build_capsule_cmd_pdu(sqe, &[]))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let c2h = read_pdu_async(&mut stream).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        assert_eq!(c2h.body.len(), 16 + 4096);
+        assert_eq!(c2h.body[16 + 111], 2, "CNTLTYPE = Discovery");
+
+        // Get Log Page LID 0x70, full page: header(1024)+entry(1024) =
+        // 2048 bytes → 512 dwords → NUMD zero-based 511.
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::GetLogPage as u8;
+        sqe[2] = 0x11; // CID
+        let cdw10 = u32::from(nvme_base::log_page::lid::DISCOVERY) | (511u32 << 16);
+        sqe[40..44].copy_from_slice(&cdw10.to_le_bytes());
+        stream
+            .write_all(&build_capsule_cmd_pdu(sqe, &[]))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let c2h = read_pdu_async(&mut stream).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        assert_eq!(c2h.body.len(), 16 + 2048);
+        // NUMREC @ data offset 8 = 1 subsystem.
+        assert_eq!(
+            u64::from_le_bytes(c2h.body[16 + 8..16 + 16].try_into().unwrap()),
+            1
+        );
+        // Entry TRADDR @ data offset 1024+512 reflects the loopback addr
+        // the discovery connection landed on (wildcard I/O bind).
+        let traddr_off = 16 + 1024 + 512;
+        assert_eq!(&c2h.body[traddr_off..traddr_off + 9], b"127.0.0.1");
+        // TRSVCID @ data offset 1024+32 = the I/O port "4420".
+        let trsvcid_off = 16 + 1024 + 32;
+        assert_eq!(&c2h.body[trsvcid_off..trsvcid_off + 4], b"4420");
+        // SUBNQN @ data offset 1024+256 = the referenced I/O subsystem.
+        let subnqn_off = 16 + 1024 + 256;
+        assert_eq!(
+            &c2h.body[subnqn_off..subnqn_off + 33],
+            b"nqn.2025-10.com.metebalci:thurvsa"
+        );
     }
 
     /// An AER parked on the admin queue completes when a reservation

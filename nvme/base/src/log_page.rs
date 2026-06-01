@@ -33,6 +33,10 @@ pub mod lid {
     pub const ERROR_INFO: u8 = 0x01;
     pub const SMART_HEALTH: u8 = 0x02;
     pub const FIRMWARE_SLOT: u8 = 0x03;
+    /// Discovery Log Page (NVMe-oF §5.16.1.23). A Discovery
+    /// controller answers this with the list of subsystems a host can
+    /// reach; `nvme discover` / `nvme connect-all` read it.
+    pub const DISCOVERY: u8 = 0x70;
     /// Reservation Notification (NVMe NVM Command Set). Carries the
     /// most-recent reservation event for the host to consume.
     pub const RESERVATION_NOTIFICATION: u8 = 0x80;
@@ -127,6 +131,140 @@ pub fn reservation_notification(
     buf
 }
 
+// ===================== Discovery Log Page (LID 0x70) =================
+
+/// Discovery Log Page header (NVMe-oF §5.16.1.23). Fixed 1024 bytes,
+/// followed by `numrec` × [`DISCOVERY_LOG_ENTRY_LEN`]-byte entries.
+pub const DISCOVERY_LOG_HEADER_LEN: usize = 1024;
+/// One Discovery Log Page entry (NVMe-oF §5.16.1.23 Figure). 1024 bytes.
+pub const DISCOVERY_LOG_ENTRY_LEN: usize = 1024;
+
+/// Discovery Log entry `TRTYPE` (transport type, byte 0).
+pub mod disc_trtype {
+    /// TCP transport (NVMe/TCP).
+    pub const TCP: u8 = 3;
+}
+
+/// Discovery Log entry `ADRFAM` (address family, byte 1).
+pub mod disc_adrfam {
+    pub const IPV4: u8 = 1;
+    pub const IPV6: u8 = 2;
+}
+
+/// Discovery Log entry `SUBTYPE` (subsystem type, byte 2).
+pub mod disc_subtype {
+    /// Referral to another Discovery service.
+    pub const DISCOVERY: u8 = 1;
+    /// An NVMe subsystem (one that exposes namespaces).
+    pub const NVME: u8 = 2;
+}
+
+/// Discovery Log entry `TREQ` (transport requirements, byte 3, bits
+/// 1:0). Tells the host whether the referenced subsystem requires a
+/// secure (TLS) channel.
+pub mod disc_treq {
+    pub const NOT_SPECIFIED: u8 = 0;
+    pub const REQUIRED: u8 = 1;
+    pub const NOT_REQUIRED: u8 = 2;
+}
+
+/// Discovery Log entry `TSAS.SECTYPE` for the TCP transport (byte 768).
+pub mod disc_sectype {
+    /// No security (plain TCP).
+    pub const NONE: u8 = 0;
+    /// TLS 1.3.
+    pub const TLS13: u8 = 2;
+}
+
+/// One subsystem the Discovery controller refers a host to. Resolved
+/// fields only; [`DiscoveryLogEntry::to_bytes`] lays them out at the
+/// NVMe-oF wire offsets.
+#[derive(Debug, Clone)]
+pub struct DiscoveryLogEntry {
+    /// Address family of `traddr` ([`disc_adrfam`]).
+    pub adrfam: u8,
+    /// Subsystem type ([`disc_subtype`]) — `NVME` for a namespace-
+    /// bearing subsystem.
+    pub subtype: u8,
+    /// Transport requirements ([`disc_treq`]).
+    pub treq: u8,
+    /// Port identifier (cosmetic; the host keys on traddr/trsvcid).
+    pub port_id: u16,
+    /// Controller ID the host should request at Connect. 0xFFFF =
+    /// dynamic ("any").
+    pub cntlid: u16,
+    /// Minimum admin submission queue size the host must allocate.
+    pub asqsz: u16,
+    /// Transport service identifier — the TCP port, as an ASCII string
+    /// (e.g. "4420").
+    pub trsvcid: String,
+    /// The referenced subsystem's NQN.
+    pub subnqn: String,
+    /// Transport address — the IP, as an ASCII string (e.g.
+    /// "192.168.1.10").
+    pub traddr: String,
+    /// TCP TSAS security type ([`disc_sectype`]).
+    pub sectype: u8,
+}
+
+impl DiscoveryLogEntry {
+    /// Lay out the entry at the NVMe-oF §5.16.1.23 wire offsets
+    /// (matches Linux `struct nvmf_disc_rsp_page_entry`). TRTYPE is
+    /// always TCP — the TSAS union is laid out for the TCP transport.
+    pub fn to_bytes(&self) -> [u8; DISCOVERY_LOG_ENTRY_LEN] {
+        let mut buf = [0u8; DISCOVERY_LOG_ENTRY_LEN];
+        buf[0] = disc_trtype::TCP;
+        buf[1] = self.adrfam;
+        buf[2] = self.subtype;
+        buf[3] = self.treq;
+        buf[4..6].copy_from_slice(&self.port_id.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.cntlid.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.asqsz.to_le_bytes());
+        // TRSVCID (transport service id) — ASCII, 32-byte field at 32.
+        write_ascii(&mut buf[32..64], &self.trsvcid);
+        // SUBNQN — ASCII, 256-byte field at 256.
+        write_ascii(&mut buf[256..512], &self.subnqn);
+        // TRADDR — ASCII, 256-byte field at 512.
+        write_ascii(&mut buf[512..768], &self.traddr);
+        // TSAS (256 bytes at 768). For TCP only byte 0 (SECTYPE) is
+        // defined.
+        buf[768] = self.sectype;
+        buf
+    }
+}
+
+/// Build a Discovery Log Page: a [`DISCOVERY_LOG_HEADER_LEN`]-byte
+/// header (GENCTR @0, NUMREC @8, RECFMT @16) followed by each entry's
+/// 1024-byte image.
+///
+/// `genctr` is the Generation Counter the host echoes between its
+/// two-phase read (header to learn NUMREC, then the full page). It
+/// MUST stay stable across those reads or the host retries — callers
+/// pass a constant (the content is fixed at boot).
+pub fn discovery_log_page(genctr: u64, entries: &[DiscoveryLogEntry]) -> Vec<u8> {
+    let mut buf = vec![0u8; DISCOVERY_LOG_HEADER_LEN + entries.len() * DISCOVERY_LOG_ENTRY_LEN];
+    buf[0..8].copy_from_slice(&genctr.to_le_bytes());
+    buf[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+    // RECFMT at 16..18 stays 0 (the only defined record format).
+    for (i, entry) in entries.iter().enumerate() {
+        let off = DISCOVERY_LOG_HEADER_LEN + i * DISCOVERY_LOG_ENTRY_LEN;
+        buf[off..off + DISCOVERY_LOG_ENTRY_LEN].copy_from_slice(&entry.to_bytes());
+    }
+    buf
+}
+
+/// Copy `s` into `dst` as ASCII, truncating to fit, NUL-padding the
+/// rest. Discovery Log string fields (TRSVCID / SUBNQN / TRADDR) are
+/// NUL-padded ASCII.
+fn write_ascii(dst: &mut [u8], s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(dst.len());
+    dst[..n].copy_from_slice(&bytes[..n]);
+    for b in dst[n..].iter_mut() {
+        *b = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +323,77 @@ mod tests {
     fn reservation_notification_empty_page_is_all_zero() {
         let log = reservation_notification(0, resv_notif_type::EMPTY, 0, 0);
         assert!(log.iter().all(|&b| b == 0));
+    }
+
+    fn sample_entry() -> DiscoveryLogEntry {
+        DiscoveryLogEntry {
+            adrfam: disc_adrfam::IPV4,
+            subtype: disc_subtype::NVME,
+            treq: disc_treq::NOT_REQUIRED,
+            port_id: 1,
+            cntlid: 0xFFFF,
+            asqsz: 32,
+            trsvcid: "4420".into(),
+            subnqn: "nqn.2025-10.com.metebalci:thurvsa".into(),
+            traddr: "192.168.1.10".into(),
+            sectype: disc_sectype::NONE,
+        }
+    }
+
+    #[test]
+    fn discovery_log_entry_layout() {
+        let e = sample_entry();
+        let b = e.to_bytes();
+        assert_eq!(b.len(), DISCOVERY_LOG_ENTRY_LEN);
+        assert_eq!(b[0], disc_trtype::TCP);
+        assert_eq!(b[1], disc_adrfam::IPV4);
+        assert_eq!(b[2], disc_subtype::NVME);
+        assert_eq!(b[3], disc_treq::NOT_REQUIRED);
+        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 1);
+        assert_eq!(u16::from_le_bytes([b[6], b[7]]), 0xFFFF);
+        assert_eq!(u16::from_le_bytes([b[8], b[9]]), 32);
+        // TRSVCID at 32..64, NUL-padded.
+        assert_eq!(&b[32..36], b"4420");
+        assert_eq!(b[36], 0);
+        // SUBNQN at 256..512.
+        assert_eq!(&b[256..256 + 33], b"nqn.2025-10.com.metebalci:thurvsa");
+        // TRADDR at 512..768.
+        assert_eq!(&b[512..512 + 12], b"192.168.1.10");
+        // SECTYPE at 768.
+        assert_eq!(b[768], disc_sectype::NONE);
+    }
+
+    #[test]
+    fn discovery_log_page_header_and_record_count() {
+        let page = discovery_log_page(0, &[sample_entry()]);
+        assert_eq!(
+            page.len(),
+            DISCOVERY_LOG_HEADER_LEN + DISCOVERY_LOG_ENTRY_LEN
+        );
+        // GENCTR @0.
+        assert_eq!(u64::from_le_bytes(page[0..8].try_into().unwrap()), 0);
+        // NUMREC @8 = 1.
+        assert_eq!(u64::from_le_bytes(page[8..16].try_into().unwrap()), 1);
+        // RECFMT @16 = 0.
+        assert_eq!(u16::from_le_bytes([page[16], page[17]]), 0);
+        // First entry begins right after the header.
+        assert_eq!(page[DISCOVERY_LOG_HEADER_LEN], disc_trtype::TCP);
+    }
+
+    #[test]
+    fn discovery_log_page_empty_is_header_only() {
+        let page = discovery_log_page(0, &[]);
+        assert_eq!(page.len(), DISCOVERY_LOG_HEADER_LEN);
+        assert_eq!(u64::from_le_bytes(page[8..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn discovery_log_entry_sectype_tls13() {
+        let mut e = sample_entry();
+        e.sectype = disc_sectype::TLS13;
+        e.treq = disc_treq::REQUIRED;
+        let b = e.to_bytes();
+        assert_eq!(b[3], disc_treq::REQUIRED);
+        assert_eq!(b[768], 2);
     }
 }

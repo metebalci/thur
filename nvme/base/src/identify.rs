@@ -66,6 +66,25 @@ impl CNS {
     }
 }
 
+/// Well-known NVMe Discovery Service NQN (NVMe-oF §1.5.7). Hosts use
+/// this as the SUBNQN when connecting to a Discovery controller
+/// (`nvme discover` / `nvme connect-all`); it is a fixed constant, not
+/// an operator-set value. Note the `.discovery` suffix (a dot, not the
+/// `:unique` colon a subsystem NQN uses).
+pub const DISCOVERY_NQN: &str = "nqn.2014-08.org.nvmexpress.discovery";
+
+/// CNTLTYPE values (Identify Controller byte 111, NVMe Base
+/// §5.17.2.1). A Discovery controller MUST report `Discovery`.
+pub mod cntltype {
+    /// I/O controller — the default for a namespace-bearing subsystem.
+    pub const IO: u8 = 1;
+    /// Discovery controller — answers Identify + the Discovery Log
+    /// Page (LID 0x70) and nothing else.
+    pub const DISCOVERY: u8 = 2;
+    /// Administrative controller.
+    pub const ADMIN: u8 = 3;
+}
+
 /// Identify Controller (NVMe Base §5.17.2.1, 4 KiB).
 ///
 /// Only the operator-visible identity fields plus the absolutely
@@ -118,6 +137,11 @@ pub struct IdentifyController {
     /// (Compare bit 0, Write Zeroes bit 3, Dataset Management bit 2)
     /// stay zero here — out of scope for the reservations work.
     pub oncs: u16,
+    /// CNTLTYPE — Controller Type (NVMe Base §5.17.2.1 byte 111). See
+    /// [`cntltype`]. `0` (not reported) for the legacy I/O path;
+    /// `cntltype::DISCOVERY` for a Discovery controller, which a host
+    /// keys its discovery state machine off.
+    pub cntltype: u8,
 }
 
 /// Keep Alive Support advertised in Identify Controller (NVMe Base
@@ -177,7 +201,38 @@ impl IdentifyController {
             mdts: 8,
             // ONCS bit 5 = Reservations supported. 0x0020.
             oncs: 0x0020,
+            // 0 = "controller type not reported" — the legacy I/O path
+            // leaves byte 111 unset, which Linux tolerates for an I/O
+            // controller. `discovery()` overrides this.
+            cntltype: 0,
         })
+    }
+
+    /// Build a Discovery controller's Identify Controller image
+    /// (CNTLTYPE = Discovery). A Discovery controller exposes no
+    /// namespaces (NN = 0) and its own NQN is the well-known
+    /// [`DISCOVERY_NQN`]; it answers Identify + the Discovery Log Page
+    /// (LID 0x70) and nothing else. KAS / SGLS / VER from `to_bytes`
+    /// stay populated — mandatory for any fabrics controller and
+    /// harmless here.
+    pub fn discovery(sn: String, mn: String, fr: String, cntlid: u16) -> Self {
+        Self {
+            vid: 0,
+            ssvid: 0,
+            sn,
+            mn,
+            fr,
+            cntlid,
+            ver: 0x0001_0400, // NVMe 1.4.0
+            nn: 0,
+            subnqn: DISCOVERY_NQN.to_string(),
+            ioccsz: 1028,
+            iorcsz: 1,
+            mdts: 8,
+            // A Discovery controller supports no NVM commands.
+            oncs: 0,
+            cntltype: cntltype::DISCOVERY,
+        }
     }
 
     /// Encode to the 4 KiB wire image (NVMe Base §5.17.2.1 layout).
@@ -201,6 +256,10 @@ impl IdentifyController {
         out[77] = self.mdts; // MDTS — max data transfer size
         out[78..80].copy_from_slice(&self.cntlid.to_le_bytes());
         out[80..84].copy_from_slice(&self.ver.to_le_bytes());
+        // CNTLTYPE at byte 111 (NVMe Base §5.17.2.1): 0 not reported,
+        // 1 I/O, 2 Discovery, 3 Administrative. A Discovery controller
+        // MUST report 2 so the host drives its discovery state machine.
+        out[111] = self.cntltype;
         // OAES, CTRATT etc all zero
         // ONCS at 520..522 — bit 5 advertises Reservations support so
         // hosts issue the reservation command set.
@@ -428,6 +487,34 @@ mod tests {
         // CMIC at byte 76 — bit 1 set (subsystem may contain 2+
         // controllers), bits 0/3 clear.
         assert_eq!(bytes[76], 0b0000_0010);
+        // CNTLTYPE at byte 111 — the I/O path leaves it "not reported"
+        // (0). Regression guard: adding discovery support must not flip
+        // the I/O controller's reported type.
+        assert_eq!(bytes[111], 0);
+    }
+
+    #[test]
+    fn identify_controller_discovery_sets_cntltype() {
+        let ic = IdentifyController::discovery(
+            "0000000000000000VSA1".into(),
+            "ThurVSA Discovery".into(),
+            "0.1.0".into(),
+            1,
+        );
+        assert_eq!(ic.cntltype, cntltype::DISCOVERY);
+        let bytes = ic.to_bytes();
+        // CNTLTYPE at byte 111 = 2 (Discovery).
+        assert_eq!(bytes[111], 2);
+        // NN at 516..520 = 0 — a Discovery controller has no namespaces.
+        assert_eq!(&bytes[516..520], &0u32.to_le_bytes());
+        // SUBNQN is the well-known discovery NQN.
+        assert_eq!(
+            &bytes[768..768 + DISCOVERY_NQN.len()],
+            DISCOVERY_NQN.as_bytes()
+        );
+        assert_eq!(bytes[768 + DISCOVERY_NQN.len()], 0);
+        // KAS stays mandatory-non-zero (any fabrics controller).
+        assert_ne!(&bytes[320..322], &[0u8, 0]);
     }
 
     #[test]

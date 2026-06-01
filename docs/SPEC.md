@@ -740,6 +740,64 @@ Per-host secrets + admission live in `nvmetcp-dhchap.json` (schema in
 [`CONFIGURATION.md`](CONFIGURATION.md); operator surface in
 [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP).
 
+#### Discovery controller (thurvsa NVMe/TCP)
+
+A direct Discovery controller (NVMe-oF §1.5.7) so `nvme discover` /
+`nvme connect-all` work. It binds a **second listener** (default
+`0.0.0.0:8009`, the IANA discovery port; `nvmetcp.discovery`, default on
+whenever the `nvmetcp` transport is enabled) answering the well-known NQN
+`nqn.2014-08.org.nvmexpress.discovery`. The listener reuses the standard
+ICReq → Connect → Property Get/Set → command-loop path; the
+`DiscoveryHandler`'s `subnqn()` returns the discovery NQN so Connect
+admits the host.
+
+It answers exactly two admin commands (Keep Alive / Get-Set Features are
+accepted as no-ops; everything else is Invalid Field / Invalid Opcode):
+
+- **Identify Controller** (CNS 0x01) — `CNTLTYPE` (byte 111) = `2`
+  (Discovery), `NN` = 0, `SUBNQN` = the discovery NQN. `KAS` / `SGLS` /
+  `VER` populated as for the I/O controller.
+- **Get Log Page LID 0x70** (Discovery Log Page) — header + one entry
+  for this subsystem.
+
+The I/O Identify Controller continues to leave `CNTLTYPE` (byte 111) = 0
+("not reported").
+
+Discovery Log Page wire layout (NVMe-oF §5.16.1.23; little-endian):
+
+```text
+Header (1024 bytes):
+  bytes 0..8    GENCTR   (u64; constant 0 — stable across the host's
+                          two-phase header-then-full read)
+  bytes 8..16   NUMREC   (u64; number of entries — 1)
+  bytes 16..18  RECFMT   (u16; 0)
+  bytes 18..1024 reserved
+
+Entry (1024 bytes each):
+  byte  0       TRTYPE   = 3 (TCP)
+  byte  1       ADRFAM   = 1 IPv4 / 2 IPv6 (from the resolved TRADDR)
+  byte  2       SUBTYPE  = 2 (NVMe subsystem)
+  byte  3       TREQ     = 1 required (when tls.mode=psk) / 2 not required
+  bytes 4..6    PORTID   = 1
+  bytes 6..8    CNTLID   = 0xFFFF (dynamic)
+  bytes 8..10   ASQSZ    = 32
+  bytes 32..64  TRSVCID  (ASCII, NUL-padded — the I/O port, e.g. "4420")
+  bytes 256..512 SUBNQN  (ASCII, NUL-padded — the I/O subsystem NQN)
+  bytes 512..768 TRADDR  (ASCII, NUL-padded — the I/O IP)
+  byte  768     TSAS.SECTYPE = 2 TLS 1.3 (when tls.mode=psk) / 0 none
+```
+
+`TRADDR` resolution: the I/O listener's bind IP is advertised verbatim
+when concrete; for a wildcard bind (`0.0.0.0` / `::`) the transport
+threads the connection's local address into the handler and the entry
+reflects the IP the discovery request landed on (so the returned address
+is reachable for the follow-up Connect).
+
+The Discovery listener is always cleartext + unauthenticated; the
+`TREQ` / `SECTYPE` fields advertise the I/O subsystem's TLS requirement so
+the host secures the *real* Connect. Per-volume admission is not applied
+at discovery — it stays at the I/O-subsystem Connect.
+
 ### Format / partitioning
 
 | Opcode | Command | Notes |

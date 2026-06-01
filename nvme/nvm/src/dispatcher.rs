@@ -1130,6 +1130,7 @@ mod tests {
                 data_in_max: 4096,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1167,6 +1168,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1194,6 +1196,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1219,6 +1222,7 @@ mod tests {
                 data_in_max: 4096,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1244,6 +1248,7 @@ mod tests {
                 data_in_max: 4096,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1639,6 +1644,7 @@ mod tests {
                 data_in_max: 4096,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1656,6 +1662,7 @@ mod tests {
                     data_in_max: 4096,
                     session_volumes: None,
                     cntlid: None,
+                    local_addr: None,
                 })
                 .await;
             assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
@@ -1673,6 +1680,7 @@ mod tests {
                 data_in_max: 4096,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_field());
@@ -1688,6 +1696,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1703,6 +1712,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -1725,6 +1735,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1740,6 +1751,7 @@ mod tests {
                 data_in_max: 0,
                 session_volumes: None,
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_opcode());
@@ -1802,6 +1814,7 @@ mod tests {
                 data_in_max: nvme_base::IDENTIFY_DATA_SIZE as u32,
                 session_volumes: Some(&allow),
                 cntlid: None,
+                local_addr: None,
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
@@ -2027,6 +2040,7 @@ mod tests {
             data_in_max: 4096,
             session_volumes: None,
             cntlid,
+            local_addr: None,
         })
         .await
     }

@@ -307,6 +307,12 @@ pub struct NvmetcpSettings {
     /// § NVMe/TCP DH-HMAC-CHAP.
     #[serde(default)]
     pub auth: NvmetcpAuthSettings,
+    /// Discovery controller (`nvme discover` / `nvme connect-all`).
+    /// Default on: a cleartext, unauthenticated listener on
+    /// `0.0.0.0:8009` answers the well-known discovery NQN and lists
+    /// this subsystem.
+    #[serde(default)]
+    pub discovery: NvmetcpDiscoverySettings,
 }
 
 impl NvmetcpSettings {
@@ -393,6 +399,43 @@ pub enum NvmetcpAuthMode {
     #[default]
     None,
     Dhchap,
+}
+
+/// Default Discovery controller listen address — the IANA-registered
+/// NVMe discovery port. Doesn't collide with the I/O listener (4420)
+/// or iSCSI (3260).
+pub const DEFAULT_NVMETCP_DISCOVERY_LISTEN_ADDRESS: &str = "0.0.0.0:8009";
+
+/// `nvmetcp.discovery:` block. A direct Discovery controller answering
+/// the well-known NQN `nqn.2014-08.org.nvmexpress.discovery`, so
+/// `nvme discover` / `nvme connect-all` work without out-of-band
+/// distribution of the SUBNQN / address / port. The listener is
+/// always cleartext + unauthenticated (the spec/industry default and
+/// the analog of unauthenticated iSCSI SendTargets); the Discovery Log
+/// record advertises the I/O subsystem's TLS requirement so hosts use
+/// TLS for the real Connect.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct NvmetcpDiscoverySettings {
+    /// Enable the Discovery controller listener. Defaults to **on**
+    /// when the `nvmetcp` transport is enabled.
+    pub enabled: Option<bool>,
+    /// Override the Discovery listen address. Defaults to
+    /// [`DEFAULT_NVMETCP_DISCOVERY_LISTEN_ADDRESS`] (`0.0.0.0:8009`).
+    pub listen: Option<String>,
+}
+
+impl NvmetcpDiscoverySettings {
+    /// Whether to bind the Discovery listener (default on).
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Resolved Discovery listen address (override or the 8009 default).
+    pub fn listen_addr(&self) -> String {
+        self.listen
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NVMETCP_DISCOVERY_LISTEN_ADDRESS.to_string())
+    }
 }
 
 /// `iscsi:` block. Carries the optional CHAP `auth` sub-block, a

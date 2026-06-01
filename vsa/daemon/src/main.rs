@@ -745,6 +745,79 @@ async fn main() -> Result<()> {
                 };
                 transport_listens.push(nvmetcp_listen.clone());
                 transport_futs.push(Box::pin(nvme_tcp::run(server_cfg)));
+
+                // Discovery controller (issue #58). A second, cleartext,
+                // unauthenticated listener on the conventional discovery
+                // port answers the well-known discovery NQN so
+                // `nvme discover` / `nvme connect-all` work without
+                // out-of-band distribution of the SUBNQN / address /
+                // port. It refers hosts to the I/O subsystem above; the
+                // Discovery Log record advertises that subsystem's TLS
+                // requirement (TREQ + TSAS.SECTYPE) so the host secures
+                // the real Connect. Default on whenever nvmetcp is.
+                if cfg.nvmetcp.discovery.enabled() {
+                    let discovery_listen = cfg.nvmetcp.discovery.listen_addr();
+                    // Resolve the I/O transport address the log record
+                    // advertises. A concrete bind IP is advertised
+                    // verbatim; a wildcard bind (0.0.0.0 / ::) leaves
+                    // `io_traddr = None` so the DiscoveryHandler reflects
+                    // the address each discovery request landed on.
+                    let io_sockaddr = nvmetcp_listen.parse::<std::net::SocketAddr>().ok();
+                    let io_port = io_sockaddr
+                        .map(|s| s.port())
+                        .or_else(|| {
+                            nvmetcp_listen
+                                .rsplit(':')
+                                .next()
+                                .and_then(|p| p.parse().ok())
+                        })
+                        .unwrap_or(4420);
+                    let io_traddr = io_sockaddr
+                        .map(|s| s.ip())
+                        .filter(|ip| !ip.is_unspecified());
+                    let (sectype, treq) = match cfg.nvmetcp.tls.mode {
+                        NvmetcpTlsMode::Psk => (
+                            nvme_base::log_page::disc_sectype::TLS13,
+                            nvme_base::log_page::disc_treq::REQUIRED,
+                        ),
+                        NvmetcpTlsMode::Disabled => (
+                            nvme_base::log_page::disc_sectype::NONE,
+                            nvme_base::log_page::disc_treq::NOT_REQUIRED,
+                        ),
+                    };
+                    let discovery_handler = Arc::new(nvme_nvm::DiscoveryHandler::new(
+                        subnqn.clone(),
+                        io_port,
+                        io_traddr,
+                        sectype,
+                        treq,
+                        format!("THURVSA{:013}", volumes.len()),
+                        shared_naming::DISK_PRODUCT.to_string(),
+                        THURVSA_VERSION_STR.to_string(),
+                    ));
+                    let discovery_cfg = nvme_tcp::ServerConfig {
+                        listen_address: discovery_listen.clone(),
+                        handler: discovery_handler,
+                        controller_regs: Arc::new(nvme_base::ControllerRegs::new()),
+                        aer: Arc::new(nvme_nvm::ControllerRegistry::new()),
+                        tls: None,
+                        psks_path: None,
+                        dhchap_path: None,
+                        audit: Arc::new(nvme_tcp::NoopLoginAudit),
+                    };
+                    tracing::info!(
+                        "transport: nvmetcp-discovery (listen={}, advertises subnqn={}, traddr={}, port={}, sectype={})",
+                        discovery_listen,
+                        subnqn,
+                        io_traddr
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|| "<reflect>".to_string()),
+                        io_port,
+                        sectype,
+                    );
+                    transport_listens.push(discovery_listen.clone());
+                    transport_futs.push(Box::pin(nvme_tcp::run(discovery_cfg)));
+                }
             }
         }
     }
