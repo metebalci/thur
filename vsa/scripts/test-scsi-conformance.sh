@@ -958,7 +958,7 @@ t_inquiry_vpd_third_party_copy_advertises_odx() {
     # (op, sa_hi, sa_lo, reserved). Grep for "83 00 10" / "83 00 11" /
     # "84 00 07" (whitespace separated in sg_inq -H output).
     local missing=0
-    for pat in '83 00 10' '83 00 11' '84 00 01' '84 00 04' '84 00 07'; do
+    for pat in '83 00 01' '83 00 10' '83 00 11' '83 00 12' '84 00 01' '84 00 04' '84 00 07'; do
         if ! echo "$hex" | grep -q "$pat"; then
             log_error "VPD 0x8F missing SUPPORTED COMMANDS entry: $pat"
             missing=1

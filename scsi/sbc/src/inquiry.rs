@@ -227,9 +227,9 @@ pub(crate) fn naa_locally_assigned(uuid: &[u8; 16]) -> [u8; 8] {
 ///          this for ROD token lifetime + size limits. Absence is
 ///          read as "no ODX" by Windows.
 ///   0x0001 SUPPORTED COMMANDS — declares opcode 0x83 (EXTENDED
-///          COPY) with service actions 0x00 (LID1), 0x10 (POPULATE
-///          TOKEN), 0x11 (WRITE USING TOKEN) and 0x12 (CANCEL ROD
-///          TOKEN); opcode 0x84
+///          COPY) with service actions 0x00 (LID1), 0x01 (LID4),
+///          0x10 (POPULATE TOKEN), 0x11 (WRITE USING TOKEN) and 0x12
+///          (CANCEL ROD TOKEN); opcode 0x84
 ///          (RECEIVE COPY RESULTS) with service actions 0x00
 ///          (COPY STATUS), 0x01 (RECEIVE DATA), 0x03 (OPERATING
 ///          PARAMETERS), 0x04 (FAILED SEGMENT DETAILS) and 0x07
@@ -311,6 +311,8 @@ fn vpd_third_party_copy(cache: Option<&PageCache>) -> Vec<u8> {
     let mut commands: Vec<u8> = Vec::new();
     // (0x83, 0x00) — EXTENDED COPY (LID1)         [VAAI XCOPY]
     commands.extend_from_slice(&[0x83, 0x00, 0x00, 0x00]);
+    // (0x83, 0x01) — EXTENDED COPY (LID4)
+    commands.extend_from_slice(&[0x83, 0x00, 0x01, 0x00]);
     // (0x83, 0x10) — POPULATE TOKEN               [ODX]
     commands.extend_from_slice(&[0x83, 0x00, 0x10, 0x00]);
     // (0x83, 0x11) — WRITE USING TOKEN            [ODX]
@@ -810,8 +812,8 @@ mod tests {
         // ESXi VAAI XCOPY and Windows Hyper-V ODX both gate on this
         // page. Required descriptor sequence: 0x0000 ROD LIMITS (for
         // ODX), 0x0001 SUPPORTED COMMANDS (with opcodes 0x83 SAs
-        // 0x00 / 0x10 / 0x11 / 0x12 and 0x84 SAs 0x00 / 0x01 / 0x03
-        // / 0x04 / 0x07), 0x0004 PARAMETER DATA, 0x0008 SUPPORTED
+        // 0x00 / 0x01 / 0x10 / 0x11 / 0x12 and 0x84 SAs 0x00 / 0x01 /
+        // 0x03 / 0x04 / 0x07), 0x0004 PARAMETER DATA, 0x0008 SUPPORTED
         // DESCRIPTORS (with type codes 0xE4 / 0x02 / 0x00), and
         // 0x8001 GENERAL COPY OPERATIONS.
         let tmp = TempDir::new().unwrap();
@@ -863,6 +865,7 @@ mod tests {
             .collect();
         for want in [
             (0x83u8, 0x0000u16),
+            (0x83, 0x0001),
             (0x83, 0x0010),
             (0x83, 0x0011),
             (0x83, 0x0012),

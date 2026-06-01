@@ -734,10 +734,11 @@ pub(super) async fn write_same(
 /// expects when the page is advertised in VPD 0x8F.
 ///
 /// Wire surface implemented (the same subset LIO and SCST expose):
-///   - Service action 0x00 only. LID4 (0x01) and any ODX action
-///     (POPULATE TOKEN 0x10 / WRITE USING TOKEN 0x11) are rejected
-///     as INVALID FIELD IN CDB. ESXi and Windows VAAI XCOPY both
-///     issue LID1.
+///   - Service action 0x00 (LID1). LID4 (0x01) is handled by
+///     `extended_copy_lid4` (same descriptor subset, different
+///     header); ODX actions (POPULATE TOKEN 0x10 / WRITE USING TOKEN
+///     0x11 / CANCEL ROD TOKEN 0x12) dispatch separately. ESXi and
+///     Windows VAAI XCOPY both issue LID1.
 ///   - Identification target descriptors (type 0xE4) carrying a
 ///     T10 vendor-ID designator — the same format thurvsa publishes
 ///     in INQUIRY VPD 0x83. NAA designators (designator type 0x03)
@@ -783,6 +784,7 @@ pub(super) async fn extended_copy(
     let sa = req.cdb[1] & 0x1F;
     match sa {
         0x00 => extended_copy_lid1(req, registry, nexus, reservations).await,
+        0x01 => extended_copy_lid4(req, registry, nexus, reservations).await,
         0x10 => populate_token(req, registry, nexus, tokens).await,
         0x11 => write_using_token(req, registry, nexus, reservations, tokens).await,
         0x12 => cancel_rod_token(req, tokens),
@@ -822,6 +824,40 @@ async fn extended_copy_lid1(
             // reject" so we don't bump either counter.
             return ScsiResponse::good(Vec::new());
         }
+        Err(ExtendedCopyParseError::ReservationConflict) => {
+            shared_telemetry::record::scsi_xcopy("reject");
+            return ScsiResponse::reservation_conflict();
+        }
+        Err(ExtendedCopyParseError::Sense(s)) => {
+            shared_telemetry::record::scsi_xcopy("reject");
+            return ScsiResponse::check(s);
+        }
+    };
+    extended_copy_execute(targets, planned).await
+}
+
+/// EXTENDED COPY (LID4) — opcode 0x83 service action 0x01 (SPC-4
+/// §6.4). LID4 carries a richer 48-byte parameter-list header (a
+/// 4-byte LIST IDENTIFIER, header-CSCD support, immediate-mode flag)
+/// but reuses the exact same CSCD target descriptor (0xE4) and
+/// block-to-block segment descriptor (0x02) bodies as LID1, so once
+/// the header is parsed the resolution + execution path is shared.
+///
+/// We implement the same block-to-block subset as the LID1 path. The
+/// IMMED bit is accepted and ignored — the copy still runs
+/// synchronously and RECEIVE COPY RESULTS reports it complete.
+/// Header CSCD descriptors and inline data are rejected (no host in
+/// our path uses them); no production initiator issues LID4 at all,
+/// so this exists purely for SPC-4 completeness.
+async fn extended_copy_lid4(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: Nexus,
+    reservations: &ReservationManager,
+) -> ScsiResponse {
+    let (targets, planned) = match parse_extended_copy_lid4(req, registry, &nexus, reservations) {
+        Ok(v) => v,
+        Err(ExtendedCopyParseError::Noop) => return ScsiResponse::good(Vec::new()),
         Err(ExtendedCopyParseError::ReservationConflict) => {
             shared_telemetry::record::scsi_xcopy("reject");
             return ScsiResponse::reservation_conflict();
@@ -911,6 +947,42 @@ fn parse_extended_copy(
             SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
         ));
     }
+    // Target descriptors begin right after the 16-byte LID1 header;
+    // segment descriptors follow them. The descriptor formats (0xE4
+    // identification CSCD, 0x02 block-to-block segment) are identical
+    // to LID4, so the resolution + planning is shared.
+    resolve_targets_and_plan(
+        plist,
+        16,
+        tdesc_len,
+        16 + tdesc_len,
+        sdesc_len,
+        registry,
+        nexus,
+        reservations,
+    )
+}
+
+/// Resolve the CSCD (target) descriptors and build the segment plan,
+/// then range-check + reservation/WORM-gate every segment. Shared by
+/// the LID1 (`parse_extended_copy`) and LID4
+/// (`parse_extended_copy_lid4`) header parsers, which differ only in
+/// header shape — the target descriptor (0xE4, 32 bytes) and
+/// block-to-block segment descriptor (0x02, 28 bytes) bodies are the
+/// same in both. `tdesc_off` / `sdesc_off` are byte offsets into
+/// `plist` where the target and segment descriptor lists begin; the
+/// caller has already checked both regions fit within `plist`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_targets_and_plan(
+    plist: &[u8],
+    tdesc_off: usize,
+    tdesc_len: usize,
+    sdesc_off: usize,
+    sdesc_len: usize,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: &Nexus,
+    reservations: &ReservationManager,
+) -> Result<(Vec<TargetHandle>, Vec<PlannedSegment>), ExtendedCopyParseError> {
     // Identification target descriptors are 32 bytes each (SPC-3
     // §6.3.6.3). VAAI sends one per CSCD reference; the source
     // and destination indices in each segment descriptor index
@@ -933,7 +1005,7 @@ fn parse_extended_copy(
     // back to the registry.
     let mut targets: Vec<TargetHandle> = Vec::with_capacity(tdesc_count);
     for i in 0..tdesc_count {
-        let off = 16 + i * 32;
+        let off = tdesc_off + i * 32;
         let desc = &plist[off..off + 32];
         let pair =
             resolve_target_descriptor(registry, desc).map_err(ExtendedCopyParseError::Sense)?;
@@ -944,7 +1016,6 @@ fn parse_extended_copy(
     // 4 (header) + 0x18 (body) = 28 bytes; reject any other
     // segment type up front so a malformed parameter list never
     // half-commits.
-    let sdesc_off = 16 + tdesc_len;
     let mut seg_cursor = 0usize;
     let mut planned: Vec<PlannedSegment> = Vec::new();
     while seg_cursor < sdesc_len {
@@ -1031,6 +1102,99 @@ fn parse_extended_copy(
         }
     }
     Ok((targets, planned))
+}
+
+/// Parse the EXTENDED COPY (LID4) parameter list (SPC-4 §6.4) and
+/// hand off to the shared resolver. The 48-byte header:
+///   byte 0       LIST FORMAT — must be 0x01 (the basic LID4 list
+///                format; other codes select header layouts we don't
+///                model)
+///   byte 1       flags (ignored)
+///   bytes 2-3    HEADER CSCD LIST LENGTH — must be 0 (no header CSCDs)
+///   bytes 4-14   reserved
+///   byte 15      flags2 (bit 0 IMMED, bit 1 G_SENSE) — accepted, ignored
+///   byte 16      HEADER CSCD TYPE CODE (unused when no header CSCDs)
+///   bytes 17-19  reserved
+///   bytes 20-23  LIST IDENTIFIER (ignored — XCOPY isn't list-tracked)
+///   bytes 24-41  reserved
+///   bytes 42-43  CSCD (target) DESCRIPTOR LIST LENGTH (16-bit BE)
+///   bytes 44-45  SEGMENT DESCRIPTOR LIST LENGTH (16-bit BE)
+///   bytes 46-47  INLINE DATA LENGTH (16-bit BE) — must be 0
+/// then the CSCD descriptors (0xE4), segment descriptors (0x02), and
+/// inline data, in that order.
+fn parse_extended_copy_lid4(
+    req: &ScsiRequest<'_>,
+    registry: &Arc<dyn VolumeLookup>,
+    nexus: &Nexus,
+    reservations: &ReservationManager,
+) -> Result<(Vec<TargetHandle>, Vec<PlannedSegment>), ExtendedCopyParseError> {
+    // PARAMETER LIST LENGTH in CDB bytes 10..14 (32-bit BE).
+    let plist_len =
+        u32::from_be_bytes([req.cdb[10], req.cdb[11], req.cdb[12], req.cdb[13]]) as usize;
+    if plist_len == 0 {
+        // Zero parameter list length specifies "no copy operation".
+        return Err(ExtendedCopyParseError::Noop);
+    }
+    if req.data_out.len() < plist_len {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let plist = &req.data_out[..plist_len];
+    const LID4_HEADER_LEN: usize = 48;
+    /// SPC-4 LID4 LIST FORMAT code for the basic parameter list.
+    const LID4_LIST_FORMAT: u8 = 0x01;
+    if plist.len() < LID4_HEADER_LEN {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    if plist[0] != LID4_LIST_FORMAT {
+        // Unknown LIST FORMAT — we can't trust the header layout.
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let header_cscd_len = u16::from_be_bytes([plist[2], plist[3]]) as usize;
+    if header_cscd_len != 0 {
+        // Header CSCD descriptors aren't modeled; the resolver
+        // expects the CSCD list to begin right after the header.
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let tdesc_len = u16::from_be_bytes([plist[42], plist[43]]) as usize;
+    let sdesc_len = u16::from_be_bytes([plist[44], plist[45]]) as usize;
+    let inline_len = u16::from_be_bytes([plist[46], plist[47]]) as usize;
+    if inline_len != 0 {
+        // Inline data isn't supported (mirrors the LID1 path).
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    if tdesc_len == 0 || sdesc_len == 0 {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    let need = LID4_HEADER_LEN
+        .saturating_add(tdesc_len)
+        .saturating_add(sdesc_len);
+    if need > plist.len() {
+        return Err(ExtendedCopyParseError::Sense(
+            SenseData::INVALID_FIELD_IN_PARAMETER_LIST,
+        ));
+    }
+    resolve_targets_and_plan(
+        plist,
+        LID4_HEADER_LEN,
+        tdesc_len,
+        LID4_HEADER_LEN + tdesc_len,
+        sdesc_len,
+        registry,
+        nexus,
+        reservations,
+    )
 }
 
 /// Execute a pre-validated XCOPY plan. Returns GOOD on full success,
@@ -3685,6 +3849,37 @@ mod tests {
         cdb
     }
 
+    /// Build a LID4 (sa 0x01) EXTENDED COPY parameter list: 48-byte
+    /// header (LIST FORMAT = 0x01, no header CSCDs, no inline data)
+    /// then the same 0xE4 target + 0x02 segment descriptor bodies as
+    /// LID1.
+    fn build_xcopy_lid4_param_list(targets: &[[u8; 32]], segments: &[[u8; 28]]) -> Vec<u8> {
+        let tdesc_len = targets.len() * 32;
+        let sdesc_len = segments.len() * 28;
+        let mut p = vec![0u8; 48 + tdesc_len + sdesc_len];
+        p[0] = 0x01; // LIST FORMAT
+        p[42..44].copy_from_slice(&(tdesc_len as u16).to_be_bytes());
+        p[44..46].copy_from_slice(&(sdesc_len as u16).to_be_bytes());
+        let mut off = 48;
+        for t in targets {
+            p[off..off + 32].copy_from_slice(t);
+            off += 32;
+        }
+        for s in segments {
+            p[off..off + 28].copy_from_slice(s);
+            off += 28;
+        }
+        p
+    }
+
+    fn xcopy_lid4_cdb(param_list_len: u32) -> [u8; 16] {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x83;
+        cdb[1] = 0x01; // service action = LID4
+        cdb[10..14].copy_from_slice(&param_list_len.to_be_bytes());
+        cdb
+    }
+
     fn rcr_cdb(service_action: u8, alloc_len: u32) -> [u8; 16] {
         let mut cdb = [0u8; 16];
         cdb[0] = 0x84;
@@ -3732,6 +3927,99 @@ mod tests {
         let src_hash = cache.writer().page_index().get(0).unwrap().unwrap();
         let dst_hash = cache.writer().page_index().get(1).unwrap().unwrap();
         assert_eq!(src_hash, dst_hash);
+    }
+
+    #[tokio::test]
+    async fn xcopy_lid4_same_lun_page_aligned_round_trips() {
+        // LID4 (sa 0x01) reuses the LID1 descriptor + execution path;
+        // a same-LUN page-aligned copy takes the hash-clone fast path
+        // exactly like LID1, just behind the 48-byte LID4 header.
+        let (_tmp, cache) = fresh_volume("vol_lid4").await;
+        let payload = page_pattern(0x77);
+        cache.write_bytes(0, &payload).await.unwrap();
+        cache.flush_all().await.unwrap();
+
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
+        let params = build_xcopy_lid4_param_list(&[target], &[seg]);
+        let cdb = xcopy_lid4_cdb(params.len() as u32);
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
+        assert!(r.sense.is_none(), "{:?}", r.sense);
+
+        let dst_off = (SECTORS_PER_PAGE * SECTOR) as u64;
+        let read_back = cache.read_bytes(dst_off, PAGE).await.unwrap();
+        assert_eq!(read_back, payload);
+        let src_hash = cache.writer().page_index().get(0).unwrap().unwrap();
+        let dst_hash = cache.writer().page_index().get(1).unwrap().unwrap();
+        assert_eq!(src_hash, dst_hash, "LID4 took the hash-clone fast path");
+    }
+
+    #[tokio::test]
+    async fn xcopy_lid4_rejects_bad_list_format() {
+        // A LID4 parameter list whose LIST FORMAT byte isn't 0x01
+        // selects a header layout we don't model; reject it.
+        let (_tmp, cache) = fresh_volume("vol_lid4_fmt").await;
+        cache.write_bytes(0, &page_pattern(0x01)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
+        let mut params = build_xcopy_lid4_param_list(&[target], &[seg]);
+        params[0] = 0x00; // invalid LIST FORMAT
+        let cdb = xcopy_lid4_cdb(params.len() as u32);
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
+    }
+
+    #[tokio::test]
+    async fn xcopy_lid4_rejects_inline_data() {
+        // INLINE DATA LENGTH != 0 is rejected (mirrors the LID1 path).
+        let (_tmp, cache) = fresh_volume("vol_lid4_inline").await;
+        cache.write_bytes(0, &page_pattern(0x02)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, cache.clone());
+            Arc::new(r)
+        };
+        let target = target_descriptor_for(cache.as_ref());
+        let seg = block_segment(0, 0, SECTORS_PER_PAGE as u16, 0, SECTORS_PER_PAGE as u64);
+        let mut params = build_xcopy_lid4_param_list(&[target], &[seg]);
+        // INLINE DATA LENGTH at bytes 46-47.
+        params[46..48].copy_from_slice(&1u16.to_be_bytes());
+        let cdb = xcopy_lid4_cdb(params.len() as u32);
+        let r = extended_copy(
+            &req(&cdb, &params, 0),
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &test_tokens(),
+        )
+        .await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
     }
 
     #[tokio::test]
@@ -3799,7 +4087,7 @@ mod tests {
             Arc::new(r)
         };
         let mut cdb = xcopy_cdb(0);
-        cdb[1] = 0x01; // LID4 — not implemented
+        cdb[1] = 0x13; // unassigned EXTENDED COPY service action
         let r = extended_copy(
             &req(&cdb, &[], 0),
             &registry,
