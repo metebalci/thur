@@ -464,8 +464,8 @@ struct DiskCacheConfig {
     /// re-read freshly-written tapes within seconds), at the cost
     /// of capping effective cache capacity by the volume of recent
     /// writes-plus-reads. Default 0 disables the pin and restores
-    /// pure LRU — see `ROADMAP.md` § Pin recent sealed chunks for
-    /// the RC/GA validation task.
+    /// pure LRU; tune empirically from the
+    /// `cache_miss_after_eviction_seconds` ghost-list histogram.
     #[serde(default = "default_recent_seal_pin_seconds")]
     recent_seal_pin_seconds: u64,
 

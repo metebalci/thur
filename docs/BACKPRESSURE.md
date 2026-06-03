@@ -346,8 +346,11 @@ position. This targets verify-after-write workloads (Veeam / NetBackup re-read
 freshly written pages within seconds; pure LRU would let an unrelated read
 burst evict them first). The trade-off is that effective cache capacity shrinks
 by the volume of write+read activity inside the window, so a tight budget under
-sustained load can see "all candidates pinned" warnings. The 0 default is
-validated before RC/GA against a workload trace (see `ROADMAP.md`).
+sustained load can see "all candidates pinned" warnings. The `0` default
+keeps pure LRU; whether a non-zero value helps is an empirical question,
+answered by the ghost-list telemetry below
+(`cache_miss_after_eviction_seconds`) — raise it only if that histogram
+shows misses clustering inside the verify-after-write window.
 
 ### Ghost-list telemetry — `cache_miss_after_eviction_seconds`
 

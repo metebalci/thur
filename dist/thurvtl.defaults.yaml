@@ -129,8 +129,8 @@ disk_cache:
   # verify-after-write pattern (backup software re-reading freshly
   # written tapes within seconds) at the cost of capping effective
   # cache capacity by recent write+read volume. 0 disables the pin
-  # (pure LRU); the default may change before RC/GA after a
-  # workload-trace validation pass — see ROADMAP.md.
+  # (pure LRU). Tune empirically from the
+  # cache_miss_after_eviction_seconds ghost-list histogram.
   recent_seal_pin_seconds: 0
   # Per-backend "ghost list" ring size. Each entry is ~100 bytes
   # (32 B BLAKE3 hash + 8 B timestamp + HashMap overhead), so the
