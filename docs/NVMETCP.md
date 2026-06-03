@@ -133,8 +133,11 @@ closes the connection with a C2HTermReq carrying a Fatal Error Status:
 1. **Initialization — ICReq → ICResp.** The first PDU on every accepted
    TCP connection must be ICReq (`PduType::ICReq`, 128 bytes — 8-byte
    common header + 120-byte payload). A `PFV != 0` is rejected with FES 0x01
-   (Invalid PDU Header Field). The server negotiates `dgst=0` (no digests)
-   and advertises `MAXH2CDATA = 128 KiB`. The host's MAXR2T is captured
+   (Invalid PDU Header Field). The server honors whatever header / data
+   digests the host requests in `ICReq.dgst` and echoes the agreed set in
+   `ICResp.dgst` (see *Header / data digests* below); it never *requires*
+   digests, so a host sending `dgst=0` keeps the no-digest fast path. It
+   advertises `MAXH2CDATA = 128 KiB`. The host's MAXR2T is captured
    per connection and clamped to ≥ 1 per §3.6.1.
 2. **Admission — Connect.** The first CapsuleCmd must be Admin Fabrics
    (`AdminOpcode::Fabrics`, opcode 0x7F) with FCTYPE at SQE byte 4 set to
@@ -623,19 +626,46 @@ records expose that common shape through the `HostCredentialEntry` /
 core. The DH-HMAC-CHAP-only `set-ctrl-key` / `clear-ctrl-key` verbs and each
 surface's `list` envelope stay surface-specific.
 
+## Header / data digests (CRC32C, NVMe/TCP §3.4)
+
+The handshake honors the header (`HDGSTF`) and data (`DDGSTF`) digests a host
+requests in `ICReq.dgst`, echoing the agreed set in `ICResp.dgst`. The server
+supports both and never requires either, so the choice is the host's: a host
+sending `dgst=0` keeps the no-digest fast path (the codec returns each PDU
+buffer untouched), while a host configured with `--hdr_digest` / `--data_digest`
+gets fully digested framing in both directions. This closes the interop gap
+where such a host would otherwise fail connection setup outright.
+
+The digest is CRC32C (Castagnoli, polynomial 0x1EDC6F41 — the same as iSCSI),
+transmitted little-endian, via the `crc32c` crate (hardware-accelerated on
+x86 SSE4.2). When enabled, a 4-byte header digest over the HLEN header bytes
+sits immediately after the header (the PDO bumps past it), and a 4-byte data
+digest trails the payload. All of this is centralized: `pdu::apply_digests`
+post-processes every outbound PDU, and `RawPdu::verify_header_digest` /
+`verify_data_digest` check the inbound direction. The negotiated `DigestCfg`
+threads from the handshake into the writer task (outbound) and reader task
+(inbound), and through the Connect + DH-HMAC-CHAP auth PDUs in between.
+
+Error handling follows §3.4: a header-digest mismatch is fatal (the header
+can't be trusted to isolate the offending command, so the connection is torn
+down with a C2HTermReq carrying FES 0x03, Header Digest Error), while a
+data-digest mismatch fails just the owning command with Data Transfer Error
+(Generic SC 0x04, DNR clear — the host may retry) and leaves the connection
+up. There is no FES for data-digest errors precisely because they are meant to
+be command-scoped. On an H2CData mismatch the per-command task drains the rest
+of the transfer off the wire before completing in error, so trailing H2CData
+PDUs don't strand as unknown-CCCID protocol violations.
+
+CRC32C also appears elsewhere in the codebase for an unrelated purpose — SSC
+LTO-7+ Logical Block Protection appends a per-tape-block CRC32C trailer
+(`core/mediachanger/src/lbp.rs`); that is a stored data guard, distinct from
+this transport-frame digest.
+
 ## Out of scope (with rationale)
 
 The following features are intentionally not implemented in this stack. Each
 entry describes why the current choice is correct and what would change the
 calculation.
-
-### Header / data digests (CRC32C, NVMe/TCP §3.5)
-
-The handshake negotiates `dgst=0` and the codec rejects PDUs with DGSTF bits
-set. TCP already provides a checksum, and the modern deployment story puts
-TLS-PSK underneath — AEAD over the whole stream. Digest negotiation doubles
-the codec surface for marginal benefit. Hosts that require digests will see
-negotiation fail and should be pointed at a different target.
 
 ### Multi-outstanding R2T
 

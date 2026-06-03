@@ -65,6 +65,12 @@
 #                         non-admitted volume stays invisible. Requires
 #                         nvme-cli + kernel with dhchap support. Composes
 #                         with --tls ("dhchap+tls").
+#   --digest              Negotiate CRC32C header + data digests (NVMe-TCP
+#                         §3.4, issue #78) by adding `--hdr-digest
+#                         --data-digest` to nvme connect. The kernel host
+#                         computes and verifies a digest on every PDU;
+#                         the full round-trip below then runs over digested
+#                         framing. Composes with --tls / --dhchap.
 #
 #   Both auth modes set `nvmetcp.{tls,auth}.identity_file` to a path
 #   OUTSIDE <data_dir> and assert the CLI `add` wrote there (not under
@@ -97,6 +103,7 @@ PSK_KEY_STR=""
 USE_DHCHAP=0
 DHCHAP_KEY_STR=""
 DHCHAP_CTRL_STR=""
+USE_DIGEST=0
 
 # Snapshot the original args BEFORE the parse loop shifts them away —
 # the `keyctl session -` re-exec below (TLS runs only) needs them, and
@@ -111,6 +118,7 @@ while [[ $# -gt 0 ]]; do
         --discovery-port) DISCOVERY_PORT="$2"; shift 2 ;;
         --tls) USE_TLS=1; shift ;;
         --dhchap) USE_DHCHAP=1; shift ;;
+        --digest) USE_DIGEST=1; shift ;;
         *)
             if parse_common_daemon_arg "$@"; then
                 shift "$_CONSUMED_ARGS"
@@ -507,6 +515,11 @@ connect_nvmetcp() {
     if [[ $USE_DHCHAP -eq 1 ]]; then
         tls_args+=(--dhchap-secret "$DHCHAP_KEY_STR")
         [[ -n "$DHCHAP_CTRL_STR" ]] && tls_args+=(--dhchap-ctrl-secret "$DHCHAP_CTRL_STR")
+    fi
+    if [[ $USE_DIGEST -eq 1 ]]; then
+        # Issue #78: negotiate CRC32C header + data digests. The kernel
+        # nvme_tcp host computes and verifies them on every PDU.
+        tls_args+=(--hdr-digest --data-digest)
     fi
     if ! nvme connect -t tcp -a 127.0.0.1 -s "$NVMETCP_PORT" \
         -n "$SUBNQN" --hostnqn "$HOST_NQN" "${tls_args[@]}" \

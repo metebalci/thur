@@ -42,9 +42,18 @@
 //!
 //! Digests are negotiated in ICReq / ICResp; until both sides agree
 //! to enable them (DGST bits 0 / 1), the flags bits remain 0 on every
-//! PDU. The MVP server in this crate always negotiates 0 (no
-//! digests), so the codec keeps the parse paths simple — digest
-//! bytes are not allocated and not verified.
+//! PDU. The negotiated state is carried per-connection as a
+//! [`DigestCfg`]. When header digests are on, a 4-byte CRC32C of the
+//! PDU header (the HLEN bytes) sits immediately after the header and
+//! before any PDO padding; when data digests are on, a 4-byte CRC32C
+//! of the data payload trails it. [`apply_digests`] post-processes a
+//! freshly-built (digest-free) PDU to insert both, fixing up the
+//! FLAGS / PDO / PLEN fields; [`RawPdu::verify_header_digest`] /
+//! [`RawPdu::verify_data_digest`] check the inbound direction.
+//!
+//! NVMe-TCP §3.4 specifies CRC32C (Castagnoli, the same polynomial
+//! iSCSI uses), transmitted little-endian — matching the rest of the
+//! NVMe wire format.
 
 use bytes::{Buf, BufMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -81,6 +90,14 @@ pub mod error {
         PdoOutOfBounds { pdo: u8, plen: u32 },
         #[error("PDO {pdo} falls inside the common header (must be >= 8)")]
         PdoInHeader { pdo: u8 },
+        #[error("header digest negotiated but HDGSTF flag not set on inbound PDU")]
+        HeaderDigestMissing,
+        #[error("header digest mismatch: computed 0x{computed:08X}, received 0x{received:08X}")]
+        HeaderDigestMismatch { computed: u32, received: u32 },
+        #[error("data digest mismatch: computed 0x{computed:08X}, received 0x{received:08X}")]
+        DataDigestMismatch { computed: u32, received: u32 },
+        #[error("PDU too short to hold the negotiated digest fields")]
+        DigestTruncated,
         #[error("I/O error reading PDU: {0}")]
         Io(#[from] std::io::Error),
         #[error("base SQE parse: {0}")]
@@ -99,6 +116,101 @@ pub const MAX_PDU_BYTES: u32 = 256 * 1024;
 pub const FLAGS_HDGSTF: u8 = 1 << 0;
 /// Data-digest flag bit (FL[1]).
 pub const FLAGS_DDGSTF: u8 = 1 << 1;
+/// Wire length of one CRC32C digest field (header or data).
+pub const DIGEST_LEN: usize = 4;
+
+/// Per-connection digest state, negotiated once in ICReq / ICResp and
+/// then applied to every subsequent PDU. The two booleans map 1:1 to
+/// the DGST byte bits ([`FLAGS_HDGSTF`] / [`FLAGS_DDGSTF`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DigestCfg {
+    pub header: bool,
+    pub data: bool,
+}
+
+impl DigestCfg {
+    /// No digests — the default until ICResp negotiates otherwise.
+    pub const NONE: Self = Self {
+        header: false,
+        data: false,
+    };
+
+    /// Decode the ICReq / ICResp DGST byte (bit 0 = header, bit 1 = data).
+    pub fn from_dgst_byte(b: u8) -> Self {
+        Self {
+            header: b & FLAGS_HDGSTF != 0,
+            data: b & FLAGS_DDGSTF != 0,
+        }
+    }
+
+    /// Encode back to the DGST byte for the ICResp payload.
+    pub fn to_dgst_byte(self) -> u8 {
+        let mut b = 0;
+        if self.header {
+            b |= FLAGS_HDGSTF;
+        }
+        if self.data {
+            b |= FLAGS_DDGSTF;
+        }
+        b
+    }
+
+    /// True if either digest is enabled.
+    pub fn any(self) -> bool {
+        self.header || self.data
+    }
+}
+
+/// Post-process a freshly-built, digest-free PDU to add the negotiated
+/// CRC32C digests (NVMe-TCP §3.4). The builders ([`build_c2hdata_pdu`],
+/// [`build_capsule_resp_pdu`], …) all emit `[header (HLEN)] [data?]`
+/// with PDO = HLEN (data PDUs) or 0 (no data) and PLEN = total length;
+/// this inserts a 4-byte header digest after the header and appends a
+/// 4-byte data digest after the payload, then fixes FLAGS / PDO / PLEN.
+///
+/// `cfg = NONE` is the hot path for connections that didn't negotiate
+/// digests: the input buffer is returned untouched.
+pub fn apply_digests(mut pdu: Vec<u8>, cfg: DigestCfg) -> Vec<u8> {
+    if !cfg.any() {
+        return pdu;
+    }
+    let hlen = pdu[2] as usize;
+    let pdo = pdu[3];
+    // Data is everything the builder placed after the HLEN-byte header
+    // (empty for no-data PDUs, where pdo == 0).
+    let data = pdu.split_off(hlen);
+    let has_data = !data.is_empty();
+
+    // Bring the header (`pdu`, now exactly HLEN bytes) to its final
+    // on-wire form *before* CRC'ing it — the header digest covers FLAGS,
+    // PDO, and PLEN as they ship.
+    if cfg.header {
+        pdu[1] |= FLAGS_HDGSTF;
+    }
+    if cfg.data && has_data {
+        pdu[1] |= FLAGS_DDGSTF;
+    }
+    let extra =
+        if cfg.header { DIGEST_LEN } else { 0 } + if cfg.data && has_data { DIGEST_LEN } else { 0 };
+    let plen = (hlen + extra + data.len()) as u32;
+    pdu[4..8].copy_from_slice(&plen.to_le_bytes());
+    // Data shifts right by the header digest; bump PDO to match (no-data
+    // PDUs keep PDO = 0).
+    if pdo != 0 && cfg.header {
+        pdu[3] = pdo + DIGEST_LEN as u8;
+    }
+
+    let mut out = Vec::with_capacity(plen as usize);
+    out.extend_from_slice(&pdu);
+    if cfg.header {
+        out.extend_from_slice(&crc32c::crc32c(&pdu).to_le_bytes());
+    }
+    out.extend_from_slice(&data);
+    if cfg.data && has_data {
+        out.extend_from_slice(&crc32c::crc32c(&data).to_le_bytes());
+    }
+    out
+}
 /// C2HData: this is the final C2HData PDU of a multi-PDU response.
 pub const C2H_FLAGS_LAST_PDU: u8 = 1 << 2;
 /// C2HData: treat as implicit success completion (no CapsuleResp
@@ -481,6 +593,69 @@ impl RawPdu {
         let data_end_in_body = data_end_in_pdu - CommonHeader::WIRE_LEN;
         Ok(Some(&self.body[data_start_in_body..data_end_in_body]))
     }
+
+    /// Verify the header digest against `cfg`. No-op when header
+    /// digests weren't negotiated. When they were, the PDU MUST carry
+    /// the HDGSTF flag and a matching CRC32C over its HLEN header bytes
+    /// (common header + type-specific header); the 4-byte digest sits
+    /// immediately after the header (PDU offset HLEN). A mismatch is a
+    /// fatal protocol error (the caller emits C2HTermReq).
+    pub fn verify_header_digest(&self, cfg: DigestCfg) -> Result<(), PduError> {
+        if !cfg.header {
+            return Ok(());
+        }
+        if self.header.flags & FLAGS_HDGSTF == 0 {
+            return Err(PduError::HeaderDigestMissing);
+        }
+        let hlen = self.header.hlen as usize;
+        let body_hdr_len = hlen - CommonHeader::WIRE_LEN;
+        if self.body.len() < body_hdr_len + DIGEST_LEN {
+            return Err(PduError::DigestTruncated);
+        }
+        // Reconstruct the on-wire header bytes (common 8 + type-specific)
+        // the host CRC'd; write_to round-trips the parsed fields exactly,
+        // flags included.
+        let mut header_bytes = Vec::with_capacity(hlen);
+        self.header.write_to(&mut header_bytes);
+        header_bytes.extend_from_slice(&self.body[..body_hdr_len]);
+        let computed = crc32c::crc32c(&header_bytes);
+        let received = u32::from_le_bytes([
+            self.body[body_hdr_len],
+            self.body[body_hdr_len + 1],
+            self.body[body_hdr_len + 2],
+            self.body[body_hdr_len + 3],
+        ]);
+        if computed != received {
+            return Err(PduError::HeaderDigestMismatch { computed, received });
+        }
+        Ok(())
+    }
+
+    /// Verify the data digest against `cfg`. No-op when data digests
+    /// weren't negotiated or this PDU carries no data payload (DDGSTF
+    /// clear). When present, the 4-byte CRC32C trails the payload (the
+    /// last 4 bytes of the PDU). A mismatch is NOT fatal — the caller
+    /// completes just the owning command with Data Transfer Error and
+    /// keeps the connection up (NVMe-TCP §3.4).
+    pub fn verify_data_digest(&self, cfg: DigestCfg) -> Result<(), PduError> {
+        if !cfg.data || self.header.flags & FLAGS_DDGSTF == 0 {
+            return Ok(());
+        }
+        let data = self.in_capsule_data()?.unwrap_or(&[]);
+        let plen = self.header.plen as usize;
+        // Data digest occupies the final DIGEST_LEN bytes of the PDU =
+        // the final DIGEST_LEN bytes of the body.
+        if self.body.len() < DIGEST_LEN || plen < DIGEST_LEN {
+            return Err(PduError::DigestTruncated);
+        }
+        let tail = &self.body[self.body.len() - DIGEST_LEN..];
+        let received = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        let computed = crc32c::crc32c(data);
+        if computed != received {
+            return Err(PduError::DataDigestMismatch { computed, received });
+        }
+        Ok(())
+    }
 }
 
 /// Decode a CapsuleCmd PDU into its SQE plus the in-capsule data
@@ -824,6 +999,138 @@ mod tests {
         let raw = RawPdu { header, body };
         let (_sqe, data) = parse_capsule_cmd(&raw).expect("parse");
         assert!(data.is_none());
+    }
+
+    /// Turn a full PDU buffer (header + body) into a `RawPdu`, the way
+    /// `read_async` would after reading it off the wire.
+    fn raw_from_bytes(pdu: &[u8]) -> RawPdu {
+        RawPdu {
+            header: CommonHeader::read_from(&pdu[..8]).unwrap(),
+            body: pdu[8..].to_vec(),
+        }
+    }
+
+    #[test]
+    fn crc32c_canonical_check_value() {
+        // The standard CRC32C check value for "123456789" (Castagnoli),
+        // shared by iSCSI / SCTP / ext4 / NVMe-TCP. Pins that we're using
+        // the right polynomial, not IEEE CRC-32.
+        assert_eq!(crc32c::crc32c(b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
+    fn digest_cfg_byte_round_trip() {
+        for (byte, header, data) in [
+            (0b00, false, false),
+            (0b01, true, false),
+            (0b10, false, true),
+            (0b11, true, true),
+        ] {
+            let cfg = DigestCfg::from_dgst_byte(byte);
+            assert_eq!(cfg.header, header);
+            assert_eq!(cfg.data, data);
+            assert_eq!(cfg.to_dgst_byte(), byte);
+            assert_eq!(cfg.any(), header || data);
+        }
+    }
+
+    #[test]
+    fn apply_digests_none_is_passthrough() {
+        let pdu = build_c2hdata_pdu(0x1234, &[1, 2, 3, 4]);
+        let out = apply_digests(pdu.clone(), DigestCfg::NONE);
+        assert_eq!(pdu, out);
+    }
+
+    #[test]
+    fn apply_both_digests_round_trip() {
+        let data = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+        let cfg = DigestCfg {
+            header: true,
+            data: true,
+        };
+        let out = apply_digests(build_c2hdata_pdu(0x55AA, &data), cfg);
+        // 8 common + 16 c2h header + 4 hdgst + 5 data + 4 ddgst = 37
+        assert_eq!(out.len(), 37);
+        let raw = raw_from_bytes(&out);
+        assert_eq!(raw.header.flags & FLAGS_HDGSTF, FLAGS_HDGSTF);
+        assert_eq!(raw.header.flags & FLAGS_DDGSTF, FLAGS_DDGSTF);
+        // PDO bumped past the 4-byte header digest: 24 -> 28.
+        assert_eq!(raw.header.pdo, 28);
+        assert_eq!(raw.header.plen, 37);
+        // Data still extracts correctly with both digests present.
+        assert_eq!(raw.in_capsule_data().unwrap().unwrap(), &data);
+        raw.verify_header_digest(cfg).expect("header digest ok");
+        raw.verify_data_digest(cfg).expect("data digest ok");
+    }
+
+    #[test]
+    fn apply_header_digest_only_no_data_pdu() {
+        let cfg = DigestCfg {
+            header: true,
+            data: true,
+        };
+        // CapsuleResp carries no data: header digest present, DDGSTF must
+        // stay clear (no data digest appended).
+        let cqe = Cqe::success(0x1234, 0, 7, 0);
+        let out = apply_digests(build_capsule_resp_pdu(&cqe), cfg);
+        assert_eq!(out.len(), 24 + DIGEST_LEN); // no data digest
+        let raw = raw_from_bytes(&out);
+        assert_eq!(raw.header.flags & FLAGS_HDGSTF, FLAGS_HDGSTF);
+        assert_eq!(raw.header.flags & FLAGS_DDGSTF, 0);
+        assert_eq!(raw.header.pdo, 0);
+        raw.verify_header_digest(cfg).expect("header digest ok");
+        raw.verify_data_digest(cfg).expect("no data digest -> ok");
+    }
+
+    #[test]
+    fn verify_header_digest_detects_corruption() {
+        let cfg = DigestCfg {
+            header: true,
+            data: false,
+        };
+        let mut out = apply_digests(build_c2hdata_pdu(0x55AA, &[1, 2, 3, 4]), cfg);
+        // Flip a byte in the type-specific header (CCCID low byte at PDU
+        // offset 8 = body[0]); the stored header digest no longer matches.
+        out[8] ^= 0xFF;
+        let raw = raw_from_bytes(&out);
+        assert!(matches!(
+            raw.verify_header_digest(cfg).unwrap_err(),
+            PduError::HeaderDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_header_digest_missing_flag_errors() {
+        let cfg = DigestCfg {
+            header: true,
+            data: false,
+        };
+        // PDU built without digests but the connection negotiated header
+        // digests — the absent HDGSTF flag is a protocol violation.
+        let raw = raw_from_bytes(&build_c2hdata_pdu(0x1, &[9, 9]));
+        assert!(matches!(
+            raw.verify_header_digest(cfg).unwrap_err(),
+            PduError::HeaderDigestMissing
+        ));
+    }
+
+    #[test]
+    fn verify_data_digest_detects_corruption() {
+        let cfg = DigestCfg {
+            header: false,
+            data: true,
+        };
+        let mut out = apply_digests(build_c2hdata_pdu(0x55AA, &[1, 2, 3, 4]), cfg);
+        // Flip a data byte (PDO = 24 with header digest off): the trailing
+        // data digest no longer matches.
+        out[24] ^= 0xFF;
+        let raw = raw_from_bytes(&out);
+        assert!(matches!(
+            raw.verify_data_digest(cfg).unwrap_err(),
+            PduError::DataDigestMismatch { .. }
+        ));
+        // Header digest wasn't negotiated, so that check is a no-op.
+        raw.verify_header_digest(cfg).expect("header check skipped");
     }
 
     #[test]

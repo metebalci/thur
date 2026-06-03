@@ -336,6 +336,10 @@ mod fes {
     /// PDU Sequence Error — wrong PDU type for this phase
     /// (e.g. CapsuleCmd before Connect succeeds).
     pub const PDU_SEQUENCE_ERROR: u16 = 0x02;
+    /// Header Digest Error — inbound header digest didn't verify
+    /// (negotiated but absent / mismatched). Fatal: the header can't be
+    /// trusted, so the offending command can't be isolated.
+    pub const HEADER_DIGEST_ERROR: u16 = 0x03;
     /// Invalid PDU Header Type — opcode byte we don't recognize.
     pub const INVALID_PDU_HEADER_TYPE: u16 = 0x07;
 }
@@ -368,6 +372,11 @@ struct H2CDataChunk {
     datao: u32,
     data: Vec<u8>,
     last_pdu: bool,
+    /// False when the PDU's data digest failed to verify (data digests
+    /// negotiated). The per-command task drains the rest of the transfer
+    /// off the wire, then completes the command with Data Transfer Error
+    /// rather than dispatching corrupt data to the handler.
+    digest_ok: bool,
 }
 
 /// Connection-wide outbound PDU intent, drained by the writer task.
@@ -426,7 +435,7 @@ where
     // State 1: Initialization — ICReq → ICResp.
     let icreq_pdu = pdu::RawPdu::read_async(&mut stream).await?;
     if icreq_pdu.header.pdu_type != pdu::PduType::ICReq {
-        write_term_req(&mut stream, fes::PDU_SEQUENCE_ERROR).await?;
+        write_term_req(&mut stream, fes::PDU_SEQUENCE_ERROR, pdu::DigestCfg::NONE).await?;
         anyhow::bail!(
             "first PDU was {:?}, expected ICReq",
             icreq_pdu.header.pdu_type
@@ -434,7 +443,12 @@ where
     }
     let icreq = pdu::ICReq::read_from(&icreq_pdu.body[..pdu::ICReq::PAYLOAD_LEN])?;
     if icreq.pfv != 0 {
-        write_term_req(&mut stream, fes::INVALID_PDU_HEADER_FIELD).await?;
+        write_term_req(
+            &mut stream,
+            fes::INVALID_PDU_HEADER_FIELD,
+            pdu::DigestCfg::NONE,
+        )
+        .await?;
         anyhow::bail!("unsupported ICReq.PFV={}", icreq.pfv);
     }
     tracing::debug!(
@@ -449,19 +463,34 @@ where
     // treat as 1 outstanding R2T per command". MVP only ever issues
     // one R2T per command anyway, so this is purely a sanity floor.
     let host_maxr2t = icreq.maxr2t.max(1);
+    // Digest negotiation (NVMe/TCP §3.4): the host requests header /
+    // data digests in ICReq.dgst; we support both, so we honor whatever
+    // it asked for and never require digests it didn't (a host that
+    // sends dgst=0 keeps the no-digest fast path). The agreed config is
+    // echoed in ICResp and threaded through every subsequent PDU.
+    let dgst = pdu::DigestCfg::from_dgst_byte(icreq.dgst);
     let icresp = pdu::ICResp {
         pfv: 0,
         cpda: 0,
-        dgst: 0, // negotiate digests off; MVP keeps the codec simple
+        dgst: dgst.to_dgst_byte(),
         maxh2cdata: ADVERTISED_MAXH2CDATA,
     };
+    // ICResp itself carries no digest — digests apply to PDUs *after*
+    // it, once both sides have agreed.
     stream.write_all(&icresp.to_pdu()).await?;
     stream.flush().await?;
 
     // State 2: Admission — Connect (first CapsuleCmd).
     let connect_pdu = pdu::RawPdu::read_async(&mut stream).await?;
+    // First PDU after ICResp — digests (if negotiated) now apply. A bad
+    // header digest is fatal; a bad data digest fails the Connect.
+    if connect_pdu.verify_header_digest(dgst).is_err() {
+        write_term_req(&mut stream, fes::HEADER_DIGEST_ERROR, dgst).await?;
+        anyhow::bail!("Connect header digest verification failed");
+    }
+    let connect_data_ok = connect_pdu.verify_data_digest(dgst).is_ok();
     if connect_pdu.header.pdu_type != pdu::PduType::CapsuleCmd {
-        write_term_req(&mut stream, fes::PDU_SEQUENCE_ERROR).await?;
+        write_term_req(&mut stream, fes::PDU_SEQUENCE_ERROR, dgst).await?;
         anyhow::bail!(
             "expected Connect (CapsuleCmd), got {:?}",
             connect_pdu.header.pdu_type
@@ -472,21 +501,28 @@ where
         // Refuse anything before Connect succeeds. Per NVMe-oF the
         // host must Connect before any other admin / I/O command.
         let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-        stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
         anyhow::bail!("first command was not Admin Fabrics");
     }
     let fctype = nvme_base::fabrics::extract_fctype(&sqe);
     if fctype != Some(FabricsType::Connect) {
         let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-        stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
         anyhow::bail!("first Fabrics command was not Connect ({:?})", fctype);
+    }
+    // A corrupted Connect Data payload (data digest mismatch) can't be
+    // trusted to admit the host — refuse before parsing it.
+    if !connect_data_ok {
+        let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
+        anyhow::bail!("Connect data digest verification failed");
     }
     // QID lives at CDW10[31:16] — RECFMT at CDW10[15:0] is the
     // "Connection record format" version; we accept only 0.
     let recfmt = (sqe.cdw10 & 0xFFFF) as u16;
     if recfmt != 0 {
         let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-        stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
         anyhow::bail!("unsupported Connect RECFMT={}", recfmt);
     }
     let qid = ((sqe.cdw10 >> 16) & 0xFFFF) as u16;
@@ -494,7 +530,7 @@ where
         Some(d) if d.len() == ConnectData::WIRE_LEN => ConnectData::parse(d)?,
         _ => {
             let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-            stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+            send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
             anyhow::bail!("Connect Data wrong size or missing");
         }
     };
@@ -506,7 +542,7 @@ where
             "nvme-tcp: Connect SUBNQN mismatch - refusing",
         );
         let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-        stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
         anyhow::bail!("SUBNQN mismatch");
     }
     // Defense-in-depth (TLS-PSK only): the host NQN we admitted at
@@ -523,7 +559,7 @@ where
             "nvme-tcp: HostNQN mismatch between TLS PSK identity and Connect - refusing",
         );
         let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-        stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+        send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
         anyhow::bail!("HostNQN TLS/Connect mismatch");
     }
     // Bind this connection to a controller. An admin-queue Connect
@@ -548,7 +584,7 @@ where
                 "nvme-tcp: Connect controller binding refused",
             );
             let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::connect_invalid_parameters());
-            stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+            send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await?;
             anyhow::bail!("Connect controller binding refused: {e}");
         }
     };
@@ -565,11 +601,7 @@ where
     // fails (host gone), release the binding before bailing — otherwise
     // the controller's CNTLID + association leak in the registry with no
     // teardown path to reclaim them.
-    if let Err(e) = stream.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await {
-        aer.disconnect(conn_token);
-        return Err(e.into());
-    }
-    if let Err(e) = stream.flush().await {
+    if let Err(e) = send_pdu(&mut stream, pdu::build_capsule_resp_pdu(&cqe), dgst).await {
         aer.disconnect(conn_token);
         return Err(e.into());
     }
@@ -608,6 +640,7 @@ where
                 &connect_data.hostnqn,
                 dhpath,
                 audit.as_ref(),
+                dgst,
             ),
         )
         .await;
@@ -717,7 +750,7 @@ where
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundPdu>(OUTBOUND_CAPACITY);
     let commands: CommandTable = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut writer = tokio::spawn(writer_task(write_half, outbound_rx, peer, qid));
+    let mut writer = tokio::spawn(writer_task(write_half, outbound_rx, peer, qid, dgst));
     let mut reader = tokio::spawn(reader_task(
         read_half,
         peer,
@@ -731,6 +764,7 @@ where
         qid,
         admission_volumes.map(Arc::new),
         connect_data.hostid,
+        dgst,
     ));
 
     // Two valid exit paths:
@@ -801,6 +835,7 @@ async fn reader_task<R>(
     // 128-bit Host Identifier from Connect; names the reservation
     // registrant. Copy, so it threads into every per-command task.
     host_id: [u8; 16],
+    dgst: pdu::DigestCfg,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -840,6 +875,19 @@ where
                 return Err(e.into());
             }
         };
+        // Header digest (if negotiated) gates everything else: a bad
+        // header means we can't trust the PDU type / CCCID, so it's a
+        // fatal connection error (NVMe/TCP §3.4). Data digests are
+        // checked per-arm below, where the owning command is known.
+        if let Err(e) = raw.verify_header_digest(dgst) {
+            tracing::warn!(peer = %peer, error = %e, "nvme-tcp: header digest error");
+            let _ = outbound
+                .send(OutboundPdu::TermReq {
+                    fes: fes::HEADER_DIGEST_ERROR,
+                })
+                .await;
+            return Err(e.into());
+        }
         match raw.header.pdu_type {
             pdu::PduType::H2CTermReq => {
                 tracing::info!(peer = %peer, "nvme-tcp: H2CTermReq from host, closing");
@@ -858,6 +906,23 @@ where
                         return Err(e.into());
                     }
                 };
+                // Data digest (if negotiated) verified here, before the
+                // chunk reaches the per-command task. A mismatch isn't
+                // fatal — the chunk is forwarded flagged so the owning
+                // command completes with Data Transfer Error while the
+                // connection stays up (NVMe/TCP §3.4).
+                let digest_ok = match raw.verify_data_digest(dgst) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer,
+                            cccid = h2c.cccid,
+                            error = %e,
+                            "nvme-tcp: H2CData data digest error - failing command",
+                        );
+                        false
+                    }
+                };
                 let sender = {
                     let map = commands.lock().await;
                     map.get(&h2c.cccid).cloned()
@@ -869,6 +934,7 @@ where
                             datao: h2c.datao,
                             data: h2c.data.to_vec(),
                             last_pdu: h2c.last_pdu,
+                            digest_ok,
                         };
                         let _ = tx.send(chunk).await;
                     }
@@ -901,6 +967,26 @@ where
                     }
                 };
                 let icd_owned = icd.map(|s| s.to_vec()).unwrap_or_default();
+
+                // In-capsule data digest (if negotiated + present): a
+                // mismatch fails just this command with Data Transfer
+                // Error; the connection survives (NVMe/TCP §3.4).
+                if let Err(e) = raw.verify_data_digest(dgst) {
+                    tracing::warn!(
+                        peer = %peer,
+                        cid = sqe.cid,
+                        error = %e,
+                        "nvme-tcp: CapsuleCmd data digest error - failing command",
+                    );
+                    let cqe = Cqe::failure(sqe.cid, 0, 0, StatusField::data_transfer_error());
+                    let _ = outbound
+                        .send(OutboundPdu::CommandResponse {
+                            cqe,
+                            data_in: Vec::new(),
+                        })
+                        .await;
+                    continue;
+                }
 
                 // Fabrics — Property Get/Set/Disconnect touch the
                 // shared ControllerRegs. They have no R2T flow and no
@@ -1200,6 +1286,7 @@ async fn writer_task<W>(
     mut outbound: mpsc::Receiver<OutboundPdu>,
     peer: std::net::SocketAddr,
     qid: u16,
+    dgst: pdu::DigestCfg,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -1213,7 +1300,10 @@ where
                 r2tl,
             } => {
                 write
-                    .write_all(&pdu::build_r2t_pdu(cccid, ttag, r2to, r2tl))
+                    .write_all(&pdu::apply_digests(
+                        pdu::build_r2t_pdu(cccid, ttag, r2to, r2tl),
+                        dgst,
+                    ))
                     .await?;
                 write.flush().await?;
             }
@@ -1238,18 +1328,27 @@ where
                         cqe.status == StatusField::SUCCESS && cqe.dw0 == 0 && cqe.dw1 == 0;
                     let extra = if can_fold { pdu::C2H_FLAGS_SUCCESS } else { 0 };
                     write
-                        .write_all(&pdu::build_c2hdata_pdu_with_flags(cqe.cid, &data_in, extra))
+                        .write_all(&pdu::apply_digests(
+                            pdu::build_c2hdata_pdu_with_flags(cqe.cid, &data_in, extra),
+                            dgst,
+                        ))
                         .await?;
                     if !can_fold {
-                        write.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+                        write
+                            .write_all(&pdu::apply_digests(pdu::build_capsule_resp_pdu(&cqe), dgst))
+                            .await?;
                     }
                 } else {
-                    write.write_all(&pdu::build_capsule_resp_pdu(&cqe)).await?;
+                    write
+                        .write_all(&pdu::apply_digests(pdu::build_capsule_resp_pdu(&cqe), dgst))
+                        .await?;
                 }
                 write.flush().await?;
             }
             OutboundPdu::TermReq { fes } => {
-                let _ = write.write_all(&pdu::build_c2h_term_req_pdu(fes)).await;
+                let _ = write
+                    .write_all(&pdu::apply_digests(pdu::build_c2h_term_req_pdu(fes), dgst))
+                    .await;
                 let _ = write.flush().await;
                 tracing::debug!(peer = %peer, fes, "nvme-tcp: writer exiting after TermReq");
                 return Ok(());
@@ -1315,6 +1414,11 @@ async fn handle_command(
         }
         let r2t_end = (r2to as u64) + (r2tl as u64);
         let mut received: u32 = 0;
+        // Set if any H2CData chunk failed its data digest. We keep
+        // draining the transfer off the wire (so trailing H2CData PDUs
+        // don't strand as unknown-CCCID protocol errors), then complete
+        // the command with Data Transfer Error instead of dispatching.
+        let mut data_corrupt = false;
         while received < r2tl {
             let chunk = match rx.recv().await {
                 Some(c) => c,
@@ -1324,6 +1428,7 @@ async fn handle_command(
                     return;
                 }
             };
+            data_corrupt |= !chunk.digest_ok;
             if chunk.ttag != TTAG {
                 tracing::warn!(
                     peer = %peer,
@@ -1393,6 +1498,17 @@ async fn handle_command(
             }
         }
         remove_from_table(&commands, cccid).await;
+        if data_corrupt {
+            // Transfer arrived but at least one PDU's data digest didn't
+            // verify — fail the command (host may retry; DNR clear).
+            let _ = outbound
+                .send(OutboundPdu::CommandResponse {
+                    cqe: Cqe::failure(cccid, qid, 0, StatusField::data_transfer_error()),
+                    data_in: Vec::new(),
+                })
+                .await;
+            return;
+        }
         Some(assembled)
     } else if matches!(data_direction(sqe.opcode), DataDirection::HostToController) {
         // Fully in-capsule (ICD covers the SGL length, or SGL = 0).
@@ -1582,25 +1698,39 @@ fn select_dhgroup(offered: &[u8]) -> Option<u8> {
 /// Fabrics command of the expected FCTYPE; returns the SQE plus the
 /// in-capsule message bytes (empty for Authentication Receive). A
 /// non-conforming PDU is a transport violation -> C2HTermReq + bail.
-async fn recv_auth_capsule<S>(stream: &mut S, expect: FabricsType) -> Result<(Sqe, Vec<u8>)>
+async fn recv_auth_capsule<S>(
+    stream: &mut S,
+    expect: FabricsType,
+    dgst: pdu::DigestCfg,
+) -> Result<(Sqe, Vec<u8>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let raw = pdu::RawPdu::read_async(stream).await?;
+    // Digests (if negotiated) apply to auth PDUs too — a bad header is
+    // fatal; a corrupt auth payload (data digest) can't be trusted to
+    // drive the exchange, so bail and let the connection close.
+    if raw.verify_header_digest(dgst).is_err() {
+        write_term_req(stream, fes::HEADER_DIGEST_ERROR, dgst).await?;
+        anyhow::bail!("auth: header digest verification failed");
+    }
+    if raw.verify_data_digest(dgst).is_err() {
+        anyhow::bail!("auth: data digest verification failed");
+    }
     if raw.header.pdu_type != pdu::PduType::CapsuleCmd {
-        write_term_req(stream, fes::PDU_SEQUENCE_ERROR).await?;
+        write_term_req(stream, fes::PDU_SEQUENCE_ERROR, dgst).await?;
         anyhow::bail!("auth: expected CapsuleCmd, got {:?}", raw.header.pdu_type);
     }
     let (sqe, data) = pdu::parse_capsule_cmd(&raw)?;
     if AdminOpcode::from_u8(sqe.opcode) != Some(AdminOpcode::Fabrics) {
-        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD).await?;
+        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD, dgst).await?;
         anyhow::bail!(
             "auth: expected Admin Fabrics opcode, got 0x{:02X}",
             sqe.opcode
         );
     }
     if nvme_base::fabrics::extract_fctype(&sqe) != Some(expect) {
-        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD).await?;
+        write_term_req(stream, fes::INVALID_PDU_HEADER_FIELD, dgst).await?;
         anyhow::bail!("auth: unexpected Fabrics command (wanted {:?})", expect);
     }
     Ok((sqe, data.map(|d| d.to_vec()).unwrap_or_default()))
@@ -1611,14 +1741,16 @@ where
 /// Authentication Receive, not as a command error, so a well-formed
 /// Send always completes successfully. `qid` is echoed in the CQE SQID
 /// to match the Connect Response (consistent on I/O-queue auth).
-async fn ack_auth_send<S>(stream: &mut S, cid: u16, qid: u16) -> Result<()>
+async fn ack_auth_send<S>(stream: &mut S, cid: u16, qid: u16, dgst: pdu::DigestCfg) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    stream
-        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)))
-        .await?;
-    stream.flush().await?;
+    send_pdu(
+        stream,
+        pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)),
+        dgst,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1632,31 +1764,39 @@ where
 /// Command rather than over-sending — and the auth phase bails. Our
 /// messages stay well under any conformant host's AL (the Challenge is
 /// <= ~1.1 KiB at FFDHE-8192), so this never trips in practice.
-async fn send_auth_message<S>(stream: &mut S, cid: u16, qid: u16, al: u32, msg: &[u8]) -> Result<()>
+async fn send_auth_message<S>(
+    stream: &mut S,
+    cid: u16,
+    qid: u16,
+    al: u32,
+    msg: &[u8],
+    dgst: pdu::DigestCfg,
+) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     if msg.len() as u64 > u64::from(al) {
-        stream
-            .write_all(&pdu::build_capsule_resp_pdu(&Cqe::failure(
-                cid,
-                qid,
-                0,
-                StatusField::invalid_field(),
-            )))
-            .await?;
-        stream.flush().await?;
+        send_pdu(
+            stream,
+            pdu::build_capsule_resp_pdu(&Cqe::failure(cid, qid, 0, StatusField::invalid_field())),
+            dgst,
+        )
+        .await?;
         anyhow::bail!(
             "auth: controller message {} bytes exceeds host allocation length {} bytes",
             msg.len(),
             al
         );
     }
-    stream.write_all(&pdu::build_c2hdata_pdu(cid, msg)).await?;
     stream
-        .write_all(&pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)))
+        .write_all(&pdu::apply_digests(pdu::build_c2hdata_pdu(cid, msg), dgst))
         .await?;
-    stream.flush().await?;
+    send_pdu(
+        stream,
+        pdu::build_capsule_resp_pdu(&Cqe::success(cid, qid, 0, 0)),
+        dgst,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1752,6 +1892,7 @@ fn validate_reply(
 /// host's admission `volumes` on success; any failure has already
 /// emitted an AUTH_Failure (where the protocol allows) before the
 /// returned error closes the connection.
+#[allow(clippy::too_many_arguments)]
 async fn run_auth_phase<S>(
     stream: &mut S,
     peer: std::net::SocketAddr,
@@ -1760,6 +1901,7 @@ async fn run_auth_phase<S>(
     hostnqn: &str,
     dhchap_path: &std::path::Path,
     audit: &dyn LoginAuditSink,
+    dgst: pdu::DigestCfg,
 ) -> Result<Vec<String>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1789,7 +1931,8 @@ where
     };
 
     // --- Negotiate (Authentication Send) ---
-    let (neg_sqe, neg_data) = recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
+    let (neg_sqe, neg_data) =
+        recv_auth_capsule(stream, FabricsType::AuthenticationSend, dgst).await?;
     let fields = dhwire::parse_auth_command(&neg_sqe);
     if fields.secp != dhwire::NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER {
         tracing::debug!(
@@ -1800,7 +1943,7 @@ where
     }
     // Well-formed Send always ACKs; failures surface on the next Receive.
     let neg = dhwire::parse_negotiate(&neg_data);
-    ack_auth_send(stream, neg_sqe.cid, qid).await?;
+    ack_auth_send(stream, neg_sqe.cid, qid, dgst).await?;
 
     // Compute the negotiation outcome: parameters + resolved secret, or
     // a failure explanation code to return in AUTH_Failure.
@@ -1857,7 +2000,8 @@ where
     };
 
     // --- Challenge (Authentication Receive pulls it) ---
-    let (recv1_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    let (recv1_sqe, _) =
+        recv_auth_capsule(stream, FabricsType::AuthenticationReceive, dgst).await?;
     let recv1_al = dhwire::parse_auth_command(&recv1_sqe).tl_al;
     let (params, resolved) = match outcome {
         Err(reason) => {
@@ -1876,6 +2020,7 @@ where
                 qid,
                 recv1_al,
                 &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+                dgst,
             )
             .await?;
             anyhow::bail!("DH-HMAC-CHAP negotiation failed (reason_exp 0x{reason:02X})");
@@ -1907,12 +2052,12 @@ where
         None => Vec::new(),
     };
     let challenge = dhwire::build_challenge(t_id, params.hash_id, params.dhgid, s1, &c1, &dhval);
-    send_auth_message(stream, recv1_sqe.cid, qid, recv1_al, &challenge).await?;
+    send_auth_message(stream, recv1_sqe.cid, qid, recv1_al, &challenge, dgst).await?;
 
     // --- Reply (Authentication Send) ---
     let (reply_sqe, reply_data) =
-        recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
-    ack_auth_send(stream, reply_sqe.cid, qid).await?;
+        recv_auth_capsule(stream, FabricsType::AuthenticationSend, dgst).await?;
+    ack_auth_send(stream, reply_sqe.cid, qid, dgst).await?;
     // Validate R1 (and build R2 for mutual auth) off the reactor: the
     // DH session-key derivation is a full-width modular exponentiation,
     // and the HMACs ride along. `validate_reply` is pure CPU, so move
@@ -1943,7 +2088,8 @@ where
     };
 
     // --- Success1 / Failure (Authentication Receive pulls it) ---
-    let (recv2_sqe, _) = recv_auth_capsule(stream, FabricsType::AuthenticationReceive).await?;
+    let (recv2_sqe, _) =
+        recv_auth_capsule(stream, FabricsType::AuthenticationReceive, dgst).await?;
     let recv2_al = dhwire::parse_auth_command(&recv2_sqe).tl_al;
     match result2 {
         Err(reason) => {
@@ -1961,17 +2107,20 @@ where
                 qid,
                 recv2_al,
                 &dhwire::build_failure1(t_id, REASON_FAILED, reason),
+                dgst,
             )
             .await?;
             anyhow::bail!("DH-HMAC-CHAP host response invalid (reason_exp 0x{reason:02X})");
         }
-        Ok(success1) => send_auth_message(stream, recv2_sqe.cid, qid, recv2_al, &success1).await?,
+        Ok(success1) => {
+            send_auth_message(stream, recv2_sqe.cid, qid, recv2_al, &success1, dgst).await?
+        }
     }
 
     // --- Success2 (or Failure2 if the host rejected our R2) ---
     let (final_sqe, final_data) =
-        recv_auth_capsule(stream, FabricsType::AuthenticationSend).await?;
-    ack_auth_send(stream, final_sqe.cid, qid).await?;
+        recv_auth_capsule(stream, FabricsType::AuthenticationSend, dgst).await?;
+    ack_auth_send(stream, final_sqe.cid, qid, dgst).await?;
     match dhwire::peek_message_type(&final_data) {
         Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE1))
         | Some((dhwire::NVME_AUTH_COMMON_MESSAGES, dhwire::NVME_AUTH_DHCHAP_MESSAGE_FAILURE2)) => {
@@ -2003,13 +2152,26 @@ where
 /// / State 2 admission code (ICReq / Connect) — once State 3 has
 /// split the stream, the writer task owns all PDU emission and
 /// fatal errors travel as `OutboundPdu::TermReq` through the channel.
-async fn write_term_req<S>(stream: &mut S, fes: u16) -> Result<()>
+/// `dgst` is `NONE` for the pre-ICResp State-1 callers (no negotiation
+/// yet) and the negotiated config for everything after.
+async fn write_term_req<S>(stream: &mut S, fes: u16, dgst: pdu::DigestCfg) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let _ = stream.write_all(&pdu::build_c2h_term_req_pdu(fes)).await;
-    let _ = stream.flush().await;
+    let _ = send_pdu(stream, pdu::build_c2h_term_req_pdu(fes), dgst).await;
     Ok(())
+}
+
+/// Write one built PDU to the (unsplit) stream during the handshake /
+/// auth phase, applying the negotiated digests and flushing. The
+/// steady-state path uses the writer task instead; this is only for the
+/// sequential pre-State-3 PDUs.
+async fn send_pdu<S>(stream: &mut S, pdu: Vec<u8>, dgst: pdu::DigestCfg) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&pdu::apply_digests(pdu, dgst)).await?;
+    stream.flush().await
 }
 
 #[cfg(test)]
@@ -2333,6 +2495,12 @@ mod tests {
 
     /// Build an ICReq PDU.
     fn build_icreq_pdu() -> Vec<u8> {
+        build_icreq_pdu_dgst(0)
+    }
+
+    /// Build an ICReq PDU requesting `dgst` (bit 0 header, bit 1 data).
+    /// ICReq itself carries no digest — it's pre-negotiation.
+    fn build_icreq_pdu_dgst(dgst: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(pdu::ICReq::PDU_LEN as usize);
         let header = pdu::CommonHeader {
             pdu_type: pdu::PduType::ICReq,
@@ -2345,11 +2513,32 @@ mod tests {
         let icreq = pdu::ICReq {
             pfv: 0,
             hpda: 0,
-            dgst: 0,
+            dgst,
             maxr2t: 16,
         };
         icreq.write_to(&mut buf);
         buf
+    }
+
+    /// Build an Identify (admin) CapsuleCmd — the StubHandler answers it
+    /// with a 4096-byte data-in payload, so it exercises the C2HData
+    /// (controller->host) data digest path.
+    fn build_identify_pdu(cid: u16) -> Vec<u8> {
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = AdminOpcode::Identify as u8;
+        sqe[1] = 0b0100_0000; // PSDT = SglInline
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        build_capsule_cmd_pdu(sqe, &[])
+    }
+
+    /// Read one PDU and verify its digests against `cfg` (panicking on a
+    /// mismatch) — the host-side mirror of the server's verify path.
+    async fn read_pdu_verified(stream: &mut TcpStream, cfg: pdu::DigestCfg) -> pdu::RawPdu {
+        let raw = pdu::RawPdu::read_async(stream).await.unwrap();
+        raw.verify_header_digest(cfg)
+            .expect("inbound header digest");
+        raw.verify_data_digest(cfg).expect("inbound data digest");
+        raw
     }
 
     /// Build a CapsuleCmd PDU carrying `sqe_bytes` (always 64) and
@@ -2647,6 +2836,146 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Issue #78: a host requesting header + data digests negotiates them
+    /// in ICResp, and every subsequent PDU carries valid CRC32C digests
+    /// in both directions — verified end to end through Connect + a
+    /// data-bearing Identify.
+    #[tokio::test]
+    async fn digests_negotiated_end_to_end() {
+        let port = spawn_server(StubHandler::new(TEST_SUBNQN)).await;
+        let cfg = pdu::DigestCfg {
+            header: true,
+            data: true,
+        };
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // ICReq requests both digests (ICResp echoes the agreed set).
+        stream.write_all(&build_icreq_pdu_dgst(0b11)).await.unwrap();
+        stream.flush().await.unwrap();
+        let icresp_pdu = read_pdu_async(&mut stream).await; // ICResp itself: no digest
+        let icresp = pdu::ICResp::read_from(&icresp_pdu.body[..pdu::ICResp::PAYLOAD_LEN]).unwrap();
+        assert_eq!(icresp.dgst, 0b11, "controller honored header+data digests");
+
+        // Connect — now digested in both directions.
+        stream
+            .write_all(&pdu::apply_digests(build_connect_pdu(TEST_SUBNQN, 0), cfg))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let connect_resp = read_pdu_verified(&mut stream, cfg).await;
+        assert_eq!(connect_resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        assert_eq!(
+            connect_resp.header.flags & pdu::FLAGS_HDGSTF,
+            pdu::FLAGS_HDGSTF
+        );
+
+        // Identify — 4096-byte data-in folds into one digested C2HData.
+        stream
+            .write_all(&pdu::apply_digests(build_identify_pdu(0x55), cfg))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let c2h = read_pdu_verified(&mut stream, cfg).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+        assert_eq!(c2h.header.flags & pdu::FLAGS_HDGSTF, pdu::FLAGS_HDGSTF);
+        assert_eq!(c2h.header.flags & pdu::FLAGS_DDGSTF, pdu::FLAGS_DDGSTF);
+        let data = c2h.in_capsule_data().unwrap().unwrap();
+        assert_eq!(data.len(), 4096);
+        assert_eq!(data[0], 0xC0, "stub canary survived digest framing");
+    }
+
+    /// A corrupted inbound header digest is fatal: C2HTermReq with FES =
+    /// Header Digest Error (0x03), then the connection closes.
+    #[tokio::test]
+    async fn header_digest_error_is_fatal() {
+        let port = spawn_server(StubHandler::new(TEST_SUBNQN)).await;
+        let cfg = pdu::DigestCfg {
+            header: true,
+            data: false,
+        };
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu_dgst(0b01)).await.unwrap(); // header only
+        stream.flush().await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // ICResp
+
+        // Flip a byte inside the CRC'd header region (the SQE opcode at
+        // PDU offset 8) AFTER the digest was computed -> stored CRC stale.
+        let mut connect = pdu::apply_digests(build_connect_pdu(TEST_SUBNQN, 0), cfg);
+        connect[8] ^= 0xFF;
+        stream.write_all(&connect).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let term = read_pdu_async(&mut stream).await;
+        assert_eq!(term.header.pdu_type, pdu::PduType::C2HTermReq);
+        assert_eq!(&term.body[0..2], &0x0003u16.to_le_bytes()); // Header Digest Error
+        let mut tmp = [0u8; 1];
+        let n = timeout(Duration::from_secs(2), stream.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "connection closed after fatal header digest error");
+    }
+
+    /// A corrupted inbound data digest fails just that command (Data
+    /// Transfer Error) and leaves the connection usable — NOT a fatal
+    /// teardown (NVMe/TCP §3.4, no FES for data digest).
+    #[tokio::test]
+    async fn data_digest_error_fails_command_not_connection() {
+        let port = spawn_server(StubHandler::new(TEST_SUBNQN)).await;
+        let cfg = pdu::DigestCfg {
+            header: true,
+            data: true,
+        };
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&build_icreq_pdu_dgst(0b11)).await.unwrap();
+        stream.flush().await.unwrap();
+        let _ = read_pdu_async(&mut stream).await; // ICResp
+        stream
+            .write_all(&pdu::apply_digests(build_connect_pdu(TEST_SUBNQN, 0), cfg))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let _ = read_pdu_verified(&mut stream, cfg).await; // Connect resp
+
+        // Write carrying 64 bytes in-capsule; corrupt one data byte after
+        // the digests are computed. Header digest still verifies (data
+        // begins at PDU offset 76 = HLEN 72 + 4-byte header digest), so
+        // only the data digest fails.
+        let mut cmd = pdu::apply_digests(build_write_with_icd_pdu(0x33, 1, &[0x11; 64]), cfg);
+        cmd[76] ^= 0xFF;
+        stream.write_all(&cmd).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let resp = read_pdu_verified(&mut stream, cfg).await;
+        assert_eq!(resp.header.pdu_type, pdu::PduType::CapsuleResp);
+        let status = u16::from_le_bytes([resp.body[14], resp.body[15]]);
+        assert_eq!(status, StatusField::data_transfer_error().to_u16());
+
+        // Connection survives: a follow-up Identify still round-trips.
+        stream
+            .write_all(&pdu::apply_digests(build_identify_pdu(0x44), cfg))
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let c2h = read_pdu_verified(&mut stream, cfg).await;
+        assert_eq!(c2h.header.pdu_type, pdu::PduType::C2HData);
+    }
+
+    /// Build a Write CapsuleCmd carrying its full payload in-capsule
+    /// (SGL length == ICD length, so no R2T) — used to exercise the
+    /// in-capsule data digest path.
+    fn build_write_with_icd_pdu(cid: u16, nsid: u32, data: &[u8]) -> Vec<u8> {
+        let mut sqe = [0u8; nvme_base::SQE_SIZE];
+        sqe[0] = NvmOpcode::Write as u8;
+        sqe[1] = 0b0100_0000; // PSDT = SglInline
+        sqe[2..4].copy_from_slice(&cid.to_le_bytes());
+        sqe[4..8].copy_from_slice(&nsid.to_le_bytes());
+        sqe[24 + 8..24 + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        build_capsule_cmd_pdu(sqe, data)
     }
 
     /// Build an H2CData PDU split with the given CCCID/TTAG carrying

@@ -3019,6 +3019,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "crc32c",
  "crc32fast",
  "hex",
  "nvme-base",

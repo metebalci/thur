@@ -194,9 +194,9 @@ dispatcher.
 | Type | PDU | Direction | Status | Spec | Notes |
 |-----:|-----|-----------|--------|:----:|-------|
 | 0x00 | ICReq | H → C | 🟩 Yes | M | First PDU on every accepted TCP connection (128 bytes: 8-byte common header + 120-byte payload). `PFV != 0` → FES 0x01 (Invalid PDU Header Field). |
-| 0x01 | ICResp | C → H | 🟩 Yes | M | Advertises `MAXH2CDATA = 128 KiB`, `dgst=0`. Captures host's MAXR2T per-connection. |
+| 0x01 | ICResp | C → H | 🟩 Yes | M | Advertises `MAXH2CDATA = 128 KiB`. Echoes the host-requested header / data digests in `dgst`. Captures host's MAXR2T per-connection. |
 | 0x02 | H2CTermReq | H → C | 🟩 Yes | M | Logged; closes the connection silently. |
-| 0x03 | C2HTermReq | C → H | 🟩 Yes | M | Emitted on protocol violations (FES 0x01 Invalid Header Field / 0x02 PDU Sequence Error / 0x07 Invalid PDU Header Type) before closing. |
+| 0x03 | C2HTermReq | C → H | 🟩 Yes | M | Emitted on protocol violations (FES 0x01 Invalid Header Field / 0x02 PDU Sequence Error / 0x03 Header Digest Error / 0x07 Invalid PDU Header Type) before closing. |
 | 0x04 | CapsuleCmd | H → C | 🟩 Yes | M | 64-byte SQE + optional in-capsule data. |
 | 0x05 | CapsuleResp | C → H | 🟩 Yes | M | 16-byte CQE. The SQID field (bytes 10..11) carries the connection's QID in every phase — Connect, auth, and steady state alike (issue #72). Cosmetic only: the host correlates completions by CID over the per-queue connection, never by SQID. |
 | 0x06 | H2CData | H → C | 🟩 Yes | M | R2T fulfillment — partial-ICD + tail stitching supported. Honors host's MAXR2T and the advertised MAXH2CDATA per-PDU cap. |
@@ -208,8 +208,8 @@ dispatcher.
 | Parameter | Value | Status | Notes |
 |-----------|-------|--------|-------|
 | `PFV` | 0 | 🟩 Fixed | Only PFV=0 accepted. |
-| `HDGSTF` (header digest, CRC32C) | Off | 🟨 No | See *Deliberate non-conformance*. |
-| `DDGSTF` (data digest, CRC32C) | Off | 🟨 No | See *Deliberate non-conformance*. |
+| `HDGSTF` (header digest, CRC32C) | Host's choice | 🟩 Yes | Honored when the host sets it in `ICReq.dgst`; never required. Mismatch → fatal C2HTermReq (FES 0x03). |
+| `DDGSTF` (data digest, CRC32C) | Host's choice | 🟩 Yes | Honored when the host sets it in `ICReq.dgst`; never required. Mismatch → command fails with Data Transfer Error, connection stays up. |
 | `MAXH2CDATA` (advertised) | 128 KiB | 🟩 Fixed | Per-PDU cap on host-to-controller data. |
 | `MAXR2T` (host-advertised) | Captured | 🟩 Yes | Clamped to ≥ 1 per NVMe-TCP §3.6.1. |
 | Outstanding R2Ts per command | 1 | 🟩 Fixed | Multi-R2T deferred — see *Deliberate non-conformance*. |
@@ -323,7 +323,6 @@ reasoning for each. SCSI-side cross-cutting departures are in
 
 | Item | Why |
 |------|-----|
-| Header / data digests (CRC32C, NVMe-TCP §3.5) | Negotiate `dgst=0`. TCP provides a checksum and TLS-PSK provides AEAD over the whole stream. Symmetric with the iSCSI transport, which also negotiates `HeaderDigest=None` / `DataDigest=None`. CRC32C is implemented elsewhere — SSC LTO-7+ Logical Block Protection appends a per-tape-block CRC32C trailer (`core/mediachanger/src/lbp.rs`) — distinct from the transport-frame digest. Hosts that require transport digests see negotiation fail and pick a different target. |
 | Multi-outstanding R2T per command | Single-R2T-per-command is bandwidth-equivalent for any transfer that fits the network's bandwidth-delay product. Lift only if a benchmark shows the round-trip is the bottleneck on a high-latency link. |
 | Firmware-activation / thermal async events | AER (Admin 0x0C) drives two event sources: reservation notifications (LID 0x80 — see *Reservation notifications*) and namespace-attribute changes (LID 0x04 — see *Namespace-change notifications*). Firmware-activation and thermal Notice-type events are not produced — VSA has no firmware mechanism or thermal sensors. Setting their FID 0x0B bits is accepted but inert. |
 | Centralized Discovery Controller (CDC) + discovery-log-change AENs | The direct Discovery controller (`nqn.2014-08.org.nvmexpress.discovery`, default on — see *Discovery, NQN, identifiers* above) covers `nvme discover` / `nvme connect-all` for the single-subsystem deployment. A CDC and proactive discovery-log-change async events land when multi-subsystem fleet discovery becomes a documented use case. |

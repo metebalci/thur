@@ -33,6 +33,11 @@ bytes = "1"
 # alongside the openssl-backed TLS handshake the server uses.
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# crc32fast (IEEE CRC-32) backs the non-cryptographic PSK-key
+# fingerprints in identity.rs / tls.rs / auth.rs. The on-wire header /
+# data digests (NVMe-TCP §3.4) use CRC32C (Castagnoli) instead, so they
+# pull in `crc32c` — already in the workspace graph via core-mediachanger.
+crc32c = "0.6"
 crc32fast = "1"
 openssl = { version = "0.10", features = ["vendored"] }
 # Identity-file (de)serialization (`<data_dir>/nvmetcp-psks.json`).
