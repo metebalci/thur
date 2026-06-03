@@ -163,6 +163,29 @@ pub mod record {
         ));
     }
 
+    /// A volume's `lru.idx` cache-recency sidecar became persistently
+    /// unwritable (permissions / disk full / corruption). The sidecar
+    /// is a local hint that is never uploaded, so the failure is
+    /// non-fatal — but eviction silently degrades to first-seen
+    /// ordering, so recently-written hot pages can be evicted ahead of
+    /// cold data. Classed disk-cache so it routes with the other
+    /// cache-degradation alerts; the producer latches it to fire once
+    /// per volume.
+    pub fn lru_index_degraded(volume: &str, error: &str) {
+        let mut fields = serde_json::Map::new();
+        fields.insert("volume".into(), serde_json::Value::String(volume.into()));
+        fields.insert("error".into(), serde_json::Value::String(error.into()));
+        emit(Alert::new(
+            AlertClass::DiskCacheBackpressure,
+            Severity::Warn,
+            format!(
+                "Volume '{volume}' lru.idx unwritable — cache eviction degraded to first-seen ordering: {error}"
+            ),
+            fields,
+            format!("{volume}:lru_index"),
+        ));
+    }
+
     /// A chunk seal blocked on the pool budget past
     /// `backpressure_max_wait_seconds`.
     pub fn disk_cache_backpressure_timeout(backend: &str, waited_seconds: u64) {

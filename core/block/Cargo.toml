@@ -45,6 +45,12 @@ shared-crypto = { path = "../../shared/crypto" }
 # daemon hasn't installed the process-global handle (CLI / tests),
 # so the dependency is pure plumbing.
 shared-telemetry = { path = "../../shared/telemetry" }
+# First-party alerting: `record::lru_index_degraded` fires a disk-cache
+# alert when a volume's lru.idx sidecar becomes persistently unwritable
+# (eviction silently degrades to first-seen). Producer-only — no `http`
+# feature; `record::*` no-ops when the daemon hasn't installed the
+# process-global dispatcher (CLI / tests).
+shared-alerting = { path = "../../shared/alerting" }
 blake3 = "1"
 tracing = "0.1"
 # Cache layer: tokio::sync primitives (Mutex / Notify) for the

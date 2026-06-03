@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
@@ -384,6 +384,13 @@ pub struct VolumeWriter {
     /// `cache_miss_after_eviction` histogram. None for CLI / test
     /// paths; the daemon calls `set_ghost_list` after open.
     ghost_list: Option<Arc<shared_pool::GhostList>>,
+    /// Latch: set the first time an `lru.idx` touch fails so the
+    /// warning + disk-cache alert fire exactly once per volume rather
+    /// than once per page write. The sidecar is a local cache hint
+    /// (never uploaded); a persistent touch failure degrades eviction
+    /// to first-seen ordering but is otherwise non-fatal — see
+    /// [`Self::note_lru_touch_failed`].
+    lru_touch_failed: AtomicBool,
 }
 
 impl Drop for VolumeWriter {
@@ -488,6 +495,7 @@ impl VolumeWriter {
             sync_after,
             live_size_bytes,
             ghost_list: None,
+            lru_touch_failed: AtomicBool::new(false),
         })
     }
 
@@ -496,6 +504,27 @@ impl VolumeWriter {
     /// oldest-first.
     pub fn lru_index(&self) -> &LruIndexFile {
         &self.lru_index
+    }
+
+    /// Record an `lru.idx` touch failure. The sidecar is a local cache
+    /// hint that is never uploaded, so a touch failure is non-fatal:
+    /// the eviction worker reads a missing/stale entry as 0 (= oldest).
+    /// But a *persistent* failure (permissions / disk full / corruption)
+    /// silently degrades eviction to first-seen ordering, and — left
+    /// unrated — would log a warning on every page read and write. Latch
+    /// on the first failure so the warning and the disk-cache alert each
+    /// fire exactly once per volume.
+    fn note_lru_touch_failed(&self, page_id: PageId, error: &LruIndexError) {
+        if !latch_first_failure(&self.lru_touch_failed) {
+            return; // Already warned + alerted for this volume.
+        }
+        tracing::warn!(
+            page_id,
+            volume = %self.manifest.name,
+            "lru.idx touch failed (ignored; eviction degraded to first-seen): {}",
+            error
+        );
+        shared_alerting::record::lru_index_degraded(&self.manifest.name, &error.to_string());
     }
 
     /// Wire in the daemon-managed per-backend pool budget. Bytes
@@ -919,7 +948,7 @@ impl VolumeWriter {
         // Failure is non-fatal: the eviction worker tolerates a
         // missing entry (reads as 0 = oldest).
         if let Err(e) = self.lru_index.touch(page_id, now_unix_secs()) {
-            tracing::warn!(page_id, "lru.idx touch failed (ignored): {}", e);
+            self.note_lru_touch_failed(page_id, &e);
         }
 
         tracing::debug!(
@@ -986,7 +1015,7 @@ impl VolumeWriter {
         // page so the eviction worker can sort by genuine recency,
         // not by write time alone. Non-fatal if it fails.
         if let Err(e) = self.lru_index.touch(page_id, now_unix_secs()) {
-            tracing::warn!(page_id, "lru.idx touch failed (ignored): {}", e);
+            self.note_lru_touch_failed(page_id, &e);
         }
         let hash_hex = hex::encode(hash);
         // `cloud_bytes` is the cache-miss download size — 0 on a
@@ -1050,6 +1079,16 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Latch helper for once-per-volume failure reporting: returns `true`
+/// on the first call (the caller should warn + alert), `false`
+/// thereafter, leaving `flag` set. Pulled out of
+/// [`VolumeWriter::note_lru_touch_failed`] so the gating is unit-
+/// testable without injecting a live filesystem failure into the touch
+/// path.
+fn latch_first_failure(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
 fn decode_hash(hash_hex: &str) -> Result<ChunkHash, UploaderError> {
     let raw = hex::decode(hash_hex)
         .map_err(|_| UploaderError::BadHash(format!("not hex: {hash_hex}")))?;
@@ -1070,6 +1109,24 @@ mod tests {
     use crate::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES, DedupScope};
     use shared_object_store::LocalBackend;
     use tempfile::TempDir;
+
+    #[test]
+    fn lru_touch_latch_fires_once_then_suppresses() {
+        // Models the once-per-volume gating in `note_lru_touch_failed`:
+        // the first failure reports (warn + disk-cache alert), every
+        // subsequent failure is suppressed even though the flag stays
+        // latched.
+        let flag = AtomicBool::new(false);
+        assert!(latch_first_failure(&flag), "first failure must report");
+        assert!(
+            !latch_first_failure(&flag),
+            "second failure must be suppressed"
+        );
+        assert!(
+            !latch_first_failure(&flag),
+            "later failures stay suppressed"
+        );
+    }
 
     /// Stand up a 4 MiB volume with the given dedup scope and a
     /// LocalBackend rooted at `<tmp>/cloud`. Returns

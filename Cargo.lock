@@ -1161,6 +1161,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "shared-alerting",
  "shared-crypto",
  "shared-object-store",
  "shared-pool",

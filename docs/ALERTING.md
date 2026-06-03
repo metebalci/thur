@@ -25,7 +25,7 @@ off by default (useful, but potentially noisier in practice).
 |---|---|---|---|
 | `backend_reachability` | error / info | `system storage check` job (VTL; VSA: future periodic ticker) | `<backend>:<failure\|recovery>` |
 | `audit_failure` | error | `shared/audit/src/audit_channel.rs` writer task on `AuditLog::append` Err (disk write / fsync / chain-state), via a function-pointer hook installed at boot (avoids the shared-alerting → shared-audit dep cycle) | `<op>` |
-| `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve` | `<backend>:watermark` / `<backend>:backpressure` |
+| `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve`; VSA `lru.idx` sidecar persistently unwritable (eviction degrades to first-seen), latched once per volume in `core/block/src/uploader.rs` | `<backend>:watermark` / `<backend>:backpressure` / `<volume>:lru_index` |
 | `chap_failures` | warn | `shared/iscsi/src/transport.rs` CHAP path, surfaced by the daemon's `LoginAuditSink` adapter (VTL `IscsiLibraryLoginAudit`, VSA `IscsiDiskLoginAudit`). Per-user counter in the dispatcher; WARN fires once the user crosses `alerting.chap_failures_threshold` (default 3) inside one window | `chap:<user>` |
 
 The dispatcher special-cases `backend_reachability`: alerts fire
