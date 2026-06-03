@@ -76,10 +76,10 @@ impl GhostList {
                 // popped (hash, ts) pair. If a later insert refreshed
                 // this hash, the index now points at the newer ts; we
                 // must leave it alone so the live entry survives.
-                if let Some(&cur) = g.index.get(&old_hash) {
-                    if cur == old_ts {
-                        g.index.remove(&old_hash);
-                    }
+                if let Some(&cur) = g.index.get(&old_hash)
+                    && cur == old_ts
+                {
+                    g.index.remove(&old_hash);
                 }
             }
         }

@@ -1994,13 +1994,10 @@ impl Cartridge {
             );
             if let Some(gl) = self.ghost_list.as_ref() {
                 let mut hash_bytes = [0u8; 32];
-                if hex::decode_to_slice(&hash, &mut hash_bytes).is_ok() {
-                    if let Some(age) = gl.lookup(&hash_bytes, now_timestamp()) {
-                        shared_telemetry::record::cache_miss_after_eviction(
-                            gl.backend(),
-                            age as f64,
-                        );
-                    }
+                if hex::decode_to_slice(&hash, &mut hash_bytes).is_ok()
+                    && let Some(age) = gl.lookup(&hash_bytes, now_timestamp())
+                {
+                    shared_telemetry::record::cache_miss_after_eviction(gl.backend(), age as f64);
                 }
             }
             let data = backend.download_chunk(&object_key).await?;

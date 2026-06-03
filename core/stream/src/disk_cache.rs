@@ -599,10 +599,10 @@ impl DiskCacheManager {
         if let Some(budget) = self.pool_budget.as_ref() {
             budget.release(candidate.size, candidate.namespace.as_deref());
         }
-        if let Some(gl) = self.ghost_list.as_ref() {
-            if let Some(hash_bytes) = hex_to_blake3(&candidate.hash) {
-                gl.insert(hash_bytes, now_unix_secs());
-            }
+        if let Some(gl) = self.ghost_list.as_ref()
+            && let Some(hash_bytes) = hex_to_blake3(&candidate.hash)
+        {
+            gl.insert(hash_bytes, now_unix_secs());
         }
         debug!(
             "Deleted pool file for hash {}.. ({} bytes, namespace {:?})",
