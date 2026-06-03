@@ -290,6 +290,42 @@ impl PageIndex {
             done: false,
         }
     }
+
+    /// The highest allocated page id, or `None` if the volume has no
+    /// allocated pages. [`Self::iter`] yields in ascending page-id
+    /// order, so the last entry is the maximum. O(file size). Used by
+    /// `volume resize --shrink-to-fit` to find the smallest size that
+    /// keeps every allocated page, and by the shrink guard rail to
+    /// detect allocated data past a proposed new end (issue #77).
+    pub fn highest_allocated_page(&self) -> Result<Option<PageId>, PageIndexError> {
+        let mut highest = None;
+        for entry in self.iter() {
+            let (pid, _) = entry?;
+            highest = Some(pid);
+        }
+        Ok(highest)
+    }
+
+    /// Drop every record at or beyond `from_page_id`. The index is a
+    /// positional file (`offset = HEADER + page_id * RECORD_SIZE`), so
+    /// truncating it to the boundary offset makes every higher slot read
+    /// as an EOF hole — i.e. unallocated — in one `ftruncate` instead of
+    /// a `clear` per dropped page. Only ever shrinks the file: a no-op
+    /// when the boundary is already at or past the current length.
+    /// `sync_data` makes the trim durable before returning.
+    ///
+    /// The pool-side chunks the dropped pages referenced are left for
+    /// `system gc` to sweep, matching `volume destroy` (issue #77).
+    pub fn truncate_from(&self, from_page_id: PageId) -> Result<(), PageIndexError> {
+        let boundary = HEADER_SIZE + u64::from(from_page_id) * RECORD_SIZE;
+        let current = self.file.metadata()?.len();
+        if boundary >= current {
+            return Ok(());
+        }
+        self.file.set_len(boundary)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
 }
 
 fn build_header(volume_uuid: [u8; 16], page_size_bytes: u64) -> [u8; HEADER_SIZE as usize] {
@@ -505,6 +541,54 @@ mod tests {
         let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
         let collected: Vec<_> = idx.iter().collect::<Result<Vec<_>, _>>().unwrap();
         assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn highest_allocated_page_reports_max_or_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+
+        // Empty volume: no allocated pages.
+        assert_eq!(idx.highest_allocated_page().unwrap(), None);
+
+        idx.set(3, &fixture_hash(3)).unwrap();
+        idx.set(17, &fixture_hash(17)).unwrap();
+        idx.set(5, &fixture_hash(5)).unwrap();
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(17));
+
+        // Clearing the top page drops the high-water mark to the next.
+        idx.clear(17).unwrap();
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn truncate_from_drops_records_at_and_beyond_boundary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+
+        for pid in [2u32, 4, 8, 9, 20] {
+            idx.set(pid, &fixture_hash(pid as u8)).unwrap();
+        }
+
+        // Drop everything from page 9 up: 9 and 20 go, 2/4/8 stay.
+        idx.truncate_from(9).unwrap();
+        assert_eq!(idx.get(8).unwrap(), Some(fixture_hash(8)));
+        assert_eq!(idx.get(9).unwrap(), None);
+        assert_eq!(idx.get(20).unwrap(), None);
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(8));
+
+        // The trim survives a reopen, and the freed slots read back as
+        // unallocated holes.
+        let reopened = PageIndex::open(&path, fixture_uuid(), 65_536).unwrap();
+        assert_eq!(reopened.get(8).unwrap(), Some(fixture_hash(8)));
+        assert_eq!(reopened.get(9).unwrap(), None);
+        assert_eq!(reopened.get(20).unwrap(), None);
+
+        // A boundary at or past the current length is a no-op.
+        reopened.truncate_from(1000).unwrap();
+        assert_eq!(reopened.get(8).unwrap(), Some(fixture_hash(8)));
     }
 
     #[test]

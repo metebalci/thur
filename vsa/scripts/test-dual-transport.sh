@@ -33,6 +33,11 @@
 #      capacity with no reconnect (iSCSI CAPACITY DATA HAS CHANGED UA +
 #      rescan / NVMe Namespace Attribute Changed AER + ns-rescan), and a
 #      host write into the newly-grown region round-trips cross-transport.
+#   6. Online shrink (issue #77): `volume resize` shrinks the live volume.
+#      Guard rails refuse a destructive shrink (a held persistent
+#      reservation; or allocated data past the new end), while a safe
+#      shrink and `--shrink-to-fit` succeed, propagate to both hosts with
+#      no reconnect, and preserve the data below the new end.
 #
 # The cross-protocol coherence falls out of the single shared
 # ReservationManager keyed by LUN (issue #57): an iSCSI initiator port
@@ -421,6 +426,24 @@ test_iscsi_preempt_raises_nvme_notif() {
     return 0
 }
 
+# Rescan both hosts and wait (best-effort) until each reports $1 bytes for
+# vol-dual. Returns 0 on match, 1 on timeout. Used by the shrink test (#77).
+await_both_capacity() {
+    local want="$1" a n
+    sg_turs "$ISCSI_SG" >/dev/null 2>&1 || true
+    echo 1 > "/sys/block/$(basename "$ISCSI_BLK")/device/rescan" 2>/dev/null || true
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --rescan >/dev/null 2>&1 || true
+    nvme ns-rescan "/dev/${NVME_DEVICE}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 25); do
+        a=$(blockdev --getsize64 "$ISCSI_BLK" 2>/dev/null)
+        n=$(blockdev --getsize64 "/dev/${NVME_DEVICE}n1" 2>/dev/null)
+        if [[ "$a" == "$want" && "$n" == "$want" ]]; then return 0; fi
+        sleep 0.4
+    done
+    log_error "  capacity did not reach ${want}B: iscsi=${a}B nvme=${n}B"
+    return 1
+}
+
 # Test 5: online grow (issue #76). Resize the live volume via the admin
 # socket (daemon stays up) and assert BOTH hosts see the new capacity
 # without a reconnect, then that a host write into the newly-grown region
@@ -499,6 +522,98 @@ test_online_resize_dual_transport() {
     return 0
 }
 
+# Test 6: online shrink (issue #77) — the other half of resize. Asserts the
+# guard rails refuse a destructive shrink (a held persistent reservation; or
+# allocated data past the new end) while a safe shrink and `--shrink-to-fit`
+# succeed and propagate to BOTH hosts with no reconnect, preserving the data
+# below the new end. Runs after the grow test, so vol-dual is 128M here.
+test_online_shrink_dual_transport() {
+    log_test "online shrink: guard rails refuse, safe shrink + shrink-to-fit propagate (#77)"
+    reset_lun_reservations
+
+    local nvme_dev="/dev/${NVME_DEVICE}n1"
+    local cfg="${TEST_DIR}/config.yaml"
+
+    # Anchor the allocated high-water mark with a known pattern at 64M
+    # (page-aligned, 16 pages), so shrink-to-fit lands deterministically at
+    # exactly 65M.
+    local infile="$TEST_DIR/shrink-pattern.bin"
+    dd if=/dev/urandom of="$infile" bs=1M count=1 status=none
+    local want_sha
+    want_sha=$(sha256sum "$infile" | awk '{print $1}')
+    if ! dd if="$infile" of="$ISCSI_BLK" bs=1M seek=64 count=1 oflag=direct conv=fsync status=none \
+        2>"$TEST_DIR/shrink-anchor.err"; then
+        log_error "  anchor write at 64M failed: $(cat "$TEST_DIR/shrink-anchor.err")"
+        return 1
+    fi
+
+    # Guard rail 1: a held persistent reservation blocks any shrink.
+    if ! { sg_persist --out --register --param-sark=0xA1A1 "$ISCSI_SG" >/dev/null 2>&1 \
+        && sg_persist --out --reserve --param-rk=0xA1A1 --prout-type=1 "$ISCSI_SG" >/dev/null 2>&1; }; then
+        log_error "  persistent-reservation setup failed"
+        return 1
+    fi
+    if "$CLI_PATH" --config "$cfg" volume resize "vol-dual" --size 96M \
+        >"$TEST_DIR/shrink-resv.log" 2>&1; then
+        log_error "  shrink succeeded despite a held reservation (expected refusal)"
+        reset_lun_reservations
+        return 1
+    fi
+    log_info "  shrink refused while a persistent reservation is held"
+    reset_lun_reservations
+
+    # Guard rail 2: refuse a shrink that would discard allocated data — the
+    # anchor lives at 64M, so 32M would drop it.
+    if "$CLI_PATH" --config "$cfg" volume resize "vol-dual" --size 32M \
+        >"$TEST_DIR/shrink-data.log" 2>&1; then
+        log_error "  shrink to 32M succeeded despite data past the new end (expected refusal)"
+        return 1
+    fi
+    log_info "  shrink refused: allocated data past the new end"
+    # Both refusals must leave capacity untouched at 128M.
+    if ! await_both_capacity $((128 * 1024 * 1024)); then
+        log_error "  capacity changed after a refused shrink"
+        return 1
+    fi
+
+    # Happy path: shrink to 96M (above the anchor) — both hosts see it.
+    if ! "$CLI_PATH" --config "$cfg" volume resize "vol-dual" --size 96M \
+        >"$TEST_DIR/shrink-ok.log" 2>&1; then
+        log_error "  shrink to 96M failed: $(cat "$TEST_DIR/shrink-ok.log")"
+        return 1
+    fi
+    await_both_capacity $((96 * 1024 * 1024)) || return 1
+    log_info "  both hosts report 96M after shrink (no reconnect)"
+
+    # --shrink-to-fit snaps to the high-water mark: the anchor occupies
+    # pages through byte 65M, so the fit size is exactly 65M.
+    if ! "$CLI_PATH" --config "$cfg" volume resize "vol-dual" --shrink-to-fit \
+        >"$TEST_DIR/shrink-fit.log" 2>&1; then
+        log_error "  shrink-to-fit failed: $(cat "$TEST_DIR/shrink-fit.log")"
+        return 1
+    fi
+    if ! await_both_capacity $((65 * 1024 * 1024)); then
+        log_error "  shrink-to-fit did not land at 65M on both hosts"
+        return 1
+    fi
+    log_info "  shrink-to-fit snapped both hosts to 65M (the allocated high-water mark)"
+
+    # Data below the new end survived the trims: read the anchor back over
+    # NVMe (it was written over iSCSI).
+    local outfile="$TEST_DIR/shrink-readback.bin"
+    if ! dd if="$nvme_dev" of="$outfile" bs=1M skip=64 count=1 iflag=direct status=none \
+        2>"$TEST_DIR/shrink-read.err"; then
+        log_error "  NVMe read after shrink failed: $(cat "$TEST_DIR/shrink-read.err")"
+        return 1
+    fi
+    if [[ "$(sha256sum "$outfile" | awk '{print $1}')" != "$want_sha" ]]; then
+        log_error "  anchor data corrupted by shrink (sha mismatch)"
+        return 1
+    fi
+    log_info "  data below the new end read back identically after shrink + shrink-to-fit"
+    return 0
+}
+
 main() {
     echo "========================================"
     echo "Thur VSA Dual-Transport (iSCSI + NVMe/TCP)"
@@ -514,7 +629,8 @@ main() {
     local passed=0 failed=0
     for t in test_cross_transport_io test_iscsi_reservation_fences_nvme \
         test_nvme_reservation_fences_iscsi test_nvme_preempt_raises_iscsi_ua \
-        test_iscsi_preempt_raises_nvme_notif test_online_resize_dual_transport; do
+        test_iscsi_preempt_raises_nvme_notif test_online_resize_dual_transport \
+        test_online_shrink_dual_transport; do
         if "$t"; then ((passed++)); else ((failed++)); fi
         echo ""
     done

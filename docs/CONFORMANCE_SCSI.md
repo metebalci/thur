@@ -1194,14 +1194,27 @@ VPD in Part 3; NVMe in
 
 ## Online resize (capacity-change notification)
 
-`thurvsa volume resize NAME --size N` grows a volume's logical capacity
-while it is exported (issue #76). Grow is metadata-only — the page table
-is sparse, so pages past the old end already read as zero and the
-data-path range gate admits I/O into the grown region the instant the
-size changes. The size is the live source of truth (an in-memory shadow
-the daemon flips and persists to `manifest.json`); READ CAPACITY (10/16),
-MODE SENSE block descriptors, and the READ/WRITE range check all read it,
-so a connected host sees the new capacity without a daemon restart.
+`thurvsa volume resize NAME --size N` changes a volume's logical capacity
+while it is exported (grow: issue #76; shrink: issue #77). Grow is
+metadata-only — the page table is sparse, so pages past the old end
+already read as zero and the data-path range gate admits I/O into the
+grown region the instant the size changes. The size is the live source of
+truth (an in-memory shadow the daemon flips and persists to
+`manifest.json`); READ CAPACITY (10/16), MODE SENSE block descriptors, and
+the READ/WRITE range check all read it, so a connected host sees the new
+capacity without a daemon restart.
+
+Shrink is the riskier half and is **non-destructive by construction**: the
+daemon flushes the page cache, then refuses if the volume is WORM, if a
+persistent reservation is held, or if any allocated page sits at or beyond
+the new last page — so a shrink can never silently drop data. The operator
+frees the tail from the host first (resize the filesystem down, then
+`fstrim`/`blkdiscard`, which UNMAPs and deallocates those pages), after
+which the shrink succeeds and trims the page table (the orphaned chunks are
+left for `system gc`, matching `volume destroy`). `--shrink-to-fit` snaps
+to the smallest size that keeps every allocated page so the operator need
+not compute the exact byte count; `--size` and `--shrink-to-fit` are
+mutually exclusive.
 
 To prompt the host to re-read, a resize raises a **CAPACITY DATA HAS
 CHANGED** Unit Attention (sense key 0x06, ASC/ASCQ `0x2A/0x09`) on every
@@ -1212,7 +1225,7 @@ LUNS). The host clears the UA and re-issues READ CAPACITY. The Linux SCSI
 midlayer still needs an explicit rescan (`iscsiadm -m node --rescan` or
 `echo 1 > /sys/block/sdX/device/rescan`) to resize the block device; the
 UA invalidates the host's cached capacity but does not by itself trigger
-a rescan. Shrink is not supported (the resize verb is grow-only). The
+a rescan. The same UA fires on a shrink. The
 NVMe/TCP counterpart fires a Namespace Attribute Changed AER — see
 [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md) § Namespace-change
 notifications.

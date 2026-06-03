@@ -5726,7 +5726,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__volume__subcmd__resize)
-            opts="-c -h --size --config --user --copyright --help <NAME>"
+            opts="-c -h --size --shrink-to-fit --config --user --copyright --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

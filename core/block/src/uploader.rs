@@ -245,11 +245,26 @@ pub enum UploaderError {
     )]
     ResizeNotSectorAligned { size_bytes: u64, sector_bytes: u32 },
 
+    #[error("resize target {size_bytes} B is smaller than one {page_size} B page")]
+    ResizeBelowPage { size_bytes: u64, page_size: u32 },
+
+    #[error("resize target {size_bytes} B equals the current size; nothing to do")]
+    ResizeNoChange { size_bytes: u64 },
+
+    #[error("cannot shrink a WORM volume (would discard write-once data past the new end)")]
+    ResizeWormForbidden,
+
     #[error(
-        "resize target {requested} B does not grow the volume \
-         (current size {current} B); shrink is not supported"
+        "cannot shrink to {new_size} B: allocated data extends through page \
+         {highest_page} (byte {occupied_through}); free that range from the host \
+         (resize the filesystem, then fstrim/blkdiscard) and retry, or use \
+         --shrink-to-fit"
     )]
-    ResizeNotGrow { current: u64, requested: u64 },
+    ResizeWouldDiscardData {
+        new_size: u64,
+        highest_page: u64,
+        occupied_through: u64,
+    },
 
     #[error("invalid hash from chunk pool: {0}")]
     BadHash(String),
@@ -684,18 +699,32 @@ impl VolumeWriter {
         self.live_size_bytes.load(Ordering::Relaxed)
     }
 
-    /// Grow the volume's logical size and rewrite `manifest.json` so the
-    /// new capacity survives a daemon restart. Grow-only: rejects a
-    /// shrink or a no-op. The new size must be a whole multiple of the
-    /// volume's sector size.
+    /// Resize the volume's logical capacity and rewrite `manifest.json`
+    /// so the new size survives a daemon restart. Grows or shrinks; the
+    /// new size must be a whole multiple of the volume's sector size and
+    /// at least one page.
     ///
-    /// Grow is metadata-only — the page table is sparse, so pages past
-    /// the old end already read as zero and the data path admits I/O
+    /// **Grow** is metadata-only — the page table is sparse, so pages
+    /// past the old end already read as zero and the data path admits I/O
     /// into the grown region the moment the shadow flips. Persist the
     /// manifest first, then flip the atomic: a crash in between leaves
     /// disk = new, live = old, and the next boot reseeds the shadow from
     /// the persisted manifest, converging on the new size. The reverse
     /// ordering could advertise capacity that isn't durable.
+    ///
+    /// **Shrink** (issue #77) is non-destructive by construction. It
+    /// refuses on a WORM volume, and refuses if any allocated page sits
+    /// at or beyond the new last page ([`UploaderError::ResizeWouldDiscardData`])
+    /// — the operator must free that range from the host first (resize the
+    /// filesystem, then fstrim/blkdiscard, which UNMAPs those pages) or
+    /// use the daemon's `--shrink-to-fit` ([`Self::min_size_to_fit`]).
+    /// **The caller must flush the page cache before a shrink** so the
+    /// allocated-page check sees every in-flight write. Crash ordering is
+    /// the reverse of grow: trim the page table first, then shrink the
+    /// advertised size — a crash mid-way leaves the volume
+    /// bigger-than-target (retry completes it), never a smaller size whose
+    /// dropped-but-still-recorded high pages could resurrect stale data on
+    /// a later grow.
     pub fn set_size(&self, new_size: u64) -> Result<(), UploaderError> {
         let sector = u64::from(self.manifest.sector_bytes);
         if sector == 0 || !new_size.is_multiple_of(sector) {
@@ -704,22 +733,77 @@ impl VolumeWriter {
                 sector_bytes: self.manifest.sector_bytes,
             });
         }
-        let current = self.size_bytes();
-        if new_size <= current {
-            return Err(UploaderError::ResizeNotGrow {
-                current,
-                requested: new_size,
+        let page_size = u64::from(self.manifest.page_size_bytes);
+        if new_size < page_size {
+            return Err(UploaderError::ResizeBelowPage {
+                size_bytes: new_size,
+                page_size: self.manifest.page_size_bytes,
             });
         }
-        // Clone the boot snapshot and flip just the size — unlike
-        // `runtime.json`, `manifest.json` has no hot-path writer to
-        // merge against (it's frozen post-create), so there is nothing
-        // to reload.
+        let current = self.size_bytes();
+        if new_size == current {
+            return Err(UploaderError::ResizeNoChange {
+                size_bytes: new_size,
+            });
+        }
+        if new_size > current {
+            // Grow: persist the larger manifest first, then flip the live
+            // shadow (see the doc comment for the crash rationale).
+            self.persist_manifest_size(new_size)?;
+            self.live_size_bytes.store(new_size, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // Shrink. Guard rails first — never discard write-once data, never
+        // silently drop allocated pages past the new end.
+        if self.manifest.worm {
+            return Err(UploaderError::ResizeWormForbidden);
+        }
+        // Floor division mirrors `last_page_id()`: a volume of `new_size`
+        // addresses pages `0 .. new_page_count`, so `new_page_count` is
+        // the first page to drop.
+        let new_page_count = new_size / page_size;
+        if let Some(highest) = self.page_index.highest_allocated_page()?
+            && u64::from(highest) >= new_page_count
+        {
+            return Err(UploaderError::ResizeWouldDiscardData {
+                new_size,
+                highest_page: u64::from(highest),
+                occupied_through: (u64::from(highest) + 1) * page_size,
+            });
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        self.page_index.truncate_from(new_page_count as PageId)?;
+        self.persist_manifest_size(new_size)?;
+        self.live_size_bytes.store(new_size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Smallest size that keeps every allocated page, for the daemon's
+    /// `volume resize --shrink-to-fit` (issue #77):
+    /// `(highest_allocated_page + 1) * page_size`, or one page on an empty
+    /// volume. Page-aligned by construction, so it always satisfies the
+    /// sector + page-floor checks in [`Self::set_size`] and never trips
+    /// the allocated-data-past-end guard. The caller must flush the page
+    /// cache first so the high-water mark reflects all writes.
+    pub fn min_size_to_fit(&self) -> Result<u64, UploaderError> {
+        let page_size = u64::from(self.manifest.page_size_bytes);
+        let min = match self.page_index.highest_allocated_page()? {
+            Some(highest) => (u64::from(highest) + 1) * page_size,
+            None => page_size,
+        };
+        Ok(min)
+    }
+
+    /// Rewrite `manifest.json` with `new_size`. Clones the boot snapshot
+    /// and flips just the size — unlike `runtime.json`, `manifest.json`
+    /// has no hot-path writer to merge against (it's frozen post-create),
+    /// so there is nothing to reload.
+    fn persist_manifest_size(&self, new_size: u64) -> Result<(), UploaderError> {
         let vol_dir = VolumeManifest::dir_for(&self.data_dir, &self.manifest.name);
         let mut m = self.manifest.clone();
         m.size_bytes = new_size;
         m.persist(&vol_dir)?;
-        self.live_size_bytes.store(new_size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1405,22 +1489,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_size_rejects_shrink_noop_and_unaligned() {
+    async fn set_size_rejects_noop_unaligned_and_below_page() {
         let (tmp, name, backend) = fixture(DedupScope::Local).await;
         let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
         let orig = 4 * (1u64 << 20);
 
-        assert!(matches!(
-            writer.set_size(2 * (1u64 << 20)).unwrap_err(),
-            UploaderError::ResizeNotGrow { .. }
-        ));
+        // No-op.
         assert!(matches!(
             writer.set_size(orig).unwrap_err(),
-            UploaderError::ResizeNotGrow { .. }
+            UploaderError::ResizeNoChange { .. }
         ));
+        // Not sector-aligned.
         assert!(matches!(
             writer.set_size(orig + 1).unwrap_err(),
             UploaderError::ResizeNotSectorAligned { .. }
+        ));
+        // Sector-aligned but smaller than one 64 KiB page.
+        assert!(matches!(
+            writer
+                .set_size(u64::from(DEFAULT_SECTOR_BYTES))
+                .unwrap_err(),
+            UploaderError::ResizeBelowPage { .. }
         ));
 
         // No rejected call touched the live shadow or the on-disk manifest.
@@ -1429,6 +1518,131 @@ mod tests {
             VolumeManifest::load(tmp.path(), &name).unwrap().size_bytes,
             orig
         );
+    }
+
+    #[tokio::test]
+    async fn set_size_shrinks_empty_volume_trims_and_persists() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend.clone()).unwrap();
+        // 4 MiB / 64 KiB = 64 pages (0..63). Nothing allocated.
+        assert_eq!(writer.last_page_id(), 63);
+
+        // Shrink to 2 MiB (32 pages, 0..31). Live size + last_page_id move
+        // immediately; a write past the new end is now rejected.
+        writer.set_size(2 * (1u64 << 20)).unwrap();
+        assert_eq!(writer.size_bytes(), 2 * (1u64 << 20));
+        assert_eq!(writer.last_page_id(), 31);
+        assert!(matches!(
+            writer.write_page(32, &page_bytes(0)).await.unwrap_err(),
+            UploaderError::PageOutOfRange { .. }
+        ));
+
+        // Persisted: a fresh open boots at the smaller size.
+        assert_eq!(
+            VolumeManifest::load(tmp.path(), &name).unwrap().size_bytes,
+            2 * (1u64 << 20)
+        );
+        let reopened = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        assert_eq!(reopened.size_bytes(), 2 * (1u64 << 20));
+        assert_eq!(reopened.last_page_id(), 31);
+    }
+
+    #[tokio::test]
+    async fn set_size_shrink_refuses_allocated_data_past_new_end() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        let orig = 4 * (1u64 << 20);
+
+        // Allocate page 40 (within 0..63).
+        writer.write_page(40, &page_bytes(0x40)).await.unwrap();
+
+        // Shrinking to 2 MiB (last page 31) would drop page 40 — refuse,
+        // and leave the size + manifest untouched.
+        let err = writer.set_size(2 * (1u64 << 20)).unwrap_err();
+        assert!(matches!(
+            err,
+            UploaderError::ResizeWouldDiscardData {
+                highest_page: 40,
+                ..
+            }
+        ));
+        assert_eq!(writer.size_bytes(), orig);
+        assert_eq!(
+            VolumeManifest::load(tmp.path(), &name).unwrap().size_bytes,
+            orig
+        );
+
+        // Shrinking to a size that still covers page 40 succeeds; page 40's
+        // data survives, the trimmed tail does not.
+        let fits = 41 * u64::from(DEFAULT_PAGE_SIZE_BYTES); // pages 0..40
+        writer.set_size(fits).unwrap();
+        assert_eq!(writer.size_bytes(), fits);
+        assert_eq!(writer.last_page_id(), 40);
+        assert_eq!(
+            writer.read_page(40).await.unwrap(),
+            Some((page_bytes(0x40), 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn min_size_to_fit_snaps_to_high_water_mark() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        let page = u64::from(DEFAULT_PAGE_SIZE_BYTES);
+
+        // Empty volume floors at one page.
+        assert_eq!(writer.min_size_to_fit().unwrap(), page);
+
+        // Allocate page 10 -> minimum is 11 pages.
+        writer.write_page(10, &page_bytes(0x10)).await.unwrap();
+        let min = writer.min_size_to_fit().unwrap();
+        assert_eq!(min, 11 * page);
+
+        // Shrinking to that minimum keeps page 10 and rejects page 11.
+        writer.set_size(min).unwrap();
+        assert_eq!(writer.last_page_id(), 10);
+        assert_eq!(
+            writer.read_page(10).await.unwrap(),
+            Some((page_bytes(0x10), 0))
+        );
+        assert!(matches!(
+            writer.write_page(11, &page_bytes(0)).await.unwrap_err(),
+            UploaderError::PageOutOfRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_size_shrink_refuses_worm_but_allows_grow() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let cloud_root = data_dir.join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&cloud_root).await.unwrap());
+        let name = "wormvol".to_string();
+        VolumeManifest::new(
+            name.clone(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            true, // worm
+            0,
+        )
+        .unwrap()
+        .create(&data_dir)
+        .unwrap();
+        let writer = VolumeWriter::open(&data_dir, &name, backend).unwrap();
+
+        // Shrink refused on WORM.
+        assert!(matches!(
+            writer.set_size(2 * (1u64 << 20)).unwrap_err(),
+            UploaderError::ResizeWormForbidden
+        ));
+        // Grow still allowed — it discards nothing.
+        writer.set_size(8 * (1u64 << 20)).unwrap();
+        assert_eq!(writer.size_bytes(), 8 * (1u64 << 20));
     }
 
     // -- At-rest encryption -----------------------------------------------

@@ -488,15 +488,17 @@ enum VolumeAction {
         sync_after: String,
     },
 
-    /// Grow a volume's capacity.
+    /// Grow or shrink a volume's capacity.
     ///
     /// Daemon-routed only — refuses if the admin socket is
-    /// unreachable. Grow-only: the new size must exceed the current
-    /// size and be a multiple of the sector size (4 KiB). Grow is
-    /// metadata-only (the page table is sparse), so it's instant and
-    /// reversible-free. Connected hosts are signalled to re-read
-    /// capacity (NVMe AER / iSCSI unit attention); the host OS may
-    /// still need a rescan (`iscsiadm --rescan` / `nvme ns-rescan`).
+    /// unreachable. Grow is metadata-only (the page table is sparse), so
+    /// it's instant. Shrink is non-destructive: it refuses on a WORM
+    /// volume, when a persistent reservation is held, or when allocated
+    /// data sits past the new end — free that range from the host first
+    /// (resize the filesystem, then `fstrim`/`blkdiscard`) or use
+    /// `--shrink-to-fit`. Connected hosts are signalled to re-read
+    /// capacity (NVMe AER / iSCSI unit attention); the host OS may still
+    /// need a rescan (`iscsiadm --rescan` / `nvme ns-rescan`).
     Resize {
         /// Volume name.
         name: String,
@@ -504,10 +506,19 @@ enum VolumeAction {
         /// New logical volume size, e.g. `2T`, `500G`, `8192`.
         ///
         /// Binary units only: K=2^10, M=2^20, G=2^30, T=2^40, P=2^50.
-        /// Bare integer = bytes. Must exceed the current size and be a
-        /// multiple of the sector size (4 KiB).
+        /// Bare integer = bytes. Must be a multiple of the sector size
+        /// (4 KiB) and at least one page. Conflicts with
+        /// `--shrink-to-fit`; exactly one is required.
+        #[arg(long, required_unless_present = "shrink_to_fit", conflicts_with = "shrink_to_fit")]
+        size: Option<String>,
+
+        /// Shrink to the smallest size that keeps all data.
+        ///
+        /// Auto-computes the target (the allocated high-water mark) so you
+        /// don't have to. Resize the filesystem down first (e.g.
+        /// `resize2fs`) so it fits. Conflicts with `--size`.
         #[arg(long)]
-        size: String,
+        shrink_to_fit: bool,
     },
 
     /// Per-volume key-management operations.

@@ -121,10 +121,11 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (resize)
 _arguments "${_arguments_options[@]}" : \
-'--size=[New logical volume size, e.g. \`2T\`, \`500G\`, \`8192\`]:SIZE:_default' \
+'(--shrink-to-fit)--size=[New logical volume size, e.g. \`2T\`, \`500G\`, \`8192\`]:SIZE:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
+'--shrink-to-fit[Shrink to the smallest size that keeps all data]' \
 '--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -2675,7 +2676,7 @@ _thurvsa__subcmd__help__subcmd__volume_commands() {
 'info:Show one volume'\''s manifest' \
 'destroy:Destroy a volume' \
 'modify:Modify a live volume'\''s mutable settings' \
-'resize:Grow a volume'\''s capacity' \
+'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
     )
     _describe -t commands 'thurvsa help volume commands' commands "$@"
@@ -3744,7 +3745,7 @@ _thurvsa__subcmd__volume_commands() {
 'info:Show one volume'\''s manifest' \
 'destroy:Destroy a volume' \
 'modify:Modify a live volume'\''s mutable settings' \
-'resize:Grow a volume'\''s capacity' \
+'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -3768,7 +3769,7 @@ _thurvsa__subcmd__volume__subcmd__help_commands() {
 'info:Show one volume'\''s manifest' \
 'destroy:Destroy a volume' \
 'modify:Modify a live volume'\''s mutable settings' \
-'resize:Grow a volume'\''s capacity' \
+'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
 'help:Print this message or the help of the given subcommand(s)' \
     )

@@ -992,18 +992,22 @@ pub struct SetSyncAfterRequest {
     pub mode: String,
 }
 
-/// `POST /api/v1/volumes/:name/resize` — grow the volume's logical
-/// capacity at runtime (issue #76).
+/// `POST /api/v1/volumes/:name/resize` — change the volume's logical
+/// capacity at runtime (grow: issue #76; shrink: issue #77).
 ///
-/// Body shape: `{ "size_bytes": N }` (the CLI converts `--size 10G`).
-/// Grow-only this release: a shrink or no-op is a `400`. Grow is
-/// metadata-only — the page table is sparse, so the handler flips the
-/// writer's live size + rewrites `manifest.json`, then notifies hosts.
-/// Unlike `sync-after`, the change **is** signalled: NVMe via the
-/// Namespace Attribute Changed AER, iSCSI via a CAPACITY DATA HAS
-/// CHANGED Unit Attention, so a connected host re-reads the new size on
-/// its next command (a host-side rescan may still be needed for the OS
-/// to act on it).
+/// Body shape: exactly one of `{ "size_bytes": N }` (the CLI converts
+/// `--size 10G`) or `{ "shrink_to_fit": true }`. Grow is metadata-only —
+/// the page table is sparse, so the handler flips the writer's live size +
+/// rewrites `manifest.json`. Shrink is non-destructive by construction:
+/// the handler flushes the cache, then `set_size` refuses on WORM or when
+/// allocated data sits past the new end, otherwise trims the page table.
+/// `--shrink-to-fit` snaps to the high-water mark
+/// ([`core_block::VolumeWriter::min_size_to_fit`]). A held PERSISTENT
+/// RESERVE blocks any shrink (`409`). Either way the change **is**
+/// signalled: NVMe via the Namespace Attribute Changed AER, iSCSI via a
+/// CAPACITY DATA HAS CHANGED Unit Attention, so a connected host re-reads
+/// the new size on its next command (a host-side rescan may still be
+/// needed for the OS to act on it).
 pub async fn resize(
     State(state): State<AdminState>,
     peer: PeerCred,
@@ -1017,19 +1021,72 @@ pub async fn resize(
         )
     })?;
 
+    let lun = cache.manifest().lun;
     let previous = cache.size_bytes();
-    cache.writer().set_size(body.size_bytes).map_err(|e| {
-        // Align / shrink-or-noop are client errors; anything else (a
-        // manifest persist failure) is a 500.
+
+    let internal = |e: core_block::UploaderError| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    };
+
+    // Resolve the target size — exactly one of `size_bytes` /
+    // `shrink_to_fit`. A shrink needs a flush first so the page table
+    // reflects every in-flight write before `set_size` reads the
+    // high-water mark (`--shrink-to-fit`) or runs the allocated-past-end
+    // guard (explicit `--size`).
+    let new_size = match (body.size_bytes, body.shrink_to_fit) {
+        (Some(_), true) | (None, false) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "resize requires exactly one of size_bytes or shrink_to_fit"
+                })),
+            ));
+        }
+        (None, true) => {
+            cache.flush_all().await.map_err(internal)?;
+            cache.writer().min_size_to_fit().map_err(internal)?
+        }
+        (Some(req), false) => {
+            if req < previous {
+                cache.flush_all().await.map_err(internal)?;
+            }
+            req
+        }
+    };
+
+    // A held PERSISTENT RESERVE blocks a shrink: dropping capacity out from
+    // under a registrant is a least-surprise violation. Grow keeps all data
+    // and is unaffected.
+    if new_size < previous && !state.reservations.snapshot(lun).registrants.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "volume '{name}' has an active persistent reservation; \
+                     clear it before shrinking"
+                )
+            })),
+        ));
+    }
+
+    cache.writer().set_size(new_size).map_err(|e| {
+        // Bad target (align / below-page / no-op) is a client error; a
+        // guard-rail refusal (WORM / would-discard-data) is a conflict;
+        // anything else (a manifest persist / trim failure) is a 500.
         let status = match e {
             core_block::UploaderError::ResizeNotSectorAligned { .. }
-            | core_block::UploaderError::ResizeNotGrow { .. } => StatusCode::BAD_REQUEST,
+            | core_block::UploaderError::ResizeBelowPage { .. }
+            | core_block::UploaderError::ResizeNoChange { .. } => StatusCode::BAD_REQUEST,
+            core_block::UploaderError::ResizeWormForbidden
+            | core_block::UploaderError::ResizeWouldDiscardData { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": e.to_string() })))
     })?;
 
-    let lun = cache.manifest().lun;
     state.notify_capacity_changed(lun);
 
     if let Some(channel) = state.audit.as_ref() {
@@ -1039,7 +1096,8 @@ pub async fn resize(
             json!({
                 "name": name,
                 "previous": previous,
-                "new": body.size_bytes,
+                "new": new_size,
+                "shrink_to_fit": body.shrink_to_fit,
             }),
             AuditResult::Ok,
         );
@@ -1048,20 +1106,27 @@ pub async fn resize(
     info!(
         volume = name.as_str(),
         previous,
-        new = body.size_bytes,
+        new = new_size,
         "admin: volume resized (capacity-change signalled to hosts)"
     );
 
     Ok(Json(json!({
         "volume": name,
         "previous": previous,
-        "size_bytes": body.size_bytes,
+        "size_bytes": new_size,
     })))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ResizeVolumeRequest {
-    pub size_bytes: u64,
+    /// Explicit target size in bytes. Mutually exclusive with
+    /// `shrink_to_fit`.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// Snap to the smallest size that keeps all allocated data. Mutually
+    /// exclusive with `size_bytes`.
+    #[serde(default)]
+    pub shrink_to_fit: bool,
 }
 
 /// Lookup or instantiate the `Arc<dyn ObjectStoreBackend>` for `name`.

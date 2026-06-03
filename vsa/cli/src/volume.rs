@@ -298,13 +298,22 @@ pub async fn cmd_modify_sync_after(name: &str, mode: &str) -> Result<()> {
     Ok(())
 }
 
-/// `thurvsa volume resize NAME --size N` — grow a volume's logical
-/// capacity. Daemon-routed only; the daemon flips the live size +
-/// rewrites manifest.json, then signals connected hosts (NVMe AER /
-/// iSCSI unit attention) to re-read capacity. Grow-only.
-pub async fn cmd_resize(name: &str, size_str: &str) -> Result<()> {
-    let size_bytes =
-        parse_size(size_str).with_context(|| format!("parsing --size '{size_str}'"))?;
+/// `thurvsa volume resize NAME (--size N | --shrink-to-fit)` — grow or
+/// shrink a volume's logical capacity. Daemon-routed only; the daemon
+/// resolves the target, applies the shrink guard rails, flips the live
+/// size + rewrites manifest.json, then signals connected hosts (NVMe AER
+/// / iSCSI unit attention) to re-read capacity.
+pub async fn cmd_resize(name: &str, size_str: Option<&str>, shrink_to_fit: bool) -> Result<()> {
+    let body = if shrink_to_fit {
+        serde_json::json!({ "shrink_to_fit": true })
+    } else {
+        // clap guarantees exactly one of --size / --shrink-to-fit, so
+        // `size_str` is Some here.
+        let size_str = size_str.expect("clap requires --size when not --shrink-to-fit");
+        let size_bytes =
+            parse_size(size_str).with_context(|| format!("parsing --size '{size_str}'"))?;
+        serde_json::json!({ "size_bytes": size_bytes })
+    };
     let admin = AdminClient::auto_discover(&shared_naming::DISK);
     if !admin.ping().await {
         bail!(
@@ -314,7 +323,6 @@ pub async fn cmd_resize(name: &str, size_str: &str) -> Result<()> {
             admin.socket_path().display()
         );
     }
-    let body = serde_json::json!({ "size_bytes": size_bytes });
     let resp: serde_json::Value = admin
         .post_json(
             &format!("/api/v1/volumes/{}/resize", urlencode(name)),
@@ -325,7 +333,7 @@ pub async fn cmd_resize(name: &str, size_str: &str) -> Result<()> {
     let now = resp
         .get("size_bytes")
         .and_then(|v| v.as_u64())
-        .unwrap_or(size_bytes);
+        .unwrap_or(prev);
     println!(
         "OK: volume '{name}' resized: {} -> {}",
         format_bytes(prev),

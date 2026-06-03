@@ -170,7 +170,11 @@ async fn run(cli: Cli) -> Result<()> {
             VolumeAction::Modify { name, sync_after } => {
                 volume::cmd_modify_sync_after(&name, &sync_after).await
             }
-            VolumeAction::Resize { name, size } => volume::cmd_resize(&name, &size).await,
+            VolumeAction::Resize {
+                name,
+                size,
+                shrink_to_fit,
+            } => volume::cmd_resize(&name, size.as_deref(), shrink_to_fit).await,
             VolumeAction::Key { action } => match action {
                 KeyAction::Migrate {
                     name,

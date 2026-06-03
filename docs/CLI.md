@@ -42,12 +42,20 @@ The `volume` commands (`create`, `list`, `info`, `destroy`, `modify`,
 and refuse with a clear "start the daemon" message when the socket is
 unreachable. `volume create` resolves `--backend` daemon-side: you may
 omit it when exactly one `storage.backends:` entry exists. `volume resize
-NAME --size N` grows a volume's logical capacity online (grow-only;
-metadata-only over the sparse page table): the daemon flips the live size,
-persists `manifest.json`, and signals connected hosts to re-read capacity
-(NVMe Namespace Attribute Changed AER / iSCSI CAPACITY DATA HAS CHANGED
-unit attention). A host-side rescan (`iscsiadm -m node --rescan` / `nvme
-ns-rescan`) may still be needed for the OS to pick up the new size. `system storage benchmark` is
+NAME --size N` changes a volume's logical capacity online: the daemon flips
+the live size, persists `manifest.json`, and signals connected hosts to
+re-read capacity (NVMe Namespace Attribute Changed AER / iSCSI CAPACITY
+DATA HAS CHANGED unit attention). Grow is metadata-only over the sparse
+page table. Shrink is non-destructive by construction — it refuses on a
+WORM volume, when a persistent reservation is held, or when allocated data
+sits past the new end (free that range from the host first: resize the
+filesystem down, then `fstrim`/`blkdiscard`, which UNMAPs the freed pages).
+`volume resize NAME --shrink-to-fit` snaps to the smallest size that keeps
+all allocated data so you needn't compute the exact byte count; resize the
+filesystem down first so it fits. `--size` and `--shrink-to-fit` are
+mutually exclusive (exactly one required). A host-side rescan (`iscsiadm -m
+node --rescan` / `nvme ns-rescan`) may still be needed for the OS to pick
+up the new size. `system storage benchmark` is
 daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
 delete operations via `shared-object-store-bench`. `config` is pure-local.

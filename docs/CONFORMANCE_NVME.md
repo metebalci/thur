@@ -512,7 +512,8 @@ the namespace's live size, which Identify Namespace reports as NSZE /
 NCAP). Without a signal, a connected host keeps its stale Active
 Namespace List / cached capacity until it re-enumerates on its own
 schedule. The Namespace Attribute Changed asynchronous event closes that
-gap (issue #64; resize added in issue #76).
+gap (issue #64; resize added in issue #76, shrink in issue #77 — both
+directions reuse this path).
 
 The flow mirrors the reservation path but with three deliberate
 differences. **Opt-in:** the controller advertises support in Identify
@@ -545,9 +546,10 @@ maps to LUN as `nsid = lun + 1`, the same mapping the dispatcher's
 FID 0x0B config) is freed with the controller when its last association
 drops, so a reconnecting host starts clean and learns the namespace
 inventory from Identify, not stale notices. An online `volume resize`
-(issue #76) is the third trigger; it reuses this path unchanged (the host
-just re-Identifies and reads the new NSZE / NCAP) — a host-side `nvme
-ns-rescan` surfaces the new size to the OS block device.
+(grow #76, shrink #77) is the third trigger; both directions reuse this
+path unchanged (the host just re-Identifies and reads the new NSZE / NCAP)
+— a host-side `nvme ns-rescan` surfaces the new size to the OS block
+device.
 
 ### Is DH-HMAC-CHAP used in practice?
 
