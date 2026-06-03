@@ -22,6 +22,7 @@ pub enum AlertClass {
     AuditFailure,
     DiskCacheBackpressure,
     ChapFailures,
+    OrphanedObjects,
 }
 
 impl AlertClass {
@@ -30,6 +31,7 @@ impl AlertClass {
         AlertClass::AuditFailure,
         AlertClass::DiskCacheBackpressure,
         AlertClass::ChapFailures,
+        AlertClass::OrphanedObjects,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -38,6 +40,7 @@ impl AlertClass {
             AlertClass::AuditFailure => "audit_failure",
             AlertClass::DiskCacheBackpressure => "disk_cache_backpressure",
             AlertClass::ChapFailures => "chap_failures",
+            AlertClass::OrphanedObjects => "orphaned_objects",
         }
     }
 }
@@ -125,8 +128,9 @@ mod tests {
             "disk_cache_backpressure",
         );
         assert_eq!(AlertClass::ChapFailures.as_str(), "chap_failures");
+        assert_eq!(AlertClass::OrphanedObjects.as_str(), "orphaned_objects");
         // ALL must enumerate every variant exactly once.
-        assert_eq!(AlertClass::ALL.len(), 4);
+        assert_eq!(AlertClass::ALL.len(), 5);
     }
 
     #[test]

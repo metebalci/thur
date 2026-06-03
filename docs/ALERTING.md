@@ -15,11 +15,12 @@ Discord / ntfy.sh / ServiceNow webhook directly into the daemon.
 
 ## Event classes
 
-Four classes of event are supported, each individually toggled via
+Five classes of event are supported, each individually toggled via
 `alerting.events.*`. The defaults reflect signal-to-noise tradeoffs:
-`audit_failure` and `chap_failures` are on by default (high-signal, low
-frequency), while `backend_reachability` and `disk_cache_backpressure` are
-off by default (useful, but potentially noisier in practice).
+`audit_failure`, `chap_failures`, and `orphaned_objects` are on by
+default (high-signal, low frequency), while `backend_reachability` and
+`disk_cache_backpressure` are off by default (useful, but potentially
+noisier in practice).
 
 | Class | Severity | Source | Dedup key |
 |---|---|---|---|
@@ -27,6 +28,7 @@ off by default (useful, but potentially noisier in practice).
 | `audit_failure` | error | `shared/audit/src/audit_channel.rs` writer task on `AuditLog::append` Err (disk write / fsync / chain-state), via a function-pointer hook installed at boot (avoids the shared-alerting → shared-audit dep cycle) | `<op>` |
 | `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve`; VSA `lru.idx` sidecar persistently unwritable (eviction degrades to first-seen), latched once per volume in `core/block/src/uploader.rs` | `<backend>:watermark` / `<backend>:backpressure` / `<volume>:lru_index` |
 | `chap_failures` | warn | `shared/iscsi/src/transport.rs` CHAP path, surfaced by the daemon's `LoginAuditSink` adapter (VTL `IscsiLibraryLoginAudit`, VSA `IscsiDiskLoginAudit`). Per-user counter in the dispatcher; WARN fires once the user crosses `alerting.chap_failures_threshold` (default 3) inside one window | `chap:<user>` |
+| `orphaned_objects` | warn | A best-effort storage delete left objects behind (orphaned until GC). Today: VTL `cartridge migrate` source-side delete failures, fired from `vtl/daemon/src/admin/job_dispatch/migrate.rs` when `report.source_delete_warnings` is non-empty. The `count` field carries the true total; the `keys` array is capped at 32 (`keys_truncated` records the overflow) so a large failure can't produce an unbounded sink body | `<backend>:<operation>:orphaned` |
 
 The dispatcher special-cases `backend_reachability`: alerts fire
 only on status transitions (healthy → failing or failing → healthy),

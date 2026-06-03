@@ -32,8 +32,8 @@ pub struct AlertingConfig {
     pub chap_failures_threshold: u32,
 
     /// Per-event-class on/off knobs. Unset = on for audit_failure /
-    /// chap_failures (high-signal), off for backend_reachability /
-    /// disk_cache_backpressure (noisier).
+    /// chap_failures / orphaned_objects (high-signal), off for
+    /// backend_reachability / disk_cache_backpressure (noisier).
     #[serde(default)]
     pub events: EventsConfig,
 
@@ -73,6 +73,8 @@ pub struct EventsConfig {
     pub disk_cache_backpressure: bool,
     #[serde(default = "default_event_enabled")]
     pub chap_failures: bool,
+    #[serde(default = "default_event_enabled")]
+    pub orphaned_objects: bool,
 }
 
 impl Default for EventsConfig {
@@ -82,6 +84,7 @@ impl Default for EventsConfig {
             audit_failure: default_event_enabled(),
             disk_cache_backpressure: default_event_off(),
             chap_failures: default_event_enabled(),
+            orphaned_objects: default_event_enabled(),
         }
     }
 }
@@ -254,6 +257,18 @@ sinks:
         assert!(!cfg.enabled);
         assert_eq!(cfg.dedup_window_seconds, 300);
         assert_eq!(cfg.chap_failures_threshold, 3);
+    }
+
+    #[test]
+    fn events_orphaned_objects_defaults_on() {
+        // High-signal class (rare, actionable, costs storage) — on by
+        // default like audit_failure / chap_failures.
+        let ev = EventsConfig::default();
+        assert!(ev.orphaned_objects);
+        // And an explicit YAML override is honored.
+        let cfg: AlertingConfig =
+            serde_yaml::from_str("events:\n  orphaned_objects: false\n").unwrap();
+        assert!(!cfg.events.orphaned_objects);
     }
 
     #[test]

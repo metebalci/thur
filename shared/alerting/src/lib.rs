@@ -206,12 +206,101 @@ pub mod record {
         ));
     }
 
+    /// A best-effort storage cleanup left objects behind that should
+    /// have been deleted — e.g. a `cartridge migrate` source-side
+    /// delete that failed on permission / transient-network errors.
+    /// The orphans consume backend storage until a future GC sweep
+    /// reclaims them; fire so the leak has a standing signal rather
+    /// than a one-shot line in a job report an operator sees once.
+    ///
+    /// `keys` is the list of leaked objects (the producer formats each
+    /// as `<key>: <error>`); the `count` field always carries the true
+    /// total, while the wire-side `keys` array is capped so a
+    /// large-scale failure can't produce an unbounded email / webhook
+    /// body.
+    pub fn orphaned_objects(backend: &str, operation: &str, keys: &[String]) {
+        emit(build_orphaned_objects_alert(backend, operation, keys));
+    }
+
+    /// Cap on how many leaked keys ride in the alert's `keys` field —
+    /// the `count` field always carries the true total.
+    const MAX_ORPHAN_KEYS_IN_ALERT: usize = 32;
+
+    /// Build the [`AlertClass::OrphanedObjects`] alert. Split out from
+    /// [`orphaned_objects`] so the key-cap / count bookkeeping is unit-
+    /// testable without installing a global dispatcher.
+    fn build_orphaned_objects_alert(backend: &str, operation: &str, keys: &[String]) -> Alert {
+        let mut fields = serde_json::Map::new();
+        fields.insert("backend".into(), serde_json::Value::String(backend.into()));
+        fields.insert(
+            "operation".into(),
+            serde_json::Value::String(operation.into()),
+        );
+        fields.insert("count".into(), serde_json::Value::from(keys.len()));
+        let sample: Vec<serde_json::Value> = keys
+            .iter()
+            .take(MAX_ORPHAN_KEYS_IN_ALERT)
+            .map(|k| serde_json::Value::String(k.clone()))
+            .collect();
+        fields.insert("keys".into(), serde_json::Value::Array(sample));
+        if keys.len() > MAX_ORPHAN_KEYS_IN_ALERT {
+            fields.insert(
+                "keys_truncated".into(),
+                serde_json::Value::from(keys.len() - MAX_ORPHAN_KEYS_IN_ALERT),
+            );
+        }
+        Alert::new(
+            AlertClass::OrphanedObjects,
+            Severity::Warn,
+            format!(
+                "{operation}: {} object(s) left on backend '{backend}' after a failed delete (orphaned until GC reclaims them)",
+                keys.len()
+            ),
+            fields,
+            format!("{backend}:{operation}:orphaned"),
+        )
+    }
+
     /// One CHAP login failure. The dispatcher tracks per-user failures
     /// inside the dedup window and emits a WARN alert once the count
     /// reaches the configured threshold.
     pub fn chap_failure(user: &str, peer: &str) {
         if let Some(d) = global() {
             d.observe_chap_failure(user, peer);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn orphan_alert_carries_class_count_and_dedup_key() {
+            let keys = vec!["a/b: denied".to_string(), "c/d: timeout".to_string()];
+            let alert = build_orphaned_objects_alert("s3-cold", "migrate ABC123", &keys);
+            assert_eq!(alert.class, AlertClass::OrphanedObjects);
+            assert_eq!(alert.severity, Severity::Warn);
+            assert_eq!(alert.fields["backend"], "s3-cold");
+            assert_eq!(alert.fields["count"], 2);
+            assert_eq!(alert.fields["keys"].as_array().unwrap().len(), 2);
+            assert!(alert.fields.get("keys_truncated").is_none());
+            assert_eq!(alert.dedup_key, "s3-cold:migrate ABC123:orphaned");
+        }
+
+        #[test]
+        fn orphan_alert_caps_key_sample_but_counts_all() {
+            let keys: Vec<String> = (0..100).map(|i| format!("k{i}: denied")).collect();
+            let alert = build_orphaned_objects_alert("s3-cold", "migrate ABC123", &keys);
+            // True total preserved; wire-side sample capped.
+            assert_eq!(alert.fields["count"], 100);
+            assert_eq!(
+                alert.fields["keys"].as_array().unwrap().len(),
+                MAX_ORPHAN_KEYS_IN_ALERT
+            );
+            assert_eq!(
+                alert.fields["keys_truncated"],
+                (100 - MAX_ORPHAN_KEYS_IN_ALERT) as u64
+            );
         }
     }
 }

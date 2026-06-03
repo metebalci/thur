@@ -289,6 +289,7 @@ which is off by default. Full design and worked examples:
 | `alerting.events.audit_failure` | `true` | Per-class on/off — audit-log append failures. |
 | `alerting.events.disk_cache_backpressure` | `false` | Per-class on/off — disk-cache watermark / backpressure timeout. |
 | `alerting.events.chap_failures` | `true` | Per-class on/off — repeated CHAP login failures. |
+| `alerting.events.orphaned_objects` | `true` | Per-class on/off — storage objects left behind by a failed best-effort delete (VTL `cartridge migrate` source-delete; orphaned until GC). |
 | `alerting.sinks` | `[]` | Sink list. Each sink is `type: email` (SMTP) or `type: webhook` (Tera-templated HTTP POST). Sink fields and worked examples are in [`ALERTING.md`](ALERTING.md). |
 
 ---

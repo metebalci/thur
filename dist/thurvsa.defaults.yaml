@@ -480,14 +480,21 @@ alerting:
   # individual audit rows still record). Default 3.
   chap_failures_threshold: 3
 
-  # Per-class on/off. Defaults: audit_failure / chap_failures on
-  # (high-signal), backend_reachability / disk_cache_backpressure
-  # off (noisier, opt in once you've verified the wiring).
+  # Per-class on/off. Defaults: audit_failure / chap_failures /
+  # orphaned_objects on (high-signal), backend_reachability /
+  # disk_cache_backpressure off (noisier, opt in once you've verified
+  # the wiring).
   events:
     backend_reachability: false
     audit_failure: true
     disk_cache_backpressure: false
     chap_failures: true
+    # A best-effort storage cleanup left objects behind that should
+    # have been deleted — the orphans consume backend storage until a
+    # future GC sweep reclaims them. The alert class is shared across
+    # products; no VSA op fires it today (it is driven by VTL
+    # `cartridge migrate`), but the knob parses here for parity.
+    orphaned_objects: true
 
   # Configured sinks. Empty (the shipped default) means no sinks;
   # required to be non-empty when enabled: true.

@@ -147,6 +147,7 @@ impl AlertingDispatcher {
             AlertClass::AuditFailure => self.events.audit_failure,
             AlertClass::DiskCacheBackpressure => self.events.disk_cache_backpressure,
             AlertClass::ChapFailures => self.events.chap_failures,
+            AlertClass::OrphanedObjects => self.events.orphaned_objects,
         }
     }
 
@@ -400,6 +401,7 @@ mod tests {
                 audit_failure: true,
                 disk_cache_backpressure: true,
                 chap_failures: true,
+                orphaned_objects: true,
             },
             sinks: vec![webhook_sink("primary")],
         }

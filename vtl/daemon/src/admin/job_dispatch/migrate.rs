@@ -253,6 +253,17 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             for w in &report.source_delete_warnings {
                 emitter.warn(format!("source delete warning: {}", w)).await;
             }
+            // The job-stream warnings above are seen once; fire a
+            // standing OrphanedObjects alert so the leaked source-side
+            // objects (orphaned until a future GC sweep) stay visible to
+            // operators. They live on the source (`from_backend`).
+            if !report.source_delete_warnings.is_empty() {
+                shared_alerting::record::orphaned_objects(
+                    &report.from_backend,
+                    &format!("migrate {}", report.barcode),
+                    &report.source_delete_warnings,
+                );
+            }
             emitter
                 .info(format!(
                     "migrate complete: {} chunks ({} bytes), {} manifest objects",
