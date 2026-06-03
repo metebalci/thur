@@ -261,6 +261,22 @@ impl SessionManager {
             .collect()
     }
 
+    /// Every live session's TSIH. Used to fan a logical-unit-wide Unit
+    /// Attention (e.g. CAPACITY DATA HAS CHANGED after an online resize,
+    /// issue #76) to all connected initiators — unlike
+    /// [`tsihs_for`](Self::tsihs_for), which filters to one reservation
+    /// registrant's identity, capacity change concerns every session.
+    /// A UA queued for a session not admitted to the affected LUN is
+    /// harmless: that nexus never issues commands on it, so it is never
+    /// popped.
+    pub fn active_tsihs(&self) -> Vec<u16> {
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("session manager mutex poisoned");
+        sessions.values().map(|s| s.tsih).collect()
+    }
+
     /// Update session activity timestamp
     pub fn update_activity(&self, tsih: u16) -> Result<(), IscsiError> {
         let mut sessions = self
@@ -528,6 +544,19 @@ mod tests {
         mgr.add_connection(tsih2, 0, 131072).unwrap();
 
         assert_eq!(mgr.connection_count(), 2);
+    }
+
+    #[test]
+    fn active_tsihs_returns_every_live_session() {
+        let mgr = SessionManager::new();
+        assert!(mgr.active_tsihs().is_empty());
+        let t1 = mgr.create_session([0, 1, 2, 3, 4, 5]);
+        let t2 = mgr.create_session([0, 6, 7, 8, 9, 10]);
+        let mut got = mgr.active_tsihs();
+        got.sort_unstable();
+        let mut want = [t1, t2];
+        want.sort_unstable();
+        assert_eq!(got, want);
     }
 
     #[test]

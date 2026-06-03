@@ -86,6 +86,14 @@ impl UnitAttentionCode {
         asc: 0x2A,
         ascq: 0x04,
     };
+
+    // Capacity data has changed (SBC-3: the logical unit's capacity
+    // changed out-of-band, e.g. an online `volume resize`). The host
+    // re-issues READ CAPACITY on the next command. Issue #76.
+    pub const CAPACITY_DATA_HAS_CHANGED: Self = Self {
+        asc: 0x2A,
+        ascq: 0x09,
+    };
 }
 
 /// Map key: (session TSIH, target LUN). One UA list per nexus.

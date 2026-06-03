@@ -40,7 +40,9 @@ pub(super) fn read_capacity_10(req: &ScsiRequest<'_>, cache: Option<&PageCache>)
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
     let manifest = cache.manifest();
-    let total_blocks = manifest.size_bytes / u64::from(manifest.sector_bytes);
+    // Live size (issue #76), not the boot-snapshot manifest, so a host
+    // re-issuing READ CAPACITY after an online resize sees the new size.
+    let total_blocks = cache.size_bytes() / u64::from(manifest.sector_bytes);
     let last_lba_u32 = if total_blocks > u64::from(u32::MAX) {
         u32::MAX
     } else if total_blocks == 0 {
@@ -77,7 +79,8 @@ fn read_capacity_16(req: &ScsiRequest<'_>, cache: Option<&PageCache>) -> ScsiRes
         return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED);
     };
     let manifest = cache.manifest();
-    let total_blocks = manifest.size_bytes / u64::from(manifest.sector_bytes);
+    // Live size (issue #76), not the boot-snapshot manifest.
+    let total_blocks = cache.size_bytes() / u64::from(manifest.sector_bytes);
     let last_lba = total_blocks.saturating_sub(1);
 
     let alloc_len =
@@ -237,6 +240,37 @@ mod tests {
         // Lowest aligned LBA bits = 0.
         assert_eq!(r.data_in[14] & 0x3F, 0x00);
         assert_eq!(r.data_in[15], 0x00);
+    }
+
+    #[tokio::test]
+    async fn read_capacity_16_reflects_online_resize() {
+        // 4 MiB / 4 KiB = 1024 blocks, last LBA = 1023.
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path(), 4 * (1u64 << 20)).await;
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0x9E;
+        cdb[1] = 0x10;
+        cdb[10..14].copy_from_slice(&32u32.to_be_bytes());
+        let last_lba = |r: &ScsiResponse| {
+            u64::from_be_bytes([
+                r.data_in[0],
+                r.data_in[1],
+                r.data_in[2],
+                r.data_in[3],
+                r.data_in[4],
+                r.data_in[5],
+                r.data_in[6],
+                r.data_in[7],
+            ])
+        };
+        let before = service_action_in_16(&req(&cdb), Some(cache.as_ref()));
+        assert_eq!(last_lba(&before), 1023);
+
+        // Grow to 8 MiB: READ CAPACITY must report the new last LBA off
+        // the live shadow with no restart / new PageCache (issue #76).
+        cache.writer().set_size(8 * (1u64 << 20)).unwrap();
+        let after = service_action_in_16(&req(&cdb), Some(cache.as_ref()));
+        assert_eq!(last_lba(&after), 2047);
     }
 
     #[tokio::test]

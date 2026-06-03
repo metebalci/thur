@@ -1165,8 +1165,8 @@ VPD in Part 3; NVMe in
 
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
-| 0x25 | READ CAPACITY (10) | 🟩 Yes | M | Caps `LAST LBA` at `0xFFFFFFFF` so big volumes force the host to RC16. |
-| 0x9E sa 0x10 | READ CAPACITY (16) | 🟩 Yes | M | Full 8-byte last LBA. Byte 14 carries LBPME=1 + LBPRZ=1 (thin-provision hint, unmapped reads zero). |
+| 0x25 | READ CAPACITY (10) | 🟩 Yes | M | Caps `LAST LBA` at `0xFFFFFFFF` so big volumes force the host to RC16. Reports the live size, so a re-issue after an online `volume resize` reflects the new capacity (issue #76). |
+| 0x9E sa 0x10 | READ CAPACITY (16) | 🟩 Yes | M | Full 8-byte last LBA. Byte 14 carries LBPME=1 + LBPRZ=1 (thin-provision hint, unmapped reads zero). Reports the live size — see *Online resize* below. |
 | 0x28 | READ (10) | 🟩 Yes | M | Sub-page supported via cache RMW. Unallocated pages return zeros (sparse holes). Reservation-gated. |
 | 0x2A | WRITE (10) | 🟩 Yes | M | Sub-page supported via cache RMW. WORM volumes refuse with WRITE PROTECTED. Reservation-gated. |
 | 0x2F | VERIFY (10) | 🟩 Yes | O | BYTCHK=00 reads the requested range to surface medium errors (sparse-hole pages succeed). BYTCHK=01 compares Data-Out against on-medium bytes; mismatch surfaces as MISCOMPARE (sense key 0x0E, ASC/ASCQ 0x1D/0x00). BYTCHK=10/11 rejected with INVALID FIELD IN CDB. VRPROTECT must be 0. Reservation-gated as a read-side opcode. |
@@ -1189,6 +1189,33 @@ VPD in Part 3; NVMe in
 | 0x8F | VERIFY (16) | 🟩 Yes | O | Same semantics as VERIFY (10), 64-bit LBA + 32-bit transfer length. |
 | 0x91 | SYNCHRONIZE CACHE (16) | 🟩 Yes | O | Same semantics as 0x35, 64-bit LBA. |
 | 0x93 | WRITE SAME (16) | 🟩 Partial | O | Same semantics as WRITE SAME (10) plus the NDOB bit (byte 1 bit 0): NDOB=1 means "no Data-Out, zero-fill." NUMBER OF BLOCKS = 0 means "from LBA to end of medium" per SBC-3 §5.50. Reservation-gated. |
+
+---
+
+## Online resize (capacity-change notification)
+
+`thurvsa volume resize NAME --size N` grows a volume's logical capacity
+while it is exported (issue #76). Grow is metadata-only — the page table
+is sparse, so pages past the old end already read as zero and the
+data-path range gate admits I/O into the grown region the instant the
+size changes. The size is the live source of truth (an in-memory shadow
+the daemon flips and persists to `manifest.json`); READ CAPACITY (10/16),
+MODE SENSE block descriptors, and the READ/WRITE range check all read it,
+so a connected host sees the new capacity without a daemon restart.
+
+To prompt the host to re-read, a resize raises a **CAPACITY DATA HAS
+CHANGED** Unit Attention (sense key 0x06, ASC/ASCQ `0x2A/0x09`) on every
+live iSCSI session, delivered by the same dispatch-level UA preemption as
+RESERVATIONS PREEMPTED / MEDIUM MAY HAVE CHANGED — popped ahead of the
+next command on each nexus (except INQUIRY / REQUEST SENSE / REPORT
+LUNS). The host clears the UA and re-issues READ CAPACITY. The Linux SCSI
+midlayer still needs an explicit rescan (`iscsiadm -m node --rescan` or
+`echo 1 > /sys/block/sdX/device/rescan`) to resize the block device; the
+UA invalidates the host's cached capacity but does not by itself trigger
+a rescan. Shrink is not supported (the resize verb is grow-only). The
+NVMe/TCP counterpart fires a Namespace Attribute Changed AER — see
+[`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md) § Namespace-change
+notifications.
 
 ---
 

@@ -113,11 +113,12 @@ struct Sizing {
 
 impl Sizing {
     fn from(cache: &PageCache) -> Self {
-        let m = cache.manifest();
-        let sector = u64::from(m.sector_bytes);
+        let sector = u64::from(cache.manifest().sector_bytes);
         Self {
             sector,
-            total_blocks: m.size_bytes / sector,
+            // Live size (issue #76): the data-path range gate must admit
+            // I/O into a grown volume without a daemon restart.
+            total_blocks: cache.size_bytes() / sector,
         }
     }
 }

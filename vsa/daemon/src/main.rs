@@ -515,6 +515,12 @@ async fn main() -> Result<()> {
     // when nvmetcp isn't a configured transport; the handlers then skip
     // the notify entirely.
     let mut aer_hub_for_admin: Option<Arc<nvme_nvm::ControllerRegistry>> = None;
+    // The iSCSI Unit Attention queue, lifted out of the iSCSI arm so the
+    // admin socket's volume resize can fan a CAPACITY DATA HAS CHANGED UA
+    // to connected iSCSI sessions (issue #76). `None` when iSCSI isn't a
+    // configured transport; the handler then skips the iSCSI notify.
+    let mut ua_tracker_for_admin: Option<Arc<shared_iscsi::unit_attention::UnitAttentionTracker>> =
+        None;
     // The login-audit sink is consumed only by the iSCSI arm; park it in
     // an Option so an NVMe-only boot leaves it untouched (dropped after
     // the loop). Config de-dups `transports`, so iSCSI runs at most once
@@ -547,6 +553,7 @@ async fn main() -> Result<()> {
                 // sink's enqueue (issue #67).
                 let ua_tracker =
                     Arc::new(shared_iscsi::unit_attention::UnitAttentionTracker::new());
+                ua_tracker_for_admin = Some(Arc::clone(&ua_tracker));
                 let collapse_isid = cfg.iscsi.reservations.initiator_port.collapse_isid();
                 let handler = Arc::new(SbcScsiDispatcher::with_alua(
                     Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
@@ -865,6 +872,7 @@ async fn main() -> Result<()> {
         sessions: Arc::clone(&session_manager),
         reservations: Arc::clone(&reservations),
         aer_hub: aer_hub_for_admin,
+        ua_tracker: ua_tracker_for_admin,
     };
     let admin_socket = admin::admin_socket_path();
 

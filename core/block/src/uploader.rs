@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
@@ -239,6 +239,18 @@ pub enum UploaderError {
     )]
     IncompatiblePageSize { src: u32, dst: u32 },
 
+    #[error(
+        "resize target {size_bytes} B is not a whole multiple of the \
+         {sector_bytes} B sector size"
+    )]
+    ResizeNotSectorAligned { size_bytes: u64, sector_bytes: u32 },
+
+    #[error(
+        "resize target {requested} B does not grow the volume \
+         (current size {current} B); shrink is not supported"
+    )]
+    ResizeNotGrow { current: u64, requested: u64 },
+
     #[error("invalid hash from chunk pool: {0}")]
     BadHash(String),
 
@@ -355,6 +367,17 @@ pub struct VolumeWriter {
     /// dispatch, telemetry) can read the live value without
     /// holding the `VolumeWriter`.
     sync_after: Arc<AtomicU8>,
+    /// Hot-path lock-free shadow of the volume's logical size. Seeded
+    /// from `manifest.size_bytes` at `open_inner`; mutated by
+    /// [`Self::set_size`] (which also rewrites `manifest.json`). This —
+    /// not `self.manifest.size_bytes`, which stays the boot snapshot —
+    /// is the live source of truth read by [`Self::size_bytes`] /
+    /// [`Self::last_page_id`] and, through
+    /// [`crate::cache::PageCache::size_bytes`], by READ CAPACITY,
+    /// Identify Namespace, and every data-path range check. An online
+    /// `volume resize` flips it so both transports see the new capacity
+    /// without a daemon restart (issue #76).
+    live_size_bytes: Arc<AtomicU64>,
     /// Per-backend ghost list of recently-evicted chunk hashes. When
     /// set, the cache-miss path in `read_page` consults it before
     /// each backend GET and records the eviction age into the
@@ -447,6 +470,7 @@ impl VolumeWriter {
             None
         };
         let sync_after = Arc::new(AtomicU8::new(runtime.sync_after.as_u8()));
+        let live_size_bytes = Arc::new(AtomicU64::new(manifest.size_bytes));
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             manifest,
@@ -462,6 +486,7 @@ impl VolumeWriter {
             upload_sender: None,
             pending_uploads: PendingUploads::new(),
             sync_after,
+            live_size_bytes,
             ghost_list: None,
         })
     }
@@ -621,6 +646,54 @@ impl VolumeWriter {
         Ok(())
     }
 
+    /// Live logical size of the volume in bytes. Lock-free read off the
+    /// shadow atomic, which an online [`Self::set_size`] keeps current —
+    /// so this, not `self.manifest().size_bytes` (the boot snapshot),
+    /// is what READ CAPACITY / Identify Namespace / the data-path range
+    /// checks must consult after a `volume resize` (issue #76).
+    pub fn size_bytes(&self) -> u64 {
+        self.live_size_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Grow the volume's logical size and rewrite `manifest.json` so the
+    /// new capacity survives a daemon restart. Grow-only: rejects a
+    /// shrink or a no-op. The new size must be a whole multiple of the
+    /// volume's sector size.
+    ///
+    /// Grow is metadata-only — the page table is sparse, so pages past
+    /// the old end already read as zero and the data path admits I/O
+    /// into the grown region the moment the shadow flips. Persist the
+    /// manifest first, then flip the atomic: a crash in between leaves
+    /// disk = new, live = old, and the next boot reseeds the shadow from
+    /// the persisted manifest, converging on the new size. The reverse
+    /// ordering could advertise capacity that isn't durable.
+    pub fn set_size(&self, new_size: u64) -> Result<(), UploaderError> {
+        let sector = u64::from(self.manifest.sector_bytes);
+        if sector == 0 || !new_size.is_multiple_of(sector) {
+            return Err(UploaderError::ResizeNotSectorAligned {
+                size_bytes: new_size,
+                sector_bytes: self.manifest.sector_bytes,
+            });
+        }
+        let current = self.size_bytes();
+        if new_size <= current {
+            return Err(UploaderError::ResizeNotGrow {
+                current,
+                requested: new_size,
+            });
+        }
+        // Clone the boot snapshot and flip just the size — unlike
+        // `runtime.json`, `manifest.json` has no hot-path writer to
+        // merge against (it's frozen post-create), so there is nothing
+        // to reload.
+        let vol_dir = VolumeManifest::dir_for(&self.data_dir, &self.manifest.name);
+        let mut m = self.manifest.clone();
+        m.size_bytes = new_size;
+        m.persist(&vol_dir)?;
+        self.live_size_bytes.store(new_size, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn pool(&self) -> &ChunkPool {
         &self.pool
     }
@@ -638,7 +711,9 @@ impl VolumeWriter {
     /// `size_bytes / page_size_bytes` pages addressed `0 ..
     /// page_count`. `page_count - 1` is the last legal id.
     pub fn last_page_id(&self) -> u64 {
-        let count = self.manifest.size_bytes / u64::from(self.manifest.page_size_bytes);
+        // Live size, not the boot snapshot: a grown volume must admit
+        // writes into the new page range (issue #76).
+        let count = self.size_bytes() / u64::from(self.manifest.page_size_bytes);
         count.saturating_sub(1)
     }
 
@@ -692,7 +767,7 @@ impl VolumeWriter {
             return Err(UploaderError::PageOutOfRange {
                 page_id: u64::from(page_id),
                 page_size: self.manifest.page_size_bytes,
-                size_bytes: self.manifest.size_bytes,
+                size_bytes: self.size_bytes(),
             });
         }
 
@@ -1234,6 +1309,69 @@ mod tests {
         let bytes = page_bytes(0);
         let err = writer.write_page(64, &bytes).await.unwrap_err();
         assert!(matches!(err, UploaderError::PageOutOfRange { .. }));
+    }
+
+    #[tokio::test]
+    async fn set_size_grows_admits_new_range_and_persists() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend.clone()).unwrap();
+        // 4 MiB / 64 KiB = 64 pages (0..63). Page 64 is past the end.
+        assert_eq!(writer.size_bytes(), 4 * (1u64 << 20));
+        assert_eq!(writer.last_page_id(), 63);
+        let bytes = page_bytes(0x33);
+        assert!(matches!(
+            writer.write_page(64, &bytes).await.unwrap_err(),
+            UploaderError::PageOutOfRange { .. }
+        ));
+
+        // Grow to 8 MiB: live size + last_page_id move immediately, the
+        // previously-rejected page is now admitted, and a write past the
+        // *new* end is still rejected.
+        writer.set_size(8 * (1u64 << 20)).unwrap();
+        assert_eq!(writer.size_bytes(), 8 * (1u64 << 20));
+        assert_eq!(writer.last_page_id(), 127);
+        writer.write_page(64, &bytes).await.unwrap();
+        assert_eq!(writer.read_page(64).await.unwrap(), Some((bytes, 0)));
+        assert!(matches!(
+            writer.write_page(128, &page_bytes(0)).await.unwrap_err(),
+            UploaderError::PageOutOfRange { .. }
+        ));
+
+        // Persisted to manifest.json: a fresh open boots at the new size.
+        assert_eq!(
+            VolumeManifest::load(tmp.path(), &name).unwrap().size_bytes,
+            8 * (1u64 << 20)
+        );
+        let reopened = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        assert_eq!(reopened.size_bytes(), 8 * (1u64 << 20));
+        assert_eq!(reopened.last_page_id(), 127);
+    }
+
+    #[tokio::test]
+    async fn set_size_rejects_shrink_noop_and_unaligned() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        let orig = 4 * (1u64 << 20);
+
+        assert!(matches!(
+            writer.set_size(2 * (1u64 << 20)).unwrap_err(),
+            UploaderError::ResizeNotGrow { .. }
+        ));
+        assert!(matches!(
+            writer.set_size(orig).unwrap_err(),
+            UploaderError::ResizeNotGrow { .. }
+        ));
+        assert!(matches!(
+            writer.set_size(orig + 1).unwrap_err(),
+            UploaderError::ResizeNotSectorAligned { .. }
+        ));
+
+        // No rejected call touched the live shadow or the on-disk manifest.
+        assert_eq!(writer.size_bytes(), orig);
+        assert_eq!(
+            VolumeManifest::load(tmp.path(), &name).unwrap().size_bytes,
+            orig
+        );
     }
 
     // -- At-rest encryption -----------------------------------------------

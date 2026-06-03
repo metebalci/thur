@@ -29,7 +29,7 @@ clap drives both `--help` and the shipped completion scripts.
 ## thurvsa
 
 ```
-volume     create / list / info / destroy / modify / key migrate
+volume     create / list / info / destroy / modify / resize / key migrate
 system     storage benchmark / gc / stats / verify / regenerate-cert / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
@@ -37,11 +37,17 @@ nvmetcp    psks {add,remove,disable,enable,rotate,list}
 config     defaults / systemd-unit / completion
 ```
 
-The `volume` commands (`create`, `list`, `info`, `destroy`, `modify`) are
-daemon-routed only — they talk to `/run/thurvsa/admin.sock` and refuse
-with a clear "start the daemon" message when the socket is unreachable.
-`volume create` resolves `--backend` daemon-side: you may omit it when
-exactly one `storage.backends:` entry exists. `system storage benchmark` is
+The `volume` commands (`create`, `list`, `info`, `destroy`, `modify`,
+`resize`) are daemon-routed only — they talk to `/run/thurvsa/admin.sock`
+and refuse with a clear "start the daemon" message when the socket is
+unreachable. `volume create` resolves `--backend` daemon-side: you may
+omit it when exactly one `storage.backends:` entry exists. `volume resize
+NAME --size N` grows a volume's logical capacity online (grow-only;
+metadata-only over the sparse page table): the daemon flips the live size,
+persists `manifest.json`, and signals connected hosts to re-read capacity
+(NVMe Namespace Attribute Changed AER / iSCSI CAPACITY DATA HAS CHANGED
+unit attention). A host-side rescan (`iscsiadm -m node --rescan` / `nvme
+ns-rescan`) may still be needed for the OS to pick up the new size. `system storage benchmark` is
 daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
 delete operations via `shared-object-store-bench`. `config` is pure-local.

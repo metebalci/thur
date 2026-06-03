@@ -506,9 +506,11 @@ impl PageCache {
     }
 
     /// Total volume size in bytes. Convenience accessor for the
-    /// dispatcher which does range checking in byte space.
+    /// dispatcher which does range checking in byte space. Reads the
+    /// writer's live shadow, not the boot-snapshot manifest, so an
+    /// online `volume resize` is visible without a restart (issue #76).
     pub fn size_bytes(&self) -> u64 {
-        self.manifest().size_bytes
+        self.writer.size_bytes()
     }
 
     /// Resolve an LBA range to a `(byte_offset, byte_len)` window,
@@ -1500,6 +1502,27 @@ mod tests {
         let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
         let got = cache.read_bytes(0, PAGE).await.unwrap();
         assert!(got.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn resolve_range_tracks_live_size_after_resize() {
+        // 4 MiB / 4 KiB sector = 1024 blocks (LBA 0..1023).
+        let (_tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+        assert_eq!(cache.size_bytes(), 4 * (1u64 << 20));
+        assert!(matches!(
+            cache.resolve_range(1024, 1),
+            Err(RangeError::OutOfRange)
+        ));
+
+        // The cache reads the writer's live shadow — a grow is visible
+        // to the data-path range gate immediately, no new PageCache.
+        writer.set_size(8 * (1u64 << 20)).unwrap();
+        assert_eq!(cache.size_bytes(), 8 * (1u64 << 20));
+        assert!(cache.resolve_range(1024, 1).is_ok());
+        assert!(matches!(
+            cache.resolve_range(2048, 1),
+            Err(RangeError::OutOfRange)
+        ));
     }
 
     #[tokio::test]

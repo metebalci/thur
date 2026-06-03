@@ -315,7 +315,12 @@ pub struct VolumeManifest {
     pub name: String,
     #[serde(with = "uuid_serde")]
     pub uuid: [u8; 16],
-    /// Logical (host-visible) volume size, sector-aligned.
+    /// Logical (host-visible) volume size, sector-aligned. This is the
+    /// boot/persist record. The *live* size after an online `volume
+    /// resize` is the writer's shadow atomic — read it via
+    /// [`crate::uploader::VolumeWriter::size_bytes`] /
+    /// [`crate::cache::PageCache::size_bytes`]. Reading this field on a
+    /// hot path advertises a stale capacity after a resize (issue #76).
     pub size_bytes: u64,
     /// SBC-3 advertised logical-block size. 4 KiB by default.
     pub sector_bytes: u32,

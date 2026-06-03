@@ -28,6 +28,11 @@
 #        b. iSCSI preempts an NVMe-held reservation -> the NVMe host's
 #           Reservation Notification log (LID 0x80) carries a Reservation
 #           Preempted entry.
+#   5. Online resize (issue #76): `volume resize` grows the live volume
+#      while it is exported; both the iSCSI and NVMe hosts see the new
+#      capacity with no reconnect (iSCSI CAPACITY DATA HAS CHANGED UA +
+#      rescan / NVMe Namespace Attribute Changed AER + ns-rescan), and a
+#      host write into the newly-grown region round-trips cross-transport.
 #
 # The cross-protocol coherence falls out of the single shared
 # ReservationManager keyed by LUN (issue #57): an iSCSI initiator port
@@ -416,6 +421,84 @@ test_iscsi_preempt_raises_nvme_notif() {
     return 0
 }
 
+# Test 5: online grow (issue #76). Resize the live volume via the admin
+# socket (daemon stays up) and assert BOTH hosts see the new capacity
+# without a reconnect, then that a host write into the newly-grown region
+# round-trips cross-transport. This exercises the live-size shadow end to
+# end: READ CAPACITY / Identify Namespace report the new size, and the
+# SBC data-path + writer page-bounds admit I/O past the old end.
+test_online_resize_dual_transport() {
+    log_test "online resize: both hosts see the grown capacity with no reconnect (#76)"
+    reset_lun_reservations
+
+    local iscsi_dev="$ISCSI_BLK"
+    local nvme_dev="/dev/${NVME_DEVICE}n1"
+    local before_iscsi before_nvme
+    before_iscsi=$(blockdev --getsize64 "$iscsi_dev" 2>/dev/null)
+    before_nvme=$(blockdev --getsize64 "$nvme_dev" 2>/dev/null)
+    log_info "  capacity before: iscsi=${before_iscsi}B nvme=${before_nvme}B"
+    # vol-dual was created at 64M; grow to 128M.
+    local want=$((128 * 1024 * 1024))
+
+    "$CLI_PATH" --config "${TEST_DIR}/config.yaml" volume resize "vol-dual" --size 128M \
+        >"$TEST_DIR/resize.log" 2>&1 \
+        || { log_error "volume resize failed: $(cat "$TEST_DIR/resize.log")"; return 1; }
+    log_info "  daemon resized vol-dual 64M -> 128M (daemon still up)"
+
+    # iSCSI: a CAPACITY DATA HAS CHANGED UA (0x2A/0x09) is queued; drain it
+    # with a TUR (best-effort — the kernel may consume it first), then
+    # rescan so the block layer re-reads READ CAPACITY.
+    local ua
+    ua=$(sg_turs -v "$ISCSI_SG" 2>&1 || true)
+    if echo "$ua" | grep -qiE "2a 09|capacity data has changed"; then
+        log_info "  observed CAPACITY DATA HAS CHANGED unit attention on iSCSI"
+    fi
+    echo 1 > "/sys/block/$(basename "$iscsi_dev")/device/rescan" 2>/dev/null || true
+    iscsiadm -m node --targetname "$TARGET_IQN" --portal "127.0.0.1:$ISCSI_PORT" --rescan >/dev/null 2>&1 || true
+
+    # NVMe: the Namespace Attribute Changed AER fired; force a re-Identify.
+    nvme ns-rescan "/dev/${NVME_DEVICE}" >/dev/null 2>&1 || true
+
+    local after_iscsi after_nvme ok=0
+    for _ in $(seq 1 25); do
+        after_iscsi=$(blockdev --getsize64 "$iscsi_dev" 2>/dev/null)
+        after_nvme=$(blockdev --getsize64 "$nvme_dev" 2>/dev/null)
+        if [[ "$after_iscsi" == "$want" && "$after_nvme" == "$want" ]]; then ok=1; break; fi
+        sleep 0.4
+    done
+    if [[ $ok -ne 1 ]]; then
+        log_error "  capacity did not update to ${want}B: iscsi=${after_iscsi}B nvme=${after_nvme}B"
+        return 1
+    fi
+    log_info "  both hosts report ${want}B after resize (no reconnect)"
+
+    # Functional: write a pattern into the newly-grown region (offset 64M)
+    # over iSCSI and read it back over NVMe — proves the SBC data-path +
+    # writer page-bounds admit I/O past the old end-of-volume.
+    local infile="$TEST_DIR/grow-pattern.bin"
+    local outfile="$TEST_DIR/grow-readback.bin"
+    dd if=/dev/urandom of="$infile" bs=1M count=1 status=none
+    local in_sha out_sha
+    in_sha=$(sha256sum "$infile" | awk '{print $1}')
+    if ! dd if="$infile" of="$iscsi_dev" bs=1M seek=64 count=1 oflag=direct conv=fsync status=none \
+        2>"$TEST_DIR/grow-write.err"; then
+        log_error "  iSCSI write into grown region failed: $(cat "$TEST_DIR/grow-write.err")"
+        return 1
+    fi
+    if ! dd if="$nvme_dev" of="$outfile" bs=1M skip=64 count=1 iflag=direct status=none \
+        2>"$TEST_DIR/grow-read.err"; then
+        log_error "  NVMe read from grown region failed: $(cat "$TEST_DIR/grow-read.err")"
+        return 1
+    fi
+    out_sha=$(sha256sum "$outfile" | awk '{print $1}')
+    if [[ "$in_sha" != "$out_sha" ]]; then
+        log_error "  grown-region cross-transport mismatch: in=$in_sha out=$out_sha"
+        return 1
+    fi
+    log_info "  write past old end (iSCSI) read back identically (NVMe)"
+    return 0
+}
+
 main() {
     echo "========================================"
     echo "Thur VSA Dual-Transport (iSCSI + NVMe/TCP)"
@@ -431,7 +514,7 @@ main() {
     local passed=0 failed=0
     for t in test_cross_transport_io test_iscsi_reservation_fences_nvme \
         test_nvme_reservation_fences_iscsi test_nvme_preempt_raises_iscsi_ua \
-        test_iscsi_preempt_raises_nvme_notif; do
+        test_iscsi_preempt_raises_nvme_notif test_online_resize_dual_transport; do
         if "$t"; then ((passed++)); else ((failed++)); fi
         echo ""
     done

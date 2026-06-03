@@ -98,7 +98,7 @@ rather than via these commands, so a host that submits them receives
 | 0x08 | Abort | 🟩 Stub | O | Returns CQE.DW0 bit 0 = 1 (command not aborted / already complete). The dispatcher does not queue commands at the controller level. |
 | 0x09 | Set Features | 🟩 Partial | M | See FID table below. |
 | 0x0A | Get Features | 🟩 Partial | M | See FID table below. |
-| 0x0C | Async Event Request | 🟩 Partial | O | Parked on the admin queue by the transport (not the dispatcher) until a controller event fires. Two event sources are wired: a reservation change completes with DW0 = `0x00800006` (AET=0x6 I/O Command Set specific, AEI=0x00 Reservation Log Page Available, LID=0x80) → Reservation Notification log; a volume create / destroy completes with DW0 = `0x00040002` (AET=0x2 Notice, AEI=0x00 Namespace Attribute Changed, LID=0x04) → Changed Namespace List, gated on Set Features FID 0x0B bit 8. Firmware / thermal notices are not produced. See *Reservation notifications* and *Namespace-change notifications* below. |
+| 0x0C | Async Event Request | 🟩 Partial | O | Parked on the admin queue by the transport (not the dispatcher) until a controller event fires. Two event sources are wired: a reservation change completes with DW0 = `0x00800006` (AET=0x6 I/O Command Set specific, AEI=0x00 Reservation Log Page Available, LID=0x80) → Reservation Notification log; a volume create / destroy / resize completes with DW0 = `0x00040002` (AET=0x2 Notice, AEI=0x00 Namespace Attribute Changed, LID=0x04) → Changed Namespace List, gated on Set Features FID 0x0B bit 8. Firmware / thermal notices are not produced. See *Reservation notifications* and *Namespace-change notifications* below. |
 | 0x10 | Firmware Commit | 🟨 No | O | No firmware-download surface — the daemon ships as a binary, not a flashable image. |
 | 0x11 | Firmware Image Download | 🟨 No | O | As above. |
 | 0x14 | Device Self-test | 🟨 No | O | No self-test surface. |
@@ -505,13 +505,15 @@ by the initiator IQN + ISID rather than the ephemeral TSIH).
 
 ### Namespace-change notifications (LID 0x04)
 
-A namespace can appear or disappear out-of-band while a host is
-connected: an operator runs `thurvsa volume create` or `volume destroy`
-against the admin socket, mutating the live `VolumeRegistry` the NVMe
-dispatcher resolves NSIDs through. Without a signal, a connected host
-keeps its stale Active Namespace List until it re-enumerates on its own
+A namespace can appear, disappear, or change size out-of-band while a
+host is connected: an operator runs `thurvsa volume create`, `volume
+destroy`, or `volume resize` against the admin socket, mutating the live
+`VolumeRegistry` the NVMe dispatcher resolves NSIDs through (resize flips
+the namespace's live size, which Identify Namespace reports as NSZE /
+NCAP). Without a signal, a connected host keeps its stale Active
+Namespace List / cached capacity until it re-enumerates on its own
 schedule. The Namespace Attribute Changed asynchronous event closes that
-gap (issue #64).
+gap (issue #64; resize added in issue #76).
 
 The flow mirrors the reservation path but with three deliberate
 differences. **Opt-in:** the controller advertises support in Identify
@@ -534,18 +536,19 @@ set; an idle controller's log is the all-zero 4 KiB page.
 The wiring reuses the same per-subsystem `ControllerRegistry` (AER hub)
 the reservation path uses: the admin socket holds the same `Arc`
 (`None` when nvmetcp isn't a configured transport, in which case the
-notify is a no-op), and `volume create` / `destroy` call
+notify is a no-op), and `volume create` / `destroy` / `resize` call
 `notify_namespace_attribute_changed(nsid)` after the registry mutation —
-on create once the namespace resolves, on destroy once it's gone — so a
-host that reads the log and re-runs Identify / Active Namespace List sees
-the current truth. NSID maps to LUN as `nsid = lun + 1`, the same
-mapping the dispatcher's `NamespaceLookup` uses. Per-controller state
-(the changed-NSID set + the FID 0x0B config) is freed with the
-controller when its last association drops, so a reconnecting host starts
-clean and learns the namespace inventory from Identify, not stale
-notices. Resize is not a notification source today because VSA has no
-volume-resize operation; create and destroy are the only lifecycle
-events.
+on create once the namespace resolves, on destroy once it's gone, on
+resize once the live size has flipped — so a host that reads the log and
+re-runs Identify / Active Namespace List sees the current truth. NSID
+maps to LUN as `nsid = lun + 1`, the same mapping the dispatcher's
+`NamespaceLookup` uses. Per-controller state (the changed-NSID set + the
+FID 0x0B config) is freed with the controller when its last association
+drops, so a reconnecting host starts clean and learns the namespace
+inventory from Identify, not stale notices. An online `volume resize`
+(issue #76) is the third trigger; it reuses this path unchanged (the host
+just re-Identifies and reads the new NSZE / NCAP) — a host-side `nvme
+ns-rescan` surfaces the new size to the OS block device.
 
 ### Is DH-HMAC-CHAP used in practice?
 

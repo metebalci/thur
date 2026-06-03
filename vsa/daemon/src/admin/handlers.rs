@@ -126,6 +126,13 @@ pub struct AdminState {
     /// controllers through it so live NVMe hosts learn about
     /// out-of-band namespace add / remove (issue #64).
     pub aer_hub: Option<Arc<nvme_nvm::ControllerRegistry>>,
+    /// iSCSI per-(TSIH, LUN) Unit Attention queue (the same `Arc` the
+    /// SBC dispatcher pops from), or `None` when iSCSI isn't a
+    /// configured transport. `volume resize` fans a CAPACITY DATA HAS
+    /// CHANGED UA to every live session through it so connected iSCSI
+    /// hosts re-issue READ CAPACITY (issue #76) — the SCSI counterpart
+    /// of the NVMe `aer_hub` notice.
+    pub ua_tracker: Option<Arc<shared_iscsi::unit_attention::UnitAttentionTracker>>,
 }
 
 // `system.monitor` per-tick view. The handler in `shared-admin-monitor`
@@ -211,6 +218,42 @@ impl AdminState {
             && let Ok(nsid) = u32::try_from(lun + 1)
         {
             aer.notify_namespace_attribute_changed(nsid);
+        }
+    }
+
+    /// Tell every connected host that `lun`'s capacity changed after an
+    /// online `volume resize` (issue #76), so it re-reads the new size:
+    ///
+    /// - NVMe: the Namespace Attribute Changed AER + Changed Namespace
+    ///   List (reusing [`Self::notify_nvme_namespace_changed`], the
+    ///   issue #64 hook — resize is a third trigger alongside
+    ///   create / destroy), and
+    /// - iSCSI: a CAPACITY DATA HAS CHANGED (0x2A/0x09) Unit Attention
+    ///   on every live session, popped on that session's next command.
+    ///
+    /// Each half no-ops when its transport isn't configured. The iSCSI
+    /// fan-out is skipped (with a warning) when the LUN doesn't fit a
+    /// `u8` — the iSCSI single-byte LUN ceiling — mirroring the NVMe
+    /// `u32` NSID guard; NVMe still fires in that case.
+    fn notify_capacity_changed(&self, lun: u64) {
+        self.notify_nvme_namespace_changed(lun);
+        if let Some(ua) = &self.ua_tracker {
+            match u8::try_from(lun) {
+                Ok(lun8) => {
+                    for tsih in self.sessions.active_tsihs() {
+                        ua.add_ua(
+                            tsih,
+                            lun8,
+                            shared_iscsi::unit_attention::UnitAttentionCode::CAPACITY_DATA_HAS_CHANGED,
+                        );
+                    }
+                }
+                Err(_) => warn!(
+                    lun,
+                    "capacity-change UA skipped: LUN exceeds the iSCSI single-byte ceiling \
+                     (NVMe hosts still notified)"
+                ),
+            }
         }
     }
 }
@@ -947,6 +990,78 @@ pub async fn set_sync_after(
 #[derive(Debug, Deserialize)]
 pub struct SetSyncAfterRequest {
     pub mode: String,
+}
+
+/// `POST /api/v1/volumes/:name/resize` — grow the volume's logical
+/// capacity at runtime (issue #76).
+///
+/// Body shape: `{ "size_bytes": N }` (the CLI converts `--size 10G`).
+/// Grow-only this release: a shrink or no-op is a `400`. Grow is
+/// metadata-only — the page table is sparse, so the handler flips the
+/// writer's live size + rewrites `manifest.json`, then notifies hosts.
+/// Unlike `sync-after`, the change **is** signalled: NVMe via the
+/// Namespace Attribute Changed AER, iSCSI via a CAPACITY DATA HAS
+/// CHANGED Unit Attention, so a connected host re-reads the new size on
+/// its next command (a host-side rescan may still be needed for the OS
+/// to act on it).
+pub async fn resize(
+    State(state): State<AdminState>,
+    peer: PeerCred,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ResizeVolumeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let cache = state.registry.get_by_name(&name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("volume '{name}' is not registered") })),
+        )
+    })?;
+
+    let previous = cache.size_bytes();
+    cache.writer().set_size(body.size_bytes).map_err(|e| {
+        // Align / shrink-or-noop are client errors; anything else (a
+        // manifest persist failure) is a 500.
+        let status = match e {
+            core_block::UploaderError::ResizeNotSectorAligned { .. }
+            | core_block::UploaderError::ResizeNotGrow { .. } => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": e.to_string() })))
+    })?;
+
+    let lun = cache.manifest().lun;
+    state.notify_capacity_changed(lun);
+
+    if let Some(channel) = state.audit.as_ref() {
+        channel.try_append(
+            "volume.resize",
+            AuditActor::cli(peer.audit_descriptor()),
+            json!({
+                "name": name,
+                "previous": previous,
+                "new": body.size_bytes,
+            }),
+            AuditResult::Ok,
+        );
+    }
+
+    info!(
+        volume = name.as_str(),
+        previous,
+        new = body.size_bytes,
+        "admin: volume resized (capacity-change signalled to hosts)"
+    );
+
+    Ok(Json(json!({
+        "volume": name,
+        "previous": previous,
+        "size_bytes": body.size_bytes,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResizeVolumeRequest {
+    pub size_bytes: u64,
 }
 
 /// Lookup or instantiate the `Arc<dyn ObjectStoreBackend>` for `name`.

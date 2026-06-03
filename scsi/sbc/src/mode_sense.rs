@@ -252,7 +252,8 @@ fn device_specific_parameter(cache: &PageCache) -> u8 {
 ///   bytes 5-7  LOGICAL BLOCK LENGTH (24-bit)
 fn short_block_descriptor(cache: &PageCache) -> Vec<u8> {
     let m = cache.manifest();
-    let total_blocks = m.size_bytes / u64::from(m.sector_bytes);
+    // Live size (issue #76), not the boot-snapshot manifest.
+    let total_blocks = cache.size_bytes() / u64::from(m.sector_bytes);
     let block_count = if total_blocks > u64::from(u32::MAX) {
         u32::MAX
     } else {
@@ -274,7 +275,8 @@ fn short_block_descriptor(cache: &PageCache) -> Vec<u8> {
 ///   bytes 12-15  LOGICAL BLOCK LENGTH (32-bit)
 fn long_block_descriptor(cache: &PageCache) -> Vec<u8> {
     let m = cache.manifest();
-    let total_blocks = m.size_bytes / u64::from(m.sector_bytes);
+    // Live size (issue #76), not the boot-snapshot manifest.
+    let total_blocks = cache.size_bytes() / u64::from(m.sector_bytes);
     let mut buf = Vec::with_capacity(16);
     buf.extend_from_slice(&total_blocks.to_be_bytes());
     buf.extend_from_slice(&[0u8; 4]);

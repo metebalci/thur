@@ -660,11 +660,14 @@ host is never notified. Routing is keyed by the Connect HOSTID (the
 fencing identity); each event completes one AER parked on that host's
 admin queue and queues a LID 0x80 entry the host drains oldest-first.
 
-Namespace-change notifications (out-of-band volume create / destroy): a
-second AER source tells connected hosts a namespace appeared or
-disappeared. Gated per controller via Set Features FID 0x0B bit 8
-(advertised in Identify Controller OAES bit 8); fanned to every opted-in
-controller (subsystem-wide, not HOSTID-scoped).
+Namespace-change notifications (out-of-band volume create / destroy /
+resize): a second AER source tells connected hosts a namespace appeared,
+disappeared, or changed size. Gated per controller via Set Features FID
+0x0B bit 8 (advertised in Identify Controller OAES bit 8); fanned to
+every opted-in controller (subsystem-wide, not HOSTID-scoped). An online
+`volume resize` is the third trigger alongside create / destroy — the
+host reads the Changed Namespace List, re-runs Identify Namespace, and
+sees the new NSZE / NCAP.
 
 ```text
 AER completion DW0 (NVMe Base §5.2):
@@ -1840,11 +1843,17 @@ the prior tail — the break stays on the record.
 
 Daemon-side: `daemon.start`, `daemon.stop`.
 
-CLI-side: `cartridge.create`, `cartridge.import`,
+CLI-side (thurvtl): `cartridge.create`, `cartridge.import`,
 `cartridge.export`, `cartridge.legal_hold.set`,
 `cartridge.legal_hold.clear`, `library.materialize`,
 `library.reconcile`, `library.load`, `library.unload`,
 `library.move`, `inventory.move_medium`, `gc.run`.
+
+CLI-side (thurvsa volume admin, actor `kind:"cli"`):
+`volume.create`, `volume.destroy`, `volume.sync_after.modified`,
+`volume.resize`. The last records `params:{name, previous, new}` —
+`previous` and `new` are the old / new logical sizes in bytes (grow
+only).
 
 iSCSI / SCSI-side (actor `kind:"iscsi"`, `user` = initiator IQN if
 the initiator advertised one, `addr` = peer ip:port):

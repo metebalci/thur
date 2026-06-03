@@ -78,6 +78,7 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/volumes/:name/sync-after",
             post(handlers::set_sync_after),
         )
+        .route("/api/v1/volumes/:name/resize", post(handlers::resize))
         // iSCSI CHAP users (list / add / remove / disable / enable / rotate)
         .route(
             "/api/v1/iscsi/users",

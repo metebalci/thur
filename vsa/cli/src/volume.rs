@@ -298,6 +298,46 @@ pub async fn cmd_modify_sync_after(name: &str, mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// `thurvsa volume resize NAME --size N` — grow a volume's logical
+/// capacity. Daemon-routed only; the daemon flips the live size +
+/// rewrites manifest.json, then signals connected hosts (NVMe AER /
+/// iSCSI unit attention) to re-read capacity. Grow-only.
+pub async fn cmd_resize(name: &str, size_str: &str) -> Result<()> {
+    let size_bytes =
+        parse_size(size_str).with_context(|| format!("parsing --size '{size_str}'"))?;
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume resize` needs the daemon \
+             running so the live size + manifest.json stay in sync and connected hosts are \
+             notified. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let body = serde_json::json!({ "size_bytes": size_bytes });
+    let resp: serde_json::Value = admin
+        .post_json(
+            &format!("/api/v1/volumes/{}/resize", urlencode(name)),
+            &body,
+        )
+        .await?;
+    let prev = resp.get("previous").and_then(|v| v.as_u64()).unwrap_or(0);
+    let now = resp
+        .get("size_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(size_bytes);
+    println!(
+        "OK: volume '{name}' resized: {} -> {}",
+        format_bytes(prev),
+        format_bytes(now)
+    );
+    println!(
+        "note: connected hosts were signalled to re-read capacity; the host OS may still need \
+         a rescan (`iscsiadm -m node --rescan` / `nvme ns-rescan`) to pick up the new size."
+    );
+    Ok(())
+}
+
 pub async fn cmd_destroy(name: &str, force: bool) -> Result<()> {
     if !force {
         eprintln!(
