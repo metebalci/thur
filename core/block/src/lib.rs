@@ -9,8 +9,7 @@
 //! `shared-cloud`; the chunk pool is currently a lean thurvsa-side
 //! mirror of thurvtl's `chunk_store` and will move to a future
 //! `shared-storage` crate once both products give us evidence
-//! about what really wants to be shared. See `ROADMAP.md` §
-//! Workspace restructure.
+//! about what really wants to be shared.
 
 pub mod cache;
 pub mod chunk_pool;

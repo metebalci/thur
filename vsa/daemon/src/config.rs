@@ -599,8 +599,8 @@ pub struct AuthSettings {
 /// `audit:` block. thurvsa's audit subsystem is minimal today —
 /// daily-rotating JSONL appends to
 /// `<audit.dir or data_dir/audit>/audit-YYYY-MM-DD.jsonl`. No chain,
-/// no rate limiting: those land when shared-audit lifts
-/// (ROADMAP.md § shared-audit). The single emitter today is the
+/// no rate limiting: those land when shared-audit lifts. The single
+/// emitter today is the
 /// shared-iscsi login phase (CHAP success / failure) via
 /// `crate::audit::IscsiDiskLoginAudit`.
 #[derive(Debug, Clone, Deserialize)]

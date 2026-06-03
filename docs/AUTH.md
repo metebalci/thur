@@ -706,8 +706,7 @@ cannot decrypt the volume.
 The full design — threat model, IV derivation, and how encryption
 interacts with dedup — lives in
 [`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md) § At-rest encryption.
-Forward work on key custody is tracked in
-[`../ROADMAP.md`](../ROADMAP.md) § Encryption-key management.
+Forward work on key custody is tracked in the issue tracker.
 
 It is worth being explicit that keystore backends and storage-backend
 authentication are orthogonal concerns. The storage credentials gate

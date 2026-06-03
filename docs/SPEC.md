@@ -2110,7 +2110,7 @@ This assumes the storage provider has already replicated the source
 bucket to the mirror region out-of-band — S3, GCS, and Azure all offer
 bucket-level cross-region replication. Thur VTL itself does not drive
 cross-bucket replication; that is a separate feature ("cartridge
-replication", see `ROADMAP.md`).
+replication", issue #14).
 
 ### Exit codes
 
@@ -2132,7 +2132,7 @@ replication", see `ROADMAP.md`).
 - **Eager chunk pre-fetch.** The restore is metadata-only by design;
   the first host read is what pulls chunks in.
 - **App-driven cross-region mirroring** — synchronous writes to two
-  buckets. That is the cartridge-replication feature in `ROADMAP.md`.
+  buckets. That is the cartridge-replication feature (issue #14).
 
 ---
 

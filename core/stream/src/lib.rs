@@ -5,7 +5,7 @@
 //!
 //! Tape-side primitives consumed by `thurvtl` (SMC LUN 0 + N SSC
 //! drives — composes this crate via `core-mediachanger`). Extracted from
-//! `core-mediachanger` in Step 5 Milestone 5.B.1 — see `ROADMAP.md` § Step 5.
+//! `core-mediachanger`.
 
 pub mod block_index;
 pub mod cartridge;

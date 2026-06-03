@@ -55,7 +55,7 @@ The Rust toolchain is pinned via `rust-toolchain.toml`
 `release/Containerfile.builder` — both must match; bump them in lockstep
 whenever a transitive dependency raises its `rust-version` floor. Pinning
 achieves close-to-byte-stable rebuilds; full reproducible builds are a
-separate effort tracked in `ROADMAP.md`.
+separate effort tracked in the issue tracker.
 
 ## Layout
 
@@ -365,4 +365,4 @@ operator's trusted fingerprint. Publish the fingerprint prominently —
 release notes, this file, and the project website — so operators have
 an authoritative reference to verify against.
 
-CVE notifications go on a public mailing list (TBD); see `ROADMAP.md`.
+CVE notifications go on a public mailing list (TBD).

@@ -875,7 +875,7 @@ instead:
 | LTO-7 Type M media (`M8` barcode) | LTO-8 only | A physical-substrate artifact with no virtual equivalent. The `M8` suffix stays a valid label string, but the daemon does no LTO-generation inference from barcodes; cartridges carry their generation in the manifest. |
 | LTO-7 cartridge creation | LTO-7 / LTO-8 | Refused — VTL ships as a clean LTO-8 drive. REPORT DENSITY SUPPORT still advertises LTO-7 RO as a secondary descriptor (matching real LTO-8 backwards-read advertisement), but no LTO-7 media is ever loaded. |
 | End-to-end Logical Block Protection (CRC32C / Reed-Solomon) | LTO-7+ | Implemented for CRC32C (Castagnoli) — see Mode Page 0x0A/0xF0 above. Reed-Solomon not modeled. PROTECT=0 in standard INQUIRY; discovery is via the mode page. |
-| WORM tamper detection (WTRE field, EOPD value) | LTO-7+ | Declined — we honor WORM at-EOD-only writes (the actual integrity guarantee); WTRE / EOPD out-of-band signaling has no physical tape to defend. See [`../ROADMAP.md`](../ROADMAP.md) § *Considered, declined*. |
+| WORM tamper detection (WTRE field, EOPD value) | LTO-7+ | Declined — we honor WORM at-EOD-only writes (the actual integrity guarantee); WTRE / EOPD out-of-band signaling has no physical tape to defend. |
 
 VTL emulates LTO-7 and LTO-8 only, which is what keeps it aligned
 with the SPC-4 / SSC-4 / SAM-5 conformance target. The generations on
@@ -1261,8 +1261,7 @@ daemon — the operator's `--key-file` path is never consulted again.
 There is no rotate-in-place: to rotate or to restore a key the
 operator backs up `<data_dir>/keys/` alongside the volume manifest,
 and a cross-region DR scenario additionally needs the keystore itself
-restored separately. The gap is tracked in
-[`../ROADMAP.md`](../ROADMAP.md) § Encryption-key management.
+restored separately. The gap is tracked in the issue tracker.
 
 **Key custody:**
 

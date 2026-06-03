@@ -12,7 +12,7 @@ shared mechanism first, then the per-product specifics.
   volume, the volume-encryption interaction.
 
 This is the single explanation of how deduplication works. Other docs
-(`README.md`, `docs/SPEC.md`, `CLAUDE.md`, `ROADMAP.md`,
+(`README.md`, `docs/SPEC.md`, `CLAUDE.md`,
 `dist/thurvtl.defaults.yaml`) link here rather than repeating it.
 
 ## The shared mechanism
@@ -212,8 +212,8 @@ schema does not support segment lists. The practical consequence is:
 
 Lifting the sub-block limitation would require `BlockIndex` to become a
 `Vec<Segment>` so that a logical block can span multiple chunks. This has
-been evaluated and **declined** — see `ROADMAP.md` "Considered, declined"
-for the full rationale (encrypted chunks dedup near-zero anyway, zstd
+been evaluated and **declined** for these reasons (encrypted chunks
+dedup near-zero anyway, zstd
 captures most savings, cold-backend read seams double, AME ordering becomes
 trickier, manifest grows O(segments), and the correctness surface
 expands). Revisit only for a workload that is plaintext, highly redundant
