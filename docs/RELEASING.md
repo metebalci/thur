@@ -280,6 +280,13 @@ release/release.sh
 release/tag-release.sh
 ```
 
+The same tag push also triggers `container.yml`, which builds the
+per-product multi-arch (amd64 + arm64) images and publishes them to
+`ghcr.io/<owner>/thurvtl` and `.../thurvsa` (a `v*-*` pre-release tag
+publishes by version only — no `latest` / `major.minor` float). It runs
+independently of the `.deb` / `.rpm` pipeline: a container-build failure
+doesn't block the GitHub Release, and vice versa.
+
 If smoke fails in CI no release is published — the tag exists at
 origin but there is no GitHub Release for it. Recover by deleting
 the remote and local tag (`git push origin :v0.2.0 && git tag -d

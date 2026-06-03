@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+#
+# Thur runtime container image — one Containerfile, parameterized by the
+# PRODUCT build-arg (thurvtl | thurvsa). Both the daemon (<PRODUCT>d) and
+# the CLI (<PRODUCT>) ship in the image; the CLI is daemon-routed, so you
+# operate a running container with `podman exec <ctr> <PRODUCT> ...`.
+#
+#   podman build --build-arg PRODUCT=thurvsa -t thurvsa -f release/Containerfile .
+#   podman build --build-arg PRODUCT=thurvtl -t thurvtl -f release/Containerfile .
+#
+# Unlike release/Containerfile.builder (which pins a Debian 11 glibc floor
+# for the .deb/.rpm that run on the *host's* glibc), the container bundles
+# its own glibc via the debian:12-slim runtime stage, so the build stage
+# can track the pinned toolchain on bookworm directly.
+
+ARG RUST_VERSION=1.92.0
+
+############################## build stage ##############################
+FROM rust:${RUST_VERSION}-bookworm AS builder
+
+ARG PRODUCT
+RUN test -n "${PRODUCT}" || { echo "PRODUCT build-arg required (thurvtl|thurvsa)"; exit 1; }
+
+WORKDIR /src
+COPY . .
+
+# Build only this product's daemon + CLI bins (both names are unique
+# across the workspace). OpenSSL is vendored (openssl-src builds it from
+# source), so the buildpack-deps base's perl + cc suffice — no libssl-dev.
+RUN cargo build --release --locked --bin "${PRODUCT}d" --bin "${PRODUCT}"
+
+############################# runtime stage #############################
+FROM debian:12-slim AS runtime
+
+ARG PRODUCT
+ENV THUR_PRODUCT=${PRODUCT}
+
+# TLS roots for cloud backends (S3/GCS/Azure over HTTPS). The TLS stack
+# itself is statically vendored into the binary; only the CA bundle is
+# needed at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fixed uid/gid so bind-mounted host volumes get predictable ownership.
+# Mirrors the system user the .deb/.rpm + systemd unit run as.
+RUN groupadd --system --gid 9000 "${PRODUCT}" \
+    && useradd --system --uid 9000 --gid 9000 \
+         --home-dir "/var/lib/${PRODUCT}" --shell /usr/sbin/nologin "${PRODUCT}"
+
+COPY --from=builder /src/target/release/${PRODUCT}d /usr/bin/${PRODUCT}d
+COPY --from=builder /src/target/release/${PRODUCT}  /usr/bin/${PRODUCT}
+COPY release/container-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+# Config dir (mount your <PRODUCT>.yaml here), data dir, and the runtime
+# dir for the admin socket (/run/<PRODUCT>/admin.sock). systemd provisions
+# /run/<PRODUCT> via RuntimeDirectory=; in a container the entrypoint does.
+# Chowning the data dir means a fresh named volume inherits 9000:9000.
+RUN mkdir -p /etc/${PRODUCT} /var/lib/${PRODUCT} /run/${PRODUCT} \
+    && chown ${PRODUCT}:${PRODUCT} /var/lib/${PRODUCT} /run/${PRODUCT} \
+    && chmod 0750 /run/${PRODUCT}
+
+# iSCSI 3260 + HTTP/Prometheus 9090 (both products); NVMe/TCP 4420 +
+# NVMe discovery 8009 (VSA, when `nvmetcp` is in transports:). Reaching
+# the target needs host or macvlan networking — the target advertises the
+# connection's local IP in SendTargets/discovery (see README).
+EXPOSE 3260 9090 4420 8009
+
+USER ${PRODUCT}
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

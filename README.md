@@ -171,6 +171,66 @@ Other install paths:
 
 - **From source** — `cargo build --release`; binaries land in
   `target/release/`. Not recommended for production.
+- **Container** — per-product OCI images on GHCR (see below).
+
+### Run in a container
+
+Tagged releases publish multi-arch (amd64 + arm64) images per product:
+
+```
+ghcr.io/metebalci/thurvtl
+ghcr.io/metebalci/thurvsa
+```
+
+Each image carries both the daemon and the CLI. Because the CLI is
+daemon-routed, you operate a running container with `exec`:
+
+```bash
+# Minimal local-backend config (no cloud credentials needed):
+cat > thurvsa.yaml <<'EOF'
+data_dir: /var/lib/thurvsa
+storage:
+  backends:
+    local:
+      type: local
+      root_dir: /var/lib/thurvsa/storage-local
+EOF
+
+# The target advertises the connection's local IP in iSCSI/NVMe
+# discovery, so host networking is required (see below).
+podman run -d --name thurvsa --network host \
+    -v ./thurvsa.yaml:/etc/thurvsa/thurvsa.yaml:ro \
+    -v thurvsa-data:/var/lib/thurvsa \
+    ghcr.io/metebalci/thurvsa:latest
+
+podman exec thurvsa thurvsa volume create myvol --size 100G
+```
+
+Ready-to-edit Compose files are at
+[`release/compose-vsa.yaml`](release/compose-vsa.yaml) and
+[`release/compose-vtl.yaml`](release/compose-vtl.yaml) (each carries the
+matching minimal config in its header — Thur VTL additionally needs the
+required `library:` chassis block, and serves iSCSI only). Print the fully
+annotated config without a running daemon via
+`podman run --rm ghcr.io/metebalci/thurvsa config defaults`.
+
+Notes:
+
+- **Host networking (`--network host`) or macvlan is required.** The
+  iSCSI/NVMe target advertises the connection's local IP in SendTargets /
+  discovery; behind a bridge + published ports the initiator would be
+  handed the unreachable container-internal address. Host net also makes
+  the published-port mapping moot — the daemon binds 3260 (iSCSI), 9090
+  (HTTP/Prometheus), and, for VSA with `nvmetcp` enabled, 4420 + 8009
+  directly on the host.
+- **The daemon runs as uid/gid 9000** (`thurvtl` / `thurvsa` inside the
+  image). A *named* volume for the data dir inherits that ownership
+  automatically; a host **bind**-mounted data dir must be
+  `chown 9000:9000`, and the mounted config must be readable by uid 9000.
+- **Apple Silicon / Mac mini:** the arm64 image is the artifact to run in
+  a Linux VM on macOS (OrbStack / Lima / UTM / Docker Desktop) — fast
+  crypto via the host's extensions, no macOS port. See
+  [issue #83](https://github.com/metebalci/thur/issues/83).
 
 ## Configure
 

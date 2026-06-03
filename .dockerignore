@@ -1,0 +1,17 @@
+# Build-context excludes for the container image. Honored by both Docker
+# buildx (CI) and podman (which falls back to .dockerignore when there is
+# no .containerignore). `.git` is intentionally NOT excluded — the CLI
+# build.rs shells out to it to stamp the version.
+
+# Maintainer-private state: cloud / keystore credentials, signing-key
+# backup. Must never enter the build context (mirrors /private/ in
+# .gitignore).
+private/
+
+# Build output (multi-GB) and local scratch.
+target/
+**/target/
+.thur/
+**/.thur/
+*.log
+release-artifacts/

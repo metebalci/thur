@@ -1,0 +1,43 @@
+# Thur VTL — minimal local-backend example (no cloud credentials needed).
+#
+#   1. Drop a config next to this file as ./thurvtl.yaml. The smallest one
+#      that runs — note the REQUIRED library: chassis block (a VTL has no
+#      default topology). Local backend, all chunks on disk under data_dir:
+#
+#          data_dir: /var/lib/thurvtl
+#          library:
+#            num_slots: 8        # storage slots
+#            num_drives: 1       # tape drives
+#            lto_generation: 8
+#          storage:
+#            backends:
+#              local:
+#                type: local
+#                root_dir: /var/lib/thurvtl/storage-local
+#
+#      For cloud backends, see `podman run --rm ghcr.io/metebalci/thurvtl config defaults`.
+#   2. podman-compose -f compose-vtl.yaml up -d     # or: docker compose -f compose-vtl.yaml up -d
+#   3. podman exec thurvtl thurvtl cartridge create TAPE001
+#
+# Host networking is required: the iSCSI target advertises the connection's
+# local IP in SendTargets, so behind a bridge+NAT the initiator would be
+# handed an unreachable container-internal address. See the README "Run in a
+# container" section. VTL serves iSCSI (3260) + HTTP/Prometheus (9090) only;
+# it has no NVMe/TCP transport.
+services:
+  thurvtl:
+    image: ghcr.io/metebalci/thurvtl:latest
+    container_name: thurvtl
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./thurvtl.yaml:/etc/thurvtl/thurvtl.yaml:ro
+      - thurvtl-data:/var/lib/thurvtl
+      # Cloud credentials (S3/GCS/Azure) — uncomment and provide an env
+      # file (same format as /etc/thurvtl/thurvtl.env):
+      # - ./thurvtl.env:/etc/thurvtl/thurvtl.env:ro
+    # env_file:
+    #   - ./thurvtl.env
+
+volumes:
+  thurvtl-data:

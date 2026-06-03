@@ -1,0 +1,37 @@
+# Thur VSA — minimal local-backend example (no cloud credentials needed).
+#
+#   1. Drop a config next to this file as ./thurvsa.yaml. The smallest one
+#      that runs (local backend, all chunks on disk under data_dir):
+#
+#          data_dir: /var/lib/thurvsa
+#          storage:
+#            backends:
+#              local:
+#                type: local
+#                root_dir: /var/lib/thurvsa/storage-local
+#
+#      For cloud backends, see `podman run --rm ghcr.io/metebalci/thurvsa config defaults`.
+#   2. podman-compose -f compose-vsa.yaml up -d     # or: docker compose -f compose-vsa.yaml up -d
+#   3. podman exec thurvsa thurvsa volume create myvol --size 100G
+#
+# Host networking is required: the iSCSI/NVMe target advertises the
+# connection's local IP in discovery, so behind a bridge+NAT the initiator
+# would be handed an unreachable container-internal address. See the README
+# "Run in a container" section.
+services:
+  thurvsa:
+    image: ghcr.io/metebalci/thurvsa:latest
+    container_name: thurvsa
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./thurvsa.yaml:/etc/thurvsa/thurvsa.yaml:ro
+      - thurvsa-data:/var/lib/thurvsa
+      # Cloud credentials (S3/GCS/Azure) — uncomment and provide an env
+      # file (same format as /etc/thurvsa/thurvsa.env):
+      # - ./thurvsa.env:/etc/thurvsa/thurvsa.env:ro
+    # env_file:
+    #   - ./thurvsa.env
+
+volumes:
+  thurvsa-data:
