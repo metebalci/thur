@@ -112,6 +112,21 @@ impl StatusField {
         }
     }
 
+    /// Generic: Namespace Is Write Protected (NVMe Base §4.6.1.5,
+    /// Generic Command Status 0x20). Returned for a write-class command
+    /// (Write / Write Zeroes / Dataset Management Deallocate / fused
+    /// Compare+Write) against a WORM namespace — the NVM-Command-Set
+    /// analog of SCSI WRITE PROTECTED / DATA PROTECT (0x07 / 0x27). DNR:
+    /// the volume's WORM flag is sticky, so re-issuing fails the same.
+    pub fn namespace_write_protected() -> Self {
+        Self {
+            sct: StatusCodeType::Generic,
+            sc: 0x20,
+            dnr: true,
+            ..Self::SUCCESS
+        }
+    }
+
     pub fn lba_out_of_range() -> Self {
         Self {
             sct: StatusCodeType::Generic,
@@ -248,6 +263,16 @@ mod tests {
         let w = s.to_u16();
         // SC 0x80 << 1 = 0x100; SCT 0; DNR bit 15.
         assert_eq!(w, 0x8100);
+    }
+
+    #[test]
+    fn namespace_write_protected_packs_generic_0x20() {
+        let s = StatusField::namespace_write_protected();
+        // SC 0x20 << 1 = 0x40; SCT 0 (Generic); DNR bit 15 = 0x8000.
+        assert_eq!(s.to_u16(), 0x8040);
+        assert_eq!(s.sct, StatusCodeType::Generic);
+        assert_eq!(s.sc, 0x20);
+        assert!(s.dnr);
     }
 
     #[test]

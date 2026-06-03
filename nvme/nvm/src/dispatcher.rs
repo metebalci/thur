@@ -245,6 +245,23 @@ impl NvmeNvmDispatcher {
             ));
         }
 
+        // WORM enforcement: a write-class command against a write-once
+        // namespace is refused with Namespace Is Write Protected — the
+        // NVMe analog of the SBC WRITE PROTECTED gate
+        // (`scsi_sbc::data_path`), so the WORM guarantee holds on both
+        // transports (issue #79). `Write` / `WriteZeroes` always mutate
+        // and are gated here; DSM is gated inside `cmd_dsm` on its
+        // deallocate (AD) branch only, so advisory non-deallocate hints
+        // still no-op through. Reads / Verify / Flush are unaffected.
+        if matches!(opcode, NvmOpcode::Write | NvmOpcode::WriteZeroes) && cache.manifest().worm {
+            return NvmeResponse::just(Cqe::failure(
+                cid,
+                0,
+                0,
+                StatusField::namespace_write_protected(),
+            ));
+        }
+
         match opcode {
             NvmOpcode::Flush => self.cmd_flush(cid, &cache).await,
             NvmOpcode::Write => self.cmd_write(cid, sqe, cmd.data_out, &cache).await,
@@ -764,6 +781,17 @@ impl NvmeNvmDispatcher {
             // for those so the host's hint pass is a no-op.
             return NvmeResponse::just(Cqe::success(cid, 0, 0, 0));
         }
+        // A DSM Deallocate mutates the medium (the SBC UNMAP analog), so
+        // refuse it on a WORM namespace — Namespace Is Write Protected,
+        // mirroring the iSCSI/SBC WORM gate (issue #79).
+        if cache.manifest().worm {
+            return NvmeResponse::just(Cqe::failure(
+                cid,
+                0,
+                0,
+                StatusField::namespace_write_protected(),
+            ));
+        }
         let nr_zero_based = (sqe.cdw10 & 0xFF) as usize;
         let count = nr_zero_based + 1;
         let expected_bytes = count * 16;
@@ -935,6 +963,16 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
             );
         }
+        // WORM: a fused Compare+Write mutates the medium, so refuse it on
+        // a write-once namespace — the reason rides the compare (first)
+        // half and the write half aborts, the same shape as the
+        // reservation-conflict refusal above (issue #79).
+        if cache.manifest().worm {
+            return (
+                Cqe::failure(compare_cid, 0, 0, StatusField::namespace_write_protected()),
+                Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
+            );
+        }
         let slba = read_slba(&compare.sqe);
         let nlb = read_nlb(&compare.sqe);
         let (byte_off, len_bytes) = match cache.resolve_range(slba, u64::from(nlb)) {
@@ -1037,6 +1075,16 @@ mod tests {
     }
 
     async fn fixture_dispatcher() -> (TempDir, NvmeNvmDispatcher) {
+        fixture_dispatcher_with_worm(false).await
+    }
+
+    /// WORM variant of [`fixture_dispatcher`] — the namespace is
+    /// write-once, used by the issue #79 WORM-enforcement tests.
+    async fn fixture_dispatcher_worm() -> (TempDir, NvmeNvmDispatcher) {
+        fixture_dispatcher_with_worm(true).await
+    }
+
+    async fn fixture_dispatcher_with_worm(worm: bool) -> (TempDir, NvmeNvmDispatcher) {
         let tmp = TempDir::new().unwrap();
         let cloud_root = tmp.path().join("cloud");
         std::fs::create_dir_all(&cloud_root).unwrap();
@@ -1050,7 +1098,7 @@ mod tests {
             DEFAULT_PAGE_SIZE_BYTES,
             "primary".into(),
             DedupScope::Local,
-            false,
+            worm,
             0,
         )
         .unwrap()
@@ -1649,6 +1697,164 @@ mod tests {
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    // --- WORM enforcement (issue #79) ---------------------------------
+    // A write-once namespace must refuse every mutating opcode with
+    // Namespace Is Write Protected, mirroring the SBC WRITE PROTECTED
+    // gate so the WORM guarantee holds over NVMe/TCP as well as iSCSI.
+
+    #[tokio::test]
+    async fn write_refused_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Write, 0, 0),
+                data_out: Some(&vec![0xFFu8; 4096]),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::namespace_write_protected());
+
+        // The refused write must not have landed: the sector still reads
+        // back as unallocated zeros.
+        let rd = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Read, 0, 0),
+                data_out: None,
+                data_in_max: 4096,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(rd.cqe.status, StatusField::SUCCESS);
+        assert!(rd.data_in.iter().all(|&b| b == 0), "WORM write leaked");
+    }
+
+    #[tokio::test]
+    async fn write_zeroes_refused_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::WriteZeroes, 0, 0),
+                data_out: None,
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::namespace_write_protected());
+    }
+
+    #[tokio::test]
+    async fn dsm_deallocate_refused_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::DatasetManagement as u8;
+        b[4] = 0x01; // NSID = 1
+        // CDW10 NR = 0 (one range); CDW11 bit 2 = AD (Deallocate).
+        b[44] = 0x04;
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let mut range = vec![0u8; 16];
+        range[4..8].copy_from_slice(&1u32.to_le_bytes()); // nlb = 1 block
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: Some(&range),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::namespace_write_protected());
+    }
+
+    /// A non-deallocate DSM (no AD bit) is an advisory hint, not a
+    /// mutation, so it still no-ops to success even on a WORM namespace.
+    #[tokio::test]
+    async fn dsm_hint_without_ad_still_noops_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::DatasetManagement as u8;
+        b[4] = 0x01;
+        // No AD bit set.
+        let sqe = nvme_base::Sqe::parse(&b).unwrap();
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe,
+                data_out: None,
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    /// Reads are never WORM-gated.
+    #[tokio::test]
+    async fn read_allowed_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_io(NvmOpcode::Read, 0, 0),
+                data_out: None,
+                data_in_max: 4096,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn fused_compare_write_refused_on_worm_namespace() {
+        let (_tmp, disp) = fixture_dispatcher_worm().await;
+        let expected = vec![0u8; 64 * 1024];
+        let new = vec![0xCCu8; 64 * 1024];
+        let mut csqe = vec![0u8; nvme_base::SQE_SIZE];
+        csqe[0] = NvmOpcode::Compare as u8;
+        csqe[1] = 0b0000_0001; // FUSE = First
+        csqe[2] = 0x71;
+        csqe[4] = 0x01;
+        csqe[48..52].copy_from_slice(&15u32.to_le_bytes());
+        let mut wsqe = vec![0u8; nvme_base::SQE_SIZE];
+        wsqe[0] = NvmOpcode::Write as u8;
+        wsqe[1] = 0b0000_0010; // FUSE = Second
+        wsqe[2] = 0x72;
+        wsqe[4] = 0x01;
+        wsqe[48..52].copy_from_slice(&15u32.to_le_bytes());
+
+        let (cqe_c, cqe_w) = disp
+            .handle_fused_compare_write(
+                IoCommand {
+                    sqe: nvme_base::Sqe::parse(&csqe).unwrap(),
+                    data_out: Some(&expected),
+                    data_in_max: 0,
+                    session_volumes: None,
+                    host_id: None,
+                },
+                IoCommand {
+                    sqe: nvme_base::Sqe::parse(&wsqe).unwrap(),
+                    data_out: Some(&new),
+                    data_in_max: 0,
+                    session_volumes: None,
+                    host_id: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            cqe_c.status,
+            StatusField::namespace_write_protected(),
+            "compare half write-protected",
+        );
+        assert_eq!(
+            cqe_w.status,
+            StatusField::aborted_due_to_failed_fused(),
+            "write half aborted",
+        );
     }
 
     #[tokio::test]
