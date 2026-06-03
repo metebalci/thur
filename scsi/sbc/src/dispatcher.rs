@@ -94,7 +94,8 @@ impl SbcScsiDispatcher {
     /// [`Self::with_alua`] from `thurvsad::main`.
     pub fn new(registry: Arc<dyn VolumeLookup>, target_iqn: String) -> Self {
         let portals = [shared_iscsi::transport::Portal {
-            address: String::new(),
+            bind: String::new(),
+            advertise: None,
             tpgt: 1,
         }];
         let alua = Arc::new(AluaTopology::from_portals(&portals, target_iqn.clone()));
@@ -469,7 +470,8 @@ mod tests {
         let ua = Arc::new(UnitAttentionTracker::new());
         let alua = Arc::new(AluaTopology::from_portals(
             &[shared_iscsi::transport::Portal {
-                address: String::new(),
+                bind: String::new(),
+                advertise: None,
                 tpgt: 1,
             }],
             ISCSI_DISK_TARGET_IQN.to_string(),

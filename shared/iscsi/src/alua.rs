@@ -287,7 +287,8 @@ mod tests {
 
     fn portal(addr: &str, tpgt: u16) -> Portal {
         Portal {
-            address: addr.to_string(),
+            bind: addr.to_string(),
+            advertise: None,
             tpgt,
         }
     }

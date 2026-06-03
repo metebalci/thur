@@ -23,6 +23,12 @@ services:
     image: ghcr.io/metebalci/thurvsa:latest
     container_name: thurvsa
     network_mode: host
+    # Bridge + published ports instead of host net: drop network_mode,
+    # add `ports: ["3260:3260", "9090:9090"]` (+ "4420:4420", "8009:8009"
+    # for NVMe/TCP), and set the advertised address in thurvsa.yaml so
+    # discovery hands initiators a reachable IP:
+    #   iscsi:   { listen: [{ bind: "0.0.0.0:3260", advertise: "<host-ip>:3260" }] }
+    #   nvmetcp: { advertise: "<host-ip>:4420" }
     restart: unless-stopped
     volumes:
       - ./thurvsa.yaml:/etc/thurvsa/thurvsa.yaml:ro

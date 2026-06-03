@@ -149,7 +149,8 @@ mod tests {
     fn default_alua() -> AluaTopology {
         AluaTopology::from_portals(
             &[Portal {
-                address: "0.0.0.0:3260".to_string(),
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: None,
                 tpgt: 1,
             }],
             "iqn.example:test",
@@ -254,11 +255,13 @@ mod tests {
         let alua = AluaTopology::from_portals(
             &[
                 Portal {
-                    address: "10.0.0.1:3260".to_string(),
+                    bind: "10.0.0.1:3260".to_string(),
+                    advertise: None,
                     tpgt: 1,
                 },
                 Portal {
-                    address: "10.0.0.2:3260".to_string(),
+                    bind: "10.0.0.2:3260".to_string(),
+                    advertise: None,
                     tpgt: 2,
                 },
             ],

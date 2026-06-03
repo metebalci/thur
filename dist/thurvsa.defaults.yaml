@@ -37,22 +37,30 @@ iscsi:
   #   - a single "ip:port" scalar (default; TPGT=1);
   #   - a list of bare "ip:port" strings — each gets a sequential
   #     Target Portal Group Tag from its input position (1, 2, …);
-  #   - a list of { address: "ip:port", tpgt: N } objects — operator-
-  #     controlled TPGT, the prerequisite for ALUA. Multiple portals
-  #     may share one tpgt (one TPG, many paths); the same address
-  #     listed twice is rejected.
+  #   - a list of { bind: "ip:port", advertise: "ip:port", tpgt: N }
+  #     objects. Only `bind` is required: `tpgt` defaults to the entry's
+  #     input position (operator-controlled TPGT is the prerequisite for
+  #     ALUA; portals may share a tpgt — one TPG, many paths), and
+  #     `advertise` overrides what SendTargets hands initiators.
+  #   The same `bind` listed twice is rejected.
   # Each portal binds its own listener; SendTargets advertises every
-  # entry as `TargetAddress=<address>,<tpgt>` and the Login Response
-  # echoes the arrival portal's tpgt as `TargetPortalGroupTag`.
-  # Wildcards (0.0.0.0:*, [::]:*) are substituted with the connection's
-  # actual local IP. Test scripts may pin an ephemeral port to avoid
-  # clashing across concurrent runs.
+  # entry as `TargetAddress=<advertise|bind>,<tpgt>` and the Login
+  # Response echoes the arrival portal's tpgt as `TargetPortalGroupTag`.
+  # With no `advertise`, a wildcard bind (0.0.0.0:*, [::]:*) is
+  # substituted with the connection's actual local IP. Set `advertise`
+  # (emitted verbatim) when the bind isn't reachable by initiators — NAT,
+  # Docker bridge + published ports, reverse proxy, multi-homed host.
+  # A wildcard `advertise` is rejected at startup. Test scripts may pin
+  # an ephemeral port to avoid clashing across concurrent runs.
   # listen: "0.0.0.0:3260"
-  # Multi-portal examples:
+  # Examples:
   # listen: ["10.0.0.5:3260", "10.0.0.6:3260"]
   # listen:
-  #   - { address: "10.0.0.5:3260", tpgt: 1 }
-  #   - { address: "10.0.0.6:3260", tpgt: 2 }
+  #   - { bind: "10.0.0.5:3260", tpgt: 1 }
+  #   - { bind: "10.0.0.6:3260", tpgt: 2 }
+  # # bind wildcard inside a container, advertise the reachable host IP:
+  # listen:
+  #   - { bind: "0.0.0.0:3260", advertise: "192.168.1.50:3260" }
 
   # iSCSI target IQN advertised to initiators in the Login /
   # SendTargets response. Defaults to the per-product identity
@@ -96,6 +104,17 @@ iscsi:
 #   # Listen address override. Test scripts may pin an ephemeral
 #   # port to avoid clashing across concurrent runs.
 #   listen: "0.0.0.0:4420"
+#
+#   # Address advertised to hosts in the Discovery Log Page
+#   # (TRADDR + TRSVCID), as a full ip:port. Defaults to the `listen`
+#   # address — and with a wildcard bind the discovery controller
+#   # reflects the address each request landed on. Set this (emitted
+#   # verbatim) when the bind isn't reachable by hosts — NAT, Docker
+#   # bridge + published ports, reverse proxy, multi-homed host. Only
+#   # affects discovery (`nvme discover` / `connect-all`); a direct
+#   # `nvme connect` to a known address ignores it. A wildcard advertise
+#   # is rejected at startup.
+#   advertise: "192.168.1.50:4420"
 #
 #   # NVMe Subsystem NQN advertised to hosts (`nvme connect --nqn=`
 #   # must match this exactly). Defaults to the per-product identity

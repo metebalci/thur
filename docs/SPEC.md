@@ -113,8 +113,8 @@ separately in `<data_dir>/library/inventory.json`.
 | Param | Value |
 |-------|-------|
 | Target IQN | `iqn.2025-10.com.metebalci:thurvtl` (configurable via `iscsi.target_iqn`) |
-| Portal Group Tag | Per portal (configurable via `iscsi.listen`). Bare-string entries auto-assign TPGTs by input position (1-indexed); object-form entries (`{address, tpgt}`) carry an explicit TPGT. The single-portal default `listen: "0.0.0.0:3260"` continues to advertise `TPGT=1`. Multiple portals sharing one TPGT (one TPG, many paths) is legal — the SCSI layer's REPORT TARGET PORT GROUPS / VPD 0x83 TargetPort designators group them under that TPGT |
-| Listen | `0.0.0.0:3260` (configurable via `iscsi.listen`; accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{address: "ip:port", tpgt: N}` objects — the daemon binds one TCP listener per entry, SendTargets advertises every entry as `TargetAddress=<address>,<tpgt>`, and the Login Response `TargetPortalGroupTag` echoes the *arrival* portal's TPGT (RFC 7143 §12.10). Wildcard entries (`0.0.0.0:*`, `[::]:*`) are substituted with the connection's actual local IP when emitted — without the substitution an initiator would receive an unusable `0.0.0.0:3260` line. Two entries with the same address are rejected at boot (`bind(2)` would fail and the initiator can't disambiguate). Two wildcard / concrete entries that collapse to the same line after substitution are deduped — first entry's TPGT wins) |
+| Portal Group Tag | Per portal (configurable via `iscsi.listen`). Bare-string entries (and object-form entries omitting `tpgt`) auto-assign TPGTs by input position (1-indexed); object-form entries (`{bind, advertise?, tpgt?}`) may carry an explicit TPGT. The single-portal default `listen: "0.0.0.0:3260"` continues to advertise `TPGT=1`. Multiple portals sharing one TPGT (one TPG, many paths) is legal — the SCSI layer's REPORT TARGET PORT GROUPS / VPD 0x83 TargetPort designators group them under that TPGT |
+| Listen | `0.0.0.0:3260` (configurable via `iscsi.listen`; accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{bind: "ip:port", advertise?: "ip:port", tpgt?: N}` objects — the daemon binds one TCP listener per entry's `bind`, SendTargets advertises every entry as `TargetAddress=<advertise\|bind>,<tpgt>`, and the Login Response `TargetPortalGroupTag` echoes the *arrival* portal's TPGT (RFC 7143 §12.10). With no `advertise`, a wildcard `bind` (`0.0.0.0:*`, `[::]:*`) is substituted with the connection's actual local IP when emitted — without the substitution an initiator would receive an unusable `0.0.0.0:3260` line. `advertise`, when set, is emitted verbatim (no substitution) — for initiators behind NAT / Docker bridge + published ports / a reverse proxy / on a multi-homed host where the bind isn't reachable; a wildcard `advertise` is rejected at boot. Two entries with the same `bind` are rejected at boot (`bind(2)` would fail and the initiator can't disambiguate). Two entries that collapse to the same advertised line are deduped — first entry's TPGT wins) |
 | Max sessions | 10 (configurable) |
 | Session timeout | 300 s (configurable) |
 | HeaderDigest | None or CRC32C (negotiated) |
@@ -816,11 +816,17 @@ Entry (1024 bytes each):
   byte  768     TSAS.SECTYPE = 2 TLS 1.3 (when tls.mode=psk) / 0 none
 ```
 
-`TRADDR` resolution: the I/O listener's bind IP is advertised verbatim
-when concrete; for a wildcard bind (`0.0.0.0` / `::`) the transport
-threads the connection's local address into the handler and the entry
-reflects the IP the discovery request landed on (so the returned address
-is reachable for the follow-up Connect).
+`TRADDR` / `TRSVCID` resolution: an explicit `nvmetcp.advertise`
+(a full `ip:port`) overrides both fields verbatim — for hosts behind
+NAT / Docker bridge + published ports / a reverse proxy / on a
+multi-homed host where the bind isn't reachable; a wildcard `advertise`
+is rejected at boot. With no override, they derive from the I/O
+listener's bind: a concrete bind IP is advertised verbatim, while for a
+wildcard bind (`0.0.0.0` / `::`) the transport threads the connection's
+local address into the handler and the entry reflects the IP the
+discovery request landed on (so the returned address is reachable for the
+follow-up Connect). The override only affects discovery (`nvme discover`
+/ `connect-all`); a direct `nvme connect` to a known address ignores it.
 
 The Discovery listener is always cleartext + unauthenticated; the
 `TREQ` / `SECTYPE` fields advertise the I/O subsystem's TLS requirement so

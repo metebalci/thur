@@ -288,6 +288,16 @@ pub struct NvmetcpSettings {
     /// Override the NVMe/TCP TCP listen address. Defaults to
     /// `0.0.0.0:4420` (IANA-registered nvme-tcp port) when unset.
     pub listen: Option<String>,
+    /// Override the address advertised to hosts in the Discovery Log
+    /// Page (TRADDR + TRSVCID), as a full `ip:port`. Defaults to the
+    /// `listen` address — and with a wildcard bind the discovery
+    /// controller reflects the address each request landed on. Set this
+    /// when the bind isn't reachable by hosts (NAT, Docker bridge +
+    /// published ports, reverse proxy, multi-homed host); it is emitted
+    /// verbatim. Only affects discovery (`nvme discover` /
+    /// `connect-all`); a direct `nvme connect` to a known address
+    /// ignores it. A wildcard advertise is rejected at startup.
+    pub advertise: Option<String>,
     /// Override the NVMe Subsystem NQN advertised to hosts. Defaults
     /// to `shared_naming::DISK.nqn` (`nqn.2025-10.com.metebalci:thurvsa`)
     /// when unset. A host's `nvme connect --nqn=` must match this
@@ -449,16 +459,19 @@ pub struct IscsiSettings {
     /// - a single `"ip:port"` scalar;
     /// - a list of bare `"ip:port"` strings (auto-assign sequential
     ///   TPGTs from input position, 1-indexed);
-    /// - a list of `{address, tpgt}` objects (operator-controlled
-    ///   Target Portal Group Tag — the prerequisite for ALUA);
+    /// - a list of `{bind, advertise?, tpgt?}` objects (`bind` is the
+    ///   listen address; optional `advertise` overrides what SendTargets
+    ///   hands initiators; optional `tpgt` defaults to input position);
     /// - or a mix (per-entry).
     ///
-    /// Defaults to `[{address: "0.0.0.0:3260", tpgt: 1}]` when unset.
+    /// Defaults to `[{bind: "0.0.0.0:3260", tpgt: 1}]` when unset.
     /// Each entry binds its own listener; SendTargets advertises every
-    /// entry as `TargetAddress=<address>,<tpgt>`, with wildcards
-    /// (`0.0.0.0:*`, `[::]:*`) substituted by the connection's actual
-    /// local IP. Test scripts assign an ephemeral port here so
-    /// concurrent runs don't fight over a fixed bind.
+    /// entry as `TargetAddress=<advertise|bind>,<tpgt>`. When `advertise`
+    /// is unset, a wildcard `bind` (`0.0.0.0:*`, `[::]:*`) is substituted
+    /// by the connection's actual local IP; when set, it is emitted
+    /// verbatim (for NAT / bridge / reverse-proxy reachability). Test
+    /// scripts assign an ephemeral port here so concurrent runs don't
+    /// fight over a fixed bind.
     #[serde(default, deserialize_with = "deserialize_listen_opt")]
     pub listen: Option<Vec<shared_iscsi::transport::Portal>>,
     /// Override the iSCSI target IQN advertised to initiators in the
@@ -493,7 +506,12 @@ where
     #[serde(untagged)]
     enum Entry {
         Bare(String),
-        Full { address: String, tpgt: u16 },
+        Full {
+            bind: String,
+            #[serde(default)]
+            advertise: Option<String>,
+            tpgt: Option<u16>,
+        },
     }
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -520,13 +538,20 @@ where
             .map(|(i, e)| {
                 let position = (i as u16) + 1;
                 match e {
-                    Entry::Bare(address) => shared_iscsi::transport::Portal {
-                        address,
+                    Entry::Bare(bind) => shared_iscsi::transport::Portal {
+                        bind,
+                        advertise: None,
                         tpgt: position,
                     },
-                    Entry::Full { address, tpgt } => {
-                        shared_iscsi::transport::Portal { address, tpgt }
-                    }
+                    Entry::Full {
+                        bind,
+                        advertise,
+                        tpgt,
+                    } => shared_iscsi::transport::Portal {
+                        bind,
+                        advertise,
+                        tpgt: tpgt.unwrap_or(position),
+                    },
                 }
             })
             .collect(),
@@ -724,7 +749,8 @@ iscsi:
 
     fn portal(addr: &str, tpgt: u16) -> shared_iscsi::transport::Portal {
         shared_iscsi::transport::Portal {
-            address: addr.to_string(),
+            bind: addr.to_string(),
+            advertise: None,
             tpgt,
         }
     }
@@ -769,8 +795,8 @@ iscsi:
 data_dir: /var/lib/thurvsa
 iscsi:
   listen:
-    - { address: "10.0.0.5:3260", tpgt: 1 }
-    - { address: "10.0.0.6:3260", tpgt: 2 }
+    - { bind: "10.0.0.5:3260", tpgt: 1 }
+    - { bind: "10.0.0.6:3260", tpgt: 2 }
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("object form parses");
@@ -789,8 +815,8 @@ iscsi:
 data_dir: /var/lib/thurvsa
 iscsi:
   listen:
-    - { address: "10.0.0.5:3260", tpgt: 1 }
-    - { address: "10.0.0.6:3260", tpgt: 1 }
+    - { bind: "10.0.0.5:3260", tpgt: 1 }
+    - { bind: "10.0.0.6:3260", tpgt: 1 }
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("shared-TPGT form parses");
@@ -798,6 +824,25 @@ iscsi:
             cfg.iscsi.listen,
             Some(vec![portal("10.0.0.5:3260", 1), portal("10.0.0.6:3260", 1)])
         );
+    }
+
+    #[test]
+    fn iscsi_listen_object_form_advertise_with_optional_tpgt() {
+        // bind + advertise, tpgt omitted -> position default (1).
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+iscsi:
+  listen:
+    - { bind: "0.0.0.0:3260", advertise: "192.0.2.50:3260" }
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("advertise form parses");
+        let portals = cfg.iscsi.listen.expect("listen present");
+        assert_eq!(portals.len(), 1);
+        assert_eq!(portals[0].bind, "0.0.0.0:3260");
+        assert_eq!(portals[0].advertise.as_deref(), Some("192.0.2.50:3260"));
+        assert_eq!(portals[0].tpgt, 1);
     }
 
     #[test]

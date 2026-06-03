@@ -216,13 +216,14 @@ annotated config without a running daemon via
 
 Notes:
 
-- **Host networking (`--network host`) or macvlan is required.** The
-  iSCSI/NVMe target advertises the connection's local IP in SendTargets /
-  discovery; behind a bridge + published ports the initiator would be
-  handed the unreachable container-internal address. Host net also makes
-  the published-port mapping moot — the daemon binds 3260 (iSCSI), 9090
+- **Networking — host net (simplest) or bridge + published ports.** With
+  `--network host` (or macvlan) the daemon binds 3260 (iSCSI), 9090
   (HTTP/Prometheus), and, for VSA with `nvmetcp` enabled, 4420 + 8009
-  directly on the host.
+  directly on the host and discovery just works. To run on a Docker
+  **bridge** with `-p` published ports, set the advertised address so the
+  target hands initiators a reachable IP instead of the container-internal
+  one: `iscsi.listen: [{ bind: "0.0.0.0:3260", advertise: "<host-ip>:3260" }]`
+  and, for NVMe/TCP, `nvmetcp.advertise: "<host-ip>:4420"`.
 - **The daemon runs as uid/gid 9000** (`thurvtl` / `thurvsa` inside the
   image). A *named* volume for the data dir inherits that ownership
   automatically; a host **bind**-mounted data dir must be

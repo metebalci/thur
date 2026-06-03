@@ -60,6 +60,43 @@ pub const DEFAULT_NVMETCP_LISTEN_ADDRESS: &str = "0.0.0.0:4420";
 /// without LOGOUT have their session manager state reaped.
 const STALE_SESSION_TIMEOUT_SECS: u64 = 300;
 
+/// Resolve the `(TRADDR, TRSVCID)` the NVMe/TCP discovery log advertises
+/// for the I/O subsystem (issue #84).
+///
+/// `advertise` (a full `ip:port`), when set, overrides both verbatim —
+/// for hosts behind NAT / Docker bridge + published ports / reverse
+/// proxy where the bind address isn't reachable; a wildcard advertise is
+/// rejected. Otherwise the value derives from the I/O `listen` bind: a
+/// concrete IP is advertised as-is, while a wildcard bind yields `None`
+/// so the discovery controller reflects the address each request landed
+/// on.
+fn resolve_discovery_traddr(
+    listen: &str,
+    advertise: Option<&str>,
+) -> Result<(Option<std::net::IpAddr>, u16)> {
+    if let Some(adv) = advertise {
+        let sa = adv
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("nvmetcp.advertise must be ip:port, got {adv:?}"))?;
+        if sa.ip().is_unspecified() {
+            anyhow::bail!(
+                "nvmetcp.advertise address {adv} is a wildcard; \
+                 it must be a concrete reachable address"
+            );
+        }
+        return Ok((Some(sa.ip()), sa.port()));
+    }
+    let io_sockaddr = listen.parse::<std::net::SocketAddr>().ok();
+    let port = io_sockaddr
+        .map(|s| s.port())
+        .or_else(|| listen.rsplit(':').next().and_then(|p| p.parse().ok()))
+        .unwrap_or(4420);
+    let traddr = io_sockaddr
+        .map(|s| s.ip())
+        .filter(|ip| !ip.is_unspecified());
+    Ok((traddr, port))
+}
+
 #[derive(Parser)]
 #[command(name = "thurvsad", about = "ThurVSA daemon", version = THURVSA_VERSION_STR)]
 struct Cli {
@@ -534,12 +571,13 @@ async fn main() -> Result<()> {
                 // bind set both key off it.
                 let iscsi_portals = cfg.iscsi.listen.clone().unwrap_or_else(|| {
                     vec![shared_iscsi::transport::Portal {
-                        address: DEFAULT_LISTEN_ADDRESS.to_string(),
+                        bind: DEFAULT_LISTEN_ADDRESS.to_string(),
+                        advertise: None,
                         tpgt: 1,
                     }]
                 });
                 let iscsi_listens: Vec<String> =
-                    iscsi_portals.iter().map(|p| p.address.clone()).collect();
+                    iscsi_portals.iter().map(|p| p.bind.clone()).collect();
 
                 // ALUA topology — built from the advertised portals with
                 // the target IQN as the per-port NAA-3 namespace so two
@@ -603,7 +641,10 @@ async fn main() -> Result<()> {
                     "transport: iscsi (listen={})",
                     iscsi_portals
                         .iter()
-                        .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+                        .map(|p| match &p.advertise {
+                            Some(adv) => format!("{} (advertise {}),tpgt={}", p.bind, adv, p.tpgt),
+                            None => format!("{},tpgt={}", p.bind, p.tpgt),
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -774,24 +815,16 @@ async fn main() -> Result<()> {
                 // the real Connect. Default on whenever nvmetcp is.
                 if cfg.nvmetcp.discovery.enabled() {
                     let discovery_listen = cfg.nvmetcp.discovery.listen_addr();
-                    // Resolve the I/O transport address the log record
-                    // advertises. A concrete bind IP is advertised
-                    // verbatim; a wildcard bind (0.0.0.0 / ::) leaves
-                    // `io_traddr = None` so the DiscoveryHandler reflects
-                    // the address each discovery request landed on.
-                    let io_sockaddr = nvmetcp_listen.parse::<std::net::SocketAddr>().ok();
-                    let io_port = io_sockaddr
-                        .map(|s| s.port())
-                        .or_else(|| {
-                            nvmetcp_listen
-                                .rsplit(':')
-                                .next()
-                                .and_then(|p| p.parse().ok())
-                        })
-                        .unwrap_or(4420);
-                    let io_traddr = io_sockaddr
-                        .map(|s| s.ip())
-                        .filter(|ip| !ip.is_unspecified());
+                    // Resolve the (TRADDR, TRSVCID) the discovery log
+                    // record advertises for the I/O subsystem. An explicit
+                    // `nvmetcp.advertise` overrides both; otherwise it
+                    // derives from the I/O bind (concrete IP advertised
+                    // verbatim, wildcard -> reflect the request's local
+                    // addr). See `resolve_discovery_traddr` (issue #84).
+                    let (io_traddr, io_port) = resolve_discovery_traddr(
+                        &nvmetcp_listen,
+                        cfg.nvmetcp.advertise.as_deref(),
+                    )?;
                     let (sectype, treq) = match cfg.nvmetcp.tls.mode {
                         NvmetcpTlsMode::Psk => (
                             nvme_base::log_page::disc_sectype::TLS13,
@@ -1246,5 +1279,55 @@ async fn run_runtime_persist_worker(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_discovery_traddr;
+    use std::net::IpAddr;
+
+    #[test]
+    fn discovery_traddr_derives_from_concrete_bind() {
+        let (traddr, port) = resolve_discovery_traddr("10.0.0.5:4420", None).unwrap();
+        assert_eq!(traddr, Some("10.0.0.5".parse::<IpAddr>().unwrap()));
+        assert_eq!(port, 4420);
+    }
+
+    #[test]
+    fn discovery_traddr_wildcard_bind_reflects() {
+        // Wildcard bind -> None so the discovery controller reflects the
+        // request's local addr; port is still carried.
+        let (traddr, port) = resolve_discovery_traddr("0.0.0.0:4420", None).unwrap();
+        assert_eq!(traddr, None);
+        assert_eq!(port, 4420);
+    }
+
+    #[test]
+    fn discovery_traddr_advertise_overrides_both_verbatim() {
+        // Bind wildcard, advertise a concrete reachable ip:port — both
+        // TRADDR and TRSVCID come from advertise (issue #84).
+        let (traddr, port) =
+            resolve_discovery_traddr("0.0.0.0:4420", Some("192.0.2.50:9420")).unwrap();
+        assert_eq!(traddr, Some("192.0.2.50".parse::<IpAddr>().unwrap()));
+        assert_eq!(port, 9420);
+    }
+
+    #[test]
+    fn discovery_traddr_rejects_wildcard_advertise() {
+        let err = resolve_discovery_traddr("0.0.0.0:4420", Some("0.0.0.0:4420")).unwrap_err();
+        assert!(
+            err.to_string().contains("wildcard"),
+            "want 'wildcard' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn discovery_traddr_rejects_malformed_advertise() {
+        let err = resolve_discovery_traddr("0.0.0.0:4420", Some("not-an-addr")).unwrap_err();
+        assert!(
+            err.to_string().contains("ip:port"),
+            "want 'ip:port' in error, got: {err}"
+        );
     }
 }

@@ -70,19 +70,28 @@ pub const MAX_BURST_LENGTH: u32 = 16 * 1024 * 1024;
 /// no follow-on unsolicited Data-Out PDUs needed.
 pub const FIRST_BURST_LENGTH: u32 = MAX_RECV_DATA_SEGMENT_LENGTH;
 
-/// One advertised iSCSI portal: a TCP listen address paired with the
+/// One advertised iSCSI portal: a TCP bind address paired with the
 /// Target Portal Group Tag the daemon reports for it. Each portal binds
 /// its own [`TcpListener`]; SendTargets emits one
-/// `TargetAddress=address,tpgt` line per portal; the Login Response
+/// `TargetAddress=<advertised>,tpgt` line per portal; the Login Response
 /// `TargetPortalGroupTag` key carries the *arrival* portal's TPGT
 /// (RFC 7143 §12.10).
 ///
+/// `bind` is what the daemon binds. `advertise`, when set, is the address
+/// handed to initiators in SendTargets, emitted verbatim — set it when
+/// the bind address isn't reachable by initiators (NAT, Docker bridge +
+/// published ports, reverse proxy, multi-homed host). When `advertise` is
+/// `None`, the `bind` address is advertised, with a wildcard bind
+/// (`0.0.0.0` / `[::]`) substituted by the connection's local IP.
+///
 /// Multiple portals may share one TPGT (group). Two portals with the
-/// same address are rejected at `run()` — `bind(2)` would fail anyway,
+/// same `bind` are rejected at `run()` — `bind(2)` would fail anyway,
 /// and SendTargets would hand the initiator duplicate records.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Portal {
-    pub address: String,
+    pub bind: String,
+    #[serde(default)]
+    pub advertise: Option<String>,
     pub tpgt: u16,
 }
 
@@ -1841,12 +1850,17 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
 fn build_target_addresses(advertised: &[Portal], local: SocketAddr) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> = Vec::with_capacity(advertised.len());
     for portal in advertised {
-        let line = match portal.address.parse::<SocketAddr>() {
-            Ok(sa) if sa.ip().is_unspecified() => {
-                SocketAddr::new(local.ip(), sa.port()).to_string()
-            }
-            Ok(sa) => sa.to_string(),
-            Err(_) => portal.address.clone(),
+        let line = match &portal.advertise {
+            // Operator-chosen reachable address: emit verbatim, no
+            // wildcard substitution.
+            Some(adv) => adv.clone(),
+            None => match portal.bind.parse::<SocketAddr>() {
+                Ok(sa) if sa.ip().is_unspecified() => {
+                    SocketAddr::new(local.ip(), sa.port()).to_string()
+                }
+                Ok(sa) => sa.to_string(),
+                Err(_) => portal.bind.clone(),
+            },
         };
         if !out.iter().any(|(a, _)| a == &line) {
             out.push((line, portal.tpgt));
@@ -1938,15 +1952,30 @@ where
     {
         let mut seen: HashMap<&str, u16> = HashMap::new();
         for p in &config.listen_portals {
-            if let Some(prev_tpgt) = seen.insert(p.address.as_str(), p.tpgt) {
+            if let Some(prev_tpgt) = seen.insert(p.bind.as_str(), p.tpgt) {
                 return Err(anyhow!(
                     "iscsi: duplicate listen address {} (TPGT {} and {}); \
-                     each address must appear once",
-                    p.address,
+                     each bind address must appear once",
+                    p.bind,
                     prev_tpgt,
                     p.tpgt
                 ));
             }
+        }
+    }
+
+    // A wildcard advertise address is meaningless — it would hand the
+    // initiator 0.0.0.0 / [::] as the connect target.
+    for p in &config.listen_portals {
+        if let Some(adv) = &p.advertise
+            && let Ok(sa) = adv.parse::<SocketAddr>()
+            && sa.ip().is_unspecified()
+        {
+            return Err(anyhow!(
+                "iscsi: portal advertise address {} is a wildcard; \
+                 advertise must be a concrete reachable address",
+                adv
+            ));
         }
     }
 
@@ -1955,16 +1984,19 @@ where
         config
             .listen_portals
             .iter()
-            .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+            .map(|p| match &p.advertise {
+                Some(adv) => format!("{} (advertise {}),tpgt={}", p.bind, adv, p.tpgt),
+                None => format!("{},tpgt={}", p.bind, p.tpgt),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     );
 
     let mut listeners = Vec::with_capacity(config.listen_portals.len());
     for portal in &config.listen_portals {
-        let listener = TcpListener::bind(&portal.address)
+        let listener = TcpListener::bind(&portal.bind)
             .await
-            .map_err(|e| anyhow!("iscsi: bind {}: {}", portal.address, e))?;
+            .map_err(|e| anyhow!("iscsi: bind {}: {}", portal.bind, e))?;
         listeners.push((listener, portal.tpgt));
     }
 
@@ -3600,7 +3632,8 @@ mod tests {
         });
         let config = ServerConfig {
             listen_portals: vec![Portal {
-                address: "127.0.0.1:0".to_string(),
+                bind: "127.0.0.1:0".to_string(),
+                advertise: None,
                 tpgt: 1,
             }],
             session_manager: Arc::clone(&mgr),
@@ -3617,7 +3650,8 @@ mod tests {
         drop(probe);
         let config = ServerConfig {
             listen_portals: vec![Portal {
-                address: format!("127.0.0.1:{port}"),
+                bind: format!("127.0.0.1:{port}"),
+                advertise: None,
                 tpgt: 1,
             }],
             ..config
@@ -3655,7 +3689,8 @@ mod tests {
     fn server_config_carries_transport_hooks() {
         let config = ServerConfig {
             listen_portals: vec![Portal {
-                address: "0.0.0.0:3260".to_string(),
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: None,
                 tpgt: 1,
             }],
             session_manager: Arc::new(SessionManager::new()),
@@ -3666,7 +3701,8 @@ mod tests {
         assert_eq!(
             config.listen_portals,
             vec![Portal {
-                address: "0.0.0.0:3260".to_string(),
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: None,
                 tpgt: 1
             }]
         );
@@ -3676,7 +3712,8 @@ mod tests {
 
     fn portal(addr: &str, tpgt: u16) -> Portal {
         Portal {
-            address: addr.to_string(),
+            bind: addr.to_string(),
+            advertise: None,
             tpgt,
         }
     }
@@ -3779,11 +3816,13 @@ mod tests {
         let config = ServerConfig {
             listen_portals: vec![
                 Portal {
-                    address: "127.0.0.1:65535".to_string(),
+                    bind: "127.0.0.1:65535".to_string(),
+                    advertise: None,
                     tpgt: 1,
                 },
                 Portal {
-                    address: "127.0.0.1:65535".to_string(),
+                    bind: "127.0.0.1:65535".to_string(),
+                    advertise: None,
                     tpgt: 2,
                 },
             ],
@@ -3799,6 +3838,78 @@ mod tests {
         assert!(
             err.to_string().contains("duplicate listen address"),
             "want 'duplicate listen address' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_target_addresses_emits_advertise_verbatim_over_wildcard_bind() {
+        // The point of #84: bind wildcard, advertise a concrete reachable
+        // address — emit the advertise value as-is, NO local-IP
+        // substitution (the local IP would be the unreachable bridge addr).
+        let advertised = vec![Portal {
+            bind: "0.0.0.0:3260".to_string(),
+            advertise: Some("192.0.2.50:3260".to_string()),
+            tpgt: 1,
+        }];
+        let local: SocketAddr = "172.17.0.2:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec![("192.0.2.50:3260".to_string(), 1)]);
+    }
+
+    #[test]
+    fn build_target_addresses_advertise_may_remap_port() {
+        // advertise is a full host:port, so a port-forward (external
+        // :9260 -> bound :3260) is expressible.
+        let advertised = vec![Portal {
+            bind: "0.0.0.0:3260".to_string(),
+            advertise: Some("192.0.2.50:9260".to_string()),
+            tpgt: 2,
+        }];
+        let local: SocketAddr = "172.17.0.2:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec![("192.0.2.50:9260".to_string(), 2)]);
+    }
+
+    #[test]
+    fn build_target_addresses_dedupes_identical_advertise() {
+        // Two portals advertising the same address collapse to one line.
+        let advertised = vec![
+            Portal {
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: Some("192.0.2.50:3260".to_string()),
+                tpgt: 1,
+            },
+            Portal {
+                bind: "0.0.0.0:3261".to_string(),
+                advertise: Some("192.0.2.50:3260".to_string()),
+                tpgt: 2,
+            },
+        ];
+        let local: SocketAddr = "172.17.0.2:3260".parse().unwrap();
+        let out = build_target_addresses(&advertised, local);
+        assert_eq!(out, vec![("192.0.2.50:3260".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_wildcard_advertise() {
+        let config = ServerConfig {
+            listen_portals: vec![Portal {
+                bind: "127.0.0.1:0".to_string(),
+                advertise: Some("0.0.0.0:3260".to_string()),
+                tpgt: 1,
+            }],
+            session_manager: Arc::new(SessionManager::new()),
+            auth: None,
+            audit: Arc::new(NoopLoginAudit),
+            stale_session_timeout_secs: 300,
+        };
+        let handler = Arc::new(TestHandler {
+            iqn: "iqn.test:adv".into(),
+        });
+        let err = run(config, handler).await.unwrap_err();
+        assert!(
+            err.to_string().contains("wildcard"),
+            "want 'wildcard' in error, got: {err}"
         );
     }
 

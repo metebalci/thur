@@ -591,9 +591,10 @@ struct IscsiConfig {
     /// ALUA give each portal its own. Bare-string entries auto-assign
     /// sequential TPGTs from their input position (1, 2, …) so the
     /// single-portal `listen: "0.0.0.0:3260"` happy path keeps
-    /// TPGT=1. SendTargets discovery advertises every entry;
-    /// wildcards (`0.0.0.0:*`, `[::]:*`) are substituted with the
-    /// connection's actual local IP.
+    /// TPGT=1. SendTargets discovery advertises every entry; with no
+    /// per-portal `advertise` override a wildcard bind (`0.0.0.0:*`,
+    /// `[::]:*`) is substituted with the connection's actual local IP,
+    /// otherwise the `advertise` address is emitted verbatim.
     #[serde(
         default = "default_iscsi_listen",
         deserialize_with = "deserialize_listen"
@@ -616,7 +617,8 @@ struct IscsiConfig {
 
 fn default_iscsi_listen() -> Vec<shared_iscsi::transport::Portal> {
     vec![shared_iscsi::transport::Portal {
-        address: "0.0.0.0:3260".to_string(),
+        bind: "0.0.0.0:3260".to_string(),
+        advertise: None,
         tpgt: 1,
     }]
 }
@@ -632,10 +634,11 @@ fn default_session_timeout() -> u32 {
 
 /// Accept either a single TCP address (scalar) or a list of portal
 /// entries (sequence of either bare `"ip:port"` strings or
-/// `{address, tpgt}` objects); normalizes both forms to
-/// `Vec<Portal>`. Bare strings auto-assign `tpgt = position` (1-indexed)
-/// so the single-string happy path advertises TPGT=1. Empty lists are
-/// rejected — the daemon needs at least one portal to bind.
+/// `{bind, advertise?, tpgt?}` objects); normalizes both forms to
+/// `Vec<Portal>`. Bare strings (and objects omitting `tpgt`) auto-assign
+/// `tpgt = position` (1-indexed) so the single-string happy path
+/// advertises TPGT=1. Empty lists are rejected — the daemon needs at
+/// least one portal to bind.
 fn deserialize_listen<'de, D>(
     de: D,
 ) -> std::result::Result<Vec<shared_iscsi::transport::Portal>, D::Error>
@@ -647,7 +650,12 @@ where
     #[serde(untagged)]
     enum Entry {
         Bare(String),
-        Full { address: String, tpgt: u16 },
+        Full {
+            bind: String,
+            #[serde(default)]
+            advertise: Option<String>,
+            tpgt: Option<u16>,
+        },
     }
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -672,11 +680,20 @@ where
         .map(|(i, e)| {
             let position = (i as u16) + 1;
             match e {
-                Entry::Bare(address) => shared_iscsi::transport::Portal {
-                    address,
+                Entry::Bare(bind) => shared_iscsi::transport::Portal {
+                    bind,
+                    advertise: None,
                     tpgt: position,
                 },
-                Entry::Full { address, tpgt } => shared_iscsi::transport::Portal { address, tpgt },
+                Entry::Full {
+                    bind,
+                    advertise,
+                    tpgt,
+                } => shared_iscsi::transport::Portal {
+                    bind,
+                    advertise,
+                    tpgt: tpgt.unwrap_or(position),
+                },
             }
         })
         .collect())
@@ -1667,7 +1684,7 @@ async fn main() -> Result<()> {
         library: std::sync::Arc::clone(&library_arc),
         element_config,
         target_iqn: iscsi_cfg.target_iqn.clone(),
-        listen_addresses: iscsi_cfg.listen.iter().map(|p| p.address.clone()).collect(),
+        listen_addresses: iscsi_cfg.listen.iter().map(|p| p.bind.clone()).collect(),
         event_tx: event_tx.clone(),
         audit_log: audit_log.clone(),
         audit_dir: audit_log_dir.clone(),
@@ -1806,7 +1823,10 @@ async fn main() -> Result<()> {
             iscsi_cfg
                 .listen
                 .iter()
-                .map(|p| format!("{},tpgt={}", p.address, p.tpgt))
+                .map(|p| match &p.advertise {
+                    Some(adv) => format!("{} (advertise {}),tpgt={}", p.bind, adv, p.tpgt),
+                    None => format!("{},tpgt={}", p.bind, p.tpgt),
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -2302,7 +2322,8 @@ mod config_parse_tests {
 
     fn portal(addr: &str, tpgt: u16) -> shared_iscsi::transport::Portal {
         shared_iscsi::transport::Portal {
-            address: addr.to_string(),
+            bind: addr.to_string(),
+            advertise: None,
             tpgt,
         }
     }
@@ -2328,7 +2349,7 @@ mod config_parse_tests {
 
     #[test]
     fn iscsi_listen_object_form_carries_explicit_tpgt() {
-        let yaml = "listen:\n  - { address: \"10.0.0.5:3260\", tpgt: 5 }\n  - { address: \"10.0.0.6:3260\", tpgt: 9 }\n";
+        let yaml = "listen:\n  - { bind: \"10.0.0.5:3260\", tpgt: 5 }\n  - { bind: \"10.0.0.6:3260\", tpgt: 9 }\n";
         let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("object form parses");
         assert_eq!(
             cfg.listen,
@@ -2337,10 +2358,21 @@ mod config_parse_tests {
     }
 
     #[test]
+    fn iscsi_listen_object_form_advertise_with_optional_tpgt() {
+        // bind + advertise, tpgt omitted -> position default.
+        let yaml = "listen:\n  - { bind: \"0.0.0.0:3260\", advertise: \"192.0.2.50:3260\" }\n";
+        let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("advertise form parses");
+        assert_eq!(cfg.listen.len(), 1);
+        assert_eq!(cfg.listen[0].bind, "0.0.0.0:3260");
+        assert_eq!(cfg.listen[0].advertise.as_deref(), Some("192.0.2.50:3260"));
+        assert_eq!(cfg.listen[0].tpgt, 1);
+    }
+
+    #[test]
     fn iscsi_listen_object_form_allows_shared_tpgt_for_group() {
         // Multiple portals sharing one TPGT is legal (one TPG, many
         // paths) — the group surface is the prerequisite for ALUA.
-        let yaml = "listen:\n  - { address: \"10.0.0.5:3260\", tpgt: 1 }\n  - { address: \"10.0.0.6:3260\", tpgt: 1 }\n";
+        let yaml = "listen:\n  - { bind: \"10.0.0.5:3260\", tpgt: 1 }\n  - { bind: \"10.0.0.6:3260\", tpgt: 1 }\n";
         let cfg: IscsiConfig = serde_yaml::from_str(yaml).expect("shared-TPGT form parses");
         assert_eq!(
             cfg.listen,

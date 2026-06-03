@@ -149,7 +149,8 @@ impl Default for LibrarySettings {
 
 fn default_listen_portals() -> Vec<shared_iscsi::transport::Portal> {
     vec![shared_iscsi::transport::Portal {
-        address: "0.0.0.0:3260".to_string(),
+        bind: "0.0.0.0:3260".to_string(),
+        advertise: None,
         tpgt: 1,
     }]
 }
@@ -199,7 +200,8 @@ mod tests {
         assert_eq!(
             s.listen_portals,
             vec![shared_iscsi::transport::Portal {
-                address: "0.0.0.0:3260".to_string(),
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: None,
                 tpgt: 1,
             }]
         );
@@ -273,11 +275,13 @@ mod tests {
         let original = IscsiSettings {
             listen_portals: vec![
                 shared_iscsi::transport::Portal {
-                    address: "10.0.0.1:3260".to_string(),
+                    bind: "10.0.0.1:3260".to_string(),
+                    advertise: None,
                     tpgt: 1,
                 },
                 shared_iscsi::transport::Portal {
-                    address: "10.0.0.2:3260".to_string(),
+                    bind: "10.0.0.2:3260".to_string(),
+                    advertise: None,
                     tpgt: 2,
                 },
             ],
@@ -362,7 +366,8 @@ mod tests {
         assert_eq!(
             c.iscsi.listen_portals,
             vec![shared_iscsi::transport::Portal {
-                address: "0.0.0.0:3260".to_string(),
+                bind: "0.0.0.0:3260".to_string(),
+                advertise: None,
                 tpgt: 1,
             }]
         );

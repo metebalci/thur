@@ -29,6 +29,10 @@ services:
     image: ghcr.io/metebalci/thurvtl:latest
     container_name: thurvtl
     network_mode: host
+    # Bridge + published ports instead of host net: drop network_mode,
+    # add `ports: ["3260:3260", "9090:9090"]`, and set the advertised
+    # address in thurvtl.yaml so SendTargets hands initiators a reachable IP:
+    #   iscsi: { listen: [{ bind: "0.0.0.0:3260", advertise: "<host-ip>:3260" }] }
     restart: unless-stopped
     volumes:
       - ./thurvtl.yaml:/etc/thurvtl/thurvtl.yaml:ro
