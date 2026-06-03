@@ -88,7 +88,7 @@ pub async fn run_http_server(cfg: HttpListenerConfig, router: axum::Router) -> R
 ///
 /// rustls 0.23 requires a provider to be selected before any
 /// `ServerConfig` / `ClientConfig` is built. Other crates in the
-/// workspace (`shared-keystore::kmip`, `shared-cloud::gcs`) also call
+/// workspace (`shared-keystore::kmip`, `shared-object-store::gcs`) also call
 /// `install_default()`; whichever runs first wins, and the rest become
 /// no-ops. Both `ring` and `aws-lc-rs` providers support the cert
 /// algorithms this crate emits (ECDSA P-256), so the race is benign.

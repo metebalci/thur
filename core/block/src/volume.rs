@@ -342,9 +342,9 @@ pub struct VolumeManifest {
     #[serde(default = "default_unassigned_lun")]
     pub lun: u64,
     pub dedup_scope: DedupScope,
-    /// WORM marker. Sticky once set; SBC-3 write paths refuse
-    /// when `true`. Not yet enforced — placeholder for the cloud
-    /// retention-mode integration that lands with the iSCSI handler.
+    /// WORM marker. Sticky once set; the SBC-3 write paths refuse
+    /// WRITE / COMPARE AND WRITE / UNMAP / WRITE SAME / XCOPY-dest with
+    /// WRITE PROTECTED when `true` (see `scsi_sbc::data_path`).
     pub worm: bool,
     pub created_at: DateTime<Utc>,
     /// At-rest encryption settings. `None` is the default for both

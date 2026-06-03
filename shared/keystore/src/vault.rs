@@ -5,7 +5,7 @@
 //!
 //! Hand-rolled `reqwest` client — vaultrs adds a heavyweight builder
 //! surface for the four endpoints we need (encrypt, decrypt, datakey,
-//! sys/health) plus AppRole login. Mirrors `shared-cloud`'s posture
+//! sys/health) plus AppRole login. Mirrors `shared-object-store`'s posture
 //! against the Azure / GCP SDK split: lean on the official SDK when
 //! it's first-party, otherwise hand-roll the JSON.
 //!

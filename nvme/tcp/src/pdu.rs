@@ -214,8 +214,10 @@ pub fn apply_digests(mut pdu: Vec<u8>, cfg: DigestCfg) -> Vec<u8> {
 /// C2HData: this is the final C2HData PDU of a multi-PDU response.
 pub const C2H_FLAGS_LAST_PDU: u8 = 1 << 2;
 /// C2HData: treat as implicit success completion (no CapsuleResp
-/// follows). The MVP server does not set this — it always emits a
-/// separate CapsuleResp after data.
+/// follows). The server sets this on the final C2HData PDU when the
+/// command's CQE is a no-payload success, folding the completion in
+/// and skipping a separate CapsuleResp; a non-foldable CQE clears it
+/// and a CapsuleResp follows.
 pub const C2H_FLAGS_SUCCESS: u8 = 1 << 3;
 /// H2CData: this is the final H2CData PDU servicing the R2T.
 /// Same bit position as `C2H_FLAGS_LAST_PDU`; aliased for symmetry

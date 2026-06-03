@@ -3,7 +3,7 @@
 
 //! `thurvsa system cloud benchmark` — daemon-down first-party
 //! throughput benchmark. Parses the daemon YAML conffile, constructs
-//! each named backend, hands the lot to `shared-cloud-bench`. Doesn't
+//! each named backend, hands the lot to `shared-object-store-bench`. Doesn't
 //! touch the admin socket so operators can validate a freshly-
 //! configured backend before the daemon ever opens it.
 

@@ -11,15 +11,16 @@
 //!   `<data_dir>/chunks/<backend>/...`. Symmetric to thurvtl's
 //!   `data_dir`.
 //! - `cloud`: the shared `ObjectStoreConfig` schema (named `backends:`
-//!   map + retry / compression knobs) consumed by `shared-cloud`'s
-//!   backend constructors.
+//!   map + retry / compression knobs) consumed by
+//!   `shared-object-store`'s backend constructors.
 //! - `iscsi.auth`: optional CHAP block. Schema mirrors thurvtl's
 //!   `iscsi.auth` (enabled / method / target_username /
 //!   target_password / allowed_algorithms / users[]) minus the
 //!   per-user `partition` field — thurvsa has no library topology /
 //!   partition concept.
-//! - `audit`: minimal JSONL audit log (daily-rotating). Default
-//!   directory is `<data_dir>/audit/` when unset.
+//! - `audit`: BLAKE3-chained, daily-rotating JSONL audit log from
+//!   `shared-audit`. Default directory is `<data_dir>/audit/` when
+//!   unset.
 //!
 //! Validation runs `ObjectStoreConfig::validate()` so an empty backend
 //! map or a misconfigured Azure-WORM entry surfaces here, not later
@@ -596,13 +597,17 @@ pub struct AuthSettings {
     pub allowed_algorithms: Vec<String>,
 }
 
-/// `audit:` block. thurvsa's audit subsystem is minimal today —
-/// daily-rotating JSONL appends to
-/// `<audit.dir or data_dir/audit>/audit-YYYY-MM-DD.jsonl`. No chain,
-/// no rate limiting: those land when shared-audit lifts. The single
-/// emitter today is the
-/// shared-iscsi login phase (CHAP success / failure) via
-/// `crate::audit::IscsiDiskLoginAudit`.
+/// `audit:` block. thurvsa's audit log is the BLAKE3-chained,
+/// tamper-evident, daily-rotating JSONL from `shared-audit` —
+/// `<audit.dir or data_dir/audit>/audit-YYYY-MM-DD.jsonl`, drained by
+/// a single-writer task off a cloneable `AuditChannel`. The emitters
+/// are the two transport login phases: iSCSI CHAP via
+/// `crate::audit::IscsiDiskLoginAudit` and NVMe/TCP DH-HMAC-CHAP via
+/// `crate::audit::NvmetcpLoginAudit` (each writes success / failure
+/// rows). The audit-chain `AuditRateLimiter` is not wired yet —
+/// failure rows write one-per-event; the per-user / per-NQN
+/// brute-force *alert* is already deduped + thresholded in
+/// `shared-alerting`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditSettings {
     /// On by default. Disable only for development / ephemeral

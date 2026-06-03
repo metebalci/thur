@@ -6,10 +6,12 @@
 //! Three phases, in order:
 //!
 //! 1. **ICReq → ICResp** (NVMe/TCP §3.6.1 / §3.6.2). The very first
-//!    PDU on every accepted TCP connection MUST be ICReq. We
-//!    negotiate digests off (DGST=0) and an `MAXH2CDATA` large
-//!    enough that hosts have no reason to fall back to R2T —
-//!    the MVP server only handles in-capsule writes.
+//!    PDU on every accepted TCP connection MUST be ICReq. We advertise
+//!    an `MAXH2CDATA` of 128 KiB and honor whichever header- / data-
+//!    digests (CRC32C) the host requests — a host sending `dgst=0`
+//!    keeps the no-digest fast path; one configured for digests gets
+//!    fully digested framing both ways (issue #78). Writes that exceed
+//!    the in-capsule data budget fall back to R2T (see phase 3).
 //! 2. **Connect** (NVMe-oF §6.3.1). The first CapsuleCmd carries an
 //!    Admin Fabrics command with FCTYPE=0x01. We validate the
 //!    host's SUBNQN against our subsystem's NQN and capture QID from
@@ -19,20 +21,21 @@
 //!    echoed in the Connect Response DW0.
 //! 3. **Command loop**. Each subsequent CapsuleCmd routes through
 //!    [`NvmeCommandHandler::handle_admin`] or
-//!    [`NvmeCommandHandler::handle_io`] based on the captured QID.
-//!    Responses with `data_in.len() > 0` get a preceding C2HData
-//!    PDU; every command gets a CapsuleResp.
+//!    [`NvmeCommandHandler::handle_io`] based on the captured QID. A
+//!    write whose data doesn't fit the in-capsule budget is gathered
+//!    via a single outstanding R2T (partial-ICD + R2T-tail stitching);
+//!    a fused Compare+Write pair is tracked across its two SQEs.
+//!    Responses with `data_in.len() > 0` get a preceding C2HData PDU
+//!    (the CapsuleResp SUCCESS bit folded onto the last one where
+//!    allowed); every other command gets a CapsuleResp.
 //!
-//! Errors on the wire (unexpected PDU type, malformed Connect Data,
-//! SUBNQN mismatch) are reported via C2HTermReq with the appropriate
-//! Fatal Error Status (FES) and the connection is dropped. Clean
-//! host-driven teardown (H2CTermReq) closes silently.
-//!
-//! Out of scope this session (per the build-up roadmap in
-//! `docs/NVMETCP.md` § Follow-up scope): R2T flow control,
-//! header / data digests (CRC32C), TLS-PSK, fused Compare+Write
-//! pairing, Property Get / Set, Disconnect, Authentication Send /
-//! Receive.
+//! Property Get / Set (against the shared `ControllerRegs`),
+//! Disconnect, and DH-HMAC-CHAP Authentication Send / Receive are
+//! handled in the same loop. Errors on the wire (unexpected PDU type,
+//! malformed Connect Data, SUBNQN mismatch, digest mismatch) are
+//! reported via C2HTermReq with the appropriate Fatal Error Status
+//! (FES) and the connection is dropped. Clean host-driven teardown
+//! (H2CTermReq) closes silently.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -328,7 +331,7 @@ fn data_direction(opc: u8) -> DataDirection {
 /// FFDHE keygen even on a slow host.
 const AUTH_PHASE_TIMEOUT_SECS: u64 = 30;
 
-/// FES codes (NVMe/TCP §3.6.4) we emit. Only the subset the MVP
+/// FES codes (NVMe/TCP §3.6.4) we emit. Only the subset the server
 /// can hit; full enumeration in the spec.
 mod fes {
     /// Invalid PDU Header Field — e.g. PFV != 0 in ICReq.
@@ -460,8 +463,8 @@ where
         "nvme-tcp: ICReq accepted",
     );
     // MAXR2T per NVMe/TCP §3.6.1 — 0 means "the controller shall
-    // treat as 1 outstanding R2T per command". MVP only ever issues
-    // one R2T per command anyway, so this is purely a sanity floor.
+    // treat as 1 outstanding R2T per command". The server only ever
+    // issues one R2T per command anyway, so this is purely a sanity floor.
     let host_maxr2t = icreq.maxr2t.max(1);
     // Digest negotiation (NVMe/TCP §3.4): the host requests header /
     // data digests in ICReq.dgst; we support both, so we honor whatever
@@ -2187,7 +2190,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     /// Stub handler. Returns canned data so the transport's loop
-    /// can be exercised without pulling in core-block + shared-cloud.
+    /// can be exercised without pulling in core-block + shared-object-store.
     /// Tracks the number of admin / io calls + captures the most
     /// recent I/O `data_out` so tests can verify R2T-assembled
     /// payloads round-tripped intact.

@@ -50,13 +50,18 @@ denies an NVMe host's writes (and vice-versa); `nvme resv-report` and
 `sg_persist --read-reservation` report the same holder. The two admission
 fences stay independent — see [admission](#admission-is-per-transport).
 
-**Limitation (out of scope, #66):** there is no *proactive* cross-transport
-notification. A fence taken over one transport does **not** push an NVMe AER or
-a SCSI Unit Attention to hosts on the other transport — they discover the fence
-reactively (Reservation Conflict on the next I/O) or by polling resv-report /
-read-reservation. (The SCSI/iSCSI path emits no reservation Unit Attention at
-all today; wiring a `ReservationManager` change-observer that fans out to both
-transports' notification machinery is tracked as a follow-up.)
+**Proactive cross-transport notification (#67):** beyond the pull-side
+coherence above, a fence taken over one transport now also *pushes* a
+notification to hosts on the other. The `ReservationManager` owns a
+transport-neutral change diff and fires registered observers with the
+issuer-excluded affected set on every mutating reservation op. Two sinks consume
+it: `shared_iscsi::IscsiReservationSink` raises RESERVATIONS PREEMPTED /
+RESERVATIONS RELEASED Unit Attentions on the affected iSCSI sessions, and
+`nvme_nvm::AerReservationSink` raises an NVMe AER plus a LID 0x80 Reservation
+Notification on the affected controllers. So an NVMe-originated preempt reaches
+SCSI hosts and an iSCSI-originated release reaches NVMe hosts — not just the
+reactive Reservation Conflict on the next I/O or a poll of resv-report /
+read-reservation.
 
 ### Admission is per-transport
 
@@ -305,13 +310,16 @@ next command. The pieces:
   unread LID 0x80 queue, and the FID 0x82 masks. The controller — and all
   this state — is freed when its last association drops; the host's
   reservation registration is separate (HOSTID-keyed, persists).
-- **Event source** — the reservation adapter
-  (`nvme_nvm::reservations`) snapshots the shared `ReservationManager`
-  before and after each Acquire(Preempt) / Release / Clear /
-  self-unregister, and the pure `diff_reservation_events` helper derives
-  the affected `(host, type)` set (issuer host excluded). The dispatcher
-  feeds those to `ControllerRegistry::notify`, which fans each event out
-  to every live controller of the affected host.
+- **Event source** — the shared `ReservationManager` itself computes the
+  before/after diff (`scsi_spc::reservations::diff_reservation_changes`,
+  issuer host excluded) on each mutating op and fires every registered
+  `ReservationObserver`. `nvme_nvm::AerReservationSink` is the NVMe
+  observer: it self-filters to NVMe registrants and feeds each affected
+  host to `ControllerRegistry::notify`, which fans the event out to every
+  live controller of that host. Because the diff lives in the manager and
+  the sink fires regardless of which transport issued the change (#67), an
+  iSCSI-issued preempt now reaches a fenced NVMe host — see *Cross-protocol
+  reservation coherence* above.
 - **Parking** — the transport's `reader_task` intercepts AER on the
   admin queue (qid 0), creates a `oneshot`, parks it on the controller,
   and spawns a task that awaits the completion and emits the CQE on the
@@ -687,12 +695,13 @@ has no firmware mechanism or thermal sensors, and namespaces are bound at
 the park/notify/oneshot path) is reusable when a namespace-change source lands; it
 would add OACS bit 8 + a Changed Namespace List (LID 0x04), out of scope here.
 
-Reservation notifications are also **not** fanned out across transports: a
-reservation taken/preempted over iSCSI does not raise an NVMe AER (and an NVMe
-reservation change raises no SCSI Unit Attention). Enforcement and the pull-side
-reports stay coherent (see *Cross-protocol reservation coherence* above); only
-the proactive signal is per-transport. Wiring a transport-neutral
-`ReservationManager` change-observer is a tracked follow-up.
+Reservation notifications **are** fanned out across transports as of #67: a
+reservation taken/preempted over iSCSI raises an NVMe AER on affected NVMe
+controllers, and an NVMe reservation change raises a SCSI Unit Attention on
+affected iSCSI sessions. The transport-neutral `ReservationManager`
+change-observer that makes this work is described under *Cross-protocol
+reservation coherence* above; only the reservation-notification source is
+shared here — the other AER event sources below remain unwired.
 
 (The Discovery controller is now implemented — see *NQN / discovery* §
 *Discovery controller* above. Still out of scope there: a Centralized Discovery

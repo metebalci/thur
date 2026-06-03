@@ -70,7 +70,7 @@ pub const CNTLID_ANY: u16 = 0xFFFF;
 
 /// "Static" controller — the host is asking for a controller that
 /// stays bound to one host (the alternative is "dynamic" where the
-/// target may load-balance). VSA's MVP behavior is static (one
+/// target may load-balance). VSA's behavior is static (one
 /// controller per connection), so we don't expose the dynamic
 /// alternative.
 pub const CNTLID_STATIC_FLAG: u16 = 0xFFFE;
@@ -95,9 +95,11 @@ pub struct ConnectData {
     /// equality against the controller's own subsystem NQN; on
     /// mismatch we fail Connect with `connect_invalid_parameters`.
     pub subnqn: String,
-    /// HOSTNQN with NUL padding stripped. Logged + audited; not
-    /// used for admission control today (we accept any host that
-    /// matches our SUBNQN).
+    /// HOSTNQN with NUL padding stripped. Logged + audited, and —
+    /// when TLS-PSK / DH-HMAC-CHAP is enabled — the key for per-host
+    /// volume admission: it must match the TLS-negotiated host NQN and
+    /// selects the admitted volume set. With auth disabled it is
+    /// informational only and any host matching our SUBNQN connects.
     pub hostnqn: String,
 }
 

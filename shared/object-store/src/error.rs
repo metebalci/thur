@@ -4,7 +4,7 @@
 //! Object-store-layer error type.
 //!
 //! Decoupled from `core-mediachanger::errors::SmcError` so that
-//! consumers (`core-block`, future shared-storage layers, third-party
+//! consumers (`core-block`, `shared-upload-worker`, third-party
 //! callers) can use the storage backends without inheriting the
 //! whole `SmcError` hierarchy. core-mediachanger provides
 //! `From<ObjectStoreError> for SmcError` so existing call sites

@@ -65,5 +65,5 @@ pub use pipeline::run_upload_pipeline;
 
 // Re-export DedupScope for callers of this crate so the `payload`
 // surface is self-contained — they don't need a parallel
-// `shared-cloud` dep just to construct a `PendingUpload`.
+// `shared-object-store` dep just to construct a `PendingUpload`.
 pub use shared_object_store::DedupScope;

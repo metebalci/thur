@@ -6,10 +6,11 @@
 //! Sibling to `core-mediachanger`. Houses SBC-3 logic, the per-volume
 //! page table, and the write-back / cloud-tier pipeline. Cloud
 //! backends + retry / compression primitives come from
-//! `shared-cloud`; the chunk pool is currently a lean thurvsa-side
-//! mirror of thurvtl's `chunk_store` and will move to a future
-//! `shared-storage` crate once both products give us evidence
-//! about what really wants to be shared.
+//! `shared-object-store`; the content-addressed chunk pool lives in
+//! `shared-pool` — the cross-product restructure shipped in Step 5
+//! Milestone 5.A.3 (2026-05-09), and `crate::chunk_pool` re-exports
+//! `ChunkPool` / `ChunkPoolError` from there so call sites resolve
+//! unchanged.
 
 pub mod cache;
 pub mod chunk_pool;

@@ -5,7 +5,7 @@
 //! dispatch.
 //!
 //! Holds the named `keystore.backends:` map. Per-backend auth enums (`AwsKmsAuth`,
-//! `VaultAuth`, …) follow the same Env-vs-Static shape `shared-cloud`
+//! `VaultAuth`, …) follow the same Env-vs-Static shape `shared-object-store`
 //! uses for S3 / Azure — secrets stay out of YAML via `_env` variants
 //! populated from `/etc/{thurvtl,thurvsa}/{product}.env`.
 
@@ -313,7 +313,7 @@ pub struct GcpKmsBackendConfig {
     pub auth: Option<GcpKmsAuth>,
 }
 
-/// GCP KMS auth. Mirrors shared-cloud's GCS auth posture: either a
+/// GCP KMS auth. Mirrors shared-object-store's GCS auth posture: either a
 /// service-account JSON key file (inline path or env-var-named path)
 /// or the Application Default Credentials chain
 /// (`GOOGLE_APPLICATION_CREDENTIALS` → `gcloud auth

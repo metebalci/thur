@@ -6,12 +6,12 @@
 // Operators on a packaged install should prefer the daemon-down CLI
 // verbs `thurvtl system cloud benchmark` / `thurvsa system
 // cloud benchmark`, which parse the daemon YAML conffile and call the
-// same engine via `shared-cloud-bench`. This example exists so
+// same engine via `shared-object-store-bench`. This example exists so
 // developers can drive the engine against an ad-hoc YAML file without
 // building either CLI binary.
 //
 // Usage:
-//   cargo run --release -p shared-cloud --example bench -- \
+//   cargo run --release -p shared-object-store --example bench -- \
 //     --config <PATH> [--backend NAME]... \
 //     [--total-gb N] [--chunk-size-mb N] [--concurrency N] \
 //     [--chunk-size-mb-sweep N,N,N] [--concurrency-sweep N,N,N] \

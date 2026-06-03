@@ -700,7 +700,7 @@ pub async fn create(
         }
     };
     // Resolve the same `max_concurrent` the boot path uses (auto-scale
-    // sentinel + explicit override semantics live in shared-cloud's
+    // sentinel + explicit override semantics live in shared-object-store's
     // UploadConfig). The source string is intentionally discarded —
     // it's already logged once at boot; per-volume log lines would be
     // noise.

@@ -263,8 +263,9 @@ on-disk paths group by purpose.
   `nvme_nvm::ControllerRegistry` (which also allocates a CNTLID per
   controller at Connect). Enabled by listing `nvmetcp` in `transports:`
   in `thurvsa.yaml` (default `[iscsi]`; list both to bind concurrently —
-  issue #66). Out of scope: TLS-PSK auth, CRC32C
-  digests, multi-outstanding R2T, discovery controller — rationale in
+  issue #66). TLS-PSK auth, CRC32C header/data digests (issue #78), and
+  a single-subsystem discovery controller have all shipped; still out of
+  scope: multi-outstanding R2T — rationale in
   [`docs/NVMETCP.md`](docs/NVMETCP.md) § *Out of scope*.
 - `core/ssc` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
   cartridge, block/chunk/lru indexes, dirty-page tracker, index-page

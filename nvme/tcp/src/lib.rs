@@ -10,39 +10,30 @@
 //! Layered above [`nvme_base`] (SQE / CQE / Identify) and
 //! [`nvme_nvm`] (the NVM Command Set handler trait this transport
 //! dispatches into). Co-resident with the iSCSI transport in
-//! `thurvsad` — the operator picks one via `transport:
-//! iscsi | nvmetcp` in `thurvsa.yaml`; the two are mutually
-//! exclusive so the iSCSI / NVMe-TCP listeners don't fight over
-//! port 3260.
+//! `thurvsad`: the operator lists one or both in `transports:` in
+//! `thurvsa.yaml` (default `[iscsi]`). The two bind concurrently —
+//! NVMe/TCP defaults to `0.0.0.0:4420`, iSCSI to `:3260`, so the
+//! listeners don't clash (issue #66).
 //!
-//! # Current status (session 1 scaffold)
+//! # Modules
 //!
-//! This crate ships the wire-shape types every subsequent session
-//! plugs into:
+//! - [`pdu`] — PDU codec: every PDU type byte, the fixed 8-byte
+//!   common header, ICReq / ICResp, CapsuleCmd / CapsuleResp,
+//!   H2CData / C2HData, R2T, TermReq, plus the CRC32C header- and
+//!   data-digest apply / verify helpers (issue #78).
+//! - [`server`] — the per-connection state machine ([`run`] /
+//!   [`ServerConfig`]): ICReq -> ICResp handshake, Connect with SUBNQN
+//!   admission, Property Get / Set, Disconnect, the command loop with
+//!   R2T write flow + fused Compare+Write pairing, and C2HTermReq on
+//!   protocol violations.
+//! - [`auth`] — DH-HMAC-CHAP authentication (Authentication Send /
+//!   Receive) over the negotiated FFDHE group.
+//! - [`tls`] / [`identity`] — TLS 1.3 PSK channel and the per-host PSK
+//!   identity store (`nvmetcp-psks.json`).
 //!
-//! - [`pdu::PduType`] — every PDU type byte defined in the spec.
-//! - [`pdu::CommonHeader`] — fixed 8-byte PDU header (PDU type +
-//!   flags + HPDA + PDO + PLEN).
-//! - [`pdu::ICReq`] / [`pdu::ICResp`] — Initialize Connection
-//!   handshake payload structures.
-//! - [`ServerConfig`] / [`run`] — server entry stub that binds the
-//!   TCP listen address and accepts connections; the per-connection
-//!   loop currently logs "not yet wired" and closes. Wired in
-//!   `thurvsad`'s boot path behind the `transport: nvmetcp`
-//!   selector so the YAML knob round-trips end-to-end.
-//!
-//! Deferred to follow-up sessions:
-//!
-//! - Full PDU codec (read + write loop with HPDA / PDO / PLEN
-//!   honored, header-digest + data-digest fields).
-//! - ICReq / ICResp handshake.
-//! - Connect handler (NVMe Admin Fabrics command 0x7F sub-type 0x01)
-//!   — first SQE on a new connection, carries the host's HostNQN
-//!   and the target's SubsystemNQN.
-//! - R2T flow control + H2CData collection.
-//! - TLS 1.3 PSK auth (recommended MVP per NVMe-oF §8.13.2);
-//!   DH-HMAC-CHAP is the alternative for non-TLS deployments and
-//!   lands later.
+//! The transport's behavioral model, opcode -> PageCache mapping, NQN
+//! handling, reservation-notification path, and TLS-PSK / DH-HMAC-CHAP
+//! design are in `docs/NVMETCP.md`.
 
 #![forbid(unsafe_code)]
 

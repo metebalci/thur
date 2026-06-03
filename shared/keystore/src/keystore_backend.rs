@@ -3,13 +3,16 @@
 
 //! Pluggable keystore-backend trait.
 //!
-//! Three real backends today: [`super::local::LocalBackend`] (on-disk
+//! Six real backends today: [`super::local::LocalBackend`] (on-disk
 //! plaintext keyfile, same shape the daemon used pre-trait),
-//! [`super::awskms::AwsKmsBackend`] (KMS envelope encryption), and
-//! [`super::vault::VaultBackend`] (HashiCorp Vault Transit). All three
-//! return / accept 32-byte AES-256 DEKs through the same
-//! `generate_and_wrap` / `wrap` / `unwrap` surface; the daemon doesn't
-//! special-case any backend in the data path.
+//! [`super::awskms::AwsKmsBackend`] (KMS envelope encryption),
+//! [`super::vault::VaultBackend`] (HashiCorp Vault Transit),
+//! [`super::azurekv::AzureKvBackend`] (Azure Key Vault RSA wrap/unwrap),
+//! [`super::gcpkms::GcpKmsBackend`] (GCP Cloud KMS symmetric
+//! encrypt/decrypt), and [`super::kmip::KmipBackend`] (KMIP 1.4+
+//! AES-GCM Encrypt/Decrypt). All return / accept 32-byte AES-256 DEKs
+//! through the same `generate_and_wrap` / `wrap` / `unwrap` surface;
+//! the daemon doesn't special-case any backend in the data path.
 
 use std::fmt::Debug;
 
