@@ -659,8 +659,30 @@ non-all-registrants reservation) → Reservation Released. The issuing
 host is never notified. Routing is keyed by the Connect HOSTID (the
 fencing identity); each event completes one AER parked on that host's
 admin queue and queues a LID 0x80 entry the host drains oldest-first.
-Out of scope: async events other than reservation notifications
-(namespace-attribute, firmware-activation, thermal).
+
+Namespace-change notifications (out-of-band volume create / destroy): a
+second AER source tells connected hosts a namespace appeared or
+disappeared. Gated per controller via Set Features FID 0x0B bit 8
+(advertised in Identify Controller OAES bit 8); fanned to every opted-in
+controller (subsystem-wide, not HOSTID-scoped).
+
+```text
+AER completion DW0 (NVMe Base §5.2):
+  bits 2:0   Asynchronous Event Type      = 0x2 (Notice)
+  bits 15:8  Asynchronous Event Info      = 0x00 (Namespace Attribute Changed)
+  bits 23:16 Associated Log Page (LID)    = 0x04
+  => DW0 = 0x0004_0002
+
+Changed Namespace List log page (LID 0x04, 4096 bytes):
+  up to 1024 × u32 LE NSIDs, ascending, zero-terminated; reading drains
+  the list. First dword = 0xFFFFFFFF means "> 1024 changed, re-scan all".
+
+Async Event Configuration (Set/Get Features FID 0x0B, controller-wide):
+  CDW11 bit 8  enable Namespace Attribute Changed notices (0 = disabled)
+```
+
+Out of scope: firmware-activation and thermal async events (no firmware
+mechanism, no sensors).
 
 #### DH-HMAC-CHAP authentication (NVMe/TCP in-band auth)
 

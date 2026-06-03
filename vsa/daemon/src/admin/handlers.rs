@@ -119,6 +119,13 @@ pub struct AdminState {
     /// volume's LUN from it so a later LUN reuse can't inherit a gone
     /// volume's fence (PTPL, issue #57).
     pub reservations: Arc<scsi_spc::reservations::ReservationManager>,
+    /// NVMe per-subsystem AER hub (the same `Arc` the NVMe/TCP
+    /// transport + dispatcher hold), or `None` when nvmetcp isn't a
+    /// configured transport. `volume create` / `destroy` fan a
+    /// Namespace Attribute Changed notice (AER + LID 0x04) to connected
+    /// controllers through it so live NVMe hosts learn about
+    /// out-of-band namespace add / remove (issue #64).
+    pub aer_hub: Option<Arc<nvme_nvm::ControllerRegistry>>,
 }
 
 // `system.monitor` per-tick view. The handler in `shared-admin-monitor`
@@ -191,6 +198,20 @@ impl AdminState {
             .await
             .insert(name.clone(), Arc::clone(&arc));
         Ok((name, arc))
+    }
+
+    /// Fan a Namespace Attribute Changed notice (AER + Changed
+    /// Namespace List, LID 0x04) to connected NVMe controllers for the
+    /// namespace backing `lun` (nsid = lun + 1, matching the registry's
+    /// `NamespaceLookup` mapping). No-op when nvmetcp isn't a configured
+    /// transport, no controller has opted in via FID 0x0B, or the LUN
+    /// doesn't map to a valid u32 NSID (issue #64).
+    fn notify_nvme_namespace_changed(&self, lun: u64) {
+        if let Some(aer) = &self.aer_hub
+            && let Ok(nsid) = u32::try_from(lun + 1)
+        {
+            aer.notify_namespace_attribute_changed(nsid);
+        }
     }
 }
 
@@ -663,6 +684,11 @@ pub async fn create(
         warn!("admin: LUN {} double-bound during volume create", lun);
     }
 
+    // Tell live NVMe hosts a namespace appeared (issue #64). The new
+    // namespace is now resolvable in the registry, so a host that reads
+    // the Changed Namespace List + re-runs Identify sees it.
+    state.notify_nvme_namespace_changed(lun);
+
     info!(
         "admin: created volume '{}' (LUN {}) backend='{}' size={} B uid={} pid={:?}",
         created.name, lun, created.backend, created.size_bytes, peer.uid, peer.pid,
@@ -770,6 +796,11 @@ pub async fn destroy(
     // a future volume that reuses this LUN number (PTPL, issue #57).
     // Removes the in-memory entry and rewrites reservations.json.
     state.reservations.purge_lun(lun);
+
+    // Tell live NVMe hosts the namespace went away (issue #64). The
+    // volume is already out of the registry, so a host that reads the
+    // Changed Namespace List + re-runs Identify no longer finds it.
+    state.notify_nvme_namespace_changed(lun);
 
     // Wipe the at-rest key first — once the volume dir is gone the
     // keystore entry is orphaned and an operator would have to clean

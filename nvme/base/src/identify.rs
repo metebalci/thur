@@ -137,11 +137,27 @@ pub struct IdentifyController {
     /// (Compare bit 0, Write Zeroes bit 3, Dataset Management bit 2)
     /// stay zero here — out of scope for the reservations work.
     pub oncs: u16,
+    /// OAES — Optional Asynchronous Events Supported (NVMe Base
+    /// §5.17.2.1 bytes 92..96). Bit 8 = Namespace Attribute Changed:
+    /// the host gates the matching async event on via Set Features FID
+    /// 0x0B only if this bit advertises support. See [`oaes`].
+    pub oaes: u32,
     /// CNTLTYPE — Controller Type (NVMe Base §5.17.2.1 byte 111). See
     /// [`cntltype`]. `0` (not reported) for the legacy I/O path;
     /// `cntltype::DISCOVERY` for a Discovery controller, which a host
     /// keys its discovery state machine off.
     pub cntltype: u8,
+}
+
+/// OAES — Optional Asynchronous Events Supported bits (NVMe Base
+/// §5.17.2.1 bytes 92..96). A host enables an optional async event via
+/// Set Features FID 0x0B only when the controller advertises support
+/// here.
+pub mod oaes {
+    /// Bit 8 — Namespace Attribute Changed. The controller emits a
+    /// Namespace Attribute Changed AER (+ Changed Namespace List log,
+    /// LID 0x04) when this is advertised and the host enables it.
+    pub const NAMESPACE_ATTRIBUTE_CHANGED: u32 = 1 << 8;
 }
 
 /// Keep Alive Support advertised in Identify Controller (NVMe Base
@@ -201,6 +217,11 @@ impl IdentifyController {
             mdts: 8,
             // ONCS bit 5 = Reservations supported. 0x0020.
             oncs: 0x0020,
+            // OAES bit 8 = Namespace Attribute Changed supported, so a
+            // host enables namespace-change async events (Set Features
+            // FID 0x0B) and learns about out-of-band volume create /
+            // destroy.
+            oaes: oaes::NAMESPACE_ATTRIBUTE_CHANGED,
             // 0 = "controller type not reported" — the legacy I/O path
             // leaves byte 111 unset, which Linux tolerates for an I/O
             // controller. `discovery()` overrides this.
@@ -231,6 +252,8 @@ impl IdentifyController {
             mdts: 8,
             // A Discovery controller supports no NVM commands.
             oncs: 0,
+            // No namespaces to change → no namespace-attribute notices.
+            oaes: 0,
             cntltype: cntltype::DISCOVERY,
         }
     }
@@ -260,7 +283,10 @@ impl IdentifyController {
         // 1 I/O, 2 Discovery, 3 Administrative. A Discovery controller
         // MUST report 2 so the host drives its discovery state machine.
         out[111] = self.cntltype;
-        // OAES, CTRATT etc all zero
+        // OAES at 92..96 — bit 8 advertises Namespace Attribute Changed
+        // async-event support so the host enables it via Set Features
+        // FID 0x0B. CTRATT etc stay zero.
+        out[92..96].copy_from_slice(&self.oaes.to_le_bytes());
         // ONCS at 520..522 — bit 5 advertises Reservations support so
         // hosts issue the reservation command set.
         out[520..522].copy_from_slice(&self.oncs.to_le_bytes());
@@ -484,6 +510,12 @@ mod tests {
         assert_eq!(bytes[77], 8);
         // ONCS at 520..522 — bit 5 (Reservations) set.
         assert_eq!(&bytes[520..522], &0x0020u16.to_le_bytes());
+        // OAES at 92..96 — bit 8 (Namespace Attribute Changed) set so
+        // the host enables namespace-change async events.
+        assert_eq!(
+            &bytes[92..96],
+            &oaes::NAMESPACE_ATTRIBUTE_CHANGED.to_le_bytes()
+        );
         // CMIC at byte 76 — bit 1 set (subsystem may contain 2+
         // controllers), bits 0/3 clear.
         assert_eq!(bytes[76], 0b0000_0010);
@@ -515,6 +547,9 @@ mod tests {
         assert_eq!(bytes[768 + DISCOVERY_NQN.len()], 0);
         // KAS stays mandatory-non-zero (any fabrics controller).
         assert_ne!(&bytes[320..322], &[0u8, 0]);
+        // OAES at 92..96 = 0 — a Discovery controller exposes no
+        // namespaces, so no namespace-attribute notices.
+        assert_eq!(&bytes[92..96], &0u32.to_le_bytes());
     }
 
     #[test]

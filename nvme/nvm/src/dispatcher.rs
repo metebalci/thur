@@ -15,10 +15,12 @@
 //! Admin commands handled: Identify (CNS = 0x00 Namespace /
 //! 0x01 Controller / 0x02 Active NS List / 0x03 NS ID Descriptor
 //! List / 0x06 I/O Command Set Identify Controller), Get Features /
-//! Set Features (FID 0x07 Number of Queues + FID 0x0F Keep Alive
-//! Timer), Get Log Page (Error / SMART / FW Slot), Keep Alive,
-//! Abort. AER returns Invalid Opcode (NVMe Base §5.2 lets that
-//! terminate the host's AER loop cleanly).
+//! Set Features (FID 0x07 Number of Queues + FID 0x0B Async Event
+//! Configuration + FID 0x0F Keep Alive Timer + FID 0x82 Reservation
+//! Notification Mask), Get Log Page (Error / SMART / FW Slot /
+//! 0x04 Changed Namespace List / 0x80 Reservation Notification),
+//! Keep Alive, Abort. AER returns Invalid Opcode (NVMe Base §5.2 lets
+//! that terminate the host's AER loop cleanly).
 //!
 //! NVM I/O commands: Read, Write, Flush, Compare, Write Zeroes,
 //! DSM Deallocate, Verify, fused Compare+Write (the transport
@@ -77,6 +79,13 @@ const FID_KEEP_ALIVE_TIMER: u8 = 0x0F;
 /// notifications respectively (0 = all enabled). The host's
 /// enable/disable knob for reservation async events.
 const FID_RESERVATION_NOTIF_MASK: u8 = 0x82;
+
+/// Feature Identifier for Async Event Configuration (NVMe Base
+/// §5.21.1.11). Controller-wide; CDW11 bit 8
+/// (`AEN_CFG_NAMESPACE_ATTRIBUTE`) enables Namespace Attribute Changed
+/// notices. The host's enable/disable knob for namespace-change async
+/// events — distinct from FID 0x82, which gates reservation notices.
+const FID_ASYNC_EVENT_CONFIG: u8 = 0x0B;
 
 pub struct NvmeNvmDispatcher {
     registry: Arc<dyn NamespaceLookup>,
@@ -327,6 +336,13 @@ impl NvmeNvmDispatcher {
                 let mask = self.aer.get_mask(cntlid, sqe.nsid);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, mask))
             }
+            FID_ASYNC_EVENT_CONFIG => {
+                // Controller-wide. Outside a real connection (no CNTLID)
+                // report "nothing enabled."
+                let cntlid = cntlid.unwrap_or(0);
+                let config = self.aer.get_aen_config(cntlid);
+                NvmeResponse::just(Cqe::success(cid, 0, 0, config))
+            }
             _ => NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field())),
         }
     }
@@ -352,6 +368,15 @@ impl NvmeNvmDispatcher {
                 // notifications. Echo the stored value in CDW0.
                 let cntlid = cntlid.unwrap_or(0);
                 self.aer.set_mask(cntlid, sqe.nsid, sqe.cdw11);
+                NvmeResponse::just(Cqe::success(cid, 0, 0, sqe.cdw11))
+            }
+            FID_ASYNC_EVENT_CONFIG => {
+                // Controller-wide (CDW11). Bit 8 enables Namespace
+                // Attribute Changed notices; store keyed by CNTLID so
+                // one controller's config can't change another's. Echo
+                // the stored value in CDW0.
+                let cntlid = cntlid.unwrap_or(0);
+                self.aer.set_aen_config(cntlid, sqe.cdw11);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, sqe.cdw11))
             }
             FID_NUMBER_OF_QUEUES => {
@@ -418,6 +443,17 @@ impl NvmeNvmDispatcher {
                 // is no per-controller queue — return the empty page.
                 let cntlid = cntlid.unwrap_or(0);
                 let log = self.aer.take_log_entry(cntlid);
+                log[..total_bytes.min(log.len())].to_vec()
+            }
+            nvme_base::log_page::lid::CHANGED_NAMESPACE_LIST => {
+                // Drain this controller's Changed Namespace List (the
+                // NSIDs that changed since its last read; reading clears
+                // it). Outside a real connection (no CNTLID) there is no
+                // per-controller list — return the empty (all-zero)
+                // page.
+                let cntlid = cntlid.unwrap_or(0);
+                let nsids = self.aer.take_changed_namespaces(cntlid);
+                let log = nvme_base::log_page::changed_namespace_list(&nsids);
                 log[..total_bytes.min(log.len())].to_vec()
             }
             _ => {
@@ -2192,6 +2228,95 @@ mod tests {
         resv_io(&disp, preempt, Some(&keys16(0xBBBB, 0xAAAA)), b).await;
         let log = admin_io(&disp, sqe_get_resv_log(), Some(ca)).await;
         assert_eq!(log.data_in[8], 0, "masked notification not queued");
+    }
+
+    /// Set Features FID 0x0B (Async Event Configuration) build helper —
+    /// CDW11 carries the controller-wide config bitmap.
+    fn sqe_set_aen_config(config: u32) -> nvme_base::Sqe {
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = AdminOpcode::SetFeatures as u8;
+        b[40..44].copy_from_slice(&u32::from(FID_ASYNC_EVENT_CONFIG).to_le_bytes());
+        b[44..48].copy_from_slice(&config.to_le_bytes());
+        nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    /// Get Log Page LID 0x04 for the whole 4 KiB Changed Namespace List
+    /// (NUMD zero-based = 1023 dwords).
+    fn sqe_get_changed_ns_log() -> nvme_base::Sqe {
+        let cdw10 = u32::from(nvme_base::log_page::lid::CHANGED_NAMESPACE_LIST) | (1023u32 << 16);
+        sqe_admin(AdminOpcode::GetLogPage as u8, 0, cdw10)
+    }
+
+    /// FID 0x0B Set/Get round-trips per-controller and defaults to 0.
+    #[tokio::test]
+    async fn nvme_async_event_config_round_trip() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let ca = controller_for(&disp, [0xA1u8; 16]);
+        let cb = controller_for(&disp, [0xB2u8; 16]);
+
+        let get_fid = u32::from(FID_ASYNC_EVENT_CONFIG);
+        // Default before any Set: nothing enabled.
+        let get_a = sqe_admin(AdminOpcode::GetFeatures as u8, 0, get_fid);
+        assert_eq!(admin_io(&disp, get_a, Some(ca)).await.cqe.dw0, 0);
+
+        // Enable Namespace Attribute Notices (bit 8) on A.
+        let set = sqe_set_aen_config(nvme_base::aer::AEN_CFG_NAMESPACE_ATTRIBUTE);
+        let r = admin_io(&disp, set, Some(ca)).await;
+        assert_eq!(r.cqe.status, StatusField::SUCCESS);
+        assert_eq!(
+            r.cqe.dw0,
+            nvme_base::aer::AEN_CFG_NAMESPACE_ATTRIBUTE,
+            "Set echoes the stored config"
+        );
+
+        // Get reflects it; the sibling controller is independent.
+        let get_a2 = sqe_admin(AdminOpcode::GetFeatures as u8, 0, get_fid);
+        assert_eq!(
+            admin_io(&disp, get_a2, Some(ca)).await.cqe.dw0,
+            nvme_base::aer::AEN_CFG_NAMESPACE_ATTRIBUTE
+        );
+        let get_b = sqe_admin(AdminOpcode::GetFeatures as u8, 0, get_fid);
+        assert_eq!(admin_io(&disp, get_b, Some(cb)).await.cqe.dw0, 0);
+    }
+
+    /// LID 0x04 is well-formed + empty when idle; after a namespace
+    /// change it lists the changed NSID and drains on read.
+    #[tokio::test]
+    async fn nvme_changed_namespace_list_reports_and_drains() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let ca = controller_for(&disp, [0xA1u8; 16]);
+
+        // Idle: all-zero 4 KiB page.
+        let idle = admin_io(&disp, sqe_get_changed_ns_log(), Some(ca)).await;
+        assert_eq!(idle.cqe.status, StatusField::SUCCESS);
+        assert_eq!(idle.data_in.len(), 4096);
+        assert!(
+            idle.data_in.iter().all(|&b| b == 0),
+            "empty list is all zero"
+        );
+
+        // Opt in, then two volumes change out-of-band.
+        admin_io(
+            &disp,
+            sqe_set_aen_config(nvme_base::aer::AEN_CFG_NAMESPACE_ATTRIBUTE),
+            Some(ca),
+        )
+        .await;
+        disp.aer.notify_namespace_attribute_changed(2);
+        disp.aer.notify_namespace_attribute_changed(5);
+
+        let log = admin_io(&disp, sqe_get_changed_ns_log(), Some(ca)).await;
+        assert_eq!(log.cqe.status, StatusField::SUCCESS);
+        assert_eq!(u32::from_le_bytes(log.data_in[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(log.data_in[4..8].try_into().unwrap()), 5);
+        assert!(log.data_in[8..].iter().all(|&b| b == 0), "list terminates");
+
+        // Drained on read → empty again.
+        let again = admin_io(&disp, sqe_get_changed_ns_log(), Some(ca)).await;
+        assert!(
+            again.data_in.iter().all(|&b| b == 0),
+            "drained after consume"
+        );
     }
 
     /// The Release / Clear / Unregister adapter arms each drive a

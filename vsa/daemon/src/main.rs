@@ -509,6 +509,12 @@ async fn main() -> Result<()> {
     type TransportFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
     let mut transport_futs: Vec<TransportFut> = Vec::with_capacity(cfg.transports.len());
     let mut transport_listens: Vec<String> = Vec::new();
+    // The NVMe AER hub, lifted out of the nvmetcp arm so the admin
+    // socket's volume create / destroy can fan a Namespace Attribute
+    // Changed notice to connected NVMe controllers (issue #64). `None`
+    // when nvmetcp isn't a configured transport; the handlers then skip
+    // the notify entirely.
+    let mut aer_hub_for_admin: Option<Arc<nvme_nvm::ControllerRegistry>> = None;
     // The login-audit sink is consumed only by the iSCSI arm; park it in
     // an Option so an NVMe-only boot leaves it untouched (dropped after
     // the loop). Config de-dups `transports`, so iSCSI runs at most once
@@ -630,6 +636,10 @@ async fn main() -> Result<()> {
                 // consumer) — same construct-once-at-boot pattern as
                 // `controller_regs` below.
                 let aer_hub = Arc::new(nvme_nvm::ControllerRegistry::new());
+                // Hand the admin socket the same hub so volume lifecycle
+                // changes can drive Namespace Attribute Changed AERs
+                // (issue #64).
+                aer_hub_for_admin = Some(Arc::clone(&aer_hub));
                 // Proactive reservation-change notification (issue #67): a
                 // reservation preempted/released over iSCSI or NVMe drives
                 // a LID 0x80 + AER to the affected NVMe controllers.
@@ -854,6 +864,7 @@ async fn main() -> Result<()> {
         upload_tx: upload_tx.clone(),
         sessions: Arc::clone(&session_manager),
         reservations: Arc::clone(&reservations),
+        aer_hub: aer_hub_for_admin,
     };
     let admin_socket = admin::admin_socket_path();
 

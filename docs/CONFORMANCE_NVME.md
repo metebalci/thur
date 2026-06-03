@@ -91,14 +91,14 @@ rather than via these commands, so a host that submits them receives
 |-------:|---------|--------|:----:|-------|
 | 0x00 | Delete I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Disconnect. Returns `Invalid Command Opcode`. |
 | 0x01 | Create I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Connect on a new TCP connection. |
-| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller), 0x80 Reservation Notification (one 64-byte entry per call, oldest-first; empty page when the host's queue is drained — see *Reservation notifications* below). Other LIDs return `Invalid Field in Command`. |
+| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller), 0x04 Changed Namespace List (the NSIDs that changed since this controller last read it, drained on read; empty 4 KiB page when nothing changed — see *Namespace-change notifications* below), 0x80 Reservation Notification (one 64-byte entry per call, oldest-first; empty page when the host's queue is drained — see *Reservation notifications* below). Other LIDs return `Invalid Field in Command`. |
 | 0x04 | Delete I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x05 | Create I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x06 | Identify | 🟩 Partial | M | See CNS table below. |
 | 0x08 | Abort | 🟩 Stub | O | Returns CQE.DW0 bit 0 = 1 (command not aborted / already complete). The dispatcher does not queue commands at the controller level. |
 | 0x09 | Set Features | 🟩 Partial | M | See FID table below. |
 | 0x0A | Get Features | 🟩 Partial | M | See FID table below. |
-| 0x0C | Async Event Request | 🟩 Partial | O | Parked on the admin queue by the transport (not the dispatcher) until a controller event fires; completes with DW0 = `0x00800006` (AET=0x6 I/O Command Set specific, AEI=0x00 Reservation Log Page Available, LID=0x80) pointing the host at the Reservation Notification log. The only event source today is reservations; namespace-change / firmware / thermal notices are not produced. See *Reservation notifications* below. |
+| 0x0C | Async Event Request | 🟩 Partial | O | Parked on the admin queue by the transport (not the dispatcher) until a controller event fires. Two event sources are wired: a reservation change completes with DW0 = `0x00800006` (AET=0x6 I/O Command Set specific, AEI=0x00 Reservation Log Page Available, LID=0x80) → Reservation Notification log; a volume create / destroy completes with DW0 = `0x00040002` (AET=0x2 Notice, AEI=0x00 Namespace Attribute Changed, LID=0x04) → Changed Namespace List, gated on Set Features FID 0x0B bit 8. Firmware / thermal notices are not produced. See *Reservation notifications* and *Namespace-change notifications* below. |
 | 0x10 | Firmware Commit | 🟨 No | O | No firmware-download surface — the daemon ships as a binary, not a flashable image. |
 | 0x11 | Firmware Image Download | 🟨 No | O | As above. |
 | 0x14 | Device Self-test | 🟨 No | O | No self-test surface. |
@@ -121,7 +121,7 @@ rather than via these commands, so a host that submits them receives
 | CNS | Name | Status | Notes |
 |----:|------|--------|-------|
 | 0x00 | Identify Namespace | 🟩 Yes | NSZE / NCAP / NUSE in 4 KiB-LBA units; LBAF[0] = 4 KiB sector; NSFEAT bit 0 (thin provisioning) set; RESCAP (byte 31) = `0x7F` (all six reservation types + PTPL bit 0; the daemon persists reservation state across power loss — bit 0 is cleared to `0x7E` only if the manager is built without a data dir, which never happens in a real install); VWC bit 0 set (so Linux issues Flush). |
-| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID = the per-controller ID assigned at Connect (distinct per association), CMIC (byte 76) bit 1 set (subsystem may contain two or more controllers; bits 0/3 clear — single port, no ANA), VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
+| 0x01 | Identify Controller | 🟩 Yes | VID=0 / SSVID=0 (fabrics-only), CNTLID = the per-controller ID assigned at Connect (distinct per association), CMIC (byte 76) bit 1 set (subsystem may contain two or more controllers; bits 0/3 clear — single port, no ANA), OAES (bytes 92..96) bit 8 set (Namespace Attribute Changed async events supported, so the host enables them via FID 0x0B), VER=`0x00010400` (NVMe 1.4.0), NN from live registry, KAS=120 (12 s), MDTS=8 (1 MiB max transfer at the 4 KiB MPSMIN page), ONCS (bytes 520..522) bit 5 set (Reservations supported), SUBNQN=`nqn.2025-10.com.metebalci:thurvsa`, SGLS bit 0 set, IOCCSZ=1028 / IORCSZ=1. |
 | 0x02 | Active Namespace ID List | 🟩 Yes | Up to 1024 u32 NSIDs greater than `SQE.NSID`, zero-padded. |
 | 0x03 | Namespace ID Descriptor List | 🟩 Yes | Two descriptors: NIDT=0x02 NGUID (from volume UUID), then NIDT=0x04 CSI=0x00 (NVM). Linux nvme-tcp issues this right after CNS 0x00 and silently fails namespace attach without a CSI descriptor. |
 | 0x06 | I/O Command Set specific Identify Controller | 🟩 Yes | 4 KiB of zeros = "no specific NVM limits." Linux nvme-tcp issues this against a 1.4-versioned controller during bring-up; refusing it kills the namespace attach. |
@@ -140,7 +140,7 @@ rather than via these commands, so a host that submits them receives
 | 0x08 | Interrupt Coalescing | 🟩 N/A | PCIe-only (no MSI-X on fabrics). |
 | 0x09 | Interrupt Vector Configuration | 🟩 N/A | PCIe-only. |
 | 0x0A | Write Atomicity Normal | 🟨 No | |
-| 0x0B | Async Event Configuration | 🟨 No | Gates *Notice*-type async events (namespace-attribute / firmware-activation), which VSA does not produce — distinct from the reservation-notification mask (FID 0x82 below), which is implemented. Returns `Invalid Field in Command`. |
+| 0x0B | Async Event Configuration | 🟩 Yes | Controller-wide (CDW11). Bit 8 (Namespace Attribute Notices) enables the Namespace Attribute Changed AER; default clear, so a host opts in explicitly. Stored keyed by CNTLID so one controller's config can't change another's; Set echoes the stored value in CDW0, Get returns it. Other Notice classes (firmware-activation, thermal) have no event source, so setting their bits is accepted but inert. Distinct from the reservation-notification mask (FID 0x82 below). |
 | 0x0F | Keep Alive Timer | 🟩 Partial | KATO captured on Set, echoed on Get. No watchdog — KA admin commands are unconditionally acknowledged — so the value is stored only for symmetry. |
 | 0x10 | Host Identifier | 🟨 No | Host identity is captured at Connect via HOSTID in `ConnectData`. |
 | 0x82 | Reservation Notification Mask | 🟩 Yes | Per-namespace (CDW1 NSID). CDW11 bits 1 / 2 / 3 suppress Registration Preempted / Reservation Released / Reservation Preempted notifications respectively (0 = all enabled). Stored keyed by (HOSTID, NSID) so one host's masking cannot silence another's; Set echoes the stored value in CQE.DW0, Get returns it. The host's enable/disable knob for reservation async events. |
@@ -325,7 +325,7 @@ reasoning for each. SCSI-side cross-cutting departures are in
 |------|-----|
 | Header / data digests (CRC32C, NVMe-TCP §3.5) | Negotiate `dgst=0`. TCP provides a checksum and TLS-PSK provides AEAD over the whole stream. Symmetric with the iSCSI transport, which also negotiates `HeaderDigest=None` / `DataDigest=None`. CRC32C is implemented elsewhere — SSC LTO-7+ Logical Block Protection appends a per-tape-block CRC32C trailer (`core/mediachanger/src/lbp.rs`) — distinct from the transport-frame digest. Hosts that require transport digests see negotiation fail and pick a different target. |
 | Multi-outstanding R2T per command | Single-R2T-per-command is bandwidth-equivalent for any transfer that fits the network's bandwidth-delay product. Lift only if a benchmark shows the round-trip is the bottleneck on a high-latency link. |
-| Async events other than reservation notifications | AER (Admin 0x0C) is implemented, but the only event source wired is reservation notifications (LID 0x80 — see *Reservation notifications* below). Namespace-attribute (the Notice-type events behind FID 0x0B Async Event Configuration), firmware-activation, and thermal notices are not produced — VSA has no firmware mechanism or thermal sensors, and namespaces are bound at `volume create`. The generic AER plumbing is reusable when a namespace-change source lands. |
+| Firmware-activation / thermal async events | AER (Admin 0x0C) drives two event sources: reservation notifications (LID 0x80 — see *Reservation notifications*) and namespace-attribute changes (LID 0x04 — see *Namespace-change notifications*). Firmware-activation and thermal Notice-type events are not produced — VSA has no firmware mechanism or thermal sensors. Setting their FID 0x0B bits is accepted but inert. |
 | Centralized Discovery Controller (CDC) + discovery-log-change AENs | The direct Discovery controller (`nqn.2014-08.org.nvmexpress.discovery`, default on — see *Discovery, NQN, identifiers* above) covers `nvme discover` / `nvme connect-all` for the single-subsystem deployment. A CDC and proactive discovery-log-change async events land when multi-subsystem fleet discovery becomes a documented use case. |
 | Firmware download / commit (Admin 0x10 / 0x11) | The daemon ships as a binary, not a flashable image. |
 | Sanitize, Format NVM, Security Send / Receive (Admin 0x80 / 0x82 / 0x84) | No in-place sanitize on a chunk-pool-backed virtual volume; LBA format is fixed at `volume create`; at-rest encryption is keystore-driven below the dispatcher boundary. |
@@ -410,12 +410,16 @@ transport (`nvme-tcp::server`), not the dispatcher, because completing
 an AER needs the connection's writer — the dispatcher hands back one
 synchronous CQE per command and has no deferred-completion path.
 
-The **only** event source today is reservations. Thermal, firmware-
-activation, and namespace-change notices are not produced (no sensors,
-no firmware mechanism, namespaces bound at `volume create`), so an AER
-parks until a reservation event affects the host or the connection
-tears down. Per NVMe Base §5.2 an AER that never completes is legal;
-parked AERs are released when the admin connection closes.
+Two event sources are wired: reservation notifications (LID 0x80, DW0
+`0x00800006`) and namespace-attribute changes (LID 0x04, DW0
+`0x00040002`). Thermal and firmware-activation notices are not produced
+(no sensors, no firmware mechanism), so absent reservation traffic or
+volume lifecycle churn an AER parks until an event affects the host or
+the connection tears down. Per NVMe Base §5.2 an AER that never
+completes is legal; parked AERs are released when the admin connection
+closes. When both event types are pending at re-park, the reservation
+log is announced first; the host re-issues an AER after draining each
+log, so neither is lost.
 
 ### Reservation notifications (LID 0x80)
 
@@ -498,6 +502,50 @@ rebinds the HOSTID to the new key and re-persists. Linux `nvme` does not
 auto-register, so the common path is clean. The HOSTID is host-stable, so
 no identity fixup is needed on reload (unlike the iSCSI side, which keys
 by the initiator IQN + ISID rather than the ephemeral TSIH).
+
+### Namespace-change notifications (LID 0x04)
+
+A namespace can appear or disappear out-of-band while a host is
+connected: an operator runs `thurvsa volume create` or `volume destroy`
+against the admin socket, mutating the live `VolumeRegistry` the NVMe
+dispatcher resolves NSIDs through. Without a signal, a connected host
+keeps its stale Active Namespace List until it re-enumerates on its own
+schedule. The Namespace Attribute Changed asynchronous event closes that
+gap (issue #64).
+
+The flow mirrors the reservation path but with three deliberate
+differences. **Opt-in:** the controller advertises support in Identify
+Controller OAES bit 8, and the host enables it with Set Features FID
+0x0B (Async Event Configuration) bit 8 — a controller that never opted
+in is skipped entirely (no list entry, no AER), so the default-off
+posture is undisturbed. **Subsystem-wide fan-out:** unlike a reservation
+change (scoped to the affected HOSTID), a namespace change is reported to
+*every* opted-in controller, matching how a physical multi-controller
+subsystem tells all attached controllers. **Coalescing log:** each
+opted-in controller accumulates the changed NSIDs in a per-CNTLID set
+(so repeated churn on one namespace collapses) and an AER fires with DW0
+`0x00040002` (AET=0x2 Notice, AEI=0x00 Namespace Attribute Changed,
+LID=0x04). The host reads Get Log Page LID 0x04 (Changed Namespace List)
+— up to 1024 little-endian NSIDs, ascending, zero-terminated; if more
+than 1024 changed since the last read the first entry is `0xFFFFFFFF`,
+telling the host to re-scan all namespaces. Reading the log drains the
+set; an idle controller's log is the all-zero 4 KiB page.
+
+The wiring reuses the same per-subsystem `ControllerRegistry` (AER hub)
+the reservation path uses: the admin socket holds the same `Arc`
+(`None` when nvmetcp isn't a configured transport, in which case the
+notify is a no-op), and `volume create` / `destroy` call
+`notify_namespace_attribute_changed(nsid)` after the registry mutation —
+on create once the namespace resolves, on destroy once it's gone — so a
+host that reads the log and re-runs Identify / Active Namespace List sees
+the current truth. NSID maps to LUN as `nsid = lun + 1`, the same
+mapping the dispatcher's `NamespaceLookup` uses. Per-controller state
+(the changed-NSID set + the FID 0x0B config) is freed with the
+controller when its last association drops, so a reconnecting host starts
+clean and learns the namespace inventory from Identify, not stale
+notices. Resize is not a notification source today because VSA has no
+volume-resize operation; create and destroy are the only lifecycle
+events.
 
 ### Is DH-HMAC-CHAP used in practice?
 

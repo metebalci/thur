@@ -12,11 +12,13 @@
 //! - LID 0x01 — Error Information (64 bytes per entry × N entries)
 //! - LID 0x02 — SMART / Health Information (512 bytes)
 //! - LID 0x03 — Firmware Slot Information (512 bytes)
+//! - LID 0x04 — Changed Namespace List (4096 bytes) — the namespaces
+//!   that changed since the host last read it, paired with the
+//!   Namespace Attribute Changed AER
 //!
-//! Everything else (Changed Namespace List, Commands Supported and
-//! Effects, ANA, Sanitize Status, Endurance Group, ...) is optional
-//! per spec and currently returned as Invalid Field by the
-//! dispatcher.
+//! Everything else (Commands Supported and Effects, ANA, Sanitize
+//! Status, Endurance Group, ...) is optional per spec and currently
+//! returned as Invalid Field by the dispatcher.
 
 /// SMART / Health Information log (NVMe Base §5.16.1.3). 512 bytes.
 pub const SMART_HEALTH_LEN: usize = 512;
@@ -24,6 +26,12 @@ pub const SMART_HEALTH_LEN: usize = 512;
 pub const ERROR_INFO_ENTRY_LEN: usize = 64;
 /// Firmware Slot Information log (NVMe Base §5.16.1.4). 512 bytes.
 pub const FIRMWARE_SLOT_INFO_LEN: usize = 512;
+/// Changed Namespace List log (NVMe Base §5.16.1.5). 4096 bytes =
+/// 1024 × u32 NSIDs.
+pub const CHANGED_NAMESPACE_LIST_LEN: usize = 4096;
+/// Maximum NSIDs the Changed Namespace List can carry before it
+/// overflows into the "too many to enumerate" marker.
+pub const CHANGED_NAMESPACE_LIST_MAX: usize = 1024;
 /// Reservation Notification log page (NVMe NVM Command Set). One
 /// 64-byte entry per Get Log Page.
 pub const RESERVATION_NOTIFICATION_LEN: usize = 64;
@@ -33,6 +41,10 @@ pub mod lid {
     pub const ERROR_INFO: u8 = 0x01;
     pub const SMART_HEALTH: u8 = 0x02;
     pub const FIRMWARE_SLOT: u8 = 0x03;
+    /// Changed Namespace List (NVMe Base §5.16.1.5). Lists the NSIDs
+    /// whose attributes changed since the host last read it; paired
+    /// with the Namespace Attribute Changed asynchronous event.
+    pub const CHANGED_NAMESPACE_LIST: u8 = 0x04;
     /// Discovery Log Page (NVMe-oF §5.16.1.23). A Discovery
     /// controller answers this with the list of subsystems a host can
     /// reach; `nvme discover` / `nvme connect-all` read it.
@@ -128,6 +140,30 @@ pub fn reservation_notification(
     buf[8] = notification_type;
     buf[9] = num_available;
     buf[12..16].copy_from_slice(&nsid.to_le_bytes());
+    buf
+}
+
+/// Build a Changed Namespace List log page (LID 0x04, 4096 bytes).
+///
+/// The page is a list of up to [`CHANGED_NAMESPACE_LIST_MAX`] u32
+/// NSIDs (little-endian), zero-padded. NSID 0 is reserved, so a zero
+/// entry terminates the list — an empty list is the all-zero buffer.
+///
+/// If more than [`CHANGED_NAMESPACE_LIST_MAX`] namespaces changed the
+/// list overflows: the first entry is set to `0xFFFFFFFF` and the rest
+/// are zero, telling the host "too many to enumerate, re-scan all
+/// namespaces" (NVMe Base §5.16.1.5). `nsids` should be sorted and
+/// de-duplicated by the caller; this builder copies them verbatim.
+pub fn changed_namespace_list(nsids: &[u32]) -> [u8; CHANGED_NAMESPACE_LIST_LEN] {
+    let mut buf = [0u8; CHANGED_NAMESPACE_LIST_LEN];
+    if nsids.len() > CHANGED_NAMESPACE_LIST_MAX {
+        buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        return buf;
+    }
+    for (i, nsid) in nsids.iter().enumerate() {
+        let off = i * 4;
+        buf[off..off + 4].copy_from_slice(&nsid.to_le_bytes());
+    }
     buf
 }
 
@@ -323,6 +359,49 @@ mod tests {
     fn reservation_notification_empty_page_is_all_zero() {
         let log = reservation_notification(0, resv_notif_type::EMPTY, 0, 0);
         assert!(log.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn changed_namespace_list_layout() {
+        let log = changed_namespace_list(&[1, 7, 0x0000_002A]);
+        assert_eq!(log.len(), CHANGED_NAMESPACE_LIST_LEN);
+        assert_eq!(u32::from_le_bytes(log[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(log[4..8].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(log[8..12].try_into().unwrap()), 0x2A);
+        // Remaining entries are zero (list terminator).
+        assert!(log[12..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn changed_namespace_list_empty_is_all_zero() {
+        let log = changed_namespace_list(&[]);
+        assert!(log.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn changed_namespace_list_overflow_marks_first_dword() {
+        let many: Vec<u32> = (1..=(CHANGED_NAMESPACE_LIST_MAX as u32 + 1)).collect();
+        let log = changed_namespace_list(&many);
+        // First dword = 0xFFFFFFFF ("too many, re-scan all").
+        assert_eq!(
+            u32::from_le_bytes(log[0..4].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
+        // Everything after the marker is zero.
+        assert!(log[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn changed_namespace_list_exactly_max_enumerates() {
+        let exact: Vec<u32> = (1..=(CHANGED_NAMESPACE_LIST_MAX as u32)).collect();
+        let log = changed_namespace_list(&exact);
+        // Not an overflow — last entry is enumerated, not the marker.
+        assert_eq!(u32::from_le_bytes(log[0..4].try_into().unwrap()), 1);
+        let last = (CHANGED_NAMESPACE_LIST_MAX - 1) * 4;
+        assert_eq!(
+            u32::from_le_bytes(log[last..last + 4].try_into().unwrap()),
+            CHANGED_NAMESPACE_LIST_MAX as u32
+        );
     }
 
     fn sample_entry() -> DiscoveryLogEntry {

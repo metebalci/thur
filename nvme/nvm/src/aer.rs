@@ -19,30 +19,44 @@
 //!    manager (see #54).
 //! 2. **AER delivery.** Each connection's reader parks an AER via
 //!    [`ControllerRegistry::park`] and a delivery task awaits the
-//!    oneshot; a reservation op on an I/O queue calls
-//!    [`ControllerRegistry::notify`], which fans the event out to every
-//!    live controller of the affected host and completes their parked
-//!    AERs. This is what makes cross-connection delivery work: a
-//!    reservation command on host A's I/O queue completes an AER parked
-//!    on a controller's admin queue, possibly on a different TCP
-//!    connection.
+//!    oneshot. Two event sources complete parked AERs:
+//!    - a reservation op on an I/O queue calls
+//!      [`ControllerRegistry::notify`], which fans the event to every
+//!      live controller of the *affected host* and completes their
+//!      parked AERs (LID 0x80);
+//!    - a volume create / destroy on the admin socket calls
+//!      [`ControllerRegistry::notify_namespace_attribute_changed`],
+//!      which fans to *every* live controller that has enabled the
+//!      notice (FID 0x0B bit 8) and completes their parked AERs
+//!      (LID 0x04).
+//!
+//!    Either way the completion is cross-connection: a command on one
+//!    TCP connection completes an AER parked on a controller's admin
+//!    queue, possibly on a different connection.
 //! 3. **Per-controller log + feature state.** The LID 0x80 reservation
-//!    notification log ([`ControllerRegistry::take_log_entry`]) and the
+//!    notification log ([`ControllerRegistry::take_log_entry`]), the
 //!    FID 0x82 Reservation Notification Mask
-//!    ([`ControllerRegistry::set_mask`] / [`ControllerRegistry::get_mask`])
-//!    are per-controller (keyed by CNTLID) — each controller has its
-//!    own log page and feature settings, and both vanish when the
-//!    controller is freed.
+//!    ([`ControllerRegistry::set_mask`] / [`ControllerRegistry::get_mask`]),
+//!    the LID 0x04 Changed Namespace List
+//!    ([`ControllerRegistry::take_changed_namespaces`]), and the FID
+//!    0x0B Async Event Configuration
+//!    ([`ControllerRegistry::set_aen_config`] /
+//!    [`ControllerRegistry::get_aen_config`]) are all per-controller
+//!    (keyed by CNTLID) — each controller has its own log pages and
+//!    feature settings, and all vanish when the controller is freed.
 //!
 //! Notifications target the affected host's controllers; the issuing
 //! host is excluded at derivation time (`diff_reservation_events`), so
 //! a host never receives an asynchronous notice for its own command.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nvme_base::aer::{AEI_RESERVATION_LOG_AVAILABLE, AET_IO_COMMAND_SET, async_event_dw0};
+use nvme_base::aer::{
+    AEI_NAMESPACE_ATTRIBUTE_CHANGED, AEI_RESERVATION_LOG_AVAILABLE, AEN_CFG_NAMESPACE_ATTRIBUTE,
+    AET_IO_COMMAND_SET, AET_NOTICE, async_event_dw0,
+};
 use nvme_base::log_page::{self, lid, resv_notif_type};
 use scsi_spc::reservations::{
     RegistrantId, ReservationChange, ReservationChangeKind, ReservationObserver,
@@ -61,6 +75,15 @@ const RESERVATION_NOTICE_DW0: u32 = async_event_dw0(
     AET_IO_COMMAND_SET,
     AEI_RESERVATION_LOG_AVAILABLE,
     lid::RESERVATION_NOTIFICATION,
+);
+
+/// DW0 a parked AER completes with for a namespace-attribute change:
+/// AET=Notice, AEI=Namespace Attribute Changed, LID=0x04 (Changed
+/// Namespace List). Const-folded.
+const NAMESPACE_NOTICE_DW0: u32 = async_event_dw0(
+    AET_NOTICE,
+    AEI_NAMESPACE_ATTRIBUTE_CHANGED,
+    lid::CHANGED_NAMESPACE_LIST,
 );
 
 /// Which reservation event a notification reports. Maps onto the LID
@@ -184,6 +207,14 @@ struct ControllerState {
     pending: VecDeque<(u64, u8, u32)>,
     /// Per-namespace FID 0x82 Reservation Notification Mask.
     masks: HashMap<u32, u32>,
+    /// NSIDs whose attributes changed since this controller last read
+    /// the Changed Namespace List (LID 0x04). A set so repeated changes
+    /// to one namespace collapse; drained on Get Log Page LID 0x04.
+    changed_ns: BTreeSet<u32>,
+    /// Controller-wide FID 0x0B Async Event Configuration. Bit 8
+    /// (`AEN_CFG_NAMESPACE_ATTRIBUTE`) gates namespace-change notices;
+    /// defaults to 0 (host hasn't opted in yet).
+    aen_config: u32,
 }
 
 struct Inner {
@@ -237,6 +268,8 @@ impl ControllerRegistry {
                 parked: Vec::new(),
                 pending: VecDeque::new(),
                 masks: HashMap::new(),
+                changed_ns: BTreeSet::new(),
+                aen_config: 0,
             },
         );
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -295,7 +328,10 @@ impl ControllerRegistry {
 
     /// Park an AER from a connection's admin queue. If the controller
     /// already has an unread notification, complete the AER immediately
-    /// (announce availability) instead of parking it.
+    /// (announce availability) instead of parking it. Reservation
+    /// notifications take precedence over namespace-change notices when
+    /// both are pending; the host re-issues an AER after draining each
+    /// log, so the other is announced on the next park.
     pub fn park(&self, token: ConnToken, tx: oneshot::Sender<AerCompletion>) {
         let mut inner = self.lock();
         let Some(state) = inner.controllers.get_mut(&token.cntlid) else {
@@ -306,6 +342,12 @@ impl ControllerRegistry {
         if !state.pending.is_empty() {
             let _ = tx.send(AerCompletion {
                 dw0: RESERVATION_NOTICE_DW0,
+            });
+            return;
+        }
+        if !state.changed_ns.is_empty() {
+            let _ = tx.send(AerCompletion {
+                dw0: NAMESPACE_NOTICE_DW0,
             });
             return;
         }
@@ -384,6 +426,73 @@ impl ControllerRegistry {
             .controllers
             .get(&cntlid)
             .and_then(|s| s.masks.get(&nsid).copied())
+            .unwrap_or(0)
+    }
+
+    /// Record a namespace-attribute change (a volume create / destroy /
+    /// resize) and fan it out to *every* live controller that has
+    /// enabled namespace-change notices (FID 0x0B bit 8): append `nsid`
+    /// to that controller's Changed Namespace List and complete one of
+    /// its parked AERs (if any) to announce it.
+    ///
+    /// Unlike [`notify`](Self::notify), this is a subsystem-wide event
+    /// — not host-scoped — so it reaches all hosts, mirroring how a
+    /// physical multi-controller subsystem reports namespace changes to
+    /// every attached controller. A controller that hasn't opted in is
+    /// skipped entirely (no list entry, no AER), so a host that never
+    /// set FID 0x0B bit 8 is undisturbed. With no live controllers (NVMe
+    /// transport disabled, or no host connected) this is a no-op.
+    pub fn notify_namespace_attribute_changed(&self, nsid: u32) {
+        let mut inner = self.lock();
+        let targets: Vec<u16> = inner
+            .controllers
+            .iter()
+            .filter(|(_, s)| s.aen_config & AEN_CFG_NAMESPACE_ATTRIBUTE != 0)
+            .map(|(&c, _)| c)
+            .collect();
+        for cntlid in targets {
+            let state = inner
+                .controllers
+                .get_mut(&cntlid)
+                .expect("cntlid was just listed under the same lock");
+            state.changed_ns.insert(nsid);
+            if let Some(parked) = state.parked.pop() {
+                let _ = parked.tx.send(AerCompletion {
+                    dw0: NAMESPACE_NOTICE_DW0,
+                });
+            }
+        }
+    }
+
+    /// Drain a controller's Changed Namespace List (LID 0x04) for a Get
+    /// Log Page: return its changed NSIDs ascending and clear the set.
+    /// Empty when nothing changed since the last read / the controller
+    /// is unknown — the dispatcher renders that as the all-zero page.
+    pub fn take_changed_namespaces(&self, cntlid: u16) -> Vec<u32> {
+        let mut inner = self.lock();
+        match inner.controllers.get_mut(&cntlid) {
+            Some(state) => std::mem::take(&mut state.changed_ns).into_iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Store the controller-wide FID 0x0B Async Event Configuration.
+    /// No-op if the controller is unknown.
+    pub fn set_aen_config(&self, cntlid: u16, config: u32) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.controllers.get_mut(&cntlid) {
+            state.aen_config = config;
+        }
+    }
+
+    /// Read the FID 0x0B Async Event Configuration (0 = no notices
+    /// enabled, also the reply for an unknown controller).
+    pub fn get_aen_config(&self, cntlid: u16) -> u32 {
+        let inner = self.lock();
+        inner
+            .controllers
+            .get(&cntlid)
+            .map(|s| s.aen_config)
             .unwrap_or(0)
     }
 
@@ -746,6 +855,155 @@ mod tests {
         let c1 = reg.connect_admin(HOST_A).unwrap().cntlid();
         let c2 = reg.connect_admin(HOST_A).unwrap().cntlid();
         assert_eq!(reg.representative_cntlid(HOST_A), c1.min(c2));
+    }
+
+    // -- Namespace-attribute-changed notices (LID 0x04 / FID 0x0B) --
+
+    /// Helper: enable namespace-change notices on a controller as the
+    /// host would via Set Features FID 0x0B bit 8.
+    fn enable_ns_notices(reg: &ControllerRegistry, cntlid: u16) {
+        reg.set_aen_config(cntlid, AEN_CFG_NAMESPACE_ATTRIBUTE);
+    }
+
+    #[test]
+    fn aen_config_round_trips_per_controller() {
+        let reg = ControllerRegistry::new();
+        let c1 = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let c2 = reg.connect_admin(HOST_B).unwrap().cntlid();
+        // Default: no notices enabled.
+        assert_eq!(reg.get_aen_config(c1), 0);
+        reg.set_aen_config(c1, AEN_CFG_NAMESPACE_ATTRIBUTE);
+        assert_eq!(reg.get_aen_config(c1), AEN_CFG_NAMESPACE_ATTRIBUTE);
+        // Sibling controller is independent.
+        assert_eq!(reg.get_aen_config(c2), 0);
+        // Unknown controller reads 0.
+        assert_eq!(reg.get_aen_config(0xABCD), 0);
+    }
+
+    #[test]
+    fn namespace_notice_fans_to_all_enabled_hosts() {
+        let reg = ControllerRegistry::new();
+        // Two different hosts, both opted in. A namespace change is a
+        // subsystem-wide event, so both see it (unlike reservations).
+        let ca = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let cb = reg.connect_admin(HOST_B).unwrap().cntlid();
+        enable_ns_notices(&reg, ca);
+        enable_ns_notices(&reg, cb);
+        reg.notify_namespace_attribute_changed(5);
+        assert_eq!(reg.take_changed_namespaces(ca), vec![5]);
+        assert_eq!(reg.take_changed_namespaces(cb), vec![5]);
+    }
+
+    #[test]
+    fn namespace_notice_skips_controllers_that_did_not_opt_in() {
+        let reg = ControllerRegistry::new();
+        let optin = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let silent = reg.connect_admin(HOST_B).unwrap().cntlid();
+        enable_ns_notices(&reg, optin);
+        // `silent` never set FID 0x0B bit 8.
+        reg.notify_namespace_attribute_changed(3);
+        assert_eq!(reg.take_changed_namespaces(optin), vec![3]);
+        assert!(reg.take_changed_namespaces(silent).is_empty());
+    }
+
+    #[test]
+    fn namespace_notice_with_no_controllers_is_noop() {
+        let reg = ControllerRegistry::new();
+        // NVMe transport up but no host connected (or transport off):
+        // the call simply finds no targets.
+        reg.notify_namespace_attribute_changed(1);
+        assert!(reg.take_changed_namespaces(1).is_empty());
+    }
+
+    #[test]
+    fn park_then_namespace_notice_fires_with_namespace_dw0() {
+        let reg = ControllerRegistry::new();
+        let token = reg.connect_admin(HOST_A).unwrap();
+        enable_ns_notices(&reg, token.cntlid());
+        let (tx, mut rx) = oneshot::channel();
+        reg.park(token, tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        reg.notify_namespace_attribute_changed(9);
+        assert_eq!(
+            rx.try_recv().expect("AER completed").dw0,
+            NAMESPACE_NOTICE_DW0
+        );
+    }
+
+    #[test]
+    fn namespace_notice_then_park_fires_immediately() {
+        let reg = ControllerRegistry::new();
+        let token = reg.connect_admin(HOST_A).unwrap();
+        enable_ns_notices(&reg, token.cntlid());
+        reg.notify_namespace_attribute_changed(2);
+        let (tx, mut rx) = oneshot::channel();
+        reg.park(token, tx);
+        assert_eq!(
+            rx.try_recv().expect("immediate completion").dw0,
+            NAMESPACE_NOTICE_DW0
+        );
+    }
+
+    #[test]
+    fn take_changed_namespaces_dedups_sorts_and_clears() {
+        let reg = ControllerRegistry::new();
+        let c = reg.connect_admin(HOST_A).unwrap().cntlid();
+        enable_ns_notices(&reg, c);
+        // Out-of-order with a duplicate — the set collapses + sorts.
+        reg.notify_namespace_attribute_changed(7);
+        reg.notify_namespace_attribute_changed(1);
+        reg.notify_namespace_attribute_changed(7);
+        assert_eq!(reg.take_changed_namespaces(c), vec![1, 7]);
+        // Drained — a second read is empty until the next change.
+        assert!(reg.take_changed_namespaces(c).is_empty());
+    }
+
+    #[test]
+    fn reservation_notice_takes_precedence_at_park() {
+        // Both event types pending: park announces the reservation log
+        // first; the namespace notice surfaces on the host's next AER.
+        let reg = ControllerRegistry::new();
+        let token = reg.connect_admin(HOST_A).unwrap();
+        let c = token.cntlid();
+        enable_ns_notices(&reg, c);
+        reg.notify(ev(HOST_A, ReservationEventKind::ReservationReleased));
+        reg.notify_namespace_attribute_changed(4);
+        let (tx, mut rx) = oneshot::channel();
+        reg.park(token, tx);
+        assert_eq!(
+            rx.try_recv().expect("first AER").dw0,
+            RESERVATION_NOTICE_DW0
+        );
+        // Host drains the reservation log (Get Log Page LID 0x80); the
+        // re-park then sees only the namespace change still queued.
+        let _ = reg.take_log_entry(c);
+        let (tx2, mut rx2) = oneshot::channel();
+        reg.park(token, tx2);
+        assert_eq!(
+            rx2.try_recv().expect("second AER").dw0,
+            NAMESPACE_NOTICE_DW0
+        );
+    }
+
+    #[test]
+    fn changed_ns_gone_after_controller_freed() {
+        let reg = ControllerRegistry::new();
+        let token = reg.connect_admin(HOST_A).unwrap();
+        let c = token.cntlid();
+        enable_ns_notices(&reg, c);
+        reg.notify_namespace_attribute_changed(6);
+        // Freeing the controller drops its changed list + AEN config.
+        assert!(reg.disconnect(token));
+        let again = reg.connect_admin(HOST_A).unwrap();
+        assert_eq!(again.cntlid(), c);
+        assert_eq!(reg.get_aen_config(c), 0, "AEN config did not survive free");
+        assert!(
+            reg.take_changed_namespaces(c).is_empty(),
+            "changed list did not survive free"
+        );
     }
 
     // -- AerReservationSink --------------------------------------
