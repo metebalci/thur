@@ -235,6 +235,9 @@ _thurvsa() {
             thurvsa__subcmd__help__subcmd__system__subcmd__storage,benchmark)
                 cmd="thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark"
                 ;;
+            thurvsa__subcmd__help__subcmd__system__subcmd__storage,check)
+                cmd="thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__check"
+                ;;
             thurvsa__subcmd__help__subcmd__volume,create)
                 cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__create"
                 ;;
@@ -724,14 +727,23 @@ _thurvsa() {
             thurvsa__subcmd__system__subcmd__help__subcmd__storage,benchmark)
                 cmd="thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark"
                 ;;
+            thurvsa__subcmd__system__subcmd__help__subcmd__storage,check)
+                cmd="thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__check"
+                ;;
             thurvsa__subcmd__system__subcmd__storage,benchmark)
                 cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__benchmark"
+                ;;
+            thurvsa__subcmd__system__subcmd__storage,check)
+                cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__check"
                 ;;
             thurvsa__subcmd__system__subcmd__storage,help)
                 cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__help"
                 ;;
             thurvsa__subcmd__system__subcmd__storage__subcmd__help,benchmark)
                 cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark"
+                ;;
+            thurvsa__subcmd__system__subcmd__storage__subcmd__help,check)
+                cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__check"
                 ;;
             thurvsa__subcmd__system__subcmd__storage__subcmd__help,help)
                 cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help"
@@ -1808,7 +1820,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__system__subcmd__storage)
-            opts="benchmark"
+            opts="check benchmark"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1822,6 +1834,20 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__check)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -4824,7 +4850,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__help__subcmd__storage)
-            opts="benchmark"
+            opts="check benchmark"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4838,6 +4864,20 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__check)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -4944,7 +4984,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__storage)
-            opts="-c -h --config --user --copyright --help benchmark help"
+            opts="-c -h --config --user --copyright --help check benchmark help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5019,8 +5059,34 @@ _thurvsa() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        thurvsa__subcmd__system__subcmd__storage__subcmd__check)
+            opts="-c -h --config --user --copyright --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         thurvsa__subcmd__system__subcmd__storage__subcmd__help)
-            opts="benchmark help"
+            opts="check benchmark help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5034,6 +5100,20 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__check)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

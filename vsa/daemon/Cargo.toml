@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 core-block = { path = "../../core/block" }
 shared-admin-audit = { path = "../../shared/admin-audit" }
+shared-admin-cloud-check = { path = "../../shared/admin-cloud-check" }
 shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
 shared-admin-monitor = { path = "../../shared/admin-monitor" }

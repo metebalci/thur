@@ -1684,6 +1684,24 @@ async fn main() -> Result<()> {
         backpressure_max_wait,
     }));
 
+    // Periodic backend-reachability ticker. Opt-in via
+    // `storage.check_interval_seconds` (0 = off, the default). When on,
+    // it probes every configured backend on a timer and fires
+    // `backend_reachability` failure/recovery transitions, so a backend
+    // that goes unreachable overnight is caught without an operator
+    // running `system storage check` by hand.
+    let reachability_ticker_handle = {
+        let interval = cfg.storage.check_interval_seconds;
+        if interval > 0 {
+            let storage_config = std::sync::Arc::clone(&storage_config_arc);
+            Some(tokio::spawn(async move {
+                shared_admin_cloud_check::run_reachability_ticker(storage_config, interval).await;
+            }))
+        } else {
+            None
+        }
+    };
+
     // 🔸 At-rest DEK pre-unwrap: walk every cartridge dir, peek
     // `manifest.json` for an `encryption` block, and (if present)
     // resolve the named keystore backend and unwrap the wrapped DEK.
@@ -1918,6 +1936,9 @@ async fn main() -> Result<()> {
     prefetch_worker_handle.abort();
     disk_cache_worker_handle.abort();
     if let Some(handle) = audit_ratelimit_flush_handle {
+        handle.abort();
+    }
+    if let Some(handle) = reachability_ticker_handle {
         handle.abort();
     }
     if let Some(handle) = iscsi_server_handle {

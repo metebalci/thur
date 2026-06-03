@@ -30,7 +30,7 @@ clap drives both `--help` and the shipped completion scripts.
 
 ```
 volume     create / list / info / destroy / modify / resize / key migrate
-system     storage benchmark / gc / stats / verify / regenerate-cert / alerting {list,test}
+system     storage {check,benchmark} / gc / stats / verify / regenerate-cert / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 nvmetcp    psks {add,remove,disable,enable,rotate,list}

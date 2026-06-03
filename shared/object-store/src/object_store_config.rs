@@ -67,6 +67,20 @@ pub struct ObjectStoreConfig {
     /// compliance story should leave it default.
     #[serde(default)]
     pub skip_retention_mode_check: bool,
+
+    /// Periodic backend-reachability ticker interval, in seconds. `0`
+    /// (the default) disables it — reachability is then only checked on
+    /// operator-invoked `system storage check`. When non-zero, each
+    /// daemon spawns a background task that runs the same reachability
+    /// probe (a small list/write/read/delete per backend) every
+    /// `check_interval_seconds` and fires `backend_reachability`
+    /// failure/recovery alerts, so a backend that goes unreachable
+    /// overnight (revoked credential, quota, network partition) is
+    /// caught without an operator at the console. Each tick does real
+    /// backend I/O, so set it conservatively (e.g. 300+); `local`
+    /// backends are construct-only (no network round-trip).
+    #[serde(default)]
+    pub check_interval_seconds: u64,
 }
 
 /// One named entry in `cloud.backends`. The discriminant is the YAML

@@ -255,6 +255,18 @@ storage:
   # Default: false (validation runs; recommended for compliance setups).
   # skip_retention_mode_check: false
 
+  # Periodic backend-reachability ticker interval, in seconds. 0
+  # (default) disables it — reachability is then only checked on
+  # operator-invoked `system storage check`. When non-zero, the daemon
+  # probes every configured backend on this interval (a small
+  # list/write/read/delete per backend) and fires backend_reachability
+  # failure/recovery alerts, so a backend that goes unreachable
+  # overnight (revoked credential, quota, network partition) is caught
+  # without an operator at the console. Each tick does real backend I/O
+  # — set it conservatively (e.g. 300+). `local` backends are
+  # construct-only (no network round-trip).
+  check_interval_seconds: 0
+
   # Backend-side compression (S3/GCS/Azure only; ignored for local).
   # Applied per-chunk on upload, post-dedup. Default zstd because
   # chunk-sized inputs (1-128 MiB) amortize the heavier algorithm

@@ -182,11 +182,17 @@ impl AlertingDispatcher {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            if map.get(backend).copied() == Some(next) {
-                return;
-            }
+            let prev = map.get(backend).copied();
             map.insert(backend.to_string(), next);
             drop(map);
+            // Suppress non-transitions and the first-seen-healthy
+            // baseline — a "recovered" alert only makes sense after an
+            // observed failure, so neither the first `storage check`
+            // nor the periodic ticker's first healthy tick pages. A
+            // first-seen *failure* still fires.
+            if !backend_reachability_should_fire(prev, next) {
+                return;
+            }
         }
 
         if !self.rate_limiter.allow(&alert) {
@@ -316,6 +322,21 @@ impl AlertingDispatcher {
 
 fn record_telemetry(telemetry: &Telemetry, class: &str, severity: &str, sink: &str, outcome: &str) {
     telemetry.alerts_record(class, severity, sink, outcome);
+}
+
+/// Decide whether a backend-reachability status change should fire an
+/// alert. Same-status repeats don't fire; a first sighting that's
+/// healthy is recorded as a silent baseline (no failure was ever
+/// observed, so "recovered" would be spurious). Everything else — a
+/// first-seen failure, a healthy->failing drop, a failing->healthy
+/// recovery — fires. Pulled out of [`AlertingDispatcher::try_emit`] so
+/// the transition policy is unit-testable on its own.
+fn backend_reachability_should_fire(prev: Option<BackendStatus>, next: BackendStatus) -> bool {
+    match (prev, next) {
+        (Some(p), n) if p == n => false,
+        (None, BackendStatus::Healthy) => false,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +474,31 @@ mod tests {
         d.try_emit(backend_alert("s3-a", "permanent"));
         let snap = d.backend_status_snapshot();
         assert_eq!(snap.get("s3-a").copied(), Some("failing"));
+    }
+
+    #[test]
+    fn backend_reachability_fire_decision() {
+        use BackendStatus::{Failing, Healthy};
+        // First-seen failure fires; first-seen healthy is a silent baseline.
+        assert!(backend_reachability_should_fire(None, Failing));
+        assert!(!backend_reachability_should_fire(None, Healthy));
+        // Genuine transitions fire in both directions.
+        assert!(backend_reachability_should_fire(Some(Failing), Healthy));
+        assert!(backend_reachability_should_fire(Some(Healthy), Failing));
+        // Same-status repeats don't.
+        assert!(!backend_reachability_should_fire(Some(Healthy), Healthy));
+        assert!(!backend_reachability_should_fire(Some(Failing), Failing));
+    }
+
+    #[tokio::test]
+    async fn backend_reachability_first_seen_healthy_records_baseline() {
+        // A fresh backend reported healthy (the ticker's first tick, or
+        // a `storage check` against a never-failed backend) records the
+        // baseline without treating it as a recovery transition.
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        d.try_emit(backend_alert("s3-a", "recovery"));
+        let snap = d.backend_status_snapshot();
+        assert_eq!(snap.get("s3-a").copied(), Some("healthy"));
     }
 
     #[tokio::test]

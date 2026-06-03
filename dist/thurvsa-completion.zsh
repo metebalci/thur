@@ -336,7 +336,17 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-system-storage-command-$line[1]:"
         case $line[1] in
-            (benchmark)
+            (check)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(benchmark)
 _arguments "${_arguments_options[@]}" : \
 '*--backend=[Backend name to benchmark. Repeatable]:BACKENDS:_default' \
 '--total-gb=[GiB per cell. Default 32]:TOTAL_GB:_default' \
@@ -366,7 +376,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-system-storage-help-command-$line[1]:"
         case $line[1] in
-            (benchmark)
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(benchmark)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -669,7 +683,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-system-help-storage-command-$line[1]:"
         case $line[1] in
-            (benchmark)
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(benchmark)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1857,7 +1875,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:thurvsa-help-system-storage-command-$line[1]:"
         case $line[1] in
-            (benchmark)
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(benchmark)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2625,6 +2647,7 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__stats_commands() {
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands() {
     local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
 'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
     )
     _describe -t commands 'thurvsa help system storage commands' commands "$@"
@@ -2633,6 +2656,11 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__storage_commands() {
 _thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help system storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands] )) ||
+_thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help system storage check commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__verify_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__verify_commands() {
@@ -3625,6 +3653,7 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__stats_commands() {
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands() {
     local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
 'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
     )
     _describe -t commands 'thurvsa system help storage commands' commands "$@"
@@ -3633,6 +3662,11 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__storage_commands() {
 _thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__benchmark_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system help storage benchmark commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands] )) ||
+_thurvsa__subcmd__system__subcmd__help__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system help storage check commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__verify_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__verify_commands() {
@@ -3657,6 +3691,7 @@ _thurvsa__subcmd__system__subcmd__stats_commands() {
 (( $+functions[_thurvsa__subcmd__system__subcmd__storage_commands] )) ||
 _thurvsa__subcmd__system__subcmd__storage_commands() {
     local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
 'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -3667,9 +3702,15 @@ _thurvsa__subcmd__system__subcmd__storage__subcmd__benchmark_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system storage benchmark commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__check_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system storage check commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands] )) ||
 _thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands() {
     local commands; commands=(
+'check:Check storage-backend connectivity, auth, and read/write/delete' \
 'benchmark:First-party storage-backend throughput benchmark (daemon-down)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -3679,6 +3720,11 @@ _thurvsa__subcmd__system__subcmd__storage__subcmd__help_commands() {
 _thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__benchmark_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system storage help benchmark commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__check_commands] )) ||
+_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system storage help check commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands] )) ||
 _thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help_commands() {

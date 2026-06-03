@@ -78,6 +78,15 @@ on-disk paths group by purpose.
   passed as a plain `PathBuf`. Kept out of `shared-audit` itself so
   that low-level crate stays free of the `JobEmitter` / job-protocol
   deps.
+- `shared/admin-cloud-check` (`shared-admin-cloud-check`) —
+  cross-product cloud-backend reachability. `run_cloud_check` is the
+  `system.cloud_check` job handler both daemons mount (CLI verb
+  `system storage check`); `run_reachability_ticker` is the opt-in
+  periodic ticker each daemon spawns when
+  `storage.check_interval_seconds` is non-zero. Both reuse
+  `shared_object_store::validate_object_store_backend` and fire
+  `backend_reachability` alerts. Same split rationale as
+  `shared-admin-audit`.
 - `shared/admin-monitor` (`shared-admin-monitor`) — cross-product
   `system.monitor` job handler. Tick loop that emits one
   `MonitorSnapshot` (JSON-encoded in the `JobEvent::Log.message`)

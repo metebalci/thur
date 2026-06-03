@@ -37,6 +37,16 @@ pub fn dispatch(
             tokio::spawn(alerting::run_test(emitter, body, state));
             Ok(())
         }
+        "system.cloud_check" => {
+            // Same shared handler VTL mounts; the per-product input is
+            // just the parsed storage config.
+            let _ = body;
+            tokio::spawn(shared_admin_cloud_check::run_cloud_check(
+                emitter,
+                std::sync::Arc::clone(&state.storage),
+            ));
+            Ok(())
+        }
         "system.gc" => {
             tokio::spawn(gc::run(emitter, body, state));
             Ok(())

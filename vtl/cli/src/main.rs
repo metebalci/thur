@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
             }
             SystemAction::Storage { action } => match action {
                 StorageAction::Check => {
-                    commands::storage::cmd_check().await?;
+                    shared_cli_system::cmd_storage_check(&shared_naming::TAPE_LIBRARY).await?;
                 }
                 StorageAction::Benchmark {
                     backends,

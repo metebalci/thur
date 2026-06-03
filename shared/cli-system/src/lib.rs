@@ -14,8 +14,10 @@ pub mod gc;
 pub mod monitor;
 pub mod regenerate_cert;
 pub mod secrets_io;
+pub mod storage_check;
 
 pub use daemon_health::cmd_daemon_health;
 pub use gc::cmd_gc;
 pub use monitor::cmd_monitor;
 pub use regenerate_cert::cmd_regenerate_cert;
+pub use storage_check::cmd_storage_check;

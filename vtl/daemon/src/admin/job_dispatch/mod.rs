@@ -14,7 +14,6 @@
 
 pub mod alerting;
 pub mod archive;
-pub mod cloud_check;
 pub mod gc;
 pub mod migrate;
 pub mod restore_archive;
@@ -40,7 +39,13 @@ pub fn dispatch(
 ) -> Result<(), String> {
     match kind {
         "system.cloud_check" => {
-            tokio::spawn(cloud_check::run(emitter, body, state));
+            // Handler lifted to the shared crate so VSA mounts the same
+            // job; the per-product input is just the storage config.
+            let _ = body;
+            tokio::spawn(shared_admin_cloud_check::run_cloud_check(
+                emitter,
+                Arc::clone(&state.storage_config),
+            ));
         }
         "system.verify" => {
             tokio::spawn(verify::run(emitter, body, state));

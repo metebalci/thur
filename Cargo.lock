@@ -4438,6 +4438,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shared-admin-cloud-check"
+version = "0.1.0-dev.4"
+dependencies = [
+ "serde_json",
+ "shared-admin-server",
+ "shared-alerting",
+ "shared-object-store",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "shared-admin-http"
 version = "0.1.0-dev.4"
 dependencies = [
@@ -5590,6 +5603,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shared-admin-audit",
+ "shared-admin-cloud-check",
  "shared-admin-http",
  "shared-admin-iscsi",
  "shared-admin-monitor",
@@ -5685,6 +5699,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "shared-admin-audit",
+ "shared-admin-cloud-check",
  "shared-admin-http",
  "shared-admin-iscsi",
  "shared-admin-monitor",

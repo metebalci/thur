@@ -2,6 +2,7 @@
 members = [
     "shared/admin-audit",
     "shared/admin-client",
+    "shared/admin-cloud-check",
     "shared/admin-http",
     "shared/admin-iscsi",
     "shared/admin-monitor",

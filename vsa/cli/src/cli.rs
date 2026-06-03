@@ -272,6 +272,11 @@ enum AlertingAction {
 
 #[derive(Subcommand)]
 enum StorageAction {
+    /// Check storage-backend connectivity, auth, and read/write/delete.
+    ///
+    /// Always allowed — does not require the daemon to be stopped.
+    Check,
+
     /// First-party storage-backend throughput benchmark (daemon-down).
     ///
     /// Drives parallel upload / download / delete against the named

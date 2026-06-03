@@ -934,6 +934,24 @@ async fn main() -> Result<()> {
         }))
     };
 
+    // Periodic backend-reachability ticker. Opt-in via
+    // `storage.check_interval_seconds` (0 = off, the default). When on,
+    // it probes every configured backend on a timer and fires
+    // `backend_reachability` failure/recovery transitions, so a backend
+    // that goes unreachable overnight is caught without an operator
+    // running `system storage check` by hand.
+    let reachability_ticker_handle = {
+        let interval = cfg.storage.check_interval_seconds;
+        if interval > 0 {
+            let storage_config = Arc::new(cfg.storage.clone());
+            Some(tokio::spawn(async move {
+                shared_admin_cloud_check::run_reachability_ticker(storage_config, interval).await;
+            }))
+        } else {
+            None
+        }
+    };
+
     // Drive every data-path listener concurrently. The first to finish
     // (clean shutdown, error, bind failure, or task panic) resolves the
     // select arm and tears the daemon down — the same fail-fast the
@@ -1039,6 +1057,9 @@ async fn main() -> Result<()> {
     // The shutdown flush loop above already persisted every volume's
     // counters via `flush_all`; abort the periodic worker outright.
     if let Some(h) = runtime_persist_handle {
+        h.abort();
+    }
+    if let Some(h) = reachability_ticker_handle {
         h.abort();
     }
 

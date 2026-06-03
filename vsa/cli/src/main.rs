@@ -214,6 +214,9 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::System { action } => match action {
             SystemAction::Storage { action } => match action {
+                StorageAction::Check => {
+                    shared_cli_system::cmd_storage_check(&shared_naming::DISK).await
+                }
                 StorageAction::Benchmark {
                     backends,
                     total_gb,

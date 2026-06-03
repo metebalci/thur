@@ -75,6 +75,18 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `PathBuf` (no trait — the handlers need nothing else). Deliberately
   kept out of `shared-audit` so that lower-level crate stays free of
   the `JobEmitter` / job-protocol deps.
+- **shared-admin-cloud-check** — cross-product cloud-backend
+  reachability. `run_cloud_check(JobEmitter, Arc<ObjectStoreConfig>)`
+  is the `system.cloud_check` job handler both daemons mount (CLI verb
+  `system storage check`); `run_reachability_ticker(Arc<ObjectStoreConfig>, u64)`
+  is the opt-in periodic ticker each daemon spawns when
+  `storage.check_interval_seconds` is non-zero, and `probe_backends_once`
+  is the shared per-tick probe. All three reuse
+  `shared_object_store::validate_object_store_backend` and fire
+  `shared_alerting::record::backend_reachability`. Kept out of
+  `shared-object-store` (which owns the probe) so that lower-level crate
+  stays free of the `JobEmitter` + `shared-alerting` deps — same split
+  as `shared-admin-audit` / `shared-admin-monitor`.
 - **shared-health** — axum handler for `GET /health`, an
   unauthenticated liveness probe. Body is `{ status, daemon, version }`;
   per-product topology stays on `/info`. Daemons supply `HealthMeta
@@ -88,9 +100,11 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   each daemon's main via `set_global`, mirroring how
   `shared_telemetry::set_global` works; producers emit through
   `shared_alerting::record::*`. Per-class dedup wraps
-  `shared_audit::audit_ratelimit::AuditRateLimiter`. Four event
+  `shared_audit::audit_ratelimit::AuditRateLimiter`. Five event
   classes: backend reachability, audit-log append failure, disk-cache
-  watermark + backpressure timeout, repeated CHAP failures. Hosts the
+  watermark + backpressure timeout (incl. VSA `lru.idx` degradation),
+  repeated CHAP failures, and orphaned objects (failed best-effort
+  storage delete, e.g. `cartridge migrate` source-delete). Hosts the
   cross-product `system.alerting.test` admin job and the
   `/api/v1/system/alerting` handler (behind the `http` feature).
   Audit-append failures bridge in via an `AppendFailureHook` function
@@ -422,7 +436,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   in-process smoke tests and exits. Admin socket at
   `/run/thurvtl/admin.sock` — `admin/mod.rs` builds the product router,
   merges `jobs_router` (dispatch in `admin/job_dispatch/*.rs`: gc /
-  verify / stats / cloud_check (job kind in code; CLI verb is `system storage check`) / self_test / audit / archive /
+  verify / stats / cloud_check (routed to `shared-admin-cloud-check`; CLI verb `system storage check`) / self_test / audit / archive /
   restore_archive / migrate / alerting) and the alerting route, and
   hands off to `run_admin_server`.
 - **vtl-cli** (binary `thurvtl`) — top-level subcommands `library`,

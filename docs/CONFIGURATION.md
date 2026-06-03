@@ -163,6 +163,7 @@ shapes are in [`AUTH.md`](AUTH.md).
 | Key | Default | Description |
 |---|---|---|
 | `storage.skip_retention_mode_check` | `false` | Skip bucket-immutability validation at startup / `storage check`. `retention_mode` still parses and still gates `--worm`. Use when the principal can't be granted management-plane IAM. |
+| `storage.check_interval_seconds` | `0` | Periodic backend-reachability ticker interval. `0` = off (reachability only checked on `system storage check`). When set, each daemon probes every backend on this interval (small list/write/read/delete per backend) and fires `backend_reachability` failure/recovery. Set conservatively (300+); each tick does real backend I/O. Both products. |
 | `storage.compression.algorithm` | `zstd` | Backend-tier compression (post-dedup, per-chunk on upload): `none` / `lz4` / `zstd`. S3/GCS/Azure only. |
 | `storage.compression.level` | `3` | Zstd level 1–22. Ignored for `lz4` / `none`. |
 | `storage.upload.max_concurrent` | `0` | In-flight uploads per backend. `0` = auto-scale to `min(16, parallelism × 4)`. |
