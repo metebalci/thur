@@ -492,6 +492,15 @@ impl VolumeManifest {
         self.crypto_uuid.unwrap_or(self.uuid)
     }
 
+    /// Whether this volume encrypts its chunks at rest. The chunk pool
+    /// then stores ciphertext (hash over ciphertext) and reads decrypt
+    /// under `dek_uuid()`; the copy paths consult this to decide whether
+    /// a cross-volume hash-rebind is sound (see
+    /// [`crate::cache::rebind_is_sound`]).
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
     /// Build a fresh manifest. Does not touch disk — call
     /// [`Self::create`] for the on-disk side. The `encryption` field
     /// is set separately via [`Self::with_encryption`]; the daemon

@@ -36,7 +36,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::VolumeLookup;
 use super::inquiry::naa_locally_assigned;
-use super::odx::{JobResult, JobStatus, ROD_TOKEN_LEN, RodToken, TokenManager, TokenState};
+use super::odx::{
+    JobResult, JobStatus, ROD_TOKEN_LEN, RodToken, SourceDecryptor, TokenManager, TokenState,
+};
 use super::reservations::{Nexus, ReservationManager};
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
 
@@ -1806,6 +1808,15 @@ async fn populate_token(
     }
     let ttl = tokens.resolve_ttl(inactivity);
     let manifest = src_cache.manifest();
+    // Capture the source crypto identity + a decrypt handle so
+    // WRITE USING TOKEN can recrypt the pinned snapshot chunks under the
+    // source identity when the destination can't reconstruct their
+    // (key, IV) (issue #88). Holding `src_cache` keeps the source DEK
+    // reachable for the token's lifetime and avoids re-resolving the
+    // source LUN (which could be reused by an unrelated volume).
+    let source_encrypted = manifest.is_encrypted();
+    let source_dek_uuid = manifest.dek_uuid();
+    let source_decryptor: Arc<dyn SourceDecryptor> = src_cache.clone();
     let state = TokenState {
         source_volume_uuid: manifest.uuid,
         source_lun: req.lun,
@@ -1816,6 +1827,9 @@ async fn populate_token(
         source_pages,
         hashes,
         iv_salts,
+        source_encrypted,
+        source_dek_uuid,
+        source_decryptor,
         total_blocks,
         deadline: std::time::Instant::now() + ttl,
         pins,
@@ -1825,10 +1839,17 @@ async fn populate_token(
 }
 
 /// WRITE USING TOKEN (EXTENDED COPY service action 0x11). Look up
-/// the snapshot under the supplied ROD token; apply its per-page
-/// chunk hashes to the destination volume's `pages.idx` across the
-/// destination range. Cross-volume by design — Hyper-V's primary
-/// use of ODX is moving a VHDX between LUNs.
+/// the snapshot under the supplied ROD token and apply it to the
+/// destination range. Where the destination can reconstruct a chunk's
+/// (key, IV) — both volumes unencrypted, or both encrypted under the
+/// same `dek_uuid()` with the page landing at the same offset — the
+/// page-index slot is rebound to the source chunk hash (zero-copy).
+/// Otherwise the page is recrypted (issue #88): the pinned snapshot
+/// chunk is decrypted under the source identity via the token's retained
+/// `source_decryptor` and re-sealed under the destination identity, so a
+/// cross-crypto-identity / cross-offset / enc<->unenc copy never leaves
+/// an undecryptable destination page. Cross-volume by design — Hyper-V's
+/// primary use of ODX is moving a VHDX between LUNs.
 ///
 /// Sync-inline; records a job outcome under the CDB's LIST IDENTIFIER
 /// so RRTI can answer.
@@ -2007,7 +2028,15 @@ async fn write_using_token(
     }
     let dst_pi = dst_cache.writer().page_index();
     let dst_ui = dst_cache.writer().upload_index();
+    // Rebind-vs-recrypt decision inputs for the destination, captured as
+    // scalars so the per-page loop holds no manifest borrow across the
+    // recrypt awaits.
+    let dst_encrypted = dst_manifest.is_encrypted();
+    let dst_dek_uuid = dst_manifest.dek_uuid();
     let mut snap_idx = 0usize;
+    // Blocks actually committed — reported as the RRTI TRANSFER COUNT on
+    // a mid-apply failure (SPC-4 allows partial-completion reporting).
+    let mut committed_blocks: u64 = 0;
     for bd in &bdrds {
         if bd.blocks == 0 {
             continue;
@@ -2016,39 +2045,82 @@ async fn write_using_token(
         let pages_in_range = ((bd.blocks as u64) * sector / page) as u32;
         for p in 0..pages_in_range {
             let dst_page = first_page + p;
-            let hash = &snapshot.hashes[snap_idx];
+            let src_page = snapshot.source_pages[snap_idx];
+            let hash = snapshot.hashes[snap_idx];
             let iv_salt = snapshot.iv_salts[snap_idx];
             snap_idx += 1;
             // Drop any cached destination entry so subsequent reads
-            // repopulate from the new page-index binding.
+            // repopulate from the new page-index binding / sealed bytes.
             dst_cache.invalidate_cached_page(dst_page).await;
-            let res: Result<(), UploaderError> = (|| {
-                match hash {
-                    Some(h) => {
-                        // Carry the source page's IV salt so an encrypted
-                        // rebind reads back under the sealing nonce (#87).
-                        dst_pi.set_salted(dst_page, h, iv_salt)?;
-                        dst_ui.set(dst_page, UploadState::Uploaded)?;
-                    }
-                    None => {
+            // A zero-copy hash-rebind is sound only when the destination
+            // can reconstruct the chunk's (key, IV). Otherwise recrypt
+            // (issue #88): decrypt the pinned snapshot chunk under the
+            // SOURCE identity and re-seal under the DESTINATION identity.
+            let rebind_ok = core_block::rebind_is_sound(
+                snapshot.source_encrypted,
+                snapshot.source_dek_uuid,
+                src_page,
+                dst_encrypted,
+                dst_dek_uuid,
+                dst_page,
+            );
+            let step: Result<(), SenseData> = match hash {
+                None => {
+                    // Sparse hole — identity-agnostic, reads-as-zero.
+                    (|| -> Result<(), UploaderError> {
                         dst_pi.clear(dst_page)?;
                         dst_ui.set(dst_page, UploadState::Uploaded)?;
+                        Ok(())
+                    })()
+                    .map_err(|e| map_write_error(&e))
+                }
+                Some(h) if rebind_ok => {
+                    // Carry the source page's IV salt so an encrypted
+                    // rebind reads back under the sealing nonce (#87).
+                    // The chunk is already pool-resident + Uploaded.
+                    (|| -> Result<(), UploaderError> {
+                        dst_pi.set_salted(dst_page, &h, iv_salt)?;
+                        dst_ui.set(dst_page, UploadState::Uploaded)?;
+                        Ok(())
+                    })()
+                    .map_err(|e| map_write_error(&e))
+                }
+                Some(h) => {
+                    // Recrypt: decrypt the pinned snapshot chunk under
+                    // the SOURCE identity (frozen at POPULATE TOKEN —
+                    // immune to later source mutation), then seal it via
+                    // the destination's normal write path. `write_page`
+                    // re-encrypts under the destination identity with a
+                    // fresh per-page IV salt, consumes real destination
+                    // pool budget, and drives the honest LocalOnly ->
+                    // Uploaded transition (never a premature `Uploaded`).
+                    match snapshot
+                        .source_decryptor
+                        .decrypt_chunk(src_page, h, iv_salt)
+                        .await
+                    {
+                        Ok(plain) => dst_cache
+                            .writer()
+                            .write_page(dst_page, &plain)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| map_write_error(&e)),
+                        Err(e) => Err(map_read_error(&e)),
                     }
-                };
-                Ok(())
-            })();
-            if let Err(e) = res {
-                let sense = map_write_error(&e);
+                }
+            };
+            if let Err(sense) = step {
                 tokens.record_write_outcome(
                     list_id,
                     JobStatus::Failed {
                         completion_status: sense.key as u8,
                     },
-                    0,
+                    committed_blocks,
                     tokens.resolve_ttl(0),
                 );
                 return ScsiResponse::check(sense);
             }
+            committed_blocks = committed_blocks.saturating_add(sectors_per_page);
         }
     }
     tokens.record_write_outcome(
@@ -4584,6 +4656,452 @@ mod tests {
             rrti_w.data_in[23],
         ]);
         assert_eq!(transfer, 2 * SECTORS_PER_PAGE as u64);
+    }
+
+    /// Two volumes on one backend (so they can share the pool under
+    /// Global dedup). Each side is encrypted iff its `*_enc` flag is set;
+    /// when both are encrypted, `shared_identity` makes `b` a clone of
+    /// `a`'s crypto identity (same `dek_uuid` + same DEK), else `b` is an
+    /// independent encrypted volume (distinct DEK).
+    async fn fresh_two_volumes_keyed(
+        a: &str,
+        b: &str,
+        a_enc: bool,
+        b_enc: bool,
+        shared_identity: bool,
+        dedup: DedupScope,
+    ) -> (TempDir, Arc<PageCache>, Arc<PageCache>) {
+        use core_block::volume::VolumeEncryptionAlgorithm;
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        let mk = |name: &str| {
+            VolumeManifest::new(
+                name.into(),
+                8 * (1u64 << 20),
+                DEFAULT_SECTOR_BYTES,
+                DEFAULT_PAGE_SIZE_BYTES,
+                "primary".into(),
+                dedup,
+                false,
+                0,
+            )
+            .unwrap()
+        };
+        let am = if a_enc {
+            mk(a).with_encryption(VolumeEncryptionAlgorithm::Aes256Gcm)
+        } else {
+            mk(a)
+        };
+        am.create(tmp.path()).unwrap();
+        let wa = if a_enc {
+            Arc::new(
+                VolumeWriter::open_with_key(tmp.path(), a, backend.clone(), [0x11u8; 32]).unwrap(),
+            )
+        } else {
+            Arc::new(VolumeWriter::open(tmp.path(), a, backend.clone()).unwrap())
+        };
+        let a_dek_uuid = wa.manifest().dek_uuid();
+        let mut bm = if b_enc {
+            mk(b).with_encryption(VolumeEncryptionAlgorithm::Aes256Gcm)
+        } else {
+            mk(b)
+        };
+        if b_enc && shared_identity {
+            bm = bm.with_crypto_uuid(a_dek_uuid);
+        }
+        bm.create(tmp.path()).unwrap();
+        let wb = if b_enc {
+            let b_key = if shared_identity {
+                [0x11u8; 32]
+            } else {
+                [0x22u8; 32]
+            };
+            Arc::new(VolumeWriter::open_with_key(tmp.path(), b, backend, b_key).unwrap())
+        } else {
+            Arc::new(VolumeWriter::open(tmp.path(), b, backend).unwrap())
+        };
+        (tmp, PageCache::new(wa), PageCache::new(wb))
+    }
+
+    /// Two encrypted volumes (thin wrapper over [`fresh_two_volumes_keyed`]).
+    async fn fresh_two_volumes_enc(
+        a: &str,
+        b: &str,
+        shared_identity: bool,
+        dedup: DedupScope,
+    ) -> (TempDir, Arc<PageCache>, Arc<PageCache>) {
+        fresh_two_volumes_keyed(a, b, true, true, shared_identity, dedup).await
+    }
+
+    /// POPULATE TOKEN over `src_lun` for `ranges`, then RRTI to fetch the
+    /// minted 512-byte ROD token.
+    async fn odx_mint_token(
+        registry: &Arc<dyn VolumeLookup>,
+        tokens: &Arc<TokenManager>,
+        src_lun: u64,
+        list_id: u32,
+        ranges: &[(u64, u32)],
+    ) -> [u8; ROD_TOKEN_LEN] {
+        let pt_params = populate_token_param_list(ranges);
+        let pt_cdb = odx_cdb(0x83, 0x10, list_id, pt_params.len() as u32);
+        let r = extended_copy(
+            &req_lun(src_lun, &pt_cdb, &pt_params, 0),
+            registry,
+            test_nexus(),
+            &test_mgr(),
+            tokens,
+        )
+        .await;
+        assert!(r.sense.is_none(), "POPULATE TOKEN: {:?}", r.sense);
+        let rrti_cdb = odx_cdb(0x84, 0x07, list_id, 1024);
+        let rrti = receive_copy_results(&req_lun(src_lun, &rrti_cdb, &[], 1024), tokens);
+        rod_token_from_rrti(&rrti.data_in)
+    }
+
+    async fn odx_write_using_token(
+        registry: &Arc<dyn VolumeLookup>,
+        tokens: &Arc<TokenManager>,
+        dst_lun: u64,
+        list_id: u32,
+        token: &[u8; ROD_TOKEN_LEN],
+        ranges: &[(u64, u32)],
+    ) -> ScsiResponse {
+        let wut_params = write_using_token_param_list(token, ranges);
+        let wut_cdb = odx_cdb(0x83, 0x11, list_id, wut_params.len() as u32);
+        extended_copy(
+            &req_lun(dst_lun, &wut_cdb, &wut_params, 0),
+            registry,
+            test_nexus(),
+            &test_mgr(),
+            tokens,
+        )
+        .await
+    }
+
+    fn two_lun_registry(src: Arc<PageCache>, dst: Arc<PageCache>) -> Arc<dyn VolumeLookup> {
+        let r = TestRegistry::new();
+        r.register(0, src);
+        r.register(1, dst);
+        Arc::new(r)
+    }
+
+    #[tokio::test]
+    async fn odx_recrypt_cross_identity_roundtrip() {
+        // Two independently-keyed encrypted volumes, same pool (Global).
+        // A rebind would bind the destination to ciphertext sealed under
+        // the source DEK -> undecryptable. WRITE USING TOKEN must recrypt:
+        // distinct destination ciphertext, identical plaintext.
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", false, DedupScope::Global).await;
+        let p = page_pattern(0x3C);
+        src.write_bytes(0, &p).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x100,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x101,
+            &token,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(r.sense.is_none(), "WRITE USING TOKEN: {:?}", r.sense);
+
+        assert_eq!(
+            dst.read_bytes(0, PAGE).await.unwrap(),
+            p,
+            "cross-identity ODX must read back as source plaintext"
+        );
+        let src_h = src.writer().page_index().get(0).unwrap().unwrap();
+        let dst_h = dst.writer().page_index().get(0).unwrap().unwrap();
+        assert_ne!(
+            src_h, dst_h,
+            "cross-identity ODX must recrypt (fresh dest ciphertext), not rebind"
+        );
+    }
+
+    #[tokio::test]
+    async fn odx_rebind_same_identity_roundtrip() {
+        // Destination shares the source crypto identity (clone case) and
+        // the page lands at the same offset -> zero-copy hash rebind must
+        // be preserved.
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", true, DedupScope::Global).await;
+        let p = page_pattern(0x4D);
+        src.write_bytes(0, &p).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x200,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x201,
+            &token,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(r.sense.is_none(), "WRITE USING TOKEN: {:?}", r.sense);
+
+        let src_h = src.writer().page_index().get(0).unwrap().unwrap();
+        let dst_h = dst.writer().page_index().get(0).unwrap().unwrap();
+        assert_eq!(src_h, dst_h, "same identity + same offset must hash-rebind");
+        assert_eq!(dst.read_bytes(0, PAGE).await.unwrap(), p);
+    }
+
+    #[tokio::test]
+    async fn odx_recrypt_uses_pinned_snapshot_not_live_source() {
+        // POPULATE TOKEN freezes a point-in-time view via pinned chunks.
+        // Overwriting the source page afterwards must NOT change what
+        // WRITE USING TOKEN delivers — the recrypt decrypts the pinned
+        // snapshot chunk under the source identity, not the live page.
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", false, DedupScope::Global).await;
+        let original = page_pattern(0x5E);
+        src.write_bytes(0, &original).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x300,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        // Overwrite the source page after the token is minted.
+        let overwritten = page_pattern(0xEE);
+        src.write_bytes(0, &overwritten).await.unwrap();
+        src.flush_all().await.unwrap();
+
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x301,
+            &token,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(r.sense.is_none(), "WRITE USING TOKEN: {:?}", r.sense);
+        assert_eq!(
+            dst.read_bytes(0, PAGE).await.unwrap(),
+            original,
+            "recrypt must deliver the snapshot-time bytes, not the overwritten live source"
+        );
+    }
+
+    #[tokio::test]
+    async fn odx_cross_pool_still_refused() {
+        // Distinct Local namespaces => cross-pool. The same_pool gate is
+        // unchanged by the recrypt work: WRITE USING TOKEN must still
+        // refuse rather than recrypt across pools (out of scope for #88).
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", false, DedupScope::Local).await;
+        let p = page_pattern(0x6F);
+        src.write_bytes(0, &p).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x400,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x401,
+            &token,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(
+            r.sense.is_some(),
+            "cross-pool WRITE USING TOKEN must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn odx_recrypt_cross_offset_same_identity() {
+        // Shared crypto identity but the token lands the source page at a
+        // DIFFERENT destination offset. page_id is in the IV, so a rebind
+        // would be undecryptable -> must recrypt. Exercises src_page vs
+        // dst_page threading in the hand-rolled WUT loop (the page-0-only
+        // tests can't distinguish them).
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", true, DedupScope::Global).await;
+        let p = page_pattern(0x7A);
+        src.write_bytes(0, &p).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x500,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        // src page 0 -> dst page 1.
+        let dst_lba = SECTORS_PER_PAGE as u64;
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x501,
+            &token,
+            &[(dst_lba, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(r.sense.is_none(), "WRITE USING TOKEN: {:?}", r.sense);
+        assert_eq!(
+            dst.read_bytes(PAGE as u64, PAGE).await.unwrap(),
+            p,
+            "cross-offset same-identity ODX must recrypt + read back correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn odx_recrypt_enc_to_unenc_and_unenc_to_enc() {
+        // enc source -> unenc dest: dest must hold plaintext. unenc source
+        // -> enc dest: dest must hold ciphertext that decrypts back. Both
+        // go through the recrypt branch (enc<->unenc is never a sound
+        // rebind).
+        {
+            // enc -> unenc
+            let (_tmp, src, dst) =
+                fresh_two_volumes_keyed("s", "d", true, false, false, DedupScope::Global).await;
+            let p = page_pattern(0x8B);
+            src.write_bytes(0, &p).await.unwrap();
+            src.flush_all().await.unwrap();
+            let registry = two_lun_registry(src.clone(), dst.clone());
+            let tokens = test_tokens();
+            let token = odx_mint_token(
+                &registry,
+                &tokens,
+                0,
+                0x600,
+                &[(0, SECTORS_PER_PAGE as u32)],
+            )
+            .await;
+            let r = odx_write_using_token(
+                &registry,
+                &tokens,
+                1,
+                0x601,
+                &token,
+                &[(0, SECTORS_PER_PAGE as u32)],
+            )
+            .await;
+            assert!(r.sense.is_none(), "enc->unenc WUT: {:?}", r.sense);
+            assert_eq!(dst.read_bytes(0, PAGE).await.unwrap(), p);
+        }
+        {
+            // unenc -> enc
+            let (_tmp, src, dst) =
+                fresh_two_volumes_keyed("s", "d", false, true, false, DedupScope::Global).await;
+            let p = page_pattern(0x9C);
+            src.write_bytes(0, &p).await.unwrap();
+            src.flush_all().await.unwrap();
+            let registry = two_lun_registry(src.clone(), dst.clone());
+            let tokens = test_tokens();
+            let token = odx_mint_token(
+                &registry,
+                &tokens,
+                0,
+                0x700,
+                &[(0, SECTORS_PER_PAGE as u32)],
+            )
+            .await;
+            let r = odx_write_using_token(
+                &registry,
+                &tokens,
+                1,
+                0x701,
+                &token,
+                &[(0, SECTORS_PER_PAGE as u32)],
+            )
+            .await;
+            assert!(r.sense.is_none(), "unenc->enc WUT: {:?}", r.sense);
+            assert_eq!(dst.read_bytes(0, PAGE).await.unwrap(), p);
+        }
+    }
+
+    #[tokio::test]
+    async fn odx_recrypt_sparse_hole_cross_identity() {
+        // A sparse (never-written) source page is a None-hash snapshot
+        // entry; even across distinct crypto identities the None arm must
+        // run before any decrypt, leaving the destination reading zeros.
+        let (_tmp, src, dst) =
+            fresh_two_volumes_enc("src_vol", "dst_vol", false, DedupScope::Global).await;
+        // Write page 1 so the range is valid; leave page 0 a hole.
+        src.write_bytes(PAGE as u64, &page_pattern(0x11))
+            .await
+            .unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        // POPULATE over pages 0 (hole) + 1.
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x800,
+            &[(0, 2 * SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x801,
+            &token,
+            &[(0, 2 * SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert!(r.sense.is_none(), "WUT with sparse hole: {:?}", r.sense);
+        assert_eq!(
+            dst.read_bytes(0, PAGE).await.unwrap(),
+            vec![0u8; PAGE],
+            "sparse source page must read back as zeros"
+        );
+        assert_eq!(
+            dst.read_bytes(PAGE as u64, PAGE).await.unwrap(),
+            page_pattern(0x11)
+        );
     }
 
     #[tokio::test]

@@ -277,6 +277,21 @@ lives in the provider's KMS. The appliance-side layer is for shops where
 the bucket-key model is not sufficient — zero-trust against the storage backend
 provider, or HSM-backed KMIP custody chains.
 
+Server-side copy offload (VAAI XCOPY / Hyper-V ODX) upholds this boundary
+rather than punching through it. Those primitives normally copy by
+*hash-rebind* — pointing the destination's page-index slot at the source's
+existing chunk — which for encrypted data would bind the destination to
+ciphertext it cannot decrypt (the IV is keyed on the source's `dek_uuid` +
+`page_id`). VSA therefore rebinds only when the destination can reconstruct
+the chunk's (key, IV): both volumes unencrypted, or both encrypted under the
+same crypto identity (`dek_uuid`) with the page at the same offset
+(`core_block::rebind_is_sound`). Otherwise it *recrypts* — decrypt under the
+source identity, re-encrypt under the destination — so the offloaded copy
+still lands under the destination's own DEK and never shares a chunk across
+crypto identities (issue #88). A snapshot/clone, which inherits the source
+DEK + `dek_uuid`, keeps the zero-copy rebind and so still shares chunks with
+its source family.
+
 ### Backend-side compression × dedup
 
 Backend-tier compression (`storage.compression.algorithm`,

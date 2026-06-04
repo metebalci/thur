@@ -1412,6 +1412,41 @@ fn copy_pages_idx(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether a cross-volume hash-rebind (pointing `dst`'s page-index slot
+/// at `src`'s existing chunk hash) yields a destination page the
+/// destination can actually read back.
+///
+/// For an encrypted volume the chunk pool stores ciphertext and the
+/// read path decrypts with `AES-256-GCM` under
+/// `derive_iv(dek_uuid(), page_id, iv_salt)` keyed by the per-volume
+/// DEK. A rebound chunk is therefore decryptable by the destination
+/// only when:
+/// - both volumes are unencrypted (the pool holds plaintext, no IV), or
+/// - both are encrypted *and* share the same `dek_uuid()` (⇒ same DEK,
+///   see `VolumeManifest::dek_uuid`) *and* the chunk lands at the same
+///   `page_id` (the IV folds it in, so a different offset changes the
+///   nonce).
+///
+/// Any enc↔unenc mix, distinct crypto identity, or page-offset shift
+/// fails the test — the caller must then *recrypt* (decrypt under the
+/// source identity, re-encrypt under the destination identity) instead
+/// of rebinding, or it would silently produce an undecryptable
+/// destination page.
+pub fn rebind_is_sound(
+    src_encrypted: bool,
+    src_dek_uuid: [u8; 16],
+    src_page: PageId,
+    dst_encrypted: bool,
+    dst_dek_uuid: [u8; 16],
+    dst_page: PageId,
+) -> bool {
+    match (src_encrypted, dst_encrypted) {
+        (false, false) => true,
+        (true, true) => src_dek_uuid == dst_dek_uuid && src_page == dst_page,
+        _ => false,
+    }
+}
+
 /// Per-page clone shared by [`PageCache::clone_page_range`] (same
 /// volume, `src` and `dst` are the same `Arc`) and the cross-volume
 /// ODX path (distinct volumes on the same backend + matching pool
@@ -1420,16 +1455,22 @@ fn copy_pages_idx(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// 1. **Source dirty in cache** — copy the cached bytes and install
 ///    them as a dirty page on the destination. One memcpy, no pool
 ///    or backend IO.
-/// 2. **Source clean and `Uploaded`, same pool namespace** — rebind
-///    `dst`'s page-index slot to the source's chunk hash and mark
-///    the destination's upload state `Uploaded`. Zero data IO; the
-///    chunk now has two page-index references.
-/// 3. **Source `LocalOnly` (pending upload) OR cross-pool mismatch**
-///    — full bytes copy through `acquire_page` + `install_full_page`.
-///    Cross-pool happens when the two volumes are scoped
-///    `DedupScope::Local` to different namespaces; the hash isn't
-///    reachable from `dst`'s pool, so a rebind would leave the
-///    destination unable to read the chunk back.
+/// 2. **Source clean and `Uploaded`, same pool namespace, rebind
+///    sound** — rebind `dst`'s page-index slot to the source's chunk
+///    hash and mark the destination's upload state `Uploaded`. Zero
+///    data IO; the chunk now has two page-index references.
+/// 3. **Source `LocalOnly` (pending upload), cross-pool mismatch, OR
+///    cross-crypto-identity / cross-offset** — full bytes copy
+///    (a *recrypt*) through `acquire_page` (decrypts under the source
+///    identity) + `install_full_page` (re-encrypts under the
+///    destination identity on the next seal). Cross-pool happens when
+///    the two volumes are scoped `DedupScope::Local` to different
+///    namespaces; the hash isn't reachable from `dst`'s pool. The
+///    crypto check ([`rebind_is_sound`]) additionally catches encrypted
+///    volumes that don't share a DEK/`dek_uuid`, a rebind to a
+///    different page offset (the IV folds in `page_id`), and any
+///    enc↔unenc mix — each of which would otherwise leave the
+///    destination unable to decrypt the rebound chunk.
 async fn clone_one_page_into(
     src: &PageCache,
     src_id: PageId,
@@ -1459,13 +1500,43 @@ async fn clone_one_page_into(
         dst.install_full_page(dst_id, bytes).await?;
         return Ok(());
     }
-    // Case 3 trigger B — cross-pool: source and destination live in
-    // distinct chunk pools (different backend or different Local
-    // namespace), so the source's hash isn't addressable from
-    // `dst.pool`. Fall back to bytes copy.
+    // Case 3 trigger B — cross-pool OR cross-crypto-identity: a hash
+    // rebind only yields a readable destination page when the source's
+    // chunk is addressable from `dst`'s pool (same backend + namespace)
+    // AND the destination can reconstruct its (key, IV) — see
+    // `rebind_is_sound`. Otherwise route the page through plaintext: a
+    // recrypt where `acquire_page` decrypts under the source identity
+    // and `install_full_page` re-encrypts under the destination identity
+    // on the next seal. This covers cross-pool, distinct encrypted
+    // identities, cross-offset rebinds, and any enc<->unenc mix.
     let same_pool = src.writer.manifest().backend == dst.writer.manifest().backend
         && src.writer.manifest().pool_namespace() == dst.writer.manifest().pool_namespace();
-    if !same_pool {
+    let rebind_ok = same_pool
+        && rebind_is_sound(
+            src.writer.manifest().is_encrypted(),
+            src.writer.manifest().dek_uuid(),
+            src_id,
+            dst.writer.manifest().is_encrypted(),
+            dst.writer.manifest().dek_uuid(),
+            dst_id,
+        );
+    if !rebind_ok {
+        // Preserve sparse holes (thin provisioning): a clean source page
+        // with no page-index entry is a hole — clear the destination
+        // rather than materializing a re-encrypted zero page. (Source is
+        // clean and `Uploaded` here; Case 1 / Case 3A already returned
+        // for the dirty / pending cases.)
+        if src.writer.page_index().get_entry(src_id)?.is_none() {
+            {
+                let mut inner = dst.inner.lock().await;
+                inner.drop_entry(dst_id);
+            }
+            dst.writer.page_index().clear(dst_id)?;
+            dst.writer
+                .upload_index()
+                .set(dst_id, UploadState::Uploaded)?;
+            return Ok(());
+        }
         let bytes = src.acquire_page(src_id).await?;
         dst.install_full_page(dst_id, bytes).await?;
         return Ok(());
@@ -2672,6 +2743,261 @@ mod tests {
 
         let read = c_dst.read_bytes(0, PAGE).await.unwrap();
         assert_eq!(read, bytes);
+    }
+
+    // ──────────── cross-crypto-identity recrypt (issue #88) ────────────
+    //
+    // A cross-volume hash-rebind is only sound when the destination can
+    // reconstruct the chunk's (key, IV). These tests pin that the copy
+    // path rebinds when (and only when) that holds, and otherwise
+    // recrypts (decrypt-source / re-encrypt-dest) instead of producing
+    // an undecryptable destination page.
+
+    /// Open a volume; `key = Some(..)` makes it encrypted (the writer
+    /// retains the DEK directly, no keystore needed for tests), and
+    /// `crypto_uuid` inherits a source crypto identity (the clone case).
+    async fn open_vol(
+        tmp: &std::path::Path,
+        backend: Arc<dyn ObjectStoreBackend>,
+        name: &str,
+        size_bytes: u64,
+        dedup: DedupScope,
+        key: Option<[u8; 32]>,
+        crypto_uuid: Option<[u8; 16]>,
+    ) -> Arc<VolumeWriter> {
+        let mut m = VolumeManifest::new(
+            name.into(),
+            size_bytes,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            dedup,
+            false,
+            0,
+        )
+        .unwrap();
+        if key.is_some() {
+            m = m.with_encryption(crate::volume::VolumeEncryptionAlgorithm::Aes256Gcm);
+        }
+        if let Some(cu) = crypto_uuid {
+            m = m.with_crypto_uuid(cu);
+        }
+        m.create(tmp).unwrap();
+        match key {
+            Some(k) => Arc::new(VolumeWriter::open_with_key(tmp, name, backend, k).unwrap()),
+            None => Arc::new(VolumeWriter::open(tmp, name, backend).unwrap()),
+        }
+    }
+
+    async fn enc_backend() -> (TempDir, Arc<dyn ObjectStoreBackend>) {
+        let tmp = TempDir::new().unwrap();
+        let cloud = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let backend = LocalBackend::new(&cloud).await.unwrap();
+        (tmp, Arc::new(backend) as Arc<dyn ObjectStoreBackend>)
+    }
+
+    #[tokio::test]
+    async fn clone_cross_identity_encrypted_recrypts_not_rebinds() {
+        // Two independently-keyed encrypted volumes, Global dedup (so
+        // they share the pool namespace and same_pool is true). A rebind
+        // would bind the destination to ciphertext sealed under the
+        // source DEK -> undecryptable. The fix must recrypt: distinct
+        // ciphertext hash on the destination, identical plaintext.
+        let (tmp, backend) = enc_backend().await;
+        let w_src = open_vol(
+            tmp.path(),
+            backend.clone(),
+            "src_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x11u8; 32]),
+            None,
+        )
+        .await;
+        let w_dst = open_vol(
+            tmp.path(),
+            backend,
+            "dst_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x22u8; 32]),
+            None,
+        )
+        .await;
+        assert_ne!(w_src.manifest().dek_uuid(), w_dst.manifest().dek_uuid());
+        let c_src = PageCache::new(w_src.clone());
+        let c_dst = PageCache::new(w_dst.clone());
+
+        let bytes = pattern(0x5A, PAGE);
+        c_src.write_bytes(0, &bytes).await.unwrap();
+        c_src.flush_all().await.unwrap();
+        let src_hash = w_src.page_index().get(0).unwrap().unwrap();
+
+        c_src
+            .clone_page_range_into(0, &c_dst, 0, PAGE as u64)
+            .await
+            .unwrap();
+
+        let read = c_dst.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(
+            read, bytes,
+            "cross-identity copy must read back as source plaintext"
+        );
+        c_dst.flush_all().await.unwrap();
+        let dst_hash = w_dst.page_index().get(0).unwrap().unwrap();
+        assert_ne!(
+            dst_hash, src_hash,
+            "recrypt must mint distinct ciphertext under the dest DEK, not rebind the source hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_same_identity_same_offset_still_rebinds() {
+        // Destination shares the source crypto identity (the clone case)
+        // and the page lands at the same offset -> the zero-copy hash
+        // rebind must be preserved (guards against over-broadening the
+        // predicate and regressing the encrypted-clone fast path).
+        let (tmp, backend) = enc_backend().await;
+        let w_src = open_vol(
+            tmp.path(),
+            backend.clone(),
+            "src_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x33u8; 32]),
+            None,
+        )
+        .await;
+        let src_dek_uuid = w_src.manifest().dek_uuid();
+        let w_dst = open_vol(
+            tmp.path(),
+            backend,
+            "dst_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x33u8; 32]),
+            Some(src_dek_uuid),
+        )
+        .await;
+        let c_src = PageCache::new(w_src.clone());
+        let c_dst = PageCache::new(w_dst.clone());
+
+        let bytes = pattern(0x6B, PAGE);
+        c_src.write_bytes(0, &bytes).await.unwrap();
+        c_src.flush_all().await.unwrap();
+        let src_hash = w_src.page_index().get(0).unwrap().unwrap();
+
+        c_src
+            .clone_page_range_into(0, &c_dst, 0, PAGE as u64)
+            .await
+            .unwrap();
+
+        let dst_hash = w_dst.page_index().get(0).unwrap().unwrap();
+        assert_eq!(
+            dst_hash, src_hash,
+            "same identity + same offset must hash-rebind"
+        );
+        let read = c_dst.read_bytes(0, PAGE).await.unwrap();
+        assert_eq!(read, bytes);
+    }
+
+    #[tokio::test]
+    async fn clone_cross_offset_same_identity_recrypts() {
+        // Same crypto identity but the chunk lands at a DIFFERENT page
+        // offset. The IV folds in page_id, so a rebind would be
+        // undecryptable even with the same DEK -> must recrypt.
+        let (tmp, backend) = enc_backend().await;
+        let w_src = open_vol(
+            tmp.path(),
+            backend.clone(),
+            "src_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x44u8; 32]),
+            None,
+        )
+        .await;
+        let src_dek_uuid = w_src.manifest().dek_uuid();
+        let w_dst = open_vol(
+            tmp.path(),
+            backend,
+            "dst_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x44u8; 32]),
+            Some(src_dek_uuid),
+        )
+        .await;
+        let c_src = PageCache::new(w_src.clone());
+        let c_dst = PageCache::new(w_dst.clone());
+
+        let bytes = pattern(0x7C, PAGE);
+        c_src.write_bytes(0, &bytes).await.unwrap();
+        c_src.flush_all().await.unwrap();
+
+        // src page 0 -> dst page 1.
+        c_src
+            .clone_page_range_into(0, &c_dst, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+
+        let read = c_dst.read_bytes(PAGE as u64, PAGE).await.unwrap();
+        assert_eq!(
+            read, bytes,
+            "cross-offset encrypted copy must recrypt + read back correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_enc_to_unenc_and_unenc_to_enc_recrypt() {
+        // enc -> unenc: destination must hold plaintext (so a plain read
+        // returns the data, not ciphertext). unenc -> enc: destination
+        // must hold ciphertext that decrypts back to the source bytes.
+        let (tmp, backend) = enc_backend().await;
+        let w_enc = open_vol(
+            tmp.path(),
+            backend.clone(),
+            "enc_vol",
+            8 << 20,
+            DedupScope::Global,
+            Some([0x55u8; 32]),
+            None,
+        )
+        .await;
+        let w_plain = open_vol(
+            tmp.path(),
+            backend,
+            "plain_vol",
+            8 << 20,
+            DedupScope::Global,
+            None,
+            None,
+        )
+        .await;
+        let c_enc = PageCache::new(w_enc.clone());
+        let c_plain = PageCache::new(w_plain.clone());
+
+        let bytes = pattern(0x8D, PAGE);
+
+        // enc -> unenc
+        c_enc.write_bytes(0, &bytes).await.unwrap();
+        c_enc.flush_all().await.unwrap();
+        c_enc
+            .clone_page_range_into(0, &c_plain, 0, PAGE as u64)
+            .await
+            .unwrap();
+        assert_eq!(c_plain.read_bytes(0, PAGE).await.unwrap(), bytes);
+
+        // unenc -> enc (use page 1 to avoid overlap with the above)
+        let bytes2 = pattern(0x9E, PAGE);
+        c_plain.write_bytes(PAGE as u64, &bytes2).await.unwrap();
+        c_plain.flush_all().await.unwrap();
+        c_plain
+            .clone_page_range_into(PAGE as u64, &c_enc, PAGE as u64, PAGE as u64)
+            .await
+            .unwrap();
+        assert_eq!(c_enc.read_bytes(PAGE as u64, PAGE).await.unwrap(), bytes2);
     }
 
     // ─────────────────────── intrusive LRU coverage ───────────────────────

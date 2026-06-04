@@ -32,11 +32,58 @@
 //! implementation's snapshot capability).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use core_block::PageCache;
+use core_block::page_index::ChunkHash;
+use core_block::uploader::UploaderError;
 use rand::RngCore;
 use shared_pool::PoolPinGuard;
+
+/// Source-side decryptor a live ROD token retains so `WRITE USING
+/// TOKEN` can recrypt its pinned snapshot chunks under the *source*
+/// crypto identity when the destination cannot reconstruct their
+/// (key, IV) — i.e. the two volumes have distinct crypto identities,
+/// the chunk lands at a different page offset, or one side is
+/// unencrypted (see [`core_block::rebind_is_sound`]). Implemented by
+/// [`core_block::PageCache`] (delegating to the source `VolumeWriter`);
+/// the token holds it as `Arc<dyn SourceDecryptor>` so the chunk's
+/// decrypt key stays reachable for the token's lifetime even if the
+/// source volume is closed or deleted before `WRITE USING TOKEN`
+/// arrives. Holding the source handle (rather than re-resolving the
+/// source LUN at write time) also closes a LUN-reuse hole: a recycled
+/// `source_lun` could otherwise point the recrypt at an unrelated
+/// volume's data.
+#[async_trait]
+pub trait SourceDecryptor: Send + Sync {
+    /// Decrypt the pinned chunk identified by (`hash`, `iv_salt`) under
+    /// the source identity, deriving the IV from `source_page_id`.
+    /// Returns plaintext (or the chunk bytes verbatim for an
+    /// unencrypted source).
+    async fn decrypt_chunk(
+        &self,
+        source_page_id: u32,
+        hash: ChunkHash,
+        iv_salt: u64,
+    ) -> Result<Vec<u8>, UploaderError>;
+}
+
+#[async_trait]
+impl SourceDecryptor for PageCache {
+    async fn decrypt_chunk(
+        &self,
+        source_page_id: u32,
+        hash: ChunkHash,
+        iv_salt: u64,
+    ) -> Result<Vec<u8>, UploaderError> {
+        self.writer()
+            .decrypt_page_at(source_page_id, &hash, iv_salt)
+            .await
+    }
+}
 
 /// Default ROD token inactivity timeout, published in VPD 0x8F
 /// descriptor `0x0000`. Hosts that don't override via the POPULATE
@@ -79,6 +126,21 @@ pub struct TokenState {
     /// nonce the ciphertext was sealed under. `0` for sparse holes and
     /// unencrypted sources.
     pub iv_salts: Vec<u64>,
+    /// Whether the source volume encrypts at rest, captured at
+    /// POPULATE TOKEN so `WRITE USING TOKEN` can choose rebind-vs-recrypt
+    /// without re-reading the (possibly mutated/closed) source manifest.
+    pub source_encrypted: bool,
+    /// Source volume's crypto identity (`dek_uuid()`), captured at
+    /// POPULATE TOKEN. The destination may hash-rebind only if it shares
+    /// this (and the page lands at the same offset); otherwise the
+    /// snapshot chunks are recrypted via [`Self::source_decryptor`]
+    /// (issue #88).
+    pub source_dek_uuid: [u8; 16],
+    /// Decrypt handle for the source's pinned snapshot chunks, retained
+    /// for the token's lifetime so the recrypt path can read them back
+    /// under the source identity even if the source volume is closed or
+    /// deleted before `WRITE USING TOKEN` arrives.
+    pub source_decryptor: Arc<dyn SourceDecryptor>,
     /// Sum of block counts across every range descriptor. Reported
     /// back via RRTI's TRANSFER COUNT field on the corresponding
     /// WRITE USING TOKEN job.
@@ -101,8 +163,9 @@ pub struct TokenState {
 #[allow(dead_code)]
 pub struct TokenSnapshot {
     /// Source volume's UUID at POPULATE TOKEN time. Surfaced for
-    /// future per-source attribution; not consulted by the v1
-    /// WRITE USING TOKEN path which trusts the snapshot hashes.
+    /// future per-source attribution; the WRITE USING TOKEN path keys
+    /// its rebind-vs-recrypt decision on `source_dek_uuid` /
+    /// `source_decryptor` instead, so this field itself is not consulted.
     pub source_volume_uuid: [u8; 16],
     pub source_lun: u64,
     pub source_backend: String,
@@ -116,6 +179,14 @@ pub struct TokenSnapshot {
     pub hashes: Vec<Option<[u8; 32]>>,
     /// Per-page IV salts, parallel to `hashes` (issue #87).
     pub iv_salts: Vec<u64>,
+    /// Whether the source volume encrypts at rest (issue #88).
+    pub source_encrypted: bool,
+    /// Source crypto identity (`dek_uuid()`) — rebind is sound only if
+    /// the destination shares it and the page offset matches.
+    pub source_dek_uuid: [u8; 16],
+    /// Decrypt handle for the source's pinned snapshot chunks, used by
+    /// the WRITE USING TOKEN recrypt path.
+    pub source_decryptor: Arc<dyn SourceDecryptor>,
 }
 
 /// Outcome of a POPULATE TOKEN or WRITE USING TOKEN job, keyed by
@@ -280,6 +351,9 @@ impl TokenManager {
             source_pages: st.source_pages.clone(),
             hashes: st.hashes.clone(),
             iv_salts: st.iv_salts.clone(),
+            source_encrypted: st.source_encrypted,
+            source_dek_uuid: st.source_dek_uuid,
+            source_decryptor: st.source_decryptor.clone(),
         })
     }
 
@@ -377,6 +451,24 @@ impl Default for TokenManager {
 mod tests {
     use super::*;
 
+    /// Trivial decryptor for the token-manager unit tests, which
+    /// exercise TTL / mint / sweep logic and never drive the recrypt
+    /// path. The cross-identity recrypt itself is covered end-to-end in
+    /// the `data_path` ODX tests against real encrypted volumes.
+    struct StubDecryptor;
+
+    #[async_trait]
+    impl SourceDecryptor for StubDecryptor {
+        async fn decrypt_chunk(
+            &self,
+            _source_page_id: u32,
+            _hash: ChunkHash,
+            _iv_salt: u64,
+        ) -> Result<Vec<u8>, UploaderError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn dummy_state(deadline: Instant, total_blocks: u64) -> TokenState {
         TokenState {
             source_volume_uuid: [0u8; 16],
@@ -388,6 +480,9 @@ mod tests {
             source_pages: vec![0, 1],
             hashes: vec![Some([0xAAu8; 32]), Some([0xBBu8; 32])],
             iv_salts: vec![0, 0],
+            source_encrypted: false,
+            source_dek_uuid: [0u8; 16],
+            source_decryptor: Arc::new(StubDecryptor),
             total_blocks,
             deadline,
             pins: Vec::new(),

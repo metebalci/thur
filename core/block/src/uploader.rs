@@ -1115,14 +1115,38 @@ impl VolumeWriter {
         if let Err(e) = self.lru_index.touch(page_id, now_unix_secs()) {
             self.note_lru_touch_failed(page_id, &e);
         }
-        let hash_hex = hex::encode(entry.hash);
+        let out = self
+            .fetch_and_decrypt(page_id, &entry.hash, entry.iv_salt)
+            .await?;
+        Ok(Some(out))
+    }
+
+    /// Fetch the chunk identified by `hash` (local pool, else cloud
+    /// refetch) and, for an encrypted volume, decrypt it under this
+    /// volume's identity using `derive_iv(dek_uuid(), page_id, iv_salt)`.
+    /// Returns `(plaintext, cloud_bytes)` where `cloud_bytes` is the
+    /// cache-miss download size (`0` on a local-pool hit). For an
+    /// unencrypted volume the pool bytes are returned verbatim.
+    ///
+    /// Shared by [`Self::read_page`] (which supplies the page's own
+    /// `pages.idx` hash + salt) and [`Self::decrypt_page_at`] (which
+    /// supplies an explicit snapshot hash + salt for the ODX recrypt
+    /// path), so the cloud-miss accounting, ghost-list probe, and
+    /// decrypt logic can never diverge between the two.
+    async fn fetch_and_decrypt(
+        &self,
+        page_id: PageId,
+        hash: &ChunkHash,
+        iv_salt: u64,
+    ) -> Result<(Vec<u8>, u64), UploaderError> {
+        let hash_hex = hex::encode(hash);
         // `cloud_bytes` is the cache-miss download size — 0 on a
         // local-pool hit, the fetched length on a cloud miss.
         let (payload, cloud_bytes) = if self.pool.exists(&hash_hex) {
             (self.pool.read_bytes(&hash_hex)?, 0u64)
         } else {
             if let Some(gl) = self.ghost_list.as_ref()
-                && let Some(age) = gl.lookup(&entry.hash, now_unix_secs())
+                && let Some(age) = gl.lookup(hash, now_unix_secs())
             {
                 shared_telemetry::record::cache_miss_after_eviction(gl.backend(), age as f64);
             }
@@ -1157,21 +1181,42 @@ impl VolumeWriter {
         // the per-page salt read back from the page record (issue #87);
         // pre-salt records carry salt 0, reproducing the original IV.
         if let Some(key) = self.encryption_key.as_ref() {
-            let iv = shared_crypto::derive_iv(
-                &self.manifest.dek_uuid(),
-                u64::from(page_id),
-                entry.iv_salt,
-            );
+            let iv =
+                shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), iv_salt);
             let plaintext =
                 shared_crypto::decrypt_block(key, &iv, &payload).map_err(|e| match e {
                     CryptoError::Decrypt(msg) => UploaderError::Decrypt(msg),
                     CryptoError::Input(_) => UploaderError::Decrypt("invalid decrypt input"),
                     CryptoError::Encrypt => UploaderError::Decrypt("encrypt error during decrypt"),
                 })?;
-            Ok(Some((plaintext, cloud_bytes)))
+            Ok((plaintext, cloud_bytes))
         } else {
-            Ok(Some((payload, cloud_bytes)))
+            Ok((payload, cloud_bytes))
         }
+    }
+
+    /// Decrypt the chunk identified by (`hash`, `iv_salt`) under *this*
+    /// volume's crypto identity, deriving the IV from `page_id` exactly
+    /// as the sealing write did. Returns plaintext (or the chunk bytes
+    /// verbatim for an unencrypted volume).
+    ///
+    /// Unlike [`Self::read_page`], the chunk is addressed by an explicit
+    /// hash rather than by reading this volume's *current* `pages.idx`
+    /// binding for `page_id`. This is the ODX `WRITE USING TOKEN` recrypt
+    /// input: the copy manager must turn the *pinned snapshot chunk*
+    /// (frozen at `POPULATE TOKEN`) back into plaintext under the source
+    /// identity, regardless of whether the host has since overwritten the
+    /// live source page — so it passes the snapshot's `(hash, page_id,
+    /// iv_salt)`, not the live page binding. `page_id` must be the
+    /// *source* page the chunk was sealed under (the IV folds it in).
+    pub async fn decrypt_page_at(
+        &self,
+        page_id: PageId,
+        hash: &ChunkHash,
+        iv_salt: u64,
+    ) -> Result<Vec<u8>, UploaderError> {
+        let (plaintext, _cloud_bytes) = self.fetch_and_decrypt(page_id, hash, iv_salt).await?;
+        Ok(plaintext)
     }
 }
 
@@ -1735,6 +1780,33 @@ mod tests {
         let on_disk = writer.pool().read_bytes(&outcome.hash_hex).unwrap();
         assert_eq!(on_disk.len(), plaintext.len() + shared_crypto::TAG_LEN);
         assert_ne!(&on_disk[..plaintext.len()], plaintext.as_slice());
+    }
+
+    #[tokio::test]
+    async fn decrypt_page_at_returns_snapshot_plaintext() {
+        // `decrypt_page_at` is the ODX recrypt input: given a chunk's
+        // (hash, iv_salt) and the SOURCE page_id it was sealed under, it
+        // returns the original plaintext under this volume's identity.
+        let (tmp, name, backend, key) = encrypted_fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open_with_key(tmp.path(), &name, backend, key).unwrap();
+        let plaintext = page_bytes(0x5A);
+        writer.write_page(3, &plaintext).await.unwrap();
+        let entry = writer.page_index().get_entry(3).unwrap().unwrap();
+
+        let got = writer
+            .decrypt_page_at(3, &entry.hash, entry.iv_salt)
+            .await
+            .unwrap();
+        assert_eq!(got, plaintext);
+
+        // page_id is folded into the IV, so decrypting the same chunk
+        // under a different page_id must fail the GCM tag — exactly why a
+        // cross-offset hash-rebind is unsound for encrypted volumes.
+        let wrong = writer.decrypt_page_at(4, &entry.hash, entry.iv_salt).await;
+        assert!(
+            matches!(wrong, Err(UploaderError::Decrypt(_))),
+            "wrong page_id must fail decrypt, got {wrong:?}"
+        );
     }
 
     #[tokio::test]
