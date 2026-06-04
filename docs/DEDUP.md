@@ -403,22 +403,26 @@ VSA volume encryption is **opt-in per volume** (`volume create --encrypt
 is encrypted **before** it is hashed — the pool stores ciphertext, and the
 content address is computed over ciphertext.
 
-The per-page IV is derived from `(volume_uuid, page_id, 0)`. The
-consequences for dedup are:
+The per-page IV is derived from `(crypto_uuid, page_id, iv_salt)`, where
+`crypto_uuid` is the volume's crypto identity and `iv_salt` is a fresh
+random per-seal value stored in the page's `pages.idx` record (issue #87,
+to eliminate AES-GCM nonce reuse). The consequences for dedup are:
 
 - **Cross-volume dedup is defeated** — two encrypted volumes with
-  different DEKs produce different ciphertext for the same plaintext page,
-  so no pool collision occurs.
+  different DEKs (distinct `crypto_uuid`) produce different ciphertext for
+  the same plaintext page, so no pool collision occurs.
 - **Cross-page dedup within a volume is defeated** — the IV is bound to
   `page_id`, so the same plaintext at two different page positions encrypts
   to different ciphertext.
-- A page rewritten with identical content at the *same* `page_id` still
-  maps to the same ciphertext, making an idempotent rewrite a local-pool
-  hit — but that is the only dedup an encrypted volume ever sees.
+- **Even an idempotent rewrite is defeated** — a fresh `iv_salt` per seal
+  means rewriting a page with identical content at the *same* `page_id`
+  produces a new IV → new ciphertext → new pool chunk (the superseded one
+  becomes a GC orphan). An encrypted volume therefore sees **no** dedup at
+  all; this is the deliberate cost of guaranteeing nonce uniqueness.
 
-This is the same content-vs.-key tension as VTL's AME. Plaintext volumes
-dedup normally within their scope; for at-rest custody combined with
-meaningful dedup, the right approach is bucket-level SSE.
+This is the same content-vs.-key tension as VTL's AME, taken to its limit.
+Plaintext volumes dedup normally within their scope; for at-rest custody
+combined with meaningful dedup, the right approach is bucket-level SSE.
 
 ## Eviction & GC
 

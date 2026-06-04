@@ -32,7 +32,7 @@ pub use chunk_pool::{ChunkPool, ChunkPoolError};
 // shared-pool dep just for the type.
 pub use disk_cache::{DiskCacheManager, refresh_pool_budget_from_volumes};
 pub use lru_index::{LruIndexError, LruIndexFile};
-pub use page_index::{PageIndex, PageIndexError};
+pub use page_index::{PageEntry, PageIndex, PageIndexError};
 pub use runtime_state::VolumeRuntime;
 pub use shared_pool::{DiskCacheBounds, DiskCacheSize};
 pub use snapshot::{SnapshotManifest, crypto_identity_referenced};

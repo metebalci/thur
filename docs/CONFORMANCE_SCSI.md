@@ -1315,12 +1315,20 @@ restored separately. The gap is tracked in the issue tracker.
 **On the data path** ([`../core/block/src/uploader.rs`](../core/block/src/uploader.rs)):
 
 - **Write:** plaintext page → AES-256-GCM encrypt with IV =
-  `derive_iv(volume_uuid, page_id, 0)` → ciphertext+tag (page_size +
-  16 B) → BLAKE3-hash → chunk pool insert → backend upload.
+  `derive_iv(crypto_uuid, page_id, iv_salt)` → ciphertext+tag
+  (page_size + 16 B) → BLAKE3-hash → chunk pool insert → backend
+  upload. `crypto_uuid` is the volume's crypto identity (`dek_uuid()`:
+  its own `uuid`, or the inherited source identity for a clone — issue
+  #86). `iv_salt` is a fresh random per-seal value persisted in the
+  page's `pages.idx` record (issue #87), so every rewrite and every
+  divergent clone write gets a unique nonce.
 - **Read:** chunk pool / storage fetch → ciphertext+tag → AES-256-GCM
-  decrypt → plaintext page → SCSI READ buffer.
-- IV is never stored on disk; re-derived from the same identity
-  tuple at decrypt time. Same pattern as VTL tape AME
+  decrypt with the IV re-derived from the page record's stored
+  `iv_salt` → plaintext page → SCSI READ buffer.
+- The IV itself is never stored; only its `iv_salt` input lives on
+  disk (in `pages.idx`). A pre-salt (v1) record reads `iv_salt = 0`,
+  reproducing the original IV so existing encrypted volumes keep
+  decrypting. Same re-derivation pattern as VTL tape AME
   ([`../core/stream/src/block_index.rs`](../core/stream/src/block_index.rs)).
 - Key zeroized on `VolumeWriter::Drop` (volume close, daemon
   shutdown).

@@ -58,7 +58,7 @@ use crate::page_index::{ChunkHash, PageId, PageIndex, PageIndexError};
 use crate::runtime_state::VolumeRuntime;
 use crate::upload_index::{UploadIndexError, UploadIndexFile, UploadState};
 use crate::volume::{SyncAfter, VolumeError, VolumeManifest};
-use shared_crypto::{CryptoError, KEY_LEN};
+use shared_crypto::{CryptoError, KEY_LEN, OsRng, RngCore};
 
 /// Default backpressure wait deadline used when a `VolumeWriter` is
 /// built without a daemon-supplied budget. Matches `core-stream`'s
@@ -885,17 +885,27 @@ impl VolumeWriter {
         }
 
         // Encrypt-on-write: AES-256-GCM with per-page IV derived from
-        // (crypto_uuid, page_id, 0). `dek_uuid()` is the volume's own
-        // uuid for a fresh volume, or the inherited source identity for
-        // a clone of an encrypted volume (issue #86) so the clone's
-        // shared chunks stay decryptable. For encrypted volumes the
-        // BLAKE3 hash that follows runs over ciphertext, which means two
-        // encrypted volumes with the same plaintext never collide in
-        // the chunk pool — a feature, not a bug (cross-volume sharing
-        // of encrypted data would defeat the encryption boundary).
+        // (crypto_uuid, page_id, iv_salt). `dek_uuid()` is the volume's
+        // own uuid for a fresh volume, or the inherited source identity
+        // for a clone of an encrypted volume (issue #86) so the clone's
+        // shared chunks stay decryptable. `iv_salt` is a fresh random
+        // per-seal value (issue #87): it is persisted in this page's
+        // `pages.idx` record and folded back into the IV at read time,
+        // so every distinct seal of a page — an in-place rewrite, or a
+        // divergent write on a clone that still shares the source's
+        // crypto identity — gets a unique nonce, eliminating the GCM
+        // nonce reuse that a deterministic `counter_b = 0` caused. For
+        // encrypted volumes the BLAKE3 hash that follows runs over
+        // ciphertext, which means two encrypted volumes with the same
+        // plaintext never collide in the chunk pool — a feature, not a
+        // bug (cross-volume sharing of encrypted data would defeat the
+        // encryption boundary).
         let ciphertext;
+        let mut iv_salt: u64 = 0;
         let payload: &[u8] = if let Some(key) = self.encryption_key.as_ref() {
-            let iv = shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), 0);
+            iv_salt = OsRng.next_u64();
+            let iv =
+                shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), iv_salt);
             ciphertext = shared_crypto::encrypt_block(key, &iv, bytes)
                 .map_err(|e: CryptoError| UploaderError::Encrypt(e.to_string()))?;
             &ciphertext
@@ -963,7 +973,8 @@ impl VolumeWriter {
         // only buffers (pwrite to the OS page cache); the trailing
         // `page_index_sync` in the flush drain — or a concurrent
         // SYNC's own `page_index_sync` — fsyncs it.
-        self.page_index.set_unsynced(page_id, &hash_bytes)?;
+        self.page_index
+            .set_unsynced_salted(page_id, &hash_bytes, iv_salt)?;
 
         // Build the shared upload payload once — both the async and
         // inline dispatch paths use it. `object_key` derivation is
@@ -1095,7 +1106,7 @@ impl VolumeWriter {
         &self,
         page_id: PageId,
     ) -> Result<Option<(Vec<u8>, u64)>, UploaderError> {
-        let Some(hash) = self.page_index.get(page_id)? else {
+        let Some(entry) = self.page_index.get_entry(page_id)? else {
             return Ok(None);
         };
         // LRU sidecar touch — fires on every read of an allocated
@@ -1104,14 +1115,14 @@ impl VolumeWriter {
         if let Err(e) = self.lru_index.touch(page_id, now_unix_secs()) {
             self.note_lru_touch_failed(page_id, &e);
         }
-        let hash_hex = hex::encode(hash);
+        let hash_hex = hex::encode(entry.hash);
         // `cloud_bytes` is the cache-miss download size — 0 on a
         // local-pool hit, the fetched length on a cloud miss.
         let (payload, cloud_bytes) = if self.pool.exists(&hash_hex) {
             (self.pool.read_bytes(&hash_hex)?, 0u64)
         } else {
             if let Some(gl) = self.ghost_list.as_ref()
-                && let Some(age) = gl.lookup(&hash, now_unix_secs())
+                && let Some(age) = gl.lookup(&entry.hash, now_unix_secs())
             {
                 shared_telemetry::record::cache_miss_after_eviction(gl.backend(), age as f64);
             }
@@ -1141,10 +1152,16 @@ impl VolumeWriter {
         // Decrypt-on-read: for encrypted volumes the bytes we just
         // pulled from pool / cloud are ciphertext-plus-tag and must
         // be peeled back to plaintext before returning to the SCSI
-        // READ handler. IV is re-derived from the same identity
-        // tuple used at write time, no per-chunk metadata required.
+        // READ handler. IV is re-derived from the same identity tuple
+        // used at write time — `(crypto_uuid, page_id, iv_salt)` — with
+        // the per-page salt read back from the page record (issue #87);
+        // pre-salt records carry salt 0, reproducing the original IV.
         if let Some(key) = self.encryption_key.as_ref() {
-            let iv = shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), 0);
+            let iv = shared_crypto::derive_iv(
+                &self.manifest.dek_uuid(),
+                u64::from(page_id),
+                entry.iv_salt,
+            );
             let plaintext =
                 shared_crypto::decrypt_block(key, &iv, &payload).map_err(|e| match e {
                     CryptoError::Decrypt(msg) => UploaderError::Decrypt(msg),
@@ -1761,5 +1778,92 @@ mod tests {
         // No encrypt-on-write happened, so the read returns the
         // plaintext we put in.
         assert_eq!(read_back, Some((bytes, 0)));
+    }
+
+    #[tokio::test]
+    async fn rewrite_draws_a_fresh_iv_salt() {
+        // Single-volume rewrite case (issue #87): overwriting a page
+        // with new plaintext must seal under a fresh nonce, not reuse
+        // the previous (key, IV).
+        let (tmp, name, backend, key) = encrypted_fixture(DedupScope::Global).await;
+        let writer = VolumeWriter::open_with_key(tmp.path(), &name, backend, key).unwrap();
+
+        writer.write_page(5, &page_bytes(0xA1)).await.unwrap();
+        let salt1 = writer.page_index().get_entry(5).unwrap().unwrap().iv_salt;
+
+        let plain2 = page_bytes(0xA2);
+        writer.write_page(5, &plain2).await.unwrap();
+        let salt2 = writer.page_index().get_entry(5).unwrap().unwrap().iv_salt;
+
+        assert_ne!(salt1, salt2, "a page rewrite must draw a fresh IV salt");
+        // The current plaintext still reads back through the salted IV.
+        assert_eq!(writer.read_page(5).await.unwrap().unwrap().0, plain2);
+    }
+
+    #[tokio::test]
+    async fn diverged_clone_page_seals_under_a_different_iv_than_its_source() {
+        // The encrypted-COW-clone case (issue #87): a source page P and a
+        // *diverged* clone page P are both live, share the same crypto
+        // identity, and sit at the same page_id. Pre-salt they sealed
+        // under one `(DEK, IV)` — a nonce reuse. With the per-page salt
+        // the divergent write draws a fresh salt, so the two live
+        // ciphertexts never share a nonce, while the still-shared
+        // (un-diverged) chunk keeps decrypting against its copied salt.
+        let (tmp, src_name, backend, key) = encrypted_fixture(DedupScope::Global).await;
+        let src = VolumeWriter::open_with_key(tmp.path(), &src_name, backend.clone(), key).unwrap();
+        let src_uuid = src.manifest().uuid;
+
+        let plain_src = page_bytes(0xA2);
+        src.write_page(5, &plain_src).await.unwrap();
+        let src_entry = src.page_index().get_entry(5).unwrap().unwrap();
+
+        // Build a clone sharing the source's crypto identity + DEK + the
+        // global pool (Global scope, same backend). `with_crypto_uuid`
+        // is exactly what `volume clone` of an encrypted volume sets.
+        VolumeManifest::new(
+            "vol-clone".into(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Global,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_encryption(VolumeEncryptionAlgorithm::Aes256Gcm)
+        .with_crypto_uuid(src_uuid)
+        .create(tmp.path())
+        .unwrap();
+        let clone = VolumeWriter::open_with_key(tmp.path(), "vol-clone", backend, key).unwrap();
+
+        // Seed the clone's page 5 with the source's (hash, salt) — what a
+        // wholesale `pages.idx` clone yields: the clone shares the
+        // source ciphertext and reads the source plaintext through the
+        // copied salt.
+        clone
+            .page_index()
+            .set_salted(5, &src_entry.hash, src_entry.iv_salt)
+            .unwrap();
+        assert_eq!(
+            clone.read_page(5).await.unwrap().unwrap().0,
+            plain_src,
+            "an un-diverged shared chunk decrypts against the copied salt"
+        );
+
+        // Diverge the clone's page 5.
+        let plain_clone = page_bytes(0xB1);
+        clone.write_page(5, &plain_clone).await.unwrap();
+        let clone_salt = clone.page_index().get_entry(5).unwrap().unwrap().iv_salt;
+
+        // Same crypto_uuid, same page_id, both live → the salts (hence
+        // the IVs) must differ. No two live ciphertexts share a nonce.
+        assert_ne!(
+            src_entry.iv_salt, clone_salt,
+            "a diverged clone page must seal under a fresh IV salt"
+        );
+        // Each ciphertext is still live and decrypts to its own plaintext.
+        assert_eq!(src.read_page(5).await.unwrap().unwrap().0, plain_src);
+        assert_eq!(clone.read_page(5).await.unwrap().unwrap().0, plain_clone);
     }
 }

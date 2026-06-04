@@ -1477,9 +1477,17 @@ async fn clone_one_page_into(
         let mut inner = dst.inner.lock().await;
         inner.drop_entry(dst_id);
     }
-    match src.writer.page_index().get(src_id)? {
-        Some(hash) => {
-            dst.writer.page_index().set(dst_id, &hash)?;
+    match src.writer.page_index().get_entry(src_id)? {
+        Some(entry) => {
+            // Carry the source page's IV salt across with the hash
+            // (issue #87): the rebound ciphertext was sealed under
+            // `derive_iv(crypto_uuid, src_id, iv_salt)`, so an encrypted
+            // destination that shares the source's crypto identity (a
+            // clone) reads it back with the matching nonce only if the
+            // salt travels with the hash.
+            dst.writer
+                .page_index()
+                .set_salted(dst_id, &entry.hash, entry.iv_salt)?;
             dst.writer
                 .upload_index()
                 .set(dst_id, UploadState::Uploaded)?;

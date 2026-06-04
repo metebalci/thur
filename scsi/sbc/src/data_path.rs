@@ -1774,6 +1774,7 @@ async fn populate_token(
     let page_index = src_cache.writer().page_index();
     let mut source_pages: Vec<u32> = Vec::new();
     let mut hashes: Vec<Option<[u8; 32]>> = Vec::new();
+    let mut iv_salts: Vec<u64> = Vec::new();
     let mut pins: Vec<shared_pool::PoolPinGuard> = Vec::new();
     let mut pinned: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for bd in &bdrds {
@@ -1784,19 +1785,23 @@ async fn populate_token(
         let pages_in_range = ((bd.blocks as u64) * sector / page) as u32;
         for p in 0..pages_in_range {
             let page_id = first_page + p;
-            let hash = match page_index.get(page_id) {
+            // Capture the full entry (hash + IV salt) so WRITE USING
+            // TOKEN can rebind an encrypted source's ciphertext under
+            // the nonce it was sealed with (issue #87).
+            let entry = match page_index.get_entry(page_id) {
                 Ok(opt) => opt,
                 Err(e) => {
                     return ScsiResponse::check(map_read_error(&UploaderError::PageIndex(e)));
                 }
             };
             source_pages.push(page_id);
-            if let Some(h) = hash.as_ref()
-                && pinned.insert(*h)
+            if let Some(e) = entry.as_ref()
+                && pinned.insert(e.hash)
             {
-                pins.push(pool.pin(&hex::encode(h)));
+                pins.push(pool.pin(&hex::encode(e.hash)));
             }
-            hashes.push(hash);
+            hashes.push(entry.as_ref().map(|e| e.hash));
+            iv_salts.push(entry.map(|e| e.iv_salt).unwrap_or(0));
         }
     }
     let ttl = tokens.resolve_ttl(inactivity);
@@ -1810,6 +1815,7 @@ async fn populate_token(
         sector_size: manifest.sector_bytes,
         source_pages,
         hashes,
+        iv_salts,
         total_blocks,
         deadline: std::time::Instant::now() + ttl,
         pins,
@@ -2011,6 +2017,7 @@ async fn write_using_token(
         for p in 0..pages_in_range {
             let dst_page = first_page + p;
             let hash = &snapshot.hashes[snap_idx];
+            let iv_salt = snapshot.iv_salts[snap_idx];
             snap_idx += 1;
             // Drop any cached destination entry so subsequent reads
             // repopulate from the new page-index binding.
@@ -2018,7 +2025,9 @@ async fn write_using_token(
             let res: Result<(), UploaderError> = (|| {
                 match hash {
                     Some(h) => {
-                        dst_pi.set(dst_page, h)?;
+                        // Carry the source page's IV salt so an encrypted
+                        // rebind reads back under the sealing nonce (#87).
+                        dst_pi.set_salted(dst_page, h, iv_salt)?;
                         dst_ui.set(dst_page, UploadState::Uploaded)?;
                     }
                     None => {

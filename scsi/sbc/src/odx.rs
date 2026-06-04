@@ -73,6 +73,12 @@ pub struct TokenState {
     /// BLAKE3 bytes (the same shape `PageIndex` stores). `None`
     /// records a sparse hole (SBC-3 reads-as-zero).
     pub hashes: Vec<Option<[u8; 32]>>,
+    /// `iv_salts[i]` is the per-page AES-GCM IV salt for
+    /// `source_pages[i]` (issue #87), captured alongside the hash so
+    /// `WRITE USING TOKEN` rebinds the destination record with the
+    /// nonce the ciphertext was sealed under. `0` for sparse holes and
+    /// unencrypted sources.
+    pub iv_salts: Vec<u64>,
     /// Sum of block counts across every range descriptor. Reported
     /// back via RRTI's TRANSFER COUNT field on the corresponding
     /// WRITE USING TOKEN job.
@@ -108,6 +114,8 @@ pub struct TokenSnapshot {
     pub sector_size: u32,
     pub source_pages: Vec<u32>,
     pub hashes: Vec<Option<[u8; 32]>>,
+    /// Per-page IV salts, parallel to `hashes` (issue #87).
+    pub iv_salts: Vec<u64>,
 }
 
 /// Outcome of a POPULATE TOKEN or WRITE USING TOKEN job, keyed by
@@ -271,6 +279,7 @@ impl TokenManager {
             sector_size: st.sector_size,
             source_pages: st.source_pages.clone(),
             hashes: st.hashes.clone(),
+            iv_salts: st.iv_salts.clone(),
         })
     }
 
@@ -378,6 +387,7 @@ mod tests {
             sector_size: 4096,
             source_pages: vec![0, 1],
             hashes: vec![Some([0xAAu8; 32]), Some([0xBBu8; 32])],
+            iv_salts: vec![0, 0],
             total_blocks,
             deadline,
             pins: Vec::new(),

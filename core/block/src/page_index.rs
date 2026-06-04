@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! bytes 0..4    magic "CRPI"
-//! bytes 4..8    schema_version (u32 LE) = 1
+//! bytes 4..8    schema_version (u32 LE) = 2
 //! bytes 8..12   record_size (u32 LE) = 64
 //! bytes 12..16  reserved
 //! bytes 16..32  volume_uuid (binds the index to its volume)
@@ -34,16 +34,36 @@
 //! byte 32       flags
 //!                 bit 0  allocated
 //!                 bits 1..8 reserved
-//! bytes 33..64  reserved
+//! bytes 33..40  reserved
+//! bytes 40..48  iv_salt (u64 LE) — per-page AES-GCM nonce salt
+//! bytes 48..64  reserved
 //! ```
+//!
+//! ## v2 — per-page IV salt (issue #87)
+//!
+//! The `iv_salt` field is fed to `shared_crypto::derive_iv` as
+//! `counter_b` so every encrypted seal gets a unique nonce, killing
+//! the AES-GCM nonce reuse that deterministic per-`(crypto_uuid,
+//! page_id)` IVs caused on single-volume rewrites and encrypted-clone
+//! divergence. The salt lives in the record's formerly-reserved tail,
+//! so it rides the same atomic 64-byte `pwrite` as the hash and copies
+//! for free with a wholesale `pages.idx` clone (snapshot / volume
+//! clone). A pre-salt **v1** record's tail is zero, so it reads
+//! `iv_salt = 0`, reproducing the original `counter_b = 0` IV — every
+//! existing encrypted volume keeps decrypting. [`PageIndex::open`]
+//! transparently migrates a v1 header to v2 on first open; new seals
+//! then start salting. Salt is irrelevant for unencrypted volumes
+//! (no IV is derived); they write `iv_salt = 0` and never read it.
 //!
 //! ## Crash semantics
 //!
 //! Each `set` / `clear` is a single `pwrite_at(64-byte record)`
 //! followed by `sync_data`. A torn write loses at most that one
 //! record; the daemon will detect the inconsistency on the next
-//! read and re-upload the affected page. There's no journal —
-//! defer until we have evidence the cost is real.
+//! read and re-upload the affected page. The hash and its `iv_salt`
+//! share one record, so a non-torn write persists both or neither —
+//! a sealed page can never be observed with a hash but no salt.
+//! There's no journal — defer until we have evidence the cost is real.
 //!
 //! The cache's parallel-flush drain takes the cheaper path: each
 //! per-page commit is a [`PageIndex::set_unsynced`] (pwrite only,
@@ -75,8 +95,15 @@ pub const RECORD_SIZE: u64 = 64;
 /// File-format magic — `CRPI` = core-block block-page index.
 pub const MAGIC: [u8; 4] = *b"CRPI";
 
-/// Page-index format version. Bumped on schema breaks.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Page-index format version. Bumped on schema breaks. v2 adds the
+/// per-page `iv_salt` (issue #87); a v1 file is migrated in place on
+/// [`PageIndex::open`].
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The oldest on-disk version [`PageIndex::open`] still accepts. A v1
+/// file is upgraded to [`SCHEMA_VERSION`] on open — its records' zero
+/// tail already reads as `iv_salt = 0`.
+const MIN_READABLE_VERSION: u32 = 1;
 
 /// Logical page id (offset / page_size). 32-bit limit caps a 1 PB
 /// volume at 256 KiB pages — bump to u64 in v2 if larger volumes
@@ -86,7 +113,21 @@ pub type PageId = u32;
 /// 32-byte BLAKE3 chunk hash. Same as thurvtl's chunk pool.
 pub type ChunkHash = [u8; 32];
 
+/// A resolved page-table entry: the chunk hash plus the per-page
+/// AES-GCM IV salt (issue #87). The salt is fed to
+/// `shared_crypto::derive_iv` as `counter_b` at encrypt/decrypt time;
+/// it is `0` for unencrypted volumes and for pre-salt (v1) records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageEntry {
+    pub hash: ChunkHash,
+    pub iv_salt: u64,
+}
+
 const FLAG_ALLOCATED: u8 = 0b0000_0001;
+
+/// Byte offset of the per-page IV salt (`u64` LE) within a record —
+/// in the formerly-reserved tail so a v1 record reads salt `0`.
+const SALT_OFFSET: usize = 40;
 
 #[derive(Error, Debug)]
 pub enum PageIndexError {
@@ -168,7 +209,7 @@ impl PageIndex {
             return Err(PageIndexError::BadMagic);
         }
         let version = read_u32_le(&header[4..8]);
-        if version != SCHEMA_VERSION {
+        if !(MIN_READABLE_VERSION..=SCHEMA_VERSION).contains(&version) {
             return Err(PageIndexError::SchemaMismatch {
                 found: version,
                 expected: SCHEMA_VERSION,
@@ -198,6 +239,21 @@ impl PageIndex {
             });
         }
 
+        // Migrate a pre-salt (v1) header up to the current version in
+        // place (issue #87). Existing records keep their zero tail, so
+        // they read `iv_salt = 0` (the original counter_b=0 IV) and stay
+        // decryptable; only the version stamp moves so subsequent seals
+        // and any later reader agree the file may now carry salts.
+        if version < SCHEMA_VERSION {
+            file.write_at(&SCHEMA_VERSION.to_le_bytes(), 4)?;
+            file.sync_all()?;
+            tracing::info!(
+                from = version,
+                to = SCHEMA_VERSION,
+                "thurvsa pages.idx migrated to per-page IV salt format"
+            );
+        }
+
         Ok(Self {
             file,
             volume_uuid,
@@ -205,10 +261,20 @@ impl PageIndex {
         })
     }
 
-    /// Look up a page. Returns `None` for unallocated pages
+    /// Look up a page's hash. Returns `None` for unallocated pages
     /// (including any page id past the current file size — sparse
-    /// holes count as unallocated).
+    /// holes count as unallocated). Hash-only convenience over
+    /// [`Self::get_entry`] for the callers (upload re-enqueue, verify)
+    /// that don't need the IV salt.
     pub fn get(&self, page_id: PageId) -> Result<Option<ChunkHash>, PageIndexError> {
+        Ok(self.get_entry(page_id)?.map(|e| e.hash))
+    }
+
+    /// Look up a page's full [`PageEntry`] — chunk hash plus the
+    /// per-page IV salt (issue #87). `None` for unallocated pages.
+    /// The salt is `0` for pre-salt (v1) records and unencrypted
+    /// volumes.
+    pub fn get_entry(&self, page_id: PageId) -> Result<Option<PageEntry>, PageIndexError> {
         let offset = HEADER_SIZE + u64::from(page_id) * RECORD_SIZE;
         let mut record = [0u8; RECORD_SIZE as usize];
         let n = self.file.read_at(&mut record, offset)?;
@@ -220,29 +286,58 @@ impl PageIndex {
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&record[0..32]);
-        Ok(Some(hash))
+        let iv_salt = read_u64_le(&record[SALT_OFFSET..SALT_OFFSET + 8]);
+        Ok(Some(PageEntry { hash, iv_salt }))
     }
 
-    /// Bind `page_id` to `hash`. Overwrites any prior mapping
-    /// (the chunk-pool side handles refcount / orphan reclaim).
-    /// `sync_data` is called after the write so a crash can lose
-    /// at most this one update.
+    /// Bind `page_id` to `hash` with IV salt `0`. Overwrites any prior
+    /// mapping (the chunk-pool side handles refcount / orphan reclaim).
+    /// `sync_data` is called after the write so a crash can lose at
+    /// most this one update. Used by the unencrypted / salt-agnostic
+    /// call sites; [`Self::set_salted`] carries an explicit salt.
     pub fn set(&self, page_id: PageId, hash: &ChunkHash) -> Result<(), PageIndexError> {
-        self.set_unsynced(page_id, hash)?;
+        self.set_salted(page_id, hash, 0)
+    }
+
+    /// Bind `page_id` to `hash` with an explicit per-page IV salt
+    /// (issue #87), fsynced. Used by the encrypted write seal's synced
+    /// path and by clone hash-rebind, which copies the source page's
+    /// salt so the shared ciphertext keeps decrypting under the same
+    /// nonce.
+    pub fn set_salted(
+        &self,
+        page_id: PageId,
+        hash: &ChunkHash,
+        iv_salt: u64,
+    ) -> Result<(), PageIndexError> {
+        self.set_unsynced_salted(page_id, hash, iv_salt)?;
         self.sync()
     }
 
-    /// Bind `page_id` to `hash` *without* the trailing `sync_data`.
-    /// The pwrite goes through to the OS page cache; durability
-    /// requires a later [`Self::sync`] (or an OS-level flush).
-    /// Used by the cache's parallel-flush drain so an N-page cohort
-    /// pays one `fdatasync` instead of N redundant ones — see the
-    /// crate-level "Crash semantics" comment.
+    /// Bind `page_id` to `hash` with IV salt `0`, *without* the
+    /// trailing `sync_data`. See [`Self::set_unsynced_salted`].
     pub fn set_unsynced(&self, page_id: PageId, hash: &ChunkHash) -> Result<(), PageIndexError> {
+        self.set_unsynced_salted(page_id, hash, 0)
+    }
+
+    /// Bind `page_id` to `hash` and `iv_salt` *without* the trailing
+    /// `sync_data`. The pwrite goes through to the OS page cache;
+    /// durability requires a later [`Self::sync`] (or an OS-level
+    /// flush). Used by the cache's parallel-flush drain so an N-page
+    /// cohort pays one `fdatasync` instead of N redundant ones — see
+    /// the crate-level "Crash semantics" comment. Hash and salt share
+    /// the one 64-byte record, so they commit atomically.
+    pub fn set_unsynced_salted(
+        &self,
+        page_id: PageId,
+        hash: &ChunkHash,
+        iv_salt: u64,
+    ) -> Result<(), PageIndexError> {
         let offset = HEADER_SIZE + u64::from(page_id) * RECORD_SIZE;
         let mut record = [0u8; RECORD_SIZE as usize];
         record[0..32].copy_from_slice(hash);
         record[32] = FLAG_ALLOCATED;
+        record[SALT_OFFSET..SALT_OFFSET + 8].copy_from_slice(&iv_salt.to_le_bytes());
         self.file.write_at(&record, offset)?;
         Ok(())
     }
@@ -450,6 +545,122 @@ mod tests {
         let opened = PageIndex::open(&path, uuid, 65_536).unwrap();
         assert_eq!(opened.volume_uuid(), &uuid);
         assert_eq!(opened.page_size_bytes(), 65_536);
+    }
+
+    #[test]
+    fn salt_round_trips_through_get_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+
+        let h = fixture_hash(0x42);
+        idx.set_salted(7, &h, 0xDEAD_BEEF_CAFE_F00D).unwrap();
+        assert_eq!(
+            idx.get_entry(7).unwrap(),
+            Some(PageEntry {
+                hash: h,
+                iv_salt: 0xDEAD_BEEF_CAFE_F00D
+            })
+        );
+        // The hash-only accessor still works and ignores the salt.
+        assert_eq!(idx.get(7).unwrap(), Some(h));
+        // Survives a reopen (the salt lives in the on-disk record).
+        let reopened = PageIndex::open(&path, fixture_uuid(), 65_536).unwrap();
+        assert_eq!(
+            reopened.get_entry(7).unwrap().unwrap().iv_salt,
+            0xDEAD_BEEF_CAFE_F00D
+        );
+    }
+
+    #[test]
+    fn plain_set_writes_salt_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+        idx.set(3, &fixture_hash(3)).unwrap();
+        assert_eq!(idx.get_entry(3).unwrap().unwrap().iv_salt, 0);
+    }
+
+    #[test]
+    fn create_stamps_current_schema_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let _idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32_le(&bytes[4..8]), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    /// Hand-build a pre-salt (v1) index: v1 header + one allocated
+    /// record whose 64-byte slot has a zero tail (no salt field).
+    fn write_v1_index(path: &Path, uuid: [u8; 16], page_id: PageId, hash: &ChunkHash) {
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&MAGIC);
+        header[4..8].copy_from_slice(&1u32.to_le_bytes()); // v1
+        header[8..12].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
+        header[16..32].copy_from_slice(&uuid);
+        header[32..40].copy_from_slice(&65_536u64.to_le_bytes());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        use std::io::Write;
+        file.write_all(&header).unwrap();
+        let offset = HEADER_SIZE + u64::from(page_id) * RECORD_SIZE;
+        let mut record = [0u8; RECORD_SIZE as usize];
+        record[0..32].copy_from_slice(hash);
+        record[32] = FLAG_ALLOCATED;
+        // Tail (incl. the salt slot) stays zero — the v1 shape.
+        file.write_at(&record, offset).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn v1_index_opens_migrates_and_reads_salt_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let uuid = fixture_uuid();
+        let h = fixture_hash(0xAB);
+        write_v1_index(&path, uuid, 9, &h);
+
+        // Opening a v1 file succeeds and reads the legacy record with
+        // salt 0 — the original counter_b=0 IV, so existing encrypted
+        // volumes keep decrypting.
+        let idx = PageIndex::open(&path, uuid, 65_536).unwrap();
+        assert_eq!(
+            idx.get_entry(9).unwrap(),
+            Some(PageEntry {
+                hash: h,
+                iv_salt: 0
+            })
+        );
+
+        // The header was migrated to the current version in place, so a
+        // later reader (or an old binary's version guard) sees v2.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32_le(&bytes[4..8]), SCHEMA_VERSION);
+
+        // A fresh salted seal after migration is read back intact, while
+        // the untouched legacy record keeps its salt 0.
+        idx.set_salted(10, &fixture_hash(0xCD), 0x1234).unwrap();
+        assert_eq!(idx.get_entry(10).unwrap().unwrap().iv_salt, 0x1234);
+        assert_eq!(idx.get_entry(9).unwrap().unwrap().iv_salt, 0);
+    }
+
+    #[test]
+    fn open_rejects_future_schema_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let uuid = fixture_uuid();
+        let _idx = PageIndex::create(&path, uuid, 65_536).unwrap();
+        // Forge a version one past what we understand.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = PageIndex::open(&path, uuid, 65_536).unwrap_err();
+        assert!(matches!(err, PageIndexError::SchemaMismatch { .. }));
     }
 
     #[test]

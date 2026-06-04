@@ -268,9 +268,24 @@ page slot to the content-addressed pool chunk that holds it.
 A sparse positional index — magic `CRPI`, a 64-byte header (magic,
 version, record size, volume UUID, `page_size_bytes`), then one fixed
 64-byte record per `page_id` (a `u32`). Each record carries the
-32-byte BLAKE3 hash of the page's chunk plus an `allocated` flag bit.
-A host READ / WRITE resolves `page_id = LBA / page_size`, then record
-→ hash → pool chunk.
+32-byte BLAKE3 hash of the page's chunk, an `allocated` flag bit, and
+an 8-byte per-page `iv_salt` (format v2, issue #87). A host READ /
+WRITE resolves `page_id = LBA / page_size`, then record → hash → pool
+chunk.
+
+For **encrypted** volumes the `iv_salt` is fed to AES-GCM nonce
+derivation as `derive_iv(crypto_uuid, page_id, iv_salt)`: every seal
+draws a fresh random salt, so each distinct ciphertext for a page gets
+a unique nonce — eliminating the GCM nonce reuse that a deterministic
+per-`(crypto_uuid, page_id)` IV caused on in-place rewrites and on
+copy-on-write clone divergence. The salt lives in the record's
+formerly-reserved tail, so it rides the same atomic 64-byte write as
+the hash and copies for free with a wholesale `pages.idx` clone (so an
+un-diverged shared chunk keeps decrypting under the salt it was sealed
+with). A pre-salt **v1** record's zero tail reads `iv_salt = 0` — the
+original IV — so existing encrypted volumes keep decrypting; `open`
+migrates a v1 header to v2 in place and new seals start salting. The
+salt is unused for unencrypted volumes (written as 0, never read).
 
 The index is **sparse**: a `page_id` the host never wrote is a file
 hole consuming zero disk — the thin-provisioning mechanism. A 100 TiB
@@ -349,15 +364,17 @@ exists never strands the clone. `volume key migrate` refuses a crypto
 identity that is still shared, since re-wrapping one member's manifest
 would desync the family.
 
-Because the clone shares the source's IV identity, a source page P and a
-*diverged* clone page P both seal under the same `(DEK, IV)` — a GCM
-nonce reuse, inherent to copy-on-write sharing of encrypted chunks (the
-only alternatives, re-encrypting on clone or per-page IV salts, defeat
-COW or require a `pages.idx` format change — the latter tracked in issue
-#87). This extends the already-accepted nonce reuse on single-volume page
-rewrites; it is a documented limitation, not a correctness bug (distinct
-plaintexts still produce distinct ciphertext hashes, so no chunk ever
-aliases).
+The clone shares the source's IV identity, so an un-diverged shared page
+decrypts against the same ciphertext as the source. A source page P and a
+*diverged* clone page P sit at the same `page_id` under the same crypto
+identity, but each seal carries its own per-page `iv_salt` in `pages.idx`
+(issue #87): the wholesale page-table copy hands the clone the source's
+salt for the shared chunk, while a divergent write draws a fresh salt, so
+the two simultaneously-live ciphertexts never share an AES-GCM nonce. The
+same salt removes the nonce reuse on single-volume page rewrites. (Even
+before the salt this was never a correctness bug — distinct plaintexts
+produce distinct ciphertext hashes, so no chunk ever aliases — but it now
+holds GCM's confidentiality + integrity guarantees too.)
 
 The family-namespace GC arithmetic is in [`DEDUP.md`](DEDUP.md) §
 Snapshots + clones.
