@@ -439,6 +439,9 @@ http:
   listen: "127.0.0.1:$HTTP_PORT"
 $(yaml_iscsi)
 storage:
+  compression:
+    algorithm: zstd
+    level: 3
   backends:
     testbackend: $backend_json
 EOFCONFIG
@@ -455,6 +458,9 @@ nvmetcp:
   listen: "0.0.0.0:$NVMETCP_PORT"
 
 storage:
+  compression:
+    algorithm: zstd
+    level: 3
   backends:
     testbackend: $backend_json
 EOFCONFIG
@@ -625,6 +631,33 @@ phase_b_assert_storage_objects() {
     return 0
 }
 
+phase_b2_assert_compression_metadata() {
+    log_info "[Phase B2] Asserting per-object compression metadata..."
+    # The daemon writes a `compression` marker (algorithm only) into
+    # each chunk object's backend metadata on upload; the download path
+    # keys decompression off it, the same way S3 / GCS / Azure all do
+    # (docs/DEDUP.md "Backend-side compression", issue #10). The config
+    # above pins zstd, so every chunk object must carry compression=zstd.
+    # Reading it back through the cloud CLI confirms the marker actually
+    # landed on the wire (the daemon's read side is unit-tested).
+    local chunk_key
+    chunk_key=$(storage_list "chunks/" | head -1)
+    if [[ -z "$chunk_key" ]]; then
+        log_error "[Phase B2] no chunk objects found under chunks/ to inspect"
+        return 1
+    fi
+    local meta
+    meta=$(storage_object_compression_meta "$chunk_key")
+    log_info "[Phase B2] $chunk_key carries compression=${meta:-<none>}"
+    if [[ "$meta" != "zstd" ]]; then
+        log_error "[Phase B2] expected compression=zstd on chunk objects, got '${meta:-<empty>}'"
+        log_error "[Phase B2] (per-object compression metadata missing or wrong on ${BACKEND_TYPE})"
+        return 1
+    fi
+    log_info "[Phase B2] per-object compression marker verified on ${BACKEND_TYPE}"
+    return 0
+}
+
 phase_c_restart_and_verify() {
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         log_info "[Phase C] Disconnecting iSCSI, stopping daemon, restarting..."
@@ -696,6 +729,9 @@ main() {
     echo ""
     log_test "Phase B — assert chunk objects landed in storage"
     if phase_b_assert_storage_objects; then log_pass "Phase B"; else log_fail "Phase B"; exit 1; fi
+    echo ""
+    log_test "Phase B2 — assert per-object compression metadata"
+    if phase_b2_assert_compression_metadata; then log_pass "Phase B2"; else log_fail "Phase B2"; exit 1; fi
     echo ""
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         log_test "Phase C — restart daemon + iSCSI + fsck + diff hashes"

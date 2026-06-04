@@ -53,7 +53,7 @@ shared-audit = { path = "../../shared/audit" }
 shared-telemetry = { path = "../../shared/telemetry" }
 
 bytes = "1"
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"

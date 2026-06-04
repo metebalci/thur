@@ -83,8 +83,26 @@ pub(crate) struct RetentionPolicy {
 /// into the `projects/_/buckets/...` resource name where required.
 #[async_trait]
 pub(crate) trait GcsApi: Send + Sync + std::fmt::Debug {
-    async fn write_object(&self, bucket: &str, key: &str, body: Bytes) -> Result<()>;
-    async fn read_object_to_vec(&self, bucket: &str, key: &str) -> Result<Vec<u8>>;
+    /// Write `body` to `key`, attaching `metadata` as GCS custom
+    /// metadata (`x-goog-meta-*`). Mirrors the S3 backend's per-object
+    /// metadata, the source of truth the download path keys
+    /// decompression off.
+    async fn write_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        metadata: Vec<(String, String)>,
+    ) -> Result<()>;
+    /// Read `key`, returning the object bytes plus its user-provided
+    /// custom metadata (lowercased, `x-goog-meta-` prefix stripped by
+    /// the server). The metadata is empty for objects written without
+    /// any.
+    async fn read_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, String>)>;
     async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool>;
     async fn get_event_based_hold(&self, bucket: &str, key: &str) -> Result<bool>;
     async fn set_event_based_hold(&self, bucket: &str, key: &str, held: bool) -> Result<()>;
@@ -132,9 +150,16 @@ impl RealGcsApi {
 
 #[async_trait]
 impl GcsApi for RealGcsApi {
-    async fn write_object(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
+    async fn write_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        metadata: Vec<(String, String)>,
+    ) -> Result<()> {
         self.data
             .write_object(Self::bucket_resource(bucket), key.to_string(), body)
+            .set_metadata(metadata)
             .send_buffered()
             .await
             .map_err(|e| {
@@ -149,7 +174,11 @@ impl GcsApi for RealGcsApi {
         Ok(())
     }
 
-    async fn read_object_to_vec(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    async fn read_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Vec<u8>, std::collections::HashMap<String, String>)> {
         let mut resp = self
             .data
             .read_object(Self::bucket_resource(bucket), key.to_string())
@@ -164,6 +193,9 @@ impl GcsApi for RealGcsApi {
                     ),
                 )
             })?;
+        // Grab the object's custom metadata before draining the body —
+        // `object()` borrows `&self`, the `next()` drain borrows `&mut self`.
+        let metadata = resp.object().metadata;
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.next().await {
             let chunk = chunk.map_err(|e| {
@@ -177,7 +209,7 @@ impl GcsApi for RealGcsApi {
             })?;
             buf.extend_from_slice(&chunk);
         }
-        Ok(buf)
+        Ok((buf, metadata))
     }
 
     async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {

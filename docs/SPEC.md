@@ -2041,9 +2041,10 @@ container. The keyspace is laid out like this:
   lz4 also available) and the algorithm chosen is recorded in the
   per-cartridge manifest. Compression runs **post-dedup** — only after
   the chunk has sealed and a hash exists. The marker itself
-  (`compression: zstd|lz4|none`, plus `compression_level` for zstd) is
-  stored in S3 object metadata, GCS custom metadata, or Azure blob
-  metadata.
+  (`compression: zstd|lz4|none`) is stored in S3 object metadata, GCS
+  custom metadata, or Azure blob metadata. Only the algorithm is
+  recorded, not the level — the level is an encoder-side knob and the
+  zstd / lz4 frames are self-describing on decode.
 
 The `local` backend uses this same key shape, just rooted at
 `storage.local.root_dir` on the filesystem instead of in a bucket.

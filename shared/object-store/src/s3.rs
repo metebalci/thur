@@ -377,16 +377,12 @@ impl S3Backend {
                 .body(body);
 
             // Record the algorithm in object metadata so an out-of-band
-            // tool can tell what's on disk without the manifest.
+            // tool can tell what's on disk without the manifest. Only the
+            // algorithm, never the level: the level is an encoder-side
+            // knob and zstd / lz4 frames are self-describing on decode.
             match applied_algo {
                 Some(algo) => {
                     put_request = put_request.metadata("compression", algo.as_str());
-                    if matches!(algo, CompressionAlgo::Zstd) {
-                        put_request = put_request.metadata(
-                            "compression_level",
-                            self.compression_config.level.to_string(),
-                        );
-                    }
                 }
                 None => {
                     put_request = put_request.metadata("compression", "none");

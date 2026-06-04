@@ -50,6 +50,26 @@ const MAX_UPLOAD_RETRIES: u32 = 5;
 const MAX_DOWNLOAD_RETRIES: u32 = 3;
 // Backoff cadence is owned by `object_store_helpers::retry_async`.
 
+/// Build the GCS custom-metadata pairs recording how a chunk was
+/// compressed, mirroring the S3 / Azure backends' `compression`
+/// object metadata. This single marker travels with the object and is
+/// the decode signal the download path keys decompression off — so a
+/// daemon that later switches `storage.compression` still decodes
+/// pre-switch chunks correctly. `None` records `compression: none`.
+///
+/// Only the algorithm is recorded, never the level: the level is an
+/// encoder-side effort knob, and zstd / lz4 frames are self-describing
+/// on decode (`decompress_data` takes no level). The marker is a hint,
+/// not the source of truth — see DEDUP.md "Backend-side compression"
+/// for the content-address recovery path if it is ever lost.
+fn compression_metadata(algo: Option<CompressionAlgo>) -> Vec<(String, String)> {
+    let value = match algo {
+        Some(a) => a.as_str(),
+        None => "none",
+    };
+    vec![("compression".to_string(), value.to_string())]
+}
+
 /// Google Cloud Storage backend for storing chunks and manifests
 #[derive(Clone)]
 pub struct GcsBackend {
@@ -188,10 +208,11 @@ impl ObjectStoreBackend for GcsBackend {
         // cheap Arc handle instead of memcpy'ing the full Vec.
         let data_bytes = Bytes::from(data_to_upload);
         let bucket = self.bucket.as_str();
+        let metadata = compression_metadata(applied_algo);
 
         crate::object_store_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || async {
             self.api
-                .write_object(bucket, &full_key, data_bytes.clone())
+                .write_object(bucket, &full_key, data_bytes.clone(), metadata.clone())
                 .await
         })
         .await?;
@@ -220,6 +241,10 @@ impl ObjectStoreBackend for GcsBackend {
 
         let bucket = self.bucket.as_str();
 
+        // Zero-copy path never compresses, so mark the object
+        // uncompressed (mirrors the S3 zero-copy upload).
+        let metadata = compression_metadata(None);
+
         crate::object_store_helpers::retry_async(
             "upload_chunk_zerocopy",
             MAX_UPLOAD_RETRIES,
@@ -228,7 +253,7 @@ impl ObjectStoreBackend for GcsBackend {
                     .await
                     .map_err(|e| ObjectStoreError::Other(format!("failed to read file: {}", e)))?;
                 self.api
-                    .write_object(bucket, &full_key, Bytes::from(data))
+                    .write_object(bucket, &full_key, Bytes::from(data), metadata.clone())
                     .await
             },
         )
@@ -247,18 +272,24 @@ impl ObjectStoreBackend for GcsBackend {
             // Drain the streamed body into a single Vec inside the
             // retry closure so a mid-stream error replays the whole
             // RPC instead of returning a half-filled buffer.
-            let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
+            let (buf, metadata) = self.api.read_object(bucket, &full_key).await?;
             debug!("Downloaded {} bytes from GCS: {}", buf.len(), full_key);
 
-            // Mirror upload_chunk's compression logic: if the backend is
-            // configured to compress on upload, reverse it on download.
-            // TODO(beta-blocker): switch to per-object `metadata` once the
-            // SDK surfaces it on `ReadObjectResponse` (today only on a
-            // separate `StorageControl::get_object` RPC). See
-            // `project_gcs_compression_metadata_beta_blocker.md`.
-            let data = match self.compression_config.algorithm {
-                Some(algo) => decompress_data(algo, &buf)?,
-                None => buf,
+            // Decompress off the per-object `compression` marker, not the
+            // daemon's current `compression_config` — a config switch
+            // after upload must not mis-decode pre-switch chunks. The
+            // per-cartridge / per-volume manifest stays the authoritative
+            // record; this metadata read mirrors the S3 backend (issue #10).
+            let data = match metadata.get("compression").map(String::as_str) {
+                Some("zstd") => decompress_data(CompressionAlgo::Zstd, &buf)?,
+                Some("lz4") => decompress_data(CompressionAlgo::Lz4, &buf)?,
+                Some("none") | None => buf,
+                Some(other) => {
+                    return Err(ObjectStoreError::Other(format!(
+                        "unsupported compression type: {}",
+                        other
+                    )));
+                }
             };
             Ok(data)
         })
@@ -333,7 +364,10 @@ impl ObjectStoreBackend for GcsBackend {
         let body = Bytes::from(json.as_bytes().to_vec());
 
         crate::object_store_helpers::retry_async("upload_manifest", MAX_UPLOAD_RETRIES, || async {
-            self.api.write_object(bucket, &full_key, body.clone()).await
+            // Manifests carry no compression marker (mirrors S3).
+            self.api
+                .write_object(bucket, &full_key, body.clone(), Vec::new())
+                .await
         })
         .await
     }
@@ -348,7 +382,7 @@ impl ObjectStoreBackend for GcsBackend {
             "download_manifest",
             MAX_DOWNLOAD_RETRIES,
             || async {
-                let buf = self.api.read_object_to_vec(bucket, &full_key).await?;
+                let (buf, _metadata) = self.api.read_object(bucket, &full_key).await?;
                 let json = String::from_utf8(buf).map_err(|e| {
                     ObjectStoreError::Other(format!("manifest not valid UTF-8: {}", e))
                 })?;
@@ -458,6 +492,7 @@ mod tests {
     use crate::compression::CompressionConfig;
     use crate::gcs_api::RetentionPolicy;
     use crate::object_store_backend::LockState;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -468,10 +503,17 @@ mod tests {
     /// queue is empty, the default behaviour is `Ok(...)` of a benign
     /// value — that matches the production retry/back-off pattern where
     /// a successful next attempt ends the loop.
+    /// Captured `(bucket, key, body, metadata)` from each `write_object`
+    /// call. Aliased to keep clippy's `type_complexity` lint happy.
+    type CapturedWrite = (String, String, Vec<u8>, Vec<(String, String)>);
+
     #[derive(Default, Debug)]
     struct MockGcsApi {
         write_outcomes: Mutex<Vec<Result<()>>>,
         read_outcomes: Mutex<Vec<Result<Vec<u8>>>>,
+        /// Custom metadata the mock returns alongside every read (empty
+        /// by default; set to exercise the metadata-driven decompress path).
+        read_metadata: Mutex<HashMap<String, String>>,
         exists_outcomes: Mutex<Vec<Result<bool>>>,
         list_outcomes: Mutex<Vec<Result<Vec<String>>>>,
         delete_outcomes: Mutex<Vec<Result<()>>>,
@@ -488,7 +530,7 @@ mod tests {
         hold_get_calls: AtomicU32,
         hold_set_calls: AtomicU32,
 
-        captured_write: Mutex<Vec<(String, String, Vec<u8>)>>,
+        captured_write: Mutex<Vec<CapturedWrite>>,
         captured_hold_set: Mutex<Vec<(String, String, bool)>>,
     }
 
@@ -506,18 +548,31 @@ mod tests {
 
     #[async_trait]
     impl GcsApi for MockGcsApi {
-        async fn write_object(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
+        async fn write_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Bytes,
+            metadata: Vec<(String, String)>,
+        ) -> Result<()> {
             self.write_calls.fetch_add(1, Ordering::SeqCst);
             self.captured_write.lock().expect("write capture").push((
                 bucket.to_string(),
                 key.to_string(),
                 body.to_vec(),
+                metadata,
             ));
             Self::pop_or(&self.write_outcomes, || Ok(()))
         }
-        async fn read_object_to_vec(&self, _bucket: &str, _key: &str) -> Result<Vec<u8>> {
+        async fn read_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<(Vec<u8>, HashMap<String, String>)> {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
-            Self::pop_or(&self.read_outcomes, || Ok(Vec::new()))
+            let bytes = Self::pop_or(&self.read_outcomes, || Ok(Vec::new()))?;
+            let meta = self.read_metadata.lock().expect("read metadata").clone();
+            Ok((bytes, meta))
         }
         async fn object_exists(&self, _bucket: &str, _key: &str) -> Result<bool> {
             self.exists_calls.fetch_add(1, Ordering::SeqCst);
@@ -636,6 +691,12 @@ mod tests {
         assert_eq!(captured[0].0, "my-bucket");
         assert_eq!(captured[0].1, "tapes/chunks/x.dat");
         assert_eq!(captured[0].2, b"hello world");
+        // Uncompressed chunks still carry an explicit `compression: none`
+        // marker, mirroring the S3 backend.
+        assert_eq!(
+            captured[0].3,
+            vec![("compression".to_string(), "none".to_string())]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -651,6 +712,13 @@ mod tests {
         let csz = compressed.expect("compressed size present");
         assert!(csz < 4096, "compressed must be smaller, got {}", csz);
         assert_eq!(algo, Some(CompressionAlgo::Zstd));
+        // The compression marker (algorithm only — no level) is recorded
+        // in the object's custom metadata, the decode signal on download.
+        let captured = api.captured_write.lock().expect("captured").clone();
+        assert_eq!(
+            captured[0].3,
+            vec![("compression".to_string(), "zstd".to_string())]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -710,6 +778,10 @@ mod tests {
         assert_eq!(api.write_calls.load(Ordering::SeqCst), 1);
         let captured = api.captured_write.lock().expect("captured").clone();
         assert_eq!(captured[0].2, b"abcdef");
+        assert_eq!(
+            captured[0].3,
+            vec![("compression".to_string(), "none".to_string())]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -758,22 +830,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn download_chunk_decompresses_when_algo_configured() {
+    async fn download_chunk_decompresses_from_object_metadata() {
         // Pre-compress the payload so the mock returns compressed bytes;
-        // the backend should decompress on download.
+        // the backend decompresses off the object's `compression`
+        // metadata, not its own config (here: compression disabled).
         let payload = vec![0u8; 1024];
         let compressed = compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.read_outcomes.lock().expect("queue");
             g.push(Ok(compressed));
+            *api.read_metadata.lock().expect("meta") =
+                HashMap::from([("compression".to_string(), "zstd".to_string())]);
         }
-        let backend = backend_with_compression(api.clone(), CompressionAlgo::Zstd);
+        let backend = backend_with(api.clone());
         let got = backend
             .download_chunk("chunks/z.dat")
             .await
             .expect("download + decompress");
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunk_uses_object_metadata_over_config() {
+        // Issue #10 regression: a chunk uploaded as zstd must still
+        // decode after the operator switches `storage.compression` to
+        // lz4 and restarts. The per-object marker, not the live config,
+        // governs decompression.
+        let payload = b"the quick brown fox jumped over the lazy dog".repeat(8);
+        let compressed = compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
+        let api = Arc::new(MockGcsApi::default());
+        {
+            let mut g = api.read_outcomes.lock().expect("queue");
+            g.push(Ok(compressed));
+            *api.read_metadata.lock().expect("meta") =
+                HashMap::from([("compression".to_string(), "zstd".to_string())]);
+        }
+        // Backend config says lz4 — deliberately mismatched.
+        let backend = backend_with_compression(api.clone(), CompressionAlgo::Lz4);
+        let got = backend
+            .download_chunk("chunks/z.dat")
+            .await
+            .expect("decode via metadata, not config");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_chunk_rejects_unknown_compression_marker() {
+        let api = Arc::new(MockGcsApi::default());
+        {
+            // `Other` classifies as retryable, so outlast the budget.
+            let mut g = api.read_outcomes.lock().expect("queue");
+            for _ in 0..8 {
+                g.push(Ok(b"payload".to_vec()));
+            }
+            *api.read_metadata.lock().expect("meta") =
+                HashMap::from([("compression".to_string(), "brotli".to_string())]);
+        }
+        let backend = backend_with(api);
+        let err = backend
+            .download_chunk("chunks/z.dat")
+            .await
+            .expect_err("unknown marker must error");
+        match err {
+            ObjectStoreError::Other(msg) => assert!(msg.contains("brotli")),
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]

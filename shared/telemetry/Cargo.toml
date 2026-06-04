@@ -10,13 +10,19 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "reqwest-rustls"] }
-opentelemetry-prometheus = "0.31"
-opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
-prometheus = "0.14"
-thiserror = "1"
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "reqwest-rustls"] }
+opentelemetry-prometheus = "0.32"
+opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
+# default-features = false drops the `protobuf` feature: we only emit
+# the text exposition format (TextEncoder) at /metrics, never the
+# legacy protobuf format. Dropping it removes the protobuf 3.7.2 +
+# protobuf-codegen build-dep — and with them the last consumer of
+# thiserror 1.x in the tree, so thiserror collapses to a single
+# (2.x) version.
+prometheus = { version = "0.14", default-features = false }
+thiserror = "2"
 tonic = { version = "0.14", default-features = false }
 tracing = "0.1"
 

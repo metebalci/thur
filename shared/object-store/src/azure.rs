@@ -384,18 +384,16 @@ impl TokenCredential for ChainedCredential {
 
 /// Build the upload-options struct for a chunk upload. Carries the
 /// compression-mode metadata so a downloader can route the bytes
-/// through the right decompressor (or skip it).
+/// through the right decompressor (or skip it). Records the algorithm
+/// only, never the level: the level is an encoder-side knob and
+/// zstd / lz4 frames are self-describing on decode.
 fn upload_options_with_metadata(
     applied_algo: Option<CompressionAlgo>,
-    level: i32,
 ) -> BlobClientUploadOptions<'static> {
     let mut metadata: HashMap<String, String> = HashMap::new();
     match applied_algo {
         Some(algo) => {
             metadata.insert("compression".to_string(), algo.as_str().to_string());
-            if matches!(algo, CompressionAlgo::Zstd) {
-                metadata.insert("compression_level".to_string(), level.to_string());
-            }
         }
         None => {
             metadata.insert("compression".to_string(), "none".to_string());
@@ -443,7 +441,6 @@ impl ObjectStoreBackend for AzureBackend {
             data_to_upload.len()
         );
 
-        let level = self.compression_config.level;
         // Wrap once: per-retry `Bytes::clone` is just an Arc bump.
         let data_bytes = Bytes::from(data_to_upload);
         crate::object_store_helpers::retry_async("upload_chunk", MAX_UPLOAD_RETRIES, || {
@@ -453,7 +450,7 @@ impl ObjectStoreBackend for AzureBackend {
             let account = self.account.clone();
             let container_name = self.container_name.clone();
             async move {
-                let opts = upload_options_with_metadata(applied_algo, level);
+                let opts = upload_options_with_metadata(applied_algo);
                 blob.upload(body.into(), Some(opts)).await.map_err(|e| {
                     ObjectStoreError::classified(
                         classify_azure_error(&e),
@@ -503,7 +500,7 @@ impl ObjectStoreBackend for AzureBackend {
                         ObjectStoreError::Other(format!("failed to read file: {e}"))
                     })?;
                     let body = Bytes::from(data);
-                    let opts = upload_options_with_metadata(None, 0);
+                    let opts = upload_options_with_metadata(None);
                     blob.upload(body.into(), Some(opts)).await.map_err(|e| {
                         ObjectStoreError::classified(
                             classify_azure_error(&e),

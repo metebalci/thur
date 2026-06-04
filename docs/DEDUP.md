@@ -290,6 +290,40 @@ metadata) so the download path knows how to decompress. The default is
 zstd level 3; switch to lz4 if throughput matters more than compression
 ratio.
 
+The marker records only the **algorithm** (`zstd` / `lz4` / `none`), not
+the level. The level governs how hard the encoder works, never how the
+decoder reads the result — a zstd or lz4 frame is self-describing, so
+decompression takes the algorithm alone. The `local` backend never
+compresses, so it stores no marker at all (a plain filesystem has no
+object-metadata facility, and there is nothing to record).
+
+That marker is a fast-path *hint*, not the ultimate source of truth —
+because the pool is content-addressed, the chunk's BLAKE3 hash is. If a
+chunk's compression metadata were ever lost (say an out-of-band tool
+rewrote the object without carrying its metadata across), the chunk stays
+both safe and recoverable. Safe, because the read path verifies the
+decompressed bytes against the expected hash before admitting them to the
+pool: a missing marker can never silently yield wrong data — at worst it
+surfaces as an integrity error, never corruption. Recoverable, because the
+algorithm can be read back from the bytes themselves: zstd and lz4 frames
+each begin with a distinct 4-byte magic (`0x28B52FFD` and `0x184D2204`),
+so a recovery tool can spot a compressed chunk on sight, and the one
+genuinely ambiguous case — uncompressed data carries no magic and could,
+at scale, coincidentally begin with one — is settled by trying each of the
+three candidates and keeping whichever decompresses to the expected hash.
+There are only three, and collision resistance guarantees exactly one
+matches.
+
+This stays a documented recovery procedure, not an automatic fallback on
+the hot read path: the live decode trusts the single explicit marker and
+stays O(1). Magic-sniffing alone cannot replace the marker — it cannot
+distinguish an uncompressed chunk from a compressed one without that hash
+round-trip. The same reasoning rules out encoding the algorithm in the
+object key's extension (e.g. `<hash>.zst`): a hash-derived key has to stay
+independent of compression, or the dedup HEAD-probe would have to glob
+across extensions and a mid-life config change would silently store
+duplicates.
+
 ## Garbage collection
 
 `thurvtl system gc [--dry-run] [--storage]` walks every

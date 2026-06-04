@@ -586,6 +586,56 @@ storage_list() {
     esac
 }
 
+# Read the custom `compression` metadata value off a single stored
+# object, given its key as `storage_list` emits it (bucket prefix
+# stripped, TEST_PREFIX-relative-to-bucket-root included). Echoes the
+# value (`zstd` / `lz4` / `none`) or empty if absent / unreadable.
+# Backend-agnostic: S3 user metadata, GCS custom metadata, Azure blob
+# metadata. Used to assert the per-object compression marker the
+# download path keys decompression off (docs/DEDUP.md "Backend-side
+# compression").
+storage_object_compression_meta() {
+    local key="$1"
+    case "$BACKEND_TYPE" in
+        s3)
+            local args=()
+            [[ -n "$BACKEND_ENDPOINT" ]] && args+=(--endpoint-url "$BACKEND_ENDPOINT")
+            [[ -n "$BACKEND_REGION" ]] && args+=(--region "$BACKEND_REGION")
+            local aws_overrides=()
+            if [[ -n "$BACKEND_AUTH_AKID_ENV" && -n "$BACKEND_AUTH_SECRET_ENV" ]]; then
+                aws_overrides=(
+                    "AWS_ACCESS_KEY_ID=${!BACKEND_AUTH_AKID_ENV}"
+                    "AWS_SECRET_ACCESS_KEY=${!BACKEND_AUTH_SECRET_ENV}"
+                )
+            fi
+            # S3 lowercases user-metadata keys; `Metadata.compression`
+            # prints the literal `None` when absent — filter it out.
+            env "${aws_overrides[@]}" aws "${args[@]}" s3api head-object \
+                --bucket "$BACKEND_BUCKET" --key "$key" \
+                --query 'Metadata.compression' --output text 2>/dev/null \
+                | grep -vx 'None' || true
+            ;;
+        gcs)
+            # `gcloud storage objects describe` surfaces custom object
+            # metadata under `custom_fields`, not `metadata` (the latter
+            # is always null in its projection).
+            gcloud storage objects describe "gs://${BACKEND_BUCKET}/${key}" \
+                --format="value(custom_fields.compression)" 2>/dev/null || true
+            ;;
+        azure)
+            az storage blob show \
+                --account-name "$BACKEND_ACCOUNT" \
+                --container-name "$BACKEND_CONTAINER" \
+                --name "$key" \
+                --auth-mode login \
+                --query "metadata.compression" -o tsv 2>/dev/null || true
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Snapshot the sorted set of chunk-object keys to a file. Used by
 # the pipeline-layer matrix's row 2 dedup assertion: snap before +
 # after the second write, take the set-difference, count new keys.

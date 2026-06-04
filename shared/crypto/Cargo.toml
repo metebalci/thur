@@ -17,4 +17,4 @@ aes-gcm = "0.10"
 # 12-byte AES-GCM nonce. Same primitive the content-addressed pool
 # already uses, so adopting it here costs no new dep weight.
 blake3 = "1"
-thiserror = "1"
+thiserror = "2"
