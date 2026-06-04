@@ -543,8 +543,9 @@ enum VolumeAction {
     /// Seeds the clone from a snapshot (`--from-snapshot`) or the
     /// source's live contents, sharing chunks copy-on-write. The clone
     /// is a new LUN — grant host admission before use; it does not
-    /// inherit the source's grants. Encrypted sources are refused
-    /// (issue #86). Daemon-routed only.
+    /// inherit the source's grants. An encrypted source clones too: the
+    /// clone inherits its crypto identity + shared DEK (issue #86).
+    /// Daemon-routed only.
     Clone {
         /// Source volume name.
         source: String,

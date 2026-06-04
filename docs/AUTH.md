@@ -765,6 +765,39 @@ location — two `local` entries with the same `data_dir`, or two
 fingerprint named in the error, rather than performing a meaningless
 migration.
 
+### Cloning an encrypted volume: shared DEK custody
+
+`volume clone` of an encrypted volume (issue #86) does **not** mint a new
+DEK. The clone inherits the source's *crypto identity* in its manifest's
+`crypto_uuid` field — the value the keystore is addressed by (the wrap
+context / AAD) and the IV is derived from — and copies the source's
+`encryption` metadata (`keystore_backend` + `wrapped_dek`) verbatim. So
+the whole family (source + clones + their snapshots) shares one DEK and
+one keystore entry: for `local`, one sidecar at
+`<data_dir>/keys/<crypto_uuid_hex>.key`; for the envelope backends, the
+same `wrapped_dek` blob bound to `crypto_uuid`. No re-wrap, no
+re-encrypt.
+
+Because the DEK is shared, its lifecycle is **refcounted by scan**. There
+is no persistent refcount — `volume destroy` removes the volume's on-disk
+subtree first, then walks every surviving volume and snapshot manifest
+(`crypto_identity_referenced`) and only calls `keystore.forget()` when no
+other family member still keys its crypto identity on that DEK. So
+destroying the source while a clone exists retains the DEK (for `local`,
+the sidecar survives; for the envelope backends `forget` is a no-op
+anyway); destroying the *last* family member is what finally forgets it.
+If the scan itself fails, destroy conservatively keeps the DEK — a leaked
+wrapped DEK is inert, whereas a wrongly-forgotten one would strand a
+clone.
+
+`volume key migrate`, `key export`, and `key import` all address the
+keystore by `crypto_uuid` too, so they operate on the shared DEK
+correctly. **`volume key migrate` refuses a crypto identity that is still
+shared** (the same manifest walk): migrating would rewrap only one
+member's manifest and, with `--purge-local`, forget a sidecar the rest of
+the family still needs. Destroy the other members first, leaving a single
+holder, before migrating a once-shared identity.
+
 ### Escrow: passphrase-sealed DEK export / import
 
 `volume key migrate` assumes both keystores are *online* at the same

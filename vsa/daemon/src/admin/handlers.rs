@@ -807,7 +807,16 @@ struct CloneSource {
     /// Family namespace the clone inherits via `dedup_namespace` so its
     /// Local-dedup chunks resolve in the source family's pool.
     namespace_uuid: [u8; 16],
-    encrypted: bool,
+    /// At-rest encryption metadata of the source (keystore backend +
+    /// wrapped DEK), copied verbatim into the clone so it references the
+    /// *same* DEK with no re-wrap (issue #86). `None` for an
+    /// unencrypted source.
+    encryption: Option<core_block::volume::VolumeEncryptionMeta>,
+    /// The source's crypto identity ([`VolumeManifest::dek_uuid`]) the
+    /// clone inherits as its own `crypto_uuid` so it derives the right
+    /// IV for the shared chunks and unwraps the shared DEK. Only
+    /// meaningful when `encryption` is `Some`.
+    crypto_uuid: [u8; 16],
 }
 
 /// `POST /api/v1/volumes/{name}/clone` — create a new writable volume
@@ -820,10 +829,13 @@ struct CloneSource {
 /// It inherits the source's *family* `dedup_namespace` so Local-dedup
 /// chunks resolve in the shared pool.
 ///
-/// Encrypted sources are refused (issue #86): shared chunks are sealed
-/// with the source's DEK and an IV derived from the source uuid, which a
-/// clone with a fresh uuid cannot reproduce. Unencrypted volumes (the
-/// common case) clone freely.
+/// Encrypted sources clone too (issue #86): the clone inherits the
+/// source's *crypto identity* (`crypto_uuid` = source `dek_uuid`), which
+/// seeds both AES-GCM IV derivation and the keystore wrap-context. So
+/// the clone derives the right IV for the shared chunks and unwraps the
+/// *same* DEK — no re-wrap, no re-encrypt (that would defeat COW). The
+/// shared DEK is refcounted by scan, so destroying the source while a
+/// clone exists does not strand the clone (see [`destroy`]).
 ///
 /// Secure-by-default: the clone is a new volume name, so no host sees it
 /// until the operator grants admission (`iscsi users grant` /
@@ -864,6 +876,8 @@ pub async fn clone_volume(
                 )
             })?;
             let idx = SnapshotManifest::page_index_path(&state.data_dir, &name, snap);
+            // Compute before moving fields out of `m` below.
+            let crypto_uuid = m.dek_uuid();
             (
                 CloneSource {
                     backend: m.backend,
@@ -872,7 +886,8 @@ pub async fn clone_volume(
                     sector_bytes: m.sector_bytes,
                     size_bytes: m.size_bytes,
                     namespace_uuid: m.dedup_namespace,
-                    encrypted: m.encryption.is_some(),
+                    crypto_uuid,
+                    encryption: m.encryption,
                 },
                 Some(idx),
             )
@@ -888,22 +903,13 @@ pub async fn clone_volume(
                     sector_bytes: m.sector_bytes,
                     size_bytes: cache.size_bytes(),
                     namespace_uuid: m.dedup_namespace_uuid(),
-                    encrypted: m.encryption.is_some(),
+                    crypto_uuid: m.dek_uuid(),
+                    encryption: m.encryption.clone(),
                 },
                 None,
             )
         }
     };
-
-    if src.encrypted {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "cloning an encrypted volume is not supported yet (issue #86); \
-                          clone an unencrypted volume, or restore from backup"
-            })),
-        ));
-    }
 
     let pool_budget = state
         .pool_budgets
@@ -934,8 +940,12 @@ pub async fn clone_volume(
     };
 
     // Build + create the clone manifest (fresh uuid, inherited family
-    // namespace). `create` also lays down an empty pages.idx we overwrite
-    // with the source's index below.
+    // namespace). For an encrypted source the clone also inherits the
+    // crypto identity + the source's encryption meta verbatim (same
+    // keystore backend + wrapped DEK, no re-wrap) so it derives the
+    // right IV for the shared chunks and unwraps the shared DEK (issue
+    // #86). `create` also lays down an empty pages.idx we overwrite with
+    // the source's index below.
     let created = match VolumeManifest::new(
         body.new_name.clone(),
         src.size_bytes,
@@ -946,7 +956,16 @@ pub async fn clone_volume(
         false,
         pinned_lun,
     ) {
-        Ok(m) => m.with_dedup_namespace(src.namespace_uuid),
+        Ok(m) => {
+            let m = m.with_dedup_namespace(src.namespace_uuid);
+            match src.encryption.as_ref() {
+                Some(meta) => m
+                    .with_crypto_uuid(src.crypto_uuid)
+                    .with_encryption(meta.algorithm)
+                    .with_keystore(meta.keystore_backend.clone(), meta.wrapped_dek.clone()),
+                None => m,
+            }
+        }
         Err(e) => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1012,7 +1031,61 @@ pub async fn clone_volume(
             ));
         }
     };
-    let writer = match VolumeWriter::open(&state.data_dir, &created.name, cloud_backend) {
+    // For an encrypted clone, unwrap the *shared* DEK under the source
+    // crypto identity (mirrors discovery's volume-open path) and open
+    // with it; an unencrypted clone takes the plain path. Roll the clone
+    // dir back on any failure, same as the seed/backend steps above.
+    let open_result = if let Some(meta) = src.encryption.as_ref() {
+        let (_, ks) = match state
+            .resolve_keystore_backend(Some(meta.keystore_backend.as_str()))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&clone_dir);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("resolve keystore '{}': {e}", meta.keystore_backend)
+                    })),
+                ));
+            }
+        };
+        let wrapped: Vec<u8> = match meta.wrapped_dek.as_deref() {
+            Some(b64) => {
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&clone_dir);
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": format!("decode wrapped_dek: {e}") })),
+                        ));
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        let secret = match ks.unwrap(&src.crypto_uuid, &wrapped).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&clone_dir);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("unwrap shared DEK: {e}") })),
+                ));
+            }
+        };
+        VolumeWriter::open_with_key(
+            &state.data_dir,
+            &created.name,
+            cloud_backend,
+            *secret.as_bytes(),
+        )
+    } else {
+        VolumeWriter::open(&state.data_dir, &created.name, cloud_backend)
+    };
+    let writer = match open_result {
         Ok(w) => Arc::new(
             w.with_pool_budget(Arc::clone(&pool_budget), state.backpressure_deadline)
                 .with_upload_sender(state.upload_tx.clone()),
@@ -1140,6 +1213,10 @@ pub async fn destroy(
     let backend_name = cache.manifest().backend.clone();
     let uuid = cache.manifest().uuid;
     let uuid_hex = hex::encode(uuid);
+    // The crypto identity the DEK is keyed on — the volume's own uuid
+    // for a fresh volume, or the inherited source identity for a clone
+    // (issue #86). Drives the keystore `forget` below.
+    let dek_uuid = cache.manifest().dek_uuid();
     let encryption = cache.manifest().encryption.clone();
     drop(cache);
 
@@ -1154,40 +1231,13 @@ pub async fn destroy(
     // Changed Namespace List + re-runs Identify no longer finds it.
     state.notify_nvme_namespace_changed(lun);
 
-    // Wipe the at-rest key first — once the volume dir is gone the
-    // keystore entry is orphaned and an operator would have to clean
-    // it up by hand. Idempotent on missing, so a re-destroy on a
-    // partially-removed volume still converges.
-    if let Some(enc) = encryption.as_ref() {
-        match state
-            .resolve_keystore_backend(Some(enc.keystore_backend.as_str()))
-            .await
-        {
-            Ok((_, backend)) => {
-                if let Err(e) = backend.forget(&uuid).await {
-                    warn!(
-                        volume = name.as_str(),
-                        error = %e,
-                        keystore = enc.keystore_backend.as_str(),
-                        "admin: keystore forget failed during volume destroy; \
-                         manual cleanup of the {} backend may be needed for uuid {}",
-                        enc.keystore_backend, uuid_hex
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    volume = name.as_str(),
-                    error = %e,
-                    keystore = enc.keystore_backend.as_str(),
-                    "admin: could not resolve keystore backend for destroy; \
-                     wrapped DEK in manifest is harmless on its own but \
-                     operator may want to verify",
-                );
-            }
-        }
-    }
-
+    // Remove the on-disk subtree first (manifest + pages.idx + this
+    // volume's own snapshots), THEN decide whether to forget the DEK.
+    // Removing first makes the on-disk tree exactly the surviving family
+    // members, so the refcount scan below needs no self-exclusion, and
+    // it keeps the crash window on the harmless side: an orphaned wrapped
+    // DEK is inert, whereas forgetting a DEK that a surviving clone still
+    // needs would brick that clone (issue #86).
     let vol_dir = VolumeManifest::dir_for(&state.data_dir, &name);
     if let Err(e) = std::fs::remove_dir_all(&vol_dir) {
         warn!(
@@ -1201,6 +1251,69 @@ pub async fn destroy(
                 "lun": lun,
             })),
         ));
+    }
+
+    // Wipe the at-rest key — but only when no other family member
+    // (source / sibling clone / snapshot) still keys its crypto identity
+    // on it (issue #86). For a fresh volume `dek_uuid == uuid` and
+    // nothing else references it, so this forgets exactly as before; for
+    // a shared identity it's a no-op until the last member is gone.
+    // Idempotent on missing, so a re-destroy still converges.
+    if let Some(enc) = encryption.as_ref() {
+        let still_referenced =
+            match core_block::crypto_identity_referenced(&state.data_dir, dek_uuid, None) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Be conservative: if we can't prove the DEK is
+                    // unreferenced, keep it. A leaked wrapped DEK is
+                    // inert; a wrongly-forgotten one strands a clone.
+                    warn!(
+                        volume = name.as_str(),
+                        error = %e,
+                        "admin: crypto-identity refcount scan failed during destroy; \
+                         retaining the DEK to avoid stranding a possible clone",
+                    );
+                    true
+                }
+            };
+        if still_referenced {
+            info!(
+                volume = name.as_str(),
+                keystore = enc.keystore_backend.as_str(),
+                "admin: DEK for crypto identity {} retained during destroy — still \
+                 referenced by another clone/snapshot family member",
+                hex::encode(dek_uuid)
+            );
+        } else {
+            match state
+                .resolve_keystore_backend(Some(enc.keystore_backend.as_str()))
+                .await
+            {
+                Ok((_, backend)) => {
+                    if let Err(e) = backend.forget(&dek_uuid).await {
+                        warn!(
+                            volume = name.as_str(),
+                            error = %e,
+                            keystore = enc.keystore_backend.as_str(),
+                            "admin: keystore forget failed during volume destroy; \
+                             manual cleanup of the {} backend may be needed for uuid {}",
+                            enc.keystore_backend,
+                            hex::encode(dek_uuid)
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        volume = name.as_str(),
+                        error = %e,
+                        keystore = enc.keystore_backend.as_str(),
+                        "admin: could not resolve keystore backend for destroy; \
+                         wrapped DEK in manifest is harmless on its own but \
+                         operator may want to verify",
+                    );
+                }
+            }
+        }
     }
 
     info!(

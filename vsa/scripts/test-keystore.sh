@@ -15,6 +15,9 @@
 #      manifest with keystore_backend + wrapped_dek.
 #   2. unwrap (daemon restart) — discovery re-opens the volume,
 #      which means the backend's unwrap call worked.
+#   2B. encrypted clone (issue #86) — the clone inherits the source
+#      crypto identity + wrapped DEK and must unwrap via this backend;
+#      destroying the clone retains the shared DEK (source still live).
 #   3. wrap-target move (volume key migrate --to local --purge-local)
 #      — unwraps via the source backend, rewraps via `local`,
 #      verifies the migrated volume re-opens cleanly.
@@ -99,6 +102,10 @@ VOLUME_NAME="v-keystore-test"
 # collapse to Daemon. We still create the volume for the latter
 # three to verify the collapse round-trips cleanly.
 VOLUME_BACKEND_RNG="v-keystore-test-backendrng"
+# Clone of VOLUME_NAME — exercises the encrypted-clone shared-DEK unwrap
+# against this backend (issue #86). Torn down within phase_clone so
+# VOLUME_NAME is un-shared again before phase_migrate runs.
+VOLUME_CLONE="v-keystore-test-clone"
 
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
@@ -337,6 +344,53 @@ phase_restart_unwrap() {
     log_pass "Phase 2: unwrap round-trip verified for both DEK sources"
 }
 
+# Step 2B: clone the encrypted volume (issue #86). The clone inherits
+# the source crypto identity (crypto_uuid = source uuid) and the SAME
+# wrapped DEK — no re-wrap — so it must unwrap via THIS backend and
+# attach. A restart round-trips the persisted crypto_uuid; destroying
+# the clone (a member, source still live) must RETAIN the shared DEK.
+# Tears the clone down so VOLUME_NAME is un-shared again for phase 3
+# (migrate refuses a shared crypto identity).
+phase_clone() {
+    log_test "Phase 2B: clone encrypted volume -> shared-DEK unwrap via $TEST_KEYSTORE_NAME"
+    "$CLI_PATH" --config "$TEST_CONFIG" volume clone "$VOLUME_NAME" "$VOLUME_CLONE" >/dev/null \
+        || { log_error "volume clone (encrypted source) failed"; exit 1; }
+
+    local srcm clonem src_uuid c_crypto c_ks s_ks c_wrapped s_wrapped
+    srcm=$(manifest_path "$VOLUME_NAME"); clonem=$(manifest_path "$VOLUME_CLONE")
+    src_uuid=$(jq -r '.uuid' "$srcm")
+    c_crypto=$(jq -r '.crypto_uuid // ""' "$clonem")
+    [[ "$c_crypto" == "$src_uuid" ]] \
+        || { log_error "clone crypto_uuid='$c_crypto', expected source uuid '$src_uuid'"; exit 1; }
+    c_ks=$(jq -r '.encryption.keystore_backend // ""' "$clonem")
+    s_ks=$(jq -r '.encryption.keystore_backend // ""' "$srcm")
+    [[ "$c_ks" == "$s_ks" ]] \
+        || { log_error "clone keystore_backend='$c_ks', expected '$s_ks'"; exit 1; }
+    c_wrapped=$(jq -r '.encryption.wrapped_dek // ""' "$clonem")
+    s_wrapped=$(jq -r '.encryption.wrapped_dek // ""' "$srcm")
+    [[ "$c_wrapped" == "$s_wrapped" ]] \
+        || { log_error "clone wrapped_dek differs from source (should be copied verbatim)"; exit 1; }
+    assert_volume_attached "$VOLUME_CLONE"
+    log_info "clone manifest OK: crypto_uuid=source, shared keystore_backend + wrapped_dek"
+
+    # Restart: the clone re-unwraps under the inherited crypto identity.
+    stop_daemon; start_daemon
+    assert_volume_attached "$VOLUME_NAME"
+    assert_volume_attached "$VOLUME_CLONE"
+
+    # Destroy the clone (the source still references the DEK): the shared
+    # DEK must be retained and the source must stay attached.
+    local sidecar="$TEST_DIR/data/keys/${src_uuid}.key"
+    "$CLI_PATH" --config "$TEST_CONFIG" volume destroy "$VOLUME_CLONE" --force >/dev/null \
+        || { log_error "destroy clone failed"; exit 1; }
+    if [[ "$KEYSTORE_TYPE" == "local" ]]; then
+        [[ -f "$sidecar" ]] \
+            || { log_error "shared DEK sidecar wrongly removed while source still lives ($sidecar)"; exit 1; }
+    fi
+    assert_volume_attached "$VOLUME_NAME"
+    log_pass "Phase 2B: encrypted-clone unwrap + restart + shared-DEK retention verified"
+}
+
 # Step 3: migrate wrap-target to the local fallback, verify both
 # unwrap (from chosen backend) and wrap (to local) work.
 #
@@ -481,6 +535,7 @@ create_test_config
 phase_create
 phase_create_backend_rng
 phase_restart_unwrap
+phase_clone
 phase_migrate
 phase_export_import
 

@@ -563,6 +563,24 @@ pub async fn cmd_key_migrate(
         );
     };
 
+    // Refuse to migrate a *shared* crypto identity (issue #86). A clone
+    // of an encrypted volume shares the source family's DEK; re-wrapping
+    // would only update this manifest (siblings keep the old backend)
+    // and a `--purge-local` would forget the family's live sidecar,
+    // stranding the others. A lone survivor (e.g. the last clone after
+    // the source is gone, whose `dek_uuid` differs from its `uuid` but
+    // is referenced by nobody else) migrates fine.
+    if core_block::crypto_identity_referenced(data_dir, manifest.dek_uuid(), Some(name))
+        .map_err(|e| anyhow!("scanning for shared crypto identity: {e}"))?
+    {
+        bail!(
+            "volume '{name}' shares its encryption key with a clone/snapshot family \
+             (issue #86); `key migrate` on a shared crypto identity is not supported. \
+             Destroy the other family members first, or migrate is a family-wide \
+             operation that must be done while only one member remains."
+        );
+    }
+
     if enc.keystore_backend == to {
         bail!(
             "no-op: volume '{name}' is already bound to keystore '{to}'. Pass a \
@@ -618,13 +636,13 @@ pub async fn cmd_key_migrate(
         None => Vec::new(),
     };
     let plain_dek: SecretBytes = old_backend
-        .unwrap(&manifest.uuid, &wrapped_in)
+        .unwrap(&manifest.dek_uuid(), &wrapped_in)
         .await
         .map_err(|e| anyhow!("unwrap via old backend '{}': {e}", enc.keystore_backend))?;
 
     // Wrap into new.
     let wrapped_out = new_backend
-        .wrap(&manifest.uuid, &plain_dek)
+        .wrap(&manifest.dek_uuid(), &plain_dek)
         .await
         .map_err(|e| anyhow!("wrap via new backend '{to}': {e}"))?;
 
@@ -654,13 +672,13 @@ pub async fn cmd_key_migrate(
     // leaves the sidecar present (recoverable rollback) rather than
     // a half-migrated volume with no key material reachable.
     let sidecar_warning = if purge_local && from_label == "local" {
-        match old_backend.forget(&manifest.uuid).await {
+        match old_backend.forget(&manifest.dek_uuid()).await {
             Ok(()) => Some(true),
             Err(e) => {
                 eprintln!(
                     "warning: migration succeeded but sidecar purge failed: {e}. Remove \
                      <data_dir>/keys/{}.key manually if desired.",
-                    hex::encode(manifest.uuid)
+                    hex::encode(manifest.dek_uuid())
                 );
                 Some(false)
             }
@@ -674,7 +692,7 @@ pub async fn cmd_key_migrate(
         println!(
             "  Wrap target moved to the local-backend sidecar at \
              <data_dir>/keys/{}.key (mode 0600).",
-            hex::encode(manifest.uuid)
+            hex::encode(manifest.dek_uuid())
         );
     } else {
         println!(
@@ -687,12 +705,12 @@ pub async fn cmd_key_migrate(
         match sidecar_warning {
             Some(true) => println!(
                 "  Local sidecar at <data_dir>/keys/{}.key removed (--purge-local).",
-                hex::encode(manifest.uuid)
+                hex::encode(manifest.dek_uuid())
             ),
             None => println!(
                 "  Local sidecar at <data_dir>/keys/{}.key preserved; re-run with \
                  --purge-local once you've verified the new backend.",
-                hex::encode(manifest.uuid)
+                hex::encode(manifest.dek_uuid())
             ),
             Some(false) => {}
         }
@@ -747,7 +765,7 @@ pub async fn cmd_key_export(
         None => Vec::new(),
     };
     let plain_dek: SecretBytes = backend
-        .unwrap(&manifest.uuid, &wrapped_in)
+        .unwrap(&manifest.dek_uuid(), &wrapped_in)
         .await
         .map_err(|e| anyhow!("unwrap via backend '{}': {e}", enc.keystore_backend))?;
 
@@ -770,7 +788,14 @@ pub async fn cmd_key_export(
         "application/vnd.thur.vsa.dek+json".to_string(),
     );
     extras.insert("thur_purpose".to_string(), "vsa_volume_dek".to_string());
-    extras.insert("thur_volume_uuid".to_string(), hex::encode(manifest.uuid));
+    // Bind the envelope to the *crypto identity* (the source uuid for a
+    // clone), not the volume's own uuid — that is the value any family
+    // member's `dek_uuid()` resolves to and the import binding check
+    // compares against (issue #86).
+    extras.insert(
+        "thur_volume_uuid".to_string(),
+        hex::encode(manifest.dek_uuid()),
+    );
 
     let jwe = passphrase_envelope::encode(&payload_bytes, &passphrase, iter, &extras)
         .map_err(|e| anyhow!("build JWE envelope: {e}"))?;
@@ -779,7 +804,7 @@ pub async fn cmd_key_export(
         .with_context(|| format!("writing envelope to {}", to.display()))?;
 
     println!("OK: volume '{name}' DEK exported to {}", to.display());
-    println!("  UUID bound:    {}", hex::encode(manifest.uuid));
+    println!("  UUID bound:    {}", hex::encode(manifest.dek_uuid()));
     println!("  Source backend: {}", enc.keystore_backend);
     println!("  Envelope:      JWE Compact (alg=PBES2-HS512+A256KW, enc=A256GCM, p2c={iter})");
     println!("  File mode:     0600");
@@ -839,12 +864,16 @@ pub async fn cmd_key_import(
              pass an envelope produced by `thurvsa volume key export`."
         );
     }
-    let manifest_uuid_hex = hex::encode(manifest.uuid);
-    if bound_uuid != manifest_uuid_hex {
+    // Compare against the *crypto identity* (`dek_uuid`), not the
+    // volume's own uuid — a clone's DEK is bound to the source family's
+    // identity C, so an envelope for the family carries C and any member
+    // accepts it (issue #86).
+    let manifest_dek_hex = hex::encode(manifest.dek_uuid());
+    if bound_uuid != manifest_dek_hex {
         bail!(
-            "envelope is bound to volume UUID {bound_uuid}, but volume '{name}' has \
-             UUID {manifest_uuid_hex}. Cross-volume binding is rejected — the \
-             envelope was made for a different volume."
+            "envelope is bound to crypto identity {bound_uuid}, but volume '{name}' \
+             resolves to {manifest_dek_hex}. Cross-family binding is rejected — the \
+             envelope was made for a different volume family."
         );
     }
 
@@ -940,7 +969,7 @@ pub async fn cmd_key_import(
         Vec::new()
     };
     if target_backend
-        .unwrap(&manifest.uuid, &probe_wrapped)
+        .unwrap(&manifest.dek_uuid(), &probe_wrapped)
         .await
         .is_ok()
     {
@@ -953,7 +982,7 @@ pub async fn cmd_key_import(
     }
 
     let wrapped_out = target_backend
-        .wrap(&manifest.uuid, &plain_dek)
+        .wrap(&manifest.dek_uuid(), &plain_dek)
         .await
         .map_err(|e| anyhow!("wrap via target backend '{target_name}': {e}"))?;
 
@@ -977,7 +1006,7 @@ pub async fn cmd_key_import(
     if target_backend.manages_local_blob() {
         println!(
             "  Sidecar written: <data_dir>/keys/{}.key (mode 0600)",
-            hex::encode(manifest.uuid)
+            hex::encode(manifest.dek_uuid())
         );
     } else {
         println!("  Wrapped DEK stored in manifest.encryption.wrapped_dek");

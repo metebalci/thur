@@ -222,16 +222,19 @@ specific chunk fails.
 
 A volume is a directory under `<data_dir>/volumes/<name>/`:
 
-- **`manifest.json`** — creation-frozen identity (schema v5): `name`,
+- **`manifest.json`** — creation-frozen identity (schema v6): `name`,
   `uuid`, `size_bytes`, `sector_bytes` (default 4096),
   `page_size_bytes` (default 65536), `backend`, `lun`, `dedup_scope`,
   `worm`, `created_at`, optional `encryption` metadata (wrapped
-  DEK for non-local keystore backends), and optional `dedup_namespace`
+  DEK for non-local keystore backends), optional `dedup_namespace`
   (schema v5; the chunk-pool *family* namespace — present only on
-  snapshots' clones, see § Snapshots + clones). Persisted atomically —
-  tmp + fsync + rename. Pre-v5 manifests load with `dedup_namespace`
-  absent, which means "namespace from my own `uuid`" — byte-for-byte
-  the historical behaviour, no migration.
+  snapshots and clones, see § Snapshots + clones), and optional
+  `crypto_uuid` (schema v6; the *crypto identity* — present only on a
+  clone of an encrypted volume, see § Snapshots + clones). Persisted
+  atomically — tmp + fsync + rename. Pre-v6 manifests load with
+  `crypto_uuid` (and pre-v5 with `dedup_namespace`) absent, each meaning
+  "derive from my own `uuid`" — byte-for-byte the historical behaviour,
+  no migration.
 - **`runtime.json`** — daemon-mutated sidecar carrying the four
   per-volume byte counters plus `modified_at` and `sync_after`.
   `host_bytes_written` and `host_bytes_read` are logical,
@@ -289,12 +292,14 @@ A **snapshot** is a frozen point-in-time copy of a volume's page table.
 It lives under the volume directory at
 `<data_dir>/volumes/<parent>/snapshots/<snap>/`:
 
-- **`snap.json`** — `SnapshotManifest` (schema v1): `name`, `uuid`
+- **`snap.json`** — `SnapshotManifest` (schema v2): `name`, `uuid`
   (= the parent's uuid, so the copied index header validates with no
   rewrite), `parent_volume`, `parent_uuid`, `created_at`, `backend`,
   `dedup_scope`, `dedup_namespace` (the family namespace), `page_size_bytes`,
   `sector_bytes`, `size_bytes` (the parent's live size at snapshot time),
-  and the parent's optional `encryption` metadata.
+  the parent's optional `encryption` metadata, and optional `crypto_uuid`
+  (schema v2; copied from the parent so a clone made from a snapshot of an
+  encrypted clone inherits the right crypto identity).
 - **`pages.idx`** — a byte-for-byte copy of the parent's page table at
   snapshot time.
 
@@ -323,12 +328,36 @@ snapshot's (or the live volume's) page table — a first-class volume with
 its own `uuid`, LUN, and page table. It inherits the source's *family*
 `dedup_namespace` so its `Local`-dedup chunks resolve in the shared
 family pool, and diverges from the source through ordinary copy-on-write
-on write. Cloning an **encrypted** volume is refused in this release
-(issue #86): shared chunks are sealed with the source's DEK and an IV
-derived from the source uuid, which a clone with a fresh uuid can't
-reproduce. A clone is a new volume name, so no host sees it until the
+on write. A clone is a new volume name, so no host sees it until the
 operator grants iSCSI / NVMe-TCP admission — it does **not** inherit the
 source's grants.
+
+Cloning an **encrypted** volume works too (issue #86). The shared chunks
+are ciphertext sealed with the source's DEK under an IV derived from the
+source's identity, so the clone inherits the source's *crypto identity*
+in its `crypto_uuid` field — the single value that seeds both AES-GCM IV
+derivation and the keystore wrap-context. The clone therefore derives the
+right IV for the shared chunks and unwraps the *same* DEK (the source's
+`encryption` metadata is copied verbatim — no re-wrap, no re-encrypt,
+which would defeat COW). Its own `uuid` stays distinct for identity and
+namespace. Divergent writes seal new ciphertext chunks under the same
+crypto identity. The DEK's lifecycle is refcounted by a manifest-walk
+scan (`crypto_identity_referenced`): `volume destroy` only forgets the
+DEK once no other family member (source, sibling clone, or snapshot) still
+keys its crypto identity on it, so destroying the source while a clone
+exists never strands the clone. `volume key migrate` refuses a crypto
+identity that is still shared, since re-wrapping one member's manifest
+would desync the family.
+
+Because the clone shares the source's IV identity, a source page P and a
+*diverged* clone page P both seal under the same `(DEK, IV)` — a GCM
+nonce reuse, inherent to copy-on-write sharing of encrypted chunks (the
+only alternatives, re-encrypting on clone or per-page IV salts, defeat
+COW or require a `pages.idx` format change — the latter tracked in issue
+#87). This extends the already-accepted nonce reuse on single-volume page
+rewrites; it is a documented limitation, not a correctness bug (distinct
+plaintexts still produce distinct ciphertext hashes, so no chunk ever
+aliases).
 
 The family-namespace GC arithmetic is in [`DEDUP.md`](DEDUP.md) §
 Snapshots + clones.

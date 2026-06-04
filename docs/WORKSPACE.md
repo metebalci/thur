@@ -459,7 +459,11 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `created_at`, optional `encryption`, optional `dedup_namespace`
   (schema v5; the family chunk-pool namespace inherited by a clone —
   absent means "namespace from my own uuid", routed through
-  `pool_namespace()`/`dedup_namespace_uuid()`). Volume names are 1-64
+  `pool_namespace()`/`dedup_namespace_uuid()`), and optional
+  `crypto_uuid` (schema v6; the crypto identity a clone of an encrypted
+  volume inherits — absent means "crypto identity from my own uuid",
+  routed through `dek_uuid()`, seeds AES-GCM IV + keystore wrap-context).
+  Volume names are 1-64
   ASCII alphanumeric + `-`/`_`. `VolumeManifest::create` also
   materializes the empty page index (`pages.idx`) plus a zero-valued
   `runtime.json` — a volume directory always has all three files or none.
@@ -468,8 +472,11 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `<data_dir>/volumes/<parent>/snapshots/<snap>/{snap.json, pages.idx}`.
   Carries the parent uuid (binds the copied index), the family
   `dedup_namespace`, backend, dedup scope, page/sector size, the
-  parent's live size, and optional encryption. Nested under the parent
-  so the discovery LUN walk skips it while GC + eviction descend into
+  parent's live size, optional encryption, and optional `crypto_uuid`
+  (schema v2; copied from the parent so a clone made from a snapshot of
+  an encrypted clone inherits the right crypto identity). Nested under
+  the parent so the discovery LUN walk skips it while GC + eviction
+  descend into
   `snapshots/`. `list_all` is the cross-volume walk GC uses to fold
   snapshot indexes into the live set.
 - `core-block::runtime_state::VolumeRuntime` — daemon-mutated sidecar

@@ -23,7 +23,13 @@
 #   Phase F — `system gc` must NOT reclaim pattern A's chunks while a
 #             snapshot/clone still references them: re-read cloneA after
 #             GC and confirm it is still pattern A.
-#   Phase G — `volume clone` of an encrypted volume is refused (#86).
+#   Phase G — clone an ENCRYPTED volume (#86): the clone inherits the
+#             source crypto identity and decrypts the shared chunks.
+#   Phase H — a divergent write to the encrypted clone seals new chunks;
+#             the encrypted source stays unchanged.
+#   Phase I — destroy the source while the clone lives: the shared DEK
+#             sidecar survives and the clone still decrypts (refcount).
+#   Phase J — destroy the last family member: the DEK sidecar is gone.
 #
 # The op model is transport-agnostic; only the login / device-discovery
 # primitives are iSCSI-specific (mirrors test-fs.sh's Phase D note).
@@ -108,6 +114,15 @@ cli() { "$CLI_PATH" --config "$TEST_CONFIG" "$@"; }
 get_lun() {
     cli volume info "$1" --json 2>/dev/null \
         | grep -oE '"lun":[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# A volume's 16-byte uuid (hex), read straight from its on-disk
+# manifest. For an origin encrypted volume the uuid is also its crypto
+# identity, so the DEK sidecar is <data_dir>/keys/<uuid>.key.
+get_uuid() {
+    grep -oE '"uuid":[[:space:]]*"[0-9a-f]{32}"' \
+        "${TEST_DIR}/data/volumes/$1/manifest.json" 2>/dev/null \
+        | grep -oE '[0-9a-f]{32}' | head -1
 }
 
 # By-path device node for a LUN; waits up to 10s for the kernel to
@@ -218,14 +233,58 @@ test_snapshot_clone_cow() {
         log_error "  ✗ daemon unhealthy after GC"; return 1; }
     log_info "  ✓ Phase F: GC retained snapshot/clone chunks; cloneA still pattern A"
 
-    # Phase G — cloning an encrypted volume is refused (#86).
-    local err
-    if err=$(cli volume clone enc encclone 2>&1); then
-        log_error "  ✗ encrypted clone unexpectedly succeeded"; return 1
-    fi
-    echo "$err" | grep -qiE "encrypt|#?86" || {
-        log_error "  ✗ encrypted-clone error message unclear: $err"; return 1; }
-    log_info "  ✓ Phase G: encrypted-volume clone refused (issue #86)"
+    # Phase G — clone an ENCRYPTED volume (issue #86). The clone inherits
+    # the source's crypto identity, so reads of un-diverged pages decrypt
+    # against the shared ciphertext chunks.
+    local enc_lun; enc_lun=$(get_lun enc)
+    [[ -n "$enc_lun" ]] || { log_error "  ✗ no LUN for enc"; return 1; }
+    write_region "$enc_lun" "$PATTERN_A" || return 1
+    cli volume clone enc encclone >/dev/null || {
+        log_error "  ✗ clone encrypted volume (issue #86 regression)"; return 1; }
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+    local encclone_lun; encclone_lun=$(get_lun encclone)
+    [[ -n "$encclone_lun" ]] || { log_error "  ✗ encrypted clone LUN not assigned"; return 1; }
+    read_region "$encclone_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_A" || {
+        log_error "  ✗ encrypted clone != pattern A (shared chunks did not decrypt)"; return 1; }
+    log_info "  ✓ Phase G: encrypted clone reads pattern A (shared encrypted chunks decrypt)"
+
+    # Phase H — a divergent write to the encrypted clone seals NEW
+    # encrypted chunks under the shared crypto identity; the source stays
+    # pattern A.
+    write_region "$encclone_lun" "$PATTERN_B" || return 1
+    read_region "$encclone_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_B" || {
+        log_error "  ✗ encrypted clone != pattern B after divergent write"; return 1; }
+    read_region "$enc_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_A" || {
+        log_error "  ✗ encrypted source diverged (should still be pattern A)"; return 1; }
+    log_info "  ✓ Phase H: clone diverged to B, encrypted source still A"
+
+    # Phase I — DEK custody is refcounted (issue #86). Destroy the SOURCE
+    # while the clone lives: the shared sidecar key must survive and the
+    # clone must still decrypt.
+    local cryptoid sidecar
+    cryptoid=$(get_uuid enc)
+    [[ -n "$cryptoid" ]] || { log_error "  ✗ could not read enc crypto identity"; return 1; }
+    sidecar="${TEST_DIR}/data/keys/${cryptoid}.key"
+    [[ -f "$sidecar" ]] || { log_error "  ✗ expected DEK sidecar $sidecar missing"; return 1; }
+    cli volume destroy enc --force >/dev/null || {
+        log_error "  ✗ destroy encrypted source"; return 1; }
+    [[ -f "$sidecar" ]] || {
+        log_error "  ✗ DEK sidecar removed while clone still references it"; return 1; }
+    read_region "$encclone_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_B" || {
+        log_error "  ✗ clone unreadable after source destroy (DEK stranded)"; return 1; }
+    log_info "  ✓ Phase I: source destroyed, shared DEK retained, clone still decrypts"
+
+    # Phase J — destroying the LAST family member forgets the DEK.
+    cli volume destroy encclone --force >/dev/null || {
+        log_error "  ✗ destroy encrypted clone"; return 1; }
+    [[ ! -f "$sidecar" ]] || {
+        log_error "  ✗ DEK sidecar survived the last family member ($sidecar)"; return 1; }
+    log_info "  ✓ Phase J: last family member destroyed, DEK forgotten"
 
     return 0
 }

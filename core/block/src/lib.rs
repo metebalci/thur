@@ -35,7 +35,7 @@ pub use lru_index::{LruIndexError, LruIndexFile};
 pub use page_index::{PageIndex, PageIndexError};
 pub use runtime_state::VolumeRuntime;
 pub use shared_pool::{DiskCacheBounds, DiskCacheSize};
-pub use snapshot::SnapshotManifest;
+pub use snapshot::{SnapshotManifest, crypto_identity_referenced};
 pub use upload_index::{UploadIndexError, UploadIndexFile, UploadState};
 pub use uploader::{
     DEFAULT_BACKPRESSURE_DEADLINE, PendingUploads, UploadTask, UploaderError, VolumeWriter,

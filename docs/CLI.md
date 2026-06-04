@@ -69,8 +69,10 @@ seeded from a snapshot (or `SRC`'s live contents), sharing chunks until it
 diverges on write. The clone is a new LUN — a host-side rescan plus an
 admission grant (`iscsi users grant` / `nvmetcp psks grant`, when CHAP /
 TLS-PSK is on) are needed before a host can use it; it does **not** inherit
-the source's grants. Cloning an encrypted volume is refused
-(issue #86). `system storage benchmark` is
+the source's grants. Cloning an encrypted volume is supported: the clone
+inherits the source's crypto identity (`crypto_uuid`) and shares its DEK,
+which is refcounted so destroying the source while a clone exists keeps
+the clone readable (issue #86). `system storage benchmark` is
 daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
 delete operations via `shared-object-store-bench`. `config` is pure-local.

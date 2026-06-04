@@ -885,14 +885,17 @@ impl VolumeWriter {
         }
 
         // Encrypt-on-write: AES-256-GCM with per-page IV derived from
-        // (volume_uuid, page_id, 0). For encrypted volumes the BLAKE3
-        // hash that follows runs over ciphertext, which means two
+        // (crypto_uuid, page_id, 0). `dek_uuid()` is the volume's own
+        // uuid for a fresh volume, or the inherited source identity for
+        // a clone of an encrypted volume (issue #86) so the clone's
+        // shared chunks stay decryptable. For encrypted volumes the
+        // BLAKE3 hash that follows runs over ciphertext, which means two
         // encrypted volumes with the same plaintext never collide in
         // the chunk pool — a feature, not a bug (cross-volume sharing
         // of encrypted data would defeat the encryption boundary).
         let ciphertext;
         let payload: &[u8] = if let Some(key) = self.encryption_key.as_ref() {
-            let iv = shared_crypto::derive_iv(&self.manifest.uuid, u64::from(page_id), 0);
+            let iv = shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), 0);
             ciphertext = shared_crypto::encrypt_block(key, &iv, bytes)
                 .map_err(|e: CryptoError| UploaderError::Encrypt(e.to_string()))?;
             &ciphertext
@@ -1141,7 +1144,7 @@ impl VolumeWriter {
         // READ handler. IV is re-derived from the same identity
         // tuple used at write time, no per-chunk metadata required.
         if let Some(key) = self.encryption_key.as_ref() {
-            let iv = shared_crypto::derive_iv(&self.manifest.uuid, u64::from(page_id), 0);
+            let iv = shared_crypto::derive_iv(&self.manifest.dek_uuid(), u64::from(page_id), 0);
             let plaintext =
                 shared_crypto::decrypt_block(key, &iv, &payload).map_err(|e| match e {
                     CryptoError::Decrypt(msg) => UploaderError::Decrypt(msg),

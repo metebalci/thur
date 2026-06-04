@@ -262,7 +262,7 @@ pub async fn discover_and_register(
                     })?,
                 None => Vec::new(),
             };
-            let secret = ks.unwrap(&m.uuid, &wrapped).await.with_context(|| {
+            let secret = ks.unwrap(&m.dek_uuid(), &wrapped).await.with_context(|| {
                 format!(
                     "unwrap DEK for volume '{}' via keystore '{}'",
                     m.name, enc.keystore_backend

@@ -51,7 +51,16 @@ use crate::volume::{
 };
 
 /// Current on-disk snapshot-manifest version.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+///
+/// History:
+/// - **v1** (issue #13) — initial frozen-page-table snapshot.
+/// - **v2** (issue #86) — adds optional `crypto_uuid: [u8; 16]`, the
+///   parent's crypto identity, copied through so a clone made from a
+///   snapshot of an encrypted *clone* inherits the right IV/DEK
+///   identity. `None` (the default for a snapshot of an origin volume,
+///   whose `uuid` already is the crypto identity) keeps the file
+///   byte-identical to v1 — no migration.
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Inline serde for a 16-byte UUID as lowercase hex — matching the
 /// volume manifest's encoding so a snapshot's `uuid` / `parent_uuid` /
@@ -72,6 +81,33 @@ mod uuid_hex {
         let mut out = [0u8; 16];
         out.copy_from_slice(&bytes);
         Ok(out)
+    }
+}
+
+/// `Option`-shaped variant of [`uuid_hex`] for the optional
+/// `crypto_uuid`, so a snapshot of an origin volume omits the field.
+mod opt_uuid_hex {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(uuid: &Option<[u8; 16]>, s: S) -> Result<S::Ok, S::Error> {
+        match uuid {
+            Some(u) => s.serialize_str(&hex::encode(u)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 16]>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        let Some(s) = opt else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(&s).map_err(D::Error::custom)?;
+        if bytes.len() != 16 {
+            return Err(D::Error::custom("uuid must be 16 bytes"));
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        Ok(Some(out))
     }
 }
 
@@ -114,11 +150,24 @@ pub struct SnapshotManifest {
     /// snapshot comes up at the right capacity.
     pub size_bytes: u64,
     /// At-rest encryption metadata copied from the parent. The snapshot
-    /// itself never decrypts (it is not host-visible); this records
-    /// whether the underlying chunks are encrypted so clone-create can
-    /// refuse an encrypted source (issue #86).
+    /// itself never decrypts (it is not host-visible); this records the
+    /// keystore backend + wrapped DEK so a clone made from this snapshot
+    /// can unwrap the *shared* DEK (issue #86).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<VolumeEncryptionMeta>,
+    /// Crypto identity copied from the parent (issue #86), the value a
+    /// clone made from this snapshot inherits as its own `crypto_uuid`.
+    /// `None` for a snapshot of an *origin* volume (its `uuid` already
+    /// is the crypto identity, and `uuid == parent_uuid` here);
+    /// `Some(C)` for a snapshot of an encrypted *clone*, whose `uuid`
+    /// differs from its crypto root `C`. Routed through
+    /// [`Self::dek_uuid`].
+    #[serde(
+        default,
+        with = "opt_uuid_hex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub crypto_uuid: Option<[u8; 16]>,
 }
 
 impl SnapshotManifest {
@@ -172,6 +221,7 @@ impl SnapshotManifest {
             sector_bytes: parent.sector_bytes,
             size_bytes: live_size_bytes,
             encryption: parent.encryption.clone(),
+            crypto_uuid: parent.crypto_uuid,
         })
     }
 
@@ -184,6 +234,15 @@ impl SnapshotManifest {
             DedupScope::Global => None,
             DedupScope::Local => Some(namespace_from_uuid(&self.dedup_namespace)),
         }
+    }
+
+    /// The crypto identity a clone made from this snapshot inherits: the
+    /// copied-through `crypto_uuid` if set (snapshot of an encrypted
+    /// clone), else this snapshot's `uuid` (snapshot of an origin
+    /// volume, where `uuid` is the crypto root). Mirrors
+    /// [`VolumeManifest::dek_uuid`] (issue #86).
+    pub fn dek_uuid(&self) -> [u8; 16] {
+        self.crypto_uuid.unwrap_or(self.uuid)
     }
 
     /// Atomic write: tmp + fsync + rename, matching
@@ -261,6 +320,46 @@ impl SnapshotManifest {
     }
 }
 
+/// Refcount-by-scan over crypto identities (issue #86). Returns `true`
+/// if any volume or snapshot manifest under `data_dir` keys its crypto
+/// identity ([`VolumeManifest::dek_uuid`] / [`SnapshotManifest::dek_uuid`])
+/// on `target` — other than the volume named `exclude` and its own
+/// snapshots, when given.
+///
+/// This is the reference notion behind refcounted DEK custody: a DEK
+/// shared by a source + clone family must not be `keystore.forget`-ten
+/// (on `volume destroy`) or rewrapped (on `volume key migrate`) while
+/// any other family member still needs it. There is no persistent
+/// refcount — a chunk-pool-GC-style manifest walk is the source of
+/// truth, so it can never drift from reality.
+///
+/// `exclude = None` is the destroy path: call it *after* removing the
+/// volume's on-disk subtree, so the tree it walks is exactly the
+/// survivors. `exclude = Some(name)` is the migrate path: the volume is
+/// still present and must not count itself or its snapshots.
+pub fn crypto_identity_referenced(
+    data_dir: &Path,
+    target: [u8; 16],
+    exclude: Option<&str>,
+) -> Result<bool, VolumeError> {
+    for vol in VolumeManifest::list(data_dir)? {
+        if exclude == Some(vol.as_str()) {
+            // Skips this volume's manifest *and* its snapshots (walked
+            // inside this loop body), i.e. the whole excluded subtree.
+            continue;
+        }
+        if VolumeManifest::load(data_dir, &vol)?.dek_uuid() == target {
+            return Ok(true);
+        }
+        for snap in SnapshotManifest::list(data_dir, &vol)? {
+            if SnapshotManifest::load(data_dir, &vol, &snap)?.dek_uuid() == target {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +412,68 @@ mod tests {
         let p = parent("vol1", DedupScope::Global);
         let s = SnapshotManifest::new("snap1".into(), &p, 1u64 << 30).unwrap();
         assert_eq!(s.pool_namespace(), None);
+    }
+
+    #[test]
+    fn snapshot_propagates_crypto_identity() {
+        // Origin volume: crypto_uuid None, so the snapshot's dek_uuid is
+        // the parent uuid (== the snapshot's own uuid).
+        let p = parent("vol1", DedupScope::Local);
+        let s = SnapshotManifest::new("snap1".into(), &p, 1u64 << 30).unwrap();
+        assert!(s.crypto_uuid.is_none());
+        assert_eq!(s.dek_uuid(), p.uuid);
+
+        // Snapshot of an encrypted clone: crypto_uuid copies through, so
+        // dek_uuid stays the *source* identity even though the snapshot's
+        // own uuid is the clone's (issue #86).
+        let source = [0xC0u8; 16];
+        let clone = parent("clone1", DedupScope::Local).with_crypto_uuid(source);
+        let s2 = SnapshotManifest::new("s".into(), &clone, 1u64 << 30).unwrap();
+        assert_eq!(s2.uuid, clone.uuid);
+        assert_eq!(s2.crypto_uuid, Some(source));
+        assert_eq!(s2.dek_uuid(), source);
+    }
+
+    #[test]
+    fn crypto_identity_referenced_tracks_family() {
+        let dir = TempDir::new().unwrap();
+        let source = [0xC0u8; 16];
+
+        // A clone keyed on the shared crypto identity `source`, plus an
+        // unrelated volume on its own identity.
+        let clone = parent("clone1", DedupScope::Local).with_crypto_uuid(source);
+        clone.clone().create(dir.path()).unwrap();
+        let other = parent("other", DedupScope::Local);
+        other.clone().create(dir.path()).unwrap();
+
+        // `source` is referenced by clone1, but not once clone1 is
+        // excluded (the destroy-of-last-member case).
+        assert!(crypto_identity_referenced(dir.path(), source, None).unwrap());
+        assert!(!crypto_identity_referenced(dir.path(), source, Some("clone1")).unwrap());
+        // `other`'s own identity is referenced by itself only.
+        assert!(crypto_identity_referenced(dir.path(), other.uuid, None).unwrap());
+        assert!(!crypto_identity_referenced(dir.path(), other.uuid, Some("other")).unwrap());
+        // An unknown identity is referenced by nobody.
+        assert!(!crypto_identity_referenced(dir.path(), [0x99u8; 16], None).unwrap());
+
+        // A snapshot of clone1 also pins `source` — but excluding clone1
+        // excludes its whole subtree (its own snapshots go with it on
+        // destroy), so `source` is unreferenced under that exclusion.
+        let snap = SnapshotManifest::new("snap".into(), &clone, 1u64 << 30).unwrap();
+        let sd = SnapshotManifest::dir_for(dir.path(), "clone1", "snap");
+        fs::create_dir_all(&sd).unwrap();
+        snap.persist(&sd).unwrap();
+        assert!(crypto_identity_referenced(dir.path(), source, None).unwrap());
+        assert!(!crypto_identity_referenced(dir.path(), source, Some("clone1")).unwrap());
+
+        // A *sibling* volume that also references `source` keeps it alive
+        // even when clone1 is excluded — destroying clone1 must not
+        // forget the shared DEK.
+        parent("sibling", DedupScope::Local)
+            .with_crypto_uuid(source)
+            .create(dir.path())
+            .unwrap();
+        assert!(crypto_identity_referenced(dir.path(), source, Some("clone1")).unwrap());
     }
 
     #[test]

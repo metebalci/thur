@@ -49,7 +49,17 @@ use thiserror::Error;
 ///   `Local`-dedup pool namespace and can resolve each other's shared
 ///   chunks. `Global`-dedup volumes ignore it (their namespace is
 ///   always the shared per-backend pool).
-pub const VOLUME_SCHEMA_VERSION: u32 = 5;
+/// - **v6** (2026-06-04) — adds optional `crypto_uuid: [u8; 16]`, the
+///   *crypto identity* a clone of an encrypted volume inherits from its
+///   source (issue #86). It seeds both AES-GCM IV derivation and the
+///   keystore wrap-context (DEK lookup), so a clone with its own fresh
+///   `uuid` still derives the right IV for the source's shared chunks
+///   and resolves the shared DEK. `None` (the default for every pre-v6
+///   and freshly-created volume) means "crypto identity is my own
+///   `uuid`" — byte-for-byte identical to prior behaviour, no
+///   migration. Distinct from `dedup_namespace` so the chunk-pool and
+///   DEK lifecycles stay independent.
+pub const VOLUME_SCHEMA_VERSION: u32 = 6;
 
 /// Sentinel for "this manifest predates the v4 schema and has no
 /// pinned LUN yet." Discovery resolves these to real values at boot.
@@ -315,9 +325,10 @@ mod uuid_serde {
     }
 }
 
-/// Inline serde for the optional `dedup_namespace` UUID — same
-/// lowercase-hex encoding as [`uuid_serde`], but `Option`-shaped so
-/// the field can be omitted from a fresh volume's manifest.
+/// Inline serde for an optional manifest UUID (`dedup_namespace`,
+/// `crypto_uuid`) — same lowercase-hex encoding as [`uuid_serde`], but
+/// `Option`-shaped so the field can be omitted from a fresh volume's
+/// manifest.
 mod opt_uuid_serde {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
@@ -335,7 +346,7 @@ mod opt_uuid_serde {
         };
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
         if bytes.len() != 16 {
-            return Err(D::Error::custom("dedup_namespace must be 16 bytes"));
+            return Err(D::Error::custom("manifest uuid must be 16 bytes"));
         }
         let mut out = [0u8; 16];
         out.copy_from_slice(&bytes);
@@ -410,6 +421,24 @@ pub struct VolumeManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub dedup_namespace: Option<[u8; 16]>,
+    /// *Crypto identity* for at-rest encryption (issue #86). Seeds both
+    /// the AES-GCM IV (`derive_iv`) and the keystore wrap-context (DEK
+    /// lookup). `None` (the default for every fresh volume) means "use
+    /// my own `uuid`" — the historical behaviour. A clone of an
+    /// encrypted volume inherits the source's identity here so it
+    /// derives the right IV for the shared chunks and unwraps the
+    /// *shared* DEK, while keeping its own distinct `uuid`. Immutable
+    /// once set — the shared chunks are sealed under it forever. Routed
+    /// through [`Self::dek_uuid`] so no crypto/keystore call site reads
+    /// the raw field. Distinct from `dedup_namespace`: the two govern
+    /// independent lifecycles (chunk-pool GC vs DEK custody) and diverge
+    /// under `Global` dedup.
+    #[serde(
+        default,
+        with = "opt_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub crypto_uuid: Option<[u8; 16]>,
 }
 
 impl VolumeManifest {
@@ -452,6 +481,17 @@ impl VolumeManifest {
         self.dedup_namespace.unwrap_or(self.uuid)
     }
 
+    /// The 16-byte identity feeding AES-GCM IV derivation *and* the
+    /// keystore wrap-context (DEK lookup) for an encrypted volume: the
+    /// inherited `crypto_uuid` for a clone of an encrypted volume, else
+    /// this volume's own `uuid` (a fresh volume is its own crypto root).
+    /// Every crypto/keystore call site keys on this rather than `uuid`
+    /// so a clone with a fresh `uuid` still resolves the source family's
+    /// IV + DEK (issue #86).
+    pub fn dek_uuid(&self) -> [u8; 16] {
+        self.crypto_uuid.unwrap_or(self.uuid)
+    }
+
     /// Build a fresh manifest. Does not touch disk — call
     /// [`Self::create`] for the on-disk side. The `encryption` field
     /// is set separately via [`Self::with_encryption`]; the daemon
@@ -492,6 +532,7 @@ impl VolumeManifest {
             created_at: Utc::now(),
             encryption: None,
             dedup_namespace: None,
+            crypto_uuid: None,
         })
     }
 
@@ -501,6 +542,16 @@ impl VolumeManifest {
     /// its own (empty) one. A no-op effect under `Global` dedup.
     pub fn with_dedup_namespace(mut self, namespace_uuid: [u8; 16]) -> Self {
         self.dedup_namespace = Some(namespace_uuid);
+        self
+    }
+
+    /// Inherit a crypto identity (issue #86). Builder-style, used by
+    /// clone create when the source is encrypted so the new volume
+    /// derives the source family's IV and unwraps the *shared* DEK
+    /// instead of minting its own. Immutable thereafter — see
+    /// [`Self::dek_uuid`].
+    pub fn with_crypto_uuid(mut self, crypto_uuid: [u8; 16]) -> Self {
+        self.crypto_uuid = Some(crypto_uuid);
         self
     }
 
@@ -1262,5 +1313,123 @@ mod tests {
         assert_eq!(loaded.schema_version, VOLUME_SCHEMA_VERSION);
         assert!(loaded.dedup_namespace.is_none());
         assert_eq!(loaded.dedup_namespace_uuid(), loaded.uuid);
+    }
+
+    #[test]
+    fn fresh_volume_dek_uuid_keys_on_own_uuid() {
+        // crypto_uuid defaults to None, so dek_uuid() resolves to the
+        // volume's own uuid — identical to pre-#86 behaviour.
+        let m = VolumeManifest::new(
+            "vol1".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(m.crypto_uuid.is_none());
+        assert_eq!(m.dek_uuid(), m.uuid);
+    }
+
+    #[test]
+    fn inherited_crypto_uuid_keys_on_family_root() {
+        // A clone of an encrypted volume carries crypto_uuid = the
+        // source identity, so dek_uuid() resolves there (for IV + DEK),
+        // while its own uuid stays distinct (for identity/namespace).
+        // The crypto identity is independent of the dedup namespace.
+        let source = [0xC0u8; 16];
+        let family = [0xABu8; 16];
+        let m = VolumeManifest::new(
+            "clone1".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_dedup_namespace(family)
+        .with_crypto_uuid(source);
+        assert_ne!(m.uuid, source);
+        assert_eq!(m.dek_uuid(), source);
+        // Distinct field from the dedup namespace.
+        assert_eq!(m.dedup_namespace_uuid(), family);
+    }
+
+    #[test]
+    fn v6_crypto_uuid_round_trips_and_omits_when_absent() {
+        let dir = TempDir::new().unwrap();
+        // Absent: must not leak a "crypto_uuid" key into the JSON.
+        VolumeManifest::new(
+            "plain".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(dir.path())
+        .unwrap();
+        let raw = std::fs::read_to_string(VolumeManifest::path_for(dir.path(), "plain")).unwrap();
+        assert!(
+            !raw.contains("crypto_uuid"),
+            "fresh manifest leaks crypto_uuid: {raw}"
+        );
+
+        // Present: persists and reloads byte-identically.
+        let source = [0x5Au8; 16];
+        let created = VolumeManifest::new(
+            "child".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            1,
+        )
+        .unwrap()
+        .with_crypto_uuid(source)
+        .create(dir.path())
+        .unwrap();
+        let loaded = VolumeManifest::load(dir.path(), "child").unwrap();
+        assert_eq!(loaded, created);
+        assert_eq!(loaded.crypto_uuid, Some(source));
+        assert_eq!(loaded.dek_uuid(), source);
+    }
+
+    #[test]
+    fn pre_v6_manifest_loads_crypto_uuid_none() {
+        // A v5 manifest on disk (no crypto_uuid field) loads with None
+        // and keys its DEK on its own uuid — no behaviour change.
+        let dir = TempDir::new().unwrap();
+        let vol_dir = VolumeManifest::dir_for(dir.path(), "vol1");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let raw = serde_json::json!({
+            "schema_version": 5,
+            "name": "vol1",
+            "uuid": "00112233445566778899aabbccddeeff",
+            "size_bytes": 1_073_741_824u64,
+            "sector_bytes": DEFAULT_SECTOR_BYTES,
+            "page_size_bytes": DEFAULT_PAGE_SIZE_BYTES,
+            "backend": "primary",
+            "lun": 0,
+            "dedup_scope": "local",
+            "worm": false,
+            "created_at": "2026-06-04T00:00:00Z",
+        });
+        std::fs::write(vol_dir.join("manifest.json"), raw.to_string()).unwrap();
+        let loaded = VolumeManifest::load(dir.path(), "vol1").unwrap();
+        assert_eq!(loaded.schema_version, VOLUME_SCHEMA_VERSION);
+        assert!(loaded.crypto_uuid.is_none());
+        assert_eq!(loaded.dek_uuid(), loaded.uuid);
     }
 }

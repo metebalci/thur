@@ -140,11 +140,21 @@ pub fn decrypt_block(
 ///   per-cartridge monotonic and never reused (ALLOW OVERWRITE mints a
 ///   new chunk, doesn't recycle), so `(chunk_id, offset)` is unique for
 ///   the cartridge lifetime.
-/// - **Block (SBC):** `derive_iv(uuid, page_id, 0)`. `page_id` is per-
-///   volume unique across rewrites because every write produces a new
-///   ciphertext via fresh nonce; same `page_id` reused after a rewrite
-///   is fine as long as the new ciphertext + tag overwrite the old
-///   pool entry (chunk pool atomic-rename handles that).
+/// - **Block (SBC):** `derive_iv(crypto_uuid, page_id, 0)`, where
+///   `crypto_uuid` is the volume's *crypto identity* (`dek_uuid()` —
+///   its own `uuid`, or the inherited source identity for a clone of an
+///   encrypted volume, issue #86).
+///   Within a single volume the same `page_id` reused after a rewrite
+///   reuses the IV; that is accepted because the new ciphertext + tag
+///   overwrite the old pool entry (chunk pool atomic-rename). A clone
+///   of an encrypted volume shares the source's `crypto_uuid` so it
+///   derives the matching IV for the shared (un-diverged) ciphertext
+///   chunks — which means a source page and a *diverged* clone page at
+///   the same `page_id` can hold two live ciphertexts under one
+///   `(key, IV)`. This is the same class of nonce reuse as the rewrite
+///   case, inherent to copy-on-write sharing of encrypted chunks, and
+///   is a documented limitation (a per-page IV salt would remove it but
+///   needs a `pages.idx` format change — tracked in issue #87).
 pub fn derive_iv(uuid: &[u8; 16], counter_a: u64, counter_b: u64) -> [u8; IV_LEN] {
     let mut h = blake3::Hasher::new();
     h.update(uuid);
