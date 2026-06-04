@@ -140,11 +140,6 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Pre-parse intercept for `--copyright`. Lets the flag work
-    // without a subcommand (clap would otherwise reject for
-    // missing one).
-    shared_cli::handle_copyright_flag();
-
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())

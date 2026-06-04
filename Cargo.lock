@@ -4528,7 +4528,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "nix",
- "shared-naming",
 ]
 
 [[package]]

@@ -887,7 +887,7 @@ _thurvtl() {
 
     case "${cmd}" in
         thurvtl)
-            opts="-c -h -V --config --user --copyright --help --version library cartridge changer drive system iscsi config help"
+            opts="-c -h -V --config --user --help --version library cartridge changer drive system iscsi config help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -913,7 +913,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge)
-            opts="-c -h --config --user --copyright --help create archive migrate import export list info reset-stats legal-hold key help"
+            opts="-c -h --config --user --help create archive migrate import export list info reset-stats legal-hold key help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -939,7 +939,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__archive)
-            opts="-c -h --target-backend --label --dry-run --config --user --copyright --help <BARCODE>"
+            opts="-c -h --target-backend --label --dry-run --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -973,7 +973,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__create)
-            opts="-c -h --lto-generation --chunk-size-mb --chunking --chunking-min-kb --chunking-max-kb --multi --backend --worm --dedup --encrypt --keystore --config --user --copyright --help <BARCODE>"
+            opts="-c -h --lto-generation --chunk-size-mb --chunking --chunking-min-kb --chunking-max-kb --multi --backend --worm --dedup --encrypt --keystore --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1035,7 +1035,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__export)
-            opts="-c -h --config --user --copyright --help <SLOT> <PATH>"
+            opts="-c -h --config --user --help <SLOT> <PATH>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1299,7 +1299,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__import)
-            opts="-c -h --config --user --copyright --help <PATH> <SLOT>"
+            opts="-c -h --config --user --help <PATH> <SLOT>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1325,7 +1325,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__info)
-            opts="-c -h --json --config --user --copyright --help <IDENTIFIER>"
+            opts="-c -h --json --config --user --help <IDENTIFIER>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1351,7 +1351,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__key)
-            opts="-c -h --config --user --copyright --help migrate show help"
+            opts="-c -h --config --user --help migrate show help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1433,7 +1433,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__key__subcmd__migrate)
-            opts="-c -h --to --purge-local --config --user --copyright --help <BARCODE>"
+            opts="-c -h --to --purge-local --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1463,7 +1463,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__key__subcmd__show)
-            opts="-c -h --config --user --copyright --help <BARCODE>"
+            opts="-c -h --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1489,7 +1489,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__legal__subcmd__hold)
-            opts="-c -h --config --user --copyright --help set clear status help"
+            opts="-c -h --config --user --help set clear status help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1515,7 +1515,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__legal__subcmd__hold__subcmd__clear)
-            opts="-c -h --id --reason --config --user --copyright --help <BARCODE>"
+            opts="-c -h --id --reason --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1619,7 +1619,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__legal__subcmd__hold__subcmd__set)
-            opts="-c -h --id --reason --config --user --copyright --help <BARCODE>"
+            opts="-c -h --id --reason --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1653,7 +1653,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__legal__subcmd__hold__subcmd__status)
-            opts="-c -h --full --config --user --copyright --help <BARCODE>"
+            opts="-c -h --full --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1679,7 +1679,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__list)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1705,7 +1705,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__migrate)
-            opts="-c -h --target-backend --mode --no-verify --dry-run --config --user --copyright --help <BARCODE>"
+            opts="-c -h --target-backend --mode --no-verify --dry-run --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1739,7 +1739,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__cartridge__subcmd__reset__subcmd__stats)
-            opts="-c -h --config --user --copyright --help <BARCODE>"
+            opts="-c -h --config --user --help <BARCODE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1765,7 +1765,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__changer)
-            opts="-c -h --config --user --copyright --help inventory move load unload help"
+            opts="-c -h --config --user --help inventory move load unload help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1875,7 +1875,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__changer__subcmd__inventory)
-            opts="-c -h --filter --json --config --user --copyright --help"
+            opts="-c -h --filter --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1905,7 +1905,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__changer__subcmd__load)
-            opts="-c -h --cross-partition --config --user --copyright --help <SLOT> <DRIVE>"
+            opts="-c -h --cross-partition --config --user --help <SLOT> <DRIVE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1931,7 +1931,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__changer__subcmd__move)
-            opts="-c -h --cross-partition --config --user --copyright --help <FROM_SLOT> <TO_SLOT>"
+            opts="-c -h --cross-partition --config --user --help <FROM_SLOT> <TO_SLOT>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1957,7 +1957,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__changer__subcmd__unload)
-            opts="-c -h --force --cross-partition --config --user --copyright --help <DRIVE> [SLOT]"
+            opts="-c -h --force --cross-partition --config --user --help <DRIVE> [SLOT]"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1983,7 +1983,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__config)
-            opts="-c -h --config --user --copyright --help defaults systemd-unit completion help"
+            opts="-c -h --config --user --help defaults systemd-unit completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2009,7 +2009,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__config__subcmd__completion)
-            opts="-c -h --config --user --copyright --help bash elvish fish powershell zsh"
+            opts="-c -h --config --user --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2035,7 +2035,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__config__subcmd__defaults)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2131,7 +2131,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__config__subcmd__systemd__subcmd__unit)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2157,7 +2157,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__drive)
-            opts="-c -h --config --user --copyright --help status self-test reset-stats help"
+            opts="-c -h --config --user --help status self-test reset-stats help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2253,7 +2253,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__drive__subcmd__reset__subcmd__stats)
-            opts="-c -h --all --config --user --copyright --help [DRIVE]"
+            opts="-c -h --all --config --user --help [DRIVE]"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2279,7 +2279,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__drive__subcmd__self__subcmd__test)
-            opts="-c -h --json --config --user --copyright --help <DRIVE>"
+            opts="-c -h --json --config --user --help <DRIVE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2305,7 +2305,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__drive__subcmd__status)
-            opts="-c -h --json --config --user --copyright --help <DRIVE>"
+            opts="-c -h --json --config --user --help <DRIVE>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3437,7 +3437,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi)
-            opts="-c -h --config --user --copyright --help users target help"
+            opts="-c -h --config --user --help users target help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3645,7 +3645,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__target)
-            opts="-c -h --config --user --copyright --help show set clear help"
+            opts="-c -h --config --user --help show set clear help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3671,7 +3671,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__target__subcmd__clear)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3767,7 +3767,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__target__subcmd__set)
-            opts="-c -h --username --password --password-stdin --config --user --copyright --help"
+            opts="-c -h --username --password --password-stdin --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3801,7 +3801,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__target__subcmd__show)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3827,7 +3827,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users)
-            opts="-c -h --config --user --copyright --help list add remove disable enable rotate help"
+            opts="-c -h --config --user --help list add remove disable enable rotate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3853,7 +3853,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__add)
-            opts="-c -h --password --password-stdin --mutual-chap --partition --config --user --copyright --help <NAME>"
+            opts="-c -h --password --password-stdin --mutual-chap --partition --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3887,7 +3887,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__disable)
-            opts="-c -h --config --user --copyright --help <NAME>"
+            opts="-c -h --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3913,7 +3913,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__enable)
-            opts="-c -h --config --user --copyright --help <NAME>"
+            opts="-c -h --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4051,7 +4051,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__list)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4077,7 +4077,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__remove)
-            opts="-c -h --config --user --copyright --help <NAME>"
+            opts="-c -h --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4103,7 +4103,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__iscsi__subcmd__users__subcmd__rotate)
-            opts="-c -h --password --password-stdin --grace --cancel --config --user --copyright --help <NAME>"
+            opts="-c -h --password --password-stdin --grace --cancel --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4137,7 +4137,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library)
-            opts="-c -h --config --user --copyright --help info bounds restore restore-archive monitor self-test partition help"
+            opts="-c -h --config --user --help info bounds restore restore-archive monitor self-test partition help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4163,7 +4163,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__bounds)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4371,7 +4371,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__info)
-            opts="-c -h --json --with-cartridges --config --user --copyright --help"
+            opts="-c -h --json --with-cartridges --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4397,7 +4397,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__monitor)
-            opts="-c -h --interval --config --user --copyright --help"
+            opts="-c -h --interval --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4427,7 +4427,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition)
-            opts="-c -h --config --user --copyright --help list create modify delete help"
+            opts="-c -h --config --user --help list create modify delete help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4453,7 +4453,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__create)
-            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --copyright --help <NAME>"
+            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4499,7 +4499,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__delete)
-            opts="-c -h --merge-into --config --user --copyright --help <NAME>"
+            opts="-c -h --merge-into --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4613,7 +4613,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__list)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4639,7 +4639,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__partition__subcmd__modify)
-            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --copyright --help <NAME>"
+            opts="-c -h --storage-start --storage-end --mail-start --mail-end --drives --config --user --help <NAME>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4685,7 +4685,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__restore)
-            opts="-c -h --backend --barcodes --dry-run --allow-existing --config --user --copyright --help"
+            opts="-c -h --backend --barcodes --dry-run --allow-existing --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4719,7 +4719,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__restore__subcmd__archive)
-            opts="-c -h --backend --barcode --label --as-barcode --allow-existing --dry-run --config --user --copyright --help"
+            opts="-c -h --backend --barcode --label --as-barcode --allow-existing --dry-run --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4761,7 +4761,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__library__subcmd__self__subcmd__test)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4787,7 +4787,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system)
-            opts="-c -h --config --user --copyright --help gc audit storage stats daemon-health monitor reset-stats verify tiering regenerate-cert alerting help"
+            opts="-c -h --config --user --help gc audit storage stats daemon-health monitor reset-stats verify tiering regenerate-cert alerting help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4813,7 +4813,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__alerting)
-            opts="-c -h --config --user --copyright --help list test help"
+            opts="-c -h --config --user --help list test help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4895,7 +4895,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__alerting__subcmd__list)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4921,7 +4921,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__alerting__subcmd__test)
-            opts="-c -h --severity --config --user --copyright --help <SINK>"
+            opts="-c -h --severity --config --user --help <SINK>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4951,7 +4951,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit)
-            opts="-c -h --config --user --copyright --help tail export verify verify-offline rotate help"
+            opts="-c -h --config --user --help tail export verify verify-offline rotate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4977,7 +4977,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit__subcmd__export)
-            opts="-c -h --format --from --to --config --user --copyright --help"
+            opts="-c -h --format --from --to --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5113,7 +5113,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit__subcmd__rotate)
-            opts="-c -h --accept-break --config --user --copyright --help"
+            opts="-c -h --accept-break --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5139,7 +5139,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit__subcmd__tail)
-            opts="-f -n -c -h --follow --lines --config --user --copyright --help"
+            opts="-f -n -c -h --follow --lines --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5173,7 +5173,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit__subcmd__verify)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5199,7 +5199,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__audit__subcmd__verify__subcmd__offline)
-            opts="-c -h --dir --json --config --user --copyright --help"
+            opts="-c -h --dir --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5229,7 +5229,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__daemon__subcmd__health)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5255,7 +5255,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__gc)
-            opts="-c -h --dry-run --storage --config --user --copyright --help"
+            opts="-c -h --dry-run --storage --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5631,7 +5631,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__monitor)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5657,7 +5657,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__regenerate__subcmd__cert)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5683,7 +5683,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__reset__subcmd__stats)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5709,7 +5709,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__stats)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5735,7 +5735,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__storage)
-            opts="-c -h --config --user --copyright --help check benchmark help"
+            opts="-c -h --config --user --help check benchmark help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5761,7 +5761,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__storage__subcmd__benchmark)
-            opts="-c -h --backend --total-gb --chunk-size-mb --concurrency --chunk-size-mb-sweep --concurrency-sweep --skip-download --yes --config --user --copyright --help"
+            opts="-c -h --backend --total-gb --chunk-size-mb --concurrency --chunk-size-mb-sweep --concurrency-sweep --skip-download --yes --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5811,7 +5811,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__storage__subcmd__check)
-            opts="-c -h --config --user --copyright --help"
+            opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5893,7 +5893,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__tiering)
-            opts="-c -h --config --user --copyright --help plan run-now status help"
+            opts="-c -h --config --user --help plan run-now status help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5989,7 +5989,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__tiering__subcmd__plan)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6015,7 +6015,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__tiering__subcmd__run__subcmd__now)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6041,7 +6041,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__tiering__subcmd__status)
-            opts="-c -h --json --config --user --copyright --help"
+            opts="-c -h --json --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6067,7 +6067,7 @@ _thurvtl() {
             return 0
             ;;
         thurvtl__subcmd__system__subcmd__verify)
-            opts="-c -h --skip-storage --verbose --json --config --user --copyright --help [BARCODES]..."
+            opts="-c -h --skip-storage --verbose --json --config --user --help [BARCODES]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

@@ -18,7 +18,6 @@ _thurvsa() {
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -37,7 +36,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__volume_commands" \
@@ -66,7 +64,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--worm[Mark the volume Write-Once-Read-Many]' \
 '--encrypt[Enable at-rest encryption (requires --keystore)]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name (1-64 chars\: letters, digits, '\''-'\'', '\''_'\''):_default' \
@@ -78,7 +75,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the response as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -89,7 +85,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the manifest as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -101,7 +96,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--force[Confirm destruction. Without this flag the command refuses; the volume contents are gone after a destroy]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -113,7 +107,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -126,7 +119,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--shrink-to-fit[Shrink to the smallest size that keeps all data]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -137,7 +129,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__volume__subcmd__key_commands" \
@@ -157,7 +148,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--purge-local[Delete the local-keystore sidecar after migrating away]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -170,7 +160,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -183,7 +172,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Volume name:_default' \
@@ -230,7 +218,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__volume__subcmd__snapshot_commands" \
@@ -248,7 +235,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':volume -- Volume name:_default' \
@@ -261,7 +247,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the response as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':volume -- Volume name:_default' \
@@ -273,7 +258,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--force[Confirm destruction. Without it the command refuses]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':volume -- Volume name:_default' \
@@ -323,7 +307,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':source -- Source volume name:_default' \
@@ -443,7 +426,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__system_commands" \
@@ -461,7 +443,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__system__subcmd__storage_commands" \
@@ -479,7 +460,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -497,7 +477,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--skip-download[Skip the download phase]' \
 '--yes[Bypass the sweep-preview prompt (scripted runs)]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -541,7 +520,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--dry-run[Show what would be deleted without actually deleting]' \
 '--storage[Also delete orphan objects from the storage backend]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -551,7 +529,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -561,7 +538,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__system__subcmd__alerting_commands" \
@@ -580,7 +556,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -591,7 +566,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':sink -- Sink name from the YAML `alerting.sinks` list:_default' \
@@ -635,7 +609,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the response as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -645,7 +618,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -655,7 +627,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__system__subcmd__audit_commands" \
@@ -677,7 +648,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '-f[Follow new entries as they land]' \
 '--follow[Follow new entries as they land]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -690,7 +660,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -700,7 +669,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -712,7 +680,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the VerifyReport as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -723,7 +690,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--accept-break[Required confirmation. Without this flag, refuses to run]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -778,7 +744,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit the full report as JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -791,7 +756,6 @@ _arguments "${_arguments_options[@]}" : \
 '--skip-storage[Skip the storage-backend sweep (local-only audit)]' \
 '--verbose[Per-volume breakdown (every error and warning)]' \
 '--json[Emit the full report as JSON for CI / automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '*::volumes -- Optional volume names to limit the sweep:_default' \
@@ -934,7 +898,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__iscsi_commands" \
@@ -952,7 +915,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__iscsi__subcmd__users_commands" \
@@ -971,7 +933,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -986,7 +947,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--password-stdin[Read the password from stdin (single line, trailing newline stripped). Mutually exclusive with \`--password\`]' \
 '--mutual-chap[Enable mutual CHAP (target authenticates back to the initiator). Requires \`iscsi target set\` to have been run]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username (CHAP identity the initiator presents):_default' \
@@ -998,7 +958,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to grant access to:_default' \
@@ -1010,7 +969,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to revoke access from:_default' \
@@ -1021,7 +979,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to remove:_default' \
@@ -1032,7 +989,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to disable:_default' \
@@ -1043,7 +999,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to re-enable:_default' \
@@ -1058,7 +1013,6 @@ _arguments "${_arguments_options[@]}" : \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '(--cancel)--password-stdin[Read the new password from stdin (single line)]' \
 '--cancel[Cancel an in-flight rotation\: drop the new password, restore the previous one as sole current. Errors if no rotation is in progress]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':name -- Username to rotate:_default' \
@@ -1125,7 +1079,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__iscsi__subcmd__target_commands" \
@@ -1144,7 +1097,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1157,7 +1109,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--password-stdin[Read the password from stdin (single line)]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1167,7 +1118,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1313,7 +1263,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__nvmetcp_commands" \
@@ -1331,7 +1280,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__nvmetcp__subcmd__psks_commands" \
@@ -1350,7 +1298,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1363,7 +1310,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1375,7 +1321,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1387,7 +1332,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1398,7 +1342,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1409,7 +1352,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1420,7 +1362,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1434,7 +1375,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--cancel[Cancel an in-flight rotation\: drop the new key, restore the previous one. Errors if no rotation is in progress]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1500,7 +1440,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__nvmetcp__subcmd__dhchap_commands" \
@@ -1519,7 +1458,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--json[Emit JSON for automation]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1533,7 +1471,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1545,7 +1482,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1557,7 +1493,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1568,7 +1503,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1579,7 +1513,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1590,7 +1523,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1602,7 +1534,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1613,7 +1544,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1627,7 +1557,6 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--cancel[Cancel an in-flight rotation\: drop the new secret, restore the previous one. Errors if no rotation is in progress]' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1829,7 +1758,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_thurvsa__subcmd__config_commands" \
@@ -1847,7 +1775,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1857,7 +1784,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1867,7 +1793,6 @@ _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
-'--copyright[Print the copyright + license notice and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::shell -- Target shell. Defaults to `basename $SHELL`:(bash elvish fish powershell zsh)' \

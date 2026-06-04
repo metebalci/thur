@@ -71,11 +71,6 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
-    // Pre-parse intercept for `--copyright`. Lets the flag work
-    // without a subcommand (clap would otherwise reject for
-    // missing one).
-    shared_cli::handle_copyright_flag();
-
     let cli = Cli::parse();
 
     // Local-only commands — `config defaults` / `config systemd-unit`

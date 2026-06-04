@@ -4,7 +4,7 @@
 .SH NAME
 thurvsa \- ThurVSA Management CLI
 .SH SYNOPSIS
-\fBthurvsa\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-\-user\fR] [\fB\-\-copyright\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+\fBthurvsa\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-\-user\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
 ThurVSA Management CLI
 .SH OPTIONS
@@ -18,11 +18,6 @@ Defaults to `/etc/thurvtl/thurvtl.yaml` (thurvtl) or `/etc/thurvsa/thurvsa.yaml`
 User to drop privileges to under sudo.
 
 Only applied by daemon\-down commands that write under `data_dir`. Under plain `sudo` those files would otherwise be owned by root and unreadable by the daemon. No effect when the CLI is already running as a non\-root user. Defaults to `thurvtl` (thurvtl) or `thurvsa` (thurvsa).
-.TP
-\fB\-\-copyright\fR
-Print the copyright + license notice and exit.
-
-Handled by [`handle_copyright_flag`] before `Cli::parse()`, so the flag works without a subcommand. Declared here too so it shows up in `\-\-help`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

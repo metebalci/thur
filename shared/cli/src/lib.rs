@@ -30,7 +30,7 @@ pub use fmt::{format_bytes, with_host_ratio};
 /// Common global flags shared by every CLI binary in the workspace.
 ///
 /// Embed via `#[command(flatten)]` on each binary's top-level
-/// `Cli` so `--config`, `--user`, and `--copyright` parse
+/// `Cli` so `--config` and `--user` parse
 /// identically. The defaults referenced in the help text are
 /// product-specific (`thurvtl` / `thurvsa`) and resolved at runtime
 /// in `main` — the flag definitions themselves stay product-neutral
@@ -54,30 +54,6 @@ pub struct GlobalArgs {
     /// (thurvsa).
     #[arg(long, global = true)]
     pub user: Option<String>,
-
-    /// Print the copyright + license notice and exit.
-    ///
-    /// Handled by [`handle_copyright_flag`] before `Cli::parse()`,
-    /// so the flag works without a subcommand. Declared here too
-    /// so it shows up in `--help`.
-    #[arg(long, global = true)]
-    pub copyright: bool,
-}
-
-/// Pre-parse intercept for `--copyright`. If the flag appears
-/// anywhere in `std::env::args()`, print
-/// [`shared_naming::COPYRIGHT_NOTICE`] on stdout and `exit(0)`.
-///
-/// Call at the very top of `main` (before `Cli::parse()`) so the
-/// flag works in `<binary> --copyright` form — clap would
-/// otherwise reject that for missing a subcommand. clap's parse
-/// of the same flag (via [`GlobalArgs::copyright`]) is unused;
-/// the field exists purely so `--help` lists the flag.
-pub fn handle_copyright_flag() {
-    if std::env::args().skip(1).any(|a| a == "--copyright") {
-        println!("{}", shared_naming::COPYRIGHT_NOTICE);
-        std::process::exit(0);
-    }
 }
 
 /// `config` subcommand. Local-only artifact emission — does not
@@ -190,7 +166,6 @@ mod tests {
         let cli = Cli::parse_from(["synthetic"]);
         assert!(cli.global.config.is_none());
         assert!(cli.global.user.is_none());
-        assert!(!cli.global.copyright);
         assert!(cli.action.is_none());
     }
 
@@ -205,12 +180,6 @@ mod tests {
     fn global_args_short_config_flag() {
         let cli = Cli::parse_from(["synthetic", "-c", "/etc/p.yaml"]);
         assert_eq!(cli.global.config.as_deref(), Some("/etc/p.yaml"));
-    }
-
-    #[test]
-    fn copyright_flag_parses() {
-        let cli = Cli::parse_from(["synthetic", "--copyright"]);
-        assert!(cli.global.copyright);
     }
 
     #[test]
