@@ -526,6 +526,75 @@ enum VolumeAction {
         #[command(subcommand)]
         action: KeyAction,
     },
+
+    /// Manage volume snapshots.
+    ///
+    /// A snapshot is a frozen point-in-time copy of the volume's page
+    /// table, sharing chunks with the volume (copy-on-write). It is not
+    /// host-visible — access its data by cloning it (`volume clone
+    /// --from-snapshot`). Daemon-routed only.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+
+    /// Clone a volume into a new writable volume.
+    ///
+    /// Seeds the clone from a snapshot (`--from-snapshot`) or the
+    /// source's live contents, sharing chunks copy-on-write. The clone
+    /// is a new LUN — grant host admission before use; it does not
+    /// inherit the source's grants. Encrypted sources are refused
+    /// (issue #86). Daemon-routed only.
+    Clone {
+        /// Source volume name.
+        source: String,
+
+        /// Name for the new clone volume.
+        new_name: String,
+
+        /// Clone from this snapshot (else the source's live state).
+        #[arg(long, value_name = "SNAP")]
+        from_snapshot: Option<String>,
+
+        /// Pin the clone to LUN N (default: smallest unused).
+        #[arg(long, value_name = "N")]
+        lun: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotAction {
+    /// Create a snapshot of a volume.
+    Create {
+        /// Volume name.
+        volume: String,
+
+        /// Snapshot name (1-64 chars: letters, digits, '-', '_').
+        snapshot: String,
+    },
+
+    /// List a volume's snapshots.
+    List {
+        /// Volume name.
+        volume: String,
+
+        /// Emit the response as JSON for automation.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Destroy a snapshot.
+    Destroy {
+        /// Volume name.
+        volume: String,
+
+        /// Snapshot name.
+        snapshot: String,
+
+        /// Confirm destruction. Without it the command refuses.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -66,6 +66,10 @@ pub fn refresh_pool_budget_from_volumes(
 
     let volumes_dir = data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
     if volumes_dir.is_dir() {
+        // A snapshot/clone family shares one namespace (issue #13), so
+        // several volumes can map to the same `ns` — scan each
+        // namespace once.
+        let mut seen_ns: std::collections::HashSet<String> = std::collections::HashSet::new();
         for entry in fs::read_dir(&volumes_dir)? {
             let entry = entry?;
             let routing = match manifest_routing_for_backend(&entry.path(), backend_name) {
@@ -75,7 +79,10 @@ pub fn refresh_pool_budget_from_volumes(
             if routing.dedup_scope != DedupScope::Local {
                 continue;
             }
-            let ns = namespace_from_uuid(&routing.uuid);
+            let ns = namespace_from_uuid(&routing.namespace_uuid);
+            if !seen_ns.insert(ns.clone()) {
+                continue;
+            }
             let ns_pool = ChunkPool::new_namespaced(data_dir, backend_name, &ns)?;
             let ns_sum: u64 = ns_pool
                 .iter_chunks()?
@@ -412,9 +419,13 @@ impl DiskCacheManager {
             });
         }
 
-        // Local-scope per-volume namespaces.
+        // Local-scope per-volume namespaces. A snapshot/clone family
+        // shares one namespace (issue #13), so dedup across volumes —
+        // scanning the same namespace twice would double-count its
+        // chunks (and queue each for eviction twice).
         let volumes_dir = self.data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
         if volumes_dir.is_dir() {
+            let mut seen_ns: std::collections::HashSet<String> = std::collections::HashSet::new();
             for entry in fs::read_dir(&volumes_dir)? {
                 let entry = entry?;
                 let routing = match manifest_routing_for_backend(&entry.path(), &self.backend_name)
@@ -425,7 +436,10 @@ impl DiskCacheManager {
                 if routing.dedup_scope != DedupScope::Local {
                     continue;
                 }
-                let ns = namespace_from_uuid(&routing.uuid);
+                let ns = namespace_from_uuid(&routing.namespace_uuid);
+                if !seen_ns.insert(ns.clone()) {
+                    continue;
+                }
                 let ns_pool = ChunkPool::new_namespaced(&self.data_dir, &self.backend_name, &ns)?;
                 for (hash, size) in ns_pool.iter_chunks()? {
                     out.push(EvictableChunk {
@@ -452,11 +466,24 @@ impl DiskCacheManager {
     ///   referencing the hash still has `upload.idx[page_id] ==
     ///   LocalOnly`, which pins the chunk against eviction.
     ///
-    /// For Local-scope volumes the namespace is the volume UUID hex;
-    /// for Global-scope volumes the namespace is `None` (shared
-    /// pool). Errors on a single volume's index files are logged +
-    /// skipped rather than propagated — a corrupt or in-flux index
-    /// should not stall the whole eviction pass.
+    /// For Local-scope volumes the namespace is the family UUID hex
+    /// ([`VolumeManifest::pool_namespace`], which resolves a clone's
+    /// inherited `dedup_namespace`); for Global-scope volumes the
+    /// namespace is `None` (shared pool). Errors on a single volume's
+    /// index files are logged + skipped rather than propagated — a
+    /// corrupt or in-flux index should not stall the whole eviction
+    /// pass.
+    ///
+    /// Snapshots (issue #13) are deliberately **not** walked here. A
+    /// snapshot's frozen `pages.idx` only references chunks that were
+    /// already `Uploaded` at snapshot time (snapshot-create quiesces:
+    /// it flushes dirty pages to the pool and awaits cloud acks before
+    /// freezing), and content-addressed chunks are immutable, so a
+    /// snapshot-only chunk is always cloud-durable. With no entry here
+    /// it falls to the safe defaults in `evict_lru_chunks`
+    /// (`uploaded = true`, `last_accessed = 0`) — evictable as a cold,
+    /// already-uploaded chunk, exactly right. Walking snapshots would
+    /// change no eviction outcome.
     #[allow(clippy::type_complexity)]
     fn collect_lru_touches_and_upload_state(
         &self,
@@ -609,11 +636,14 @@ fn hex_to_blake3(hex_str: &str) -> Option<[u8; 32]> {
 /// matches `core_stream::disk_cache::ManifestRouting` in shape. The
 /// volume's `backend` has already been matched against
 /// `backend_name` before construction, so we don't carry it here.
-/// `uuid` is the durable identity the `Local`-scope namespace is
-/// keyed on (see [`namespace_from_uuid`]).
+/// `namespace_uuid` is the durable identity the `Local`-scope
+/// namespace is keyed on (see [`namespace_from_uuid`]): the inherited
+/// `dedup_namespace` for a snapshot/clone family member (issue #13),
+/// else the volume's own `uuid`. A whole family thus resolves to one
+/// namespace — callers must dedup namespaces across volumes.
 struct ManifestRouting {
     dedup_scope: DedupScope,
-    uuid: [u8; 16],
+    namespace_uuid: [u8; 16],
 }
 
 /// Return `Some(routing)` iff the volume directory at `vol_path`
@@ -622,6 +652,13 @@ struct ManifestRouting {
 /// or malformed `uuid` manifest → `None` (skip rather than fail the
 /// scan; bad manifests get fixed at load time, not by the cache
 /// layer).
+///
+/// `namespace_uuid` is read from `dedup_namespace` when present
+/// (snapshot/clone family member — chunks live in the family pool),
+/// falling back to `uuid` (a fresh volume is its own family root). This
+/// mirrors [`VolumeManifest::dedup_namespace_uuid`] but reads the raw
+/// JSON so the cache layer doesn't pay a full manifest deserialize per
+/// volume per scan.
 fn manifest_routing_for_backend(vol_path: &Path, backend_name: &str) -> Option<ManifestRouting> {
     let manifest_path = vol_path.join(VolumeManifest::FILENAME);
     if !manifest_path.is_file() {
@@ -639,9 +676,17 @@ fn manifest_routing_for_backend(vol_path: &Path, backend_name: &str) -> Option<M
         // on `DedupScope` (local is the volume-side default).
         _ => DedupScope::Local,
     };
-    let uuid_hex = v.get("uuid").and_then(|s| s.as_str())?;
-    let uuid: [u8; 16] = hex::decode(uuid_hex).ok()?.try_into().ok()?;
-    Some(ManifestRouting { dedup_scope, uuid })
+    // Family namespace (issue #13): dedup_namespace when set, else uuid.
+    let key_hex = v
+        .get("dedup_namespace")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| v.get("uuid").and_then(|s| s.as_str()))?;
+    let namespace_uuid: [u8; 16] = hex::decode(key_hex).ok()?.try_into().ok()?;
+    Some(ManifestRouting {
+        dedup_scope,
+        namespace_uuid,
+    })
 }
 
 #[cfg(test)]
@@ -783,6 +828,54 @@ mod tests {
             1,
             "dead volume's chunk lingers as an orphan until GC"
         );
+    }
+
+    /// Family namespace (issue #13): a clone carries
+    /// `dedup_namespace = family root`, so it shares the parent's pool
+    /// namespace. The cache walkers must (a) resolve that family
+    /// namespace from the clone's manifest, not the clone's own uuid,
+    /// and (b) scan it only once even though two volumes map to it —
+    /// otherwise usage double-counts.
+    #[test]
+    fn family_namespace_scanned_once_not_per_volume() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        // Parent (family root) + a clone that inherits its namespace.
+        let parent = make_volume(data_dir, "parent", "primary", DedupScope::Local);
+        let family = parent.dedup_namespace_uuid();
+        let clone = VolumeManifest::new(
+            "clone".into(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            1,
+        )
+        .unwrap()
+        .with_dedup_namespace(family)
+        .create(data_dir)
+        .unwrap();
+        // Both resolve to the same on-disk pool namespace.
+        assert_eq!(parent.pool_namespace(), clone.pool_namespace());
+
+        // One 4 KiB chunk in the shared family namespace.
+        let ns = parent.pool_namespace().unwrap();
+        ChunkPool::new_namespaced(data_dir, "primary", &ns)
+            .unwrap()
+            .insert_bytes(&[0x9; 4096])
+            .unwrap();
+
+        // calculate_usage must count it once, not twice.
+        let mut mgr = DiskCacheManager::new(data_dir.to_path_buf(), "primary", 1 << 30);
+        assert_eq!(mgr.calculate_usage().unwrap(), 4096);
+
+        // Budget refresh must also bucket it once.
+        let budget = PoolBudget::unbounded(data_dir.to_path_buf());
+        let total = refresh_pool_budget_from_volumes(&budget, data_dir, "primary").unwrap();
+        assert_eq!(total, 4096);
     }
 
     /// Pin-against-eviction contract: a chunk whose owning page is

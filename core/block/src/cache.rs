@@ -55,6 +55,7 @@
 //! write workloads.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -62,7 +63,7 @@ use std::time::Duration;
 use futures::stream::{self, StreamExt};
 use tokio::sync::{Mutex, Notify};
 
-use crate::page_index::PageId;
+use crate::page_index::{PageId, PageIndex};
 use crate::runtime_state::VolumeRuntime;
 use crate::upload_index::UploadState;
 use crate::uploader::{UploaderError, VolumeWriter};
@@ -865,6 +866,56 @@ impl PageCache {
         Ok(())
     }
 
+    /// Freeze this volume's `pages.idx` into `dst_pages_idx` — the
+    /// frozen page table a snapshot keeps so copy-on-write chunks stay
+    /// reclaimable (issue #13). The snapshot references the same chunks
+    /// as the parent; nothing in the pool is copied.
+    ///
+    /// The frozen index must reference only **cloud-uploaded** chunks:
+    /// a snapshot-only chunk (one the parent later overwrites) may have
+    /// its local copy evicted and be refetched from cloud on read, so
+    /// it must be cloud-durable. The sequence guarantees that:
+    ///
+    /// 1. [`Self::flush_all`] drains dirty cache pages into the pool +
+    ///    page index and awaits every pending cloud PUT, so the
+    ///    snapshot captures all daemon-cached writes (crash-consistent;
+    ///    the host fsyncs / fs-freezes for application consistency) and
+    ///    every currently-referenced chunk is uploaded.
+    /// 2. Holding the inner lock blocks new host writes and stops the
+    ///    flush worker (it picks its batch under this lock), so
+    ///    `pages.idx` can gain no new chunk reference while we copy.
+    /// 3. A second pending-upload drain, now under the lock, covers a
+    ///    flush that raced in between (1) and (2); no new flush can
+    ///    start, so it terminates. Afterwards every record references
+    ///    an uploaded chunk.
+    /// 4. fdatasync + byte-copy. A 64-byte index record never spans a
+    ///    page, so the copy stays structurally clean even against a
+    ///    concurrent UNMAP `clear` (removes a reference) or ODX rebind
+    ///    (binds an already-uploaded chunk) — both crash-consistent
+    ///    outcomes for the snapshot.
+    ///
+    /// The copy runs on the blocking pool but the inner lock is held
+    /// across it: the volume's host I/O pauses for the copy. `pages.idx`
+    /// is sparse, so the cost scales with allocated pages, and
+    /// `std::fs::copy` reflinks on btrfs/xfs/zfs.
+    pub async fn snapshot_pages_idx(&self, dst_pages_idx: PathBuf) -> Result<(), UploaderError> {
+        self.flush_all().await?;
+        let _freeze = self.inner.lock().await;
+        self.writer
+            .pending_uploads()
+            .wait_for_range(PageId::MIN..=PageId::MAX)
+            .await;
+        self.writer.page_index_sync()?;
+        let src = PageIndex::path_for(&VolumeManifest::dir_for(
+            self.writer.data_dir(),
+            &self.manifest().name,
+        ));
+        tokio::task::spawn_blocking(move || copy_pages_idx(&src, &dst_pages_idx))
+            .await
+            .map_err(|e| UploaderError::Io(std::io::Error::other(e.to_string())))??;
+        Ok(())
+    }
+
     /// Drive a flush worker until shutdown is requested. The daemon
     /// spawns this future at boot; tests can poll it manually if
     /// they want background-flush behavior.
@@ -1344,6 +1395,23 @@ impl PageCache {
     }
 }
 
+/// Copy a frozen `pages.idx` to `dst` and fsync it (and its parent
+/// directory) so a snapshot survives a crash. `std::fs::copy` uses
+/// `copy_file_range(2)` where the filesystem supports it (reflink on
+/// btrfs/xfs/zfs), falling back to a buffered copy elsewhere — either
+/// way a single 64-byte record is copied atomically w.r.t. a
+/// concurrent single-record write (records never cross a page).
+fn copy_pages_idx(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst)?;
+    std::fs::File::open(dst)?.sync_all()?;
+    if let Some(parent) = dst.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Per-page clone shared by [`PageCache::clone_page_range`] (same
 /// volume, `src` and `dst` are the same `Arc`) and the cross-volume
 /// ODX path (distinct volumes on the same backend + matching pool
@@ -1502,6 +1570,57 @@ mod tests {
         let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
         let got = cache.read_bytes(0, PAGE).await.unwrap();
         assert!(got.iter().all(|&b| b == 0));
+    }
+
+    /// Snapshot freeze (issue #13): `snapshot_pages_idx` copies the page
+    /// table at a point in time, references only uploaded chunks, and
+    /// stays frozen when the parent later overwrites the same page.
+    #[tokio::test]
+    async fn snapshot_freezes_index_and_references_uploaded_chunks() {
+        let (tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+
+        // Write page 0 (pattern A), flush.
+        cache.write_bytes(0, &pattern(0xA1, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let hash_a = writer.page_index().get(0).unwrap().expect("page 0 sealed");
+
+        // Freeze the index into a snapshot directory.
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let dst = PageIndex::path_for(&snap_dir);
+        cache.snapshot_pages_idx(dst.clone()).await.unwrap();
+
+        // Load-bearing invariant: the snapshot's chunk is cloud-uploaded
+        // (so eviction may safely drop its local copy and refetch).
+        assert!(
+            matches!(
+                writer.upload_index().read(0).unwrap(),
+                UploadState::Uploaded
+            ),
+            "snapshot-create must leave every referenced chunk Uploaded"
+        );
+
+        // The frozen index maps page 0 to the same chunk as the live one.
+        let frozen = PageIndex::open(
+            &dst,
+            cache.manifest().uuid,
+            u64::from(cache.manifest().page_size_bytes),
+        )
+        .unwrap();
+        assert_eq!(frozen.get(0).unwrap(), Some(hash_a));
+
+        // Parent overwrites page 0 (pattern B): the live index moves to a
+        // new chunk; the frozen snapshot index keeps the old one — this
+        // is the copy-on-write divergence.
+        cache.write_bytes(0, &pattern(0xB2, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let hash_b = writer.page_index().get(0).unwrap().unwrap();
+        assert_ne!(hash_a, hash_b, "overwrite seals a distinct chunk");
+        assert_eq!(
+            frozen.get(0).unwrap(),
+            Some(hash_a),
+            "the snapshot's frozen index does not follow the parent"
+        );
     }
 
     #[tokio::test]

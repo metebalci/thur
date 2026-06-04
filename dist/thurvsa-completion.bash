@@ -238,6 +238,9 @@ _thurvsa() {
             thurvsa__subcmd__help__subcmd__system__subcmd__storage,check)
                 cmd="thurvsa__subcmd__help__subcmd__system__subcmd__storage__subcmd__check"
                 ;;
+            thurvsa__subcmd__help__subcmd__volume,clone)
+                cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__clone"
+                ;;
             thurvsa__subcmd__help__subcmd__volume,create)
                 cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__create"
                 ;;
@@ -259,6 +262,9 @@ _thurvsa() {
             thurvsa__subcmd__help__subcmd__volume,resize)
                 cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__resize"
                 ;;
+            thurvsa__subcmd__help__subcmd__volume,snapshot)
+                cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot"
+                ;;
             thurvsa__subcmd__help__subcmd__volume__subcmd__key,export)
                 cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__key__subcmd__export"
                 ;;
@@ -267,6 +273,15 @@ _thurvsa() {
                 ;;
             thurvsa__subcmd__help__subcmd__volume__subcmd__key,migrate)
                 cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__key__subcmd__migrate"
+                ;;
+            thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot,create)
+                cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__create"
+                ;;
+            thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot,destroy)
+                cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__destroy"
+                ;;
+            thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot,list)
+                cmd="thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__list"
                 ;;
             thurvsa__subcmd__iscsi,help)
                 cmd="thurvsa__subcmd__iscsi__subcmd__help"
@@ -748,6 +763,9 @@ _thurvsa() {
             thurvsa__subcmd__system__subcmd__storage__subcmd__help,help)
                 cmd="thurvsa__subcmd__system__subcmd__storage__subcmd__help__subcmd__help"
                 ;;
+            thurvsa__subcmd__volume,clone)
+                cmd="thurvsa__subcmd__volume__subcmd__clone"
+                ;;
             thurvsa__subcmd__volume,create)
                 cmd="thurvsa__subcmd__volume__subcmd__create"
                 ;;
@@ -771,6 +789,12 @@ _thurvsa() {
                 ;;
             thurvsa__subcmd__volume,resize)
                 cmd="thurvsa__subcmd__volume__subcmd__resize"
+                ;;
+            thurvsa__subcmd__volume,snapshot)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot"
+                ;;
+            thurvsa__subcmd__volume__subcmd__help,clone)
+                cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__clone"
                 ;;
             thurvsa__subcmd__volume__subcmd__help,create)
                 cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__create"
@@ -796,6 +820,9 @@ _thurvsa() {
             thurvsa__subcmd__volume__subcmd__help,resize)
                 cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__resize"
                 ;;
+            thurvsa__subcmd__volume__subcmd__help,snapshot)
+                cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot"
+                ;;
             thurvsa__subcmd__volume__subcmd__help__subcmd__key,export)
                 cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__key__subcmd__export"
                 ;;
@@ -804,6 +831,15 @@ _thurvsa() {
                 ;;
             thurvsa__subcmd__volume__subcmd__help__subcmd__key,migrate)
                 cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__key__subcmd__migrate"
+                ;;
+            thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot,create)
+                cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__create"
+                ;;
+            thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot,destroy)
+                cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__destroy"
+                ;;
+            thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot,list)
+                cmd="thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__list"
                 ;;
             thurvsa__subcmd__volume__subcmd__key,export)
                 cmd="thurvsa__subcmd__volume__subcmd__key__subcmd__export"
@@ -828,6 +864,30 @@ _thurvsa() {
                 ;;
             thurvsa__subcmd__volume__subcmd__key__subcmd__help,migrate)
                 cmd="thurvsa__subcmd__volume__subcmd__key__subcmd__help__subcmd__migrate"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot,create)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__create"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot,destroy)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__destroy"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot,help)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot,list)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help,create)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__create"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help,destroy)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__destroy"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help,help)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__help"
+                ;;
+            thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help,list)
+                cmd="thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__list"
                 ;;
             *)
                 ;;
@@ -1876,8 +1936,22 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__volume)
-            opts="create list info destroy modify resize key"
+            opts="create list info destroy modify resize key snapshot clone"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__volume__subcmd__clone)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -2018,6 +2092,62 @@ _thurvsa() {
         thurvsa__subcmd__help__subcmd__volume__subcmd__resize)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot)
+            opts="create list destroy"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__create)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__destroy)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -5168,12 +5298,46 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__volume)
-            opts="-c -h --config --user --copyright --help create list info destroy modify resize key help"
+            opts="-c -h --config --user --copyright --help create list info destroy modify resize key snapshot clone help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__clone)
+            opts="-c -h --from-snapshot --lun --config --user --copyright --help <SOURCE> <NEW_NAME>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --from-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lun)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --config)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -5282,8 +5446,22 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__volume__subcmd__help)
-            opts="create list info destroy modify resize key help"
+            opts="create list info destroy modify resize key snapshot clone help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__help__subcmd__clone)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -5438,6 +5616,62 @@ _thurvsa() {
         thurvsa__subcmd__volume__subcmd__help__subcmd__resize)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot)
+            opts="create list destroy"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__create)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__destroy)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -5736,6 +5970,180 @@ _thurvsa() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot)
+            opts="-c -h --config --user --copyright --help create list destroy help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__create)
+            opts="-c -h --config --user --copyright --help <VOLUME> <SNAPSHOT>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__destroy)
+            opts="-c -h --force --config --user --copyright --help <VOLUME> <SNAPSHOT>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help)
+            opts="create list destroy help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__create)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__destroy)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list)
+            opts="-c -h --json --config --user --copyright --help <VOLUME>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --config)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

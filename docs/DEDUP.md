@@ -433,10 +433,37 @@ Orphan chunks accumulate when a page is rewritten to new content (the
 superseded chunk lingers until nothing references it) or when a volume is
 destroyed — `volume destroy` removes the manifest and page index but
 leaves pool chunks behind. `thurvsa system gc` reclaims them: it walks
-every volume's `pages.idx` into a live `(backend, namespace) → {hash}` set
-and removes pool chunks not in that set, including every chunk under a
-destroyed volume's now-orphan namespace directory. `--dry-run` reports
-what would be deleted without touching anything; `--storage` extends the
-sweep to the storage backend's `chunks/` objects. The verb mirrors VTL's
-`thurvtl system gc` — daemon-routed, runs alongside live traffic,
-audited as `gc.run`.
+every volume's `pages.idx` **and every snapshot's frozen `pages.idx`**
+into a live `(backend, namespace) → {hash}` set and removes pool chunks
+not in that set, including every chunk under a destroyed volume's
+now-orphan namespace directory. `--dry-run` reports what would be deleted
+without touching anything; `--storage` extends the sweep to the storage
+backend's `chunks/` objects. The verb mirrors VTL's `thurvtl system gc` —
+daemon-routed, runs alongside live traffic, audited as `gc.run`.
+
+## Snapshots + clones
+
+Snapshots and clones (issue #13) share chunks rather than copying them,
+and lean entirely on the GC arithmetic above. A snapshot is a frozen copy
+of a volume's `pages.idx`; a clone is a new writable volume seeded with a
+copy of one. Both reference the source's existing pool chunks, so the
+shared bytes are stored once.
+
+For `Global`-dedup volumes nothing special is needed — the pool is shared
+per-backend, so a snapshot/clone resolves the same chunks as the source.
+For `Local` dedup, where each volume's chunks live under a namespace keyed
+on its UUID, a snapshot/clone would otherwise derive a *different*
+namespace from its own UUID and fail to find the shared chunks. So a
+snapshot/clone inherits the source's **family namespace** via the
+manifest's `dedup_namespace` field (the snapshot records it directly; a
+clone carries it forward): the whole snapshot/clone family — origin,
+snapshots, and clones — resolves to one `Local` pool namespace.
+
+GC keys each member's hashes on that family namespace, so they union into
+one `(backend, namespace) → {hash}` bucket. A chunk shared across family
+members is therefore counted once and reclaimed only when **no** member
+references it. Concretely: overwrite a page on the origin and its old
+chunk is retained as long as a snapshot or clone still maps to it; destroy
+that snapshot (and any clone that diverged from the page) and the next GC
+reclaims the now-unreferenced chunk. The single on-disk namespace
+directory is torn down only when the entire family is gone.

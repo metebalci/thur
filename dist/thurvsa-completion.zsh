@@ -225,6 +225,111 @@ esac
     ;;
 esac
 ;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_thurvsa__subcmd__volume__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-volume-snapshot-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':volume -- Volume name:_default' \
+':snapshot -- Snapshot name (1-64 chars\: letters, digits, '\''-'\'', '\''_'\''):_default' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--json[Emit the response as JSON for automation]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':volume -- Volume name:_default' \
+&& ret=0
+;;
+(destroy)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--force[Confirm destruction. Without it the command refuses]' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':volume -- Volume name:_default' \
+':snapshot -- Snapshot name:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-volume-snapshot-help-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(destroy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(clone)
+_arguments "${_arguments_options[@]}" : \
+'--from-snapshot=[Clone from this snapshot (else the source'\''s live state)]:SNAP:_default' \
+'--lun=[Pin the clone to LUN N (default\: smallest unused)]:N:_default' \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--copyright[Print the copyright + license notice and exit]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':source -- Source volume name:_default' \
+':new_name -- Name for the new clone volume:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvsa__subcmd__volume__subcmd__help_commands" \
@@ -288,6 +393,38 @@ _arguments "${_arguments_options[@]}" : \
         esac
     ;;
 esac
+;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-volume-help-snapshot-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(destroy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(clone)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
@@ -1848,6 +1985,38 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+":: :_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thurvsa-help-volume-snapshot-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(destroy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(clone)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -2678,8 +2847,15 @@ _thurvsa__subcmd__help__subcmd__volume_commands() {
 'modify:Modify a live volume'\''s mutable settings' \
 'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
+'snapshot:Manage volume snapshots' \
+'clone:Clone a volume into a new writable volume' \
     )
     _describe -t commands 'thurvsa help volume commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__clone_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__clone_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help volume clone commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__create_commands] )) ||
 _thurvsa__subcmd__help__subcmd__volume__subcmd__create_commands() {
@@ -2734,6 +2910,30 @@ _thurvsa__subcmd__help__subcmd__volume__subcmd__modify_commands() {
 _thurvsa__subcmd__help__subcmd__volume__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help volume resize commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot_commands() {
+    local commands; commands=(
+'create:Create a snapshot of a volume' \
+'list:List a volume'\''s snapshots' \
+'destroy:Destroy a snapshot' \
+    )
+    _describe -t commands 'thurvsa help volume snapshot commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__create_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help volume snapshot create commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__destroy_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__destroy_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help volume snapshot destroy commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__list_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help volume snapshot list commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__iscsi_commands] )) ||
 _thurvsa__subcmd__iscsi_commands() {
@@ -3747,9 +3947,16 @@ _thurvsa__subcmd__volume_commands() {
 'modify:Modify a live volume'\''s mutable settings' \
 'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
+'snapshot:Manage volume snapshots' \
+'clone:Clone a volume into a new writable volume' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa volume commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__clone_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__clone_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume clone commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__volume__subcmd__create_commands] )) ||
 _thurvsa__subcmd__volume__subcmd__create_commands() {
@@ -3771,9 +3978,16 @@ _thurvsa__subcmd__volume__subcmd__help_commands() {
 'modify:Modify a live volume'\''s mutable settings' \
 'resize:Grow or shrink a volume'\''s capacity' \
 'key:Per-volume key-management operations' \
+'snapshot:Manage volume snapshots' \
+'clone:Clone a volume into a new writable volume' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa volume help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__clone_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__clone_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume help clone commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__create_commands] )) ||
 _thurvsa__subcmd__volume__subcmd__help__subcmd__create_commands() {
@@ -3833,6 +4047,30 @@ _thurvsa__subcmd__volume__subcmd__help__subcmd__modify_commands() {
 _thurvsa__subcmd__volume__subcmd__help__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa volume help resize commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot_commands() {
+    local commands; commands=(
+'create:Create a snapshot of a volume' \
+'list:List a volume'\''s snapshots' \
+'destroy:Destroy a snapshot' \
+    )
+    _describe -t commands 'thurvsa volume help snapshot commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__create_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume help snapshot create commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__destroy_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__destroy_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume help snapshot destroy commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__list_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume help snapshot list commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__volume__subcmd__info_commands] )) ||
 _thurvsa__subcmd__volume__subcmd__info_commands() {
@@ -3908,6 +4146,61 @@ _thurvsa__subcmd__volume__subcmd__modify_commands() {
 _thurvsa__subcmd__volume__subcmd__resize_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa volume resize commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot_commands() {
+    local commands; commands=(
+'create:Create a snapshot of a volume' \
+'list:List a volume'\''s snapshots' \
+'destroy:Destroy a snapshot' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa volume snapshot commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__create_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot create commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__destroy_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__destroy_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot destroy commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help_commands() {
+    local commands; commands=(
+'create:Create a snapshot of a volume' \
+'list:List a volume'\''s snapshots' \
+'destroy:Destroy a snapshot' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thurvsa volume snapshot help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__create_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot help create commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__destroy_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__destroy_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot help destroy commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__help_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot help help commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__list_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot help list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot list commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_thurvsa" ]; then

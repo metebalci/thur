@@ -18,6 +18,7 @@ pub mod disk_cache;
 pub mod lru_index;
 pub mod page_index;
 pub mod runtime_state;
+pub mod snapshot;
 pub mod upload_index;
 pub mod uploader;
 pub mod verify;
@@ -34,6 +35,7 @@ pub use lru_index::{LruIndexError, LruIndexFile};
 pub use page_index::{PageIndex, PageIndexError};
 pub use runtime_state::VolumeRuntime;
 pub use shared_pool::{DiskCacheBounds, DiskCacheSize};
+pub use snapshot::SnapshotManifest;
 pub use upload_index::{UploadIndexError, UploadIndexFile, UploadState};
 pub use uploader::{
     DEFAULT_BACKPRESSURE_DEADLINE, PendingUploads, UploadTask, UploaderError, VolumeWriter,

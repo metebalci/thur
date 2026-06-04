@@ -375,6 +375,164 @@ pub async fn cmd_destroy(name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `volume snapshot create VOLUME SNAPSHOT` — daemon-routed only. The
+/// daemon flushes the volume's cache, awaits its pending uploads, and
+/// freezes the page table; it emits a `snapshot.create` audit row.
+/// Refuses when the admin socket is unreachable.
+pub async fn cmd_snapshot_create(volume: &str, snapshot: &str) -> Result<()> {
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume snapshot create` needs the \
+             daemon running so the volume's cache is flushed and its page table frozen \
+             consistently. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let body = serde_json::json!({ "snapshot": snapshot });
+    let resp: serde_json::Value = admin
+        .post_json(
+            &format!("/api/v1/volumes/{}/snapshots", urlencode(volume)),
+            &body,
+        )
+        .await?;
+    let size = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!(
+        "OK: snapshot '{snapshot}' created for volume '{volume}' ({})",
+        format_bytes(size)
+    );
+    println!(
+        "note: a snapshot is not host-visible; create a writable volume from it with \
+         `thurvsa volume clone {volume} NEW_NAME --from-snapshot {snapshot}`."
+    );
+    Ok(())
+}
+
+/// `volume snapshot list VOLUME` — daemon-routed only; lists the
+/// volume's snapshots from the running daemon.
+pub async fn cmd_snapshot_list(volume: &str, json: bool) -> Result<()> {
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume snapshot list` reports \
+             snapshots from the running daemon. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let resp: serde_json::Value = admin
+        .get_json(&format!("/api/v1/volumes/{}/snapshots", urlencode(volume)))
+        .await?;
+    let snaps = resp
+        .get("snapshots")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snaps)?);
+        return Ok(());
+    }
+    if snaps.is_empty() {
+        println!("(no snapshots for volume '{volume}')");
+        return Ok(());
+    }
+    println!("{:<24}  {:>10}  CREATED", "SNAPSHOT", "SIZE");
+    for s in &snaps {
+        let name = s.get("snapshot").and_then(|v| v.as_str()).unwrap_or("");
+        let size = s.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let created = s.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        println!("{:<24}  {:>10}  {}", name, format_bytes(size), created);
+    }
+    Ok(())
+}
+
+/// `volume snapshot destroy VOLUME SNAPSHOT --force` — daemon-routed
+/// only. Removes the snapshot's frozen page table; chunks it alone kept
+/// alive become reclaimable by the next GC.
+pub async fn cmd_snapshot_destroy(volume: &str, snapshot: &str, force: bool) -> Result<()> {
+    if !force {
+        eprintln!(
+            "warning: destroying snapshot '{snapshot}' of volume '{volume}' removes its \
+             frozen page table. Chunks it alone kept alive become reclaimable by the next \
+             GC sweep. Re-run with --force to confirm."
+        );
+        bail!("refusing to destroy without --force");
+    }
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume snapshot destroy` needs the \
+             daemon running. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let _: serde_json::Value = admin
+        .delete_json::<(), _>(
+            &format!(
+                "/api/v1/volumes/{}/snapshots/{}",
+                urlencode(volume),
+                urlencode(snapshot)
+            ),
+            None,
+        )
+        .await?;
+    println!("OK: snapshot '{snapshot}' of volume '{volume}' destroyed");
+    Ok(())
+}
+
+/// `volume clone SOURCE NEW_NAME [--from-snapshot SNAP] [--lun N]` —
+/// daemon-routed only. Creates a new writable volume that shares
+/// SOURCE's chunks copy-on-write and registers it as a live LUN.
+pub async fn cmd_clone(
+    source: &str,
+    new_name: &str,
+    from_snapshot: Option<&str>,
+    lun: Option<u64>,
+) -> Result<()> {
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume clone` needs the daemon \
+             running so the clone is registered as a live LUN. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let mut body = serde_json::json!({ "new_name": new_name });
+    if let Some(s) = from_snapshot {
+        body["from_snapshot"] = serde_json::Value::String(s.to_string());
+    }
+    if let Some(n) = lun {
+        body["lun"] = serde_json::Value::Number(n.into());
+    }
+    let row: VolumeRow = admin
+        .post_json(
+            &format!("/api/v1/volumes/{}/clone", urlencode(source)),
+            &body,
+        )
+        .await?;
+    let src_desc = match from_snapshot {
+        Some(s) => format!("snapshot '{s}' of '{source}'"),
+        None => format!("live volume '{source}'"),
+    };
+    println!(
+        "OK: volume '{}' cloned from {} (LUN {})",
+        row.name, src_desc, row.lun
+    );
+    println!("  UUID:        {}", row.uuid);
+    println!(
+        "  Size:        {} ({})",
+        format_bytes(row.size_bytes),
+        row.size_bytes
+    );
+    println!("  Backend:     {}", row.backend);
+    println!("  Dedup scope: {}", row.dedup_scope);
+    println!(
+        "note: the clone is a new LUN and is not yet visible to any host. Grant admission \
+         (`thurvsa iscsi users grant USER --volume {}`, or `nvmetcp psks grant ...`) before use.",
+        row.name
+    );
+    Ok(())
+}
+
 /// `volume key migrate NAME --to NEW_BACKEND [--purge-local]` — move
 /// a volume's DEK wrap-target from one keystore backend to another.
 ///

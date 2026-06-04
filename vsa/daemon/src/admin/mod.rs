@@ -23,6 +23,7 @@ pub mod job_dispatch;
 pub mod nvmetcp_dhchap;
 pub mod nvmetcp_host_file;
 pub mod nvmetcp_psks;
+pub mod snapshots;
 
 use anyhow::Result;
 use axum::{
@@ -79,6 +80,18 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             post(handlers::set_sync_after),
         )
         .route("/api/v1/volumes/:name/resize", post(handlers::resize))
+        // Snapshots + clones (issue #13). Snapshots are cloneable-only
+        // restore points (not host LUNs); a clone is a new writable
+        // volume seeded from a snapshot or the live volume.
+        .route(
+            "/api/v1/volumes/:name/snapshots",
+            get(snapshots::list).post(snapshots::create),
+        )
+        .route(
+            "/api/v1/volumes/:name/snapshots/:snap",
+            axum::routing::delete(snapshots::destroy),
+        )
+        .route("/api/v1/volumes/:name/clone", post(handlers::clone_volume))
         // iSCSI CHAP users (list / add / remove / disable / enable / rotate)
         .route(
             "/api/v1/iscsi/users",

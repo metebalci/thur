@@ -456,10 +456,22 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `<data_dir>/volumes/<name>/manifest.json` (atomic tmp+rename).
   Creation-frozen: `name`, `uuid` (16-byte hex), `size_bytes`,
   `sector_bytes`, `page_size_bytes`, `backend`, `dedup_scope`, `worm`,
-  `created_at`, optional `encryption`. Volume names are 1-64 ASCII
-  alphanumeric + `-`/`_`. `VolumeManifest::create` also materializes
-  the empty page index (`pages.idx`) plus a zero-valued `runtime.json`
-  — a volume directory always has all three files or none.
+  `created_at`, optional `encryption`, optional `dedup_namespace`
+  (schema v5; the family chunk-pool namespace inherited by a clone —
+  absent means "namespace from my own uuid", routed through
+  `pool_namespace()`/`dedup_namespace_uuid()`). Volume names are 1-64
+  ASCII alphanumeric + `-`/`_`. `VolumeManifest::create` also
+  materializes the empty page index (`pages.idx`) plus a zero-valued
+  `runtime.json` — a volume directory always has all three files or none.
+- `core-block::snapshot::SnapshotManifest` — frozen point-in-time
+  snapshot of a volume's page table (issue #13) at
+  `<data_dir>/volumes/<parent>/snapshots/<snap>/{snap.json, pages.idx}`.
+  Carries the parent uuid (binds the copied index), the family
+  `dedup_namespace`, backend, dedup scope, page/sector size, the
+  parent's live size, and optional encryption. Nested under the parent
+  so the discovery LUN walk skips it while GC + eviction descend into
+  `snapshots/`. `list_all` is the cross-volume walk GC uses to fold
+  snapshot indexes into the live set.
 - `core-block::runtime_state::VolumeRuntime` — daemon-mutated sidecar
   at `<data_dir>/volumes/<name>/runtime.json` (atomic tmp+rename).
   Carries `host_bytes_written` (lifetime host write counter,

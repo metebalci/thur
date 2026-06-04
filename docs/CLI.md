@@ -30,6 +30,7 @@ clap drives both `--help` and the shipped completion scripts.
 
 ```
 volume     create / list / info / destroy / modify / resize / key migrate
+           snapshot {create,list,destroy} / clone
 system     storage {check,benchmark} / gc / stats / verify / regenerate-cert / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
@@ -38,7 +39,7 @@ config     defaults / systemd-unit / completion
 ```
 
 The `volume` commands (`create`, `list`, `info`, `destroy`, `modify`,
-`resize`) are daemon-routed only — they talk to `/run/thurvsa/admin.sock`
+`resize`, `snapshot`, `clone`) are daemon-routed only — they talk to `/run/thurvsa/admin.sock`
 and refuse with a clear "start the daemon" message when the socket is
 unreachable. `volume create` resolves `--backend` daemon-side: you may
 omit it when exactly one `storage.backends:` entry exists. `volume resize
@@ -55,7 +56,21 @@ all allocated data so you needn't compute the exact byte count; resize the
 filesystem down first so it fits. `--size` and `--shrink-to-fit` are
 mutually exclusive (exactly one required). A host-side rescan (`iscsiadm -m
 node --rescan` / `nvme ns-rescan`) may still be needed for the OS to pick
-up the new size. `system storage benchmark` is
+up the new size.
+
+`volume snapshot {create,list,destroy}` and `volume clone` (issue #13) are
+also daemon-routed only. A snapshot is a frozen point-in-time copy of a
+volume's page table, sharing chunks copy-on-write; it is **not**
+host-visible — to read its data, clone it. `volume snapshot create VOL
+SNAP` flushes the volume's cache and freezes its page table (instant; it
+briefly pauses the volume's host I/O for the index copy). `volume clone
+SRC NEW [--from-snapshot SNAP] [--lun N]` creates a new writable volume
+seeded from a snapshot (or `SRC`'s live contents), sharing chunks until it
+diverges on write. The clone is a new LUN — a host-side rescan plus an
+admission grant (`iscsi users grant` / `nvmetcp psks grant`, when CHAP /
+TLS-PSK is on) are needed before a host can use it; it does **not** inherit
+the source's grants. Cloning an encrypted volume is refused
+(issue #86). `system storage benchmark` is
 daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
 delete operations via `shared-object-store-bench`. `config` is pure-local.

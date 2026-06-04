@@ -215,6 +215,25 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                 }
             },
+            VolumeAction::Snapshot { action } => match action {
+                SnapshotAction::Create { volume, snapshot } => {
+                    volume::cmd_snapshot_create(&volume, &snapshot).await
+                }
+                SnapshotAction::List { volume, json } => {
+                    volume::cmd_snapshot_list(&volume, json).await
+                }
+                SnapshotAction::Destroy {
+                    volume: vol,
+                    snapshot,
+                    force,
+                } => volume::cmd_snapshot_destroy(&vol, &snapshot, force).await,
+            },
+            VolumeAction::Clone {
+                source,
+                new_name,
+                from_snapshot,
+                lun,
+            } => volume::cmd_clone(&source, &new_name, from_snapshot.as_deref(), lun).await,
         },
         Commands::System { action } => match action {
             SystemAction::Storage { action } => match action {

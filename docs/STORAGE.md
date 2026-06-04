@@ -222,12 +222,16 @@ specific chunk fails.
 
 A volume is a directory under `<data_dir>/volumes/<name>/`:
 
-- **`manifest.json`** — creation-frozen identity (schema v4): `name`,
+- **`manifest.json`** — creation-frozen identity (schema v5): `name`,
   `uuid`, `size_bytes`, `sector_bytes` (default 4096),
   `page_size_bytes` (default 65536), `backend`, `lun`, `dedup_scope`,
-  `worm`, `created_at`, and optional `encryption` metadata (wrapped
-  DEK for non-local keystore backends). Persisted atomically — tmp +
-  fsync + rename.
+  `worm`, `created_at`, optional `encryption` metadata (wrapped
+  DEK for non-local keystore backends), and optional `dedup_namespace`
+  (schema v5; the chunk-pool *family* namespace — present only on
+  snapshots' clones, see § Snapshots + clones). Persisted atomically —
+  tmp + fsync + rename. Pre-v5 manifests load with `dedup_namespace`
+  absent, which means "namespace from my own `uuid`" — byte-for-byte
+  the historical behaviour, no migration.
 - **`runtime.json`** — daemon-mutated sidecar carrying the four
   per-volume byte counters plus `modified_at` and `sync_after`.
   `host_bytes_written` and `host_bytes_read` are logical,
@@ -278,6 +282,56 @@ read-modify-merged in the per-volume RAM `PageCache` first, so the
 pool only ever sees whole pages. That cache tier, the write-back path,
 and the SYNCHRONIZE CACHE durability fence are in
 [`BACKPRESSURE.md`](BACKPRESSURE.md) § VSA.
+
+## Snapshots + clones
+
+A **snapshot** is a frozen point-in-time copy of a volume's page table.
+It lives under the volume directory at
+`<data_dir>/volumes/<parent>/snapshots/<snap>/`:
+
+- **`snap.json`** — `SnapshotManifest` (schema v1): `name`, `uuid`
+  (= the parent's uuid, so the copied index header validates with no
+  rewrite), `parent_volume`, `parent_uuid`, `created_at`, `backend`,
+  `dedup_scope`, `dedup_namespace` (the family namespace), `page_size_bytes`,
+  `sector_bytes`, `size_bytes` (the parent's live size at snapshot time),
+  and the parent's optional `encryption` metadata.
+- **`pages.idx`** — a byte-for-byte copy of the parent's page table at
+  snapshot time.
+
+Snapshots cost no chunk data: the frozen index references the same pool
+chunks as the parent. Because chunks carry no on-disk refcount and a
+chunk is alive iff some `pages.idx` references it, the existing
+manifest-walking GC keeps a snapshot's chunks alive automatically. When
+the parent later overwrites a page, its live `pages.idx` record moves to
+the new chunk while the snapshot's frozen copy still references the old
+one — copy-on-write, with no change to the host write path. Snapshots are
+nested two levels deep so the daemon's discovery walk (which lists
+`volumes/*`) never registers them as host LUNs, while GC and eviction
+descend into `snapshots/`.
+
+Snapshot create quiesces first — it flushes the volume's `PageCache` and
+awaits its pending cloud uploads — so the frozen index references only
+cloud-durable chunks (eviction may drop a snapshot-only chunk's local
+copy and refetch it from the backend on read). The copy runs under the
+cache lock, briefly pausing the volume's host I/O; `pages.idx` is sparse,
+so the pause scales with allocated pages, and `std::fs::copy` reflinks on
+btrfs/xfs/zfs. The snapshot is crash-consistent; the host fsyncs /
+fs-freezes for application consistency.
+
+A **clone** is a new writable top-level volume seeded with a copy of a
+snapshot's (or the live volume's) page table — a first-class volume with
+its own `uuid`, LUN, and page table. It inherits the source's *family*
+`dedup_namespace` so its `Local`-dedup chunks resolve in the shared
+family pool, and diverges from the source through ordinary copy-on-write
+on write. Cloning an **encrypted** volume is refused in this release
+(issue #86): shared chunks are sealed with the source's DEK and an IV
+derived from the source uuid, which a clone with a fresh uuid can't
+reproduce. A clone is a new volume name, so no host sees it until the
+operator grants iSCSI / NVMe-TCP admission — it does **not** inherit the
+source's grants.
+
+The family-namespace GC arithmetic is in [`DEDUP.md`](DEDUP.md) §
+Snapshots + clones.
 
 ## Integrity
 

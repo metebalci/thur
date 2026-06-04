@@ -40,7 +40,16 @@ use thiserror::Error;
 ///   auto-assigns the smallest unused LUN on first boot and persists
 ///   the manifest back, so existing volumes keep their boot-time
 ///   alphabetical assignment.
-pub const VOLUME_SCHEMA_VERSION: u32 = 4;
+/// - **v5** (2026-06-04) — adds optional `dedup_namespace: [u8; 16]`,
+///   the chunk-pool *family* namespace. `None` (the default for every
+///   pre-v5 and freshly-created volume) means "namespace from my own
+///   uuid" — byte-for-byte identical to prior behaviour, no migration.
+///   Snapshots and clones (issue #13) set it to the origin volume's
+///   effective namespace so a whole snapshot/clone family shares one
+///   `Local`-dedup pool namespace and can resolve each other's shared
+///   chunks. `Global`-dedup volumes ignore it (their namespace is
+///   always the shared per-backend pool).
+pub const VOLUME_SCHEMA_VERSION: u32 = 5;
 
 /// Sentinel for "this manifest predates the v4 schema and has no
 /// pinned LUN yet." Discovery resolves these to real values at boot.
@@ -306,6 +315,34 @@ mod uuid_serde {
     }
 }
 
+/// Inline serde for the optional `dedup_namespace` UUID — same
+/// lowercase-hex encoding as [`uuid_serde`], but `Option`-shaped so
+/// the field can be omitted from a fresh volume's manifest.
+mod opt_uuid_serde {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(uuid: &Option<[u8; 16]>, s: S) -> Result<S::Ok, S::Error> {
+        match uuid {
+            Some(u) => s.serialize_str(&hex::encode(u)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 16]>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        let Some(s) = opt else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(&s).map_err(D::Error::custom)?;
+        if bytes.len() != 16 {
+            return Err(D::Error::custom("dedup_namespace must be 16 bytes"));
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        Ok(Some(out))
+    }
+}
+
 /// Persistent volume metadata. The page index (`page_id →
 /// chunk_hash`) lives in a separate sidecar file; this manifest
 /// only carries the schema-stable identity + sizing fields.
@@ -357,6 +394,22 @@ pub struct VolumeManifest {
     /// [`crate::uploader::VolumeWriter`] on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<VolumeEncryptionMeta>,
+    /// Chunk-pool *family* namespace for `Local` dedup (issue #13).
+    /// `None` (the default for every fresh volume) means "derive the
+    /// namespace from my own `uuid`" — the historical behaviour. A
+    /// snapshot or clone inherits the origin volume's effective
+    /// namespace here so the whole family shares one pool namespace and
+    /// can resolve each other's shared chunks; without it a clone's own
+    /// uuid would point at an empty namespace. Ignored under `Global`
+    /// dedup (namespace is always the shared per-backend pool). Routed
+    /// through [`Self::pool_namespace`] so no call site sees the raw
+    /// field.
+    #[serde(
+        default,
+        with = "opt_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dedup_namespace: Option<[u8; 16]>,
 }
 
 impl VolumeManifest {
@@ -378,14 +431,25 @@ impl VolumeManifest {
 
     /// Chunk-pool namespace for this volume: `None` under `Global`
     /// dedup (the shared per-backend pool), `Some(hex-of-uuid)` under
-    /// `Local`. Keyed on the durable UUID, not the mutable name — a
-    /// destroy + recreate under the same name does NOT inherit the
+    /// `Local`. Keyed on [`Self::dedup_namespace_uuid`] — the durable
+    /// `dedup_namespace` for a snapshot/clone family member, else this
+    /// volume's own UUID. Keyed on UUID rather than the mutable name —
+    /// a destroy + recreate under the same name does NOT inherit the
     /// dead volume's namespace or its orphan chunks.
     pub fn pool_namespace(&self) -> Option<String> {
         match self.dedup_scope {
             DedupScope::Global => None,
-            DedupScope::Local => Some(namespace_from_uuid(&self.uuid)),
+            DedupScope::Local => Some(namespace_from_uuid(&self.dedup_namespace_uuid())),
         }
+    }
+
+    /// The 16-byte UUID this volume's `Local`-dedup namespace is keyed
+    /// on: the inherited `dedup_namespace` if set (snapshot/clone family
+    /// member), else this volume's own `uuid` (a fresh volume is its own
+    /// family root). Snapshot and clone create pass this to the new
+    /// member so the whole family resolves to one pool namespace.
+    pub fn dedup_namespace_uuid(&self) -> [u8; 16] {
+        self.dedup_namespace.unwrap_or(self.uuid)
     }
 
     /// Build a fresh manifest. Does not touch disk — call
@@ -427,7 +491,17 @@ impl VolumeManifest {
             worm,
             created_at: Utc::now(),
             encryption: None,
+            dedup_namespace: None,
         })
+    }
+
+    /// Inherit a chunk-pool family namespace (issue #13). Builder-style,
+    /// used by clone create so the new writable volume resolves chunks
+    /// in the source family's `Local`-dedup pool namespace instead of
+    /// its own (empty) one. A no-op effect under `Global` dedup.
+    pub fn with_dedup_namespace(mut self, namespace_uuid: [u8; 16]) -> Self {
+        self.dedup_namespace = Some(namespace_uuid);
+        self
     }
 
     /// Mark this volume as encrypted. Builder-style so the existing
@@ -564,7 +638,11 @@ impl VolumeManifest {
     }
 }
 
-fn validate_name(name: &str) -> Result<(), VolumeError> {
+/// Validate an operator-supplied volume *or snapshot* name: non-empty,
+/// ≤ [`MAX_VOLUME_NAME_LEN`], not a reserved path component, ASCII
+/// `[A-Za-z0-9_-]` only. Shared by [`VolumeManifest::new`] and snapshot
+/// create so both name surfaces enforce the same filesystem-safe shape.
+pub fn validate_name(name: &str) -> Result<(), VolumeError> {
     if name.is_empty() {
         return Err(VolumeError::InvalidName(name.to_string(), "name is empty"));
     }
@@ -1051,5 +1129,138 @@ mod tests {
         std::fs::write(vol_dir.join("manifest.json"), raw.to_string()).unwrap();
         let err = VolumeManifest::load(dir.path(), "vol1").unwrap_err();
         assert!(matches!(err, VolumeError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    fn fresh_volume_namespace_keys_on_own_uuid() {
+        // dedup_namespace defaults to None, so pool_namespace() must
+        // resolve to the volume's own uuid — identical to pre-v5.
+        let m = VolumeManifest::new(
+            "vol1".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(m.dedup_namespace.is_none());
+        assert_eq!(m.dedup_namespace_uuid(), m.uuid);
+        assert_eq!(m.pool_namespace(), Some(namespace_from_uuid(&m.uuid)));
+    }
+
+    #[test]
+    fn inherited_namespace_keys_on_family_uuid() {
+        // A clone/snapshot member carries dedup_namespace = the family
+        // root's uuid, so it resolves to the family pool namespace, NOT
+        // its own uuid.
+        let family = [0xABu8; 16];
+        let m = VolumeManifest::new(
+            "clone1".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_dedup_namespace(family);
+        assert_ne!(m.uuid, family);
+        assert_eq!(m.dedup_namespace_uuid(), family);
+        assert_eq!(m.pool_namespace(), Some(namespace_from_uuid(&family)));
+    }
+
+    #[test]
+    fn global_dedup_ignores_namespace() {
+        // Under Global dedup the family namespace is irrelevant — the
+        // pool is always the shared per-backend one.
+        let m = VolumeManifest::new(
+            "vol1".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Global,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_dedup_namespace([0x11u8; 16]);
+        assert_eq!(m.pool_namespace(), None);
+    }
+
+    #[test]
+    fn v5_namespace_round_trips_and_omits_when_absent() {
+        let dir = TempDir::new().unwrap();
+        // Absent: must not leak a "dedup_namespace" key into the JSON.
+        VolumeManifest::new(
+            "plain".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(dir.path())
+        .unwrap();
+        let raw = std::fs::read_to_string(VolumeManifest::path_for(dir.path(), "plain")).unwrap();
+        assert!(
+            !raw.contains("dedup_namespace"),
+            "fresh manifest leaks dedup_namespace: {raw}"
+        );
+
+        // Present: persists and reloads byte-identically.
+        let family = [0x5Au8; 16];
+        let created = VolumeManifest::new(
+            "child".into(),
+            1u64 << 30,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            1,
+        )
+        .unwrap()
+        .with_dedup_namespace(family)
+        .create(dir.path())
+        .unwrap();
+        let loaded = VolumeManifest::load(dir.path(), "child").unwrap();
+        assert_eq!(loaded, created);
+        assert_eq!(loaded.dedup_namespace, Some(family));
+    }
+
+    #[test]
+    fn pre_v5_manifest_loads_namespace_none() {
+        // A v4 manifest on disk (no dedup_namespace field) loads with
+        // None and keeps keying on its own uuid — no behaviour change.
+        let dir = TempDir::new().unwrap();
+        let vol_dir = VolumeManifest::dir_for(dir.path(), "vol1");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let raw = serde_json::json!({
+            "schema_version": 4,
+            "name": "vol1",
+            "uuid": "00112233445566778899aabbccddeeff",
+            "size_bytes": 1_073_741_824u64,
+            "sector_bytes": DEFAULT_SECTOR_BYTES,
+            "page_size_bytes": DEFAULT_PAGE_SIZE_BYTES,
+            "backend": "primary",
+            "lun": 0,
+            "dedup_scope": "local",
+            "worm": false,
+            "created_at": "2026-05-16T00:00:00Z",
+        });
+        std::fs::write(vol_dir.join("manifest.json"), raw.to_string()).unwrap();
+        let loaded = VolumeManifest::load(dir.path(), "vol1").unwrap();
+        assert_eq!(loaded.schema_version, VOLUME_SCHEMA_VERSION);
+        assert!(loaded.dedup_namespace.is_none());
+        assert_eq!(loaded.dedup_namespace_uuid(), loaded.uuid);
     }
 }

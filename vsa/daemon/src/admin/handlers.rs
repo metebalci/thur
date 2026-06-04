@@ -36,7 +36,8 @@ use axum::{
     Json, extract::Path as AxumPath, extract::State, http::StatusCode, response::IntoResponse,
 };
 use core_block::{
-    self, PageCache, PageIndex, UploadTask, VolumeManifest, VolumeRuntime, VolumeWriter,
+    self, PageCache, PageIndex, SnapshotManifest, UploadTask, VolumeManifest, VolumeRuntime,
+    VolumeWriter,
     volume::{VolumeEncryptionAlgorithm, parse_dedup_scope},
 };
 use serde::{Deserialize, Serialize};
@@ -779,6 +780,314 @@ pub async fn create(
         StatusCode::CREATED,
         Json(VolumeRow::from_cache(lun, &cache)),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CloneVolumeRequest {
+    /// Name for the new writable clone volume.
+    pub new_name: String,
+    /// Snapshot of the source volume to clone from. `None` clones the
+    /// source volume's current (live) contents via an implicit freeze.
+    #[serde(default)]
+    pub from_snapshot: Option<String>,
+    /// Operator-pinned LUN, else the smallest free one.
+    #[serde(default)]
+    pub lun: Option<u64>,
+}
+
+/// Resolved geometry of a clone's source — a named snapshot or the live
+/// source volume. Everything the new manifest + writer need to seed the
+/// clone and resolve its shared chunks.
+struct CloneSource {
+    backend: String,
+    dedup_scope: core_block::DedupScope,
+    page_size_bytes: u32,
+    sector_bytes: u32,
+    size_bytes: u64,
+    /// Family namespace the clone inherits via `dedup_namespace` so its
+    /// Local-dedup chunks resolve in the source family's pool.
+    namespace_uuid: [u8; 16],
+    encrypted: bool,
+}
+
+/// `POST /api/v1/volumes/{name}/clone` — create a new writable volume
+/// seeded from a snapshot of `{name}` (or its live contents), sharing
+/// the source's chunks copy-on-write (issue #13).
+///
+/// The clone is a first-class volume: a fresh uuid, a new LUN, and its
+/// own page table — a copy of the source's, so reads of un-diverged
+/// pages hit the shared chunks and writes seal new chunks that diverge.
+/// It inherits the source's *family* `dedup_namespace` so Local-dedup
+/// chunks resolve in the shared pool.
+///
+/// Encrypted sources are refused (issue #86): shared chunks are sealed
+/// with the source's DEK and an IV derived from the source uuid, which a
+/// clone with a fresh uuid cannot reproduce. Unencrypted volumes (the
+/// common case) clone freely.
+///
+/// Secure-by-default: the clone is a new volume name, so no host sees it
+/// until the operator grants admission (`iscsi users grant` /
+/// `nvmetcp psks grant`) — it does NOT inherit the source's grants.
+pub async fn clone_volume(
+    State(state): State<AdminState>,
+    peer: PeerCred,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<CloneVolumeRequest>,
+) -> Result<(StatusCode, Json<VolumeRow>), (StatusCode, Json<serde_json::Value>)> {
+    // The live-clone path holds the source cache so it can freeze the
+    // source's current index; the snapshot path reads a frozen index off
+    // disk and needs no live volume.
+    let live_cache = if body.from_snapshot.is_none() {
+        Some(state.registry.get_by_name(&name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("volume '{name}' is not registered") })),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    // Resolve the source geometry + the index path to seed from (Some
+    // for the snapshot path; None means "freeze the live cache below").
+    let (src, snap_index_path): (CloneSource, Option<PathBuf>) = match body.from_snapshot.as_deref()
+    {
+        Some(snap) => {
+            let m = SnapshotManifest::load(&state.data_dir, &name, snap).map_err(|e| {
+                let status = match e {
+                    core_block::VolumeError::NotFound(_) => StatusCode::NOT_FOUND,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (
+                    status,
+                    Json(json!({ "error": format!("load snapshot '{snap}': {e}") })),
+                )
+            })?;
+            let idx = SnapshotManifest::page_index_path(&state.data_dir, &name, snap);
+            (
+                CloneSource {
+                    backend: m.backend,
+                    dedup_scope: m.dedup_scope,
+                    page_size_bytes: m.page_size_bytes,
+                    sector_bytes: m.sector_bytes,
+                    size_bytes: m.size_bytes,
+                    namespace_uuid: m.dedup_namespace,
+                    encrypted: m.encryption.is_some(),
+                },
+                Some(idx),
+            )
+        }
+        None => {
+            let cache = live_cache.as_ref().expect("live cache resolved above");
+            let m = cache.manifest();
+            (
+                CloneSource {
+                    backend: m.backend.clone(),
+                    dedup_scope: m.dedup_scope,
+                    page_size_bytes: m.page_size_bytes,
+                    sector_bytes: m.sector_bytes,
+                    size_bytes: cache.size_bytes(),
+                    namespace_uuid: m.dedup_namespace_uuid(),
+                    encrypted: m.encryption.is_some(),
+                },
+                None,
+            )
+        }
+    };
+
+    if src.encrypted {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "cloning an encrypted volume is not supported yet (issue #86); \
+                          clone an unencrypted volume, or restore from backup"
+            })),
+        ));
+    }
+
+    let pool_budget = state
+        .pool_budgets
+        .get(&src.backend)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("no pool budget configured for backend '{}'", src.backend)
+                })),
+            )
+        })?;
+
+    let pinned_lun = match body.lun {
+        Some(req) => {
+            if state.registry.get(req).is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(
+                        json!({ "error": format!("lun {} already bound to another volume", req) }),
+                    ),
+                ));
+            }
+            req
+        }
+        None => state.registry.next_free_lun(),
+    };
+
+    // Build + create the clone manifest (fresh uuid, inherited family
+    // namespace). `create` also lays down an empty pages.idx we overwrite
+    // with the source's index below.
+    let created = match VolumeManifest::new(
+        body.new_name.clone(),
+        src.size_bytes,
+        src.sector_bytes,
+        src.page_size_bytes,
+        src.backend.clone(),
+        src.dedup_scope,
+        false,
+        pinned_lun,
+    ) {
+        Ok(m) => m.with_dedup_namespace(src.namespace_uuid),
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ));
+        }
+    };
+    let created = match created.create(&state.data_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            let status = match e {
+                core_block::VolumeError::AlreadyExists(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return Err((
+                status,
+                Json(json!({ "error": format!("create clone: {e}") })),
+            ));
+        }
+    };
+    let clone_dir = VolumeManifest::dir_for(&state.data_dir, &created.name);
+    let clone_index = PageIndex::path_for(&clone_dir);
+
+    // Seed the clone's page table from the source, then rebind the index
+    // header to the clone's uuid. Roll back the whole clone dir on any
+    // failure.
+    let seed: Result<(), String> = if let Some(src_idx) = snap_index_path {
+        let dst = clone_index.clone();
+        tokio::task::spawn_blocking(move || std::fs::copy(&src_idx, &dst).map(|_| ()))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+            .map_err(|e| format!("copy snapshot index: {e}"))
+    } else {
+        live_cache
+            .as_ref()
+            .expect("live cache")
+            .snapshot_pages_idx(clone_index.clone())
+            .await
+            .map_err(|e| format!("freeze source index: {e}"))
+    };
+    let seed = seed.and_then(|()| {
+        rebind_page_index_uuid(&clone_index, &created.uuid)
+            .map_err(|e| format!("rebind index uuid: {e}"))
+    });
+    if let Err(msg) = seed {
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": msg })),
+        ));
+    }
+
+    // Open the writer against the shared backend + family pool and bring
+    // the clone online (same tail as `create`).
+    let cloud_backend = match get_or_init_backend(&state, &src.backend).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("backend init: {e}") })),
+            ));
+        }
+    };
+    let writer = match VolumeWriter::open(&state.data_dir, &created.name, cloud_backend) {
+        Ok(w) => Arc::new(
+            w.with_pool_budget(Arc::clone(&pool_budget), state.backpressure_deadline)
+                .with_upload_sender(state.upload_tx.clone()),
+        ),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("open clone writer: {e}") })),
+            ));
+        }
+    };
+    let (max_concurrent_flushes, _) = state.storage.upload.resolve_max_concurrent();
+    let cache = PageCache::with_budget_and_concurrency(
+        writer,
+        core_block::DEFAULT_CACHE_BUDGET_BYTES,
+        max_concurrent_flushes,
+    );
+    tokio::spawn(Arc::clone(&cache).run_flush_worker());
+
+    let lun = created.lun;
+    if state.registry.register(lun, Arc::clone(&cache)).is_some() {
+        warn!("admin: LUN {} double-bound during volume clone", lun);
+    }
+    state.notify_nvme_namespace_changed(lun);
+
+    info!(
+        "admin: cloned volume '{}' (LUN {}) from source '{}'{} backend='{}' size={} B uid={} pid={:?}",
+        created.name,
+        lun,
+        name,
+        body.from_snapshot
+            .as_deref()
+            .map(|s| format!(" snapshot '{s}'"))
+            .unwrap_or_default(),
+        created.backend,
+        created.size_bytes,
+        peer.uid,
+        peer.pid,
+    );
+
+    if let Some(channel) = state.audit.as_ref() {
+        channel.try_append(
+            "volume.clone",
+            AuditActor::cli(peer.audit_descriptor()),
+            json!({
+                "volume": created.name,
+                "lun": lun,
+                "source_volume": name,
+                "source_snapshot": body.from_snapshot,
+                "size_bytes": created.size_bytes,
+                "backend": created.backend,
+                "uuid": hex::encode(created.uuid),
+            }),
+            AuditResult::Ok,
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(VolumeRow::from_cache(lun, &cache)),
+    ))
+}
+
+/// Rewrite the volume-uuid bytes (header offset 16..32) of a
+/// freshly-copied `pages.idx` so it binds to the clone, not the source.
+/// The copied index is otherwise byte-identical (page size matches), so
+/// a single 16-byte `pwrite` + fdatasync is all the rebind needs;
+/// afterwards `PageIndex::open(clone.uuid, …)` validates.
+fn rebind_page_index_uuid(idx_path: &std::path::Path, new_uuid: &[u8; 16]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new().write(true).open(idx_path)?;
+    f.write_at(new_uuid, 16)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// `DELETE /api/v1/volumes/{name}` — unregister a live volume and

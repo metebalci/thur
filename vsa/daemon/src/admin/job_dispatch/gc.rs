@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use core_block::{ChunkPool, PageIndex, VolumeManifest};
+use core_block::{ChunkPool, PageIndex, SnapshotManifest, VolumeManifest};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_audit::{AuditActor, AuditResult};
@@ -196,10 +196,19 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
     emitter.emit(JobEvent::done(0)).await;
 }
 
-/// Walk every volume's `pages.idx` and bucket the live chunk hashes
-/// by `(backend, namespace)`. A volume whose manifest or page index
-/// can't be read is logged and skipped — one corrupt volume must not
-/// stall GC for the rest.
+/// Walk every volume's `pages.idx` **and every snapshot's frozen
+/// `pages.idx`**, bucketing the live chunk hashes by
+/// `(backend, namespace)`. A volume or snapshot whose manifest or page
+/// index can't be read is logged and skipped — one corrupt member must
+/// not stall GC for the rest.
+///
+/// Snapshots (issue #13) are what make copy-on-write reclaimable: a
+/// snapshot's frozen index keeps the parent's pre-overwrite chunks in
+/// the live set, keyed on the *family* namespace
+/// ([`SnapshotManifest::pool_namespace`]) so its hashes union with the
+/// parent's and any clones' into one bucket. The union is a `HashSet`,
+/// so a chunk shared across family members is counted once and only
+/// reclaimed when no member references it.
 fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
     let mut out: LiveSet = HashMap::new();
     for name in VolumeManifest::list(data_dir)? {
@@ -238,6 +247,54 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
                 }
                 Err(e) => {
                     warn!("gc: volume '{}' - pages.idx iteration failed: {}", name, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Second pass — every snapshot's frozen page index. Same bucketing,
+    // keyed on the snapshot's family namespace so it unions with its
+    // parent/clones.
+    for (parent, snap) in SnapshotManifest::list_all(data_dir)? {
+        let manifest = match SnapshotManifest::load(data_dir, &parent, &snap) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "gc: skipping snapshot '{}/{}' - manifest load failed: {}",
+                    parent, snap, e
+                );
+                continue;
+            }
+        };
+        let idx_path = SnapshotManifest::page_index_path(data_dir, &parent, &snap);
+        let page_index = match PageIndex::open(
+            &idx_path,
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "gc: skipping snapshot '{}/{}' - pages.idx open failed: {}",
+                    parent, snap, e
+                );
+                continue;
+            }
+        };
+        let bucket = out
+            .entry((manifest.backend.clone(), manifest.pool_namespace()))
+            .or_default();
+        for record in page_index.iter() {
+            match record {
+                Ok((_page_id, hash)) => {
+                    bucket.insert(hex::encode(hash));
+                }
+                Err(e) => {
+                    warn!(
+                        "gc: snapshot '{}/{}' - pages.idx iteration failed: {}",
+                        parent, snap, e
+                    );
                     break;
                 }
             }
@@ -653,5 +710,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Take a snapshot the way the daemon does: copy the live pages.idx
+    /// into the snapshot dir and persist the snapshot manifest.
+    fn take_snapshot(data_dir: &Path, parent: &VolumeManifest, snap: &str) {
+        let snap_dir = SnapshotManifest::dir_for(data_dir, &parent.name, snap);
+        fs::create_dir_all(&snap_dir).unwrap();
+        let src = PageIndex::path_for(&VolumeManifest::dir_for(data_dir, &parent.name));
+        fs::copy(&src, PageIndex::path_for(&snap_dir)).unwrap();
+        SnapshotManifest::new(snap.to_string(), parent, parent.size_bytes)
+            .unwrap()
+            .persist(&snap_dir)
+            .unwrap();
+    }
+
+    /// The load-bearing copy-on-write property: a chunk the parent has
+    /// overwritten is retained while a snapshot still references it, and
+    /// reclaimed once the snapshot is destroyed.
+    #[test]
+    fn snapshot_retains_overwritten_chunk_then_reclaims() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary");
+        let ns = manifest.pool_namespace().unwrap();
+
+        let pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (old_hash, _) = pool.insert_bytes(&[0xAA; 4096]).unwrap();
+        let (new_hash, _) = pool.insert_bytes(&[0xBB; 4096]).unwrap();
+
+        let vol_dir = VolumeManifest::dir_for(data_dir, "vol-a");
+        let pages = PageIndex::open(
+            &PageIndex::path_for(&vol_dir),
+            manifest.uuid,
+            u64::from(manifest.page_size_bytes),
+        )
+        .unwrap();
+        let old_bytes: [u8; 32] = hex::decode(&old_hash).unwrap().try_into().unwrap();
+        let new_bytes: [u8; 32] = hex::decode(&new_hash).unwrap().try_into().unwrap();
+
+        // Page 0 = old chunk, then snapshot freezes that mapping.
+        pages.set(0, &old_bytes).unwrap();
+        take_snapshot(data_dir, &manifest, "snap1");
+
+        // Parent overwrites page 0 with the new chunk. Old chunk is now
+        // orphaned from the PARENT but still held by the snapshot.
+        pages.set(0, &new_bytes).unwrap();
+
+        // Live set holds BOTH — the snapshot keeps the old hash alive.
+        let live = collect_live_hashes(data_dir).unwrap();
+        let bucket = live
+            .get(&("primary".to_string(), Some(ns.clone())))
+            .expect("namespace bucket present");
+        assert!(
+            bucket.contains(&old_hash),
+            "snapshot keeps overwritten chunk"
+        );
+        assert!(bucket.contains(&new_hash), "parent's current chunk is live");
+
+        // GC while the snapshot exists: nothing reclaimed.
+        run_local_gc(data_dir, "primary", &live, false, None).unwrap();
+        assert!(pool.exists(&old_hash), "snapshot-held chunk survives GC");
+        assert!(pool.exists(&new_hash));
+
+        // Destroy the snapshot, re-collect, GC again: old chunk is now a
+        // true orphan and gets reclaimed; the parent's chunk stays.
+        fs::remove_dir_all(SnapshotManifest::dir_for(data_dir, "vol-a", "snap1")).unwrap();
+        let live = collect_live_hashes(data_dir).unwrap();
+        let (_lines, freed) = run_local_gc(data_dir, "primary", &live, false, None).unwrap();
+        assert_eq!(freed, 4096, "the orphaned old chunk is reclaimed");
+        assert!(
+            !pool.exists(&old_hash),
+            "old chunk gone after snapshot destroy"
+        );
+        assert!(pool.exists(&new_hash), "parent's chunk still live");
     }
 }
