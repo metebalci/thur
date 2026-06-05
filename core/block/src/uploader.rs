@@ -1810,6 +1810,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decrypt_page_at_errors_when_chunk_is_absent_from_pool_and_cloud() {
+        // The ODX recrypt input addresses a chunk by an explicit hash.
+        // If that chunk lives in neither the local pool nor cloud (a
+        // stale token, or a source page evicted before it uploaded), the
+        // fetch must surface an error — not a decrypt failure, and never
+        // silent wrong plaintext.
+        let (tmp, name, backend, key) = encrypted_fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open_with_key(tmp.path(), &name, backend, key).unwrap();
+        // A hash that was never written is present nowhere.
+        let bogus: ChunkHash = [0xFF; 32];
+        let err = writer
+            .decrypt_page_at(6, &bogus, 0)
+            .await
+            .expect_err("absent chunk must fail the fetch");
+        assert!(
+            !matches!(err, UploaderError::Decrypt(_)),
+            "must be a fetch failure, not a crypto failure: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn open_without_key_refuses_encrypted_volume() {
         let (tmp, name, backend, _key) = encrypted_fixture(DedupScope::Local).await;
         match VolumeWriter::open(tmp.path(), &name, backend) {

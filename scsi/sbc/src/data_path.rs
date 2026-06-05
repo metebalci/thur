@@ -4835,6 +4835,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn odx_write_using_token_rejects_page_size_mismatch() {
+        // Source sealed at 64 KiB pages, destination at 32 KiB. Chunk
+        // hashes are page-granular, so they can't be shared across page
+        // sizes — WRITE USING TOKEN must refuse with INVALID FIELD IN
+        // PARAMETER LIST and record the job Failed, never silently
+        // corrupt the destination.
+        let tmp = TempDir::new().unwrap();
+        let cloud_root = tmp.path().join("cloud");
+        std::fs::create_dir_all(&cloud_root).unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&cloud_root).await.unwrap());
+        let mk = |name: &str, page: u32| {
+            VolumeManifest::new(
+                name.into(),
+                8 * (1u64 << 20),
+                DEFAULT_SECTOR_BYTES,
+                page,
+                "primary".into(),
+                DedupScope::Global,
+                false,
+                0,
+            )
+            .unwrap()
+        };
+        mk("src_ps", DEFAULT_PAGE_SIZE_BYTES)
+            .create(tmp.path())
+            .unwrap();
+        mk("dst_ps", 32 * 1024).create(tmp.path()).unwrap();
+        let src = PageCache::new(Arc::new(
+            VolumeWriter::open(tmp.path(), "src_ps", backend.clone()).unwrap(),
+        ));
+        let dst = PageCache::new(Arc::new(
+            VolumeWriter::open(tmp.path(), "dst_ps", backend).unwrap(),
+        ));
+
+        // Seal one source page, then mint a token over it.
+        src.write_bytes(0, &page_pattern(0x5A)).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry = two_lun_registry(src.clone(), dst.clone());
+        let tokens = test_tokens();
+        let token = odx_mint_token(
+            &registry,
+            &tokens,
+            0,
+            0x200,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+
+        let r = odx_write_using_token(
+            &registry,
+            &tokens,
+            1,
+            0x201,
+            &token,
+            &[(0, SECTORS_PER_PAGE as u32)],
+        )
+        .await;
+        assert_eq!(r.sense, Some(SenseData::INVALID_FIELD_IN_PARAMETER_LIST));
+        let job = tokens.job_result(0x201).expect("WUT job recorded");
+        assert!(
+            matches!(job.status, JobStatus::Failed { .. }),
+            "page-size-mismatch WUT must mark the job Failed, got {:?}",
+            job.status
+        );
+    }
+
+    #[tokio::test]
     async fn odx_rebind_same_identity_roundtrip() {
         // Destination shares the source crypto identity (clone case) and
         // the page lands at the same offset -> zero-copy hash rebind must

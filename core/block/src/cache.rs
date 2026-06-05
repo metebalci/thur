@@ -1860,6 +1860,179 @@ mod tests {
         assert_eq!(cache.read_bytes(0, PAGE).await.unwrap(), vec![0u8; PAGE]);
     }
 
+    /// The pure rebind-vs-recrypt gate (issue #88 XCOPY/ODX across
+    /// crypto identities). Direct table coverage so an `&&`→`||` slip or
+    /// a dropped dek_uuid/page_id check is caught instantly — the clone
+    /// flows only exercise it indirectly.
+    #[test]
+    fn rebind_is_sound_decides_rebind_vs_recrypt() {
+        let u1 = [0x11u8; 16];
+        let u2 = [0x22u8; 16];
+        // Neither side encrypted: a raw chunk copy is always sound.
+        assert!(rebind_is_sound(false, u1, 0, false, u2, 9));
+        // Both encrypted, same identity AND same page id: the derived
+        // (key, IV) match, so the ciphertext rebinds verbatim.
+        assert!(rebind_is_sound(true, u1, 0, true, u1, 0));
+        assert!(rebind_is_sound(true, u1, 5, true, u1, 5));
+        // Same identity but different page id -> IV differs -> recrypt.
+        assert!(!rebind_is_sound(true, u1, 0, true, u1, 1));
+        // Different identity -> different key -> recrypt.
+        assert!(!rebind_is_sound(true, u1, 0, true, u2, 0));
+        // Mixed encrypted/plaintext either direction -> never a rebind.
+        assert!(!rebind_is_sound(true, u1, 0, false, u1, 0));
+        assert!(!rebind_is_sound(false, u1, 0, true, u1, 0));
+    }
+
+    /// Restore (issue #85) must reset the upload + LRU sidecars to
+    /// header-only so no stale `LocalOnly` / touch record survives
+    /// pointing at a chunk the restore just orphaned.
+    #[tokio::test]
+    async fn restore_from_snapshot_resets_upload_and_lru_sidecars() {
+        let (tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0xA1, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let frozen = PageIndex::path_for(&snap_dir);
+        cache.snapshot_pages_idx(frozen.clone()).await.unwrap();
+
+        // Seed a deliberately-stale, non-default sidecar state on a page
+        // (Uploaded == 0 is the default, so it can't prove a reset; we
+        // need LocalOnly + a non-zero LRU timestamp).
+        writer
+            .upload_index()
+            .set(7, UploadState::LocalOnly)
+            .unwrap();
+        writer.lru_index().touch(7, 0x1234_5678).unwrap();
+        assert_eq!(
+            writer.upload_index().read(7).unwrap(),
+            UploadState::LocalOnly
+        );
+        assert_eq!(writer.lru_index().read(7).unwrap(), 0x1234_5678);
+
+        cache.restore_from_snapshot(frozen).await.unwrap();
+
+        // Both sidecars are back to their header-only defaults.
+        assert_eq!(
+            writer.upload_index().read(7).unwrap(),
+            UploadState::Uploaded
+        );
+        assert_eq!(writer.lru_index().read(7).unwrap(), 0);
+    }
+
+    /// Restore rewinds the page table only — it does NOT change the
+    /// volume size (the daemon's `--resize` owns that, issue #90). A
+    /// grow-then-restore keeps the grown size while reverting content,
+    /// so reads past the snapshot's pages fall in the grown hole and
+    /// return zeros.
+    #[tokio::test]
+    async fn restore_from_snapshot_is_page_table_only_size_unchanged() {
+        let (tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0xA1, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let frozen = PageIndex::path_for(&snap_dir);
+        cache.snapshot_pages_idx(frozen.clone()).await.unwrap();
+
+        // Grow the live volume past the snapshot point.
+        writer.set_size(8 * (1u64 << 20)).unwrap();
+        assert_eq!(cache.size_bytes(), 8 * (1u64 << 20));
+
+        cache.restore_from_snapshot(frozen).await.unwrap();
+
+        // Size is untouched by restore; content reverted to the snapshot.
+        assert_eq!(cache.size_bytes(), 8 * (1u64 << 20));
+        assert_eq!(
+            cache.read_bytes(0, PAGE).await.unwrap(),
+            pattern(0xA1, PAGE)
+        );
+        // A read in the grown region (a page the snapshot never had) is a
+        // zero hole, not an out-of-range error.
+        assert_eq!(
+            cache.read_bytes(5 * PAGE as u64, PAGE).await.unwrap(),
+            vec![0u8; PAGE]
+        );
+    }
+
+    /// A corrupt snapshot file must make restore fail and leave the
+    /// volume operable. Restore validates the snapshot header before
+    /// touching the live page index, so the on-disk page table survives
+    /// and reads refetch correctly even though the in-memory cache was
+    /// already invalidated.
+    #[tokio::test]
+    async fn restore_from_snapshot_rejects_corrupt_snapshot_and_stays_operable() {
+        let (tmp, cache, _writer) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0xA1, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let frozen = PageIndex::path_for(&snap_dir);
+        cache.snapshot_pages_idx(frozen.clone()).await.unwrap();
+
+        // Corrupt the snapshot's magic so restore_from rejects it.
+        let mut bytes = std::fs::read(&frozen).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&frozen, &bytes).unwrap();
+
+        assert!(cache.restore_from_snapshot(frozen).await.is_err());
+
+        // The live page index was never mutated; page 0 still reads its
+        // pre-restore content (refetched from the pool), and new writes
+        // work.
+        assert_eq!(
+            cache.read_bytes(0, PAGE).await.unwrap(),
+            pattern(0xA1, PAGE)
+        );
+        cache
+            .write_bytes(3 * PAGE as u64, &pattern(0x3C, PAGE))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_bytes(3 * PAGE as u64, PAGE).await.unwrap(),
+            pattern(0x3C, PAGE)
+        );
+    }
+
+    /// `invalidate_all` over a mixed clean/dirty population drops the
+    /// intrusive-LRU links cleanly: the flushed (clean) page refetches
+    /// from the pool, the un-flushed dirty page is gone, and the cache
+    /// keeps working — a dangling link would surface here.
+    #[tokio::test]
+    async fn invalidate_all_with_mixed_clean_and_dirty_stays_operable() {
+        let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
+        // Page 0: written + flushed (clean, in the pool).
+        cache.write_bytes(0, &pattern(0x11, PAGE)).await.unwrap();
+        cache.flush_all().await.unwrap();
+        // Page 1: written, left dirty (never flushed).
+        cache
+            .write_bytes(PAGE as u64, &pattern(0x22, PAGE))
+            .await
+            .unwrap();
+
+        cache.invalidate_all().await;
+
+        // Clean page refetched from the pool; dirty page discarded.
+        assert_eq!(
+            cache.read_bytes(0, PAGE).await.unwrap(),
+            pattern(0x11, PAGE)
+        );
+        assert_eq!(
+            cache.read_bytes(PAGE as u64, PAGE).await.unwrap(),
+            vec![0u8; PAGE]
+        );
+        // The LRU/page maps are still consistent: a fresh write + read
+        // round-trips.
+        cache
+            .write_bytes(4 * PAGE as u64, &pattern(0x44, PAGE))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_bytes(4 * PAGE as u64, PAGE).await.unwrap(),
+            pattern(0x44, PAGE)
+        );
+    }
+
     #[tokio::test]
     async fn resolve_range_tracks_live_size_after_resize() {
         // 4 MiB / 4 KiB sector = 1024 blocks (LBA 0..1023).

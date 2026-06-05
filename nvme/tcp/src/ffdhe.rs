@@ -121,3 +121,97 @@ pub fn ffdhe_prime_hex(dhgid: u8) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nvme_base::auth::NVME_AUTH_DHGROUP_NULL;
+    use openssl::bn::BigNum;
+
+    /// Each of the five supported group ids resolves to its own prime;
+    /// the NULL group and any unknown id resolve to `None`.
+    #[test]
+    fn ffdhe_prime_hex_mappings() {
+        assert_eq!(
+            ffdhe_prime_hex(NVME_AUTH_DHGROUP_2048),
+            Some(FFDHE2048_PRIME_HEX)
+        );
+        assert_eq!(
+            ffdhe_prime_hex(NVME_AUTH_DHGROUP_3072),
+            Some(FFDHE3072_PRIME_HEX)
+        );
+        assert_eq!(
+            ffdhe_prime_hex(NVME_AUTH_DHGROUP_4096),
+            Some(FFDHE4096_PRIME_HEX)
+        );
+        assert_eq!(
+            ffdhe_prime_hex(NVME_AUTH_DHGROUP_6144),
+            Some(FFDHE6144_PRIME_HEX)
+        );
+        assert_eq!(
+            ffdhe_prime_hex(NVME_AUTH_DHGROUP_8192),
+            Some(FFDHE8192_PRIME_HEX)
+        );
+
+        // NULL group + ids outside the negotiated range.
+        assert_eq!(ffdhe_prime_hex(NVME_AUTH_DHGROUP_NULL), None);
+        for unknown in [0x06u8, 0x10, 0x7F, 0xFF] {
+            assert_eq!(
+                ffdhe_prime_hex(unknown),
+                None,
+                "id {unknown:#x} is not a known group"
+            );
+        }
+    }
+
+    /// Every prime must parse, have exactly the advertised bit length,
+    /// and exhibit the RFC 7919 safe-prime construction where the top
+    /// and bottom 64 bits are all ones. A botched line-continuation in
+    /// one of the multi-line hex literals (a stray space or a dropped
+    /// digit) would change the byte length or the boundary bytes.
+    #[test]
+    fn prime_constants_have_rfc7919_structure() {
+        let cases = [
+            (FFDHE2048_PRIME_HEX, 256usize),
+            (FFDHE3072_PRIME_HEX, 384),
+            (FFDHE4096_PRIME_HEX, 512),
+            (FFDHE6144_PRIME_HEX, 768),
+            (FFDHE8192_PRIME_HEX, 1024),
+        ];
+        for (hex, want_bytes) in cases {
+            let p = BigNum::from_hex_str(hex).expect("prime parses as hex");
+            assert_eq!(
+                p.num_bytes() as usize,
+                want_bytes,
+                "{want_bytes}-byte prime"
+            );
+            // Big-endian, no leading zero (MSB is 0xFF), so the vec is
+            // exactly `want_bytes` long with the boundary words intact.
+            let be = p.to_vec();
+            assert_eq!(be.len(), want_bytes);
+            assert!(be[..8].iter().all(|&b| b == 0xFF), "top 64 bits all ones");
+            assert!(
+                be[be.len() - 8..].iter().all(|&b| b == 0xFF),
+                "bottom 64 bits all ones"
+            );
+        }
+    }
+
+    /// No two groups share a prime (guards against a copy-paste that
+    /// pointed two ids at the same constant).
+    #[test]
+    fn all_primes_are_distinct() {
+        let primes = [
+            FFDHE2048_PRIME_HEX,
+            FFDHE3072_PRIME_HEX,
+            FFDHE4096_PRIME_HEX,
+            FFDHE6144_PRIME_HEX,
+            FFDHE8192_PRIME_HEX,
+        ];
+        for i in 0..primes.len() {
+            for j in (i + 1)..primes.len() {
+                assert_ne!(primes[i], primes[j], "group {i} and {j} must differ");
+            }
+        }
+    }
+}

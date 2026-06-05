@@ -579,4 +579,73 @@ mod tests {
         assert!(!mgr.cancel(0x77));
         assert!(mgr.job_result(0x77).is_some());
     }
+
+    /// Build a token state with deliberately non-default crypto fields
+    /// — `dummy_state` zeroes them, so the existing round-trip test
+    /// would still pass if `snapshot_for` dropped one. These are the
+    /// recrypt-decision inputs (issues #87/#88); a dropped field forces
+    /// the wrong rebind-vs-recrypt choice and corrupts the destination.
+    fn encrypted_state(decryptor: Arc<dyn SourceDecryptor>, encrypted: bool) -> TokenState {
+        TokenState {
+            source_volume_uuid: [0u8; 16],
+            source_lun: 0,
+            source_backend: "primary".to_string(),
+            source_namespace: None,
+            source_page_size: 65_536,
+            sector_size: 4096,
+            source_pages: vec![0, 1],
+            hashes: vec![Some([0xAAu8; 32]), Some([0xBBu8; 32])],
+            iv_salts: vec![0xDEAD_BEEF, 0xBEEF_DEAD],
+            source_encrypted: encrypted,
+            source_dek_uuid: if encrypted {
+                [0xAAu8; 16]
+            } else {
+                [0xBBu8; 16]
+            },
+            source_decryptor: decryptor,
+            total_blocks: 32,
+            deadline: Instant::now() + Duration::from_secs(60),
+            pins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_copies_all_crypto_fields() {
+        let mgr = TokenManager::new();
+        let decryptor: Arc<dyn SourceDecryptor> = Arc::new(StubDecryptor);
+
+        // Encrypted source: salts, the flag, the DEK identity, and the
+        // decryptor handle all travel into the snapshot verbatim.
+        let token = mgr.mint_token(0x88, encrypted_state(Arc::clone(&decryptor), true));
+        let snap = mgr.snapshot_for(&token).expect("token present");
+        assert_eq!(snap.iv_salts, vec![0xDEAD_BEEF, 0xBEEF_DEAD]);
+        assert!(snap.source_encrypted);
+        assert_eq!(snap.source_dek_uuid, [0xAAu8; 16]);
+        assert!(
+            Arc::ptr_eq(&snap.source_decryptor, &decryptor),
+            "the same decryptor handle must be shared, not rebuilt"
+        );
+
+        // Unencrypted source: the flag and a distinct DEK identity pin
+        // that the boolean discriminator is carried, not assumed.
+        let token2 = mgr.mint_token(0x89, encrypted_state(Arc::clone(&decryptor), false));
+        let snap2 = mgr.snapshot_for(&token2).expect("token present");
+        assert!(!snap2.source_encrypted);
+        assert_eq!(snap2.source_dek_uuid, [0xBBu8; 16]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_decryptor_is_callable() {
+        let mgr = TokenManager::new();
+        let decryptor: Arc<dyn SourceDecryptor> = Arc::new(StubDecryptor);
+        let token = mgr.mint_token(0x8A, encrypted_state(decryptor, true));
+        let snap = mgr.snapshot_for(&token).expect("token present");
+        // The carried handle is a live trait object the WRITE USING
+        // TOKEN recrypt path can actually invoke.
+        let out = snap
+            .source_decryptor
+            .decrypt_chunk(0, [0xAAu8; 32], 0)
+            .await;
+        assert!(out.is_ok());
+    }
 }

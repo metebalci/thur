@@ -97,6 +97,8 @@
 ./vtl/cli/src/commands/self_test.rs
 ./shared/cli-system/src/daemon_health.rs
 ./shared/cli-system/src/regenerate_cert.rs
+./shared/cli-system/src/gc.rs
+./shared/cli-system/src/storage_check.rs
 
 # --- include!d into main.rs (the clap tests live in main.rs, not the
 #     included file; the --zero grep can't see across include!) ---

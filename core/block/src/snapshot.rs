@@ -541,4 +541,116 @@ mod tests {
             assert!(SnapshotManifest::new(bad.into(), &p, 1u64 << 30).is_err());
         }
     }
+
+    /// Write a snapshot manifest JSON `value` to the canonical path for
+    /// `(parent, snap)` under `dir`, creating directories. Used by the
+    /// on-disk compat tests that hand-tweak the serialized form.
+    fn write_snap_json(dir: &Path, parent_vol: &str, snap: &str, value: &serde_json::Value) {
+        let sd = SnapshotManifest::dir_for(dir, parent_vol, snap);
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(sd.join(SnapshotManifest::FILENAME), value.to_string()).unwrap();
+    }
+
+    /// A v1 snapshot (issue #13: `schema_version` of 1, no `crypto_uuid`
+    /// field) must still load: the version stamps forward to current,
+    /// `crypto_uuid` reads as `None`, and `dek_uuid()` falls back to the
+    /// snapshot's own uuid — so existing snapshots keep resolving after
+    /// the issue #86 schema bump.
+    #[test]
+    fn v1_snapshot_loads_with_crypto_uuid_none() {
+        let dir = TempDir::new().unwrap();
+        let p = parent("vol1", DedupScope::Local);
+        let s = SnapshotManifest::new("snap1".into(), &p, 1u64 << 30).unwrap();
+        // An origin snapshot already omits crypto_uuid; downgrade the
+        // version marker to reproduce the v1 on-disk shape exactly.
+        let mut v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.get("crypto_uuid").is_none(),
+            "origin snapshot omits crypto_uuid"
+        );
+        v["schema_version"] = serde_json::json!(1);
+        write_snap_json(dir.path(), "vol1", "snap1", &v);
+
+        let loaded = SnapshotManifest::load(dir.path(), "vol1", "snap1").unwrap();
+        assert_eq!(loaded.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert!(loaded.crypto_uuid.is_none());
+        assert_eq!(loaded.dek_uuid(), loaded.uuid);
+    }
+
+    /// `load` rejects an unrecognized schema version in either direction
+    /// (a corrupt 0, or a future version this binary can't understand)
+    /// rather than silently misreading the file.
+    #[test]
+    fn load_rejects_out_of_range_schema_version() {
+        let dir = TempDir::new().unwrap();
+        let p = parent("vol1", DedupScope::Local);
+        let s = SnapshotManifest::new("snap1".into(), &p, 1u64 << 30).unwrap();
+        let base = serde_json::to_value(&s).unwrap();
+
+        for bad in [0u32, SNAPSHOT_SCHEMA_VERSION + 1, 99] {
+            let mut v = base.clone();
+            v["schema_version"] = serde_json::json!(bad);
+            write_snap_json(dir.path(), "vol1", "snap1", &v);
+            assert!(
+                matches!(
+                    SnapshotManifest::load(dir.path(), "vol1", "snap1"),
+                    Err(VolumeError::SchemaMismatch { .. })
+                ),
+                "schema_version {bad} must be rejected"
+            );
+        }
+    }
+
+    /// A malformed uuid hex string is refused by the serde adapter — a
+    /// truncated or non-hex `uuid` can't be coerced into a 16-byte array.
+    #[test]
+    fn load_rejects_malformed_uuid_hex() {
+        let dir = TempDir::new().unwrap();
+        let p = parent("vol1", DedupScope::Local);
+        let s = SnapshotManifest::new("snap1".into(), &p, 1u64 << 30).unwrap();
+        let mut v = serde_json::to_value(&s).unwrap();
+        v["uuid"] = serde_json::json!("not-hex-zz");
+        write_snap_json(dir.path(), "vol1", "snap1", &v);
+        assert!(SnapshotManifest::load(dir.path(), "vol1", "snap1").is_err());
+    }
+
+    /// The optional `crypto_uuid` is omitted from an origin snapshot's
+    /// JSON (`skip_serializing_if`) and present for an encrypted clone's
+    /// — the `opt_uuid_hex` Some path round-trips.
+    #[test]
+    fn crypto_uuid_omitted_for_origin_present_for_clone() {
+        let dir = TempDir::new().unwrap();
+        // Origin: crypto_uuid None -> field absent in the file.
+        let origin = parent("vol1", DedupScope::Local);
+        let s = SnapshotManifest::new("snap1".into(), &origin, 1u64 << 30).unwrap();
+        let sd = SnapshotManifest::dir_for(dir.path(), "vol1", "snap1");
+        fs::create_dir_all(&sd).unwrap();
+        s.persist(&sd).unwrap();
+        let raw = fs::read_to_string(sd.join(SnapshotManifest::FILENAME)).unwrap();
+        assert!(
+            !raw.contains("crypto_uuid"),
+            "origin snapshot must omit crypto_uuid"
+        );
+
+        // Encrypted clone: crypto_uuid Some(source) round-trips through
+        // persist + load, and dek_uuid resolves to the shared identity.
+        let source = [0xC0u8; 16];
+        let clone = parent("clone1", DedupScope::Local)
+            .with_crypto_uuid(source)
+            .with_encryption(VolumeEncryptionAlgorithm::Aes256Gcm);
+        let cs = SnapshotManifest::new("s".into(), &clone, 1u64 << 30).unwrap();
+        let csd = SnapshotManifest::dir_for(dir.path(), "clone1", "s");
+        fs::create_dir_all(&csd).unwrap();
+        cs.persist(&csd).unwrap();
+        let craw = fs::read_to_string(csd.join(SnapshotManifest::FILENAME)).unwrap();
+        assert!(
+            craw.contains("crypto_uuid"),
+            "clone snapshot must record crypto_uuid"
+        );
+
+        let loaded = SnapshotManifest::load(dir.path(), "clone1", "s").unwrap();
+        assert_eq!(loaded.crypto_uuid, Some(source));
+        assert!(loaded.encryption.is_some());
+        assert_eq!(loaded.dek_uuid(), source);
+    }
 }

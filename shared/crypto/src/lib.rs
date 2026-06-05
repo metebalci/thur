@@ -251,4 +251,84 @@ mod tests {
         let iv = derive_iv(&[0; 16], 0, 0);
         assert_eq!(iv.len(), IV_LEN);
     }
+
+    // The remaining tests pin the issue #87 per-page IV-salt contract:
+    // every other crypto test above hardcodes `TEST_IV`, so none of them
+    // actually exercise a *derived* IV through the AEAD, nor prove that
+    // the salt (counter_b) changes the keystream. A regression that
+    // dropped the salt from the hash would silently reintroduce GCM
+    // nonce reuse yet still pass every test above.
+
+    #[test]
+    fn derive_iv_roundtrips_through_encrypt_decrypt() {
+        // The real path: re-derive the IV at decrypt time from the same
+        // (uuid, page_id, salt) tuple rather than storing it.
+        let key = [0x7Eu8; KEY_LEN];
+        let uuid = [0x5Au8; 16];
+        let (page_id, salt) = (42u64, 0xDEAD_BEEFu64);
+        let plaintext = b"page bytes that round-trip via a derived nonce";
+
+        let iv = derive_iv(&uuid, page_id, salt);
+        let ct = encrypt_block(&key, &iv, plaintext).expect("encrypt");
+
+        // Decrypt with a freshly re-derived IV (not the same binding).
+        let iv2 = derive_iv(&uuid, page_id, salt);
+        let pt = decrypt_block(&key, &iv2, &ct).expect("decrypt");
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn iv_salt_changes_iv_and_ciphertext() {
+        // Fix (uuid, page_id) — the part that *repeats* on a page
+        // rewrite or an encrypted-clone divergence — and prove the salt
+        // is what gives nonce uniqueness.
+        let key = [0x33u8; KEY_LEN];
+        let uuid = [0xC1u8; 16];
+        let page_id = 7u64;
+        let plaintext = b"same plaintext, same key, same page";
+
+        let salts = [0u64, 1, 0xFF, 0xDEAD_BEEF, u64::MAX];
+        let ivs: Vec<_> = salts
+            .iter()
+            .map(|&s| derive_iv(&uuid, page_id, s))
+            .collect();
+        for i in 0..ivs.len() {
+            for j in (i + 1)..ivs.len() {
+                assert_ne!(
+                    ivs[i], ivs[j],
+                    "salt {} vs {} must yield distinct IVs",
+                    salts[i], salts[j]
+                );
+            }
+        }
+
+        // Distinct IVs under the same key must produce distinct
+        // ciphertext for identical plaintext — the property that makes
+        // the per-page salt a real nonce-reuse fix.
+        let ct_a = encrypt_block(&key, &ivs[0], plaintext).expect("encrypt a");
+        let ct_b = encrypt_block(&key, &ivs[3], plaintext).expect("encrypt b");
+        assert_ne!(ct_a, ct_b, "distinct salts must change the keystream");
+    }
+
+    #[test]
+    fn zero_salt_is_deterministic_and_legacy() {
+        // A pre-salt (v1) `pages.idx` record reads `iv_salt = 0`, which
+        // must reproduce the original deterministic IV so existing
+        // encrypted volumes keep decrypting; a non-zero salt must
+        // diverge from it.
+        let uuid = [0x90u8; 16];
+        let page_id = 3u64;
+        let legacy = derive_iv(&uuid, page_id, 0);
+        assert_eq!(
+            legacy,
+            derive_iv(&uuid, page_id, 0),
+            "zero-salt is deterministic"
+        );
+        assert_eq!(legacy, derive_iv(&uuid, page_id, 0), "stable across calls");
+        assert_ne!(
+            legacy,
+            derive_iv(&uuid, page_id, 1),
+            "any non-zero salt diverges from legacy"
+        );
+    }
 }

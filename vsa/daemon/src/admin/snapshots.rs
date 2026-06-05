@@ -408,3 +408,43 @@ pub struct RestoreSnapshotRequest {
     #[serde(default)]
     pub resize: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The handler guard / orchestration paths (registered-volume
+    // requirement, duplicate / size-mismatch / WORM / active-reservation
+    // refusals, the rollback ordering) run against a live daemon and are
+    // covered end-to-end by `vsa/scripts/test-snapshot.sh`. What is
+    // genuinely unit-testable here is the request-body wire contract,
+    // where the `resize` default decides whether a restore is
+    // page-table-only or a destructive size rollback.
+
+    #[test]
+    fn restore_request_resize_defaults_to_false() {
+        // Absent `resize` => page-table-only restore (the safe,
+        // size-preserving default; a size mismatch then refuses).
+        let req: RestoreSnapshotRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(!req.resize);
+    }
+
+    #[test]
+    fn restore_request_honours_explicit_resize() {
+        let on: RestoreSnapshotRequest = serde_json::from_value(json!({ "resize": true })).unwrap();
+        assert!(on.resize);
+        let off: RestoreSnapshotRequest =
+            serde_json::from_value(json!({ "resize": false })).unwrap();
+        assert!(!off.resize);
+    }
+
+    #[test]
+    fn create_request_requires_a_snapshot_name() {
+        let req: CreateSnapshotRequest =
+            serde_json::from_value(json!({ "snapshot": "daily" })).unwrap();
+        assert_eq!(req.snapshot, "daily");
+        // The name is mandatory — an empty body is a deserialize error,
+        // not a silent default.
+        assert!(serde_json::from_value::<CreateSnapshotRequest>(json!({})).is_err());
+    }
+}

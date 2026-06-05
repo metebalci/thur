@@ -1062,4 +1062,168 @@ mod tests {
             PageIndexError::BadMagic
         ));
     }
+
+    /// `restore_from` re-validates record_size and version against its
+    /// own copies of the header guards (independent of `open()`); a
+    /// malformed snapshot header must be rejected *before* any live
+    /// mutation so a mismatched-geometry snapshot can never corrupt the
+    /// live page table.
+    #[test]
+    fn restore_from_rejects_bad_record_size_and_version() {
+        let dir = TempDir::new().unwrap();
+        let uuid = fixture_uuid();
+        let live_path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&live_path, uuid, 65_536).unwrap();
+        idx.set(2, &fixture_hash(2)).unwrap();
+
+        // Header with a wrong record_size: valid magic + version so the
+        // record_size guard is the one that trips.
+        let mut bad_rs = build_header(uuid, 65_536);
+        bad_rs[8..12].copy_from_slice(&99u32.to_le_bytes());
+        let rs_path = dir.path().join("bad_rs.idx");
+        std::fs::write(&rs_path, bad_rs).unwrap();
+        assert!(matches!(
+            idx.restore_from(&rs_path).unwrap_err(),
+            PageIndexError::RecordSizeMismatch { .. }
+        ));
+
+        // Header one schema version past what we understand.
+        let mut bad_ver = build_header(uuid, 65_536);
+        bad_ver[4..8].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        let ver_path = dir.path().join("bad_ver.idx");
+        std::fs::write(&ver_path, bad_ver).unwrap();
+        assert!(matches!(
+            idx.restore_from(&ver_path).unwrap_err(),
+            PageIndexError::SchemaMismatch { .. }
+        ));
+
+        // Both rejections happened before any mutation: the live index
+        // is exactly as it was.
+        assert_eq!(idx.get(2).unwrap(), Some(fixture_hash(2)));
+    }
+
+    /// Restoring from an empty (header-only) snapshot clears every live
+    /// page and shrinks the file back to the bare header.
+    #[test]
+    fn restore_from_header_only_clears_all_pages() {
+        let dir = TempDir::new().unwrap();
+        let uuid = fixture_uuid();
+        let live_path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&live_path, uuid, 65_536).unwrap();
+        idx.set(3, &fixture_hash(3)).unwrap();
+        idx.set(5, &fixture_hash(5)).unwrap();
+
+        // A freshly-created index of the same identity is exactly
+        // HEADER_SIZE bytes with no records — the empty-snapshot case.
+        let empty = dir.path().join("empty.idx");
+        let _ = PageIndex::create(&empty, uuid, 65_536).unwrap();
+
+        idx.restore_from(&empty).unwrap();
+        assert_eq!(idx.get(3).unwrap(), None);
+        assert_eq!(idx.get(5).unwrap(), None);
+        assert_eq!(idx.highest_allocated_page().unwrap(), None);
+        assert_eq!(std::fs::metadata(&live_path).unwrap().len(), HEADER_SIZE);
+    }
+
+    /// Re-sealing a page with a *different* salt must fully replace the
+    /// old salt, on disk and across a reopen. A lingering old salt would
+    /// be silent AES-GCM nonce reuse for the page's new ciphertext.
+    #[test]
+    fn overwrite_with_different_salt_replaces_old_salt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+
+        idx.set_salted(7, &fixture_hash(0xA0), 0x1111_2222_3333_4444)
+            .unwrap();
+        idx.set_salted(7, &fixture_hash(0xB0), 0x5555_6666_7777_8888)
+            .unwrap();
+        let want = PageEntry {
+            hash: fixture_hash(0xB0),
+            iv_salt: 0x5555_6666_7777_8888,
+        };
+        assert_eq!(idx.get_entry(7).unwrap(), Some(want));
+
+        let reopened = PageIndex::open(&path, fixture_uuid(), 65_536).unwrap();
+        assert_eq!(reopened.get_entry(7).unwrap(), Some(want));
+    }
+
+    /// The salted unsynced hot-path (`set_unsynced_salted`, used by the
+    /// cache's parallel flush) writes a non-zero salt that is readable
+    /// immediately and durable after the trailing `sync` + reopen.
+    #[test]
+    fn set_unsynced_salted_persists_after_sync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+
+        let h = fixture_hash(0x5A);
+        idx.set_unsynced_salted(42, &h, 0xCAFE_DEAD_BEEF_C0DE)
+            .unwrap();
+        // Readable before the sync (pwrite hits the OS page cache).
+        assert_eq!(
+            idx.get_entry(42).unwrap(),
+            Some(PageEntry {
+                hash: h,
+                iv_salt: 0xCAFE_DEAD_BEEF_C0DE
+            })
+        );
+        idx.sync().unwrap();
+
+        let reopened = PageIndex::open(&path, fixture_uuid(), 65_536).unwrap();
+        assert_eq!(
+            reopened.get_entry(42).unwrap(),
+            Some(PageEntry {
+                hash: h,
+                iv_salt: 0xCAFE_DEAD_BEEF_C0DE
+            })
+        );
+    }
+
+    /// A cleared page stays cleared across a reopen (the zeroed record
+    /// is flushed, not just dropped from an in-memory view).
+    #[test]
+    fn clear_persists_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+        idx.set(99, &fixture_hash(99)).unwrap();
+        idx.clear(99).unwrap();
+        let reopened = PageIndex::open(&path, fixture_uuid(), 65_536).unwrap();
+        assert_eq!(reopened.get(99).unwrap(), None);
+    }
+
+    /// Opening an already-migrated (v2) file is a no-op: a second open
+    /// must not re-stamp or re-zero anything, and the record survives.
+    #[test]
+    fn v1_migration_is_idempotent_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let uuid = fixture_uuid();
+        let h = fixture_hash(0x77);
+        write_v1_index(&path, uuid, 11, &h);
+
+        // First open migrates v1 -> v2.
+        {
+            let idx = PageIndex::open(&path, uuid, 65_536).unwrap();
+            assert_eq!(
+                idx.get_entry(11).unwrap(),
+                Some(PageEntry {
+                    hash: h,
+                    iv_salt: 0
+                })
+            );
+        }
+        // Second open sees v2 already and changes nothing.
+        let reopened = PageIndex::open(&path, uuid, 65_536).unwrap();
+        assert_eq!(
+            reopened.get_entry(11).unwrap(),
+            Some(PageEntry {
+                hash: h,
+                iv_salt: 0
+            })
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32_le(&bytes[4..8]), SCHEMA_VERSION);
+    }
 }
