@@ -2771,7 +2771,7 @@ Cross-product (identical handler on both daemons):
 
 | Method + path | Body |
 |---|---|
-| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / session / audit counters). |
+| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / session / audit counters). The per-product `product` block carries VTL cartridge+drive counts or VSA volume count, and the session count is split into `iscsi_sessions` + `nvmetcp_sessions` on VSA. The Web UI derives its throughput KPI and storage-backends table from this one payload's per-backend byte counters. |
 | `GET /api/v1/jobs/recent` | `{ "jobs": [ { id, kind, started_at, finished, exit_code? } ] }`. A rolling 5-minute window, not a persistent history — finished jobs are reaped 300 s after they end. |
 | `GET /api/v1/audit/tail?lines=N` | `{ "entries": [ … ] }` — the last `N` (default 100, clamped to 1000) entries of the BLAKE3-chained audit log. The one-shot "last N" read, not the streaming `audit tail` job. |
 

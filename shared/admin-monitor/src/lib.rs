@@ -71,7 +71,7 @@ pub trait MonitorState: Clone + Send + Sync + 'static {
     /// resolver just echoes it back.
     fn pool_namespace_label(&self, backend: &str, namespace: &str) -> Option<String>;
     /// Per-product fields. VSA returns `Vsa { volumes_online,
-    /// sessions_active }`; VTL returns `Vtl { … }`.
+    /// iscsi_sessions, nvmetcp_sessions }`; VTL returns `Vtl { … }`.
     fn snapshot_product(&self) -> ProductSnapshot;
 }
 
@@ -83,7 +83,11 @@ pub trait MonitorState: Clone + Send + Sync + 'static {
 pub enum ProductSnapshot {
     Vsa {
         volumes_online: u64,
-        sessions_active: u64,
+        /// Active iSCSI sessions.
+        iscsi_sessions: u64,
+        /// Active NVMe/TCP controller associations. 0 when the NVMe/TCP
+        /// transport isn't enabled.
+        nvmetcp_sessions: u64,
     },
     Vtl {
         cartridges_loaded: u64,
@@ -291,7 +295,8 @@ mod tests {
         fn snapshot_product(&self) -> ProductSnapshot {
             ProductSnapshot::Vsa {
                 volumes_online: 3,
-                sessions_active: 1,
+                iscsi_sessions: 1,
+                nvmetcp_sessions: 2,
             }
         }
     }
@@ -325,10 +330,12 @@ mod tests {
         match snap.product {
             ProductSnapshot::Vsa {
                 volumes_online,
-                sessions_active,
+                iscsi_sessions,
+                nvmetcp_sessions,
             } => {
                 assert_eq!(volumes_online, 3);
-                assert_eq!(sessions_active, 1);
+                assert_eq!(iscsi_sessions, 1);
+                assert_eq!(nvmetcp_sessions, 2);
             }
             _ => panic!("expected Vsa variant"),
         }

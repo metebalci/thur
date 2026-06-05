@@ -177,7 +177,14 @@ impl shared_admin_monitor::MonitorState for AdminState {
     fn snapshot_product(&self) -> shared_admin_monitor::ProductSnapshot {
         shared_admin_monitor::ProductSnapshot::Vsa {
             volumes_online: self.registry.len() as u64,
-            sessions_active: self.sessions.session_count() as u64,
+            iscsi_sessions: self.sessions.session_count() as u64,
+            // Live NVMe/TCP controller associations; the AER hub is only
+            // present when the nvmetcp transport is configured.
+            nvmetcp_sessions: self
+                .aer_hub
+                .as_ref()
+                .map(|r| r.controller_count() as u64)
+                .unwrap_or(0),
         }
     }
 }

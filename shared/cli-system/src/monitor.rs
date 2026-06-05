@@ -94,10 +94,14 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
     match &current.product {
         ProductSnapshot::Vsa {
             volumes_online,
-            sessions_active,
+            iscsi_sessions,
+            nvmetcp_sessions,
         } => {
             out.push_str(&format!("Volumes:   {} online\n", volumes_online));
-            out.push_str(&format!("Sessions:  {} active\n\n", sessions_active));
+            out.push_str(&format!(
+                "Sessions:  {} iSCSI / {} NVMe/TCP\n\n",
+                iscsi_sessions, nvmetcp_sessions
+            ));
         }
         ProductSnapshot::Vtl {
             cartridges_loaded,
@@ -273,7 +277,8 @@ mod tests {
             started_at_unix: 0,
             product: ProductSnapshot::Vsa {
                 volumes_online: 1,
-                sessions_active: 0,
+                iscsi_sessions: 0,
+                nvmetcp_sessions: 0,
             },
             pool: vec![],
             storage: vec![],

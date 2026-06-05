@@ -16,9 +16,9 @@
   --bg-elev-2: #1c232c;
   --border: #29313c;
   --border-soft: #20272f;
-  --text: #e6edf3;
-  --text-dim: #9aa7b4;
-  --text-faint: #687485;
+  --text: #f0f3f7;
+  --text-dim: #c4ccd6;
+  --text-faint: #97a3b2;
   --accent: #4aa3ff;
   --accent-soft: rgba(74, 163, 255, 0.14);
   --ok: #3fb950;
@@ -276,6 +276,30 @@ code {
   flex-direction: column;
   gap: var(--gap);
   min-width: 0;
+  min-height: 0;
+}
+
+/* The two columns are equal height (grid stretch). The library panel
+   fills its column and drives that height (its body grows, no inner
+   scroll). The last side-column panel (audit tail) fills the remaining
+   space so its bottom edge lines up with the library panel, and scrolls
+   internally instead of inflating the layout. `min-height: 0` down the
+   flex chain is what lets the scroll container bound itself rather than
+   grow to its content. */
+.col-main > .panel {
+  flex: 1;
+  min-height: 0;
+}
+.col-side > .panel:last-child {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.col-side > .panel:last-child .panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* ---- Panels --------------------------------------------------------- */
@@ -312,8 +336,11 @@ code {
 
 .panel-body {
   padding: 6px 0;
-  max-height: 460px;
-  overflow: auto;
+  /* No inner scrollbars: panels size to their content and the page is
+     the only scroll context. The .panel card's `overflow: hidden`
+     clips any sideways spill, so no horizontal scrollbar appears and a
+     long panel just makes the page taller instead of nesting a
+     scrollbar. */
 }
 
 .panel-note {
@@ -451,6 +478,94 @@ tbody tr:hover td {
   font-size: var(--fs-xs);
   color: var(--text-dim);
   white-space: nowrap;
+}
+
+/* ---- Library map (VTL): drives row + storage slot grid -------------- */
+
+.lib-section {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+  padding: 14px var(--pad) 7px;
+}
+.lib-section:first-child {
+  padding-top: 8px;
+}
+
+.lib-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  padding: 0 var(--pad) 4px;
+}
+.lib-grid.drives {
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
+
+.cell {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  padding: 7px 9px;
+  min-width: 0;
+  min-height: 36px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+.cell-txt {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cell.wide {
+  padding: 9px 11px;
+}
+.cell.filled {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.cell.empty {
+  color: var(--text-faint);
+}
+/* Empty, but the home slot of a cartridge currently in a drive: a
+   dashed accent outline (not a fill) — reserved-ish, not occupied. */
+.cell.home {
+  border-style: dashed;
+  border-color: var(--accent);
+  color: var(--text-dim);
+}
+
+/* ---- Storage Backends table (fixed columns, fits the side panel) ---- */
+
+.sb-table {
+  table-layout: fixed;
+}
+.sb-table th,
+.sb-table td {
+  max-width: none;
+}
+.sb-table th:nth-child(1),
+.sb-table td:nth-child(1) {
+  width: 34%;
+}
+.sb-table th:nth-child(2),
+.sb-table td:nth-child(2) {
+  width: 27%;
+}
+.sb-table th:nth-child(n + 3),
+.sb-table td:nth-child(n + 3) {
+  width: 13%;
+}
+.num.has-err {
+  color: var(--err);
 }
 
 /* ---- Splash + footer ------------------------------------------------ */

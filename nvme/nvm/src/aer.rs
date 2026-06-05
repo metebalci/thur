@@ -326,6 +326,13 @@ impl ControllerRegistry {
         }
     }
 
+    /// Number of live NVMe controllers (one per host admin Connect that
+    /// still has at least one association). Used as the NVMe/TCP
+    /// "sessions" count on the monitor / Web UI surface.
+    pub fn controller_count(&self) -> usize {
+        self.lock().controllers.len()
+    }
+
     /// Park an AER from a connection's admin queue. If the controller
     /// already has an unread notification, complete the AER immediately
     /// (announce availability) instead of parking it. Reservation

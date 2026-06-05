@@ -11,12 +11,15 @@ Each daemon's TCP HTTP listener — the same one that already answers
 `/health`, `/metrics`, `/sessions`, and `/info` — also serves a small
 operator console at `/ui/` and a read-only slice of its `/api/v1` JSON
 surface. Point a browser at `https://<host>:9090/ui/`, authenticate with
-the web-admin password, and you get a live dashboard: the product's
-inventory (cartridges and drives on VTL, volumes on VSA), a pool/storage
-activity panel, the recent-jobs window, and an audit-log tail. It polls
-every few seconds; there is no streaming and no mutation. Everything you
-can do through it you could already do read-only through the CLI — it is
-a window onto the same state, not a new control plane.
+the web-admin password, and you get a live dashboard: a strip of KPI
+cards (drives, cartridges, sessions, pool cache, backend
+upload/download throughput), the product's inventory — a schematic
+**library map** on VTL (a drives row over a storage-slot grid, each
+filled slot showing its barcode) or a **volume list** on VSA — plus a
+**storage backends** table and an **audit log** tail. It polls every
+few seconds; there is no streaming and no mutation. Everything you can
+do through it you could already do read-only through the CLI — it is a
+window onto the same state, not a new control plane.
 
 Mutations are explicitly out of scope for v1. Creating a cartridge,
 moving a changer element, making a volume, taking a snapshot — all of
@@ -88,8 +91,12 @@ transport cannot satisfy, so the TCP surface cannot mutate state no
 matter what credentials are presented.
 
 Three of the read-only handlers are genuinely identical across both
-products — the monitor snapshot, the recent-jobs window, and the
-audit-log tail — and live in the shared crate. The rest are
+products — the monitor snapshot, the recent-jobs list, and the
+audit-log tail — and live in the shared crate. (The v1 dashboard
+surfaces the monitor and audit data prominently and uses the monitor
+snapshot's per-backend byte counters for the throughput KPI and the
+storage-backends table; the recent-jobs endpoint is still served for
+API consumers but no longer has its own panel.) The rest are
 per-product inventory reads and stay in each daemon, since they are
 typed on that product's own `AdminState`.
 

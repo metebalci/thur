@@ -11,11 +11,15 @@
 "use strict";
 
 const REFRESH_MS = 5000;
+// How many trailing audit entries the tail panel shows (it scrolls).
+const AUDIT_LINES = 50;
 
 /** Current product slug ("thurvtl" | "thurvsa"), set after /info. */
 let PRODUCT = null;
-/** Wall-clock skew helper: daemon start epoch (seconds) from monitor. */
 let timer = null;
+/** Previous backend byte totals + timestamp, for the per-second
+ *  upload/download rate averaged over the gap between polls. */
+let prevIo = null;
 
 // ---- tiny DOM + format helpers -------------------------------------------
 
@@ -54,6 +58,22 @@ function bytes(n) {
 
 function num(n) {
   return (Number(n) || 0).toLocaleString();
+}
+
+// Bare GiB number (no unit suffix) for KPIs that carry their unit in
+// the title, e.g. "Pool cache (GiB)" -> "0 / 7.58".
+function gib(n) {
+  const v = (Number(n) || 0) / (1024 * 1024 * 1024);
+  if (v === 0) return "0";
+  return v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+}
+
+// Byte-rate in MB/s (decimal MB, the throughput convention) for the
+// Up/Down KPI — the unit lives in the title so the value stays bare.
+function mbps(bps) {
+  const v = (Number(bps) || 0) / 1e6;
+  if (v === 0) return "0";
+  return v >= 10 ? v.toFixed(1) : v.toFixed(2);
 }
 
 function duration(secs) {
@@ -128,15 +148,25 @@ function renderKpis(mon) {
 
   if (PRODUCT === "thurvtl") {
     wrap.append(
-      kpi("Cartridges", num(p.cartridges_total), `${num(p.cartridges_loaded)} loaded`),
+      kpi("Drives", `${num(p.drives_busy)} / ${num(p.drives_total)}`, "in use / total"),
     );
     wrap.append(
-      kpi("Drives busy", `${num(p.drives_busy)} / ${num(p.drives_total)}`, "in use / total"),
+      kpi(
+        "Cartridges",
+        `${num(p.cartridges_loaded)} / ${num(p.cartridges_total)}`,
+        "loaded / total",
+      ),
     );
+    // Tape is iSCSI-only — no NVMe/TCP transport, so a single count.
+    wrap.append(kpi("Sessions", num(p.sessions_active), "iSCSI"));
   } else {
     wrap.append(kpi("Volumes online", num(p.volumes_online), "attached"));
+    // VSA speaks both transports; show them split. Fall back to the
+    // legacy combined field if an older daemon doesn't send the split.
+    const iscsi = p.iscsi_sessions ?? p.sessions_active ?? 0;
+    const nvme = p.nvmetcp_sessions ?? 0;
+    wrap.append(kpi("Sessions", `${num(iscsi)} / ${num(nvme)}`, "iSCSI / NVMe/TCP"));
   }
-  wrap.append(kpi("Sessions", num(p.sessions_active), "active iSCSI / NVMe"));
 
   // Pool fill: sum the per-backend global rows (namespace === null).
   const pool = (mon.pool || []).filter((r) => r.namespace == null);
@@ -146,77 +176,160 @@ function renderKpis(mon) {
   const cls = pct >= 90 ? "err" : pct >= 75 ? "warn" : "";
   wrap.append(
     kpi(
-      "Pool cache",
-      bytes(used),
-      cap > 0 ? `of ${bytes(cap)} (${pct.toFixed(0)}%)` : "no cap",
+      "Pool cache (GiB)",
+      cap > 0 ? `${gib(used)} / ${gib(cap)}` : gib(used),
+      cap > 0 ? `used / cap (${pct.toFixed(0)}%)` : "no cap",
       cap > 0 ? { pct, cls } : null,
     ),
   );
 
-  const audit = (mon.audit && mon.audit.entries_total) || 0;
-  wrap.append(kpi("Audit entries", num(audit), "since boot"));
+  // Backend upload/download, averaged over the gap since the last poll
+  // (~5 s). PUT bytes = upload to the backend, GET = download from it.
+  const putTotal = (mon.storage || []).reduce((a, s) => a + (s.put_bytes_total || 0), 0);
+  const getTotal = (mon.storage || []).reduce((a, s) => a + (s.get_bytes_total || 0), 0);
+  const ts = mon.ts_unix || 0;
+  let upRate = 0;
+  let downRate = 0;
+  if (prevIo && ts > prevIo.ts) {
+    const dt = ts - prevIo.ts;
+    upRate = Math.max(0, (putTotal - prevIo.put) / dt);
+    downRate = Math.max(0, (getTotal - prevIo.get) / dt);
+  }
+  prevIo = { ts, put: putTotal, get: getTotal };
+  wrap.append(
+    kpi("Throughput (MB/s)", `${mbps(upRate)} / ${mbps(downRate)}`, "upload / download"),
+  );
 }
 
-// ---- inventory: VTL ------------------------------------------------------
+// ---- shared table helper -------------------------------------------------
 
-function table(headers, rows) {
+function table(headers, rows, cls) {
   const thead = el("thead", null, [
     el("tr", null, headers.map((h) => el("th", h.cls ? { class: h.cls } : null, [h.label || h]))),
   ]);
   const tbody = el("tbody", null, rows);
-  return el("table", null, [thead, tbody]);
+  return el("table", cls ? { class: cls } : null, [thead, tbody]);
 }
 
-function renderVtl(data) {
-  const { cartridges, drives } = data;
+// ---- library map: VTL ----------------------------------------------------
 
-  // Cartridges
-  const cs = (cartridges && cartridges.cartridges) || [];
-  $("inventory-title").textContent = "Cartridges";
-  $("inventory-count").textContent = `${cs.length} total`;
-  const invBody = $("inventory-body");
-  clear(invBody);
-  if (cs.length === 0) {
-    invBody.append(el("p", { class: "empty" }, ["No cartridges in the library."]));
-  } else {
-    const rows = cs.map((c) =>
-      el("tr", null, [
-        el("td", { class: "mono" }, [c.barcode]),
-        el("td", null, [el("span", { class: "badge" }, [c.location])]),
-        el("td", { class: "num" }, [c.slot_id]),
-      ]),
-    );
-    invBody.append(table([{ label: "Barcode" }, { label: "Location" }, { label: "Slot", cls: "num" }], rows));
+// Above this many storage slots we stop drawing empty cells and show
+// occupied slots only — a 65535-slot grid would be unusable. Realistic
+// libraries (tens to low hundreds of slots) fall well under this.
+const SLOT_CELL_CAP = 1024;
+
+function libSection(text) {
+  return el("div", { class: "lib-section" }, [text]);
+}
+
+// One slot/drive cell. `idx` is the slot/drive label, `barcode` the
+// occupant (or null/empty). Filled cells are accented; the barcode is
+// also the hover title so a truncated one is still readable.
+function slotCell(idx, barcode, opts) {
+  opts = opts || {};
+  const filled = barcode != null && barcode !== "";
+  // State: filled (solid accent), home (empty, but the return slot of a
+  // loaded cartridge — dashed accent outline), or plain empty.
+  const state = filled ? "filled" : opts.home ? "empty home" : "empty";
+  const c = el(
+    "div",
+    { class: `cell ${state}${opts.wide ? " wide" : ""}` },
+    [el("span", { class: "cell-txt" }, [filled ? barcode : String(idx)])],
+  );
+  // Hover reveals the position (and any extra detail).
+  const title = opts.title || (filled ? `${idx} · ${barcode}` : null);
+  if (title) c.setAttribute("title", title);
+  return c;
+}
+
+function renderLibrary(data) {
+  const info = data.info || {};
+  const ds = (data.drives && data.drives.drives) || [];
+  const cs = (data.cartridges && data.cartridges.cartridges) || [];
+  const storageTotal = info.storage_slots || 0;
+  const mailTotal = info.mail_slots || 0;
+
+  const storageBySlot = {};
+  const mailQueue = [];
+  for (const c of cs) {
+    if (c.location === "storage") storageBySlot[c.slot_id] = c.barcode;
+    else if (c.location === "mail") mailQueue.push(c.barcode);
+  }
+  const filled = Object.keys(storageBySlot).length;
+  // Home slot -> the loaded drive that returns to it. Used to dash-mark
+  // the (empty) home slot of a cartridge currently in a drive.
+  const homeOfSlot = {};
+  for (const d of ds) {
+    if (d.barcode && d.home_slot != null) homeOfSlot[d.home_slot] = d;
   }
 
-  // Drives
-  const ds = (drives && drives.drives) || [];
-  $("secondary-panel").hidden = false;
-  $("secondary-title").textContent = "Drives";
-  $("secondary-count").textContent = `${ds.length} total`;
-  const secBody = $("secondary-body");
-  clear(secBody);
+  $("inventory-title").textContent = "Library";
+  $("inventory-count").textContent = `${ds.length} drives · ${storageTotal} slots`;
+  const body = $("inventory-body");
+  clear(body);
+
+  // Drives row.
+  body.append(libSection("Drives"));
   if (ds.length === 0) {
-    secBody.append(el("p", { class: "empty" }, ["No drives configured."]));
+    body.append(el("p", { class: "empty" }, ["No drives configured."]));
   } else {
-    const rows = ds.map((d) =>
-      el("tr", null, [
-        el("td", { class: "num" }, [d.id]),
-        el("td", null, [
-          d.loaded
-            ? el("span", { class: "badge accent" }, ["loaded"])
-            : el("span", { class: "badge" }, ["empty"]),
-        ]),
-        el("td", { class: "mono" }, [d.barcode || "—"]),
-        el("td", { class: "num" }, [d.total_blocks == null ? "—" : num(d.total_blocks)]),
-      ]),
-    );
-    secBody.append(
-      table(
-        [{ label: "Drive", cls: "num" }, { label: "State" }, { label: "Cartridge" }, { label: "Blocks", cls: "num" }],
-        rows,
+    body.append(
+      el(
+        "div",
+        { class: "lib-grid drives" },
+        ds.map((d) => {
+          // The cell shows just the loaded cartridge; its home slot (the
+          // storage slot it returns to on unload) goes in the tooltip
+          // rather than cluttering the cell.
+          const title =
+            d.barcode && d.home_slot != null
+              ? `Drive ${d.id} · ${d.barcode} · home slot ${d.home_slot}`
+              : undefined;
+          return slotCell(`Drive ${d.id}`, d.barcode, { wide: true, title });
+        }),
       ),
     );
+  }
+
+  // Storage slots — full grid when small enough, occupied-only beyond
+  // the cap (with a note so nothing is silently dropped).
+  body.append(libSection(`Storage — ${filled} ${filled === 1 ? "cartridge" : "cartridges"}`));
+  if (storageTotal === 0) {
+    body.append(el("p", { class: "empty" }, ["No storage slots."]));
+  } else if (storageTotal <= SLOT_CELL_CAP) {
+    const cells = [];
+    for (let i = 0; i < storageTotal; i++) {
+      const bc = storageBySlot[i];
+      const home = !bc && homeOfSlot[i];
+      const opts = home
+        ? { home: true, title: `Slot ${i} · home of ${home.barcode} (Drive ${home.id})` }
+        : undefined;
+      cells.push(slotCell(i, bc, opts));
+    }
+    body.append(el("div", { class: "lib-grid" }, cells));
+  } else {
+    const occ = Object.keys(storageBySlot)
+      .map(Number)
+      .sort((a, b) => a - b);
+    const shown = occ.slice(0, SLOT_CELL_CAP);
+    body.append(
+      el(
+        "div",
+        { class: "lib-grid" },
+        shown.map((i) => slotCell(i, storageBySlot[i])),
+      ),
+    );
+    let note = `${storageTotal} slots total — showing the ${shown.length} occupied (empty slots hidden for large libraries)`;
+    if (occ.length > shown.length) note += `; +${occ.length - shown.length} more occupied not shown`;
+    body.append(el("p", { class: "panel-note" }, [note]));
+  }
+
+  // Import/Export (mail) slots, if the chassis has any.
+  if (mailTotal > 0) {
+    body.append(libSection(`Import/Export (${mailQueue.length} / ${mailTotal})`));
+    const cells = [];
+    for (let i = 0; i < mailTotal; i++) cells.push(slotCell(`I/E ${i}`, mailQueue[i], { wide: true }));
+    body.append(el("div", { class: "lib-grid drives" }, cells));
   }
 }
 
@@ -226,7 +339,6 @@ function renderVsa(data) {
   const vols = (data.volumes && data.volumes.volumes) || [];
   $("inventory-title").textContent = "Volumes";
   $("inventory-count").textContent = `${vols.length} total`;
-  $("secondary-panel").hidden = true;
   const invBody = $("inventory-body");
   clear(invBody);
   if (vols.length === 0) {
@@ -255,35 +367,54 @@ function renderVsa(data) {
 
 // ---- jobs + audit --------------------------------------------------------
 
-function renderJobs(data) {
-  const jobs = (data && data.jobs) || [];
-  $("jobs-count").textContent = jobs.length ? `${jobs.length}` : "";
-  const body = $("jobs-body");
+function renderStorage(mon) {
+  // The backend list comes from the pool's per-backend "global" rows
+  // (namespace === null) — always present, even at zero bytes. The op
+  // counters come from the storage section, which only lists a backend
+  // once it has actually done I/O; a missing entry means zero.
+  const globals = (mon.pool || []).filter((r) => r.namespace == null);
+  const ops = {};
+  for (const s of mon.storage || []) ops[s.backend] = s;
+  $("storage-count").textContent = globals.length ? `${globals.length}` : "";
+  const body = $("storage-body");
   clear(body);
-  if (jobs.length === 0) {
-    body.append(el("p", { class: "empty" }, ["No jobs in the last 5 minutes."]));
+  if (globals.length === 0) {
+    body.append(el("p", { class: "empty" }, ["No storage backends configured."]));
     return;
   }
-  const rows = jobs.map((j) => {
-    let badge;
-    if (!j.finished) badge = el("span", { class: "badge accent" }, ["running"]);
-    else if (j.exit_code === 0) badge = el("span", { class: "badge ok" }, ["ok"]);
-    else badge = el("span", { class: "badge err" }, [`exit ${j.exit_code}`]);
+  const rows = globals.map((g) => {
+    const s = ops[g.backend] || {};
+    const cap = g.cap_bytes || 0;
+    // Cache unit lives in the column header, so the values stay short
+    // ("0 / 7.58") and the 5-column table fits the side panel.
+    const cache = cap > 0 ? `${gib(g.used_bytes)} / ${gib(cap)}` : gib(g.used_bytes);
+    const errs = s.errors_total || 0;
     return el("tr", null, [
-      el("td", { class: "mono dim" }, [j.id]),
-      el("td", { class: "mono" }, [j.kind]),
-      el("td", null, [badge]),
-      el("td", { class: "num dim" }, [ago(j.started_at)]),
+      el("td", { class: "mono" }, [g.backend]),
+      el("td", { class: "num dim" }, [cache]),
+      el("td", { class: "num" }, [num(s.put_ops_total || 0)]),
+      el("td", { class: "num" }, [num(s.get_ops_total || 0)]),
+      el("td", { class: errs > 0 ? "num has-err" : "num dim" }, [num(errs)]),
     ]);
   });
   body.append(
-    table([{ label: "Id" }, { label: "Kind" }, { label: "State" }, { label: "Started", cls: "num" }], rows),
+    table(
+      [
+        { label: "Backend" },
+        { label: "Cache (GiB)", cls: "num" },
+        { label: "PUTs", cls: "num" },
+        { label: "GETs", cls: "num" },
+        { label: "Err", cls: "num" },
+      ],
+      rows,
+      "sb-table",
+    ),
   );
 }
 
 function renderAudit(data) {
   const entries = (data && data.entries) || [];
-  $("audit-count").textContent = entries.length ? `last ${entries.length}` : "";
+  $("audit-count").textContent = entries.length ? `last ${AUDIT_LINES}` : "";
   const body = $("audit-body");
   clear(body);
   if (entries.length === 0) {
@@ -319,21 +450,19 @@ async function refresh() {
     $("version").textContent = mon.version || "";
 
     if (PRODUCT === "thurvtl") {
-      const [cartridges, drives] = await Promise.all([
+      const [info, cartridges, drives] = await Promise.all([
+        api("/api/v1/library/info").catch(() => ({})),
         api("/api/v1/cartridges").catch(() => ({})),
         api("/api/v1/drives").catch(() => ({})),
       ]);
-      renderVtl({ cartridges, drives });
+      renderLibrary({ info, cartridges, drives });
     } else {
       const volumes = await api("/api/v1/volumes").catch(() => ({}));
       renderVsa({ volumes });
     }
 
-    const [jobs, audit] = await Promise.all([
-      api("/api/v1/jobs/recent").catch(() => ({ jobs: [] })),
-      api("/api/v1/audit/tail?lines=50").catch(() => ({ entries: [] })),
-    ]);
-    renderJobs(jobs);
+    renderStorage(mon);
+    const audit = await api(`/api/v1/audit/tail?lines=${AUDIT_LINES}`).catch(() => ({ entries: [] }));
     renderAudit(audit);
 
     setStatus("ok", "live");
@@ -352,7 +481,8 @@ async function init() {
     document.documentElement.dataset.product = PRODUCT;
 
     const label = PRODUCT === "thurvtl" ? "Thur VTL" : "Thur VSA";
-    const kind = PRODUCT === "thurvtl" ? "tape library" : "storage array";
+    const kind =
+      PRODUCT === "thurvtl" ? "Virtual Tape Library" : "Virtual Storage Appliance";
     $("product-name").textContent = label;
     $("product-kind").textContent = kind;
     document.title = `${label} — admin`;
