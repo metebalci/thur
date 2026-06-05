@@ -83,7 +83,7 @@ impl Default for IscsiSettings {
     fn default() -> Self {
         Self {
             listen_portals: default_listen_portals(),
-            target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
+            target_iqn: shared_naming::TAPE_LIBRARY.iqn.to_string(),
             reservations: shared_iscsi::transport::ReservationSettings::default(),
             max_sessions: 10,
             session_timeout_seconds: 300,
@@ -156,7 +156,7 @@ fn default_listen_portals() -> Vec<shared_iscsi::transport::Portal> {
 }
 
 fn default_target_iqn() -> String {
-    "iqn.2025-10.com.metebalci:thurvtl".to_string()
+    shared_naming::TAPE_LIBRARY.iqn.to_string()
 }
 
 fn default_max_sessions() -> u32 {

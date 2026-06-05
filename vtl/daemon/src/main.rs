@@ -667,7 +667,7 @@ fn default_iscsi_listen() -> Vec<shared_iscsi::transport::Portal> {
     }]
 }
 fn default_target_iqn() -> String {
-    "iqn.2025-10.com.metebalci:thurvtl".to_string()
+    shared_naming::TAPE_LIBRARY.iqn.to_string()
 }
 fn default_max_sessions() -> u32 {
     10
@@ -747,7 +747,7 @@ impl Default for IscsiConfig {
     fn default() -> Self {
         Self {
             listen: default_iscsi_listen(),
-            target_iqn: "iqn.2025-10.com.metebalci:thurvtl".to_string(),
+            target_iqn: shared_naming::TAPE_LIBRARY.iqn.to_string(),
             reservations: shared_iscsi::transport::ReservationSettings::default(),
             max_sessions: 10,
             session_timeout_seconds: 300,
