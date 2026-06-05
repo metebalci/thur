@@ -83,8 +83,14 @@ and DEK; only the page table is rewound (the daemon rewrites the live
 Chunks that diverged after the snapshot become orphans the next `system
 gc` reclaims — the same leave-for-GC contract as `volume destroy`.
 Because it is destructive, the CLI requires `--force`. Restore refuses
-while a persistent reservation is held, and refuses if the volume has
-been resized since the snapshot (resize it back first). There is **no**
+while a persistent reservation is held. By default restore is
+page-table-only and refuses if the volume has been resized since the
+snapshot; pass `--resize` (issue #90) to roll the **logical size** back to
+the snapshot's captured size in the same step — the daemon flips the live
+size, rewrites `manifest.json`, and signals connected hosts (NVMe AER /
+iSCSI unit attention) to re-read capacity, exactly as `volume resize`
+does. A WORM volume is the one exception: its size is grow-only, so a
+shrink-back is refused (the page table is left untouched). There is **no**
 active-session check: the target cannot see whether a host has the LUN
 mounted, so you must unmount / quiesce the host before restoring —
 restoring under a live, mounted host corrupts that host's filesystem. The

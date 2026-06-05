@@ -6218,7 +6218,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__volume__subcmd__snapshot__subcmd__restore)
-            opts="-c -h --force --config --user --help <VOLUME> <SNAPSHOT>"
+            opts="-c -h --force --resize --config --user --help <VOLUME> <SNAPSHOT>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

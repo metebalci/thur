@@ -479,13 +479,19 @@ pub async fn cmd_snapshot_destroy(volume: &str, snapshot: &str, force: bool) -> 
     Ok(())
 }
 
-/// `volume snapshot restore VOL SNAP --force` — daemon-routed only.
-/// Rolls VOL in place back to SNAP, discarding every write since the
+/// `volume snapshot restore VOL SNAP --force [--resize]` — daemon-routed
+/// only. Rolls VOL in place back to SNAP, discarding every write since the
 /// snapshot. The volume keeps its identity (UUID / LUN / name / DEK);
 /// only the page table is rewound. Diverged chunks become reclaimable by
 /// the next GC. There is no host-session check — unmount/quiesce the
-/// host first.
-pub async fn cmd_snapshot_restore(volume: &str, snapshot: &str, force: bool) -> Result<()> {
+/// host first. With `--resize` (issue #90) the volume's logical size is
+/// rolled back to the snapshot's too; without it, a size mismatch refuses.
+pub async fn cmd_snapshot_restore(
+    volume: &str,
+    snapshot: &str,
+    force: bool,
+    resize: bool,
+) -> Result<()> {
     if !force {
         eprintln!(
             "warning: in-place restore DISCARDS all writes to volume '{volume}' since \
@@ -502,17 +508,33 @@ pub async fn cmd_snapshot_restore(volume: &str, snapshot: &str, force: bool) -> 
             admin.socket_path().display()
         );
     }
-    let _: serde_json::Value = admin
+    let resp: serde_json::Value = admin
         .post_json(
             &format!(
                 "/api/v1/volumes/{}/snapshots/{}/restore",
                 urlencode(volume),
                 urlencode(snapshot)
             ),
-            &serde_json::json!({}),
+            &serde_json::json!({ "resize": resize }),
         )
         .await?;
     println!("OK: volume '{volume}' restored to snapshot '{snapshot}'");
+    if resp.get("resized").and_then(|v| v.as_bool()) == Some(true) {
+        let prev = resp
+            .get("previous_size_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let now = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!(
+            "  size rolled back: {} -> {}",
+            format_bytes(prev),
+            format_bytes(now)
+        );
+        println!(
+            "note: connected hosts were signalled to re-read capacity; the host OS may still \
+             need a rescan (`iscsiadm -m node --rescan` / `nvme ns-rescan`) to pick up the new size."
+        );
+    }
     Ok(())
 }
 

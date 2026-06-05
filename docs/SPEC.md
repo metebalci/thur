@@ -1867,7 +1867,10 @@ the allocated high-water mark. `volume.clone` records
 uuid}` (`source_snapshot` is null for a clone from the live volume);
 `snapshot.create` / `snapshot.destroy` record `params:{volume, snapshot,
 …}` (issue #13). `snapshot.restore` records `params:{volume, snapshot,
-size_bytes}` — an in-place rollback of `volume` to `snapshot` (issue #85).
+size_bytes, previous_size_bytes, resized}` — an in-place rollback of
+`volume` to `snapshot` (issue #85); `resized` is `true` when `--resize`
+rolled the logical size back from `previous_size_bytes` to `size_bytes`
+too (issue #90), `false` for a page-table-only restore.
 
 iSCSI / SCSI-side (actor `kind:"iscsi"`, `user` = initiator IQN if
 the initiator advertised one, `addr` = peer ip:port):

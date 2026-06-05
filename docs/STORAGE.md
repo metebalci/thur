@@ -405,13 +405,26 @@ destroy`. A snapshot still referencing a chunk keeps it alive, so a
 restored volume that shares chunks with a sibling clone or another
 snapshot loses nothing.
 
-Restore is page-table-only: it refuses if the volume has been resized
-since the snapshot (resize it back first), and refuses while a persistent
-reservation is held. It does **not** check for active host sessions — the
-target cannot observe host mount state, and forcing a logout (which would
-also drop other LUNs sharing the session) is too heavy — so quiescing the
-host is the operator's responsibility, consistent with the
-concurrent-same-LBA host-side-UB stance elsewhere in the cache. The
+Restore is page-table-only by default: it refuses if the volume has been
+resized since the snapshot, and refuses while a persistent reservation is
+held. Passing `--resize` (issue #90) rolls the **logical size** back to
+the snapshot's captured size too: after the page-table rewrite the daemon
+calls the same `VolumeWriter::set_size` path `volume resize` uses — flip
+the live size shadow, rewrite `manifest.json`, then fan a capacity-change
+notice (NVMe Namespace Attribute Changed AER / iSCSI CAPACITY DATA HAS
+CHANGED unit attention) to connected hosts. The size step runs *after* the
+index swap on purpose: the restored index's high-water mark is already the
+snapshot's, so a shrink-back sits within the shrink guard rails by
+construction — nothing is allocated past the snapshot-era size, so
+`set_size`'s would-discard-data check can never trip. The one case it
+still refuses is a WORM volume, whose size is grow-only; since a WORM
+volume can only have been *grown* after the snapshot, the rollback would
+be a shrink, and that is rejected up front (before the index is touched)
+so the volume is left wholly intact. Restore does **not** check for active
+host sessions — the target cannot observe host mount state, and forcing a
+logout (which would also drop other LUNs sharing the session) is too heavy
+— so quiescing the host is the operator's responsibility, consistent with
+the concurrent-same-LBA host-side-UB stance elsewhere in the cache. The
 rewrite is not crash-atomic: a daemon crash mid-rewrite leaves a partial
 index, but the snapshot copy is immutable, so the recovery is simply to
 re-run the restore.

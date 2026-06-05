@@ -34,6 +34,11 @@
 #             snapshot, overwrite B, then `volume snapshot restore`. The
 #             volume reads pattern A again (rollback through the real data
 #             path), and a GC afterwards keeps it readable.
+#   Phase L — restore with size rollback (issue #90): write A, snapshot,
+#             GROW the volume, then restore. A plain restore refuses on the
+#             size mismatch; `restore --resize` rolls both the data and the
+#             logical size back to the snapshot's (verified host-side via
+#             READ CAPACITY after a fresh login).
 #
 # The op model is transport-agnostic; only the login / device-discovery
 # primitives are iSCSI-specific (mirrors test-fs.sh's Phase D note).
@@ -118,6 +123,12 @@ cli() { "$CLI_PATH" --config "$TEST_CONFIG" "$@"; }
 get_lun() {
     cli volume info "$1" --json 2>/dev/null \
         | grep -oE '"lun":[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# Daemon-side logical size of a volume in bytes, from `volume info --json`.
+get_size_bytes() {
+    cli volume info "$1" --json 2>/dev/null \
+        | grep -oE '"size_bytes":[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1
 }
 
 # A volume's 16-byte uuid (hex), read straight from its on-disk
@@ -338,6 +349,78 @@ test_snapshot_clone_cow() {
     curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null || {
         log_error "  ✗ daemon unhealthy after post-restore GC"; return 1; }
     log_info "  ✓ Phase K: post-restore GC kept rsrc readable; daemon healthy"
+
+    # Phase L — restore with size rollback (issue #90). On a fresh volume:
+    # write A, snapshot, GROW the volume, then restore. A plain restore must
+    # refuse on the size mismatch; restore --resize rolls both the data AND
+    # the logical size back to the snapshot's.
+    local small_bytes=$((VOLUME_SIZE_MIB * 1024 * 1024))
+    cli volume create rzsrc --size "${VOLUME_SIZE_MIB}M" --dedup "$DEDUP" >/dev/null || {
+        log_error "  ✗ create rzsrc"; return 1; }
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+    local rzsrc_lun; rzsrc_lun=$(get_lun rzsrc)
+    [[ -n "$rzsrc_lun" ]] || { log_error "  ✗ no LUN for rzsrc"; return 1; }
+
+    write_region "$rzsrc_lun" "$PATTERN_A" || return 1
+    cli volume snapshot create rzsrc rzsnap >/dev/null || {
+        log_error "  ✗ snapshot create rzsnap"; return 1; }
+
+    # Grow the volume to double its size — the snapshot captured the small
+    # size, so live size now diverges from the snapshot.
+    cli volume resize rzsrc --size "$((VOLUME_SIZE_MIB * 2))M" >/dev/null || {
+        log_error "  ✗ resize rzsrc (grow)"; return 1; }
+    [[ "$(get_size_bytes rzsrc)" -eq $((small_bytes * 2)) ]] || {
+        log_error "  ✗ rzsrc did not grow to $((small_bytes * 2)) B"; return 1; }
+    log_info "  ✓ Phase L: rzsrc grown past snapshot size (snapshot=$small_bytes B)"
+
+    # Quiesce (== unmount) before restoring the offline volume.
+    iscsi_logout_and_delete
+
+    # A plain restore must refuse: the live size no longer matches rzsnap.
+    if cli volume snapshot restore rzsrc rzsnap --force >/dev/null 2>&1; then
+        log_error "  ✗ plain restore should refuse on size mismatch (issue #90)"; return 1
+    fi
+    # ...and the volume's size must be untouched by the refused restore.
+    [[ "$(get_size_bytes rzsrc)" -eq $((small_bytes * 2)) ]] || {
+        log_error "  ✗ refused restore changed rzsrc size"; return 1; }
+
+    # restore --resize rolls the size back to the snapshot's captured size.
+    cli volume snapshot restore rzsrc rzsnap --force --resize >/dev/null || {
+        log_error "  ✗ snapshot restore --resize"; return 1; }
+    [[ "$(get_size_bytes rzsrc)" -eq "$small_bytes" ]] || {
+        log_error "  ✗ rzsrc size not rolled back to $small_bytes B"; return 1; }
+
+    iscsi_discover_and_login
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+
+    # A fresh login reports the rolled-back capacity, and the data is A again.
+    local rzdev; rzdev=$(lun_device "$rzsrc_lun") || {
+        log_error "  ✗ no device for rzsrc after restore --resize"; return 1; }
+    [[ "$(blockdev --getsize64 "$rzdev")" -eq "$small_bytes" ]] || {
+        log_error "  ✗ host capacity not rolled back to $small_bytes B"; return 1; }
+    read_region "$rzsrc_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_A" || {
+        log_error "  ✗ rzsrc != pattern A after restore --resize (data rollback failed)"; return 1; }
+    log_info "  ✓ Phase L: restore --resize rolled size + data back to rzsnap"
+
+    # Phase L (WORM corner) — WORM size is grow-only, so restore --resize
+    # must refuse to shrink a WORM volume back (page table left untouched).
+    # Daemon-side only: the refusal happens before any I/O. WORM grow is
+    # itself allowed, which is the only way to reach a WORM size mismatch.
+    cli volume create rzworm --size "${VOLUME_SIZE_MIB}M" --worm --dedup "$DEDUP" >/dev/null || {
+        log_error "  ✗ create rzworm"; return 1; }
+    cli volume snapshot create rzworm wsnap >/dev/null || {
+        log_error "  ✗ snapshot create wsnap"; return 1; }
+    cli volume resize rzworm --size "$((VOLUME_SIZE_MIB * 2))M" >/dev/null || {
+        log_error "  ✗ grow rzworm (WORM grow should be allowed)"; return 1; }
+    if cli volume snapshot restore rzworm wsnap --force --resize >/dev/null 2>&1; then
+        log_error "  ✗ restore --resize should refuse to shrink a WORM volume (issue #90)"; return 1
+    fi
+    [[ "$(get_size_bytes rzworm)" -eq $((small_bytes * 2)) ]] || {
+        log_error "  ✗ refused WORM restore changed rzworm size"; return 1; }
+    log_info "  ✓ Phase L (WORM): restore --resize refused the grow-only shrink-back"
 
     return 0
 }

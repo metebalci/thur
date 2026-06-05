@@ -611,6 +611,13 @@ enum SnapshotAction {
         /// Confirm rollback. Without it the command refuses.
         #[arg(long)]
         force: bool,
+
+        /// Roll the volume size back to the snapshot's.
+        ///
+        /// Without it, restore is page-table-only and refuses if the
+        /// volume was resized since the snapshot.
+        #[arg(long)]
+        resize: bool,
     },
 }
 

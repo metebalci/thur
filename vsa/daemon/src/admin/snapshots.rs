@@ -249,13 +249,18 @@ pub async fn destroy(
 ///   guard. There is NO active-session check: the target can't see host
 ///   mount state, so quiescing the host before restore is the
 ///   operator's responsibility (the CLI requires `--force` and warns).
-/// - the snapshot's captured size must equal the volume's current size;
-///   restore is page-table-only, so a resized volume must be resized
-///   back first.
+/// - without `resize` (issue #90), the snapshot's captured size must
+///   equal the volume's current size; restore is page-table-only, so a
+///   resized volume must be resized back first. With `resize`, the
+///   handler rolls the logical size back to the snapshot's captured size
+///   after the page-table rewrite and signals connected hosts to re-read
+///   capacity — except a WORM volume, whose size is grow-only, so a
+///   shrink-back is refused up front.
 pub async fn restore(
     State(state): State<AdminState>,
     peer: PeerCred,
     AxumPath((name, snap)): AxumPath<(String, String)>,
+    Json(body): Json<RestoreSnapshotRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cache = state.registry.get_by_name(&name).ok_or_else(|| {
         (
@@ -291,20 +296,43 @@ pub async fn restore(
         ));
     }
 
-    // Restore is page-table-only. If the volume was resized after the
-    // snapshot, the live size and the captured size diverge; refuse and
-    // tell the operator to resize back first rather than silently
-    // leaving a coherent-but-surprising size/extent mismatch. Compare
-    // against the live shadow, not the boot-snapshot manifest (issue #76).
+    // Restore is page-table-only by default. If the volume was resized
+    // after the snapshot, the live size and the captured size diverge.
+    // Without `resize` (issue #90), refuse and tell the operator to
+    // resize back first rather than silently leaving a
+    // coherent-but-surprising size/extent mismatch; with it, roll the
+    // size back too after the page-table rewrite below. Compare against
+    // the live shadow, not the boot-snapshot manifest (issue #76).
     let live_size = cache.size_bytes();
-    if manifest.size_bytes != live_size {
+    let target_size = manifest.size_bytes;
+    let size_rollback = body.resize && target_size != live_size;
+    if target_size != live_size && !body.resize {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!(
                     "snapshot '{snap}' captured size {} B != volume '{name}' size {} B; \
-                     resize the volume to {} B first",
-                    manifest.size_bytes, live_size, manifest.size_bytes
+                     pass --resize to roll the size back too, or resize the volume to {} B first",
+                    target_size, live_size, target_size
+                )
+            })),
+        ));
+    }
+
+    // A size rollback that shrinks a WORM volume is refused up front —
+    // before the page table is touched — so a refusal leaves the volume
+    // wholly untouched rather than data-rolled-back-but-size-stale. A WORM
+    // volume can only have been *grown* after the snapshot (shrink is
+    // forbidden), so the rollback would be a shrink, which `set_size`
+    // rejects with the same WORM guard. Mirrors `resize` (handlers.rs).
+    if size_rollback && target_size < live_size && cache.manifest().worm {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "volume '{name}' is WORM; restore cannot shrink its size back to the \
+                     snapshot's {} B (current {} B). WORM size is grow-only.",
+                    target_size, live_size
                 )
             })),
         ));
@@ -318,10 +346,30 @@ pub async fn restore(
         )
     })?;
 
+    // Roll the logical size back to the snapshot's captured size (issue
+    // #90). Ordered AFTER the page-table rewrite so the shrink guard rails
+    // hold by construction: the restored index's high-water mark is
+    // already the snapshot's, so nothing sits past the snapshot-era size
+    // and `set_size` cannot trip ResizeWouldDiscardData. The pre-checks
+    // above ruled out the only other way `set_size` could fail here (a
+    // WORM shrink); alignment / page-floor hold because `target_size` was
+    // itself a valid live size when the snapshot froze it. The
+    // capacity-change notice mirrors `volume resize` (issue #76).
+    if size_rollback {
+        cache.writer().set_size(target_size).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("roll size back to snapshot: {e}") })),
+            )
+        })?;
+        state.notify_capacity_changed(lun);
+    }
+
     info!(
         volume = name.as_str(),
         snapshot = snap.as_str(),
-        size_bytes = manifest.size_bytes,
+        size_bytes = target_size,
+        resized = size_rollback,
         "admin: restored volume to snapshot uid={} pid={:?}",
         peer.uid,
         peer.pid,
@@ -334,7 +382,9 @@ pub async fn restore(
             json!({
                 "volume": name,
                 "snapshot": snap,
-                "size_bytes": manifest.size_bytes,
+                "size_bytes": target_size,
+                "previous_size_bytes": live_size,
+                "resized": size_rollback,
             }),
             AuditResult::Ok,
         );
@@ -343,7 +393,18 @@ pub async fn restore(
     Ok(Json(json!({
         "volume": name,
         "snapshot": snap,
-        "size_bytes": manifest.size_bytes,
+        "size_bytes": target_size,
+        "previous_size_bytes": live_size,
+        "resized": size_rollback,
         "status": "restored",
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreSnapshotRequest {
+    /// Roll the volume's logical size back to the snapshot's captured
+    /// `size_bytes` as well (issue #90). Without it, restore is
+    /// page-table-only and refuses on a size mismatch.
+    #[serde(default)]
+    pub resize: bool,
 }

@@ -236,7 +236,10 @@ impl AdminState {
     /// fan-out is skipped (with a warning) when the LUN doesn't fit a
     /// `u8` — the iSCSI single-byte LUN ceiling — mirroring the NVMe
     /// `u32` NSID guard; NVMe still fires in that case.
-    fn notify_capacity_changed(&self, lun: u64) {
+    ///
+    /// Reused by `snapshots::restore` when `--resize` rolls the size back
+    /// to the snapshot's captured size (issue #90).
+    pub(crate) fn notify_capacity_changed(&self, lun: u64) {
         self.notify_nvme_namespace_changed(lun);
         if let Some(ua) = &self.ua_tracker {
             match u8::try_from(lun) {

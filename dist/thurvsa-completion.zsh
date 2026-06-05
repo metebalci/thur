@@ -270,6 +270,7 @@ _arguments "${_arguments_options[@]}" : \
 '--config=[Path to configuration file]:CONFIG:_default' \
 '--user=[User to drop privileges to under sudo]:USER:_default' \
 '--force[Confirm rollback. Without it the command refuses]' \
+'--resize[Roll the volume size back to the snapshot'\''s]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':volume -- Volume name:_default' \
