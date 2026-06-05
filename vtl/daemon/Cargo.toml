@@ -17,6 +17,7 @@ workspace = true
 bytes = "1"
 core-mediachanger = { path = "../../core/mediachanger" }
 shared-admin-audit = { path = "../../shared/admin-audit" }
+shared-admin-auth = { path = "../../shared/admin-auth" }
 shared-admin-cloud-check = { path = "../../shared/admin-cloud-check" }
 shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }

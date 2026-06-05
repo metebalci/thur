@@ -25,6 +25,7 @@ the same commit whenever a YAML key is added or changed.**
 | `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
 | `nvmetcp-dhchap.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp dhchap` |
+| `admin-password.json` | `<data_dir>/` | both | JSON | daemon — Argon2id hash of the web-admin password (set via `<product> system set-admin-password`). Holds only the hash, never the plaintext; absent = no password configured = the protected HTTP listener fails closed. |
 | `reservations.json` | `<data_dir>/` | both | JSON | daemon — persisted SCSI/NVMe PERSISTENT RESERVE state (PTPL); written on every APTPL/CPTPL-set reservation change, reloaded at start. No CLI verb; never hand-edited (a corrupt file is ignored and the daemon starts with empty reservation state). |
 
 The YAML conffile carries install-time and tuning knobs. The JSON files
@@ -388,6 +389,36 @@ The file is re-read on every Connect, so operator edits take effect on
 the next *new* connection without restart. Secret generation and wiring:
 [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP and
 [`NVMETCP.md`](NVMETCP.md).
+
+### `admin-password.json` — both
+
+`admin-password.json` holds the single shared web-admin password that
+gates the network-facing HTTP listener — the prerequisite for the Web
+UI. It carries exactly two fields: `phc`, an Argon2id PHC string (the
+self-describing `$argon2id$...` hash, OWASP-baseline parameters), and
+`updated_at`, an RFC 3339 timestamp of the last change. Only the hash
+is ever written; the plaintext is hashed server-side and never lands on
+disk. The file is mode 0640, written by atomic rename, and owned by the
+daemon — there is no packager-installed default and no postinst entry,
+so an unprovisioned host simply has no file. An absent file means no
+password is configured, and the gate **fails closed**: the protected
+half of the HTTP listener (everything but `/health` and `/metrics`)
+answers `503` with a challenge so operators can tell "unset" from
+"wrong". Once set, the hash is hot-swapped into the live verifier and
+takes effect immediately, with no restart.
+
+The password is set with `<product> system set-admin-password`
+(daemon-routed — the daemon owns the file). The verb prompts twice with
+no echo, or reads the per-product environment variable
+`THURVTL_ADMIN_PASSWORD` / `THURVSA_ADMIN_PASSWORD` for non-interactive
+provisioning; the plaintext travels over the local peer-cred admin
+socket and is hashed server-side. See [`CLI.md`](CLI.md).
+
+This feature adds **no new YAML key** — the HTTP Basic realm and the
+synthetic username are hardcoded constants, so the annotated YAML
+reference is intentionally unchanged. Because Basic credentials are
+base64, not encrypted, enable the admin HTTP TLS listener (`http.tls.*`)
+so they are not sent in clear.
 
 ---
 

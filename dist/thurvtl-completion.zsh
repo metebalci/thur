@@ -1243,6 +1243,15 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(set-admin-password)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (alerting)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -1438,6 +1447,10 @@ _arguments "${_arguments_options[@]}" : \
 esac
 ;;
 (regenerate-cert)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-admin-password)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2253,6 +2266,10 @@ _arguments "${_arguments_options[@]}" : \
 esac
 ;;
 (regenerate-cert)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-admin-password)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3214,6 +3231,7 @@ _thurvtl__subcmd__help__subcmd__system_commands() {
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
     )
     _describe -t commands 'thurvtl help system commands' commands "$@"
@@ -3296,6 +3314,11 @@ _thurvtl__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvtl__subcmd__help__subcmd__system__subcmd__reset-stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl help system reset-stats commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__set-admin-password_commands] )) ||
+_thurvtl__subcmd__help__subcmd__system__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl help system set-admin-password commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__help__subcmd__system__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__help__subcmd__system__subcmd__stats_commands() {
@@ -3787,6 +3810,7 @@ _thurvtl__subcmd__system_commands() {
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -3937,6 +3961,7 @@ _thurvtl__subcmd__system__subcmd__help_commands() {
 'verify:Library-wide consistency check' \
 'tiering:Cartridge tiering — evaluate placement policies' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -4026,6 +4051,11 @@ _thurvtl__subcmd__system__subcmd__help__subcmd__reset-stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system help reset-stats commands' commands "$@"
 }
+(( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__set-admin-password_commands] )) ||
+_thurvtl__subcmd__system__subcmd__help__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system help set-admin-password commands' commands "$@"
+}
 (( $+functions[_thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__system__subcmd__help__subcmd__stats_commands() {
     local commands; commands=()
@@ -4092,6 +4122,11 @@ _thurvtl__subcmd__system__subcmd__regenerate-cert_commands() {
 _thurvtl__subcmd__system__subcmd__reset-stats_commands() {
     local commands; commands=()
     _describe -t commands 'thurvtl system reset-stats commands' commands "$@"
+}
+(( $+functions[_thurvtl__subcmd__system__subcmd__set-admin-password_commands] )) ||
+_thurvtl__subcmd__system__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvtl system set-admin-password commands' commands "$@"
 }
 (( $+functions[_thurvtl__subcmd__system__subcmd__stats_commands] )) ||
 _thurvtl__subcmd__system__subcmd__stats_commands() {

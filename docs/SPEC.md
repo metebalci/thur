@@ -1849,6 +1849,13 @@ the prior tail — the break stays on the record.
 
 Daemon-side: `daemon.start`, `daemon.stop`.
 
+System-side (both daemons, actor = the peer-cred CLI descriptor):
+`system.admin_password.set` — the web-admin password was set or
+changed via `<product> system set-admin-password`. The plaintext is
+hashed server-side and never persisted; `params` carry **no secret**
+(the recorded fields describe only that the set occurred, never the
+password or its hash).
+
 CLI-side (thurvtl): `cartridge.create`, `cartridge.import`,
 `cartridge.export`, `cartridge.legal_hold.set`,
 `cartridge.legal_hold.clear`, `library.materialize`,
@@ -2646,6 +2653,54 @@ roughly 200 LoC.
 ---
 
 ## HTTP Endpoints
+
+### Authentication
+
+The network-facing TCP HTTP listener splits its routes into two
+groups. The **open** group — `/health` and `/metrics` — is
+unauthenticated, so a Prometheus scrape and a liveness probe never need
+a credential. The **protected** group is everything else: `/sessions`
+and `/info` today, the read-only Web UI (`/ui`) and read-only
+`/api/v1` surface tomorrow. The protected group is gated by HTTP Basic
+authentication against a single shared web-admin password.
+
+The Basic username is the fixed synthetic `webadmin` and the realm
+string is `thur admin` — both are hardcoded constants, carried in no
+YAML key. The password is set out-of-band over the admin socket
+(below) and verified against an Argon2id hash the daemon keeps in
+`<data_dir>/admin-password.json`; the plaintext never lands on disk.
+
+The wire verdicts distinguish "no password set" from "wrong password"
+so an operator can tell the two apart:
+
+| Condition | Status | Header |
+|---|---|---|
+| No web-admin password configured (file absent) | `503 Service Unavailable` | `WWW-Authenticate: Basic realm="thur admin"` |
+| Missing, malformed, or wrong `Authorization` | `401 Unauthorized` | `WWW-Authenticate: Basic realm="thur admin"` |
+| Valid `webadmin` credentials | request passes through to the handler | — |
+
+Because HTTP Basic ships the credentials base64-encoded, not
+encrypted, strongly prefer enabling the admin HTTP TLS listener
+(`http.tls.*`) so the password is not sent in clear on the wire.
+
+The password itself is set with a daemon-routed POST on the admin
+**socket**, not the TCP listener:
+
+```
+POST /api/v1/system/admin-password
+{ "password": "<plaintext>" }
+-> 204 No Content
+```
+
+The plaintext travels only over the local peer-cred admin socket; the
+daemon hashes it server-side with Argon2id, writes the PHC string to
+`admin-password.json`, and the change takes effect immediately (a
+hot-swapped in-process verifier, no restart). Driven by the
+`<product> system set-admin-password` CLI verb.
+
+Note: `/sessions` and `/info` were unauthenticated before this gate
+landed; they are now in the protected group. `/metrics` and `/health`
+stay open for Prometheus and liveness compatibility.
 
 ### `/health` JSON
 

@@ -1,0 +1,45 @@
+[package]
+name = "shared-admin-auth"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Single shared "admin password" gate for the network-facing TCP HTTP
+# listener (the Web UI prerequisite, issue #4). Owns the on-disk
+# password store (Argon2id PHC), the live `AuthState` verifier handle,
+# HTTP Basic parsing, the `require_admin_password` axum middleware, and
+# the daemon-routed `system set-admin-password` handler. Both daemons
+# (thurvtl, thurvsa) — and the future Web UI crate — consume it; the
+# only per-product variation is how the AdminState wires `data_dir` /
+# `audit_channel` / `auth`, captured by the [`AdminPasswordState`] trait.
+
+[dependencies]
+shared-admin-server = { path = "../admin-server" }
+shared-audit = { path = "../audit" }
+
+axum = "0.7"
+argon2 = "0.5"
+# argon2's `rand` feature only pulls password-hash's `rand_core`; the
+# `getrandom` feature is what makes `OsRng` (the salt source) available.
+# Same crate argon2 re-exports as `argon2::password_hash`, so this just
+# turns the feature on — no second copy.
+password-hash = { version = "0.5", features = ["getrandom"] }
+base64 = "0.22"
+subtle = "2"
+arc-swap = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Tempdir for the on-disk admin-password.json round-trip + perms tests.
+tempfile = "3"
+# Multi-thread runtime + macros to drive the async handlers/middleware.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# `ServiceExt::oneshot` to drive the middleware through a tiny Router.
+tower = { version = "0.5", features = ["util"] }

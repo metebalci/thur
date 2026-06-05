@@ -202,6 +202,9 @@ _thurvsa() {
             thurvsa__subcmd__help__subcmd__system,regenerate-cert)
                 cmd="thurvsa__subcmd__help__subcmd__system__subcmd__regenerate__subcmd__cert"
                 ;;
+            thurvsa__subcmd__help__subcmd__system,set-admin-password)
+                cmd="thurvsa__subcmd__help__subcmd__system__subcmd__set__subcmd__admin__subcmd__password"
+                ;;
             thurvsa__subcmd__help__subcmd__system,stats)
                 cmd="thurvsa__subcmd__help__subcmd__system__subcmd__stats"
                 ;;
@@ -628,6 +631,9 @@ _thurvsa() {
             thurvsa__subcmd__system,regenerate-cert)
                 cmd="thurvsa__subcmd__system__subcmd__regenerate__subcmd__cert"
                 ;;
+            thurvsa__subcmd__system,set-admin-password)
+                cmd="thurvsa__subcmd__system__subcmd__set__subcmd__admin__subcmd__password"
+                ;;
             thurvsa__subcmd__system,stats)
                 cmd="thurvsa__subcmd__system__subcmd__stats"
                 ;;
@@ -711,6 +717,9 @@ _thurvsa() {
                 ;;
             thurvsa__subcmd__system__subcmd__help,regenerate-cert)
                 cmd="thurvsa__subcmd__system__subcmd__help__subcmd__regenerate__subcmd__cert"
+                ;;
+            thurvsa__subcmd__system__subcmd__help,set-admin-password)
+                cmd="thurvsa__subcmd__system__subcmd__help__subcmd__set__subcmd__admin__subcmd__password"
                 ;;
             thurvsa__subcmd__system__subcmd__help,stats)
                 cmd="thurvsa__subcmd__system__subcmd__help__subcmd__stats"
@@ -1682,7 +1691,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__system)
-            opts="storage gc regenerate-cert alerting daemon-health monitor audit stats verify"
+            opts="storage gc regenerate-cert set-admin-password alerting daemon-health monitor audit stats verify"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1864,6 +1873,20 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__help__subcmd__system__subcmd__regenerate__subcmd__cert)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__help__subcmd__system__subcmd__set__subcmd__admin__subcmd__password)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -4288,7 +4311,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system)
-            opts="-c -h --config --user --help storage gc regenerate-cert alerting daemon-health monitor audit stats verify help"
+            opts="-c -h --config --user --help storage gc regenerate-cert set-admin-password alerting daemon-health monitor audit stats verify help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4782,7 +4805,7 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__help)
-            opts="storage gc regenerate-cert alerting daemon-health monitor audit stats verify help"
+            opts="storage gc regenerate-cert set-admin-password alerting daemon-health monitor audit stats verify help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4991,6 +5014,20 @@ _thurvsa() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        thurvsa__subcmd__system__subcmd__help__subcmd__set__subcmd__admin__subcmd__password)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         thurvsa__subcmd__system__subcmd__help__subcmd__stats)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -5088,6 +5125,32 @@ _thurvsa() {
             return 0
             ;;
         thurvsa__subcmd__system__subcmd__regenerate__subcmd__cert)
+            opts="-c -h --config --user --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -c)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --user)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thurvsa__subcmd__system__subcmd__set__subcmd__admin__subcmd__password)
             opts="-c -h --config --user --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

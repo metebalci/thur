@@ -43,7 +43,7 @@ pub async fn run_http_server(cfg: HttpListenerConfig, router: axum::Router) -> R
         None => {
             info!("HTTP server listening on http://{addr}");
             axum_server::bind(addr)
-                .serve(router.into_make_service())
+                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .context("HTTP server exited")?;
         }
@@ -76,7 +76,7 @@ pub async fn run_http_server(cfg: HttpListenerConfig, router: axum::Router) -> R
             let rustls_cfg =
                 axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
             axum_server::bind_rustls(addr, rustls_cfg)
-                .serve(router.into_make_service())
+                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .context("HTTPS server exited")?;
         }

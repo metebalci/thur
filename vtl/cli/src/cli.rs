@@ -386,6 +386,15 @@ enum SystemAction {
     /// serve the new cert.
     RegenerateCert,
 
+    /// Set the web-admin (Web UI) password.
+    ///
+    /// Daemon-routed. Prompts twice with no echo; the daemon hashes it
+    /// (Argon2id) into `<data_dir>/admin-password.json` and the change
+    /// takes effect immediately. Gates the TCP listener's `/sessions` +
+    /// `/info` (and the future Web UI); `/metrics` + `/health` stay open.
+    /// Log in as user `webadmin`. Set `THURVTL_ADMIN_PASSWORD` to script it.
+    SetAdminPassword,
+
     /// First-party alerting (email + webhook).
     ///
     /// Configure via the `alerting:` block in thurvtl.yaml; this

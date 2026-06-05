@@ -1198,6 +1198,121 @@ the whole arrangement: rotating it forces every client to re-roll, so
 give it a validity measured in years. Leaf certs, by contrast, are
 cheap to replace — re-mint them annually.
 
+## Admin password (Web UI / HTTP listener gate)
+
+The admin Unix socket and the admin HTTP listener authenticate
+differently because they have different things to lean on. The socket
+at `/run/<product>/admin.sock` is local-only and peer-cred-authed: the
+kernel hands the daemon the connecting process's uid/gid over
+`SO_PEERCRED`, so membership in the daemon's group is the credential and
+nothing crosses the network. The HTTP listener has none of that. It is a
+TCP socket reachable from anywhere the operator pointed it, so there is
+no peer identity to trust. Until now that was acceptable only because the
+listener exposed nothing but read-only status — but the Web UI (issue #5
+read-only, #91 mutating) needs a real gate in front of it. The admin
+password is that gate, and it is the hard prerequisite the Web UI builds
+on.
+
+The model is deliberately the one a network printer or a home router
+uses: a **single shared password**, not a directory of accounts. There
+is one secret for the whole appliance, it authenticates against a fixed
+synthetic username `webadmin`, and there are no per-operator logins,
+roles, or groups. LDAP, OIDC, SAML, and RBAC are explicitly out of
+scope — they are the wrong weight for a self-hosted single-appliance
+audience, where the operator who can set the password is already the
+operator who can read the conffile and restart the daemon. One password,
+one appliance.
+
+### Setting the password
+
+```bash
+# Interactive — prompts twice, no echo.
+sudo -u thurvsa thurvsa system set-admin-password
+
+# Non-interactive provisioning — read from the per-product env var.
+THURVSA_ADMIN_PASSWORD='...' sudo -u thurvsa thurvsa system set-admin-password
+```
+
+`<product> system set-admin-password` is **daemon-routed**: the daemon
+owns the on-disk store, so the verb refuses if the daemon is down. It
+prompts twice with no echo, or reads the per-product env var
+`THURVTL_ADMIN_PASSWORD` / `THURVSA_ADMIN_PASSWORD` for non-interactive
+provisioning. The plaintext travels only over the local peer-cred admin
+socket; the daemon hashes it **server-side** with Argon2id (the
+OWASP-baseline parameters m=19456, t=2, p=1) and stores only the
+resulting self-describing PHC string. The plaintext never lands on disk
+and never leaves the host. The change is effective immediately by an
+arc-swap of the live verifier — no restart, and the same in-process
+verifier is shared between the admin socket and the HTTP listener so the
+two can never disagree about the current password.
+
+The hash lives at `<data_dir>/admin-password.json`, daemon-managed
+(written by the daemon on `set`, never by the packager — there is no
+postinst entry for it), mode 0640, written by atomic rename, a sibling
+of `iscsi-users.json` next door. Its schema holds the hash and nothing
+else:
+
+```json
+{ "phc": "<Argon2id PHC string>", "updated_at": "<RFC3339>" }
+```
+
+An **absent file means no password is configured**, and the gate fails
+closed in that state — see the 503 verdict below. There is no plaintext
+anywhere in the file, so a stolen `admin-password.json` yields only an
+Argon2id hash to grind, not the password.
+
+### Open vs protected routes
+
+With the password in place the HTTP listener splits its router into two
+groups:
+
+- **Open**, unauthenticated: `/health` and `/metrics`. These stay open
+  so a Prometheus scrape and a liveness probe keep working without
+  credentials, exactly as before.
+- **Protected**, gated by HTTP Basic: everything else — today `/sessions`
+  and `/info`, tomorrow the Web UI's `/ui` and read-only `/api/v1`.
+
+The Basic challenge uses the fixed username `webadmin` and the realm
+`thur admin`. The middleware returns one of three verdicts:
+
+| State | Response |
+| --- | --- |
+| No password configured | `503` + `WWW-Authenticate` challenge |
+| Missing / malformed / wrong credentials | `401` + `WWW-Authenticate` challenge |
+| Valid credentials | request passes through |
+
+The `503`-versus-`401` split is deliberate, so an operator can tell
+"the appliance has no admin password set yet" apart from "I typed the
+wrong password." On a valid request the middleware also stamps a
+`shared_audit::AuditActor::rest("webadmin", <peer ip:port>)` descriptor
+into the request extensions, which the future Web UI mutating handlers
+(issue #91) will read to attribute the audited action.
+
+**Behavior change.** `/sessions` and `/info` were *unauthenticated*
+before this landed; they are now behind the gate. That is intended —
+those endpoints leak live session and topology detail that has no
+business being world-readable on a TCP port — and it follows the
+project's no-backward-compatibility rule. `/metrics` and `/health`
+remain open for Prometheus and liveness compatibility.
+
+### Use TLS so the password is not sent in clear
+
+HTTP Basic credentials are **base64-encoded, not encrypted** — base64 is
+trivially reversible, so on a plaintext listener the `webadmin` password
+crosses the wire in effectively cleartext on every protected request.
+The strong recommendation is therefore to enable the admin HTTP TLS
+listener (§ Admin HTTP TLS above, the `http.tls` block) before relying on
+the gate over anything but loopback. This is an operational
+recommendation, not a code knob: the daemon does not refuse Basic auth
+over plaintext, it trusts the operator to put TLS in front of it.
+
+### Audit
+
+Every successful set emits an audit row under the op name
+`system.admin_password.set`. The params carry **no secret** — only the
+peer-cred descriptor of the CLI caller that performed the change, so the
+log records *who* reset the admin password and *when*, never *to what*.
+
 ## NVMe/TCP TLS-PSK (VSA only)
 
 When VSA is run over the NVMe/TCP transport — enabled by listing

@@ -14,10 +14,12 @@ pub mod gc;
 pub mod monitor;
 pub mod regenerate_cert;
 pub mod secrets_io;
+pub mod set_admin_password;
 pub mod storage_check;
 
 pub use daemon_health::cmd_daemon_health;
 pub use gc::cmd_gc;
 pub use monitor::cmd_monitor;
 pub use regenerate_cert::cmd_regenerate_cert;
+pub use set_admin_password::cmd_set_admin_password;
 pub use storage_check::cmd_storage_check;

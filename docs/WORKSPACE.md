@@ -67,6 +67,39 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `data_dir` plus an optional `AuditChannel`. Audit op names are pinned
   (`iscsi.users.add`, `iscsi.users.rotate.start`, `iscsi.target.set`, …)
   so a multi-product audit chain reads uniformly across both daemons.
+- **shared-admin-auth** — the single shared web-admin password that
+  gates the network-facing HTTP listener (issue #4; the hard
+  prerequisite for the Web UI, #5 / #91). Sibling of
+  `shared-admin-iscsi`, deliberately kept out of `shared-admin-http`
+  so that crate stays transport-only.
+  - `hash.rs` — Argon2id (OWASP-baseline params m=19456, t=2, p=1)
+    over the `password-hash` PHC-string surface: hash a plaintext to a
+    self-describing PHC string, verify a candidate against one.
+  - `store.rs` — the on-disk store at `<data_dir>/admin-password.json`
+    (`{ phc, updated_at }`, mode 0640, atomic tmp+rename, daemon-written
+    only — no packager / postinst entry). Holds only the hash, never
+    the plaintext; an absent file means "no password configured" and
+    the gate fails closed.
+  - `state.rs` — `AuthState`, the live verifier shared in-process
+    between the admin socket and the HTTP listener. An `arc-swap` cell
+    so `system set-admin-password` hot-swaps the active hash with no
+    restart.
+  - `basic.rs` — HTTP Basic parsing (the fixed synthetic username
+    `webadmin`, realm `thur admin`).
+  - `middleware.rs` — `require_admin_password`, the axum middleware
+    that fronts the protected router group: no password configured →
+    503 + `WWW-Authenticate` (so operators can tell "unset" from
+    "wrong"); missing / malformed / wrong creds → 401 +
+    `WWW-Authenticate`; valid → pass through after stamping
+    `shared_audit::AuditActor::rest("webadmin", peer)` into the request
+    extensions for the future mutating Web UI handlers.
+  - `set.rs` — the daemon-routed set handler: the CLI ships the
+    plaintext over the local peer-cred admin socket, the daemon hashes
+    it server-side (the plaintext never lands on disk and never leaves
+    the host), swaps `AuthState`, persists the store, and emits the
+    `system.admin_password.set` audit op (params carry no secret).
+  Consumed by both daemons today and by the future
+  `shared-admin-webui` (#5).
 - **shared-admin-audit** — cross-product `system.audit.*` job handlers:
   `run_tail` / `run_export` / `run_verify` / `run_rotate`, each
   `(JobEmitter, serde_json::Value, PathBuf)`. Both daemons route those

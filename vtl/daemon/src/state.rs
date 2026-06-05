@@ -86,6 +86,11 @@ pub struct DaemonStateConfig {
     pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
     pub ghost_lists: HashMap<String, Arc<core_mediachanger::GhostList>>,
     pub backpressure_max_wait: Duration,
+    /// Live web-admin password verifier, seeded from
+    /// `<data_dir>/admin-password.json` at boot. Shared (same `Arc`)
+    /// with the HTTP listener's auth middleware and hot-swapped by the
+    /// `system set-admin-password` handler.
+    pub auth: shared_admin_auth::AuthState,
 }
 
 /// Long-lived state shared by every daemon subsystem. Instantiated
@@ -153,6 +158,11 @@ pub struct DaemonState {
     /// manager; the drive / changer LUN is itself the stable identity,
     /// so `LunIdentity` maps it 1:1.
     pub reservations: Arc<scsi_spc::reservations::ReservationManager>,
+    /// Live web-admin password verifier (see [`DaemonStateConfig::auth`]).
+    /// Reachable from the admin socket setter (`self.daemon.auth`) and
+    /// the HTTP listener (`HttpState.daemon_state.auth`) — one process,
+    /// one handle.
+    pub auth: shared_admin_auth::AuthState,
 }
 
 impl DaemonState {
@@ -216,6 +226,7 @@ impl DaemonState {
                 .unwrap_or(0),
             pool_budgets,
             reservations,
+            auth: cfg.auth,
         }
     }
 }
@@ -272,6 +283,7 @@ mod tests {
             pool_budgets: HashMap::new(),
             ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
+            auth: shared_admin_auth::AuthState::new(None),
         };
 
         let state = DaemonState::new(cfg);

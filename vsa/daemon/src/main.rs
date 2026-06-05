@@ -886,6 +886,16 @@ async fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Web-admin password gate (#4): seed the live verifier from
+    // <data_dir>/admin-password.json. Absent file = unconfigured (the
+    // TCP listener's protected routes fail closed); a malformed file is
+    // a hard startup error. One handle, cloned into the admin setter
+    // (AdminState) and the HTTP middleware (HttpState).
+    let auth_state = shared_admin_auth::AuthState::load_from(
+        &shared_admin_auth::admin_password_path(&data_dir),
+    )
+    .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
+
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
         nvmetcp_psks_path,
@@ -906,6 +916,7 @@ async fn main() -> Result<()> {
         reservations: Arc::clone(&reservations),
         aer_hub: aer_hub_for_admin,
         ua_tracker: ua_tracker_for_admin,
+        auth: auth_state.clone(),
     };
     let admin_socket = admin::admin_socket_path();
 
@@ -916,6 +927,7 @@ async fn main() -> Result<()> {
         sessions: Arc::clone(&session_manager),
         listen_addresses: transport_listens.clone(),
         target_iqn,
+        auth: auth_state,
     };
 
     // Disk-cache eviction worker. Periodically re-scans every

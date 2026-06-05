@@ -134,6 +134,11 @@ pub struct AdminState {
     /// hosts re-issue READ CAPACITY (issue #76) — the SCSI counterpart
     /// of the NVMe `aer_hub` notice.
     pub ua_tracker: Option<Arc<shared_iscsi::unit_attention::UnitAttentionTracker>>,
+    /// Live web-admin password verifier (issue #4), seeded from
+    /// `<data_dir>/admin-password.json` at boot. The same `AuthState`
+    /// handle the HTTP listener's auth middleware reads; the
+    /// `system set-admin-password` handler hot-swaps it.
+    pub auth: shared_admin_auth::AuthState,
 }
 
 // `system.monitor` per-tick view. The handler in `shared-admin-monitor`

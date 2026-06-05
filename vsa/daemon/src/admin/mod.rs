@@ -16,6 +16,7 @@
 //! This module just builds the product router, merges the shared
 //! jobs router, and hands the result off.
 
+pub mod admin_password;
 pub mod handlers;
 pub mod iscsi_target;
 pub mod iscsi_users;
@@ -197,6 +198,11 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
         .route(
             "/api/v1/nvmetcp/dhchap/ctrl-key/clear",
             post(nvmetcp_dhchap::clear_ctrl_key),
+        )
+        // web-admin password (issue #4) — daemon hashes server-side
+        .route(
+            "/api/v1/system/admin-password",
+            post(admin_password::set),
         )
         .with_state(state.clone());
 

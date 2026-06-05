@@ -42,6 +42,9 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 TEST_DIR="/tmp/test-smoke-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvtl"
+# Web-admin password (#4) the gate test sets; /sessions + /info are
+# gated behind it once configured.
+ADMIN_PW="smoke-admin-pass-1"
 
 init_common_daemon_args
 parse_common_daemon_args "$@"
@@ -304,12 +307,73 @@ test_drive_status() {
     fi
 }
 
-# Test: HTTP Sessions Endpoint
+# Test: web-admin password gate (#4).
+#
+# Before a password is set, /sessions fails closed (503). After
+# `system set-admin-password`, /sessions needs HTTP Basic (401 without,
+# 200 with the right creds, 401 with the wrong ones), while /metrics +
+# /health stay open. Runs BEFORE test_http_sessions/test_http_info, which
+# then authenticate. The password persists in <data_dir>/admin-password.json.
+test_http_admin_password_gate() {
+    log_test "Testing web-admin password gate..."
+
+    local code
+    # Unconfigured: protected route fails closed with 503.
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "503" ]; then
+        log_error "✗ /sessions returned $code before a password was set (expected 503)"
+        return 1
+    fi
+
+    # Set the password non-interactively via the dedicated env var.
+    local out
+    out=$(THURVTL_ADMIN_PASSWORD="$ADMIN_PW" "$CLI_PATH" --config "$TEST_CONFIG" \
+        system set-admin-password 2>&1)
+    if ! echo "$out" | grep -q "web-admin password set"; then
+        log_error "✗ set-admin-password failed: $out"
+        return 1
+    fi
+
+    # No credentials -> 401.
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "401" ]; then
+        log_error "✗ /sessions without creds returned $code (expected 401)"
+        return 1
+    fi
+
+    # Wrong password -> 401.
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "webadmin:wrong-password" \
+        "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "401" ]; then
+        log_error "✗ /sessions with a wrong password returned $code (expected 401)"
+        return 1
+    fi
+
+    # Correct creds -> 200.
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "200" ]; then
+        log_error "✗ /sessions with valid creds returned $code (expected 200)"
+        return 1
+    fi
+
+    # /metrics stays open (Prometheus scrape compat).
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/metrics")
+    if [ "$code" != "200" ]; then
+        log_error "✗ /metrics returned $code without creds (expected 200 — must stay open)"
+        return 1
+    fi
+
+    log_info "✓ Admin-password gate: 503 unset, 401 no/bad creds, 200 with creds, /metrics open"
+    return 0
+}
+
+# Test: HTTP Sessions Endpoint (gated — authenticate, see gate test above)
 test_http_sessions() {
     log_test "Testing HTTP sessions endpoint..."
 
     local response
-    response=$(curl -s "http://127.0.0.1:$HTTP_PORT/sessions")
+    response=$(curl -s -u "webadmin:$ADMIN_PW" "http://127.0.0.1:$HTTP_PORT/sessions")
 
     if echo "$response" | grep -q -E "(sessions|target_iqn)"; then
         log_info "✓ Sessions endpoint responded successfully"
@@ -320,12 +384,12 @@ test_http_sessions() {
     fi
 }
 
-# Test: HTTP Info Endpoint
+# Test: HTTP Info Endpoint (gated — authenticate, see gate test above)
 test_http_info() {
     log_test "Testing HTTP info endpoint..."
 
     local response
-    response=$(curl -s "http://127.0.0.1:$HTTP_PORT/info")
+    response=$(curl -s -u "webadmin:$ADMIN_PW" "http://127.0.0.1:$HTTP_PORT/info")
 
     if echo "$response" | grep -q "drives"; then
         log_info "✓ Info endpoint responded successfully"
@@ -686,6 +750,7 @@ main() {
         "test_list_cartridges"
         "test_at_rest_encryption"
         "test_drive_status"
+        "test_http_admin_password_gate"
         "test_http_sessions"
         "test_http_info"
         "test_connection_stability"

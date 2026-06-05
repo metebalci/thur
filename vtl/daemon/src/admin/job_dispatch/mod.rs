@@ -178,6 +178,7 @@ mod tests {
             pool_budgets: HashMap::new(),
             ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
+            auth: shared_admin_auth::AuthState::new(None),
         };
         Arc::new(DaemonState::new(cfg))
     }

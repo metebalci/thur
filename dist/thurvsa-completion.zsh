@@ -554,6 +554,15 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(set-admin-password)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (alerting)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -823,6 +832,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (regenerate-cert)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set-admin-password)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2015,6 +2028,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(set-admin-password)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (alerting)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvsa__subcmd__help__subcmd__system__subcmd__alerting_commands" \
@@ -2676,6 +2693,7 @@ _thurvsa__subcmd__help__subcmd__system_commands() {
 'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -2758,6 +2776,11 @@ _thurvsa__subcmd__help__subcmd__system__subcmd__monitor_commands() {
 _thurvsa__subcmd__help__subcmd__system__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help system regenerate-cert commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__set-admin-password_commands] )) ||
+_thurvsa__subcmd__help__subcmd__system__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help system set-admin-password commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__help__subcmd__system__subcmd__stats_commands] )) ||
 _thurvsa__subcmd__help__subcmd__system__subcmd__stats_commands() {
@@ -3565,6 +3588,7 @@ _thurvsa__subcmd__system_commands() {
 'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -3713,6 +3737,7 @@ _thurvsa__subcmd__system__subcmd__help_commands() {
 'storage:Storage-backend operations' \
 'gc:Garbage-collect orphan chunks from the chunk pool' \
 'regenerate-cert:Regenerate the admin HTTP self-signed TLS cert' \
+'set-admin-password:Set the web-admin (Web UI) password' \
 'alerting:First-party alerting (email + webhook)' \
 'daemon-health:Probe the daemon'\''s admin Unix socket' \
 'monitor:Live activity screen — holds and redraws ~1s, Ctrl-C to exit' \
@@ -3802,6 +3827,11 @@ _thurvsa__subcmd__system__subcmd__help__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system help regenerate-cert commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__set-admin-password_commands] )) ||
+_thurvsa__subcmd__system__subcmd__help__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system help set-admin-password commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__system__subcmd__help__subcmd__stats_commands] )) ||
 _thurvsa__subcmd__system__subcmd__help__subcmd__stats_commands() {
     local commands; commands=()
@@ -3839,6 +3869,11 @@ _thurvsa__subcmd__system__subcmd__monitor_commands() {
 _thurvsa__subcmd__system__subcmd__regenerate-cert_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa system regenerate-cert commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__system__subcmd__set-admin-password_commands] )) ||
+_thurvsa__subcmd__system__subcmd__set-admin-password_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa system set-admin-password commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__system__subcmd__stats_commands] )) ||
 _thurvsa__subcmd__system__subcmd__stats_commands() {

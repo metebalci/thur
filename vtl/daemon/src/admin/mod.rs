@@ -15,6 +15,7 @@
 //! the shared jobs router, and hands the result to the shared
 //! transport runner.
 
+pub mod admin_password;
 pub mod handlers;
 pub mod iscsi_users;
 pub mod job_dispatch;
@@ -124,6 +125,11 @@ pub async fn run_admin_server(socket_path: PathBuf, daemon_state: Arc<DaemonStat
         .route(
             "/api/v1/system/reset-stats",
             post(handlers::system_reset_stats),
+        )
+        // web-admin password (issue #4) — daemon hashes server-side
+        .route(
+            "/api/v1/system/admin-password",
+            post(admin_password::set),
         )
         // iSCSI CHAP users
         .route(

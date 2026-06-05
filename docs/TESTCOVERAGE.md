@@ -56,6 +56,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | Crate | Line cov | Tier | Coverage focus |
 |---|---:|---|---|
 | `shared-admin-audit` | 64% | shared | `system.audit.*` job handlers — reached via the daemon audit verbs |
+| `shared-admin-auth` | 96% | shared | Argon2id PHC hashing, password store, `AuthState`, HTTP Basic gate middleware |
 | `shared-admin-client` | 70% | shared | admin Unix-socket dialer, NDJSON job-stream consumer |
 | `shared-admin-http` | 80% | shared | admin HTTP listener, TLS config, self-signed cert gen / regen |
 | `shared-admin-iscsi` | 81% | shared | cross-product iSCSI admin handlers — reached via both daemons |

@@ -15,7 +15,7 @@ changer    inventory / move / load / unload [--force]
 drive      status / self-test / reset-stats [ID|--all]
 system     gc / verify / stats / reset-stats / daemon-health
            audit {tail,export,verify,verify-offline,rotate} / storage {check,benchmark}
-           regenerate-cert / alerting {list,test}
+           regenerate-cert / set-admin-password / alerting {list,test}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 config     defaults / systemd-unit / completion
 ```
@@ -31,7 +31,7 @@ clap drives both `--help` and the shipped completion scripts.
 ```
 volume     create / list / info / destroy / modify / resize / key migrate
            snapshot {create,list,destroy,restore} / clone
-system     storage {check,benchmark} / gc / stats / verify / regenerate-cert / alerting {list,test}
+system     storage {check,benchmark} / gc / stats / verify / regenerate-cert / set-admin-password / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 nvmetcp    psks {add,remove,disable,enable,rotate,list}
@@ -173,7 +173,8 @@ the 0640 conffile.
   reset-stats`; `library info`,
   `library monitor`, and `library self-test`; the live `system` ops
   (`gc`, `verify`, `stats`, `reset-stats`, `daemon-health`, `audit
-  {tail,export,verify,rotate}`, `storage check`, and `alerting`);
+  {tail,export,verify,rotate}`, `storage check`, `set-admin-password`,
+  and `alerting`);
   and all `iscsi` verbs. These commands never read
   `thurvtl.yaml` — the CLI connects to `/run/thurvtl/admin.sock` (or
   `$THURVTL_ADMIN_SOCKET`) directly. Membership in the `thurvtl` group
@@ -184,6 +185,16 @@ the 0640 conffile.
   daemon running?" if the socket is not reachable. (`system audit
   verify-offline` is the lone exception — it walks a copied audit
   directory and needs no daemon.)
+  `system set-admin-password` sets the single shared web-admin password
+  that gates the network-facing HTTP listener (the prerequisite for the
+  Web UI). It is daemon-routed because the daemon owns
+  `<data_dir>/admin-password.json` and the live verifier; it refuses with
+  "is the daemon running?" when the socket is down. The verb prompts twice
+  with no echo, or reads `THURVTL_ADMIN_PASSWORD` / `THURVSA_ADMIN_PASSWORD`
+  for non-interactive provisioning. The plaintext travels over the local
+  peer-cred admin socket and is hashed server-side with Argon2id; only the
+  hash is written, and the new password is hot-swapped into the live
+  verifier, so it takes effect immediately with no restart.
 
 - **Pure local (no data):** `config defaults / completion / systemd-unit`.
 

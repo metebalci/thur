@@ -550,6 +550,9 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            SystemAction::SetAdminPassword => {
+                shared_cli_system::cmd_set_admin_password(&shared_naming::TAPE_LIBRARY).await?;
+            }
             SystemAction::Audit { action } => {
                 use shared_cli_system::audit;
                 let p = &shared_naming::TAPE_LIBRARY;

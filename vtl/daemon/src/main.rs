@@ -1678,6 +1678,15 @@ async fn main() -> Result<()> {
 
     let library_arc = std::sync::Arc::new(std::sync::Mutex::new(library));
 
+    // Web-admin password gate (#4): seed the live verifier from
+    // <data_dir>/admin-password.json. Absent file = unconfigured (the
+    // TCP listener's protected routes fail closed); a malformed file is
+    // a hard startup error.
+    let auth_state = shared_admin_auth::AuthState::load_from(
+        &shared_admin_auth::admin_password_path(&std::path::PathBuf::from(&cfg.data_dir)),
+    )
+    .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
+
     let daemon_state = std::sync::Arc::new(state::DaemonState::new(state::DaemonStateConfig {
         data_dir: std::path::PathBuf::from(&cfg.data_dir),
         tapes_root: tapes_root.clone(),
@@ -1699,6 +1708,7 @@ async fn main() -> Result<()> {
         pool_budgets: pool_budgets.clone(),
         ghost_lists: ghost_lists.clone(),
         backpressure_max_wait,
+        auth: auth_state,
     }));
 
     // Periodic backend-reachability ticker. Opt-in via

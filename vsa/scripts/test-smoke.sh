@@ -43,6 +43,9 @@ source "${SCRIPT_DIR}/../../scripts/lib/test-helpers.sh"
 TEST_DIR="/tmp/thurvsa-test-smoke-$$"
 TEST_CONFIG="${TEST_DIR}/config.yaml"
 TARGET_IQN="iqn.2025-10.com.metebalci:thurvsa"
+# Web-admin password (#4) the gate test sets; /sessions + /info are
+# gated behind it once configured.
+ADMIN_PW="smoke-admin-pass-1"
 
 init_common_daemon_args
 parse_common_daemon_args "$@"
@@ -113,6 +116,50 @@ test_http_health() {
         log_error "Health check failed. Response: $response"
         return 1
     fi
+}
+
+# Web-admin password gate (#4): before a password is set /sessions
+# fails closed (503); after `system set-admin-password` it needs HTTP
+# Basic (401 without, 200 with), while /metrics + /health stay open.
+test_http_admin_password_gate() {
+    log_test "Testing web-admin password gate..."
+
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "503" ]; then
+        log_error "/sessions returned $code before a password was set (expected 503)"
+        return 1
+    fi
+
+    local out
+    out=$(THURVSA_ADMIN_PASSWORD="$ADMIN_PW" "$CLI_PATH" --config "$TEST_CONFIG" \
+        system set-admin-password 2>&1)
+    if ! echo "$out" | grep -q "web-admin password set"; then
+        log_error "set-admin-password failed: $out"
+        return 1
+    fi
+
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "401" ]; then
+        log_error "/sessions without creds returned $code (expected 401)"
+        return 1
+    fi
+
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/sessions")
+    if [ "$code" != "200" ]; then
+        log_error "/sessions with valid creds returned $code (expected 200)"
+        return 1
+    fi
+
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/metrics")
+    if [ "$code" != "200" ]; then
+        log_error "/metrics returned $code without creds (expected 200 — must stay open)"
+        return 1
+    fi
+
+    log_info "Admin-password gate: 503 unset, 401 no creds, 200 with creds, /metrics open"
+    return 0
 }
 
 test_http_metrics() {
@@ -471,6 +518,7 @@ main() {
     local tests=(
         "test_http_health"
         "test_http_metrics"
+        "test_http_admin_password_gate"
         "test_volume_create"
         "test_volume_list"
         "test_volume_info"

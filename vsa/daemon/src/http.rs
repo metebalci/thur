@@ -54,6 +54,10 @@ pub struct HttpState {
     pub listen_addresses: Vec<String>,
     /// Resolved iSCSI target IQN (`iscsi.target_iqn` or the default).
     pub target_iqn: String,
+    /// Live web-admin password verifier (issue #4) — the same handle
+    /// the admin socket's `set-admin-password` setter writes. Drives the
+    /// `require_admin_password` middleware on the protected route group.
+    pub auth: shared_admin_auth::AuthState,
 }
 
 // Lets the shared `/metrics` handler (in `shared_telemetry::http`)
@@ -91,13 +95,32 @@ impl FromRef<HttpState> for SessionsState {
 
 /// Construct the axum Router for the daemon's TCP HTTP listener.
 /// `shared-admin-http` owns the bind/serve glue.
+///
+/// Two route groups: `open` (`/health` + `/metrics`, unauthenticated
+/// for liveness probes + Prometheus scrape) and `protected` (everything
+/// else), gated by the web-admin password (#4) via
+/// [`shared_admin_auth::require_admin_password`]. Closed-by-default —
+/// new routes go on `protected` and are gated automatically.
+/// `/sessions` and `/info` are on `protected` because they expose the
+/// target IQN, listen addresses, and volume topology.
 pub fn build_router(state: HttpState) -> Router {
-    Router::new()
+    let auth = state.auth.clone();
+
+    let open = Router::new()
         .route("/health", get(shared_health::health_handler))
         .route("/metrics", get(shared_telemetry::http::metrics_handler))
+        .with_state(state.clone());
+
+    let protected = Router::new()
         .route("/sessions", get(shared_iscsi::http::sessions_handler))
         .route("/info", get(info_handler))
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            shared_admin_auth::require_admin_password,
+        ))
+        .with_state(state);
+
+    open.merge(protected)
 }
 
 /// Emit the per-route URL listing operators see in journalctl at boot.
@@ -105,8 +128,11 @@ pub fn build_router(state: HttpState) -> Router {
 /// `http.tls` is configured.
 pub fn log_route_table(listen: &str, scheme: &str) {
     info!("HTTP server listening on {scheme}://{listen}");
-    for route in ["health", "metrics", "sessions", "info"] {
+    for route in ["health", "metrics"] {
         info!("  - {route}: {scheme}://{listen}/{route}");
+    }
+    for route in ["sessions", "info"] {
+        info!("  - {route}: {scheme}://{listen}/{route} (admin password)");
     }
 }
 

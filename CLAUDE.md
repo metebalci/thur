@@ -78,6 +78,17 @@ on-disk paths group by purpose.
   passed as a plain `PathBuf`. Kept out of `shared-audit` itself so
   that low-level crate stays free of the `JobEmitter` / job-protocol
   deps.
+- `shared/admin-auth` (`shared-admin-auth`) — the single web-admin
+  password gating the network-facing HTTP listener (issue #4, the
+  prerequisite for the Web UI #5). Owns Argon2id PHC hashing (OWASP
+  baseline m=19456,t=2,p=1), the `<data_dir>/admin-password.json`
+  store (hash only), the hot-swappable `AuthState` verifier (arc-swap,
+  shared in-process between admin socket and HTTP listener), HTTP
+  Basic parsing, the `require_admin_password` axum middleware, and the
+  daemon-routed set handler that hashes the plaintext server-side.
+  Both daemons mount it today; the future `shared-admin-webui` reuses
+  it. Sibling of `shared-admin-iscsi`; kept out of the transport-only
+  `shared-admin-http`. Design in [`docs/AUTH.md`](docs/AUTH.md).
 - `shared/admin-cloud-check` (`shared-admin-cloud-check`) —
   cross-product cloud-backend reachability. `run_cloud_check` is the
   `system.cloud_check` job handler both daemons mount (CLI verb
@@ -338,6 +349,14 @@ adapter layers between products are in
   redundantly. Design in
   [`docs/TELEMETRY.md`](docs/TELEMETRY.md); full instrument
   table in [`docs/SPEC.md`](docs/SPEC.md) § Telemetry.
+- **Web-admin password** — the TCP HTTP listener splits its router into
+  an OPEN group (`/health` + `/metrics`, unauthenticated for Prometheus
+  + liveness) and a PROTECTED group (everything else, gated by HTTP
+  Basic against the single shared web-admin password — realm `thur
+  admin`, fixed username `webadmin`). No password configured fails
+  closed (503 + challenge); wrong creds 401. The prerequisite for the
+  Web UI (issue #4, set via `system set-admin-password`). Design in
+  [`docs/AUTH.md`](docs/AUTH.md).
 - **Alerting** — opt-in first-party email (SMTP via lettre) + generic
   webhook (HTTP POST with Tera-templated body — one path covers
   PagerDuty, Slack, Discord, ntfy.sh, ServiceNow) sinks. Four event
@@ -485,6 +504,13 @@ re-materializes `library.json` from the YAML `library:` block.
   `thurvsa nvmetcp psks {add,remove,disable,enable,grant,revoke,
   rotate,list}`. Daemon re-reads on every TLS handshake — no restart
   needed.
+- `admin-password.json` — the single web-admin password gating the
+  HTTP listener's protected routes. Holds only the Argon2id PHC hash
+  (never the plaintext), mode 0640, written by the daemon (no postinst
+  entry). Absent file = no password = the gate fails closed. Set via
+  `thur{vtl,vsa} system set-admin-password` (daemon-routed; the
+  plaintext is hashed server-side and never lands on disk). Hot-swapped
+  on set — no restart needed.
 S3 / GCS / Azure backends carry an optional `retention_mode` field
 (`none` / `governance` / `compliance`). Required for WORM cartridges /
 volumes. The daemon queries each backend's actual lock state at startup

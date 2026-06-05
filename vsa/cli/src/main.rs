@@ -275,6 +275,9 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await
             }
+            SystemAction::SetAdminPassword => {
+                shared_cli_system::cmd_set_admin_password(&shared_naming::DISK).await
+            }
             SystemAction::Alerting { action } => match action {
                 AlertingAction::List { json } => {
                     shared_cli_alerting::list(&shared_naming::DISK, json).await

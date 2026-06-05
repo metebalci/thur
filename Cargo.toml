@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "shared/admin-audit",
+    "shared/admin-auth",
     "shared/admin-client",
     "shared/admin-cloud-check",
     "shared/admin-http",
