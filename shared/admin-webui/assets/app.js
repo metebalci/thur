@@ -10,15 +10,20 @@
 
 "use strict";
 
-const REFRESH_MS = 5000;
+// Fast lane: the live panels (monitor + inventory) repaint every second.
+const REFRESH_MS = 1000;
+// Slow lane: the audit tail is polled less often — read_entries re-parses
+// the whole on-disk log each call, so hitting it every second is wasteful.
+const AUDIT_MS = 10000;
 // How many trailing audit entries the tail panel shows (it scrolls).
 const AUDIT_LINES = 50;
 
 /** Current product slug ("thurvtl" | "thurvsa"), set after /info. */
 let PRODUCT = null;
 let timer = null;
-/** Previous backend byte totals + timestamp, for the per-second
- *  upload/download rate averaged over the gap between polls. */
+let auditTimer = null;
+/** Previous backend byte totals + client timestamp, for the per-second
+ *  upload/download rate averaged over the interval between polls. */
 let prevIo = null;
 
 // ---- tiny DOM + format helpers -------------------------------------------
@@ -183,19 +188,22 @@ function renderKpis(mon) {
     ),
   );
 
-  // Backend upload/download, averaged over the gap since the last poll
-  // (~5 s). PUT bytes = upload to the backend, GET = download from it.
+  // Backend upload/download, averaged over the interval between polls.
+  // PUT bytes = upload to the backend, GET = download from it. Uses the
+  // client clock so the per-second math is right at any poll cadence.
   const putTotal = (mon.storage || []).reduce((a, s) => a + (s.put_bytes_total || 0), 0);
   const getTotal = (mon.storage || []).reduce((a, s) => a + (s.get_bytes_total || 0), 0);
-  const ts = mon.ts_unix || 0;
+  const now = Date.now();
   let upRate = 0;
   let downRate = 0;
-  if (prevIo && ts > prevIo.ts) {
-    const dt = ts - prevIo.ts;
-    upRate = Math.max(0, (putTotal - prevIo.put) / dt);
-    downRate = Math.max(0, (getTotal - prevIo.get) / dt);
+  if (prevIo) {
+    const dt = (now - prevIo.t) / 1000;
+    if (dt > 0) {
+      upRate = Math.max(0, (putTotal - prevIo.put) / dt);
+      downRate = Math.max(0, (getTotal - prevIo.get) / dt);
+    }
   }
-  prevIo = { ts, put: putTotal, get: getTotal };
+  prevIo = { t: now, put: putTotal, get: getTotal };
   wrap.append(
     kpi("Throughput (MB/s)", `${mbps(upRate)} / ${mbps(downRate)}`, "upload / download"),
   );
@@ -462,14 +470,19 @@ async function refresh() {
     }
 
     renderStorage(mon);
-    const audit = await api(`/api/v1/audit/tail?lines=${AUDIT_LINES}`).catch(() => ({ entries: [] }));
-    renderAudit(audit);
 
     setStatus("ok", "live");
     $("updated").textContent = `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
   } catch (e) {
     setStatus("error", e.status ? `error ${e.status}` : "unreachable");
   }
+}
+
+// Slow lane (see AUDIT_MS): the audit tail re-parses the whole on-disk
+// log per call, so it polls less often than the live panels.
+async function refreshAudit() {
+  const audit = await api(`/api/v1/audit/tail?lines=${AUDIT_LINES}`).catch(() => ({ entries: [] }));
+  renderAudit(audit);
 }
 
 // ---- bootstrap -----------------------------------------------------------
@@ -491,7 +504,9 @@ async function init() {
     $("layout").hidden = false;
 
     await refresh();
+    await refreshAudit();
     timer = setInterval(refresh, REFRESH_MS);
+    auditTimer = setInterval(refreshAudit, AUDIT_MS);
   } catch (e) {
     const card = document.querySelector(".splash-card");
     card.classList.add("error");
