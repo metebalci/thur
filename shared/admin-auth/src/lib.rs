@@ -41,7 +41,7 @@ pub use basic::parse_basic;
 pub use hash::{hash_password, verify_phc};
 pub use middleware::require_admin_password;
 pub use set::{AdminPasswordState, ApiError, SetRequest, set};
-pub use state::AuthState;
+pub use state::{AuthMethod, AuthState};
 pub use store::{AdminPasswordFile, admin_password_path};
 
 /// Synthetic single-user identity for the shared admin password

@@ -25,7 +25,7 @@ the same commit whenever a YAML key is added or changed.**
 | `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
 | `nvmetcp-dhchap.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp dhchap` |
-| `admin-password.json` | `<data_dir>/` | both | JSON | daemon — Argon2id hash of the web-admin password (set via `<product> system set-admin-password`). Holds only the hash, never the plaintext; absent = no password configured = the protected HTTP listener fails closed. |
+| `admin-password.json` | `<data_dir>/` | both | JSON | daemon — Argon2id hash of the web-admin password (set via `<product> system set-admin-password`). Holds only the hash, never the plaintext; absent = no password configured. Enforced only when `http.auth.method: Password`, in which case absent fails the listener closed; the default `http.auth.method: None` serves the protected routes open. |
 | `reservations.json` | `<data_dir>/` | both | JSON | daemon — persisted SCSI/NVMe PERSISTENT RESERVE state (PTPL); written on every APTPL/CPTPL-set reservation change, reloaded at start. No CLI verb; never hand-edited (a corrupt file is ignored and the daemon starts with empty reservation state). |
 
 The YAML conffile carries install-time and tuning knobs. The JSON files
@@ -234,7 +234,8 @@ plus the read-only Web UI when enabled.
 | `http.tls.key_file` | `""` | PKCS#8 private key matching `cert_file`. Required when `cert_file` is set. |
 | `http.tls.client_ca_file` | `""` | PEM CA bundle. When set, the listener requires a client cert signed by it (mTLS). |
 | `http.tls.extra_sans` | `[]` | Extra SANs (DNS names or IPs) baked into the auto-generated self-signed cert, beyond the built-in hostname / `localhost` / `127.0.0.1` / `::1` set. Ignored when a CA-issued cert is supplied. Editing it takes effect on the next `system regenerate-cert`. |
-| `http.webui.enabled` | `true` | Serve the read-only Web UI (issue #5): the static console at `/ui/` plus the read-only `/api/v1` GET subset, both behind the same admin password as `/sessions` + `/info`. `false` keeps only `/health` `/metrics` `/sessions` `/info`. Mutations are never exposed. |
+| `http.auth.method` | `None` | Whether the protected route group (`/sessions`, `/info`, `/ui`, read-only `/api/v1`) requires the shared web-admin password. `None` (default) serves them open — for an isolated / trusted network, the same posture `iscsi.auth.method` defaults to. `Password` requires the password (set via `system set-admin-password`) over HTTP Basic; no password configured then fails closed (503). `/health` + `/metrics` stay open regardless. Pair `Password` with `http.tls` so the secret isn't sent in clear. |
+| `http.webui.enabled` | `true` | Serve the read-only Web UI (issue #5): the static console at `/ui/` plus the read-only `/api/v1` GET subset, both under the same gate as `/sessions` + `/info` (open by default; see `http.auth.method`). `false` keeps only `/health` `/metrics` `/sessions` `/info`. Mutations are never exposed. |
 | `http.webui.asset_dir` | `""` | Directory to serve the `/ui` bundle from. Empty → the bundle embedded in the binary. Point it at the packaged `/usr/share/<product>/webui/` (or any directory) to restyle without a rebuild — edit the CSS custom-property tokens in `app.css`; a file missing from the directory falls back to the embedded copy. Path traversal out of the directory is rejected. |
 
 ### `telemetry`

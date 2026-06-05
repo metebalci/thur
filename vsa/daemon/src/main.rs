@@ -519,6 +519,7 @@ async fn main() -> Result<()> {
         .listener_config()
         .context("building HTTP listener config")?;
     let webui_cfg = cfg.http.webui_config();
+    let http_password_required = cfg.http.auth.method == shared_admin_auth::AuthMethod::Password;
 
     // iSCSI target IQN — operator override (`iscsi.target_iqn`) or the
     // per-product default. Resolved before the transport match so the
@@ -888,13 +889,22 @@ async fn main() -> Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     // Web-admin password gate (#4): seed the live verifier from
-    // <data_dir>/admin-password.json. Absent file = unconfigured (the
-    // TCP listener's protected routes fail closed); a malformed file is
-    // a hard startup error. One handle, cloned into the admin setter
-    // (AdminState) and the HTTP middleware (HttpState).
+    // <data_dir>/admin-password.json. Absent file = unconfigured (with
+    // `http.auth.method: Password` the TCP listener's protected routes
+    // fail closed); a malformed file is a hard startup error. The
+    // configured method (#92) decides whether the gate is enforced at
+    // all — default `None` serves the protected routes open. One handle,
+    // cloned into the admin setter (AdminState) and the HTTP middleware
+    // (HttpState).
     let auth_state =
         shared_admin_auth::AuthState::load_from(&shared_admin_auth::admin_password_path(&data_dir))
-            .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?
+            .with_method(cfg.http.auth.method);
+    if cfg.http.auth.method == shared_admin_auth::AuthMethod::None && auth_state.is_configured() {
+        tracing::warn!(
+            "http.auth.method is None but a web-admin password is configured; the password is NOT enforced (set http.auth.method: Password to enforce it)"
+        );
+    }
 
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
@@ -1036,7 +1046,12 @@ async fn main() -> Result<()> {
         }
         res = {
             let scheme = if http_listener_cfg.tls.is_some() { "https" } else { "http" };
-            http::log_route_table(&http_listener_cfg.listen, scheme, webui_cfg.enabled);
+            http::log_route_table(
+                &http_listener_cfg.listen,
+                scheme,
+                webui_cfg.enabled,
+                http_password_required,
+            );
             let router = http::build_router(http_state, &webui_cfg);
             shared_admin_http::run_http_server(http_listener_cfg, router)
         } => {

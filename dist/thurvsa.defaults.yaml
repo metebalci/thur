@@ -276,6 +276,18 @@ http:
     # CA-issued cert is supplied. Re-run `thurvsa system
     # regenerate-cert` after editing. Example: ["vsa.example.com", "10.0.0.5"]
     extra_sans: []
+  auth:
+    # Whether the protected route group (/sessions, /info, /ui, and the
+    # read-only /api/v1 subset) requires the shared web-admin password.
+    #   None     (default) no authentication — the routes are served
+    #            open. Intended for an isolated / trusted management
+    #            network, the same posture iscsi.auth.method defaults to.
+    #            /health + /metrics are open regardless.
+    #   Password require the single shared web-admin password over HTTP
+    #            Basic (set via `thurvsa system set-admin-password`); no
+    #            password configured then fails closed (503). Pair with
+    #            tls: above so the password isn't sent in cleartext.
+    method: None
   webui:
     # Read-only Web UI (issue #5). When true, the listener also serves
     # the static console at /ui/ and a read-only /api/v1 GET subset

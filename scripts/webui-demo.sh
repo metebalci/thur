@@ -63,6 +63,7 @@ data_dir: "$D/data"
 library: { num_slots: 40, num_drives: 2, lto_generation: 8 }
 http:
   listen: "$BIND:$PORT"
+  auth: { method: Password }
   webui:
     asset_dir: "$ASSETS"
 iscsi: { listen: "127.0.0.1:$ISCSI_PORT" }
@@ -74,6 +75,7 @@ else
 data_dir: "$D/data"
 http:
   listen: "$BIND:$PORT"
+  auth: { method: Password }
   webui:
     asset_dir: "$ASSETS"
 iscsi: { listen: "127.0.0.1:$ISCSI_PORT" }

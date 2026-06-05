@@ -30,7 +30,7 @@ use subtle::ConstantTimeEq;
 
 use crate::basic::parse_basic;
 use crate::hash::verify_phc;
-use crate::state::AuthState;
+use crate::state::{AuthMethod, AuthState};
 use crate::{REALM, WEBADMIN_USER};
 
 pub async fn require_admin_password(
@@ -39,6 +39,14 @@ pub async fn require_admin_password(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // `http.auth.method: None` — authentication disabled (trusted /
+    // isolated-network deployments). Serve the protected routes open;
+    // the network boundary is the gate. `/health` + `/metrics` are open
+    // either way.
+    if auth.method() == AuthMethod::None {
+        return next.run(req).await;
+    }
+
     let Some(phc) = auth.current() else {
         return challenge(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -160,5 +168,22 @@ mod tests {
             .unwrap_or_default();
         assert!(challenge.contains("Basic"), "got: {challenge}");
         assert!(challenge.contains(REALM), "got: {challenge}");
+    }
+
+    #[tokio::test]
+    async fn method_none_serves_open_without_credentials() {
+        // Auth disabled: no password configured, no creds presented,
+        // still 200 — the network boundary is the gate.
+        let auth = AuthState::new(None).with_method(AuthMethod::None);
+        assert_eq!(status_for(auth, None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn method_none_ignores_a_configured_password() {
+        // Password set but method None => still open (the footgun the
+        // daemon warns about at boot, asserted here at the gate level).
+        let auth = AuthState::new(Some(crate::hash::hash_password("the-password-12").unwrap()))
+            .with_method(AuthMethod::None);
+        assert_eq!(status_for(auth, None).await, StatusCode::OK);
     }
 }

@@ -538,7 +538,19 @@ struct HttpConfig {
     #[serde(default)]
     tls: HttpTlsConfig,
     #[serde(default)]
+    auth: HttpAuthConfig,
+    #[serde(default)]
     webui: HttpWebuiConfig,
+}
+
+/// `http.auth:` block. Selects whether the protected route group
+/// (`/sessions`, `/info`, `/ui`, read-only `/api/v1`) requires the
+/// shared web-admin password. Defaults to `None` (unauthenticated) —
+/// the same trusted-network posture `iscsi.auth.method` defaults to.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct HttpAuthConfig {
+    #[serde(default)]
+    method: shared_admin_auth::AuthMethod,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -581,6 +593,7 @@ impl Default for HttpConfig {
         Self {
             listen: default_http_listen(),
             tls: HttpTlsConfig::default(),
+            auth: HttpAuthConfig::default(),
             webui: HttpWebuiConfig::default(),
         }
     }
@@ -1710,13 +1723,21 @@ async fn main() -> Result<()> {
     let library_arc = std::sync::Arc::new(std::sync::Mutex::new(library));
 
     // Web-admin password gate (#4): seed the live verifier from
-    // <data_dir>/admin-password.json. Absent file = unconfigured (the
-    // TCP listener's protected routes fail closed); a malformed file is
-    // a hard startup error.
+    // <data_dir>/admin-password.json. Absent file = unconfigured (with
+    // `http.auth.method: Password` the TCP listener's protected routes
+    // fail closed); a malformed file is a hard startup error. The
+    // configured method (#92) decides whether the gate is enforced at
+    // all — default `None` serves the protected routes open.
     let auth_state = shared_admin_auth::AuthState::load_from(
         &shared_admin_auth::admin_password_path(&std::path::PathBuf::from(&cfg.data_dir)),
     )
-    .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?
+    .with_method(http_cfg.auth.method);
+    if http_cfg.auth.method == shared_admin_auth::AuthMethod::None && auth_state.is_configured() {
+        tracing::warn!(
+            "http.auth.method is None but a web-admin password is configured; the password is NOT enforced (set http.auth.method: Password to enforce it)"
+        );
+    }
 
     let daemon_state = std::sync::Arc::new(state::DaemonState::new(state::DaemonStateConfig {
         data_dir: std::path::PathBuf::from(&cfg.data_dir),
@@ -1947,7 +1968,13 @@ async fn main() -> Result<()> {
         } else {
             "http"
         };
-        http::log_route_table(&listener_cfg.listen, scheme, webui_cfg.enabled);
+        let password_required = http_cfg.auth.method == shared_admin_auth::AuthMethod::Password;
+        http::log_route_table(
+            &listener_cfg.listen,
+            scheme,
+            webui_cfg.enabled,
+            password_required,
+        );
         Some(tokio::spawn(async move {
             if let Err(e) = shared_admin_http::run_http_server(listener_cfg, router).await {
                 warn!("HTTP server error: {e:?}");
@@ -2496,6 +2523,18 @@ mod config_parse_tests {
             .expect("config with empty http block");
         let http = cfg.http.expect("http block present");
         assert_eq!(http.listen, default_http_listen());
+        // http.auth.method defaults to None — web-admin password is
+        // optional (#92).
+        assert_eq!(http.auth.method, shared_admin_auth::AuthMethod::None);
+    }
+
+    #[test]
+    fn http_auth_method_password_parses() {
+        let cfg: Config =
+            serde_yaml::from_str("data_dir: /srv/thur\nhttp:\n  auth:\n    method: Password\n")
+                .expect("config with http.auth.method");
+        let http = cfg.http.expect("http block present");
+        assert_eq!(http.auth.method, shared_admin_auth::AuthMethod::Password);
     }
 
     #[test]

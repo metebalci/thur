@@ -169,17 +169,27 @@ pub fn build_router(state: HttpState, webui: &shared_admin_webui::WebuiConfig) -
 /// Emit the per-route URL listing operators see in journalctl at boot.
 /// `scheme` is "http" or "https" — picked by the caller from whether
 /// `http.tls` is configured.
-pub fn log_route_table(listen: &str, scheme: &str, webui_enabled: bool) {
+pub fn log_route_table(listen: &str, scheme: &str, webui_enabled: bool, password_required: bool) {
     info!("HTTP server listening on {scheme}://{listen}");
+    let gate = if password_required {
+        "admin password"
+    } else {
+        "no auth"
+    };
+    if !password_required {
+        info!(
+            "  web-admin auth DISABLED (http.auth.method: None) - protected routes served open; ensure the listener is on a trusted network"
+        );
+    }
     for route in ["health", "metrics"] {
         info!("  - {route}: {scheme}://{listen}/{route}");
     }
     for route in ["sessions", "info"] {
-        info!("  - {route}: {scheme}://{listen}/{route} (admin password)");
+        info!("  - {route}: {scheme}://{listen}/{route} ({gate})");
     }
     if webui_enabled {
-        info!("  - ui: {scheme}://{listen}/ui/ (admin password)");
-        info!("  - api: {scheme}://{listen}/api/v1/* read-only (admin password)");
+        info!("  - ui: {scheme}://{listen}/ui/ ({gate})");
+        info!("  - api: {scheme}://{listen}/api/v1/* read-only ({gate})");
     }
 }
 

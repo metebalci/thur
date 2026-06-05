@@ -118,24 +118,30 @@ fan out into cloud calls.
 ## The auth dependency
 
 The Web UI does not own its own authentication. It hangs on the
-web-admin password gate that shipped first as its hard prerequisite
-(issue #4), documented in [`AUTH.md`](AUTH.md) § Admin password. That
-gate splits the listener into an **open** group — `/health` and
-`/metrics`, left unauthenticated so Prometheus scrapes and liveness
-probes keep working — and a **protected** group behind HTTP Basic
-against the single shared password. The Web UI's `/ui/*` bundle and its
-read-only `/api/v1` routes join the protected group; they are gated by
-the very same middleware and the very same in-process verifier that
-guards `/sessions` and `/info`. There is no second password and no Web
-UI login form — the browser prompts for the `webadmin` password on the
-first `401`, and the daemon's `503`-vs-`401` split lets the UI tell
-"no password has been set yet" apart from "wrong password" and show the
-operator the right next step.
+web-admin password gate (issue #4), documented in [`AUTH.md`](AUTH.md) §
+Admin password. That gate splits the listener into an **open** group —
+`/health` and `/metrics`, left unauthenticated so Prometheus scrapes and
+liveness probes keep working — and a **protected** group that carries
+`/sessions`, `/info`, the Web UI's `/ui/*` bundle, and its read-only
+`/api/v1` routes. The Web UI joins the protected group through the very
+same middleware and in-process verifier that guards `/sessions` and
+`/info`; there is no second password and no Web UI login form.
+
+Whether that protected group is actually gated is the operator's choice,
+via `http.auth.method` (see [`AUTH.md`](AUTH.md) § _The gate is
+optional_). The **default is `None`**: the read-only console is served
+open, on the assumption that the management listener sits on an isolated
+or trusted network — the same posture the iSCSI data plane defaults to,
+and a smaller exposure since the UI is read-only metadata. Setting
+`http.auth.method: Password` turns the gate on: the browser prompts for
+the `webadmin` password on the first `401`, and the daemon's
+`503`-vs-`401` split lets the UI tell "no password has been set yet"
+apart from "wrong password."
 
 Because HTTP Basic ships credentials base64-encoded rather than
-encrypted, the standing recommendation from [`AUTH.md`](AUTH.md) applies
-here too: enable the admin HTTP TLS listener (`http.tls.*`) before
-relying on the gate over anything but loopback.
+encrypted, when you do enable the gate the standing recommendation from
+[`AUTH.md`](AUTH.md) applies: enable the admin HTTP TLS listener
+(`http.tls.*`) before relying on the password over anything but loopback.
 
 ## Where the code lives
 

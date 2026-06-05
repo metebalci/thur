@@ -93,6 +93,10 @@ $(yaml_vtl_library 40 2 8)
 
 http:
   listen: "127.0.0.1:$HTTP_PORT"
+  # auth.method defaults to None (#92); the gate + webui tests below
+  # exercise the password path, so opt into it explicitly here.
+  auth:
+    method: Password
 
 $(yaml_iscsi "$TARGET_IQN")
 

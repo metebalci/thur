@@ -17,18 +17,52 @@ use arc_swap::ArcSwapOption;
 
 use crate::store::AdminPasswordFile;
 
-/// Cheap-to-clone handle to the current Argon2id PHC string (or `None`).
+/// Whether the protected TCP route group requires the shared web-admin
+/// password. Mirrors the opt-out shape of `iscsi.auth.method`: `None`
+/// is the default (no authentication — the trusted / isolated-network
+/// posture unauthenticated iSCSI also defaults to), `Password` turns
+/// the gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+pub enum AuthMethod {
+    /// No authentication: the protected routes (`/sessions`, `/info`,
+    /// `/ui`, read-only `/api/v1`) are served open. `/health` +
+    /// `/metrics` are unauthenticated regardless.
+    #[default]
+    None,
+    /// Require the single shared web-admin password over HTTP Basic
+    /// (synthetic `webadmin` user). No password configured =>
+    /// fail-closed 503.
+    Password,
+}
+
+/// Cheap-to-clone handle to the current Argon2id PHC string (or `None`),
+/// plus the configured [`AuthMethod`].
 #[derive(Clone)]
 pub struct AuthState {
     inner: Arc<ArcSwapOption<String>>,
+    method: AuthMethod,
 }
 
 impl AuthState {
     /// Construct from an already-resolved PHC (or `None` when unset).
+    /// The auth method defaults to [`AuthMethod::Password`]; the daemon
+    /// overrides it from `http.auth.method` via `with_method`.
     pub fn new(phc: Option<String>) -> Self {
         Self {
             inner: Arc::new(ArcSwapOption::from(phc.map(Arc::new))),
+            method: AuthMethod::Password,
         }
+    }
+
+    /// Set the auth method (from the resolved `http.auth.method`).
+    pub fn with_method(mut self, method: AuthMethod) -> Self {
+        self.method = method;
+        self
+    }
+
+    /// The configured auth method.
+    pub fn method(&self) -> AuthMethod {
+        self.method
     }
 
     /// Seed from the on-disk store at boot. A missing file yields an
@@ -106,5 +140,18 @@ mod tests {
             s.current().as_deref().map(String::as_str),
             Some("$argon2id$v=19$seeded")
         );
+    }
+
+    #[test]
+    fn auth_method_default_is_none() {
+        assert_eq!(AuthMethod::default(), AuthMethod::None);
+    }
+
+    #[test]
+    fn method_defaults_to_password_and_with_method_overrides() {
+        let s = AuthState::new(None);
+        assert_eq!(s.method(), AuthMethod::Password);
+        let s = s.with_method(AuthMethod::None);
+        assert_eq!(s.method(), AuthMethod::None);
     }
 }

@@ -569,7 +569,19 @@ pub struct HttpSettings {
     #[serde(default)]
     pub tls: HttpTlsSettings,
     #[serde(default)]
+    pub auth: HttpAuthSettings,
+    #[serde(default)]
     pub webui: HttpWebuiSettings,
+}
+
+/// `http.auth:` block. Selects whether the protected route group
+/// (`/sessions`, `/info`, `/ui`, read-only `/api/v1`) requires the
+/// shared web-admin password. Defaults to `None` (unauthenticated) —
+/// the same trusted-network posture `iscsi.auth.method` defaults to.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct HttpAuthSettings {
+    #[serde(default)]
+    pub method: shared_admin_auth::AuthMethod,
 }
 
 /// TLS knobs for the admin HTTP listener. All three default to
@@ -730,6 +742,26 @@ data_dir: /var/lib/thurvsa
         assert!(!cfg.iscsi.auth.method.is_chap());
         assert!(cfg.audit.enabled);
         assert!(cfg.audit.dir.is_none());
+        // http.auth.method defaults to None — the web-admin password is
+        // optional (#92), unauthenticated on a trusted network.
+        assert_eq!(cfg.http.auth.method, shared_admin_auth::AuthMethod::None);
+    }
+
+    #[test]
+    fn loads_http_auth_method_password() {
+        let f = write_config(
+            r#"
+data_dir: /var/lib/thurvsa
+http:
+  auth:
+    method: Password
+"#,
+        );
+        let cfg = DaemonConfig::load(f.path()).expect("load ok");
+        assert_eq!(
+            cfg.http.auth.method,
+            shared_admin_auth::AuthMethod::Password
+        );
     }
 
     #[test]

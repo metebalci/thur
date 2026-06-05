@@ -81,7 +81,7 @@ create_test_config() {
     mkdir -p "$TEST_DIR/data/volumes"
 
     cat > "$TEST_CONFIG" <<EOFCONFIG
-$(yaml_header)
+$(yaml_header Password)
 
 $(yaml_iscsi)
 

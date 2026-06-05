@@ -1207,11 +1207,14 @@ kernel hands the daemon the connecting process's uid/gid over
 `SO_PEERCRED`, so membership in the daemon's group is the credential and
 nothing crosses the network. The HTTP listener has none of that. It is a
 TCP socket reachable from anywhere the operator pointed it, so there is
-no peer identity to trust. Until now that was acceptable only because the
-listener exposed nothing but read-only status — but the Web UI (issue #5
-read-only, #91 mutating) needs a real gate in front of it. The admin
-password is that gate, and it is the hard prerequisite the Web UI builds
-on.
+no peer identity to trust. What it serves is read-only — live session
+and topology status plus the read-only Web UI (issue #5; mutating forms
+were considered and rejected, issue #91) — but read-only is not the same
+as public: the audit tail, session identities, and inventory it exposes
+are confidential. The admin password is the gate that keeps them off an
+open TCP port. It is **optional** (see _The gate is optional_ below): on
+an isolated management network the network itself is the boundary, the
+same posture the unauthenticated iSCSI data plane defaults to.
 
 The model is deliberately the one a network printer or a home router
 uses: a **single shared password**, not a directory of accounts. There
@@ -1256,24 +1259,52 @@ else:
 { "phc": "<Argon2id PHC string>", "updated_at": "<RFC3339>" }
 ```
 
-An **absent file means no password is configured**, and the gate fails
-closed in that state — see the 503 verdict below. There is no plaintext
-anywhere in the file, so a stolen `admin-password.json` yields only an
-Argon2id hash to grind, not the password.
+An **absent file means no password is configured**, and when the gate is
+enabled (`http.auth.method: Password`) it fails closed in that state —
+see the 503 verdict below. There is no plaintext anywhere in the file, so
+a stolen `admin-password.json` yields only an Argon2id hash to grind, not
+the password.
+
+### The gate is optional (`http.auth.method`)
+
+Whether the protected routes actually require the password is controlled
+by `http.auth.method`, which mirrors the opt-out shape of
+`iscsi.auth.method`:
+
+- **`None` (default)** — no authentication; the protected routes are
+  served open. This is the right setting when the listener lives on an
+  isolated / trusted management network, where the network boundary is
+  the gate — the same default the iSCSI data plane uses
+  (`iscsi.auth.method: None`), and a far smaller exposure than
+  unauthenticated iSCSI, since the HTTP surface is read-only metadata,
+  not bulk data. `/health` + `/metrics` are open either way.
+- **`Password`** — require the single shared web-admin password over
+  HTTP Basic. With no password configured the gate fails closed (503).
+  Pair it with `http.tls` (below) so the password is not sent in clear.
+
+Because the default is `None`, a fresh install serves its read-only
+console without a password. The **method**, not the presence of a
+password file, is what turns the gate on: if you set a password but leave
+`http.auth.method: None`, the password is *not* enforced and the daemon
+warns about that at startup.
 
 ### Open vs protected routes
 
-With the password in place the HTTP listener splits its router into two
-groups:
+The HTTP listener always splits its router into two groups; whether the
+protected group is gated depends on `http.auth.method` above:
 
 - **Open**, unauthenticated: `/health` and `/metrics`. These stay open
   so a Prometheus scrape and a liveness probe keep working without
   credentials, exactly as before.
-- **Protected**, gated by HTTP Basic: everything else — today `/sessions`
-  and `/info`, tomorrow the Web UI's `/ui` and read-only `/api/v1`.
+- **Protected**: everything else — `/sessions`, `/info`, and the
+  read-only Web UI (`/ui` + the read-only `/api/v1` GET subset). Gated by
+  HTTP Basic only when `http.auth.method: Password`; under the default
+  `None` it is served open.
 
-The Basic challenge uses the fixed username `webadmin` and the realm
-`thur admin`. The middleware returns one of three verdicts:
+When `http.auth.method: Password`, the Basic challenge uses the fixed
+username `webadmin` and the realm `thur admin`, and the middleware
+returns one of three verdicts (under `None` the protected group passes
+through unconditionally):
 
 | State | Response |
 | --- | --- |
@@ -1285,8 +1316,10 @@ The `503`-versus-`401` split is deliberate, so an operator can tell
 "the appliance has no admin password set yet" apart from "I typed the
 wrong password." On a valid request the middleware also stamps a
 `shared_audit::AuditActor::rest("webadmin", <peer ip:port>)` descriptor
-into the request extensions, which the future Web UI mutating handlers
-(issue #91) will read to attribute the audited action.
+into the request extensions. It is currently unconsumed — the Web UI is
+read-only, so nothing on the TCP listener performs an audited mutation
+(mutating forms were rejected, issue #91); the descriptor stays in place
+in case a future authenticated write path needs to attribute itself.
 
 **Behavior change.** `/sessions` and `/info` were *unauthenticated*
 before this landed; they are now behind the gate. That is intended —

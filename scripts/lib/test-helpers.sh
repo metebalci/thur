@@ -265,6 +265,11 @@ parse_common_daemon_args() {
 # -----------------------------------------------------------------------
 
 # Universal pair: data_dir + http.listen.
+# data_dir + http.listen header. Optional $1 sets http.auth.method
+# (e.g. "Password" to gate the management listener). Omitted leaves the
+# product default — None (#92), unauthenticated, so tests that read
+# /sessions etc. without credentials get them open; the gate tests that
+# need 503/401 pass "Password" explicitly.
 yaml_header() {
     cat <<EOFY
 data_dir: "$TEST_DIR/data"
@@ -272,6 +277,12 @@ data_dir: "$TEST_DIR/data"
 http:
   listen: "127.0.0.1:$HTTP_PORT"
 EOFY
+    if [[ -n "${1:-}" ]]; then
+        cat <<EOFY
+  auth:
+    method: $1
+EOFY
+    fi
 }
 
 # iscsi.listen + optional target_iqn (omitted if no arg given).
