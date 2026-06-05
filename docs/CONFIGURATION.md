@@ -224,7 +224,8 @@ state from its backend and reports held cartridges separately.
 
 ### `http`
 
-The HTTP listener serves the health, metrics, and status endpoints.
+The HTTP listener serves the health, metrics, and status endpoints,
+plus the read-only Web UI when enabled.
 
 | Key | Default | Description |
 |---|---|---|
@@ -233,6 +234,8 @@ The HTTP listener serves the health, metrics, and status endpoints.
 | `http.tls.key_file` | `""` | PKCS#8 private key matching `cert_file`. Required when `cert_file` is set. |
 | `http.tls.client_ca_file` | `""` | PEM CA bundle. When set, the listener requires a client cert signed by it (mTLS). |
 | `http.tls.extra_sans` | `[]` | Extra SANs (DNS names or IPs) baked into the auto-generated self-signed cert, beyond the built-in hostname / `localhost` / `127.0.0.1` / `::1` set. Ignored when a CA-issued cert is supplied. Editing it takes effect on the next `system regenerate-cert`. |
+| `http.webui.enabled` | `true` | Serve the read-only Web UI (issue #5): the static console at `/ui/` plus the read-only `/api/v1` GET subset, both behind the same admin password as `/sessions` + `/info`. `false` keeps only `/health` `/metrics` `/sessions` `/info`. Mutations are never exposed. |
+| `http.webui.asset_dir` | `""` | Directory to serve the `/ui` bundle from. Empty → the bundle embedded in the binary. Point it at the packaged `/usr/share/<product>/webui/` (or any directory) to restyle without a rebuild — edit the CSS custom-property tokens in `app.css`; a file missing from the directory falls back to the embedded copy. Path traversal out of the directory is rejected. |
 
 ### `telemetry`
 

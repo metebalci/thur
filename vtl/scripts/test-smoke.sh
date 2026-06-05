@@ -400,6 +400,56 @@ test_http_info() {
     fi
 }
 
+# Test: read-only Web UI (#5).
+#
+# Runs after the admin-password gate, so ADMIN_PW is set. Asserts the
+# static /ui bundle (embedded — no asset_dir in the smoke config) and a
+# read-only /api/v1 data probe are both behind the gate: 401 without
+# creds, 200 with. Also checks the served Content-Type so a future
+# refactor that drops it is caught.
+test_webui() {
+    log_test "Testing read-only Web UI..."
+
+    # Static /ui/ — gated.
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/ui/")
+    if [ "$code" != "401" ]; then
+        log_error "✗ /ui/ should be 401 without creds, got $code"
+        return 1
+    fi
+    local index
+    index=$(curl -s -u "webadmin:$ADMIN_PW" "http://127.0.0.1:$HTTP_PORT/ui/")
+    if ! echo "$index" | grep -q "data-product"; then
+        log_error "✗ /ui/ did not serve index.html. Response head: $(echo "$index" | head -c 120)"
+        return 1
+    fi
+
+    # app.css — gated, text/css.
+    local ctype
+    ctype=$(curl -s -D - -o /dev/null -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/ui/app.css" | grep -i "^content-type:")
+    if ! echo "$ctype" | grep -qi "text/css"; then
+        log_error "✗ /ui/app.css wrong content-type: $ctype"
+        return 1
+    fi
+
+    # Read-only API probe — 401 without creds, 200 with.
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/api/v1/library/info")
+    if [ "$code" != "401" ]; then
+        log_error "✗ /api/v1/library/info should be 401 without creds, got $code"
+        return 1
+    fi
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/api/v1/library/info")
+    if [ "$code" != "200" ]; then
+        log_error "✗ /api/v1/library/info should be 200 with creds, got $code"
+        return 1
+    fi
+
+    log_info "✓ Web UI served /ui + read-only /api/v1 behind the gate"
+    return 0
+}
+
 # Test: HTTPS auto-gen + load-existing.
 #
 # Stops the running daemon, restarts it with an http.tls block whose
@@ -753,6 +803,7 @@ main() {
         "test_http_admin_password_gate"
         "test_http_sessions"
         "test_http_info"
+        "test_webui"
         "test_connection_stability"
         "test_audit_log_writes"
         "test_audit_export"

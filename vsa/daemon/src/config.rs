@@ -568,6 +568,8 @@ pub struct HttpSettings {
     pub listen: Option<String>,
     #[serde(default)]
     pub tls: HttpTlsSettings,
+    #[serde(default)]
+    pub webui: HttpWebuiSettings,
 }
 
 /// TLS knobs for the admin HTTP listener. All three default to
@@ -586,6 +588,29 @@ pub struct HttpTlsSettings {
     pub extra_sans: Vec<String>,
 }
 
+/// `http.webui:` block. Gates the read-only Web UI (issue #5) on the
+/// TCP listener; defaults to enabled with the embedded asset bundle.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpWebuiSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub asset_dir: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for HttpWebuiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            asset_dir: String::new(),
+        }
+    }
+}
+
 impl HttpSettings {
     /// Coerce the YAML block into the `shared-admin-http` listener
     /// config. Fails fast at boot if the TLS triple is in a half-set
@@ -602,6 +627,15 @@ impl HttpSettings {
             .clone()
             .unwrap_or_else(|| crate::http::DEFAULT_HTTP_LISTEN_ADDRESS.to_string());
         Ok(shared_admin_http::HttpListenerConfig { listen, tls })
+    }
+
+    /// Resolve the `http.webui:` block into the shared
+    /// [`shared_admin_webui::WebuiConfig`].
+    pub fn webui_config(&self) -> shared_admin_webui::WebuiConfig {
+        shared_admin_webui::WebuiConfig {
+            enabled: self.webui.enabled,
+            asset_dir: std::path::PathBuf::from(&self.webui.asset_dir),
+        }
     }
 }
 

@@ -276,6 +276,19 @@ http:
     # CA-issued cert is supplied. Re-run `thurvsa system
     # regenerate-cert` after editing. Example: ["vsa.example.com", "10.0.0.5"]
     extra_sans: []
+  webui:
+    # Read-only Web UI (issue #5). When true, the listener also serves
+    # the static console at /ui/ and a read-only /api/v1 GET subset
+    # (volume list / info / snapshots, monitor snapshot, recent jobs,
+    # audit tail) — all behind the same admin password as /sessions +
+    # /info. /health + /metrics stay open. Set false to keep only
+    # /health /metrics /sessions /info. Mutations are not exposed.
+    enabled: true
+    # Directory to serve the /ui bundle from. Empty -> the bundle
+    # embedded in the binary. Point this at a directory (e.g. the
+    # packaged /usr/share/thurvsa/webui/) to restyle without rebuilding;
+    # a file missing from it falls back to the embedded copy.
+    asset_dir: ""
 
 # Storage backends. Workspace-wide tuning knobs (compression, upload
 # concurrency, retention-mode check) plus the named backend

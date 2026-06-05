@@ -1,0 +1,35 @@
+[package]
+name = "shared-admin-webui"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# Read-only Web UI (issue #5) embedded in both daemons' TCP HTTP
+# listeners. Owns the static `/ui/*` bundle (served from a configurable
+# `asset_dir` with an `include_dir!` embedded fallback) and the
+# cross-product read-only `/api/v1` handlers (audit tail, recent jobs,
+# monitor snapshot). The auth gate itself is #4's `shared-admin-auth`,
+# consumed directly. Mutating handlers are out of scope (issue #91).
+
+[dependencies]
+shared-admin-auth = { path = "../admin-auth" }
+shared-admin-monitor = { path = "../admin-monitor" }
+shared-admin-server = { path = "../admin-server" }
+shared-audit = { path = "../audit" }
+
+axum = "0.7"
+include_dir = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `tokio::fs::read` for the on-disk asset override; `spawn_blocking`
+# wraps the synchronous `shared_audit::read_entries` walk.
+tokio = { version = "1", features = ["fs", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"

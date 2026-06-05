@@ -61,6 +61,14 @@ impl HasJobs for AdminState {
     }
 }
 
+// Lets the Web UI's read-only `/api/v1/audit/tail` handler reach the
+// daemon's audit-log directory.
+impl shared_admin_webui::AuditLogDir for AdminState {
+    fn audit_log_dir(&self) -> PathBuf {
+        self.daemon.audit_dir.clone()
+    }
+}
+
 /// Build the product router (cartridges / library / changer /
 /// drives / system / health) and hand it off to the shared
 /// transport runner.
@@ -127,10 +135,7 @@ pub async fn run_admin_server(socket_path: PathBuf, daemon_state: Arc<DaemonStat
             post(handlers::system_reset_stats),
         )
         // web-admin password (issue #4) — daemon hashes server-side
-        .route(
-            "/api/v1/system/admin-password",
-            post(admin_password::set),
-        )
+        .route("/api/v1/system/admin-password", post(admin_password::set))
         // iSCSI CHAP users
         .route(
             "/api/v1/iscsi/users",

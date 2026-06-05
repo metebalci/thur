@@ -9,6 +9,7 @@ members = [
     "shared/admin-monitor",
     "shared/admin-proto",
     "shared/admin-server",
+    "shared/admin-webui",
     "shared/alerting",
     "shared/audit",
     "shared/cli",

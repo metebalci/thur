@@ -38,6 +38,8 @@ use shared_iscsi::session::SessionManager;
 use shared_telemetry::Telemetry;
 use tracing::info;
 
+use crate::admin::handlers::{self, AdminState};
+use crate::admin::snapshots;
 use crate::registry::VolumeRegistry;
 
 /// Default TCP listen address for the HTTP server. Distinct from
@@ -58,6 +60,11 @@ pub struct HttpState {
     /// the admin socket's `set-admin-password` setter writes. Drives the
     /// `require_admin_password` middleware on the protected route group.
     pub auth: shared_admin_auth::AuthState,
+    /// The admin state, also handed to the Unix admin socket. The Web
+    /// UI's read-only `/api/v1` GET subset (issue #5) runs against it;
+    /// only GET handlers are mounted on the TCP listener, so the surface
+    /// stays read-only (mutating handlers take `PeerCred`).
+    pub admin: AdminState,
 }
 
 // Lets the shared `/metrics` handler (in `shared_telemetry::http`)
@@ -96,14 +103,20 @@ impl FromRef<HttpState> for SessionsState {
 /// Construct the axum Router for the daemon's TCP HTTP listener.
 /// `shared-admin-http` owns the bind/serve glue.
 ///
-/// Two route groups: `open` (`/health` + `/metrics`, unauthenticated
-/// for liveness probes + Prometheus scrape) and `protected` (everything
-/// else), gated by the web-admin password (#4) via
-/// [`shared_admin_auth::require_admin_password`]. Closed-by-default —
-/// new routes go on `protected` and are gated automatically.
-/// `/sessions` and `/info` are on `protected` because they expose the
-/// target IQN, listen addresses, and volume topology.
-pub fn build_router(state: HttpState) -> Router {
+/// Route groups, all merged into one listener:
+/// - `open` (`/health` + `/metrics`) — unauthenticated, for liveness
+///   probes + Prometheus scrape.
+/// - `protected` (`/sessions`, `/info`) — gated by the web-admin
+///   password (#4) via [`shared_admin_auth::require_admin_password`];
+///   they expose the target IQN, listen addresses, and volume topology.
+/// - When `webui.enabled`: the read-only `/api/v1` GET subset (volume
+///   list / info / snapshots + the cross-product monitor / jobs / audit
+///   handlers from `shared-admin-webui`) plus the static `/ui` bundle,
+///   all gated by the same password. The read-only API runs against
+///   [`AdminState`] — the same state the admin socket uses — but only
+///   GET handlers are mounted, so the TCP surface stays read-only
+///   (mutating handlers take `PeerCred` and are never mounted here).
+pub fn build_router(state: HttpState, webui: &shared_admin_webui::WebuiConfig) -> Router {
     let auth = state.auth.clone();
 
     let open = Router::new()
@@ -115,24 +128,58 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/sessions", get(shared_iscsi::http::sessions_handler))
         .route("/info", get(info_handler))
         .route_layer(axum::middleware::from_fn_with_state(
-            auth,
+            auth.clone(),
             shared_admin_auth::require_admin_password,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    open.merge(protected)
+    let mut router = open.merge(protected);
+
+    if webui.enabled {
+        let admin = state.admin.clone();
+        let api = Router::new()
+            .route("/api/v1/volumes", get(handlers::list))
+            .route("/api/v1/volumes/:name", get(handlers::info))
+            .route("/api/v1/volumes/:name/snapshots", get(snapshots::list))
+            .route(
+                "/api/v1/monitor",
+                get(shared_admin_webui::monitor_snapshot_handler::<AdminState>),
+            )
+            .route(
+                "/api/v1/jobs/recent",
+                get(shared_admin_webui::jobs_recent_handler::<AdminState>),
+            )
+            .route(
+                "/api/v1/audit/tail",
+                get(shared_admin_webui::audit_tail_handler::<AdminState>),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                shared_admin_auth::require_admin_password,
+            ))
+            .with_state(admin);
+        router = router
+            .merge(api)
+            .merge(shared_admin_webui::webui_router(webui, auth));
+    }
+
+    router
 }
 
 /// Emit the per-route URL listing operators see in journalctl at boot.
 /// `scheme` is "http" or "https" — picked by the caller from whether
 /// `http.tls` is configured.
-pub fn log_route_table(listen: &str, scheme: &str) {
+pub fn log_route_table(listen: &str, scheme: &str, webui_enabled: bool) {
     info!("HTTP server listening on {scheme}://{listen}");
     for route in ["health", "metrics"] {
         info!("  - {route}: {scheme}://{listen}/{route}");
     }
     for route in ["sessions", "info"] {
         info!("  - {route}: {scheme}://{listen}/{route} (admin password)");
+    }
+    if webui_enabled {
+        info!("  - ui: {scheme}://{listen}/ui/ (admin password)");
+        info!("  - api: {scheme}://{listen}/api/v1/* read-only (admin password)");
     }
 }
 
@@ -141,6 +188,7 @@ pub fn log_route_table(listen: &str, scheme: &str) {
 /// reach the target. Per-volume detail stays on the admin socket.
 async fn info_handler(State(state): State<HttpState>) -> impl IntoResponse {
     Json(serde_json::json!({
+        "product": "thurvsa",
         "volume_count": state.registry.len(),
         "iqn": state.target_iqn,
         "listen_addresses": state.listen_addresses,

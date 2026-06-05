@@ -180,6 +180,53 @@ test_http_metrics() {
     fi
 }
 
+# Test: read-only Web UI (#5).
+#
+# Runs after the admin-password gate (ADMIN_PW set) and a volume create.
+# Asserts the static /ui bundle (embedded — no asset_dir in the smoke
+# config) and the read-only /api/v1/volumes probe are both behind the
+# gate: 401 without creds, 200 with. Also checks the served
+# Content-Type.
+test_webui() {
+    log_test "Testing read-only Web UI..."
+
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/ui/")
+    if [ "$code" != "401" ]; then
+        log_error "/ui/ should be 401 without creds, got $code"
+        return 1
+    fi
+    local index
+    index=$(curl -s -u "webadmin:$ADMIN_PW" "http://127.0.0.1:$HTTP_PORT/ui/")
+    if ! echo "$index" | grep -q "data-product"; then
+        log_error "/ui/ did not serve index.html. Response head: $(echo "$index" | head -c 120)"
+        return 1
+    fi
+
+    local ctype
+    ctype=$(curl -s -D - -o /dev/null -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/ui/app.css" | grep -i "^content-type:")
+    if ! echo "$ctype" | grep -qi "text/css"; then
+        log_error "/ui/app.css wrong content-type: $ctype"
+        return 1
+    fi
+
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HTTP_PORT/api/v1/volumes")
+    if [ "$code" != "401" ]; then
+        log_error "/api/v1/volumes should be 401 without creds, got $code"
+        return 1
+    fi
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "webadmin:$ADMIN_PW" \
+        "http://127.0.0.1:$HTTP_PORT/api/v1/volumes")
+    if [ "$code" != "200" ]; then
+        log_error "/api/v1/volumes should be 200 with creds, got $code"
+        return 1
+    fi
+
+    log_info "Web UI served /ui + read-only /api/v1 behind the gate"
+    return 0
+}
+
 # Pre-start: no volumes => REPORT LUNS empty, so issue INQUIRY against
 # LUN 0 only AFTER we've created a volume below.
 test_volume_create() {
@@ -522,6 +569,7 @@ main() {
         "test_volume_create"
         "test_volume_list"
         "test_volume_info"
+        "test_webui"
         "test_iscsi_inquiry"
         "test_volume_destroy"
         "test_audit_log_writes"

@@ -22,6 +22,7 @@ shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
 shared-admin-monitor = { path = "../../shared/admin-monitor" }
 shared-admin-server = { path = "../../shared/admin-server" }
+shared-admin-webui = { path = "../../shared/admin-webui" }
 shared-alerting = { path = "../../shared/alerting", features = ["http"] }
 shared-audit = { path = "../../shared/audit" }
 shared-object-store = { path = "../../shared/object-store" }

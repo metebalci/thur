@@ -171,7 +171,11 @@ pub async fn run_monitor<S: MonitorState>(emitter: JobEmitter, _body: serde_json
     }
 }
 
-fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
+/// Compose one [`MonitorSnapshot`] from the current state. The tick
+/// loop calls this once per second; the Web UI's single-shot
+/// `/api/v1/monitor` handler (`shared-admin-webui`) calls it once per
+/// request, which is why it's `pub`.
+pub fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
     let live = state.live_stats();
     let snap = live.snapshot();
     let ts_unix = SystemTime::now()

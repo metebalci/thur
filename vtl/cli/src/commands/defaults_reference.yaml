@@ -413,6 +413,19 @@ http:
     # CA-issued cert is supplied. Re-run `thurvtl system
     # regenerate-cert` after editing. Example: ["vtl.example.com", "10.0.0.5"]
     extra_sans: []
+  webui:
+    # Read-only Web UI (issue #5). When true, the listener also serves
+    # the static console at /ui/ and a read-only /api/v1 GET subset
+    # (library / cartridge / drive inventory, monitor snapshot, recent
+    # jobs, audit tail) — all behind the same admin password as
+    # /sessions + /info. /health + /metrics stay open. Set false to keep
+    # only /health /metrics /sessions /info. Mutations are not exposed.
+    enabled: true
+    # Directory to serve the /ui bundle from. Empty -> the bundle
+    # embedded in the binary. Point this at a directory (e.g. the
+    # packaged /usr/share/thurvtl/webui/) to restyle without rebuilding;
+    # a file missing from it falls back to the embedded copy.
+    asset_dir: ""
 
 # Telemetry. The daemon instruments once on the OpenTelemetry SDK and
 # exposes two parallel readers off the same MeterProvider:

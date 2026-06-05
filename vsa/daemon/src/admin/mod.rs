@@ -63,6 +63,14 @@ impl HasJobs for AdminState {
     }
 }
 
+// Lets the Web UI's read-only `/api/v1/audit/tail` handler reach the
+// daemon's audit-log directory.
+impl shared_admin_webui::AuditLogDir for AdminState {
+    fn audit_log_dir(&self) -> std::path::PathBuf {
+        self.audit_dir.clone()
+    }
+}
+
 /// Build the product router, merge in the shared jobs router, and
 /// hand the result off to the shared transport runner.
 pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result<()> {
@@ -200,10 +208,7 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             post(nvmetcp_dhchap::clear_ctrl_key),
         )
         // web-admin password (issue #4) — daemon hashes server-side
-        .route(
-            "/api/v1/system/admin-password",
-            post(admin_password::set),
-        )
+        .route("/api/v1/system/admin-password", post(admin_password::set))
         .with_state(state.clone());
 
     let jobs = shared_admin_server::jobs_router(state, |kind, body, emitter, st| {

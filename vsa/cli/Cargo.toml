@@ -51,6 +51,13 @@ assets = [
     ["../../README.md", "usr/share/doc/thurvsa/README.md", "644"],
     ["../../dist/thurvsa-completion.bash", "usr/share/bash-completion/completions/thurvsa", "644"],
     ["../../dist/thurvsa-completion.zsh", "usr/share/zsh/site-functions/_thurvsa", "644"],
+    # Read-only Web UI bundle (issue #5). The daemon also embeds these
+    # via `include_dir!`, so the package copy is purely the on-disk
+    # `http.webui.asset_dir` restyle target. Enumerated file-by-file
+    # (RPM globbing is unreliable).
+    ["../../shared/admin-webui/assets/index.html", "usr/share/thurvsa/webui/index.html", "644"],
+    ["../../shared/admin-webui/assets/app.css", "usr/share/thurvsa/webui/app.css", "644"],
+    ["../../shared/admin-webui/assets/app.js", "usr/share/thurvsa/webui/app.js", "644"],
     # Man pages. cargo-deb auto-gzips files under `usr/share/man/` to
     # satisfy Debian Policy 12.1 (`man-page-not-compressed` lintian
     # check), so we ship the .1 / .8 sources here and let the tooling
@@ -92,6 +99,11 @@ assets = [
     { source = "../../README.md", dest = "/usr/share/doc/thurvsa/README.md", mode = "644", doc = true },
     { source = "../../dist/thurvsa-completion.bash", dest = "/usr/share/bash-completion/completions/thurvsa", mode = "644" },
     { source = "../../dist/thurvsa-completion.zsh", dest = "/usr/share/zsh/site-functions/_thurvsa", mode = "644" },
+    # Read-only Web UI bundle (issue #5) — on-disk restyle target for
+    # `http.webui.asset_dir`; the daemon embeds the same files.
+    { source = "../../shared/admin-webui/assets/index.html", dest = "/usr/share/thurvsa/webui/index.html", mode = "644" },
+    { source = "../../shared/admin-webui/assets/app.css", dest = "/usr/share/thurvsa/webui/app.css", mode = "644" },
+    { source = "../../shared/admin-webui/assets/app.js", dest = "/usr/share/thurvsa/webui/app.js", mode = "644" },
     # Man pages — RPM's brp-compress macro auto-gzips files installed
     # under /usr/share/man/ at build time.
     { source = "../../dist/thurvsa.1", dest = "/usr/share/man/man1/thurvsa.1", mode = "644", doc = true },

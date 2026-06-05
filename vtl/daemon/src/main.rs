@@ -537,6 +537,8 @@ struct HttpConfig {
     listen: String,
     #[serde(default)]
     tls: HttpTlsConfig,
+    #[serde(default)]
+    webui: HttpWebuiConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -551,6 +553,25 @@ struct HttpTlsConfig {
     extra_sans: Vec<String>,
 }
 
+/// `http.webui:` block. Gates the read-only Web UI (issue #5) on the
+/// TCP listener; defaults to enabled with the embedded asset bundle.
+#[derive(Debug, Deserialize, Clone)]
+struct HttpWebuiConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    asset_dir: String,
+}
+
+impl Default for HttpWebuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            asset_dir: String::new(),
+        }
+    }
+}
+
 fn default_http_listen() -> String {
     "0.0.0.0:9090".to_string()
 }
@@ -560,6 +581,7 @@ impl Default for HttpConfig {
         Self {
             listen: default_http_listen(),
             tls: HttpTlsConfig::default(),
+            webui: HttpWebuiConfig::default(),
         }
     }
 }
@@ -579,6 +601,15 @@ impl HttpConfig {
             listen: self.listen.clone(),
             tls,
         })
+    }
+
+    /// Resolve the `http.webui:` block into the shared
+    /// [`shared_admin_webui::WebuiConfig`].
+    fn webui_config(&self) -> shared_admin_webui::WebuiConfig {
+        shared_admin_webui::WebuiConfig {
+            enabled: self.webui.enabled,
+            asset_dir: std::path::PathBuf::from(&self.webui.asset_dir),
+        }
     }
 }
 
@@ -1901,6 +1932,7 @@ async fn main() -> Result<()> {
     // auto-gen) live in `shared-admin-http`; this module only
     // builds the per-product Router.
     let listener_cfg = http_cfg.listener_config()?;
+    let webui_cfg = http_cfg.webui_config();
     let http_server_handle = {
         info!("Starting unified HTTP server");
         let metrics_arc = std::sync::Arc::new(metrics.clone());
@@ -1909,13 +1941,13 @@ async fn main() -> Result<()> {
             metrics: metrics_arc,
             daemon_state: daemon_state_for_http,
         };
-        let router = http::build_router(state);
+        let router = http::build_router(state, &webui_cfg);
         let scheme = if listener_cfg.tls.is_some() {
             "https"
         } else {
             "http"
         };
-        http::log_route_table(&listener_cfg.listen, scheme);
+        http::log_route_table(&listener_cfg.listen, scheme, webui_cfg.enabled);
         Some(tokio::spawn(async move {
             if let Err(e) = shared_admin_http::run_http_server(listener_cfg, router).await {
                 warn!("HTTP server error: {e:?}");

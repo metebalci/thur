@@ -98,8 +98,29 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
     it server-side (the plaintext never lands on disk and never leaves
     the host), swaps `AuthState`, persists the store, and emits the
     `system.admin_password.set` audit op (params carry no secret).
-  Consumed by both daemons today and by the future
-  `shared-admin-webui` (#5).
+  Consumed by both daemons today and by `shared-admin-webui` (#5),
+  which reuses `AuthState` + `require_admin_password` directly.
+- **shared-admin-webui** — the read-only Web UI (issue #5) embedded in
+  both daemons. Owns the static `/ui/*` bundle and the genuinely
+  cross-product read-only `/api/v1` GET handlers. Sibling of
+  `shared-admin-iscsi` / `shared-admin-auth`; kept out of
+  `shared-admin-http` so that crate stays transport-only.
+  - `static_serve.rs` — asset resolution for `/ui`: `include_dir!`
+    embedded bundle with an optional on-disk `asset_dir` override
+    (operator restyle target), plus the traversal guard that rejects
+    `..` / absolute / empty path segments before either lookup.
+  - `lib.rs` — `WebuiConfig`, the `webui_router(cfg, auth)` assembly
+    (the static routes gated by #4's `require_admin_password`), and the
+    three cross-product read-only handlers: `monitor_snapshot_handler`
+    (single-shot `shared_admin_monitor::build_payload`),
+    `jobs_recent_handler` (`JobRegistry::list_recent` — a rolling 5-min
+    window), and `audit_tail_handler` (last N of
+    `shared_audit::read_entries`, behind the `AuditLogDir` trait both
+    daemons implement on their `AdminState`).
+  Depends one way on `shared-admin-auth` / `shared-admin-monitor` /
+  `shared-admin-server` / `shared-audit`; only the two daemons depend on
+  it. Per-product inventory GETs stay per-daemon (typed on each
+  product's `AdminState`). Design in [`WEBUI.md`](WEBUI.md).
 - **shared-admin-audit** — cross-product `system.audit.*` job handlers:
   `run_tail` / `run_export` / `run_verify` / `run_rotate`, each
   `(JobEmitter, serde_json::Value, PathBuf)`. Both daemons route those
@@ -716,10 +737,21 @@ Mutations emit `volume.create` / `volume.destroy` audit entries.
 
 Unified HTTP server on `0.0.0.0:9090`. Routes (`vsa/daemon/src/http.rs`):
 `/health`, `/metrics`, `/sessions` (from shared crates) plus VSA's
-local `/info` (`{ daemon, version, listen_address, iqn, volume_count }`).
-Telemetry installed via `shared_telemetry::set_global` at boot with
-`service.name=thurvsa`; instrument prefix `thurvsa_*` from
-`shared_naming::PRODUCT.metric_prefix`.
+local `/info` (`{ product, listen_addresses, iqn, volume_count }`).
+When `http.webui.enabled` (default), it also serves the read-only Web UI
+(issue #5): the static `/ui/*` bundle from `shared_admin_webui::webui_router`
+plus a read-only `/api/v1` GET subset (`volumes` list / info / snapshots
++ the cross-product `monitor` / `jobs/recent` / `audit/tail` handlers),
+all merged into the `require_admin_password`-gated protected group. The
+read-only API runs against the same `AdminState` the admin socket uses,
+but only GET handlers are mounted, so the TCP surface stays read-only.
+`/health` + `/metrics` remain open. Symmetric on `thurvtld`
+(`vtl/daemon/src/http/mod.rs`): `library` / `cartridges` / `drives` /
+`changer/inventory` GETs in place of the volume routes (its
+`legal_hold_status` read is deliberately left off TCP — the one read
+that does network backend I/O). Telemetry installed via
+`shared_telemetry::set_global` at boot with `service.name=thurvsa`;
+instrument prefix `thurvsa_*` from `shared_naming::PRODUCT.metric_prefix`.
 
 ### thurvsa
 

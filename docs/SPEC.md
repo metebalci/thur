@@ -2659,10 +2659,11 @@ roughly 200 LoC.
 The network-facing TCP HTTP listener splits its routes into two
 groups. The **open** group — `/health` and `/metrics` — is
 unauthenticated, so a Prometheus scrape and a liveness probe never need
-a credential. The **protected** group is everything else: `/sessions`
-and `/info` today, the read-only Web UI (`/ui`) and read-only
-`/api/v1` surface tomorrow. The protected group is gated by HTTP Basic
-authentication against a single shared web-admin password.
+a credential. The **protected** group is everything else: `/sessions`,
+`/info`, and — when `http.webui.enabled` (the default) — the read-only
+Web UI static bundle (`/ui/*`) and the read-only `/api/v1` GET subset
+(below). The protected group is gated by HTTP Basic authentication
+against a single shared web-admin password.
 
 The Basic username is the fixed synthetic `webadmin` and the realm
 string is `thur admin` — both are hardcoded constants, carried in no
@@ -2722,6 +2723,7 @@ VTL (`thurvtld`):
 
 ```json
 {
+  "product": "thurvtl",
   "slots": { "storage": 40, "mail": 5 },
   "drives": 3,
   "lto_generation": 8,
@@ -2734,20 +2736,84 @@ VSA (`thurvsad`):
 
 ```json
 {
+  "product": "thurvsa",
   "volume_count": 42,
   "iqn": "iqn.2025-10.com.metebalci:thurvsa",
   "listen_addresses": ["0.0.0.0:3260"]
 }
 ```
 
-`listen_addresses` is always a JSON array — single-portal installs
-report one entry, multi-portal installs (`iscsi.listen: [...]`) report
-every entry.
+The `product` field (`thurvtl` / `thurvsa`) is the Web UI's product
+discriminator — `app.js` reads it to decide whether to render the tape
+library or the storage-array view. `listen_addresses` is always a JSON
+array — single-portal installs report one entry, multi-portal installs
+(`iscsi.listen: [...]`) report every entry.
 
 `/info` is a read-only summary — chassis topology on VTL, volume count
 plus iSCSI coordinates on VSA. Anything finer-grained, the per-element
 or per-volume detail, stays behind the peer-cred-authed admin socket
-rather than this open HTTP endpoint.
+rather than this HTTP endpoint.
+
+### Read-only `/api/v1` (TCP)
+
+When `http.webui.enabled`, each daemon mounts a **read-only GET subset**
+of its `/api/v1` surface on the protected TCP listener — the data the
+Web UI polls. This is a strict subset of the richer `/api/v1` the
+peer-cred admin **socket** carries: **only GET handlers are mounted on
+the TCP listener.** Every mutating verb (`POST` / `PUT` / `DELETE` —
+cartridge / volume create, changer move/load/unload, snapshot create,
+legal-hold set, …) stays on the admin socket and is **never** routed on
+TCP, so the TCP surface cannot mutate state regardless of credentials.
+All of these sit in the protected group behind the web-admin password;
+`/health` + `/metrics` remain open.
+
+Cross-product (identical handler on both daemons):
+
+| Method + path | Body |
+|---|---|
+| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / session / audit counters). |
+| `GET /api/v1/jobs/recent` | `{ "jobs": [ { id, kind, started_at, finished, exit_code? } ] }`. A rolling 5-minute window, not a persistent history — finished jobs are reaped 300 s after they end. |
+| `GET /api/v1/audit/tail?lines=N` | `{ "entries": [ … ] }` — the last `N` (default 100, clamped to 1000) entries of the BLAKE3-chained audit log. The one-shot "last N" read, not the streaming `audit tail` job. |
+
+VTL (`thurvtld`):
+
+| Method + path | Body |
+|---|---|
+| `GET /api/v1/library/info` | Chassis topology (slots / drives / LTO gen / partitions). |
+| `GET /api/v1/library/bounds` | Slot/drive sizing envelope. |
+| `GET /api/v1/cartridges` | Cartridge inventory list. |
+| `GET /api/v1/cartridges/{identifier}` | One cartridge's detail. |
+| `GET /api/v1/changer/inventory` | Element inventory. |
+| `GET /api/v1/drives` | Drive states. |
+| `GET /api/v1/drives/{id}` | One drive's state. |
+
+VTL's `legal_hold_status` GET is deliberately **not** mounted on TCP —
+it is the one read handler that performs network backend I/O, so the TCP
+surface stays local-state-only.
+
+VSA (`thurvsad`):
+
+| Method + path | Body |
+|---|---|
+| `GET /api/v1/volumes` | Volume list (LUN order). |
+| `GET /api/v1/volumes/{name}` | One volume's manifest + runtime. |
+| `GET /api/v1/volumes/{name}/snapshots` | A volume's snapshots. |
+
+### Web UI static assets (`/ui/*`)
+
+When `http.webui.enabled`, the protected listener also serves the static
+console bundle:
+
+- `GET /ui` → `308` redirect to `/ui/`.
+- `GET /ui/` → `index.html`.
+- `GET /ui/{path}` → the named asset (`text/html` / `text/css` /
+  `text/javascript`).
+
+Assets come from `http.webui.asset_dir` when configured (an operator
+restyle/override target), falling back to the bundle embedded in the
+binary. Path traversal out of the asset root (`..`, absolute, empty
+segments) is rejected. All mutating Web UI actions are out of scope for
+v1 — they are tracked as issue #91.
 
 ---
 

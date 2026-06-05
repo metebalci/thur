@@ -27,6 +27,7 @@
 //! then re-running the same job must be re-POSTed.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use shared_admin_proto::JobEvent;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,6 +157,20 @@ impl JobHandle {
     }
 }
 
+/// One row of the recent-jobs view ([`JobRegistry::list_recent`]).
+/// Serialized straight onto the Web UI's `/api/v1/jobs/recent`
+/// response. `exit_code` is `None` while the job is still running and
+/// the process-style exit once it has emitted its terminal `Done`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobSummary {
+    pub id: String,
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
+    pub finished: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 /// Process-wide job table. Owned by the product's daemon state;
 /// admin handlers reach it via the [`crate::HasJobs`] trait.
 pub struct JobRegistry {
@@ -197,6 +212,45 @@ impl JobRegistry {
         self.jobs.lock().await.get(id).map(|inner| JobHandle {
             inner: Arc::clone(inner),
         })
+    }
+
+    /// Snapshot every currently-registered job as a [`JobSummary`],
+    /// newest first. Because finished jobs are reaped after the
+    /// retention TTL (300 s), this is a *rolling recent window*, not a
+    /// persistent history — the Web UI's read-only `/api/v1/jobs/recent`
+    /// surfaces exactly what's still live. The job id is the registry's
+    /// HashMap key (never stored on `JobInner`), so this reads it from
+    /// the map rather than the struct.
+    pub async fn list_recent(&self) -> Vec<JobSummary> {
+        // Clone the Arcs under the jobs lock, release it, then read each
+        // job's terminal exit code under its own events lock — so a slow
+        // walk never blocks `create`.
+        let snapshot: Vec<(String, Arc<JobInner>)> = {
+            let jobs = self.jobs.lock().await;
+            jobs.iter()
+                .map(|(id, inner)| (id.clone(), Arc::clone(inner)))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(snapshot.len());
+        for (id, inner) in snapshot {
+            let finished = inner.finished.load(Ordering::Acquire);
+            let exit_code = {
+                let evs = inner.events.lock().await;
+                evs.iter().rev().find_map(|e| match e {
+                    JobEvent::Done { exit_code, .. } => Some(*exit_code),
+                    _ => None,
+                })
+            };
+            out.push(JobSummary {
+                id,
+                kind: inner.kind.clone(),
+                started_at: inner.started_at,
+                finished,
+                exit_code,
+            });
+        }
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out
     }
 
     /// Drop finished jobs older than `retention`. Cheap to call
@@ -278,6 +332,29 @@ mod tests {
 
         let collected = stream_task.await.unwrap();
         assert_eq!(collected.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_recent_reports_kind_finished_and_exit_code_newest_first() {
+        let reg = JobRegistry::new();
+        // First job finishes with a non-zero exit.
+        let (id_a, _a, em_a) = reg.create("system.gc").await;
+        em_a.info("starting").await;
+        em_a.emit(JobEvent::done(3)).await;
+        // Second job is still running (no terminal Done).
+        let (id_b, _b, _em_b) = reg.create("system.verify").await;
+
+        let recent = reg.list_recent().await;
+        assert_eq!(recent.len(), 2);
+        // Newest first: B was created after A.
+        assert_eq!(recent[0].id, id_b);
+        assert_eq!(recent[0].kind, "system.verify");
+        assert!(!recent[0].finished);
+        assert_eq!(recent[0].exit_code, None);
+
+        assert_eq!(recent[1].id, id_a);
+        assert!(recent[1].finished);
+        assert_eq!(recent[1].exit_code, Some(3));
     }
 
     #[tokio::test]

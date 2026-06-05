@@ -1,0 +1,100 @@
+<!doctype html>
+<!--
+  Thur Web UI (issue #5) — read-only operator dashboard.
+
+  No build step: this file, app.css, and app.js are the whole bundle.
+  app.css holds every visual token under :root — restyle there, not
+  here. app.js fetches the read-only /api/v1 surface and polls; it
+  branches on the `product` field returned by /info (thurvtl vs
+  thurvsa). All mutations are out of scope for v1 (issue #91).
+-->
+<html lang="en" data-product="loading">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Thur — admin</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name" id="product-name">Thur</span>
+        <span class="brand-tag" id="product-kind"></span>
+      </div>
+      <div class="topbar-meta">
+        <span class="pill" id="version">&mdash;</span>
+        <span class="pill" id="uptime">&mdash;</span>
+        <span class="status" id="status" data-state="pending">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-text">connecting</span>
+        </span>
+      </div>
+    </header>
+
+    <main class="layout" id="layout" hidden>
+      <section class="kpis" id="kpis" aria-label="Live statistics"></section>
+
+      <div class="columns">
+        <div class="col col-main">
+          <article class="panel" id="inventory-panel">
+            <div class="panel-head">
+              <h2 id="inventory-title">Inventory</h2>
+              <span class="count" id="inventory-count"></span>
+            </div>
+            <div class="panel-body" id="inventory-body">
+              <p class="empty">Loading&hellip;</p>
+            </div>
+          </article>
+
+          <article class="panel" id="secondary-panel" hidden>
+            <div class="panel-head">
+              <h2 id="secondary-title">Drives</h2>
+              <span class="count" id="secondary-count"></span>
+            </div>
+            <div class="panel-body" id="secondary-body"></div>
+          </article>
+        </div>
+
+        <div class="col col-side">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Recent jobs</h2>
+              <span class="count" id="jobs-count"></span>
+            </div>
+            <div class="panel-body" id="jobs-body">
+              <p class="empty">No jobs in the last 5 minutes.</p>
+            </div>
+            <p class="panel-note">Rolling 5-minute window &mdash; finished jobs are reaped after 300&nbsp;s.</p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Audit tail</h2>
+              <span class="count" id="audit-count"></span>
+            </div>
+            <div class="panel-body audit" id="audit-body">
+              <p class="empty">Loading&hellip;</p>
+            </div>
+          </article>
+        </div>
+      </div>
+    </main>
+
+    <section class="splash" id="splash">
+      <div class="splash-card">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1 id="splash-title">Connecting to the appliance&hellip;</h1>
+        <p id="splash-detail">Reading topology from <code>/info</code>.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Read-only console. Configuration and changer operations stay on the CLI / admin socket.</span>
+      <span id="updated" class="updated"></span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

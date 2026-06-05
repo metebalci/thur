@@ -518,6 +518,7 @@ async fn main() -> Result<()> {
         .http
         .listener_config()
         .context("building HTTP listener config")?;
+    let webui_cfg = cfg.http.webui_config();
 
     // iSCSI target IQN — operator override (`iscsi.target_iqn`) or the
     // per-product default. Resolved before the transport match so the
@@ -891,10 +892,9 @@ async fn main() -> Result<()> {
     // TCP listener's protected routes fail closed); a malformed file is
     // a hard startup error. One handle, cloned into the admin setter
     // (AdminState) and the HTTP middleware (HttpState).
-    let auth_state = shared_admin_auth::AuthState::load_from(
-        &shared_admin_auth::admin_password_path(&data_dir),
-    )
-    .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
+    let auth_state =
+        shared_admin_auth::AuthState::load_from(&shared_admin_auth::admin_password_path(&data_dir))
+            .map_err(|e| anyhow::anyhow!("loading admin-password.json: {e}"))?;
 
     let admin_state = AdminState {
         data_dir: data_dir.clone(),
@@ -920,7 +920,8 @@ async fn main() -> Result<()> {
     };
     let admin_socket = admin::admin_socket_path();
 
-    // HTTP server — /health + /metrics + /sessions.
+    // HTTP server — /health + /metrics + /sessions (+ read-only Web UI
+    // on /ui and /api/v1 when enabled).
     let http_state = HttpState {
         telemetry: Arc::clone(&telemetry),
         registry: Arc::clone(&registry),
@@ -928,6 +929,7 @@ async fn main() -> Result<()> {
         listen_addresses: transport_listens.clone(),
         target_iqn,
         auth: auth_state,
+        admin: admin_state.clone(),
     };
 
     // Disk-cache eviction worker. Periodically re-scans every
@@ -1034,8 +1036,8 @@ async fn main() -> Result<()> {
         }
         res = {
             let scheme = if http_listener_cfg.tls.is_some() { "https" } else { "http" };
-            http::log_route_table(&http_listener_cfg.listen, scheme);
-            let router = http::build_router(http_state);
+            http::log_route_table(&http_listener_cfg.listen, scheme, webui_cfg.enabled);
+            let router = http::build_router(http_state, &webui_cfg);
             shared_admin_http::run_http_server(http_listener_cfg, router)
         } => {
             if let Err(e) = res {

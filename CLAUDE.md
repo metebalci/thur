@@ -86,9 +86,18 @@ on-disk paths group by purpose.
   shared in-process between admin socket and HTTP listener), HTTP
   Basic parsing, the `require_admin_password` axum middleware, and the
   daemon-routed set handler that hashes the plaintext server-side.
-  Both daemons mount it today; the future `shared-admin-webui` reuses
-  it. Sibling of `shared-admin-iscsi`; kept out of the transport-only
+  Both daemons mount it today; `shared-admin-webui` reuses it. Sibling
+  of `shared-admin-iscsi`; kept out of the transport-only
   `shared-admin-http`. Design in [`docs/AUTH.md`](docs/AUTH.md).
+- `shared/admin-webui` (`shared-admin-webui`) — the read-only Web UI
+  (issue #5) embedded in both daemons' TCP HTTP listeners. Owns the
+  static `/ui/*` bundle (no-build HTML/CSS/JS, `include_dir!` embedded
+  with an optional on-disk `http.webui.asset_dir` restyle override +
+  traversal guard) and the cross-product read-only `/api/v1` GET
+  handlers (`monitor` snapshot, `jobs/recent`, `audit/tail`). Reuses
+  #4's `shared_admin_auth` gate directly; per-product inventory GETs
+  stay per-daemon. Mutations are out of scope (issue #91). Design in
+  [`docs/WEBUI.md`](docs/WEBUI.md).
 - `shared/admin-cloud-check` (`shared-admin-cloud-check`) —
   cross-product cloud-backend reachability. `run_cloud_check` is the
   `system.cloud_check` job handler both daemons mount (CLI verb
@@ -357,6 +366,15 @@ adapter layers between products are in
   closed (503 + challenge); wrong creds 401. The prerequisite for the
   Web UI (issue #4, set via `system set-admin-password`). Design in
   [`docs/AUTH.md`](docs/AUTH.md).
+- **Web UI** — a read-only operator console (issue #5) embedded in each
+  daemon's TCP HTTP listener, on by default (`http.webui.enabled`). The
+  PROTECTED group also serves a static `/ui/*` bundle (no-build
+  HTML/CSS/JS, embedded with an on-disk `asset_dir` restyle override)
+  and a read-only `/api/v1` GET subset (inventory + monitor snapshot +
+  recent jobs + audit tail). GET-only on TCP — every mutating verb stays
+  on the peer-cred admin socket. Lives in `shared-admin-webui`; reuses
+  the #4 password gate. Mutations are issue #91. Design in
+  [`docs/WEBUI.md`](docs/WEBUI.md).
 - **Alerting** — opt-in first-party email (SMTP via lettre) + generic
   webhook (HTTP POST with Tera-templated body — one path covers
   PagerDuty, Slack, Discord, ntfy.sh, ServiceNow) sinks. Four event
@@ -618,6 +636,7 @@ root (CLAUDE.md must, for auto-loading).
   [`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md),
   [`docs/AUDIT.md`](docs/AUDIT.md),
   [`docs/AUTH.md`](docs/AUTH.md),
+  [`docs/WEBUI.md`](docs/WEBUI.md),
   [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
 - Conformance:
   [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) — the whole
