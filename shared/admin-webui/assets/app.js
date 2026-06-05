@@ -81,6 +81,17 @@ function mbps(bps) {
   return v >= 10 ? v.toFixed(1) : v.toFixed(2);
 }
 
+// Dedup ratio as "3.4x" — fewer decimals as it grows. The unit lives
+// in the value (the KPI/column header can't carry an "x" cleanly).
+function ratiox(n) {
+  const v = Number(n) || 0;
+  if (v <= 0) return null;
+  // One decimal is plenty for a dedup ratio, and keeps the value short
+  // enough for the narrow Storage Backends column ("4.0x", "27x").
+  const s = v >= 10 ? v.toFixed(0) : v.toFixed(1);
+  return `${s}x`;
+}
+
 function duration(secs) {
   secs = Math.max(0, Math.floor(secs));
   const d = Math.floor(secs / 86400);
@@ -165,7 +176,7 @@ function renderKpis(mon) {
     // Tape is iSCSI-only — no NVMe/TCP transport, so a single count.
     wrap.append(kpi("Sessions", num(p.sessions_active), "iSCSI"));
   } else {
-    wrap.append(kpi("Volumes online", num(p.volumes_online), "attached"));
+    wrap.append(kpi("Volumes", num(p.volumes_online)));
     // VSA speaks both transports; show them split. Fall back to the
     // legacy combined field if an older daemon doesn't send the split.
     const iscsi = p.iscsi_sessions ?? p.sessions_active ?? 0;
@@ -185,6 +196,23 @@ function renderKpis(mon) {
       cap > 0 ? `${gib(used)} / ${gib(cap)}` : gib(used),
       cap > 0 ? `used / cap (${pct.toFixed(0)}%)` : "no cap",
       cap > 0 ? { pct, cls } : null,
+    ),
+  );
+
+  // Dedup (lifetime): logical / unique bytes summed across all backends.
+  // These are append-only counters since daemon restart (they ignore
+  // eviction/delete), so it is a cumulative trend, not a current
+  // on-disk figure — `system stats` gives the exact current breakdown.
+  const dd = mon.dedup || [];
+  const logical = dd.reduce((a, d) => a + (d.logical_bytes || 0), 0);
+  const unique = dd.reduce((a, d) => a + (d.unique_bytes || 0), 0);
+  const dratio = unique > 0 ? ratiox(logical / unique) : null;
+  const saved = logical > 0 ? Math.round((1 - unique / logical) * 100) : 0;
+  wrap.append(
+    kpi(
+      "Dedup (lifetime)",
+      dratio || "—",
+      dratio ? `${saved}% saved` : "no writes yet",
     ),
   );
 
@@ -383,6 +411,10 @@ function renderStorage(mon) {
   const globals = (mon.pool || []).filter((r) => r.namespace == null);
   const ops = {};
   for (const s of mon.storage || []) ops[s.backend] = s;
+  // Per-backend lifetime dedup ratio (logical/unique), joined by name.
+  // Missing entry = no chunks sealed on that backend yet -> "-".
+  const dedupBy = {};
+  for (const d of mon.dedup || []) dedupBy[d.backend] = d;
   $("storage-count").textContent = globals.length ? `${globals.length}` : "";
   const body = $("storage-body");
   clear(body);
@@ -394,12 +426,15 @@ function renderStorage(mon) {
     const s = ops[g.backend] || {};
     const cap = g.cap_bytes || 0;
     // Cache unit lives in the column header, so the values stay short
-    // ("0 / 7.58") and the 5-column table fits the side panel.
+    // ("0 / 7.58") and the table fits the side panel.
     const cache = cap > 0 ? `${gib(g.used_bytes)} / ${gib(cap)}` : gib(g.used_bytes);
     const errs = s.errors_total || 0;
+    const d = dedupBy[g.backend];
+    const dr = d && d.unique_bytes > 0 ? ratiox(d.logical_bytes / d.unique_bytes) : null;
     return el("tr", null, [
       el("td", { class: "mono" }, [g.backend]),
       el("td", { class: "num dim" }, [cache]),
+      el("td", { class: dr ? "num" : "num dim" }, [dr || "–"]),
       el("td", { class: "num" }, [num(s.put_ops_total || 0)]),
       el("td", { class: "num" }, [num(s.get_ops_total || 0)]),
       el("td", { class: errs > 0 ? "num has-err" : "num dim" }, [num(errs)]),
@@ -410,6 +445,7 @@ function renderStorage(mon) {
       [
         { label: "Backend" },
         { label: "Cache (GiB)", cls: "num" },
+        { label: "Dedup", cls: "num" },
         { label: "PUTs", cls: "num" },
         { label: "GETs", cls: "num" },
         { label: "Err", cls: "num" },

@@ -111,6 +111,10 @@ pub struct LiveStats {
     /// Per-pool-backend cumulative counters + an instantaneous waiter
     /// gauge.
     pool: Mutex<HashMap<String, Arc<PoolCounters>>>,
+    /// Per-backend cumulative chunk dedup byte totals. The `scope`
+    /// (local/global) dimension is folded away here — the monitor's
+    /// dedup ratio is per-backend, so both scopes sum into one pair.
+    chunk: Mutex<HashMap<String, Arc<ChunkCounters>>>,
     /// Audit entries appended since daemon start.
     pub audit_entries_total: AtomicU64,
 }
@@ -133,12 +137,26 @@ pub struct PoolCounters {
     pub waiters_now: AtomicI64,
 }
 
+/// Per-backend chunk dedup byte totals. `logical` is every byte sealed
+/// (pre-dedup); `unique` is only the bytes that actually grew the pool
+/// (first-time-ever seals). `logical / unique` is the lifetime dedup
+/// ratio. Both are append-only since daemon start — they never
+/// decrement on eviction / delete, so this is a cumulative trend, not
+/// a current-on-disk figure (that is the on-demand `system stats`
+/// scan).
+#[derive(Default)]
+pub struct ChunkCounters {
+    pub logical_bytes: AtomicU64,
+    pub unique_bytes: AtomicU64,
+}
+
 /// Plain-data snapshot of [`LiveStats`] for emission in the monitor
 /// JSON payload. All numeric; no atomics.
 #[derive(Default, Clone, Debug)]
 pub struct LiveStatsSnapshot {
     pub storage: HashMap<String, StorageSnapshot>,
     pub pool: HashMap<String, PoolSnapshot>,
+    pub chunk: HashMap<String, ChunkSnapshot>,
     pub audit_entries_total: u64,
 }
 
@@ -157,6 +175,12 @@ pub struct PoolSnapshot {
     pub waiters_now: i64,
 }
 
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ChunkSnapshot {
+    pub logical_bytes: u64,
+    pub unique_bytes: u64,
+}
+
 impl LiveStats {
     fn storage_for(&self, backend: &str) -> Arc<StorageCounters> {
         let mut map = self.storage.lock().expect("LiveStats cloud mutex poisoned");
@@ -165,6 +189,11 @@ impl LiveStats {
 
     fn pool_for(&self, backend: &str) -> Arc<PoolCounters> {
         let mut map = self.pool.lock().expect("LiveStats pool mutex poisoned");
+        Arc::clone(map.entry(backend.to_string()).or_default())
+    }
+
+    fn chunk_for(&self, backend: &str) -> Arc<ChunkCounters> {
+        let mut map = self.chunk.lock().expect("LiveStats chunk mutex poisoned");
         Arc::clone(map.entry(backend.to_string()).or_default())
     }
 
@@ -200,6 +229,22 @@ impl LiveStats {
         self.pool_for(backend)
             .waits_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mirror of [`Telemetry::chunk_add_logical_bytes`]. Scope is
+    /// folded away — per-backend logical bytes is what the monitor's
+    /// dedup ratio needs.
+    pub fn record_chunk_logical_bytes(&self, backend: &str, bytes: u64) {
+        self.chunk_for(backend)
+            .logical_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Mirror of [`Telemetry::chunk_add_unique_bytes`].
+    pub fn record_chunk_unique_bytes(&self, backend: &str, bytes: u64) {
+        self.chunk_for(backend)
+            .unique_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Called by `PoolBudget::try_reserve` when it enters the slow
@@ -240,12 +285,23 @@ impl LiveStats {
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
+        let chunk_pairs: Vec<(String, Arc<ChunkCounters>)> = self
+            .chunk
+            .lock()
+            .expect("LiveStats chunk mutex poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
         LiveStatsSnapshot {
             storage: storage_pairs
                 .into_iter()
                 .map(|(k, v)| (k, v.snapshot()))
                 .collect(),
             pool: pool_pairs
+                .into_iter()
+                .map(|(k, v)| (k, v.snapshot()))
+                .collect(),
+            chunk: chunk_pairs
                 .into_iter()
                 .map(|(k, v)| (k, v.snapshot()))
                 .collect(),
@@ -271,6 +327,15 @@ impl PoolCounters {
         PoolSnapshot {
             waits_total: self.waits_total.load(Ordering::Relaxed),
             waiters_now: self.waiters_now.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl ChunkCounters {
+    fn snapshot(&self) -> ChunkSnapshot {
+        ChunkSnapshot {
+            logical_bytes: self.logical_bytes.load(Ordering::Relaxed),
+            unique_bytes: self.unique_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -629,6 +694,9 @@ impl Telemetry {
                 KeyValue::new("scope", scope.to_string()),
             ],
         );
+        self.inner
+            .live_stats
+            .record_chunk_logical_bytes(backend, bytes);
     }
 
     /// Unique (post-dedup) bytes sealed: first-time-ever seals only
@@ -642,6 +710,9 @@ impl Telemetry {
                 KeyValue::new("scope", scope.to_string()),
             ],
         );
+        self.inner
+            .live_stats
+            .record_chunk_unique_bytes(backend, bytes);
     }
 
     /// Cloud-side HEAD-before-PUT probes (Global scope only — Local
@@ -1422,5 +1493,26 @@ mod tests {
         let dump = t.export_prometheus();
         assert!(dump.contains("backend=\"primary\""));
         assert!(dump.contains("backend=\"archive\""));
+    }
+
+    #[test]
+    fn live_stats_chunk_mirror_folds_scope_per_backend() {
+        let t = Telemetry::noop();
+        // Two scopes on the same backend must sum into one per-backend
+        // pair; a second backend stays separate.
+        t.chunk_add_logical_bytes("primary", "global", 1000);
+        t.chunk_add_unique_bytes("primary", "global", 400);
+        t.chunk_add_logical_bytes("primary", "local", 500);
+        t.chunk_add_unique_bytes("primary", "local", 500);
+        t.chunk_add_logical_bytes("archive", "global", 200);
+        t.chunk_add_unique_bytes("archive", "global", 50);
+
+        let snap = t.live_stats().snapshot();
+        let primary = snap.chunk.get("primary").expect("primary chunk row");
+        assert_eq!(primary.logical_bytes, 1500);
+        assert_eq!(primary.unique_bytes, 900);
+        let archive = snap.chunk.get("archive").expect("archive chunk row");
+        assert_eq!(archive.logical_bytes, 200);
+        assert_eq!(archive.unique_bytes, 50);
     }
 }

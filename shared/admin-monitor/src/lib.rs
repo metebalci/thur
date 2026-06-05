@@ -111,6 +111,12 @@ pub struct MonitorSnapshot {
     pub product: ProductSnapshot,
     pub pool: Vec<PoolEntry>,
     pub storage: Vec<StorageEntry>,
+    /// Per-backend lifetime dedup byte totals (one row per backend that
+    /// has sealed at least one chunk). `logical / unique` is the
+    /// cumulative-since-restart dedup ratio. Append-only — ignores
+    /// eviction / delete, so it is a trend, not a current-on-disk
+    /// figure (that is the on-demand `system stats` scan).
+    pub dedup: Vec<DedupEntry>,
     pub audit: AuditEntry,
 }
 
@@ -143,6 +149,18 @@ pub struct StorageEntry {
     pub put_bytes_total: u64,
     pub get_bytes_total: u64,
     pub errors_total: u64,
+}
+
+/// One row of the Dedup table — per backend. `logical_bytes` is every
+/// byte sealed into this backend's pool (pre-dedup); `unique_bytes` is
+/// only the bytes that actually grew the pool (first-time-ever seals).
+/// `logical / unique` is the lifetime dedup ratio, summed across
+/// local + global scope. Cumulative since daemon start.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DedupEntry {
+    pub backend: String,
+    pub logical_bytes: u64,
+    pub unique_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -244,6 +262,17 @@ pub fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
         .collect();
     storage.sort_by(|a, b| a.backend.cmp(&b.backend));
 
+    let mut dedup: Vec<DedupEntry> = snap
+        .chunk
+        .iter()
+        .map(|(name, c)| DedupEntry {
+            backend: name.clone(),
+            logical_bytes: c.logical_bytes,
+            unique_bytes: c.unique_bytes,
+        })
+        .collect();
+    dedup.sort_by(|a, b| a.backend.cmp(&b.backend));
+
     MonitorSnapshot {
         ts_unix,
         daemon: state.daemon_name().to_string(),
@@ -252,6 +281,7 @@ pub fn build_payload<S: MonitorState>(state: &S) -> MonitorSnapshot {
         product: state.snapshot_product(),
         pool,
         storage,
+        dedup,
         audit: AuditEntry {
             entries_total: snap.audit_entries_total,
         },
@@ -309,6 +339,10 @@ mod tests {
         live.record_storage_op("a-backend", "get", "ok", 50);
         live.record_audit_entry();
         live.record_audit_entry();
+        // Dedup bytes only on one backend — the dedup table should
+        // carry just that row, and sort by backend.
+        live.record_chunk_logical_bytes("z-backend", 1000);
+        live.record_chunk_unique_bytes("z-backend", 250);
 
         let state = FakeState {
             started_at: 1_000_000,
@@ -326,6 +360,12 @@ mod tests {
         assert_eq!(snap.storage[1].backend, "z-backend");
         assert_eq!(snap.storage[1].put_ops_total, 1);
         assert_eq!(snap.audit.entries_total, 2);
+
+        // Only the backend with seals appears in the dedup table.
+        assert_eq!(snap.dedup.len(), 1);
+        assert_eq!(snap.dedup[0].backend, "z-backend");
+        assert_eq!(snap.dedup[0].logical_bytes, 1000);
+        assert_eq!(snap.dedup[0].unique_bytes, 250);
 
         match snap.product {
             ProductSnapshot::Vsa {

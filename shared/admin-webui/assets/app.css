@@ -548,21 +548,29 @@ tbody tr:hover td {
 .sb-table {
   table-layout: fixed;
 }
+/* Six dense columns in a narrow side panel: trim the generous default
+   cell padding so values ("0.06 / 7.58", "4.0x") don't get ellipsized. */
 .sb-table th,
 .sb-table td {
   max-width: none;
+  padding-left: 10px;
+  padding-right: 10px;
 }
 .sb-table th:nth-child(1),
 .sb-table td:nth-child(1) {
-  width: 34%;
+  width: 24%;
 }
 .sb-table th:nth-child(2),
 .sb-table td:nth-child(2) {
-  width: 27%;
+  width: 26%;
 }
-.sb-table th:nth-child(n + 3),
-.sb-table td:nth-child(n + 3) {
-  width: 13%;
+.sb-table th:nth-child(3),
+.sb-table td:nth-child(3) {
+  width: 14%;
+}
+.sb-table th:nth-child(n + 4),
+.sb-table td:nth-child(n + 4) {
+  width: 12%;
 }
 .num.has-err {
   color: var(--err);

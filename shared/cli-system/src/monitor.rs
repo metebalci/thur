@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use shared_admin_client::AdminClient;
-use shared_admin_monitor::{MonitorSnapshot, PoolEntry, ProductSnapshot, StorageEntry};
+use shared_admin_monitor::{DedupEntry, MonitorSnapshot, PoolEntry, ProductSnapshot, StorageEntry};
 use shared_admin_proto::JobEvent;
 use shared_naming::ProductIdentity;
 
@@ -160,6 +160,19 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
     }
     out.push('\n');
 
+    // Dedup block — lifetime (since-restart) ratio per backend. Append-
+    // only counters, so this is a cumulative trend, not a current
+    // on-disk figure (run `system stats` for the exact breakdown).
+    out.push_str("Dedup (lifetime)              ratio        logical / stored\n");
+    if current.dedup.is_empty() {
+        out.push_str("  (no chunks sealed since boot)\n");
+    } else {
+        for d in &current.dedup {
+            out.push_str(&format!("  {}\n", render_dedup_row(d)));
+        }
+    }
+    out.push('\n');
+
     // Audit line — 5 minutes of cumulative entries.
     let baseline_5m = baseline_at_least(history, 300);
     let audit_delta = match baseline_5m {
@@ -242,6 +255,22 @@ fn render_storage_row(c: &StorageEntry, baseline: Option<&MonitorSnapshot>) -> S
     )
 }
 
+fn render_dedup_row(d: &DedupEntry) -> String {
+    let logical = shared_cli::fmt::format_bytes(d.logical_bytes);
+    let stored = shared_cli::fmt::format_bytes(d.unique_bytes);
+    // ratio = logical / unique; undefined until something has been
+    // stored, so show a dash rather than a divide-by-zero.
+    let ratio = if d.unique_bytes > 0 {
+        format!("{:.2}x", d.logical_bytes as f64 / d.unique_bytes as f64)
+    } else {
+        "-".to_string()
+    };
+    format!(
+        "{:<26}  {:>6}       {:>9} / {:>9}",
+        d.backend, ratio, logical, stored,
+    )
+}
+
 /// `1d 2h 34m` / `2h 34m` / `34m 12s` / `12s`. Drops larger units that
 /// are zero. Suits the header row; not for general use.
 fn format_uptime(seconds: i64) -> String {
@@ -282,6 +311,7 @@ mod tests {
             },
             pool: vec![],
             storage: vec![],
+            dedup: vec![],
             audit: AuditEntry {
                 entries_total: audit_total,
             },

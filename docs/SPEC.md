@@ -2630,6 +2630,20 @@ global-dedup pool) is surfaced via the `system monitor` job stream's
 `PoolEntry` payload, not via Prometheus, so existing dashboards that
 sum or filter on `backend` keep working unchanged.
 
+`chunk_logical` / `chunk_unique` are recorded at every chunk seal by
+**both** products — the tape path
+(`core_stream::cartridge::chunking`) and the block path
+(`core_block::uploader`). `logical` rolls up every byte presented to
+the pool (pre-dedup); `unique` only the seals that actually grew the
+pool (`was_new`); their ratio is the **lifetime dedup ratio**. Besides
+the Prometheus counters, these are mirrored into the in-process
+`LiveStats` and surfaced per-backend in the `system monitor` snapshot's
+`DedupEntry` table (`{backend, logical_bytes, unique_bytes}`), the
+source for the `system monitor` "Dedup (lifetime)" line and the Web
+UI's Dedup KPI + per-backend column. The figure is cumulative since
+daemon restart (append-only — it ignores eviction / delete); the exact
+current-on-disk breakdown is the on-demand `system stats` scan.
+
 ### Process-global handle
 
 The core call sites — cartridge, audit, storage, iSCSI, pool budget —
@@ -2771,7 +2785,7 @@ Cross-product (identical handler on both daemons):
 
 | Method + path | Body |
 |---|---|
-| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / session / audit counters). The per-product `product` block carries VTL cartridge+drive counts or VSA volume count, and the session count is split into `iscsi_sessions` + `nvmetcp_sessions` on VSA. The Web UI derives its throughput KPI and storage-backends table from this one payload's per-backend byte counters. |
+| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / dedup / session / audit counters). The per-product `product` block carries VTL cartridge+drive counts or VSA volume count, and the session count is split into `iscsi_sessions` + `nvmetcp_sessions` on VSA. The `dedup` array carries per-backend lifetime `{logical_bytes, unique_bytes}` (ratio = logical/unique). The Web UI derives its throughput + dedup KPIs and the storage-backends table from this one payload's per-backend byte counters. |
 | `GET /api/v1/jobs/recent` | `{ "jobs": [ { id, kind, started_at, finished, exit_code? } ] }`. A rolling 5-minute window, not a persistent history — finished jobs are reaped 300 s after they end. |
 | `GET /api/v1/audit/tail?lines=N` | `{ "entries": [ … ] }` — the last `N` (default 100, clamped to 1000) entries of the BLAKE3-chained audit log. The one-shot "last N" read, not the streaming `audit tail` job. |
 

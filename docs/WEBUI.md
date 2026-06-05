@@ -13,11 +13,20 @@ operator console at `/ui/` and a read-only slice of its `/api/v1` JSON
 surface. Point a browser at `https://<host>:9090/ui/`, authenticate with
 the web-admin password, and you get a live dashboard: a strip of KPI
 cards (drives, cartridges, sessions, pool cache, backend
-upload/download throughput), the product's inventory — a schematic
-**library map** on VTL (a drives row over a storage-slot grid, each
-filled slot showing its barcode) or a **volume list** on VSA — plus a
-**storage backends** table and an **audit log** tail. It polls every
-few seconds; there is no streaming and no mutation. Everything you can
+upload/download throughput, and a **lifetime dedup ratio**), the
+product's inventory — a schematic **library map** on VTL (a drives row
+over a storage-slot grid, each filled slot showing its barcode) or a
+**volume list** on VSA — plus a **storage backends** table (which also
+carries a per-backend dedup column) and an **audit log** tail. It polls
+every few seconds; there is no streaming and no mutation.
+
+The dedup figures come straight from the monitor snapshot's per-backend
+`dedup` array (`logical_bytes / unique_bytes`, summed for the headline
+KPI). They are **cumulative since daemon restart** — append-only
+counters that ignore eviction and deletion — so the KPI is labelled
+"Dedup (lifetime)" to set it apart from the exact current-on-disk
+breakdown, which stays on the `system stats` scan. Both products feed it
+identically (tape and block both record logical/unique at chunk seal). Everything you can
 do through it you could already do read-only through the CLI — it is a
 window onto the same state, not a new control plane.
 

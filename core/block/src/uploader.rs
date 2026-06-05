@@ -957,6 +957,26 @@ impl VolumeWriter {
             self.pool_budget
                 .release(reserved_bytes, namespace.as_deref());
         }
+
+        // Dedup-analytics telemetry — mirror of the tape seal in
+        // `core_stream::cartridge::chunking::seal_current_chunk`. Without
+        // this the block path recorded no chunk dedup counters at all.
+        // `reserved_bytes` is the bytes this seal presented (post-encrypt
+        // payload). `chunk_logical_bytes` rolls up every seal;
+        // `chunk_unique_bytes` only seals that grew the pool;
+        // `chunk_dedup_hit` covers local-pool dedup. Operator-facing
+        // ratio = logical / unique (the `system monitor` /
+        // "Dedup (lifetime)" Web UI figure).
+        let scope_str = self.manifest.dedup_scope.as_str();
+        let backend_name = self.manifest.backend.as_str();
+        shared_telemetry::record::chunk_seal(backend_name, scope_str);
+        shared_telemetry::record::chunk_logical_bytes(backend_name, scope_str, reserved_bytes);
+        if was_new {
+            shared_telemetry::record::chunk_unique_bytes(backend_name, scope_str, reserved_bytes);
+        } else {
+            shared_telemetry::record::chunk_dedup_hit(backend_name, scope_str);
+        }
+
         let hash_bytes = decode_hash(&hash_hex)?;
 
         // Record the page->chunk hash in `pages.idx` *before* any
