@@ -264,6 +264,18 @@ _arguments "${_arguments_options[@]}" : \
 ':snapshot -- Snapshot name:_default' \
 && ret=0
 ;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+'-c+[Path to configuration file]:CONFIG:_default' \
+'--config=[Path to configuration file]:CONFIG:_default' \
+'--user=[User to drop privileges to under sudo]:USER:_default' \
+'--force[Confirm rollback. Without it the command refuses]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':volume -- Volume name:_default' \
+':snapshot -- Snapshot name:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help_commands" \
@@ -285,6 +297,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (destroy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restore)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -398,6 +414,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (destroy)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restore)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1934,6 +1954,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -2842,6 +2866,7 @@ _thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot_commands() {
 'create:Create a snapshot of a volume' \
 'list:List a volume'\''s snapshots' \
 'destroy:Destroy a snapshot' \
+'restore:Restore a volume in place to a snapshot' \
     )
     _describe -t commands 'thurvsa help volume snapshot commands' commands "$@"
 }
@@ -2859,6 +2884,11 @@ _thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__destroy_comman
 _thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa help volume snapshot list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__restore_commands] )) ||
+_thurvsa__subcmd__help__subcmd__volume__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa help volume snapshot restore commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__iscsi_commands] )) ||
 _thurvsa__subcmd__iscsi_commands() {
@@ -3979,6 +4009,7 @@ _thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot_commands() {
 'create:Create a snapshot of a volume' \
 'list:List a volume'\''s snapshots' \
 'destroy:Destroy a snapshot' \
+'restore:Restore a volume in place to a snapshot' \
     )
     _describe -t commands 'thurvsa volume help snapshot commands' commands "$@"
 }
@@ -3996,6 +4027,11 @@ _thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__destroy_comman
 _thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa volume help snapshot list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__restore_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__help__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume help snapshot restore commands' commands "$@"
 }
 (( $+functions[_thurvsa__subcmd__volume__subcmd__info_commands] )) ||
 _thurvsa__subcmd__volume__subcmd__info_commands() {
@@ -4078,6 +4114,7 @@ _thurvsa__subcmd__volume__subcmd__snapshot_commands() {
 'create:Create a snapshot of a volume' \
 'list:List a volume'\''s snapshots' \
 'destroy:Destroy a snapshot' \
+'restore:Restore a volume in place to a snapshot' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa volume snapshot commands' commands "$@"
@@ -4098,6 +4135,7 @@ _thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help_commands() {
 'create:Create a snapshot of a volume' \
 'list:List a volume'\''s snapshots' \
 'destroy:Destroy a snapshot' \
+'restore:Restore a volume in place to a snapshot' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvsa volume snapshot help commands' commands "$@"
@@ -4122,10 +4160,20 @@ _thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__list_commands(
     local commands; commands=()
     _describe -t commands 'thurvsa volume snapshot help list commands' commands "$@"
 }
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__restore_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__help__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot help restore commands' commands "$@"
+}
 (( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list_commands] )) ||
 _thurvsa__subcmd__volume__subcmd__snapshot__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'thurvsa volume snapshot list commands' commands "$@"
+}
+(( $+functions[_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__restore_commands] )) ||
+_thurvsa__subcmd__volume__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'thurvsa volume snapshot restore commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_thurvsa" ]; then

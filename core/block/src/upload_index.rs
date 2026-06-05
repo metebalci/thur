@@ -232,6 +232,21 @@ impl UploadIndexFile {
         Ok(())
     }
 
+    /// Truncate back to a bare header so every page reads `Uploaded`
+    /// again — the sidecar half of an in-place snapshot restore (issue
+    /// #85). The frozen index a restore installs references only
+    /// cloud-durable chunks (the snapshot-create contract), so there is
+    /// nothing `LocalOnly` to track; clearing the sidecar is honest and
+    /// keeps the boot-recovery scan from re-enqueuing stale pages. Same
+    /// inode/fd, so a live writer keeps using the handle. `fdatasync`
+    /// makes the reset durable.
+    pub fn reset_to_clean(&self) -> Result<(), UploadIndexError> {
+        self.file.set_len(0)?;
+        Self::write_header(&self.file)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Iterate every record in the file as `(page_id, state)`.
     /// Skips the header. Stops at EOF; sparse holes are not yielded
     /// (callers see "non-existent" as "Uploaded" via
@@ -404,5 +419,30 @@ mod tests {
         let u = UploadIndexFile::open_or_create(tmp.path()).unwrap();
         let items: Vec<_> = u.iter().unwrap().collect::<Result<_, _>>().unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn reset_to_clean_truncates_to_header() {
+        let tmp = TempDir::new().unwrap();
+        let u = UploadIndexFile::open_or_create(tmp.path()).unwrap();
+        u.set(1, UploadState::LocalOnly).unwrap();
+        u.set(1000, UploadState::LocalOnly).unwrap();
+
+        u.reset_to_clean().unwrap();
+
+        // Every page reads as Uploaded again, and the iter (recovery
+        // scan) yields nothing.
+        assert_eq!(u.read(1).unwrap(), UploadState::Uploaded);
+        assert_eq!(u.read(1000).unwrap(), UploadState::Uploaded);
+        assert!(u.iter().unwrap().next().is_none());
+
+        // File is exactly the header, magic intact.
+        let bytes = std::fs::read(UploadIndexFile::path_for(tmp.path())).unwrap();
+        assert_eq!(bytes.len(), HEADER_SIZE as usize);
+        assert_eq!(&bytes[0..4], &MAGIC);
+
+        // Still usable after reset.
+        u.set(2, UploadState::LocalOnly).unwrap();
+        assert_eq!(u.read(2).unwrap(), UploadState::LocalOnly);
     }
 }

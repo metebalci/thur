@@ -30,6 +30,10 @@
 #   Phase I — destroy the source while the clone lives: the shared DEK
 #             sidecar survives and the clone still decrypts (refcount).
 #   Phase J — destroy the last family member: the DEK sidecar is gone.
+#   Phase K — in-place restore (issue #85): on a fresh volume, write A,
+#             snapshot, overwrite B, then `volume snapshot restore`. The
+#             volume reads pattern A again (rollback through the real data
+#             path), and a GC afterwards keeps it readable.
 #
 # The op model is transport-agnostic; only the login / device-discovery
 # primitives are iSCSI-specific (mirrors test-fs.sh's Phase D note).
@@ -285,6 +289,55 @@ test_snapshot_clone_cow() {
     [[ ! -f "$sidecar" ]] || {
         log_error "  ✗ DEK sidecar survived the last family member ($sidecar)"; return 1; }
     log_info "  ✓ Phase J: last family member destroyed, DEK forgotten"
+
+    # Phase K — in-place restore (issue #85) on a fresh, isolated volume.
+    cli volume create rsrc --size "${VOLUME_SIZE_MIB}M" --dedup "$DEDUP" >/dev/null || {
+        log_error "  ✗ create rsrc"; return 1; }
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+    local rsrc_lun; rsrc_lun=$(get_lun rsrc)
+    [[ -n "$rsrc_lun" ]] || { log_error "  ✗ no LUN for rsrc"; return 1; }
+
+    # Write A, snapshot it, then overwrite with B (sanity: B reads back).
+    write_region "$rsrc_lun" "$PATTERN_A" || return 1
+    cli volume snapshot create rsrc rsnap >/dev/null || {
+        log_error "  ✗ snapshot create rsnap"; return 1; }
+    write_region "$rsrc_lun" "$PATTERN_B" || return 1
+    read_region "$rsrc_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_B" || {
+        log_error "  ✗ rsrc != pattern B before restore"; return 1; }
+
+    # A restore without --force must refuse (CLI typo-guard).
+    if cli volume snapshot restore rsrc rsnap >/dev/null 2>&1; then
+        log_error "  ✗ restore without --force should have refused"; return 1
+    fi
+
+    # Restore is destructive and sends no "data changed" signal to hosts,
+    # so the contract is to quiesce the host first. Model that here: log
+    # the session out (== unmount), restore the now-offline volume
+    # daemon-side, then reconnect for a cache-fresh read. A buffered read
+    # over a still-logged-in device would serve stale page-cache content.
+    iscsi_logout_and_delete
+    cli volume snapshot restore rsrc rsnap --force >/dev/null || {
+        log_error "  ✗ snapshot restore"; return 1; }
+    iscsi_discover_and_login
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+
+    read_region "$rsrc_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_A" || {
+        log_error "  ✗ rsrc != pattern A after restore (rollback failed)"; return 1; }
+    log_info "  ✓ Phase K: rsrc rolled back in place to rsnap, reads pattern A"
+
+    # GC after restore: the snapshot still references the restored chunks,
+    # so the volume stays readable; the daemon stays healthy.
+    cli system gc >/dev/null 2>&1 || { log_error "  ✗ system gc after restore"; return 1; }
+    read_region "$rsrc_lun" "$READBACK" || return 1
+    cmp -s "$READBACK" "$PATTERN_A" || {
+        log_error "  ✗ rsrc != pattern A after post-restore GC"; return 1; }
+    curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null || {
+        log_error "  ✗ daemon unhealthy after post-restore GC"; return 1; }
+    log_info "  ✓ Phase K: post-restore GC kept rsrc readable; daemon healthy"
 
     return 0
 }

@@ -167,6 +167,19 @@ impl LruIndexFile {
         self.file.sync_data()?;
         Ok(())
     }
+
+    /// Truncate back to a bare header so every page reads `0` (oldest)
+    /// again — the LRU half of an in-place snapshot restore (issue #85).
+    /// LRU is a pure cache hint, so discarding it is always safe; the
+    /// first post-restore eviction cycle picks uniformly and converges
+    /// as fresh touches arrive. Same inode/fd; `fdatasync` makes it
+    /// durable.
+    pub fn reset_to_clean(&self) -> Result<(), LruIndexError> {
+        self.file.set_len(0)?;
+        Self::write_header(&self.file)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +254,29 @@ mod tests {
         assert_eq!(lru.read(0).unwrap(), 0);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], &MAGIC);
+    }
+
+    #[test]
+    fn reset_to_clean_truncates_to_header() {
+        let tmp = TempDir::new().unwrap();
+        let lru = LruIndexFile::open_or_create(tmp.path()).unwrap();
+        lru.touch(1, 1_700_000_000).unwrap();
+        lru.touch(1000, 1_700_000_000).unwrap();
+
+        lru.reset_to_clean().unwrap();
+
+        // Every page reads as 0 (oldest) again.
+        assert_eq!(lru.read(1).unwrap(), 0);
+        assert_eq!(lru.read(1000).unwrap(), 0);
+
+        // File is exactly the header, magic intact.
+        let bytes = std::fs::read(LruIndexFile::path_for(tmp.path())).unwrap();
+        assert_eq!(bytes.len(), HEADER_SIZE as usize);
+        assert_eq!(&bytes[0..4], &MAGIC);
+
+        // Still usable after reset.
+        lru.touch(2, 1_800_000_000).unwrap();
+        assert_eq!(lru.read(2).unwrap(), 1_800_000_000);
     }
 
     #[test]

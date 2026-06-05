@@ -596,6 +596,22 @@ enum SnapshotAction {
         #[arg(long)]
         force: bool,
     },
+
+    /// Restore a volume in place to a snapshot.
+    ///
+    /// Destructive: discards every write since the snapshot. Unmount the
+    /// host first; the volume keeps its identity.
+    Restore {
+        /// Volume name.
+        volume: String,
+
+        /// Snapshot name.
+        snapshot: String,
+
+        /// Confirm rollback. Without it the command refuses.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]

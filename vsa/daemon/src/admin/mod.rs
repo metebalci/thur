@@ -91,6 +91,12 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/volumes/:name/snapshots/:snap",
             axum::routing::delete(snapshots::destroy),
         )
+        // In-place rollback of a live volume to one of its snapshots
+        // (issue #85). Destructive; keeps the volume's identity.
+        .route(
+            "/api/v1/volumes/:name/snapshots/:snap/restore",
+            post(snapshots::restore),
+        )
         .route("/api/v1/volumes/:name/clone", post(handlers::clone_volume))
         // iSCSI CHAP users (list / add / remove / disable / enable / rotate)
         .route(

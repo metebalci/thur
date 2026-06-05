@@ -379,6 +379,43 @@ holds GCM's confidentiality + integrity guarantees too.)
 The family-namespace GC arithmetic is in [`DEDUP.md`](DEDUP.md) §
 Snapshots + clones.
 
+### Restore (in-place rollback)
+
+A **restore** (issue #85) is the inverse of clone: rather than reading a
+snapshot into a new volume, it rolls the *existing* volume back to the
+snapshot in place. The volume keeps its identity — same UUID, LUN, name,
+and DEK — and only its page table is rewound. Because a snapshot's frozen
+`pages.idx` is bound to the parent's UUID (`snapshot.uuid ==
+parent.uuid`), it is already valid for the live volume; restore rewrites
+the live `pages.idx` byte-for-byte from the frozen copy through the *same*
+file descriptor (no reopen, no UUID rebind — unlike clone, which mints a
+fresh identity) and matches its length exactly, so any pages allocated
+after the snapshot are dropped. It then resets the `upload.idx` / `lru.idx`
+sidecars to empty: the snapshot references only cloud-durable chunks
+(snapshot-create's quiesce contract), so every page is honestly
+`Uploaded` again.
+
+The daemon quiesces first — `flush_all` drains dirty pages and awaits
+pending uploads, then the cache's inner lock is held across the rewrite
+(fencing the flush worker) while the whole `PageCache` is invalidated so
+no stale cached page survives the swap. Chunks the volume referenced only
+after the snapshot are now unreferenced and become orphans the next
+`system gc` reclaims — the same leave-for-GC contract as `volume
+destroy`. A snapshot still referencing a chunk keeps it alive, so a
+restored volume that shares chunks with a sibling clone or another
+snapshot loses nothing.
+
+Restore is page-table-only: it refuses if the volume has been resized
+since the snapshot (resize it back first), and refuses while a persistent
+reservation is held. It does **not** check for active host sessions — the
+target cannot observe host mount state, and forcing a logout (which would
+also drop other LUNs sharing the session) is too heavy — so quiescing the
+host is the operator's responsibility, consistent with the
+concurrent-same-LBA host-side-UB stance elsewhere in the cache. The
+rewrite is not crash-atomic: a daemon crash mid-rewrite leaves a partial
+index, but the snapshot copy is immutable, so the recovery is simply to
+re-run the restore.
+
 ## Integrity
 
 The BLAKE3 content-address check applies to VSA exactly as to VTL: a

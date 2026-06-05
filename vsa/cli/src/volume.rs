@@ -479,6 +479,43 @@ pub async fn cmd_snapshot_destroy(volume: &str, snapshot: &str, force: bool) -> 
     Ok(())
 }
 
+/// `volume snapshot restore VOL SNAP --force` — daemon-routed only.
+/// Rolls VOL in place back to SNAP, discarding every write since the
+/// snapshot. The volume keeps its identity (UUID / LUN / name / DEK);
+/// only the page table is rewound. Diverged chunks become reclaimable by
+/// the next GC. There is no host-session check — unmount/quiesce the
+/// host first.
+pub async fn cmd_snapshot_restore(volume: &str, snapshot: &str, force: bool) -> Result<()> {
+    if !force {
+        eprintln!(
+            "warning: in-place restore DISCARDS all writes to volume '{volume}' since \
+             snapshot '{snapshot}'. Unmount / quiesce the host first — the target cannot \
+             see host mount state and will not check for it. Re-run with --force to confirm."
+        );
+        bail!("refusing to restore without --force");
+    }
+    let admin = AdminClient::auto_discover(&shared_naming::DISK);
+    if !admin.ping().await {
+        bail!(
+            "thurvsad admin socket unreachable at {} — `volume snapshot restore` needs the \
+             daemon running. Start the daemon and retry.",
+            admin.socket_path().display()
+        );
+    }
+    let _: serde_json::Value = admin
+        .post_json(
+            &format!(
+                "/api/v1/volumes/{}/snapshots/{}/restore",
+                urlencode(volume),
+                urlencode(snapshot)
+            ),
+            &serde_json::json!({}),
+        )
+        .await?;
+    println!("OK: volume '{volume}' restored to snapshot '{snapshot}'");
+    Ok(())
+}
+
 /// `volume clone SOURCE NEW_NAME [--from-snapshot SNAP] [--lun N]` —
 /// daemon-routed only. Creates a new writable volume that shares
 /// SOURCE's chunks copy-on-write and registers it as a live LUN.

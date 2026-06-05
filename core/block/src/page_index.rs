@@ -421,6 +421,90 @@ impl PageIndex {
         self.file.sync_data()?;
         Ok(())
     }
+
+    /// Rewrite this index's record body in place from a snapshot's
+    /// frozen `pages.idx` at `snapshot_path` — the on-disk half of an
+    /// in-place snapshot restore (issue #85). Same `File`/inode/fd, so
+    /// a live [`crate::uploader::VolumeWriter`] holding this handle sees
+    /// the new content with no reopen.
+    ///
+    /// A snapshot's frozen index is bound to the *parent* volume's uuid
+    /// (`snapshot.uuid == parent.uuid`), which is this volume's uuid, so
+    /// the header already matches and only the body is copied — no
+    /// header rewrite, no uuid rebind (unlike clone, which mints a fresh
+    /// uuid).
+    ///
+    /// Steps: validate the snapshot header binds to the same uuid +
+    /// page size + record size; `set_len` the live file to the
+    /// snapshot's exact length (this *shrinks* it, dropping every
+    /// post-snapshot higher record, and grows it if the snapshot is
+    /// longer); stream-copy the record body `[HEADER_SIZE, len)`;
+    /// `sync_data`.
+    ///
+    /// **Not crash-atomic.** A daemon crash mid-copy leaves a partial
+    /// index (a prefix of snapshot records, the rest zero holes). The
+    /// snapshot copy is immutable, so the recovery is to re-run restore
+    /// — the caller (the daemon restore handler) owns that contract. The
+    /// caller must also have quiesced host I/O and be holding the cache
+    /// inner lock so no concurrent reader observes the torn body.
+    pub fn restore_from(&self, snapshot_path: &Path) -> Result<(), PageIndexError> {
+        let src = OpenOptions::new().read(true).open(snapshot_path)?;
+        let mut header = [0u8; HEADER_SIZE as usize];
+        src.read_exact_at(&mut header, 0)?;
+
+        if header[0..4] != MAGIC {
+            return Err(PageIndexError::BadMagic);
+        }
+        let version = read_u32_le(&header[4..8]);
+        if !(MIN_READABLE_VERSION..=SCHEMA_VERSION).contains(&version) {
+            return Err(PageIndexError::SchemaMismatch {
+                found: version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        let record_size = read_u32_le(&header[8..12]);
+        if u64::from(record_size) != RECORD_SIZE {
+            return Err(PageIndexError::RecordSizeMismatch {
+                found: record_size,
+                expected: RECORD_SIZE as u32,
+            });
+        }
+        let mut snap_uuid = [0u8; 16];
+        snap_uuid.copy_from_slice(&header[16..32]);
+        if snap_uuid != self.volume_uuid {
+            return Err(PageIndexError::UuidMismatch {
+                index_uuid: hex::encode(snap_uuid),
+                volume_uuid: hex::encode(self.volume_uuid),
+            });
+        }
+        let snap_page_size = read_u64_le(&header[32..40]);
+        if snap_page_size != self.page_size_bytes {
+            return Err(PageIndexError::PageSizeMismatch {
+                index: snap_page_size,
+                volume: self.page_size_bytes,
+            });
+        }
+
+        // Match the live file to the snapshot's exact length first: this
+        // shrinks away any post-snapshot higher records and grows the
+        // file when the snapshot is longer (its trailing holes stay
+        // sparse). Then overwrite the body region with the snapshot's.
+        let len = src.metadata()?.len();
+        self.file.set_len(len)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut offset = HEADER_SIZE;
+        while offset < len {
+            let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
+            let n = src.read_at(&mut buf[..want], offset)?;
+            if n == 0 {
+                break;
+            }
+            self.file.write_all_at(&buf[..n], offset)?;
+            offset += n as u64;
+        }
+        self.file.sync_data()?;
+        Ok(())
+    }
 }
 
 fn build_header(volume_uuid: [u8; 16], page_size_bytes: u64) -> [u8; HEADER_SIZE as usize] {
@@ -877,5 +961,105 @@ mod tests {
         // Logical file size = HEADER + (100_000 + 1) * RECORD_SIZE.
         let expected_logical = HEADER_SIZE + (100_000 + 1) * RECORD_SIZE;
         assert_eq!(meta.len(), expected_logical);
+    }
+
+    #[test]
+    fn restore_from_round_trips_and_drops_post_snapshot_pages() {
+        let dir = TempDir::new().unwrap();
+        let uuid = fixture_uuid();
+        let live_path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&live_path, uuid, 65_536).unwrap();
+
+        // State A: pages 2 and 5 allocated (salt 7 on page 2 to prove the
+        // full record — hash + salt — is restored, not just the hash).
+        idx.set_salted(2, &fixture_hash(2), 7).unwrap();
+        idx.set(5, &fixture_hash(5)).unwrap();
+
+        // Freeze a byte-for-byte snapshot copy (what snapshot-create does).
+        let snap_path = dir.path().join("snap-pages.idx");
+        std::fs::copy(&live_path, &snap_path).unwrap();
+
+        // Diverge: overwrite page 2 with B, clear page 5, allocate a
+        // higher page 9 that did not exist at snapshot time.
+        idx.set_salted(2, &fixture_hash(0x22), 99).unwrap();
+        idx.clear(5).unwrap();
+        idx.set(9, &fixture_hash(9)).unwrap();
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(9));
+
+        // Restore reverts the live index exactly to state A.
+        idx.restore_from(&snap_path).unwrap();
+        assert_eq!(
+            idx.get_entry(2).unwrap(),
+            Some(PageEntry {
+                hash: fixture_hash(2),
+                iv_salt: 7
+            })
+        );
+        assert_eq!(idx.get(5).unwrap(), Some(fixture_hash(5)));
+        // The post-snapshot higher page is gone — the file shrank to the
+        // snapshot length.
+        assert_eq!(idx.get(9).unwrap(), None);
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(5));
+
+        // Survives a reopen: the body rewrite is durable, header intact.
+        let reopened = PageIndex::open(&live_path, uuid, 65_536).unwrap();
+        assert_eq!(reopened.get(2).unwrap(), Some(fixture_hash(2)));
+        assert_eq!(reopened.get(9).unwrap(), None);
+    }
+
+    #[test]
+    fn restore_from_regrows_when_snapshot_is_longer() {
+        let dir = TempDir::new().unwrap();
+        let uuid = fixture_uuid();
+        let live_path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&live_path, uuid, 65_536).unwrap();
+        idx.set(20, &fixture_hash(20)).unwrap();
+
+        let snap_path = dir.path().join("snap.idx");
+        std::fs::copy(&live_path, &snap_path).unwrap();
+
+        // Shrink the live file below the snapshot's high-water mark.
+        idx.truncate_from(0).unwrap();
+        assert_eq!(idx.get(20).unwrap(), None);
+
+        // Restore regrows the file and the page reappears.
+        idx.restore_from(&snap_path).unwrap();
+        assert_eq!(idx.get(20).unwrap(), Some(fixture_hash(20)));
+        assert_eq!(idx.highest_allocated_page().unwrap(), Some(20));
+    }
+
+    #[test]
+    fn restore_from_rejects_mismatched_identity() {
+        let dir = TempDir::new().unwrap();
+        let uuid = fixture_uuid();
+        let live_path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&live_path, uuid, 65_536).unwrap();
+
+        // A snapshot bound to a different uuid is refused (catches a
+        // wrong snapshot path before it corrupts the live index).
+        let other = dir.path().join("other.idx");
+        let mut other_uuid = uuid;
+        other_uuid[0] ^= 0xFF;
+        let _ = PageIndex::create(&other, other_uuid, 65_536).unwrap();
+        assert!(matches!(
+            idx.restore_from(&other).unwrap_err(),
+            PageIndexError::UuidMismatch { .. }
+        ));
+
+        // A different page size is refused.
+        let wrong_ps = dir.path().join("wrong_ps.idx");
+        let _ = PageIndex::create(&wrong_ps, uuid, 262_144).unwrap();
+        assert!(matches!(
+            idx.restore_from(&wrong_ps).unwrap_err(),
+            PageIndexError::PageSizeMismatch { .. }
+        ));
+
+        // A non-CRPI file is refused.
+        let bad = dir.path().join("bad.idx");
+        std::fs::write(&bad, [0u8; HEADER_SIZE as usize]).unwrap();
+        assert!(matches!(
+            idx.restore_from(&bad).unwrap_err(),
+            PageIndexError::BadMagic
+        ));
     }
 }

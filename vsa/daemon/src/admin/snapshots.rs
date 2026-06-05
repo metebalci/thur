@@ -232,3 +232,118 @@ pub async fn destroy(
         "status": "destroyed",
     })))
 }
+
+/// `POST /api/v1/volumes/{name}/snapshots/{snap}/restore` — roll a
+/// volume in place back to one of its snapshots (issue #85).
+///
+/// Destructive: discards every write to the volume since the snapshot.
+/// The volume keeps its identity (uuid / lun / name / DEK) — only the
+/// page table is rewound. Diverged post-snapshot chunks become orphans
+/// the next `system gc` reclaims (the same leave-for-GC contract as
+/// `volume destroy`).
+///
+/// Guards:
+/// - the volume must be registered (live);
+/// - a held SCSI persistent reservation refuses the restore (a cluster
+///   is actively using the LUN) — mirrors `volume resize`'s shrink
+///   guard. There is NO active-session check: the target can't see host
+///   mount state, so quiescing the host before restore is the
+///   operator's responsibility (the CLI requires `--force` and warns).
+/// - the snapshot's captured size must equal the volume's current size;
+///   restore is page-table-only, so a resized volume must be resized
+///   back first.
+pub async fn restore(
+    State(state): State<AdminState>,
+    peer: PeerCred,
+    AxumPath((name, snap)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cache = state.registry.get_by_name(&name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("volume '{name}' is not registered") })),
+        )
+    })?;
+
+    let manifest = SnapshotManifest::load(&state.data_dir, &name, &snap).map_err(|e| {
+        let status = match e {
+            core_block::VolumeError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(json!({ "error": format!("load snapshot '{snap}': {e}") })),
+        )
+    })?;
+
+    // A held persistent reservation blocks restore: silently swapping the
+    // data under a registrant (a cluster member) is a least-surprise
+    // violation. Mirrors `resize` (handlers.rs).
+    let lun = cache.manifest().lun;
+    if !state.reservations.snapshot(lun).registrants.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "volume '{name}' has an active persistent reservation; \
+                     clear it before restoring"
+                )
+            })),
+        ));
+    }
+
+    // Restore is page-table-only. If the volume was resized after the
+    // snapshot, the live size and the captured size diverge; refuse and
+    // tell the operator to resize back first rather than silently
+    // leaving a coherent-but-surprising size/extent mismatch. Compare
+    // against the live shadow, not the boot-snapshot manifest (issue #76).
+    let live_size = cache.size_bytes();
+    if manifest.size_bytes != live_size {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "snapshot '{snap}' captured size {} B != volume '{name}' size {} B; \
+                     resize the volume to {} B first",
+                    manifest.size_bytes, live_size, manifest.size_bytes
+                )
+            })),
+        ));
+    }
+
+    let snap_idx = SnapshotManifest::page_index_path(&state.data_dir, &name, &snap);
+    cache.restore_from_snapshot(snap_idx).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("restore snapshot: {e}") })),
+        )
+    })?;
+
+    info!(
+        volume = name.as_str(),
+        snapshot = snap.as_str(),
+        size_bytes = manifest.size_bytes,
+        "admin: restored volume to snapshot uid={} pid={:?}",
+        peer.uid,
+        peer.pid,
+    );
+
+    if let Some(channel) = state.audit.as_ref() {
+        channel.try_append(
+            "snapshot.restore",
+            AuditActor::cli(peer.audit_descriptor()),
+            json!({
+                "volume": name,
+                "snapshot": snap,
+                "size_bytes": manifest.size_bytes,
+            }),
+            AuditResult::Ok,
+        );
+    }
+
+    Ok(Json(json!({
+        "volume": name,
+        "snapshot": snap,
+        "size_bytes": manifest.size_bytes,
+        "status": "restored",
+    })))
+}

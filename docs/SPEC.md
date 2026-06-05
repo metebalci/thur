@@ -1857,7 +1857,8 @@ CLI-side (thurvtl): `cartridge.create`, `cartridge.import`,
 
 CLI-side (thurvsa volume admin, actor `kind:"cli"`):
 `volume.create`, `volume.destroy`, `volume.sync_after.modified`,
-`volume.resize`, `volume.clone`, `snapshot.create`, `snapshot.destroy`.
+`volume.resize`, `volume.clone`, `snapshot.create`, `snapshot.destroy`,
+`snapshot.restore`.
 `volume.resize` records `params:{name, previous, new, shrink_to_fit}` —
 `previous` and `new` are the old / new logical sizes in bytes (grow or
 shrink), `shrink_to_fit` is `true` when the target was auto-computed from
@@ -1865,7 +1866,8 @@ the allocated high-water mark. `volume.clone` records
 `params:{volume, lun, source_volume, source_snapshot, size_bytes, backend,
 uuid}` (`source_snapshot` is null for a clone from the live volume);
 `snapshot.create` / `snapshot.destroy` record `params:{volume, snapshot,
-…}` (issue #13).
+…}` (issue #13). `snapshot.restore` records `params:{volume, snapshot,
+size_bytes}` — an in-place rollback of `volume` to `snapshot` (issue #85).
 
 iSCSI / SCSI-side (actor `kind:"iscsi"`, `user` = initiator IQN if
 the initiator advertised one, `addr` = peer ip:port):

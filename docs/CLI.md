@@ -30,7 +30,7 @@ clap drives both `--help` and the shipped completion scripts.
 
 ```
 volume     create / list / info / destroy / modify / resize / key migrate
-           snapshot {create,list,destroy} / clone
+           snapshot {create,list,destroy,restore} / clone
 system     storage {check,benchmark} / gc / stats / verify / regenerate-cert / alerting {list,test}
            daemon-health / audit {tail,export,verify,verify-offline,rotate}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
@@ -72,7 +72,24 @@ TLS-PSK is on) are needed before a host can use it; it does **not** inherit
 the source's grants. Cloning an encrypted volume is supported: the clone
 inherits the source's crypto identity (`crypto_uuid`) and shares its DEK,
 which is refcounted so destroying the source while a clone exists keeps
-the clone readable (issue #86). `system storage benchmark` is
+the clone readable (issue #86).
+
+`volume snapshot restore VOL SNAP --force` (issue #85) is the complement
+of clone: where clone reads a snapshot into a **new** volume, restore
+rolls the **existing** volume in place back to the snapshot, discarding
+every write since. The volume keeps its identity — same UUID, LUN, name,
+and DEK; only the page table is rewound (the daemon rewrites the live
+`pages.idx` from the frozen copy and resets the upload/lru sidecars).
+Chunks that diverged after the snapshot become orphans the next `system
+gc` reclaims — the same leave-for-GC contract as `volume destroy`.
+Because it is destructive, the CLI requires `--force`. Restore refuses
+while a persistent reservation is held, and refuses if the volume has
+been resized since the snapshot (resize it back first). There is **no**
+active-session check: the target cannot see whether a host has the LUN
+mounted, so you must unmount / quiesce the host before restoring —
+restoring under a live, mounted host corrupts that host's filesystem. The
+rewrite is not crash-atomic; if the daemon dies mid-restore, the snapshot
+is untouched, so simply re-run the command. `system storage benchmark` is
 daemon-down — it parses the YAML conffile's `storage.backends:` block,
 constructs each named backend, and drives parallel upload, download, and
 delete operations via `shared-object-store-bench`. `config` is pure-local.

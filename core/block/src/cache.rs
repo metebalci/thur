@@ -249,6 +249,19 @@ impl CacheInner {
         }
     }
 
+    /// Drop every cached entry and clear both side indexes in one shot.
+    /// The intrusive LRU links live *inside* each `CacheEntry`, so
+    /// emptying `pages` drops them with the entries — there is nothing
+    /// dangling to unlink. Used by the in-place snapshot restore (issue
+    /// #85) to discard all pre-restore cached content before the live
+    /// `pages.idx` is rewritten underneath it.
+    fn invalidate_all(&mut self) {
+        self.pages.clear();
+        self.dirty.clear();
+        self.lru_head = None;
+        self.lru_tail = None;
+    }
+
     /// Find the LRU page id, optionally restricted to clean entries.
     /// Walks from the tail (LRU end) toward the head. Returns `None`
     /// if the cache is empty (or no clean entries when `clean_only`).
@@ -916,6 +929,64 @@ impl PageCache {
         Ok(())
     }
 
+    /// In-place restore: roll this live volume back to a snapshot by
+    /// rewriting its `pages.idx` from the snapshot's frozen copy at
+    /// `snapshot_pages_idx` and resetting the upload/lru sidecars (issue
+    /// #85). The volume keeps its identity (uuid / lun / name / DEK) and
+    /// stays registered — only the page table is rewound. The inverse of
+    /// [`Self::snapshot_pages_idx`].
+    ///
+    /// Sequence (mirrors the freeze path's quiesce):
+    /// 1. [`Self::flush_all`] drains dirty pages + awaits every pending
+    ///    PUT, leaving the flush worker idle. (We are *discarding* the
+    ///    post-snapshot writes, but settling first keeps the writer's
+    ///    internal state consistent before the swap.)
+    /// 2. Hold the inner lock across the whole rewrite — the flush
+    ///    worker takes this lock to pick its batch, so it cannot write
+    ///    `pages.idx` / `upload.idx` underneath us. A second
+    ///    pending-upload drain under the lock covers a flush that raced
+    ///    between (1) and (2); no new flush can start, so it terminates.
+    /// 3. [`CacheInner::invalidate_all`] discards every cached page so no
+    ///    stale `CacheEntry` survives the index swap.
+    /// 4. On the blocking pool: rewrite `pages.idx` from the frozen copy
+    ///    **first** (same fd — the writer sees the new content with no
+    ///    reopen; the snapshot's header already binds to this volume's
+    ///    uuid, so no rebind), **then** reset the sidecars. A crash
+    ///    between the two leaves the sidecars in their always-safe
+    ///    all-`Uploaded` / zero default.
+    ///
+    /// The rewrite is **not crash-atomic** — a crash mid-`restore_from`
+    /// leaves a partial index; the snapshot copy is immutable, so the
+    /// recovery is to re-run restore. Concurrent *host* I/O during
+    /// restore is the operator's responsibility (no session guard —
+    /// quiesce the host first), matching the cache's existing
+    /// concurrent-same-LBA UB stance.
+    pub async fn restore_from_snapshot(
+        &self,
+        snapshot_pages_idx: PathBuf,
+    ) -> Result<(), UploaderError> {
+        self.flush_all().await?;
+        let mut inner = self.inner.lock().await;
+        self.writer
+            .pending_uploads()
+            .wait_for_range(PageId::MIN..=PageId::MAX)
+            .await;
+        inner.invalidate_all();
+
+        let writer = Arc::clone(&self.writer);
+        tokio::task::spawn_blocking(move || -> Result<(), UploaderError> {
+            writer.page_index().restore_from(&snapshot_pages_idx)?;
+            writer.upload_index().reset_to_clean()?;
+            writer.lru_index().reset_to_clean()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| UploaderError::Io(std::io::Error::other(e.to_string())))??;
+
+        drop(inner);
+        Ok(())
+    }
+
     /// Drive a flush worker until shutdown is requested. The daemon
     /// spawns this future at boot; tests can poll it manually if
     /// they want background-flush behavior.
@@ -1278,6 +1349,16 @@ impl PageCache {
     pub async fn invalidate_cached_page(&self, page_id: PageId) {
         let mut inner = self.inner.lock().await;
         inner.drop_entry(page_id);
+    }
+
+    /// Discard every cached page (clears the page map, the dirty set,
+    /// and the LRU list) without flushing. Backs the in-place snapshot
+    /// restore (issue #85), which deliberately drops the post-snapshot
+    /// writes; also exposed for tests. Callers that need the dirty
+    /// pages committed must `flush_all` first.
+    pub async fn invalidate_all(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.invalidate_all();
     }
 
     /// Shared drain loop for `flush_all` and `flush_pages_in_range`.
@@ -1700,6 +1781,83 @@ mod tests {
             Some(hash_a),
             "the snapshot's frozen index does not follow the parent"
         );
+    }
+
+    /// In-place restore (issue #85): freeze a snapshot, diverge the
+    /// volume, then `restore_from_snapshot` and confirm the host-visible
+    /// content reverts to the snapshot point and the cache is emptied.
+    #[tokio::test]
+    async fn restore_from_snapshot_reverts_volume_content() {
+        let (tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
+
+        // State A: page 0 = pattern A, page 1 = pattern C. Freeze it.
+        cache.write_bytes(0, &pattern(0xA1, PAGE)).await.unwrap();
+        cache
+            .write_bytes(PAGE as u64, &pattern(0xC3, PAGE))
+            .await
+            .unwrap();
+        cache.flush_all().await.unwrap();
+        let snap_dir = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let frozen = PageIndex::path_for(&snap_dir);
+        cache.snapshot_pages_idx(frozen.clone()).await.unwrap();
+
+        // Diverge: overwrite page 0 with B and allocate a brand-new
+        // page 2 that did not exist at snapshot time.
+        cache.write_bytes(0, &pattern(0xB2, PAGE)).await.unwrap();
+        cache
+            .write_bytes(2 * PAGE as u64, &pattern(0xD4, PAGE))
+            .await
+            .unwrap();
+        cache.flush_all().await.unwrap();
+        assert_eq!(
+            cache.read_bytes(0, PAGE).await.unwrap(),
+            pattern(0xB2, PAGE)
+        );
+        assert_eq!(
+            cache.read_bytes(2 * PAGE as u64, PAGE).await.unwrap(),
+            pattern(0xD4, PAGE)
+        );
+
+        // Restore in place.
+        cache.restore_from_snapshot(frozen).await.unwrap();
+
+        // Page 0 reads pattern A again, page 1 still C, and the
+        // post-snapshot page 2 is gone (reads as a zero hole).
+        assert_eq!(
+            cache.read_bytes(0, PAGE).await.unwrap(),
+            pattern(0xA1, PAGE)
+        );
+        assert_eq!(
+            cache.read_bytes(PAGE as u64, PAGE).await.unwrap(),
+            pattern(0xC3, PAGE)
+        );
+        assert_eq!(
+            cache.read_bytes(2 * PAGE as u64, PAGE).await.unwrap(),
+            vec![0u8; PAGE]
+        );
+
+        // The page index high-water mark dropped back to the snapshot's,
+        // and the cache + dirty set were cleared by the restore.
+        assert_eq!(
+            writer.page_index().highest_allocated_page().unwrap(),
+            Some(1)
+        );
+        assert_eq!(writer.page_index().get(2).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_all_empties_the_cache() {
+        let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0x11, PAGE)).await.unwrap();
+        cache
+            .write_bytes(PAGE as u64, &pattern(0x22, PAGE))
+            .await
+            .unwrap();
+        cache.invalidate_all().await;
+        // Dropped dirty pages are gone; an unallocated read returns zeros
+        // (nothing was flushed before the invalidate).
+        assert_eq!(cache.read_bytes(0, PAGE).await.unwrap(), vec![0u8; PAGE]);
     }
 
     #[tokio::test]

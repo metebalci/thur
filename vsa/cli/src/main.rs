@@ -222,6 +222,11 @@ async fn run(cli: Cli) -> Result<()> {
                     snapshot,
                     force,
                 } => volume::cmd_snapshot_destroy(&vol, &snapshot, force).await,
+                SnapshotAction::Restore {
+                    volume: vol,
+                    snapshot,
+                    force,
+                } => volume::cmd_snapshot_restore(&vol, &snapshot, force).await,
             },
             VolumeAction::Clone {
                 source,
