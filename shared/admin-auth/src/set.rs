@@ -170,7 +170,10 @@ mod tests {
         let on_disk = AdminPasswordFile::load(&path).expect("ok").expect("some");
         assert!(on_disk.phc.starts_with("$argon2id$"));
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("a-good-password"), "plaintext must not persist");
+        assert!(
+            !raw.contains("a-good-password"),
+            "plaintext must not persist"
+        );
     }
 
     #[tokio::test]

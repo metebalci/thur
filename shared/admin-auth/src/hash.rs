@@ -30,7 +30,11 @@ pub fn hash_password(password: &str) -> Result<String, String> {
 /// password was wrong (see the middleware).
 pub fn verify_phc(phc: &str, candidate: &[u8]) -> bool {
     PasswordHash::new(phc)
-        .map(|parsed| Argon2::default().verify_password(candidate, &parsed).is_ok())
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(candidate, &parsed)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 

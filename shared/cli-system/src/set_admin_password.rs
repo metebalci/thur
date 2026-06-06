@@ -67,8 +67,8 @@ fn resolve_new_password(product: &ProductIdentity) -> Result<String> {
     if p1.is_empty() {
         bail!("empty password rejected");
     }
-    let p2 =
-        rpassword::prompt_password("Confirm password: ").context("reading confirmation from tty")?;
+    let p2 = rpassword::prompt_password("Confirm password: ")
+        .context("reading confirmation from tty")?;
     if p1 != p2 {
         bail!("passwords do not match");
     }
