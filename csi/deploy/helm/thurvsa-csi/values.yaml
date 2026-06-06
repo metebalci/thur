@@ -33,6 +33,12 @@ kubeletDir: /var/lib/kubelet
 nodeStateDir: /var/lib/thurvsa-csi
 
 controller:
+  # uid the controller process runs as. The admin socket is group-gated
+  # (runAsGroup = thurvsaGid), so the uid itself is not what grants access;
+  # root (0) is the least-fuss default and matches the image. To run non-root,
+  # set a uid here and add fsGroup: <thurvsaGid> so the /csi socket dir stays
+  # writable by the sidecars.
+  runAsUser: 0
   replicas: 1
   # Pin the controller to the appliance node — it needs the local admin socket.
   nodeSelector:

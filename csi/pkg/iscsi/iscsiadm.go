@@ -38,27 +38,43 @@ type Connector struct {
 
 // Attacher issues iscsiadm against an exec.Interface. resolve maps a Connector
 // to its block device; it is the real by-path poll in production and is
-// overridden in tests (no /dev there).
+// overridden in tests (no /dev there). cmd is the iscsiadm invocation (default
+// ["iscsiadm"]); the node wraps it in nsenter so the *host's* iscsiadm runs —
+// iscsiadm and iscsid must be the same open-iscsi version, and the container's
+// bundled copy almost never matches the host's iscsid.
 type Attacher struct {
 	exec    exec.Interface
+	cmd     []string
 	resolve func(ctx context.Context, c Connector) (string, error)
 }
 
-// NewAttacher builds an Attacher over e.
-func NewAttacher(e exec.Interface) *Attacher {
-	a := &Attacher{exec: e}
+// NewAttacher builds an Attacher over e. base is the iscsiadm invocation
+// (e.g. ["iscsiadm"] or an nsenter wrapper); empty defaults to ["iscsiadm"].
+func NewAttacher(e exec.Interface, base []string) *Attacher {
+	a := &Attacher{exec: e, cmd: base}
 	a.resolve = a.waitForDevice
 	return a
 }
 
-// Attach configures per-volume CHAP, logs in, and returns the resolved block
-// device path. Idempotent: a pre-existing session is tolerated.
+// Attach configures per-node CHAP, logs in, rescans, and returns the
+// resolved block device path. Idempotent: a pre-existing session is
+// tolerated. A node holds one iSCSI session per (target IQN, portal) and
+// mounts every volume granted to its CHAP user through it (issue #15), so
+// when this volume was granted after the session came up, the rescan is
+// what makes its just-admitted LUN appear.
 func (a *Attacher) Attach(ctx context.Context, c Connector) (string, error) {
 	portal := normalizePortal(c.Portal)
 	c.Portal = portal
 
-	if out, err := a.run(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal); err != nil {
-		return "", fmt.Errorf("iscsi discovery on %s: %s: %w", portal, out, err)
+	// Create the node DB record directly from the target coordinates the
+	// controller handed us in PublishContext. SendTargets discovery is only for
+	// *learning* unknown targets — we already know the IQN + portal — and a
+	// discovery-session login can stall when the target requires CHAP. `-o new`
+	// is tolerant of an existing record (retry-safe).
+	if out, err := a.run(ctx, "-m", "node", "-o", "new", "-T", c.TargetIQN, "-p", portal); err != nil {
+		if !strings.Contains(out, "already") {
+			return "", fmt.Errorf("iscsi node create %s: %s: %w", c.TargetIQN, strings.TrimSpace(out), err)
+		}
 	}
 	for _, kv := range [][2]string{
 		{"node.session.auth.authmethod", "CHAP"},
@@ -74,6 +90,16 @@ func (a *Attacher) Attach(ctx context.Context, c Connector) (string, error) {
 		// exit 15 / "already" => a session already exists; not an error.
 		if !strings.Contains(out, "already") {
 			return "", fmt.Errorf("iscsi login to %s: %s: %w", c.TargetIQN, strings.TrimSpace(out), err)
+		}
+	}
+	// Force a SCSI rescan so a LUN granted to this node's CHAP user
+	// *after* the session came up becomes visible — `--login` is a no-op
+	// ("already") on an existing session and would not surface it. The
+	// daemon re-reads REPORT LUNS dynamically (issue #15), so the rescan
+	// picks up the newly-admitted LUN. Harmless on a fresh login.
+	if out, err := a.run(ctx, "-m", "node", "-T", c.TargetIQN, "-p", portal, "-R"); err != nil {
+		if !tolerable(out) {
+			return "", fmt.Errorf("iscsi rescan %s: %s: %w", c.TargetIQN, strings.TrimSpace(out), err)
 		}
 	}
 	return a.resolve(ctx, c)
@@ -111,7 +137,12 @@ func (a *Attacher) Detach(ctx context.Context, iqn, portal string) error {
 }
 
 func (a *Attacher) run(ctx context.Context, args ...string) (string, error) {
-	out, err := a.exec.CommandContext(ctx, iscsiadm, args...).CombinedOutput()
+	base := a.cmd
+	if len(base) == 0 {
+		base = []string{iscsiadm}
+	}
+	full := append(append([]string{}, base[1:]...), args...)
+	out, err := a.exec.CommandContext(ctx, base[0], full...).CombinedOutput()
 	return string(out), err
 }
 

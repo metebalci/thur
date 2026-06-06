@@ -174,6 +174,23 @@ async fn main() -> Result<()> {
     let iscsi_users = shared_iscsi::auth::IscsiUsersFile::load_or_create_default(&iscsi_users_path)
         .with_context(|| format!("loading {}", iscsi_users_path.display()))?;
 
+    // Live per-CHAP-user admission view (VSA dynamic admission): seeded
+    // from iscsi-users.json here and kept current by the admin
+    // add / grant / revoke / remove handlers, so an `iscsi users grant`
+    // reaches sessions that are already connected. Shared between the
+    // SBC dispatcher (reads the current set per command) and the admin
+    // socket (mutates it + fans the REPORTED LUNS DATA HAS CHANGED UA).
+    // A login-time snapshot still gates `auth.method: None` deployments;
+    // this only takes effect for CHAP sessions (issue #15, CSI per-node
+    // CHAP).
+    let admission_view = Arc::new(shared_iscsi::AdmissionView::new());
+    admission_view.seed(
+        iscsi_users
+            .users
+            .iter()
+            .map(|u| (u.username.clone(), u.volumes.clone().unwrap_or_default())),
+    );
+
     // NVMe-TCP identity files honor the optional
     // `nvmetcp.{tls,auth}.identity_file` override, else default under
     // `<data_dir>/`. Resolved once here so the transport listener and
@@ -595,14 +612,17 @@ async fn main() -> Result<()> {
                     Arc::new(shared_iscsi::unit_attention::UnitAttentionTracker::new());
                 ua_tracker_for_admin = Some(Arc::clone(&ua_tracker));
                 let collapse_isid = cfg.iscsi.reservations.initiator_port.collapse_isid();
-                let handler = Arc::new(SbcScsiDispatcher::with_alua(
-                    Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
-                    target_iqn.clone(),
-                    alua,
-                    Arc::clone(&reservations),
-                    collapse_isid,
-                    Some(Arc::clone(&ua_tracker)),
-                ));
+                let handler = Arc::new(
+                    SbcScsiDispatcher::with_alua(
+                        Arc::clone(&registry) as Arc<dyn scsi_sbc::VolumeLookup>,
+                        target_iqn.clone(),
+                        alua,
+                        Arc::clone(&reservations),
+                        collapse_isid,
+                        Some(Arc::clone(&ua_tracker)),
+                    )
+                    .with_admission(Arc::clone(&admission_view)),
+                );
                 // Proactive reservation-change notification (issue #67): a
                 // reservation preempted/released over iSCSI or NVMe raises
                 // a RESERVATIONS PREEMPTED / RELEASED UA on the affected
@@ -926,6 +946,7 @@ async fn main() -> Result<()> {
         reservations: Arc::clone(&reservations),
         aer_hub: aer_hub_for_admin,
         ua_tracker: ua_tracker_for_admin,
+        admission: Arc::clone(&admission_view),
         auth: auth_state.clone(),
     };
     let admin_socket = admin::admin_socket_path();

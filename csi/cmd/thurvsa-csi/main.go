@@ -31,6 +31,7 @@ func main() {
 		chapStore    = flag.String("chap-secret-store", "kubernetes", "where per-volume CHAP secrets live: kubernetes or memory (memory = tests / non-cluster runs)")
 		secretNS     = flag.String("secret-namespace", os.Getenv("POD_NAMESPACE"), "namespace for CHAP secrets (defaults to POD_NAMESPACE, else the service-account namespace)")
 		nodeStateDir = flag.String("node-state-dir", "/var/lib/thurvsa-csi", "node-mode dir for per-volume iSCSI connector state")
+		hostIscsiadm = flag.Bool("host-iscsiadm", true, "run the host's iscsiadm via nsenter (it must match the host iscsid version); false uses the bundled binary")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	klog.InitFlags(nil)
@@ -59,6 +60,7 @@ func main() {
 		ChapStoreKind:   *chapStore,
 		SecretNamespace: *secretNS,
 		NodeStateDir:    *nodeStateDir,
+		HostIscsiadm:    *hostIscsiadm,
 	})
 
 	if err := d.Run(); err != nil {

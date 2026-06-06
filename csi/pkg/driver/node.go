@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -184,10 +185,23 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		}
 		return nil, status.Errorf(codes.Internal, "load connector: %v", err)
 	}
-	if err := s.attacher.Detach(ctx, conn.TargetIQN, conn.Portal); err != nil {
-		return nil, status.Errorf(codes.Internal, "iscsi detach: %v", err)
-	}
+	// Every volume a node mounts shares one iSCSI session (one (target
+	// IQN, portal) per node under per-node CHAP, issue #15), so a logout
+	// would tear every other volume's LUN off this node. Drop this
+	// volume's connector first, then log out only when it was the last
+	// staged volume on the node. The daemon revokes the volume from the
+	// node's CHAP user on ControllerUnpublishVolume; a surviving session
+	// drops the now-unadmitted LUN on its next rescan.
 	_ = os.Remove(s.connPath(req.GetVolumeId()))
+	last, err := s.isLastConnector()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "scan node state: %v", err)
+	}
+	if last {
+		if err := s.attacher.Detach(ctx, conn.TargetIQN, conn.Portal); err != nil {
+			return nil, status.Errorf(codes.Internal, "iscsi detach: %v", err)
+		}
+	}
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -279,6 +293,26 @@ func connectorFromPublishContext(pc map[string]string) (iscsi.Connector, error) 
 
 func (s *nodeServer) connPath(volID string) string {
 	return filepath.Join(s.stateDir, volID+".json")
+}
+
+// isLastConnector reports whether no per-volume connector files remain in
+// the node state dir — i.e. the volume just unstaged was the last one
+// sharing the node's single iSCSI session, so it is safe to log out.
+// A missing dir counts as "last" (nothing left to keep the session for).
+func (s *nodeServer) isLastConnector() (bool, error) {
+	entries, err := os.ReadDir(s.stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *nodeServer) saveConn(volID string, c iscsi.Connector) error {

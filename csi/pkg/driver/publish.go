@@ -57,13 +57,14 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, err
 	}
 
-	creds, err := s.chap.ensure(ctx, vol)
+	creds, err := s.chap.ensure(ctx, req.GetNodeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "ensure chap secret: %v", err)
 	}
-	// Register the per-volume CHAP user. The store is the source of truth for
-	// the secret, so a re-publish (409) just re-grants the volume and returns
-	// the same creds — the daemon already holds this password.
+	// Admit this volume to the node's CHAP user. First publish to the node
+	// creates the user (admitted to this volume); later publishes hit 409 and
+	// grant the additional volume. The store is the source of truth for the
+	// secret, so the daemon always holds this node's password.
 	if _, err := s.vsa.AddUser(ctx, vsa.AddUserRequest{
 		Username: creds.username,
 		Password: creds.secret,
@@ -92,35 +93,44 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	if err := s.dropChapUser(ctx, req.GetVolumeId()); err != nil {
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+	lastVolume, err := s.dropChapVolume(ctx, req.GetNodeId(), req.GetVolumeId())
+	if err != nil {
 		return nil, err
 	}
-	if err := s.chap.remove(ctx, req.GetVolumeId()); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete chap secret: %v", err)
+	// Only drop the node's secret once its last volume is unpublished — other
+	// volumes on the node still need it.
+	if lastVolume {
+		if err := s.chap.remove(ctx, req.GetNodeId()); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete chap secret: %v", err)
+		}
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
-// dropChapUser removes a volume's admission from its CHAP user, and removes the
-// user entirely once it is admitted to nothing else. In the per-volume model
-// the user serves exactly this volume, so revoke always refuses to empty the
-// set (400/409) and remove is the terminal step; the revoke-first shape stays
-// correct if a user ever carries extra volumes. Missing user is success.
-func (s *controllerServer) dropChapUser(ctx context.Context, vol string) error {
-	username := chapUsername(vol)
+// dropChapVolume removes a volume from the node's CHAP user admission set,
+// removing the user entirely when that was its last volume. Returns whether the
+// node user was removed (its last volume). The daemon refuses (400/409) to
+// revoke the final volume, which is the signal to remove the user. A missing
+// user is treated as already-removed.
+func (s *controllerServer) dropChapVolume(ctx context.Context, nodeID, vol string) (bool, error) {
+	username := chapUsername(nodeID)
 	_, err := s.vsa.RevokeUser(ctx, username, []string{vol})
 	switch {
 	case err == nil:
-		return nil
+		return false, nil // node retains other volumes
 	case vsa.IsNotFound(err):
-		return nil
+		return true, nil // user already gone
 	case vsa.IsBadRequest(err), vsa.IsConflict(err):
+		// Revoke refused to empty the set: this was the node's last volume.
 		if err := s.vsa.RemoveUser(ctx, username); err != nil && !vsa.IsNotFound(err) {
-			return toStatus(err)
+			return false, toStatus(err)
 		}
-		return nil
+		return true, nil
 	default:
-		return toStatus(err)
+		return false, toStatus(err)
 	}
 }
 

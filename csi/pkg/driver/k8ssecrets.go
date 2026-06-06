@@ -18,7 +18,7 @@ import (
 const (
 	chapSecretManagedByLabel = "app.kubernetes.io/managed-by"
 	chapSecretManagedByValue = "thurvsa-csi"
-	chapSecretVolumeAnno     = DefaultDriverName + "/volume"
+	chapSecretNodeAnno       = DefaultDriverName + "/node"
 	chapSecretUsernameKey    = "username"
 	chapSecretSecretKey      = "secret"
 )
@@ -39,8 +39,8 @@ func (k *k8sChapStore) secrets() typedSecrets {
 	return k.client.CoreV1().Secrets(k.namespace)
 }
 
-func (k *k8sChapStore) ensure(ctx context.Context, volume string) (chapCreds, error) {
-	name := chapSecretName(volume)
+func (k *k8sChapStore) ensure(ctx context.Context, nodeID string) (chapCreds, error) {
+	name := chapSecretName(nodeID)
 	existing, err := k.secrets().Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
 		return credsFromSecret(existing)
@@ -53,12 +53,12 @@ func (k *k8sChapStore) ensure(ctx context.Context, volume string) (chapCreds, er
 	if err != nil {
 		return chapCreds{}, err
 	}
-	creds := chapCreds{username: chapUsername(volume), secret: secret}
+	creds := chapCreds{username: chapUsername(nodeID), secret: secret}
 	obj := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Labels:      map[string]string{chapSecretManagedByLabel: chapSecretManagedByValue},
-			Annotations: map[string]string{chapSecretVolumeAnno: volume},
+			Annotations: map[string]string{chapSecretNodeAnno: nodeID},
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
@@ -82,8 +82,8 @@ func (k *k8sChapStore) ensure(ctx context.Context, volume string) (chapCreds, er
 	return chapCreds{}, err
 }
 
-func (k *k8sChapStore) remove(ctx context.Context, volume string) error {
-	err := k.secrets().Delete(ctx, chapSecretName(volume), metav1.DeleteOptions{})
+func (k *k8sChapStore) remove(ctx context.Context, nodeID string) error {
+	err := k.secrets().Delete(ctx, chapSecretName(nodeID), metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}

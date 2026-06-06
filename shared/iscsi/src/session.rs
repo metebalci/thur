@@ -33,6 +33,13 @@ pub struct Session {
     /// reservation Unit-Attention sink can resolve a fenced registrant's
     /// `(IQN, ISID)` identity back to its live TSIH(s) (issue #67).
     pub initiator_iqn: Option<String>,
+    /// CHAP username this session authenticated as (VSA dynamic
+    /// admission). Recorded at login alongside [`Self::initiator_iqn`];
+    /// `None` for sessions that skipped CHAP (`auth.method: None`). Lets
+    /// `iscsi users grant` fan a REPORTED LUNS DATA HAS CHANGED UA to
+    /// exactly the granted user's live sessions
+    /// (via [`SessionManager::tsihs_for_user`]).
+    pub authenticated_user: Option<String>,
 }
 
 /// Connection - represents a single TCP connection within a session
@@ -111,6 +118,7 @@ impl SessionManager {
             last_activity: Instant::now(),
             partition: None,
             initiator_iqn: None,
+            authenticated_user: None,
         };
 
         let mut sessions = self
@@ -237,6 +245,36 @@ impl SessionManager {
         {
             session.initiator_iqn = iqn;
         }
+    }
+
+    /// Record the CHAP username a session authenticated as (VSA
+    /// dynamic admission). Called once at login, mirroring
+    /// [`set_initiator_iqn`]. No-op for an unknown TSIH.
+    ///
+    /// [`set_initiator_iqn`]: Self::set_initiator_iqn
+    pub fn set_authenticated_user(&self, tsih: u16, user: Option<String>) {
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Some(session) = sessions.get_mut(&tsih)
+        {
+            session.authenticated_user = user;
+        }
+    }
+
+    /// Live TSIH(s) whose session authenticated as `username` (VSA
+    /// dynamic admission). `iscsi users grant` uses this to fan a
+    /// REPORTED LUNS DATA HAS CHANGED UA to exactly that user's
+    /// sessions, so an already-connected node re-reads REPORT LUNS and
+    /// picks up a newly-admitted volume.
+    pub fn tsihs_for_user(&self, username: &str) -> Vec<u16> {
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("session manager mutex poisoned");
+        sessions
+            .values()
+            .filter(|s| s.authenticated_user.as_deref() == Some(username))
+            .map(|s| s.tsih)
+            .collect()
     }
 
     /// Live TSIH(s) whose session matches a reservation registrant's
@@ -702,6 +740,39 @@ mod tests {
             mgr.tsihs_for(Some("iqn.test:a"), [1u8; 6], false)
                 .is_empty()
         );
+        let _ = t;
+    }
+
+    #[test]
+    fn test_tsihs_for_user_targets_one_chap_user() {
+        // VSA dynamic admission: `iscsi users grant alice` must reach
+        // alice's live sessions and only those, so it fans the REPORTED
+        // LUNS DATA HAS CHANGED UA precisely.
+        let mgr = SessionManager::new();
+        let ta1 = mgr.create_session([1u8; 6]);
+        let ta2 = mgr.create_session([2u8; 6]); // alice, second path
+        let tb = mgr.create_session([3u8; 6]);
+        mgr.set_authenticated_user(ta1, Some("alice".into()));
+        mgr.set_authenticated_user(ta2, Some("alice".into()));
+        mgr.set_authenticated_user(tb, Some("bob".into()));
+
+        let mut got = mgr.tsihs_for_user("alice");
+        got.sort_unstable();
+        let mut want = vec![ta1, ta2];
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert_eq!(mgr.tsihs_for_user("bob"), vec![tb]);
+        // An unauthenticated query (or unknown user) matches nothing.
+        assert!(mgr.tsihs_for_user("carol").is_empty());
+    }
+
+    #[test]
+    fn test_tsihs_for_user_skips_unauthenticated_sessions() {
+        let mgr = SessionManager::new();
+        let t = mgr.create_session([1u8; 6]);
+        // No set_authenticated_user (auth.method: None session) =>
+        // never matches a username query.
+        assert!(mgr.tsihs_for_user("alice").is_empty());
         let _ = t;
     }
 

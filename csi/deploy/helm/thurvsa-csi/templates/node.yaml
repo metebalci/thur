@@ -20,6 +20,9 @@ spec:
     spec:
       serviceAccountName: {{ include "thurvsa-csi.nodeServiceAccount" . }}
       hostNetwork: true
+      # hostPID lets the driver nsenter into the host namespaces to run the
+      # host's iscsiadm (which must match the host iscsid version).
+      hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- with .Values.node.tolerations }}
       tolerations:

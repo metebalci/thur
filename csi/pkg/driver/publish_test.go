@@ -54,8 +54,10 @@ func TestControllerPublishVolume(t *testing.T) {
 	if pc[PublishCtxLUN] == "" {
 		t.Errorf("lun missing")
 	}
-	if pc[PublishCtxChapUser] != chapUsername("pvc-pub") {
-		t.Errorf("chapUser = %q", pc[PublishCtxChapUser])
+	// Per-node CHAP (issue #15): the user is keyed by the node id, not
+	// the volume, so one node holds one CHAP identity across its volumes.
+	if pc[PublishCtxChapUser] != chapUsername("node-1") {
+		t.Errorf("chapUser = %q, want %q", pc[PublishCtxChapUser], chapUsername("node-1"))
 	}
 	if len(pc[PublishCtxChapSecret]) != 64 {
 		t.Errorf("chapSecret = %q (want 64 hex chars)", pc[PublishCtxChapSecret])
@@ -157,27 +159,44 @@ func TestControllerUnpublishIdempotent(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-unp2"}); err != nil {
+		if _, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-unp2", NodeId: "node-1"}); err != nil {
 			t.Fatalf("unpublish #%d must be idempotent, got %v", i, err)
 		}
 	}
 }
 
-func TestDeleteVolumeReapsChapUser(t *testing.T) {
+func TestControllerUnpublishRequiresNodeID(t *testing.T) {
+	cs, _ := testControllerD(t)
+	ctx := context.Background()
+	provision(t, cs, "pvc-nonode")
+	if _, err := cs.ControllerPublishVolume(ctx, publishReq("pvc-nonode")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	// Per-node CHAP keys the user by node id, so unpublish must carry one.
+	_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-nonode"})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument without node_id, got %v", err)
+	}
+}
+
+func TestDeleteVolumeLeavesNodeChapUser(t *testing.T) {
 	cs, d := testControllerD(t)
 	ctx := context.Background()
 	provision(t, cs, "pvc-del")
 	if _, err := cs.ControllerPublishVolume(ctx, publishReq("pvc-del")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	// Delete without an intervening unpublish: the volume's CHAP user must not leak.
+	// Per-node CHAP (issue #15): the user belongs to the node, not the
+	// volume, and may admit other volumes — so DeleteVolume removes only
+	// the volume. ControllerUnpublishVolume owns the user's lifecycle
+	// (revoke the volume, remove the user when its last volume goes).
 	if _, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "pvc-del"}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if d.UserCount() != 0 {
-		t.Errorf("user count = %d, want 0 after delete", d.UserCount())
-	}
 	if d.VolumeCount() != 0 {
 		t.Errorf("volume count = %d, want 0 after delete", d.VolumeCount())
+	}
+	if d.UserCount() != 1 {
+		t.Errorf("user count = %d, want 1 (node CHAP user is unpublish's to reap)", d.UserCount())
 	}
 }

@@ -28,7 +28,13 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # runAsGroup must be paired with runAsUser — containerd rejects a group
+      # without a user ("user group N is specified without user"). Access to the
+      # admin socket is governed by its file perms (0660 thurvsa:thurvsa), so
+      # running with the thurvsa gid is what grants it; the daemon records the
+      # peer uid/gid for audit only.
       securityContext:
+        runAsUser: {{ .Values.controller.runAsUser }}
         runAsGroup: {{ include "thurvsa-csi.gid" . }}
         supplementalGroups:
           - {{ include "thurvsa-csi.gid" . }}

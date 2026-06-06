@@ -158,14 +158,9 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
-	// Reap any CHAP user + secret a missed unpublish left behind, so a deleted
-	// volume never leaks a credential.
-	if err := s.vsa.RemoveUser(ctx, chapUsername(req.GetVolumeId())); err != nil && !vsa.IsNotFound(err) {
-		return nil, toStatus(err)
-	}
-	if err := s.chap.remove(ctx, req.GetVolumeId()); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete chap secret: %v", err)
-	}
+	// CHAP users are per-node, not per-volume, so DeleteVolume does not reap
+	// them — ControllerUnpublishVolume revokes the volume from each node's user
+	// (and removes the user when its last volume is unpublished).
 	if err := s.vsa.DeleteVolume(ctx, req.GetVolumeId()); err != nil && !vsa.IsNotFound(err) {
 		return nil, toStatus(err)
 	}

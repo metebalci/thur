@@ -229,6 +229,44 @@ func TestNodeUnstageIdempotent(t *testing.T) {
 	}
 }
 
+func TestNodeUnstageDetachesOnlyOnLastVolume(t *testing.T) {
+	// Per-node CHAP (issue #15): a node mounts many volumes through one
+	// iSCSI session, so a logout must wait for the *last* volume to
+	// unstage — unstaging an earlier one must not tear the session down.
+	ns, fa, _ := testNode(t)
+	ctx := context.Background()
+	stagingA := filepath.Join(t.TempDir(), "a")
+	stagingB := filepath.Join(t.TempDir(), "b")
+
+	for _, v := range []struct{ id, staging string }{{"pvc-a", stagingA}, {"pvc-b", stagingB}} {
+		if _, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+			VolumeId: v.id, StagingTargetPath: v.staging,
+			VolumeCapability: singleNodeCaps()[0], PublishContext: nodePubCtx(),
+		}); err != nil {
+			t.Fatalf("stage %s: %v", v.id, err)
+		}
+	}
+
+	// Unstaging the first must NOT log out — pvc-b still shares the session.
+	if _, err := ns.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{VolumeId: "pvc-a", StagingTargetPath: stagingA}); err != nil {
+		t.Fatalf("unstage pvc-a: %v", err)
+	}
+	if len(fa.detached) != 0 {
+		t.Fatalf("detach must not run while another volume is staged: %+v", fa.detached)
+	}
+	if _, err := os.Stat(ns.connPath("pvc-a")); !os.IsNotExist(err) {
+		t.Errorf("pvc-a connector not removed: %v", err)
+	}
+
+	// Unstaging the last logs out.
+	if _, err := ns.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{VolumeId: "pvc-b", StagingTargetPath: stagingB}); err != nil {
+		t.Fatalf("unstage pvc-b: %v", err)
+	}
+	if len(fa.detached) != 1 {
+		t.Fatalf("detach must run on the last volume: %+v", fa.detached)
+	}
+}
+
 func TestNodeExpandFilesystem(t *testing.T) {
 	ns, fa, _, fr := testNodeR(t)
 	ctx := context.Background()

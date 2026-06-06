@@ -75,6 +75,7 @@ type Config struct {
 	ChapStoreKind   string
 	SecretNamespace string
 	NodeStateDir    string
+	HostIscsiadm    bool
 }
 
 // Driver is the top-level CSI driver.
@@ -104,9 +105,16 @@ func (d *Driver) Run() error {
 		})
 	}
 	if d.cfg.Mode.servesNode() {
+		// iscsiadm must match the host's iscsid version, so by default run the
+		// host's binary by entering its namespaces (the DaemonSet sets
+		// hostPID). --host-iscsiadm=false falls back to the bundled binary.
+		iscsiadmBase := []string{"iscsiadm"}
+		if d.cfg.HostIscsiadm {
+			iscsiadmBase = []string{"nsenter", "--target", "1", "--mount", "--net", "--ipc", "--", "iscsiadm"}
+		}
 		csi.RegisterNodeServer(srv.Server(), &nodeServer{
 			driver:   d,
-			attacher: iscsi.NewAttacher(utilexec.New()),
+			attacher: iscsi.NewAttacher(utilexec.New(), iscsiadmBase),
 			mounter:  mount.NewSafeFormatAndMount(mount.New(""), utilexec.New()),
 			resizer:  mount.NewResizeFs(utilexec.New()),
 			stateDir: d.cfg.NodeStateDir,

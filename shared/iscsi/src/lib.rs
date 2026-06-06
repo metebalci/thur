@@ -19,6 +19,7 @@
 //!   product-agnostic [`ScsiHandler`] trait the transport dispatches
 //!   through.
 
+pub mod admission;
 pub mod alua;
 pub mod auth;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod session;
 pub mod transport;
 pub mod unit_attention;
 
+pub use admission::AdmissionView;
 pub use error::IscsiError;
 pub use handler::{ScsiHandler, ScsiRequest, ScsiResponse, ScsiStatus};
 pub use reservation_sink::IscsiReservationSink;

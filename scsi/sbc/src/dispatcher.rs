@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use shared_iscsi::admission::AdmissionView;
 use shared_iscsi::alua::AluaTopology;
 use shared_iscsi::unit_attention::UnitAttentionTracker;
 
@@ -84,6 +85,14 @@ pub struct SbcScsiDispatcher {
     /// enqueues into, so a reservation change preempted over either
     /// transport surfaces here on the initiator's next command.
     ua: Option<Arc<UnitAttentionTracker>>,
+    /// Live per-CHAP-user volume admission (VSA dynamic admission).
+    /// `None` in test / non-admission construction, in which case the
+    /// transport falls back to the session's login-time snapshot. When
+    /// set, [`Self::live_admission`] resolves the *current* admitted
+    /// set per command, so an `iscsi users grant` / `revoke` reaches a
+    /// session that is already up — required by the Kubernetes CSI
+    /// per-node CHAP model (one session per node, many volumes).
+    admission: Option<Arc<AdmissionView>>,
 }
 
 impl SbcScsiDispatcher {
@@ -158,7 +167,17 @@ impl SbcScsiDispatcher {
             alua,
             pr_collapse_isid,
             ua,
+            admission: None,
         }
+    }
+
+    /// Attach the live admission view (VSA dynamic per-CHAP-user LUN
+    /// admission). Builder-style so the constructors stay unchanged and
+    /// test / VTL call sites need no admission wiring; `thurvsad::main`
+    /// chains it after [`Self::with_alua`].
+    pub fn with_admission(mut self, admission: Arc<AdmissionView>) -> Self {
+        self.admission = Some(admission);
+        self
     }
 
     #[allow(dead_code)] // surfaced for tests / future admin reservations endpoint
@@ -277,6 +296,18 @@ impl shared_iscsi::ScsiHandler for SbcScsiDispatcher {
         self.pr_collapse_isid
     }
 
+    /// Dynamic admission (VSA): resolve a CHAP user's *current*
+    /// admitted-volume set from the live view, so the transport fences
+    /// each command against the up-to-date set rather than the login
+    /// snapshot. `None` when no view is wired (tests / VTL) — the
+    /// transport then keeps the snapshot. An unknown user resolves to
+    /// the empty set (sees nothing), the safe fallback for a session
+    /// whose user was removed mid-flight.
+    fn live_admission(&self, username: &str) -> Option<Arc<Vec<String>>> {
+        let view = self.admission.as_ref()?;
+        Some(view.get(username).unwrap_or_else(|| Arc::new(Vec::new())))
+    }
+
     async fn dispatch(&self, req: shared_iscsi::ScsiRequest<'_>) -> shared_iscsi::ScsiResponse {
         // shared-iscsi's ScsiRequest collapsed into scsi-spc's
         // (Step 5.A.2); thurvsa's local alias resolves to the same
@@ -296,6 +327,7 @@ mod tests {
     use super::*;
     use core_block::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES};
     use core_block::{DedupScope, PageCache, VolumeManifest, VolumeWriter};
+    use shared_iscsi::ScsiHandler;
     use shared_object_store::{LocalBackend, ObjectStoreBackend};
     use std::collections::BTreeMap;
     use std::sync::RwLock;
@@ -627,6 +659,71 @@ mod tests {
         let resp = handler.dispatch(req(&cdb, 0)).await;
         assert!(resp.sense.is_none());
         assert_eq!(resp.data_in.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn live_admission_is_none_without_a_view() {
+        // VTL / test construction wires no admission view → the
+        // transport keeps the login snapshot, so the hook yields None.
+        let (_tmp, handler) = handler_with_two_volumes().await;
+        assert!(handler.live_admission("anyone").is_none());
+    }
+
+    #[tokio::test]
+    async fn live_admission_unknown_user_sees_nothing() {
+        // With a view wired, a CHAP user that isn't in it resolves to
+        // the empty set (Some, not None) — a session whose user was
+        // removed mid-flight goes dark rather than reverting to a stale
+        // snapshot.
+        let (_tmp, handler) = handler_with_two_volumes().await;
+        let handler = handler.with_admission(Arc::new(AdmissionView::new()));
+        let set = handler
+            .live_admission("ghost")
+            .expect("view present → Some(empty)");
+        assert!(set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_admission_makes_report_luns_track_a_grant() {
+        // The crux of VSA dynamic admission (issue #15): resolving the
+        // session's admitted set through `live_admission` each command
+        // means an `iscsi users grant` (modeled here as `view.set`) is
+        // visible to REPORT LUNS on the SAME handler — no re-login.
+        let (_tmp, handler) = handler_with_two_volumes().await;
+        let view = Arc::new(AdmissionView::new());
+        let handler = handler.with_admission(Arc::clone(&view));
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0xA0;
+        cdb[6..10].copy_from_slice(&64u32.to_be_bytes());
+
+        // Granted vol2 only → REPORT LUNS shows one LUN (vol2 @ LUN 1).
+        view.set("csi-node-a", vec!["vol2".to_string()]);
+        let live = handler.live_admission("csi-node-a").unwrap();
+        let resp = handler
+            .dispatch(req_with_volumes(&cdb, 0, live.as_slice()))
+            .await;
+        let len = u32::from_be_bytes([
+            resp.data_in[0],
+            resp.data_in[1],
+            resp.data_in[2],
+            resp.data_in[3],
+        ]);
+        assert_eq!(len, 8, "one admitted LUN before the grant");
+        assert_eq!(resp.data_in[8 + 1], 1, "the one LUN is vol2 @ LUN 1");
+
+        // Grant vol1 too → the same handler now reports both LUNs.
+        view.set("csi-node-a", vec!["vol1".to_string(), "vol2".to_string()]);
+        let live = handler.live_admission("csi-node-a").unwrap();
+        let resp = handler
+            .dispatch(req_with_volumes(&cdb, 0, live.as_slice()))
+            .await;
+        let len = u32::from_be_bytes([
+            resp.data_in[0],
+            resp.data_in[1],
+            resp.data_in[2],
+            resp.data_in[3],
+        ]);
+        assert_eq!(len, 16, "both LUNs admitted after the grant — no re-login");
     }
 
     #[tokio::test]

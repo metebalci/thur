@@ -134,6 +134,15 @@ pub struct AdminState {
     /// hosts re-issue READ CAPACITY (issue #76) — the SCSI counterpart
     /// of the NVMe `aer_hub` notice.
     pub ua_tracker: Option<Arc<shared_iscsi::unit_attention::UnitAttentionTracker>>,
+    /// Live per-CHAP-user volume admission view (issue #15, CSI
+    /// per-node CHAP). The same `Arc` the SBC dispatcher reads on every
+    /// command; the `iscsi users {add,grant,revoke,remove}` handlers
+    /// mutate it in lockstep with `iscsi-users.json` (via
+    /// [`shared_admin_iscsi::IscsiUsersState::on_admission_changed`]) so
+    /// a grant reaches sessions that are already connected, and fan a
+    /// REPORTED LUNS DATA HAS CHANGED UA to the affected user's
+    /// sessions through [`Self::sessions`] + [`Self::ua_tracker`].
+    pub admission: Arc<shared_iscsi::AdmissionView>,
     /// Live web-admin password verifier (issue #4), seeded from
     /// `<data_dir>/admin-password.json` at boot. The same `AuthState`
     /// handle the HTTP listener's auth middleware reads; the

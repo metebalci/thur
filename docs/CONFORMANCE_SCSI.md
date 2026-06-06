@@ -107,7 +107,7 @@ expose must answer.
 | 0x5A | MODE SENSE(10) | 🟩 Yes | O | |
 | 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1) and the medium changer (LUN 0) — reservation state is keyed per-LUN, so the changer's is independent of the drives'. |
 | 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). APTPL = 1 is honored (state persisted to `<data_dir>/reservations.json`, reloaded at start) and PTPL_C = 1 in REPORT CAPABILITIES; SPEC_I_PT / ALL_TG_PT still reject as INVALID FIELD IN PARAMETER LIST. A durable-write failure on a persist-eligible mutation returns CHECK CONDITION / HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44) rather than a false GOOD. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
-| 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). |
+| 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). The admission set is resolved dynamically per command, so a `grant` / `revoke` reaches already-connected sessions (a REPORTED LUNS DATA HAS CHANGED UA prompts re-enumeration) — see § Dynamic LUN admission. |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 | 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
 | 0xA4 | MAINTENANCE OUT | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x06 SET IDENTIFYING INFORMATION, 0x0E SET PRIORITY, storage-array-specific SAs. (thurvtl only; thurvsa rejects 0xA4.) |
@@ -1229,6 +1229,43 @@ a rescan. The same UA fires on a shrink. The
 NVMe/TCP counterpart fires a Namespace Attribute Changed AER — see
 [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md) § Namespace-change
 notifications.
+
+---
+
+## Dynamic LUN admission (REPORTED LUNS DATA HAS CHANGED)
+
+A CHAP session is fenced to the volume set on its `UserEntry.volumes`
+admission list (see SPC-4 REPORT LUNS, INQUIRY above): REPORT LUNS shows
+only the LUNs of admitted volumes, and an un-admitted LUN answers as "no
+LU" (PQ=0x3) to INQUIRY / TUR / READ CAPACITY / data-path opcodes.
+
+That admission set is resolved **dynamically, per command** against a
+live in-memory view, not snapshotted at login. An `iscsi users grant
+USER --volume V` (or `revoke`) therefore takes effect on sessions that
+are *already connected*: the next REPORT LUNS reflects the new set
+without a re-login. The view is seeded from `iscsi-users.json` at boot
+and updated in lockstep by the `iscsi users {add,grant,revoke,remove}`
+admin handlers; a removed user's live session resolves to the empty set
+(sees nothing), the safe fallback. Sessions that skipped CHAP
+(`auth.method: None`) are unfenced and see every LUN, unchanged.
+
+To prompt a connected host to re-enumerate, a grant / revoke raises a
+**REPORTED LUNS DATA HAS CHANGED** Unit Attention (sense key 0x06,
+ASC/ASCQ `0x3F/0x0E`) on every live session of the affected CHAP user,
+on the LUNs that user is admitted to after the change — delivered by the
+same dispatch-level UA preemption as CAPACITY DATA HAS CHANGED
+(above), popped ahead of the next command on each nexus (except
+INQUIRY / REQUEST SENSE / REPORT LUNS). The host clears the UA and
+re-issues REPORT LUNS. As with capacity change, the Linux SCSI midlayer
+still needs an explicit rescan (`iscsiadm -m node --rescan`) to attach a
+newly-visible LUN's block device; the UA invalidates the host's view but
+does not by itself trigger the rescan.
+
+This is what lets the Kubernetes CSI driver use **one CHAP user per node**
+(issue #15): all VSA volumes share one target IQN, so a node holds a
+single iSCSI session, and each volume the node mounts is incrementally
+granted to that node's user and picked up on the existing session by a
+post-login rescan. See [`CSI.md`](CSI.md) § Per-node CHAP isolation.
 
 ---
 

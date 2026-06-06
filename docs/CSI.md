@@ -10,7 +10,7 @@ snapshots, clones, and online expansion along the way, and no operator in the
 loop.
 
 This document is the design walkthrough: where the driver lives, how it talks to
-the daemon, the per-volume CHAP isolation model, the RPC-to-admin-call mapping,
+the daemon, the per-node CHAP isolation model, the RPC-to-admin-call mapping,
 and how it is deployed and released. The driver is issue #15.
 
 ## Where it lives
@@ -30,7 +30,7 @@ selects which:
   daemon's admin socket directly. One replica.
 - `--mode=node` runs as a DaemonSet on every worker that may mount a volume. It
   implements the Node service: it logs into the target over iSCSI with the
-  per-volume CHAP credentials and mounts the LUN. It never touches the admin
+  node's CHAP credentials and mounts the LUN. It never touches the admin
   socket.
 - `--mode=all` serves everything in one process (tests, single-node clusters).
 
@@ -82,32 +82,44 @@ daemon directly with no uuid→name lookup. A `SnapshotId` is `"<volume>/<snapsh
 for the same reason. (The original plan named the uuid as the VolumeId; this is
 the one deliberate deviation, recorded here.)
 
-## Per-volume CHAP isolation
+## Per-node CHAP isolation
 
 A single shared iSCSI target serves every volume, so the driver needs a fence
-that stops one node from seeing another's LUN. The model is **one CHAP user per
-volume**, admitted only to that volume:
+that stops one node from seeing another's LUN. iSCSI keys a session by
+`(target IQN, portal)`, and every VSA volume shares one IQN — so a node holds
+**one** session, and every LUN it mounts has to ride that single session, under
+a single CHAP identity. The model is therefore **one CHAP user per node**,
+admitted to every volume that node mounts:
 
-- `ControllerPublishVolume` mints a CHAP user named `csi-<volume>`, admitted to
-  exactly that volume, and returns its credentials in the `PublishContext`
-  (`{iqn, portal, lun, chapUser, chapSecret}`). The node logs in with those
-  creds, and VSA's admission (`iscsi-users.json` `volumes:` array) means that
-  session sees only its one LUN.
-- The 32-byte secret is **persisted in a Kubernetes Secret**
-  (`thurvsa-chap-<hash>`, in the driver's own namespace). This is what makes a
-  retried publish idempotent: the external-attacher can re-drive
+- `ControllerPublishVolume` ensures a CHAP user named `csi-node-<nodeID>`
+  (hashed if it would exceed the daemon's 256-byte username cap) and grants it
+  the volume being published. The first publish to a node creates the user
+  (admitted to that one volume); each later publish hits a 409 and falls through
+  to a `…/grant` that adds the new volume to the node's admission set. It returns
+  `{iqn, portal, lun, chapUser, chapSecret}` in the `PublishContext`.
+- The 32-byte secret is **per node**, persisted in a Kubernetes Secret
+  (`thurvsa-chap-node-<hash>`, in the driver's own namespace). This is what makes
+  a retried publish idempotent: the external-attacher can re-drive
   `ControllerPublishVolume`, or the controller can restart, and the call must
-  return the *identical* secret the daemon's CHAP user was created with — read
-  back from the Secret — or the node's login would desync. The CHAP user create
-  is `POST /iscsi/users`; a 409 (already exists) falls through to a grant, since
-  the Secret, not the daemon, is the source of truth for the secret value.
-- `ControllerUnpublishVolume` removes the volume from the CHAP user's admission
-  set; since the user serves exactly one volume, the revoke always refuses to
-  empty the set (the daemon returns 400) and `remove` is the terminal step. The
-  revoke-first shape stays correct if a user ever carries extra volumes. The
-  Secret is then deleted.
-- `DeleteVolume` also reaps a lingering CHAP user and Secret, so a deleted
-  volume can never leak a credential even if an unpublish was missed.
+  return the *identical* secret the daemon's CHAP user holds — read back from the
+  Secret — or the node's login would desync. The Secret, not the daemon, is the
+  source of truth for the secret value.
+- `ControllerUnpublishVolume` revokes just *this* volume from the node's CHAP
+  user (`…/revoke`). While the node still has other volumes, the revoke
+  succeeds and the user (and its Secret) stay. When this was the node's last
+  volume the daemon refuses to empty the admission set (400/409), which is the
+  signal to `…/remove` the user and delete the Secret.
+- `DeleteVolume` does **not** touch CHAP users — they belong to the node, not
+  the volume, and may admit other volumes. `ControllerUnpublishVolume` owns the
+  user's lifecycle.
+
+Because a node's volumes are admitted incrementally to one already-connected
+session, the daemon's per-CHAP-user admission is **dynamic**: a `grant` reaches
+sessions that are already up, and the daemon raises a REPORTED LUNS DATA HAS
+CHANGED Unit Attention so the node re-reads REPORT LUNS. The node's stage path
+issues an explicit SCSI rescan after login for the same reason. See
+[`docs/CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md) § SBC-3 — dynamic LUN
+admission.
 
 The secret store is an interface. The Kubernetes-backed store is the default;
 `--chap-secret-store=memory` selects an in-process store for csi-sanity and
@@ -118,8 +130,10 @@ namespace).
 > The CHAP secret travels in the `PublishContext`, which the external-attacher
 > persists in the `VolumeAttachment` object. Anyone with RBAC on
 > volumeattachments in the cluster can therefore read it — the standard
-> trade-off for iSCSI CSI drivers. Per-volume secrets keep the blast radius of
-> such a read to a single volume.
+> trade-off for iSCSI CSI drivers. A per-node secret means such a read exposes
+> the volumes mounted on that one node (not the whole cluster), and the node is
+> the meaningful isolation boundary in Kubernetes (a pod is already scheduled to
+> exactly one node).
 
 ## RPC → admin-call mapping
 
@@ -127,9 +141,9 @@ namespace).
 | --- | --- | --- |
 | `CreateVolume` | `POST /volumes` | name `pvc-<uid>`, sector-rounded size; 409 → `GET /volumes` and reconcile (size match = success, mismatch = `ALREADY_EXISTS`) |
 | `CreateVolume` (from source) | `POST /volumes/:src/clone` | `content_source` snapshot (`<vol>/<snap>`) or volume |
-| `DeleteVolume` | reap CHAP user + Secret, then `DELETE /volumes/:name` | 404 tolerated |
-| `ControllerPublishVolume` | ensure CHAP Secret, `POST /iscsi/users` (409 → `…/grant`) | returns `PublishContext` |
-| `ControllerUnpublishVolume` | `…/revoke` → (400/409) `…/remove`, delete Secret | idempotent |
+| `DeleteVolume` | `DELETE /volumes/:name` | 404 tolerated; CHAP users are per-node, reaped by unpublish |
+| `ControllerPublishVolume` | ensure per-node CHAP Secret, `POST /iscsi/users` (409 → `…/grant` this volume) | returns `PublishContext` |
+| `ControllerUnpublishVolume` | `…/revoke` this volume → on last volume (400/409) `…/remove` + delete Secret | needs `node_id`; idempotent |
 | `CreateSnapshot` / `DeleteSnapshot` | `POST` / `DELETE /volumes/:src/snapshots[/:snap]` | `SnapshotId = <vol>/<snap>`; 409 → list-and-return |
 | `ControllerExpandVolume` | `POST /volumes/:name/resize` | grow-only; ≤current is an idempotent no-op; `node_expansion_required=true` |
 | `NodeStageVolume` | — (iscsiadm) | attach + format + mount; persists the connector |
@@ -139,24 +153,39 @@ namespace).
 
 VSA volumes are thin and grow-only; the driver advertises `EXPAND_VOLUME` and
 never issues a shrink (a request at or below the current size simply returns the
-current size). Access modes are restricted to the single-node family —
-per-volume CHAP plus a single iSCSI session is single-attach by construction.
+current size). Access modes are restricted to the single-node family — a volume
+is mounted on one node at a time, on that node's single CHAP-authenticated
+session.
 
 ## The node side
 
 `NodeStageVolume` builds an `iscsi.Connector` from the `PublishContext` and runs
 the attach through a `k8s.io/utils/exec` interface (so the exact `iscsiadm` argv
-is unit-tested with a fake, no real `iscsiadm` needed): SendTargets discovery,
-the three `node.session.auth.*` CHAP fields written to the node DB, then
-`--login` (an existing session is tolerated). The device is resolved from the
+is unit-tested with a fake, no real `iscsiadm` needed): it creates the node DB
+record directly from the IQN + portal (`-o new` — no SendTargets discovery,
+which can stall against a CHAP-gated target), writes the three
+`node.session.auth.*` CHAP fields, runs `--login` (an existing session is
+tolerated), then forces a SCSI **rescan** (`-R`). The rescan is what surfaces a
+LUN granted to the node's CHAP user *after* the session came up: `--login` is a
+no-op on an existing session, and the daemon re-reads admission dynamically, so
+the rescan makes the just-admitted LUN appear. The device is resolved from the
 `/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<lun>` symlink, which udev
-creates a moment after login, with a bounded poll. The volume is then formatted
-and mounted to the staging path via `mount-utils` `SafeFormatAndMount`.
+creates a moment after the rescan, with a bounded poll. The volume is then
+formatted and mounted to the staging path via `mount-utils` `SafeFormatAndMount`.
+
+`iscsiadm` and the host `iscsid` must be the same open-iscsi version, and the
+container's bundled copy rarely matches the host's, so by default the node runs
+the *host's* `iscsiadm` via `nsenter` into PID 1's namespaces (the DaemonSet
+sets `hostPID`); `--host-iscsiadm=false` falls back to the bundled binary.
 
 `NodeUnstageVolume` receives no `PublishContext`, so the connector is persisted
-to `--node-state-dir/<volid>.json` at stage time and read back to drive the
-logout and node-record delete. `NodeExpandVolume` reads it the same way to
-rescan the session before growing the filesystem.
+to `--node-state-dir/<volid>.json` at stage time and read back at unstage. Since
+every volume on a node shares the one session, unstage drops this volume's
+connector file and logs out **only when it was the last** one (no `.json`
+connector files remain) — logging out earlier would tear every other volume's
+LUN off the node. A surviving session drops the now-revoked LUN on its next
+rescan. `NodeExpandVolume` reads the connector the same way to rescan the
+session before growing the filesystem.
 
 Raw-block volumes skip the stage-time format/mount; the device file is
 bind-mounted to the target at `NodePublishVolume`, and node expansion is just
@@ -214,9 +243,9 @@ real iscsiadm, mount, or cluster. Two notes fell out of making it pass:
   lookup before creating (the external-snapshotter mints unique names, so this
   is a correctness guard, not a hot path).
 - One sanity spec is skipped: "ControllerPublishVolume should fail when the node
-  does not exist". The driver's attach is node-agnostic — publish just mints
-  per-volume CHAP creds usable from any node — so the controller keeps no node
-  registry to validate a node id against.
+  does not exist". Publish mints (or reuses) a per-node CHAP user keyed by the
+  node id and grants it the volume — the node id is a credential key, not a
+  handle into a node registry, so there is nothing to validate it against.
 
 The full lifecycle on a real cluster (the iSCSI + filesystem data path
 csi-sanity's fakes can't cover) is the gated e2e suite (`csi/test/e2e`, issue

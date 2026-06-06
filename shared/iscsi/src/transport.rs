@@ -798,11 +798,18 @@ pub struct LoginOutcome {
     /// (IQN + ISID) rather than the ephemeral TSIH (issue #57).
     pub isid: [u8; 6],
     pub authenticated_partition: Option<String>,
-    /// Volume-name set this session is admitted to (VSA only). `None`
-    /// = no admission fence. Carried from CHAP login into the FFP
-    /// loop, which threads it as `ScsiRequest::session_volumes` on
-    /// every dispatch.
+    /// Volume-name set this session is admitted to *at login* (VSA
+    /// only). `None` = no admission fence. This is the snapshot the FFP
+    /// loop falls back to when the handler exposes no live admission
+    /// (VTL, or auth disabled); VSA overrides it per command via
+    /// [`ScsiHandler::live_admission`] so a later `iscsi users grant`
+    /// reaches this session.
     pub authenticated_volumes: Option<Vec<String>>,
+    /// CHAP username this session authenticated as, or `None` for an
+    /// unauthenticated session. Threaded into the FFP loop to key the
+    /// handler's live-admission lookup, and recorded on the session so
+    /// `iscsi users grant` can target its UA.
+    pub authenticated_user: Option<String>,
     /// Initiator-declared `MaxRecvDataSegmentLength` from operational
     /// negotiation, falling back to the RFC 7143 §12.12 default of
     /// 8192 bytes when the initiator omits the key. Bounds the data
@@ -1268,9 +1275,13 @@ pub async fn handle_login_phase(
                 );
             }
             // Record the initiator IQN so the reservation UA sink can map
-            // a fenced registrant's (IQN, ISID) back to this TSIH (#67).
+            // a fenced registrant's (IQN, ISID) back to this TSIH (#67),
+            // and the CHAP username so `iscsi users grant` can fan its
+            // REPORTED LUNS DATA HAS CHANGED UA to this session (VSA
+            // dynamic admission).
             if !is_discovery && tsih != 0 {
                 session_manager.set_initiator_iqn(tsih, initiator_name.clone());
+                session_manager.set_authenticated_user(tsih, chap.authenticated_user.clone());
             }
             return Ok(LoginOutcome {
                 is_discovery,
@@ -1281,6 +1292,7 @@ pub async fn handle_login_phase(
                 isid,
                 authenticated_partition: chap.authenticated_partition,
                 authenticated_volumes: chap.authenticated_volumes,
+                authenticated_user: chap.authenticated_user,
                 peer_max_recv_data_segment_length,
             });
         }
@@ -1447,6 +1459,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         isid,
         authenticated_partition,
         authenticated_volumes,
+        authenticated_user,
         peer_max_recv_data_segment_length,
         ..
     } = outcome;
@@ -1668,6 +1681,20 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     c
                 };
 
+                // VSA dynamic admission: for a CHAP session, re-read the
+                // user's *current* admitted-volume set from the handler's
+                // live view each command, so an `iscsi users grant` /
+                // `revoke` issued after login takes effect on this session.
+                // Falls back to the login snapshot when the handler exposes
+                // no live admission (VTL, or auth disabled).
+                let live_admission = authenticated_user
+                    .as_deref()
+                    .and_then(|u| handler.live_admission(u));
+                let session_volumes = match &live_admission {
+                    Some(set) => Some(set.as_slice()),
+                    None => authenticated_volumes.as_deref(),
+                };
+
                 let req = ScsiRequest {
                     tsih,
                     cid,
@@ -1679,7 +1706,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     initiator_isid: pr_isid,
                     peer,
                     session_partition: authenticated_partition.as_deref(),
-                    session_volumes: authenticated_volumes.as_deref(),
+                    session_volumes,
                 };
 
                 let resp = handler.dispatch(req).await;

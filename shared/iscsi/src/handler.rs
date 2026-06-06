@@ -57,6 +57,24 @@ pub trait ScsiHandler: Send + Sync + 'static {
         false
     }
 
+    /// Resolve a CHAP-authenticated user's *current* admitted-volume
+    /// set, for dynamic LUN admission (VSA). The transport calls this
+    /// once per command for a CHAP session and threads the result as
+    /// [`ScsiRequest::session_volumes`], so an `iscsi users grant` /
+    /// `revoke` reaches sessions that are already up — the login-time
+    /// snapshot is no longer authoritative.
+    ///
+    /// Default `None`, meaning "no dynamic admission": the transport
+    /// keeps the login snapshot. VTL never overrides it (it has no
+    /// admission concept); VSA returns `Some(current_set)`
+    /// (empty when the user has since been removed → the session sees
+    /// nothing, the safe fallback). The empty `Vec` and `None` are
+    /// distinct: `None` means "use the snapshot", `Some(empty)` means
+    /// "admitted to nothing".
+    fn live_admission(&self, _username: &str) -> Option<std::sync::Arc<Vec<String>>> {
+        None
+    }
+
     /// Run one SCSI command end-to-end. Implementations may pre-/
     /// post-process around the actual dispatch (thurvtl does cloud
     /// chunk prefetch on READ, MOVE MEDIUM legal-hold sentinel

@@ -50,7 +50,7 @@ func wantCmd(t *testing.T, calls [][]string, i int, want string) {
 }
 
 func TestAttachIssuesExpectedCommands(t *testing.T) {
-	fe, calls := recExec(5)
+	fe, calls := recExec(6)
 	a := &Attacher{exec: fe, resolve: func(_ context.Context, _ Connector) (string, error) { return "/dev/sdx", nil }}
 
 	dev, err := a.Attach(context.Background(), Connector{
@@ -65,11 +65,14 @@ func TestAttachIssuesExpectedCommands(t *testing.T) {
 	}
 	const iqn = "iqn.2025-10.com.metebalci:thurvsa"
 	const p = "10.0.0.5:3260" // default port appended
-	wantCmd(t, *calls, 0, "iscsiadm -m discovery -t sendtargets -p "+p)
+	wantCmd(t, *calls, 0, "iscsiadm -m node -o new -T "+iqn+" -p "+p)
 	wantCmd(t, *calls, 1, "iscsiadm -m node -T "+iqn+" -p "+p+" -o update -n node.session.auth.authmethod -v CHAP")
 	wantCmd(t, *calls, 2, "iscsiadm -m node -T "+iqn+" -p "+p+" -o update -n node.session.auth.username -v csi-pvc-1")
 	wantCmd(t, *calls, 3, "iscsiadm -m node -T "+iqn+" -p "+p+" -o update -n node.session.auth.password -v deadbeef")
 	wantCmd(t, *calls, 4, "iscsiadm -m node -T "+iqn+" -p "+p+" --login")
+	// Rescan after login so a LUN granted to the node's CHAP user after
+	// the session came up becomes visible (per-node CHAP, issue #15).
+	wantCmd(t, *calls, 5, "iscsiadm -m node -T "+iqn+" -p "+p+" -R")
 }
 
 func TestAttachToleratesExistingSession(t *testing.T) {
@@ -78,6 +81,8 @@ func TestAttachToleratesExistingSession(t *testing.T) {
 		fe.CommandScript = append(fe.CommandScript, okCmd())
 	}
 	fe.CommandScript = append(fe.CommandScript, errCmd("iscsiadm: the session already exists", fmt.Errorf("exit status 15")))
+	// The post-login rescan still runs on the tolerated existing session.
+	fe.CommandScript = append(fe.CommandScript, okCmd())
 	a := &Attacher{exec: fe, resolve: func(_ context.Context, _ Connector) (string, error) { return "/dev/sdy", nil }}
 
 	if _, err := a.Attach(context.Background(), Connector{TargetIQN: "iqn.x", Portal: "10.0.0.5:3260", Lun: 0, ChapUser: "u", ChapSecret: "s"}); err != nil {

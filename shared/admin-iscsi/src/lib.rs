@@ -32,6 +32,20 @@ use shared_iscsi::auth::{IscsiUsersFile, UserEntry};
 pub trait IscsiUsersState: Clone + Send + Sync + 'static {
     fn data_dir(&self) -> &Path;
     fn audit_channel(&self) -> Option<&AuditChannel>;
+
+    /// Notify that user `username`'s admitted-volume set changed
+    /// (`add` / `grant` / `revoke` → `Some(new_set)`; `remove` →
+    /// `None`). Default no-op — VTL has no admission concept.
+    ///
+    /// VSA overrides it to keep its in-memory [`AdmissionView`] in
+    /// lockstep with the just-saved `iscsi-users.json` and to fan a
+    /// REPORTED LUNS DATA HAS CHANGED Unit Attention to that user's
+    /// live sessions, so an already-connected initiator re-reads
+    /// REPORT LUNS and picks up a newly-granted volume (dynamic
+    /// admission — the Kubernetes CSI per-node CHAP model).
+    ///
+    /// [`AdmissionView`]: shared_iscsi::AdmissionView
+    fn on_admission_changed(&self, _username: &str, _volumes: Option<&[String]>) {}
 }
 
 // ---------- request/response types ----------
@@ -174,6 +188,7 @@ pub async fn add<S: IscsiUsersState>(
     });
     save_users(&path, &file)?;
     emit_sweep_audits(&state, &peer, swept);
+    state.on_admission_changed(&body.username, row.volumes.as_deref());
     audit(
         &state,
         &peer,
@@ -197,6 +212,7 @@ pub async fn remove<S: IscsiUsersState>(
     }
     save_users(&path, &file)?;
     emit_sweep_audits(&state, &peer, swept);
+    state.on_admission_changed(&body.name, None);
     audit(
         &state,
         &peer,
@@ -347,6 +363,7 @@ pub async fn grant<S: IscsiUsersState>(
     };
     save_users(&path, &file)?;
     emit_sweep_audits(&state, &peer, swept);
+    state.on_admission_changed(&body.name, row.volumes.as_deref());
     audit(
         &state,
         &peer,
@@ -405,6 +422,7 @@ pub async fn revoke<S: IscsiUsersState>(
     };
     save_users(&path, &file)?;
     emit_sweep_audits(&state, &peer, swept);
+    state.on_admission_changed(&body.name, row.volumes.as_deref());
     audit(
         &state,
         &peer,

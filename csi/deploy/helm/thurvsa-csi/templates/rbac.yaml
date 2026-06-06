@@ -35,6 +35,12 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # csi-resizer's --handle-volume-inuse-error informer watches pods to gate
+  # online expansion; without this its shared informer factory never syncs and
+  # ControllerExpandVolume is never issued (the resize controller stalls).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
