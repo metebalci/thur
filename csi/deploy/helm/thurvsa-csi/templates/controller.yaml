@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thurvsa-csi.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thurvsa-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "thurvsa-csi.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "thurvsa-csi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "thurvsa-csi.controllerServiceAccount" . }}
+      # The controller must run on the appliance node to reach the local admin
+      # socket, with the host thurvsa gid for peer-cred admission.
+      nodeSelector:
+        {{- toYaml .Values.controller.nodeSelector | nindent 8 }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsGroup: {{ include "thurvsa-csi.gid" . }}
+        supplementalGroups:
+          - {{ include "thurvsa-csi.gid" . }}
+      containers:
+        - name: thurvsa-csi
+          image: {{ include "thurvsa-csi.image" . }}
+          imagePullPolicy: {{ .Values.driver.image.pullPolicy }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --drivername={{ .Values.driver.name }}
+            - --admin-socket={{ .Values.adminSocket }}
+            - --target-iqn={{ .Values.iscsi.targetIqn }}
+            {{- if .Values.iscsi.targetPortal }}
+            - --target-portal={{ .Values.iscsi.targetPortal }}
+            {{- end }}
+            - --chap-secret-store=kubernetes
+            - --secret-namespace=$(POD_NAMESPACE)
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: admin-socket-dir
+              mountPath: {{ dir .Values.adminSocket }}
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-provisioner
+          image: {{ .Values.sidecars.provisioner.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --extra-create-metadata
+            - --default-fstype=ext4
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-attacher
+          image: {{ .Values.sidecars.attacher.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-resizer
+          image: {{ .Values.sidecars.resizer.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-snapshotter
+          image: {{ .Values.sidecars.snapshotter.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: livenessprobe
+          image: {{ .Values.sidecars.livenessprobe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        - name: admin-socket-dir
+          hostPath:
+            path: {{ dir .Values.adminSocket }}
+            type: Directory

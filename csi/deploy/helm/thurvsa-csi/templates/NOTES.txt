@@ -1,0 +1,24 @@
+thurvsa-csi {{ .Chart.AppVersion }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Driver: {{ .Values.driver.name }}
+
+Next steps:
+  1. Confirm the controller is running on the appliance node (it needs the
+     local admin socket at {{ .Values.adminSocket }}):
+       kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=controller -o wide
+     The appliance node must be labelled:
+       kubectl label node <appliance> {{ range $k, $v := .Values.controller.nodeSelector }}{{ $k }}={{ $v }} {{ end }}
+
+  2. Confirm the node plugin is registered on every worker:
+       kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=node -o wide
+
+{{- if not .Values.storageClass.create }}
+
+  3. Create a StorageClass (or re-install with storageClass.create=true). The
+     targetPortal must be routable from every worker:
+       provisioner: {{ .Values.driver.name }}
+       parameters: { fsType: ext4, targetPortal: "<appliance-ip>:3260" }
+{{- end }}
+
+  Workers need open-iscsi installed on the host (iscsiadm runs there, not in
+  the image). Snapshots require the external-snapshotter CRDs + controller.

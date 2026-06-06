@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "thurvsa-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "thurvsa-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "thurvsa-csi.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "thurvsa-csi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: {{ include "thurvsa-csi.nodeServiceAccount" . }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: thurvsa-csi
+          image: {{ include "thurvsa-csi.image" . }}
+          imagePullPolicy: {{ .Values.driver.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --drivername={{ .Values.driver.name }}
+            - --node-id=$(NODE_ID)
+            - --node-state-dir={{ .Values.nodeStateDir }}
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: {{ .Values.kubeletDir }}/pods
+              mountPropagation: Bidirectional
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+            - name: iscsi-etc
+              mountPath: /etc/iscsi
+            - name: iscsi-lib
+              mountPath: /var/lib/iscsi
+            - name: node-state-dir
+              mountPath: {{ .Values.nodeStateDir }}
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.registrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.kubeletDir }}/plugins/{{ .Values.driver.name }}/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: livenessprobe
+          image: {{ .Values.sidecars.livenessprobe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}/plugins/{{ .Values.driver.name }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}/pods
+            type: Directory
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: iscsi-etc
+          hostPath:
+            path: /etc/iscsi
+            type: Directory
+        - name: iscsi-lib
+          hostPath:
+            path: /var/lib/iscsi
+            type: DirectoryOrCreate
+        - name: node-state-dir
+          hostPath:
+            path: {{ .Values.nodeStateDir }}
+            type: DirectoryOrCreate

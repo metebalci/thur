@@ -1,0 +1,18 @@
+apiVersion: v2
+name: thurvsa-csi
+description: Kubernetes CSI driver for Thur VSA — provisions VSA block volumes over iSCSI with snapshots, clones, and online expansion.
+type: application
+# Chart version; bumped independently of the driver. The driver image tag
+# defaults to appVersion.
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - csi
+  - iscsi
+  - storage
+  - thurvsa
+home: https://github.com/metebalci/thur
+sources:
+  - https://github.com/metebalci/thur/tree/main/csi
+maintainers:
+  - name: Mete Balci

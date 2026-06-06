@@ -1,0 +1,83 @@
+# Default values for thurvsa-csi.
+
+# REQUIRED. The numeric gid of the host `thurvsa` group on the appliance node.
+# The controller hostPath-mounts the daemon's admin socket (/run/thurvsa/admin.sock,
+# mode 0660, SO_PEERCRED); the driver process must run with this gid to be
+# admitted. There is no safe default — find it with `getent group thurvsa` on
+# the appliance and set it here (e.g. thurvsaGid: 977).
+thurvsaGid: null
+
+driver:
+  name: thurvsa.csi.metebalci.com
+  image:
+    repository: ghcr.io/metebalci/thurvsa-csi
+    # Defaults to .Chart.AppVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+# iSCSI target the node logs into. The portal must be an address routable from
+# every worker node. targetPortal here seeds the example StorageClass; it can
+# also be set per-StorageClass.
+iscsi:
+  targetIqn: iqn.2025-10.com.metebalci:thurvsa
+  targetPortal: ""
+
+# Path to the daemon's admin socket on the appliance host.
+adminSocket: /run/thurvsa/admin.sock
+
+# kubelet root dir. Override for k3s (/var/lib/rancher/k3s/agent/kubelet) etc.
+kubeletDir: /var/lib/kubelet
+
+# Persistent host dir for per-volume iSCSI connector state (read back by
+# NodeUnstageVolume / NodeExpandVolume).
+nodeStateDir: /var/lib/thurvsa-csi
+
+controller:
+  replicas: 1
+  # Pin the controller to the appliance node — it needs the local admin socket.
+  nodeSelector:
+    thurvsa.csi/appliance: "true"
+  tolerations: []
+  resources: {}
+
+node:
+  # The node plugin runs on every worker that may mount a volume.
+  tolerations:
+    - operator: Exists
+  resources: {}
+
+# Sidecar images (registry.k8s.io/sig-storage).
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+  attacher:
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+  resizer:
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+  snapshotter:
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+  livenessprobe:
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+
+# Example StorageClass. Disabled by default — most operators ship their own.
+storageClass:
+  create: false
+  name: thurvsa
+  isDefault: false
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+  # Passed straight through to CreateVolume.
+  parameters:
+    fsType: ext4
+    # backend: primary
+    # pageSize: 64Ki
+    # dedupScope: local
+
+# Example VolumeSnapshotClass. Requires the external-snapshotter CRDs +
+# controller to be installed cluster-wide first.
+snapshotClass:
+  create: false
+  name: thurvsa
+  deletionPolicy: Delete

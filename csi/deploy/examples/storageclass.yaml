@@ -1,0 +1,17 @@
+# Example StorageClass. targetPortal must be an address routable from every
+# worker node. Other parameters map straight to the VSA CreateVolume request.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: thurvsa
+provisioner: thurvsa.csi.metebalci.com
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+parameters:
+  fsType: ext4
+  targetPortal: "10.0.0.5:3260"
+  # backend: primary
+  # pageSize: 64Ki
+  # dedupScope: local
+  # worm: "false"

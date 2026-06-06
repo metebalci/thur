@@ -1,0 +1,27 @@
+# Snapshot the demo PVC, then provision a new PVC seeded from that snapshot.
+# Requires the external-snapshotter CRDs + controller and a VolumeSnapshotClass
+# named "thurvsa".
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: thurvsa-demo-snap
+spec:
+  volumeSnapshotClassName: thurvsa
+  source:
+    persistentVolumeClaimName: thurvsa-demo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: thurvsa-demo-clone
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: thurvsa
+  resources:
+    requests:
+      storage: 1Gi
+  dataSource:
+    name: thurvsa-demo-snap
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io

@@ -1,0 +1,14 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.driver.name }}
+  labels:
+    {{- include "thurvsa-csi.labels" . | nindent 4 }}
+spec:
+  # iSCSI attach is a real controller operation (ControllerPublishVolume).
+  attachRequired: true
+  # The provisioner passes pvc/pv names + namespace into CreateVolume.
+  podInfoOnMount: true
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
