@@ -1,0 +1,1272 @@
+# Copyright (c) 2026 Mete Balci
+# SPDX-License-Identifier: Apache-2.0
+#
+# Machine-readable contract for the read-only TCP HTTP admin API that
+# both daemons expose (issue #12). This is the NETWORK-FACING surface
+# only: every path here is a GET served on the TCP listener (default
+# :9090), gated by the single web-admin password (issue #4) except for
+# the open liveness/scrape pair.
+#
+# Out of scope, deliberately: the mutating /api/v1/* verbs (cartridge /
+# volume / changer / iscsi / nvmetcp / jobs / admin-password). Those are
+# reachable ONLY over the local peer-cred Unix admin socket
+# (/run/{thurvtl,thurvsa}/admin.sock) that the CLI dials — they are not
+# network endpoints and have no client that would consume an OpenAPI
+# description, so documenting them here would be reference text that
+# nothing reads and that immediately drifts.
+#
+# SYNC GUARD: vtl/daemon/tests/openapi_sync.rs and
+# vsa/daemon/tests/openapi_sync.rs parse each daemon's TCP router source
+# (vtl/daemon/src/http/mod.rs, vsa/daemon/src/http.rs) and fail if any
+# mounted route is missing from this file's `paths`. Add a TCP route ->
+# update this file in the same change, or the daemon test crate fails to
+# pass.
+
+openapi: 3.0.3
+
+info:
+  title: Thur admin API (read-only)
+  version: "1.0"
+  description: |
+    Read-only HTTP admin surface shared by the two Thur daemons.
+
+    **Two daemons, one spec.** Thur VTL (`thurvtld`) and Thur VSA
+    (`thurvsad`) are separate processes that each run their own TCP HTTP
+    listener (default `:9090`; co-resident installs override one in
+    YAML). Every operation below is tagged with the daemon(s) that serve
+    it:
+
+    - `common` — served by **both** daemons (`/health`, `/metrics`,
+      `/sessions`, `/info`, `/api/v1/monitor`, `/api/v1/jobs/recent`,
+      `/api/v1/audit/tail`).
+    - `vtl` — served by **thurvtld only** (library / cartridge / changer
+      / drive inventory).
+    - `vsa` — served by **thurvsad only** (volume / snapshot inventory).
+
+    No single running daemon answers every path — `thurvtld` serves
+    `common` + `vtl`, `thurvsad` serves `common` + `vsa`.
+
+    **Read-only by construction.** Only GET handlers are mounted on the
+    TCP listener; every mutating verb takes a peer-cred extractor and is
+    reachable only over the local Unix admin socket (the CLI's
+    transport). A remote client cannot mutate state through this API.
+
+    **Auth.** `/health` and `/metrics` are always open (for liveness
+    probes and Prometheus scrape). The remaining routes form a
+    "protected" group whose gating is operator-controlled by
+    `http.auth.method`. The **default is `None`** — the protected group
+    is served open, on the assumption the management listener sits on a
+    trusted network. Setting `http.auth.method: Password` turns on HTTP
+    Basic against the single web-admin password (realm `thur admin`,
+    fixed username `webadmin`): wrong credentials get `401`, and the
+    password-not-yet-set case fails closed with `503` + a challenge. The
+    `401`/`503` responses below therefore apply only when the gate is
+    enabled. The `http.webui.enabled` key (on by default) controls
+    whether the `/api/v1/*` and `/ui/*` groups are mounted at all; when
+    disabled, only `/health`, `/metrics`, `/sessions`, `/info` exist.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: Thur
+    url: https://github.com/metebalci/thur
+
+servers:
+  - url: "{scheme}://{host}:{port}"
+    description: Daemon TCP HTTP listener (thurvtld or thurvsad).
+    variables:
+      scheme:
+        default: http
+        enum: [http, https]
+        description: https when http.tls is configured, otherwise http.
+      host:
+        default: localhost
+      port:
+        default: "9090"
+        description: http.listen port (default 9090 for both products).
+
+tags:
+  - name: common
+    description: Served by both thurvtld and thurvsad.
+  - name: vtl
+    description: Served by thurvtld only.
+  - name: vsa
+    description: Served by thurvsad only.
+
+security:
+  - webAdminPassword: []
+
+paths:
+  /health:
+    get:
+      tags: [common]
+      summary: Liveness probe
+      description: Unauthenticated. Used by liveness probes and orchestrators.
+      operationId: getHealth
+      security: []
+      responses:
+        "200":
+          description: Daemon is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /metrics:
+    get:
+      tags: [common]
+      summary: Prometheus metrics
+      description: >
+        Unauthenticated. Prometheus text exposition format. Instrument
+        names are prefixed `thurvtl_*` / `thurvsa_*` per product.
+      operationId: getMetrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus exposition text.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /sessions:
+    get:
+      tags: [common]
+      summary: Active iSCSI sessions
+      description: >
+        Snapshot of every active iSCSI session on the target, plus the
+        configured target IQN and listen addresses.
+      operationId: getSessions
+      responses:
+        "200":
+          description: Session inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionsSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /info:
+    get:
+      tags: [common]
+      summary: Daemon summary
+      description: >
+        Product-specific read-only summary. thurvtld returns library
+        topology; thurvsad returns volume count + iSCSI coordinates.
+      operationId: getInfo
+      responses:
+        "200":
+          description: Daemon summary (shape depends on which daemon answers).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/VtlInfo"
+                  - $ref: "#/components/schemas/VsaInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/monitor:
+    get:
+      tags: [common]
+      summary: Monitor snapshot
+      description: >
+        Single-shot snapshot — the same payload the streaming
+        `system.monitor` job emits per tick. Pool / storage / dedup /
+        audit counters plus a product-tagged summary.
+      operationId: getMonitorSnapshot
+      responses:
+        "200":
+          description: Monitor snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitorSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/jobs/recent:
+    get:
+      tags: [common]
+      summary: Recent jobs
+      description: >
+        Rolling 5-minute window of jobs. Not a persistent history:
+        finished jobs are reaped 300 s after they end.
+      operationId: getRecentJobs
+      responses:
+        "200":
+          description: Recent job summaries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobsRecent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/audit/tail:
+    get:
+      tags: [common]
+      summary: Audit log tail
+      description: The last N entries of the BLAKE3-chained audit log.
+      operationId: getAuditTail
+      parameters:
+        - name: lines
+          in: query
+          required: false
+          description: Trailing entries to return. Clamped to 1..=1000.
+          schema:
+            type: integer
+            format: int64
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: Audit tail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditTail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Audit log read failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/library/info:
+    get:
+      tags: [vtl]
+      summary: Library topology
+      description: >
+        Chassis-level slot / drive counts, LTO generation, firmware, and
+        the logical partition layout. Topology-only by default.
+      operationId: getLibraryInfo
+      parameters:
+        - name: with_cartridges
+          in: query
+          required: false
+          description: >
+            When true, also walk every cartridge's runtime.json and
+            return the `cartridge_totals` aggregate (more expensive).
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Library topology.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/library/bounds:
+    get:
+      tags: [vtl]
+      summary: Slot/drive sizing envelope
+      description: >
+        Current YAML counts, the minimum the operator can shrink to
+        without losing cartridges, and the absolute wire-format ceiling.
+      operationId: getLibraryBounds
+      responses:
+        "200":
+          description: Sizing bounds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BoundsReport"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/cartridges:
+    get:
+      tags: [vtl]
+      summary: List cartridges
+      description: Every cartridge currently in the library, in inventory order.
+      operationId: listCartridges
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          description: Substring match against the barcode.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cartridge list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CartridgeList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  "/api/v1/cartridges/{identifier}":
+    get:
+      tags: [vtl]
+      summary: Cartridge detail
+      description: >
+        Per-cartridge detail resolved by barcode or numeric storage-slot
+        ID. Counters are as-of the last runtime.json persist.
+      operationId: getCartridgeInfo
+      parameters:
+        - name: identifier
+          in: path
+          required: true
+          description: Barcode or numeric storage-slot ID.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cartridge detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CartridgeInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/changer/inventory:
+    get:
+      tags: [vtl]
+      summary: Changer inventory
+      description: Occupied storage + mail slots and loaded drives, with barcodes.
+      operationId: getChangerInventory
+      responses:
+        "200":
+          description: Changer inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangerInventory"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/drives:
+    get:
+      tags: [vtl]
+      summary: List drives
+      description: '"What''s loaded?" view of every drive.'
+      operationId: listDrives
+      responses:
+        "200":
+          description: Drive list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DrivesList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  "/api/v1/drives/{id}":
+    get:
+      tags: [vtl]
+      summary: Drive status
+      operationId: getDriveStatus
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Drive id.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: Drive status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DriveStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  /api/v1/volumes:
+    get:
+      tags: [vsa]
+      summary: List volumes
+      description: Every registered volume, in LUN order (live registry).
+      operationId: listVolumes
+      responses:
+        "200":
+          description: Volume list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  "/api/v1/volumes/{name}":
+    get:
+      tags: [vsa]
+      summary: Volume detail
+      description: >
+        One volume's manifest plus the assigned lun, on-disk path,
+        allocated page count, and an embedded runtime counter block.
+      operationId: getVolumeInfo
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Volume name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Volume detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+  "/api/v1/volumes/{name}/snapshots":
+    get:
+      tags: [vsa]
+      summary: List volume snapshots
+      description: A volume's snapshots, read from the on-disk snapshots/ dir.
+      operationId: listVolumeSnapshots
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Volume name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Snapshot list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/PasswordNotConfigured"
+
+components:
+  securitySchemes:
+    webAdminPassword:
+      type: http
+      scheme: basic
+      description: >
+        HTTP Basic against the single web-admin password. Realm
+        `thur admin`, fixed username `webadmin`. Enforced only when
+        `http.auth.method: Password`; under the default `None` the
+        protected routes are served open. When enforced, the
+        password-not-yet-set case fails closed (503 + challenge).
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid web-admin credentials.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PasswordNotConfigured:
+      description: No web-admin password configured; the gate fails closed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+      description: Uniform error body for every non-2xx admin response.
+
+    HealthStatus:
+      type: object
+      required: [status, daemon, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        daemon:
+          type: string
+          description: Product name (thurvtl / thurvsa).
+        version:
+          type: string
+
+    SessionsSnapshot:
+      type: object
+      required: [status, target_iqn, listen_addresses, sessions]
+      properties:
+        status:
+          type: string
+          enum: [online]
+        target_iqn:
+          type: string
+        listen_addresses:
+          type: array
+          items:
+            type: string
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionInfo"
+
+    SessionInfo:
+      type: object
+      required: [tsih, isid, connection_count, age_seconds, idle_seconds]
+      properties:
+        tsih:
+          type: integer
+          format: int32
+        isid:
+          type: array
+          description: 6-byte iSCSI initiator session ID.
+          minItems: 6
+          maxItems: 6
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+        connection_count:
+          type: integer
+          format: int64
+        age_seconds:
+          type: integer
+          format: int64
+        idle_seconds:
+          type: integer
+          format: int64
+
+    VtlInfo:
+      type: object
+      required: [product, slots, drives, lto_generation, partitions, chassis_serial]
+      properties:
+        product:
+          type: string
+          enum: [thurvtl]
+        slots:
+          type: object
+          required: [storage, mail]
+          properties:
+            storage:
+              type: integer
+              format: int64
+            mail:
+              type: integer
+              format: int64
+        drives:
+          type: integer
+          format: int64
+        lto_generation:
+          type: integer
+        partitions:
+          type: array
+          items:
+            type: string
+        chassis_serial:
+          type: string
+
+    VsaInfo:
+      type: object
+      required: [product, volume_count, iqn, listen_addresses]
+      properties:
+        product:
+          type: string
+          enum: [thurvsa]
+        volume_count:
+          type: integer
+          format: int64
+        iqn:
+          type: string
+        listen_addresses:
+          type: array
+          items:
+            type: string
+
+    MonitorSnapshot:
+      type: object
+      required: [ts_unix, daemon, version, started_at_unix, product, pool, storage, dedup, audit]
+      properties:
+        ts_unix:
+          type: integer
+          format: int64
+          description: Wall-clock seconds the snapshot was taken.
+        daemon:
+          type: string
+        version:
+          type: string
+        started_at_unix:
+          type: integer
+          format: int64
+        product:
+          $ref: "#/components/schemas/ProductSnapshot"
+        pool:
+          type: array
+          items:
+            $ref: "#/components/schemas/PoolEntry"
+        storage:
+          type: array
+          items:
+            $ref: "#/components/schemas/StorageEntry"
+        dedup:
+          type: array
+          items:
+            $ref: "#/components/schemas/DedupEntry"
+        audit:
+          $ref: "#/components/schemas/MonitorAudit"
+
+    ProductSnapshot:
+      oneOf:
+        - $ref: "#/components/schemas/VsaProductSnapshot"
+        - $ref: "#/components/schemas/VtlProductSnapshot"
+      discriminator:
+        propertyName: kind
+        mapping:
+          vsa: "#/components/schemas/VsaProductSnapshot"
+          vtl: "#/components/schemas/VtlProductSnapshot"
+
+    VsaProductSnapshot:
+      type: object
+      required: [kind, volumes_online, iscsi_sessions, nvmetcp_sessions]
+      properties:
+        kind:
+          type: string
+          enum: [vsa]
+        volumes_online:
+          type: integer
+          format: int64
+        iscsi_sessions:
+          type: integer
+          format: int64
+        nvmetcp_sessions:
+          type: integer
+          format: int64
+
+    VtlProductSnapshot:
+      type: object
+      required: [kind, cartridges_loaded, cartridges_total, drives_busy, drives_total, sessions_active]
+      properties:
+        kind:
+          type: string
+          enum: [vtl]
+        cartridges_loaded:
+          type: integer
+          format: int64
+        cartridges_total:
+          type: integer
+          format: int64
+        drives_busy:
+          type: integer
+          format: int64
+        drives_total:
+          type: integer
+          format: int64
+        sessions_active:
+          type: integer
+          format: int64
+
+    PoolEntry:
+      type: object
+      required: [backend, namespace, label, used_bytes, cap_bytes, waiters_now, backpressure_waits_total]
+      properties:
+        backend:
+          type: string
+        namespace:
+          type: string
+          nullable: true
+          description: null for the global-dedup bucket.
+        label:
+          type: string
+          nullable: true
+          description: Human-readable name (volume on VSA, cartridge on VTL); null for the global row.
+        used_bytes:
+          type: integer
+          format: int64
+        cap_bytes:
+          type: integer
+          format: int64
+        waiters_now:
+          type: integer
+          format: int64
+        backpressure_waits_total:
+          type: integer
+          format: int64
+
+    StorageEntry:
+      type: object
+      required: [backend, put_ops_total, get_ops_total, put_bytes_total, get_bytes_total, errors_total]
+      properties:
+        backend:
+          type: string
+        put_ops_total:
+          type: integer
+          format: int64
+        get_ops_total:
+          type: integer
+          format: int64
+        put_bytes_total:
+          type: integer
+          format: int64
+        get_bytes_total:
+          type: integer
+          format: int64
+        errors_total:
+          type: integer
+          format: int64
+
+    DedupEntry:
+      type: object
+      required: [backend, logical_bytes, unique_bytes]
+      properties:
+        backend:
+          type: string
+        logical_bytes:
+          type: integer
+          format: int64
+        unique_bytes:
+          type: integer
+          format: int64
+
+    MonitorAudit:
+      type: object
+      required: [entries_total]
+      properties:
+        entries_total:
+          type: integer
+          format: int64
+
+    JobsRecent:
+      type: object
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobSummary"
+
+    JobSummary:
+      type: object
+      required: [id, kind, started_at, finished]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished:
+          type: boolean
+        exit_code:
+          type: integer
+          format: int32
+          description: Omitted while the job is still running.
+
+    AuditTail:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+
+    AuditEntry:
+      type: object
+      required: [seq, ts, actor, op, params, result]
+      properties:
+        seq:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        actor:
+          $ref: "#/components/schemas/AuditActor"
+        op:
+          type: string
+        params:
+          description: Operation-specific parameters (free-form JSON).
+        result:
+          type: string
+        error:
+          type: string
+          nullable: true
+        prev_hash:
+          type: string
+          nullable: true
+        entry_hash:
+          type: string
+          nullable: true
+
+    AuditActor:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+        user:
+          type: string
+        addr:
+          type: string
+
+    LibraryInfo:
+      type: object
+      required: [storage_slots, mail_slots, drives, lto_generation, firmware]
+      properties:
+        storage_slots:
+          type: integer
+          format: int64
+        mail_slots:
+          type: integer
+          format: int64
+        drives:
+          type: integer
+          format: int64
+        lto_generation:
+          type: integer
+        firmware:
+          type: string
+        partitions:
+          type: array
+          description: Logical partition layout. Omitted in legacy single-partition mode.
+          items:
+            $ref: "#/components/schemas/LibraryPartition"
+        cartridge_totals:
+          $ref: "#/components/schemas/CartridgeTotals"
+
+    LibraryPartition:
+      type: object
+      required: [name, storage_slots, drives]
+      properties:
+        name:
+          type: string
+        storage_slots:
+          $ref: "#/components/schemas/SlotRange"
+        mail_slots:
+          $ref: "#/components/schemas/SlotRange"
+        drives:
+          type: array
+          items:
+            type: integer
+            format: int64
+
+    SlotRange:
+      type: object
+      required: [start, end]
+      description: Half-open [start, end) band of the chassis address space.
+      properties:
+        start:
+          type: integer
+          format: int64
+        end:
+          type: integer
+          format: int64
+
+    CartridgeTotals:
+      type: object
+      required: [cartridges, host_bytes_written, host_bytes_read, backend_bytes_written, backend_bytes_read]
+      description: Present only when called with ?with_cartridges=true.
+      properties:
+        cartridges:
+          type: integer
+          format: int64
+        host_bytes_written:
+          type: integer
+          format: int64
+        host_bytes_read:
+          type: integer
+          format: int64
+        backend_bytes_written:
+          type: integer
+          format: int64
+        backend_bytes_read:
+          type: integer
+          format: int64
+
+    BoundsReport:
+      type: object
+      required: [current, min, max, explanations]
+      properties:
+        current:
+          $ref: "#/components/schemas/BoundsCounts"
+        min:
+          $ref: "#/components/schemas/BoundsCounts"
+        max:
+          $ref: "#/components/schemas/BoundsCounts"
+        explanations:
+          type: array
+          items:
+            $ref: "#/components/schemas/BoundsExplanation"
+
+    BoundsCounts:
+      type: object
+      required: [num_slots, num_drives]
+      properties:
+        num_slots:
+          type: integer
+          format: int64
+        num_drives:
+          type: integer
+          format: int64
+
+    BoundsExplanation:
+      type: object
+      required: [field, kind, reason]
+      properties:
+        field:
+          type: string
+        kind:
+          type: string
+        reason:
+          type: string
+
+    CartridgeLocation:
+      type: string
+      enum: [storage, mail, drive]
+
+    CartridgeList:
+      type: object
+      required: [cartridges]
+      properties:
+        cartridges:
+          type: array
+          items:
+            $ref: "#/components/schemas/CartridgeListItem"
+
+    CartridgeListItem:
+      type: object
+      required: [barcode, location, slot_id]
+      properties:
+        barcode:
+          type: string
+        location:
+          $ref: "#/components/schemas/CartridgeLocation"
+        slot_id:
+          type: integer
+          format: int64
+
+    CartridgeInfo:
+      type: object
+      required:
+        - barcode
+        - location
+        - slot_id
+        - backend
+        - worm
+        - total_blocks
+        - filemarks
+        - data_blocks
+        - data_bytes
+        - chunk_count
+        - host_bytes_written
+        - host_bytes_read
+        - backend_bytes_written
+        - backend_bytes_read
+      properties:
+        barcode:
+          type: string
+        location:
+          allOf:
+            - $ref: "#/components/schemas/CartridgeLocation"
+          nullable: true
+        slot_id:
+          type: integer
+          format: int64
+          nullable: true
+        backend:
+          type: string
+        worm:
+          type: boolean
+        total_blocks:
+          type: integer
+          format: int64
+        filemarks:
+          type: integer
+          format: int64
+        data_blocks:
+          type: integer
+          format: int64
+        data_bytes:
+          type: integer
+          format: int64
+        chunk_count:
+          type: integer
+          format: int64
+        host_bytes_written:
+          type: integer
+          format: int64
+        host_bytes_read:
+          type: integer
+          format: int64
+        backend_bytes_written:
+          type: integer
+          format: int64
+        backend_bytes_read:
+          type: integer
+          format: int64
+
+    ChangerInventory:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/InventoryItem"
+
+    InventoryItem:
+      type: object
+      required: [slot_id, slot_type, barcode]
+      properties:
+        slot_id:
+          type: integer
+          format: int64
+        slot_type:
+          $ref: "#/components/schemas/CartridgeLocation"
+        barcode:
+          type: string
+
+    DrivesList:
+      type: object
+      required: [drives]
+      properties:
+        drives:
+          type: array
+          items:
+            $ref: "#/components/schemas/DriveStatus"
+
+    DriveStatus:
+      type: object
+      required: [id, loaded]
+      properties:
+        id:
+          type: integer
+          format: int64
+        loaded:
+          type: boolean
+        barcode:
+          type: string
+          nullable: true
+        home_slot:
+          type: integer
+          format: int32
+          nullable: true
+        next_lba:
+          type: integer
+          format: int64
+          nullable: true
+        total_blocks:
+          type: integer
+          format: int64
+          nullable: true
+
+    DedupScope:
+      type: string
+      enum: [local, global]
+
+    VolumeList:
+      type: object
+      required: [volumes]
+      properties:
+        volumes:
+          type: array
+          items:
+            $ref: "#/components/schemas/VolumeRow"
+
+    VolumeRow:
+      type: object
+      required: [lun, name, size_bytes, sector_bytes, page_size_bytes, backend, dedup_scope, worm, uuid]
+      properties:
+        lun:
+          type: integer
+          format: int64
+        name:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        sector_bytes:
+          type: integer
+          format: int64
+        page_size_bytes:
+          type: integer
+          format: int64
+        backend:
+          type: string
+        dedup_scope:
+          $ref: "#/components/schemas/DedupScope"
+        worm:
+          type: boolean
+        uuid:
+          type: string
+          description: 32-char hex encoding of the 16-byte volume UUID.
+
+    VolumeInfo:
+      type: object
+      description: >
+        The volume's manifest.json fields plus the injected lun, path,
+        allocated_pages, and runtime block. Additional manifest fields
+        may appear as the schema grows.
+      required:
+        - schema_version
+        - name
+        - uuid
+        - size_bytes
+        - sector_bytes
+        - page_size_bytes
+        - backend
+        - dedup_scope
+        - worm
+        - created_at
+        - lun
+        - path
+        - allocated_pages
+        - runtime
+      properties:
+        schema_version:
+          type: integer
+          format: int64
+        name:
+          type: string
+        uuid:
+          type: string
+          description: Hex encoding of the 16-byte volume UUID.
+        size_bytes:
+          type: integer
+          format: int64
+        sector_bytes:
+          type: integer
+          format: int64
+        page_size_bytes:
+          type: integer
+          format: int64
+        backend:
+          type: string
+        dedup_scope:
+          $ref: "#/components/schemas/DedupScope"
+        worm:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        encryption:
+          type: object
+          nullable: true
+          description: At-rest encryption settings; absent when the volume is unencrypted.
+          additionalProperties: true
+        dedup_namespace:
+          type: string
+          description: Hex UUID of the dedup family namespace; absent when self-keyed.
+        crypto_uuid:
+          type: string
+          description: Hex UUID of the crypto identity; absent when self-keyed.
+        lun:
+          type: integer
+          format: int64
+          nullable: true
+          description: Assigned LUN; null when the volume is detached.
+        path:
+          type: string
+        allocated_pages:
+          type: integer
+          format: int64
+        runtime:
+          $ref: "#/components/schemas/VolumeRuntime"
+
+    VolumeRuntime:
+      type: object
+      required: [host_bytes_written, host_bytes_read, backend_bytes_written, backend_bytes_read, modified_at, sync_after]
+      properties:
+        host_bytes_written:
+          type: integer
+          format: int64
+        host_bytes_read:
+          type: integer
+          format: int64
+        backend_bytes_written:
+          type: integer
+          format: int64
+        backend_bytes_read:
+          type: integer
+          format: int64
+        modified_at:
+          type: string
+          format: date-time
+        sync_after:
+          type: string
+          enum: [storage, disk, memory]
+
+    SnapshotList:
+      type: object
+      required: [volume, snapshots]
+      properties:
+        volume:
+          type: string
+        snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnapshotRow"
+
+    SnapshotRow:
+      type: object
+      required: [snapshot, size_bytes, created_at]
+      properties:
+        snapshot:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time

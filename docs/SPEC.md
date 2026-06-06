@@ -2798,6 +2798,12 @@ TCP, so the TCP surface cannot mutate state regardless of credentials.
 All of these sit in the protected group behind the web-admin password;
 `/health` + `/metrics` remain open.
 
+This read-only TCP surface also has a machine-readable OpenAPI 3.0
+contract at [`openapi.yaml`](openapi.yaml) (issue #12); the tables below
+are the human-readable companion. A per-daemon test
+(`{vtl,vsa}/daemon/tests/openapi_sync.rs`) fails the build if a mounted
+TCP route is missing from that spec, so the two can't drift.
+
 Cross-product (identical handler on both daemons):
 
 | Method + path | Body |

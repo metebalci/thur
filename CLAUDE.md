@@ -654,6 +654,10 @@ root (CLAUDE.md must, for auto-loading).
   log pages, manifest schema, library / inventory schema, chunk-pool
   layout, backend object-key shape, iSCSI / LTO emulation IDs, telemetry
   inventory. Update in lockstep with the code.
+  [`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3.0 contract for the
+  read-only TCP `/api/v1` admin surface (the network-facing GET subset;
+  mutating verbs are Unix-socket-only and out of scope). Kept in sync by
+  `{vtl,vsa}/daemon/tests/openapi_sync.rs`.
 - Workspace + CLI references:
   [`docs/WORKSPACE.md`](docs/WORKSPACE.md),
   [`docs/CLI.md`](docs/CLI.md).

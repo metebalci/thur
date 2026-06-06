@@ -93,7 +93,14 @@ The rich `/api/v1` surface — including every mutating verb — lives on
 the peer-cred-authed Unix admin socket. The Web UI needs a subset of it
 reachable over TCP, so each daemon mounts a **GET-only** slice of that
 surface on the protected TCP listener. The exact routes are enumerated
-in [`SPEC.md`](SPEC.md) § HTTP Endpoints. The guarantee is structural,
+in [`SPEC.md`](SPEC.md) § HTTP Endpoints, and the same read-only surface
+has a machine-readable OpenAPI 3.0 contract in
+[`openapi.yaml`](openapi.yaml) (issue #12) for downstream consumers —
+web UI, third-party automation — to build against instead of re-deriving
+the wire format from source. That spec is kept honest by a sync guard:
+`vtl/daemon/tests/openapi_sync.rs` and `vsa/daemon/tests/openapi_sync.rs`
+parse each daemon's TCP router and fail if a mounted route is missing
+from the spec. The guarantee is structural,
 not a runtime check: only GET handlers are registered on the TCP router,
 and every mutating handler takes a `PeerCred` extractor that the TCP
 transport cannot satisfy, so the TCP surface cannot mutate state no
