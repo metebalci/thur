@@ -12,6 +12,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/metebalci/thur/csi/pkg/grpcserver"
+	"github.com/metebalci/thur/csi/pkg/vsa"
 )
 
 // Defaults shared by the binary flags and tests.
@@ -86,7 +87,10 @@ func (d *Driver) Run() error {
 
 	csi.RegisterIdentityServer(srv.Server(), &identityServer{driver: d})
 	if d.cfg.Mode.servesController() {
-		csi.RegisterControllerServer(srv.Server(), &controllerServer{driver: d})
+		csi.RegisterControllerServer(srv.Server(), &controllerServer{
+			driver: d,
+			vsa:    vsa.NewUnixClient(d.cfg.AdminSocket),
+		})
 	}
 	if d.cfg.Mode.servesNode() {
 		csi.RegisterNodeServer(srv.Server(), &nodeServer{driver: d})
