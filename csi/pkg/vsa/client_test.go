@@ -165,8 +165,8 @@ func TestUserAdmission(t *testing.T) {
 	if err != nil || len(ur.Volumes) != 1 || ur.Volumes[0] != "v" {
 		t.Fatalf("RevokeUser: %v / %+v", err, ur)
 	}
-	if _, err := c.RevokeUser(ctx, "u", []string{"v"}); !vsa.IsConflict(err) {
-		t.Fatalf("expected conflict revoking to empty, got %v", err)
+	if _, err := c.RevokeUser(ctx, "u", []string{"v"}); !vsa.IsBadRequest(err) {
+		t.Fatalf("expected bad-request revoking to empty, got %v", err)
 	}
 	if err := c.RemoveUser(ctx, "u"); err != nil {
 		t.Fatalf("RemoveUser: %v", err)

@@ -11,15 +11,16 @@ import (
 
 // storageClassParams are the recognized StorageClass parameters.
 type storageClassParams struct {
-	backend    string
-	pageSize   uint32
-	dedupScope string
-	worm       bool
-	fsType     string
-	encrypt    bool
-	keystore   string
-	dekSource  string
-	syncAfter  string
+	backend      string
+	pageSize     uint32
+	dedupScope   string
+	worm         bool
+	fsType       string
+	encrypt      bool
+	keystore     string
+	dekSource    string
+	syncAfter    string
+	targetPortal string
 }
 
 func parseParams(p map[string]string) (storageClassParams, error) {
@@ -30,6 +31,7 @@ func parseParams(p map[string]string) (storageClassParams, error) {
 	s.keystore = p["keystore"]
 	s.dekSource = p["dekSource"]
 	s.syncAfter = p["syncAfter"]
+	s.targetPortal = p["targetPortal"]
 
 	if v := p["pageSize"]; v != "" {
 		n, err := parseBytes(v)

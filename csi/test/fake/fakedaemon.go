@@ -23,9 +23,9 @@ import (
 // Daemon is the fake admin server and its in-memory state.
 type Daemon struct {
 	mu        sync.Mutex
-	volumes   map[string]*vsa.VolumeRow            // by name
+	volumes   map[string]*vsa.VolumeRow             // by name
 	snapshots map[string]map[string]vsa.SnapshotRow // volume -> snapshot -> row
-	users     map[string]*vsa.UserRow             // by username
+	users     map[string]*vsa.UserRow               // by username
 	nextLUN   uint64
 
 	server *http.Server
@@ -309,7 +309,9 @@ func (d *Daemon) revokeUser(w http.ResponseWriter, r *http.Request) {
 	}
 	remaining := difference(u.Volumes, req.Volumes)
 	if len(remaining) == 0 {
-		writeErr(w, http.StatusConflict, "revoke would empty the admission set; use remove instead")
+		// Matches the real daemon: revoke refuses to empty the admission set
+		// with 400, and remove is the terminal step (shared/admin-iscsi).
+		writeErr(w, http.StatusBadRequest, "revoke would leave user with no volumes; use remove instead")
 		return
 	}
 	u.Volumes = remaining

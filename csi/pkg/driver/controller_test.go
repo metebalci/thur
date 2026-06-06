@@ -17,6 +17,13 @@ import (
 )
 
 func testController(t *testing.T) *controllerServer {
+	cs, _ := testControllerD(t)
+	return cs
+}
+
+// testControllerD also returns the fake daemon for state assertions (CHAP user
+// / volume counts).
+func testControllerD(t *testing.T) (*controllerServer, *fake.Daemon) {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "admin.sock")
 	d, err := fake.StartUnix(sock)
@@ -24,7 +31,12 @@ func testController(t *testing.T) *controllerServer {
 		t.Fatalf("start fake: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	return &controllerServer{driver: New(Config{Name: DefaultDriverName}), vsa: vsa.NewUnixClient(sock)}
+	cs := &controllerServer{
+		driver: New(Config{Name: DefaultDriverName, TargetIQN: DefaultTargetIQN}),
+		vsa:    vsa.NewUnixClient(sock),
+		chap:   newMemoryChapStore(),
+	}
+	return cs, d
 }
 
 func singleNodeCaps() []*csi.VolumeCapability {

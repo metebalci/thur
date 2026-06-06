@@ -6,13 +6,13 @@ package driver
 import "github.com/container-storage-interface/spec/lib/go/csi"
 
 // controllerCapabilities is the set of controller RPCs the driver implements.
-// Capabilities are added as their milestones land; PUBLISH_UNPUBLISH_VOLUME,
-// EXPAND_VOLUME, and CREATE_DELETE_SNAPSHOT are filled in later.
+// Capabilities are added as their milestones land; EXPAND_VOLUME and
+// CREATE_DELETE_SNAPSHOT are filled in later.
 func controllerCapabilities() []*csi.ControllerServiceCapability {
 	rpcs := []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
-		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 	}
 	caps := make([]*csi.ControllerServiceCapability, 0, len(rpcs))
 	for _, r := range rpcs {

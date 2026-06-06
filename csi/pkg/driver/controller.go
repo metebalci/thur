@@ -23,6 +23,7 @@ type controllerServer struct {
 	csi.UnimplementedControllerServer
 	driver *Driver
 	vsa    *vsa.Client
+	chap   chapStore
 }
 
 func (s *controllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
@@ -155,6 +156,14 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
 	}
+	// Reap any CHAP user + secret a missed unpublish left behind, so a deleted
+	// volume never leaks a credential.
+	if err := s.vsa.RemoveUser(ctx, chapUsername(req.GetVolumeId())); err != nil && !vsa.IsNotFound(err) {
+		return nil, toStatus(err)
+	}
+	if err := s.chap.remove(ctx, req.GetVolumeId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete chap secret: %v", err)
+	}
 	if err := s.vsa.DeleteVolume(ctx, req.GetVolumeId()); err != nil && !vsa.IsNotFound(err) {
 		return nil, toStatus(err)
 	}
@@ -167,6 +176,11 @@ func createResponse(row *vsa.VolumeRow, params storageClassParams, src *csi.Volu
 	vctx := map[string]string{"volumeName": row.Name}
 	if params.fsType != "" {
 		vctx["fsType"] = params.fsType
+	}
+	// Carry the StorageClass portal through to ControllerPublishVolume, which
+	// has no other view of the StorageClass.
+	if params.targetPortal != "" {
+		vctx[volumeContextTargetPortal] = params.targetPortal
 	}
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{

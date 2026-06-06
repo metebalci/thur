@@ -61,14 +61,16 @@ func (m Mode) servesNode() bool       { return m == ModeAll || m == ModeNode }
 
 // Config is the fully-resolved driver configuration.
 type Config struct {
-	Name         string
-	Version      string
-	Mode         Mode
-	NodeID       string
-	Endpoint     string
-	AdminSocket  string
-	TargetIQN    string
-	TargetPortal string
+	Name            string
+	Version         string
+	Mode            Mode
+	NodeID          string
+	Endpoint        string
+	AdminSocket     string
+	TargetIQN       string
+	TargetPortal    string
+	ChapStoreKind   string
+	SecretNamespace string
 }
 
 // Driver is the top-level CSI driver.
@@ -87,9 +89,14 @@ func (d *Driver) Run() error {
 
 	csi.RegisterIdentityServer(srv.Server(), &identityServer{driver: d})
 	if d.cfg.Mode.servesController() {
+		chap, err := buildChapStore(d.cfg)
+		if err != nil {
+			return err
+		}
 		csi.RegisterControllerServer(srv.Server(), &controllerServer{
 			driver: d,
 			vsa:    vsa.NewUnixClient(d.cfg.AdminSocket),
+			chap:   chap,
 		})
 	}
 	if d.cfg.Mode.servesNode() {
