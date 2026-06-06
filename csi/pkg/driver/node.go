@@ -198,7 +198,9 @@ func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	conn, err := s.loadConn(req.GetVolumeId())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "no iSCSI connector state for %q; volume must be staged on this node", req.GetVolumeId())
+			// No persisted connector means the volume was never staged on this
+			// node (or has been unstaged): NOT_FOUND from the node's view.
+			return nil, status.Errorf(codes.NotFound, "volume %q is not staged on this node", req.GetVolumeId())
 		}
 		return nil, status.Errorf(codes.Internal, "load connector: %v", err)
 	}

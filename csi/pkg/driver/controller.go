@@ -108,7 +108,9 @@ func (s *controllerServer) createFromSource(ctx context.Context, name string, re
 	case *csi.VolumeContentSource_Snapshot:
 		vol, snap, ok := splitSnapshotID(cs.Snapshot.GetSnapshotId())
 		if !ok {
-			return nil, status.Errorf(codes.InvalidArgument, "malformed snapshot id %q", cs.Snapshot.GetSnapshotId())
+			// A snapshot id that doesn't parse can't name an existing snapshot:
+			// NOT_FOUND, per the CSI CreateVolume contract.
+			return nil, status.Errorf(codes.NotFound, "snapshot %q not found", cs.Snapshot.GetSnapshotId())
 		}
 		srcVol, clone.FromSnapshot = vol, snap
 	case *csi.VolumeContentSource_Volume:

@@ -199,8 +199,28 @@ handlers are tested against it for idempotency, the publish secret-reuse and
 revoke→remove fallthrough, snapshot/clone id round-trips, and shrink rejection.
 The node side is tested with a fake `exec.Interface` (asserting the exact
 `iscsiadm` argv) and fakes for the mounter and the Kubernetes Secret store
-(client-go's fake clientset). The full lifecycle on a real kind cluster is the
-gated e2e suite (issue #15, M10).
+(client-go's fake clientset).
+
+On top of the unit tests, **csi-sanity** (`kubernetes-csi/csi-test`) runs the
+official CSI conformance suite against the whole Identity + Controller + Node
+surface, wired to the fake daemon with the node-side fakes
+(`pkg/driver/sanity_test.go`, part of `go test ./...`). It validates the gRPC
+contract — capabilities, response fields, idempotency, error codes — without a
+real iscsiadm, mount, or cluster. Two notes fell out of making it pass:
+
+- The CSI snapshot *Name* is a global idempotency key, so the same name on a
+  different source volume must be `ALREADY_EXISTS`. The daemon scopes snapshot
+  names per volume, so the driver enforces global uniqueness with a cross-volume
+  lookup before creating (the external-snapshotter mints unique names, so this
+  is a correctness guard, not a hot path).
+- One sanity spec is skipped: "ControllerPublishVolume should fail when the node
+  does not exist". The driver's attach is node-agnostic — publish just mints
+  per-volume CHAP creds usable from any node — so the controller keeps no node
+  registry to validate a node id against.
+
+The full lifecycle on a real cluster (the iSCSI + filesystem data path
+csi-sanity's fakes can't cover) is the gated e2e suite (`csi/test/e2e`, issue
+#15 M10).
 
 ## Release
 

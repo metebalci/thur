@@ -53,6 +53,7 @@ jobs:
       - name: build
         run: go build ./...
 
+      # Includes the csi-sanity conformance suite (pkg/driver/sanity_test.go).
       - name: test
         run: go test ./...
 

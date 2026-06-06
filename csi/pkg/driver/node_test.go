@@ -292,8 +292,8 @@ func TestNodeExpandNoConnector(t *testing.T) {
 		VolumeId: "never-staged", VolumePath: filepath.Join(t.TempDir(), "p"),
 		CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30},
 	})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition without staged connector, got %v", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound without staged connector, got %v", err)
 	}
 }
 
