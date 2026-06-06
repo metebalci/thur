@@ -413,6 +413,11 @@ struct TelemetryInner {
     /// means uploads are silently stranded until the next write or the
     /// daemon-restart recovery scan re-enqueues them.
     chunk_upload_stranded_total: Counter<u64>,
+    /// Chunks (VTL) / pages (VSA) sealed into the local pool but not yet
+    /// confirmed uploaded to the backend — the current upload backlog.
+    /// Daemon-wide, no attributes. The owner pushes the absolute depth on
+    /// every change (mirrors `iscsi_sessions_active` / `prefetch_queue_depth`).
+    upload_queue_depth: Gauge<i64>,
 
     // ── iSCSI ──
     iscsi_sessions_active: Gauge<i64>,
@@ -777,6 +782,12 @@ impl Telemetry {
         );
     }
 
+    /// Current upload backlog (UpDownCounter via Gauge<i64>). The owner
+    /// pushes the absolute daemon-wide depth on every change.
+    pub fn upload_set_queue_depth(&self, n: i64) {
+        self.inner.upload_queue_depth.record(n, &[]);
+    }
+
     /// iSCSI session counter (UpDownCounter via Gauge<i64>).
     pub fn iscsi_set_sessions_active(&self, n: i64) {
         self.inner.iscsi_sessions_active.record(n, &[]);
@@ -904,11 +915,11 @@ impl TelemetryInner {
                 .with_description("Per-backend disk-cache pool cap (hard ceiling)")
                 .build(),
             pool_evictions_total: meter
-                .u64_counter(name("pool_evictions_total"))
+                .u64_counter(name("pool_evictions"))
                 .with_description("Per-backend pool eviction events")
                 .build(),
             pool_backpressure_waits_total: meter
-                .u64_counter(name("pool_backpressure_waits_total"))
+                .u64_counter(name("pool_backpressure_waits"))
                 .with_description("Times chunk-seal blocked on the pool budget")
                 .build(),
             pool_backpressure_wait_seconds: meter
@@ -919,7 +930,7 @@ impl TelemetryInner {
 
             // cache (VSA page cache)
             cache_evictions_total: meter
-                .u64_counter(name("cache_evictions_total"))
+                .u64_counter(name("cache_evictions"))
                 .with_description(
                     "VSA per-volume page-cache evictions, labeled clean vs dirty (dirty = required a cloud flush)",
                 )
@@ -937,22 +948,22 @@ impl TelemetryInner {
 
             // SCSI EXTENDED COPY (VAAI XCOPY)
             scsi_xcopy_total: meter
-                .u64_counter(name("scsi_xcopy_total"))
+                .u64_counter(name("scsi_xcopy"))
                 .with_description("EXTENDED COPY commands by outcome (success/reject/error)")
                 .build(),
             scsi_xcopy_bytes_total: meter
-                .u64_counter(name("scsi_xcopy_bytes_total"))
+                .u64_counter(name("scsi_xcopy_copied"))
                 .with_description("EXTENDED COPY host-visible bytes by path (fast/slow)")
                 .with_unit("By")
                 .build(),
             scsi_xcopy_segments_total: meter
-                .u64_counter(name("scsi_xcopy_segments_total"))
+                .u64_counter(name("scsi_xcopy_segments"))
                 .with_description("EXTENDED COPY segments executed by path (fast/slow)")
                 .build(),
 
             // cloud
             storage_requests_total: meter
-                .u64_counter(name("storage_requests_total"))
+                .u64_counter(name("storage_requests"))
                 .with_description("Cloud requests by backend/op/outcome")
                 .build(),
             storage_request_seconds: meter
@@ -966,21 +977,21 @@ impl TelemetryInner {
                 .with_unit("By")
                 .build(),
             storage_retries_total: meter
-                .u64_counter(name("storage_retries_total"))
+                .u64_counter(name("storage_retries"))
                 .with_description("Cloud retry attempts by backend/error class")
                 .build(),
             storage_permanent_errors_total: meter
-                .u64_counter(name("storage_permanent_errors_total"))
+                .u64_counter(name("storage_permanent_errors"))
                 .with_description("Permanent cloud errors that bypassed retry")
                 .build(),
 
             // chunk
             chunk_seals_total: meter
-                .u64_counter(name("chunk_seals_total"))
+                .u64_counter(name("chunk_seals"))
                 .with_description("Chunks sealed into the pool")
                 .build(),
             chunk_dedup_hits_total: meter
-                .u64_counter(name("chunk_dedup_hits_total"))
+                .u64_counter(name("chunk_dedup_hits"))
                 .with_description("Chunks skipped because the hash already existed")
                 .build(),
             chunk_logical_bytes_total: meter
@@ -1001,36 +1012,40 @@ impl TelemetryInner {
                 .with_unit("By")
                 .build(),
             chunk_storage_head_probes_total: meter
-                .u64_counter(name("chunk_storage_head_probes_total"))
+                .u64_counter(name("chunk_storage_head_probes"))
                 .with_description("Cloud-side HEAD-before-PUT probes (Global scope)")
                 .build(),
             chunk_storage_head_hits_total: meter
-                .u64_counter(name("chunk_storage_head_hits_total"))
+                .u64_counter(name("chunk_storage_head_hits"))
                 .with_description("Cloud HEAD probes that found the object already present")
                 .build(),
             chunk_storage_cache_hits_total: meter
-                .u64_counter(name("chunk_storage_cache_hits_total"))
+                .u64_counter(name("chunk_storage_cache_hits"))
                 .with_description(
                     "Meta-cache hits — lookup served from Probed/Uploaded entry without backend round-trip",
                 )
                 .build(),
             chunk_storage_cache_inflight_coalesced_total: meter
-                .u64_counter(name("chunk_storage_cache_inflight_coalesced_total"))
+                .u64_counter(name("chunk_storage_cache_inflight_coalesced"))
                 .with_description(
                     "Concurrent uploads that joined an in-flight singleflight instead of issuing a duplicate PUT",
                 )
                 .build(),
             chunk_storage_cache_warmup_seeded_total: meter
-                .u64_counter(name("chunk_storage_cache_warmup_seeded_total"))
+                .u64_counter(name("chunk_storage_cache_warmup_seeded"))
                 .with_description(
                     "Cache entries seeded from a LIST at boot / first registry insertion",
                 )
                 .build(),
             chunk_upload_stranded_total: meter
-                .u64_counter(name("chunk_upload_stranded_total"))
+                .u64_counter(name("chunk_upload_stranded"))
                 .with_description(
                     "Pages/chunks left LocalOnly because the upload worker could not resolve a backend or owning entity",
                 )
+                .build(),
+            upload_queue_depth: meter
+                .i64_gauge(name("upload_queue_depth"))
+                .with_description("Chunks/pages sealed locally but not yet uploaded to the backend")
                 .build(),
 
             // iSCSI
@@ -1039,7 +1054,7 @@ impl TelemetryInner {
                 .with_description("iSCSI sessions currently logged in")
                 .build(),
             iscsi_commands_total: meter
-                .u64_counter(name("iscsi_commands_total"))
+                .u64_counter(name("iscsi_commands"))
                 .with_description("iSCSI SCSI commands by opcode/outcome")
                 .build(),
             iscsi_command_seconds: meter
@@ -1076,31 +1091,31 @@ impl TelemetryInner {
                 .with_description("Outstanding prefetch tasks")
                 .build(),
             prefetch_hits_total: meter
-                .u64_counter(name("prefetch_hits_total"))
+                .u64_counter(name("prefetch_hits"))
                 .with_description("Reads served from a prefetched chunk")
                 .build(),
             prefetch_misses_total: meter
-                .u64_counter(name("prefetch_misses_total"))
+                .u64_counter(name("prefetch_misses"))
                 .with_description("Reads that found nothing prefetched and waited on cloud")
                 .build(),
 
             // audit
             audit_entries_total: meter
-                .u64_counter(name("audit_entries_total"))
+                .u64_counter(name("audit_entries"))
                 .with_description("Audit log entries appended, by event kind")
                 .build(),
             audit_chain_resets_total: meter
-                .u64_counter(name("audit_chain_resets_total"))
+                .u64_counter(name("audit_chain_resets"))
                 .with_description("Operator-acknowledged audit chain breaks")
                 .build(),
             audit_queue_drops_total: meter
-                .u64_counter(name("audit_queue_drops_total"))
+                .u64_counter(name("audit_queue_drops"))
                 .with_description("Audit entries dropped because the writer-task mpsc was full")
                 .build(),
 
             // orphan-upload recovery
             orphan_scan_chunks_found_total: meter
-                .u64_counter(name("orphan_scan_chunks_found_total"))
+                .u64_counter(name("orphan_scan_chunks_found"))
                 .with_description(
                     "Sealed-but-not-uploaded chunks discovered by the boot-time orphan scan",
                 )
@@ -1113,7 +1128,7 @@ impl TelemetryInner {
 
             // alerting
             alerts_fired_total: meter
-                .u64_counter(name("alerts_fired_total"))
+                .u64_counter(name("alerts_fired"))
                 .with_description(
                     "First-party alerts attempted, by class/severity/sink/outcome",
                 )
@@ -1361,6 +1376,11 @@ pub mod record {
             t.chunk_inc_upload_stranded(backend, reason);
         }
     }
+    pub fn upload_queue_depth(n: i64) {
+        if let Some(t) = global() {
+            t.upload_set_queue_depth(n);
+        }
+    }
     pub fn iscsi_sessions_active(n: i64) {
         if let Some(t) = global() {
             t.iscsi_set_sessions_active(n);
@@ -1448,11 +1468,53 @@ mod tests {
         t.chunk_inc_storage_cache_hit("primary");
         t.chunk_inc_storage_cache_inflight_coalesced("primary");
         t.chunk_add_storage_cache_warmup_seeded("primary", 42);
+        t.upload_set_queue_depth(0);
         t.iscsi_set_sessions_active(0);
+        t.iscsi_record_command("write_16", "good", 0.001);
         t.audit_inc_entry("daemon.start");
+        t.audit_inc_chain_reset();
+        t.audit_inc_queue_drop();
         t.cache_inc_eviction("vol1", "dirty");
         t.cache_record_miss_after_eviction("primary", 12.5);
+        // Record the rest of the counter surface so the no-double-suffix
+        // assertion below actually exercises the renamed instruments.
+        t.pool_inc_eviction("primary");
+        t.pool_record_backpressure_wait("primary", 0.01);
+        t.storage_inc_retry("primary", "Network");
+        t.storage_inc_permanent_error("primary", "Auth");
+        t.chunk_inc_dedup_hit("primary", "global");
+        t.chunk_inc_upload_stranded("primary", "backend_unknown");
+        t.prefetch_inc_hit();
+        t.prefetch_inc_miss();
+        t.alerts_record("disk_cache", "warning", "log", "fired");
+        t.scsi_xcopy_inc("success");
+        t.scsi_xcopy_add_bytes("fast", 4096);
+        t.scsi_xcopy_inc_segment("fast");
+        t.daemon_set_start_time(1);
+        t.orphan_scan_record(0, 0.0);
         let dump = t.export_prometheus();
+        // Regression guard for the OTel->Prometheus suffix doubling
+        // (issue #93: instrument names that bake in `_total` / `_bytes`
+        // get the exporter's suffix appended a second time). Instrument names
+        // must omit the unit + counter suffix and let the exporter add
+        // them exactly once.
+        assert!(
+            !dump.contains("_total_total"),
+            "counter name baked in `_total`; exporter doubled it:\n{dump}"
+        );
+        assert!(
+            !dump.contains("_bytes_bytes"),
+            "byte metric baked in `_bytes`; exporter doubled it:\n{dump}"
+        );
+        for exact in [
+            "# TYPE thur_pool_evictions_total counter",
+            "# TYPE thur_storage_requests_total counter",
+            "# TYPE thur_scsi_xcopy_total counter",
+            "# TYPE thur_scsi_xcopy_copied_bytes_total counter",
+            "# TYPE thur_audit_entries_total counter",
+        ] {
+            assert!(dump.contains(exact), "missing exact `{exact}` in:\n{dump}");
+        }
         for needle in [
             "thur_pool_used_bytes",
             "thur_pool_cap_bytes",
@@ -1467,6 +1529,7 @@ mod tests {
             "thur_chunk_storage_cache_warmup_seeded_total",
             "thur_cache_evictions_total",
             "thur_cache_miss_after_eviction_seconds",
+            "thur_upload_queue_depth",
             "thur_iscsi_sessions_active",
             "thur_audit_entries_total",
         ] {

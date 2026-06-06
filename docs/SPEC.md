@@ -2571,10 +2571,15 @@ block target — and both come from `shared_naming::PRODUCT.metric_prefix`.
 The table below gives only the suffix, so read every row as
 `thurvtl_<row>` for this daemon.
 
-One subtlety: where an instrument declares a unit (`s` or `By`), the
-Prometheus exporter appends the conventional suffix (`_seconds` or
-`_bytes`) on the way out. The instrument names themselves therefore do
-**not** include the unit — baking it in would produce it twice.
+The rows below are the **exported** Prometheus names (read each as
+`thurvtl_<row>`). The OpenTelemetry → Prometheus exporter mints them from
+the in-code instrument name by appending two things: the unit suffix
+(`_seconds` for `s`, `_bytes` for `By`) and, for a monotonic counter, the
+`_total` suffix. The in-code instrument names therefore omit **both** — a
+name that already baked in `_total` or `_bytes` would get it a second time
+(an instrument literally named `pool_evictions_total` exports as
+`pool_evictions_total_total`). Histograms additionally fan out into the
+usual `_bucket` / `_sum` / `_count` series.
 
 | Subsystem | Instrument | Type | Unit | Attributes |
 | --- | --- | --- | --- | --- |
@@ -2586,7 +2591,7 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | cache | `cache_evictions_total` | Counter<u64> | — | `volume`, `outcome` (VSA only) |
 | cache | `cache_miss_after_eviction_seconds` | Histogram<f64> | s | `backend` (explicit log-uniform buckets: 1, 2, 4, 8, 16, 32, 64, 128, 256, +Inf) |
 | scsi_xcopy | `scsi_xcopy_total` | Counter<u64> | — | `outcome` ∈ {`success`,`reject`,`error`} (VSA only) |
-| scsi_xcopy | `scsi_xcopy_bytes_total` | Counter<u64> | By | `path` ∈ {`fast`,`slow`} (VSA only) |
+| scsi_xcopy | `scsi_xcopy_copied_bytes_total` | Counter<u64> | By | `path` ∈ {`fast`,`slow`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_segments_total` | Counter<u64> | — | `path` ∈ {`fast`,`slow`} (VSA only) |
 | storage | `storage_requests_total` | Counter<u64> | — | `backend`, `op`, `outcome` |
 | storage | `storage_request` | Histogram<f64> | s | `backend`, `op`, `outcome` |
@@ -2604,6 +2609,7 @@ Prometheus exporter appends the conventional suffix (`_seconds` or
 | chunk | `chunk_storage_cache_inflight_coalesced_total` | Counter<u64> | — | `backend` |
 | chunk | `chunk_storage_cache_warmup_seeded_total` | Counter<u64> | — | `backend` |
 | chunk | `chunk_upload_stranded_total` | Counter<u64> | — | `backend`, `reason` |
+| upload | `upload_queue_depth` | Gauge<i64> | — | — |
 | iscsi | `iscsi_sessions_active` | Gauge<i64> | — | — |
 | iscsi | `iscsi_commands_total` | Counter<u64> | — | `opcode`, `outcome` |
 | iscsi | `iscsi_command` | Histogram<f64> | s | `opcode`, `outcome` |
@@ -2643,6 +2649,17 @@ source for the `system monitor` "Dedup (lifetime)" line and the Web
 UI's Dedup KPI + per-backend column. The figure is cumulative since
 daemon restart (append-only — it ignores eviction / delete); the exact
 current-on-disk breakdown is the on-demand `system stats` scan.
+
+`upload_queue_depth` is the daemon-wide count of chunks (VTL) / pages
+(VSA) that have sealed into the local pool but are not yet confirmed
+uploaded to the backend — the upload backlog. It is attribute-less and
+pushed as an absolute value on every change (the same idiom as
+`iscsi_sessions_active` / `prefetch_queue_depth`). On VTL the value is the
+sum of every loaded tape's pending-upload set; on VSA it is a
+process-global tally maintained as each volume's pages move pending →
+done. A sustained climb means host writes are outrunning backend uploads
+— the same condition `pool_backpressure_waits_total` catches once the
+pool actually fills.
 
 ### Process-global handle
 
