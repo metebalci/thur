@@ -649,6 +649,11 @@ root (CLAUDE.md must, for auto-loading).
   [`docs/NVMETCP.md`](docs/NVMETCP.md) (NVMe/TCP transport
   design walkthrough for VSA: crate split, opcode → PageCache
   mapping, NQN, auth roadmap).
+- Kubernetes:
+  [`docs/CSI.md`](docs/CSI.md) — the Thur VSA CSI driver (Go subtree
+  under `csi/`, issue #15): admin-socket client, per-volume CHAP
+  isolation, RPC→admin-call mapping, the Helm chart, and the `csi-v*`
+  release cadence.
 - Wire-level reference:
   [`docs/SPEC.md`](docs/SPEC.md) — SCSI opcodes, VPD / mode /
   log pages, manifest schema, library / inventory schema, chunk-pool
@@ -658,6 +663,9 @@ root (CLAUDE.md must, for auto-loading).
   read-only TCP `/api/v1` admin surface (the network-facing GET subset;
   mutating verbs are Unix-socket-only and out of scope). Kept in sync by
   `{vtl,vsa}/daemon/tests/openapi_sync.rs`.
+  [`docs/openapi-admin.yaml`](docs/openapi-admin.yaml) — the admin-socket
+  mutating contract subset the CSI driver consumes. Kept in sync by
+  `vsa/daemon/tests/admin_openapi_sync.rs`.
 - Workspace + CLI references:
   [`docs/WORKSPACE.md`](docs/WORKSPACE.md),
   [`docs/CLI.md`](docs/CLI.md).

@@ -20,5 +20,7 @@ Next steps:
        parameters: { fsType: ext4, targetPortal: "<appliance-ip>:3260" }
 {{- end }}
 
-  Workers need open-iscsi installed on the host (iscsiadm runs there, not in
-  the image). Snapshots require the external-snapshotter CRDs + controller.
+  Workers need the host iSCSI stack: open-iscsi installed with iscsid running
+  and the iscsi_tcp kernel module available. The node container bundles its own
+  iscsiadm + mkfs/resize tools and talks to the host iscsid over the shared host
+  network namespace. Snapshots require the external-snapshotter CRDs + controller.

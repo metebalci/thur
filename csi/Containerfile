@@ -1,0 +1,29 @@
+# Multi-stage build for the Thur VSA CSI driver. One image serves both
+# --mode=controller and --mode=node; the entrypoint flag selects the role.
+#
+# The node role execs iscsiadm + mkfs/mount/resize tools in-container (with the
+# DaemonSet's privileged + hostNetwork + host /etc/iscsi,/var/lib/iscsi mounts),
+# so the runtime image bundles them. The host still provides the iSCSI kernel
+# modules and the iscsid daemon the container's iscsiadm talks to.
+
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/thurvsa-csi ./cmd/thurvsa-csi
+
+FROM debian:12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        open-iscsi \
+        e2fsprogs \
+        xfsprogs \
+        util-linux \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/thurvsa-csi /usr/local/bin/thurvsa-csi
+ENTRYPOINT ["/usr/local/bin/thurvsa-csi"]

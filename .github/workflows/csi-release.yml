@@ -1,0 +1,139 @@
+name: csi-release
+
+# Tag-triggered release for the CSI driver, on its own `csi-v*` tag cadence
+# (independent of the daemon's `v*` SemVer in release.yml / container.yml). A
+# tag publishes a multi-arch image and an OCI Helm chart to GHCR:
+#
+#   ghcr.io/<owner>/thurvsa-csi:<version>          (image)
+#   ghcr.io/<owner>/charts/thurvsa-csi:<version>   (chart)
+#
+# Mirrors container.yml: amd64 + native-arm64 builds pushed by digest, then a
+# manifest list under the human tag. A `csi-v*-*` tag is a pre-release (exact
+# version only, no floating `latest`). Version = the tag minus the `csi-v`.
+
+on:
+  push:
+    tags: ['csi-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing csi-v* tag to (re)build'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/thurvsa-csi
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=${TAG#csi-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: csi
+          file: csi/Containerfile
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#csi-v}"
+          TAGFLAGS=(-t "${IMAGE}:${VERSION}")
+          case "$TAG" in
+            csi-v*-*) : ;;  # pre-release: exact version only
+            *) TAGFLAGS+=(-t "${IMAGE}:latest") ;;
+          esac
+          cd /tmp/digests
+          SRCS=$(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools create "${TAGFLAGS[@]}" ${SRCS}
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+  chart:
+    name: package + push chart
+    needs: manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package and push chart
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#csi-v}"
+          helm package csi/deploy/helm/thurvsa-csi --version "$VERSION" --app-version "$VERSION"
+          helm push "thurvsa-csi-${VERSION}.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts"

@@ -304,6 +304,27 @@ was already present on the release's tag commit. For releases cut
 before the bridge existed, run `unpublish.yml` over in
 `thur.metebalci.com` manually to clean the channel.
 
+## CSI driver
+
+The Kubernetes CSI driver (`csi/`, issue #15) releases on its **own tag
+namespace, `csi-v*`** — separate from the daemon's `v*` SemVer above. The
+two are versioned and shipped independently: a daemon release does not
+imply a driver release, and vice-versa. The repo therefore carries two
+tag families, and the workflows are path/trigger-scoped so they never
+collide:
+
+| Tag | Triggers | Publishes |
+| --- | --- | --- |
+| `v<version>` | `release.yml`, `container.yml` | `.deb`/`.rpm` + `ghcr.io/<owner>/{thurvtl,thurvsa}` images |
+| `csi-v<version>` | `csi-release.yml` | `ghcr.io/<owner>/thurvsa-csi` image + `ghcr.io/<owner>/charts/thurvsa-csi` OCI Helm chart |
+
+A `csi-v*-*` tag (e.g. `csi-v0.1.0-rc.0`) is a pre-release: it publishes
+the exact version only, without floating `latest`. The version is the tag
+minus the `csi-v` prefix and is stamped into the binary (`-ldflags -X
+main.version`), the image tag, and the Helm chart + app version. The
+per-PR gate is `csi.yml` (path-scoped to `csi/**`). Driver design and the
+deploy chart are in [CSI.md](CSI.md).
+
 ## Package repository
 
 Operators install Thur via the **https://thur.metebalci.com** apt and yum

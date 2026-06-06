@@ -1,0 +1,81 @@
+name: csi
+
+# CSI driver (Go subtree under csi/) build / vet / test / lint + Helm chart
+# validation. Path-scoped to csi/** + the admin-socket contract it consumes, so
+# it never fires on Rust-only changes (and ci.yml's **/*.rs filter never fires
+# on Go-only changes). Lint runs first, mirroring ci.yml's cheap-gate-first
+# ordering. The lint set is staticcheck + go vet + gofmt run directly (the core
+# of golangci-lint), pinned to the module's own Go toolchain for determinism.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "csi/**"
+      - "docs/openapi-admin.yaml"
+      - ".github/workflows/csi.yml"
+  pull_request:
+    paths:
+      - "csi/**"
+      - "docs/openapi-admin.yaml"
+      - ".github/workflows/csi.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: csi
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: csi/go.mod
+          cache-dependency-path: csi/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to run on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./...
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint csi/deploy/helm/thurvsa-csi --set thurvsaGid=977
+
+      - name: install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: helm template + kubeconform
+        run: |
+          helm template t csi/deploy/helm/thurvsa-csi \
+            --namespace thurvsa-system \
+            --set thurvsaGid=977 \
+            --set iscsi.targetPortal=10.0.0.5:3260 \
+            --set storageClass.create=true \
+            --set snapshotClass.create=true \
+          | kubeconform -strict -ignore-missing-schemas -summary
