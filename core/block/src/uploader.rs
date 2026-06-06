@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use shared_object_store::{ObjectStoreBackend, ObjectStoreError};
@@ -112,6 +112,22 @@ struct PendingUploadsInner {
     notify: Notify,
 }
 
+/// Process-global count of pages currently pending upload, summed
+/// across every volume's [`PendingUploads`]. Each daemon owns one
+/// `PendingUploads` per `VolumeWriter`; unlike VTL (whose single
+/// `MemoryBufferManager` can sum its tape set on demand), VSA's
+/// per-volume sets live behind the registry, so the daemon-wide
+/// backlog is tracked here through one shared atomic — the same
+/// process-global shape the telemetry/alerting handles already use.
+/// Pushed to the `upload_queue_depth` gauge on every genuine
+/// transition.
+static UPLOAD_QUEUE_DEPTH: AtomicI64 = AtomicI64::new(0);
+
+fn adjust_upload_queue_depth(delta: i64) {
+    let depth = UPLOAD_QUEUE_DEPTH.fetch_add(delta, Ordering::Relaxed) + delta;
+    shared_telemetry::record::upload_queue_depth(depth);
+}
+
 impl PendingUploads {
     pub fn new() -> Self {
         Self::default()
@@ -120,19 +136,30 @@ impl PendingUploads {
     /// Mark `page_id`'s upload as pending. Called by
     /// [`VolumeWriter::write_page_unsynced`] right before sending
     /// the task into the worker's channel, while the page-index
-    /// hasn't yet been bumped.
-    pub async fn mark_pending(&self, page_id: PageId) {
-        self.inner.pending.lock().await.insert(page_id);
+    /// hasn't yet been bumped. Returns whether this newly added the
+    /// page (a re-mark of an already-pending page is a no-op and does
+    /// not double-count the backlog gauge).
+    pub async fn mark_pending(&self, page_id: PageId) -> bool {
+        let newly = self.inner.pending.lock().await.insert(page_id);
+        if newly {
+            adjust_upload_queue_depth(1);
+        }
+        newly
     }
 
     /// Mark `page_id`'s upload as done and wake every current
     /// waiter. Idempotent: removing a never-pending or
     /// already-cleared id is a no-op. The wake fires whether or not
     /// the entry was present — overlapping waiters covering a
-    /// neighbouring range still benefit.
-    pub async fn mark_done(&self, page_id: PageId) {
-        self.inner.pending.lock().await.remove(&page_id);
+    /// neighbouring range still benefit. Returns whether an entry was
+    /// actually cleared (only a real clear decrements the gauge).
+    pub async fn mark_done(&self, page_id: PageId) -> bool {
+        let was_present = self.inner.pending.lock().await.remove(&page_id);
         self.inner.notify.notify_waiters();
+        if was_present {
+            adjust_upload_queue_depth(-1);
+        }
+        was_present
     }
 
     /// Block until no pending uploads remain for any `page_id` in
@@ -1295,6 +1322,28 @@ mod tests {
             !latch_first_failure(&flag),
             "later failures stay suppressed"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_uploads_marks_transition_once() {
+        // The backlog gauge is driven off genuine set transitions:
+        // re-marking an already-pending page (host overwrites the same
+        // page before its first upload completes) must not double-count,
+        // and marking a never-pending page done must not under-count.
+        let p = PendingUploads::new();
+        let page = PageId::try_from(7u64).unwrap();
+        assert!(p.mark_pending(page).await, "first mark is a real add");
+        assert!(
+            !p.mark_pending(page).await,
+            "re-mark of a pending page is a no-op"
+        );
+        assert_eq!(p.snapshot().await.len(), 1);
+        assert!(p.mark_done(page).await, "clearing a pending page is real");
+        assert!(
+            !p.mark_done(page).await,
+            "clearing an already-done page is a no-op"
+        );
+        assert!(p.snapshot().await.is_empty());
     }
 
     /// Stand up a 4 MiB volume with the given dedup scope and a

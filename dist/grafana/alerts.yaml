@@ -1,0 +1,160 @@
+# Thur reference alerting rules (Prometheus).
+#
+# Load these from Prometheus, not Alertmanager: add the file to the
+# `rule_files:` list in prometheus.yml. Prometheus evaluates the rules and
+# forwards firing alerts to whatever Alertmanager you have wired under
+# `alerting.alertmanagers:`; Alertmanager only routes/notifies. The
+# `severity` label on each rule is the hook your Alertmanager routes on.
+#
+# These pair with — they do not replace — the daemon's own first-party
+# email/webhook alerting (docs/ALERTING.md). They are for shops already
+# running Prometheus + Alertmanager against the always-on `/metrics`
+# endpoint.
+#
+# Both products expose the same `pool` / `storage` / `chunk` / `audit`
+# instrument bodies under their own prefix (`thurvtl_*` / `thurvsa_*`), so
+# the two groups below are mirror images. Each metric carries a `job`
+# label from your scrape config — the daemon-down rule matches on it, so
+# adjust the `job=~"thurvtl.*"` / `job=~"thurvsa.*"` matchers if you named
+# your scrape jobs differently.
+#
+# Issue #6 named four alert classes; the mapping to real series:
+#   cache >90%          -> pool_used_bytes / pool_cap_bytes  (DiskCacheNearFull)
+#   upload queue >100   -> upload_queue_depth                (UploadQueueBacklog)
+#   validation failures -> storage_permanent_errors_total +  (StoragePermanentErrors,
+#                          audit_chain_resets_total           AuditChainReset)
+#   session disconnects -> handled by the daemon's CHAP-failure / login-audit
+#                          alert class (docs/ALERTING.md), not a Prometheus rule.
+
+groups:
+  - name: thurvtl
+    rules:
+      - alert: ThurvtlDaemonDown
+        expr: up{job=~"thurvtl.*"} == 0
+        for: 2m
+        labels: { severity: critical, product: thurvtl }
+        annotations:
+          summary: "thurvtld is not being scraped (instance {{ $labels.instance }})"
+          description: "Prometheus has not scraped thurvtld for 2m — the daemon is down or the HTTP listener is unreachable."
+
+      - alert: ThurvtlDiskCacheNearFull
+        expr: max by (backend) (thurvtl_pool_used_bytes / thurvtl_pool_cap_bytes) > 0.9
+        for: 10m
+        labels: { severity: warning, product: thurvtl }
+        annotations:
+          summary: "Disk cache >90% full (backend {{ $labels.backend }})"
+          description: "Raise disk_cache.max_size_gb (auto) or disk_cache.size_gb (explicit), or investigate why uploads aren't draining."
+
+      - alert: ThurvtlBackpressureSustained
+        expr: rate(thurvtl_pool_backpressure_waits_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning, product: thurvtl }
+        annotations:
+          summary: "Host writes are blocking on a full pool (backend {{ $labels.backend }})"
+          description: "Writes are outpacing backend uploads; backups will see SCSI NOT READY if this persists."
+
+      - alert: ThurvtlUploadQueueBacklog
+        expr: thurvtl_upload_queue_depth > 100
+        for: 10m
+        labels: { severity: warning, product: thurvtl }
+        annotations:
+          summary: "Upload backlog above 100 chunks"
+          description: "Chunks are sealing into the local pool faster than the upload worker drains them to the backend. Check backend reachability/throughput."
+
+      - alert: ThurvtlStoragePermanentErrors
+        expr: rate(thurvtl_storage_permanent_errors_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical, product: thurvtl }
+        annotations:
+          summary: "Permanent backend errors (backend {{ $labels.backend }}, class {{ $labels.class }})"
+          description: "The retry layer short-circuits Auth/Authz/NotFound/RegionMismatch — any nonzero rate means broken credentials or config drift."
+
+      - alert: ThurvtlAuditChainReset
+        expr: increase(thurvtl_audit_chain_resets_total[10m]) > 0
+        for: 0m
+        labels: { severity: critical, product: thurvtl }
+        annotations:
+          summary: "Audit-log hash chain reset"
+          description: "The BLAKE3-chained audit log broke continuity — investigate tampering or disk corruption."
+
+      - alert: ThurvtlAuditQueueDrops
+        expr: increase(thurvtl_audit_queue_drops_total[10m]) > 0
+        for: 0m
+        labels: { severity: warning, product: thurvtl }
+        annotations:
+          summary: "Audit entries dropped on a full queue"
+          description: "The audit writer fell behind and dropped entries — audit completeness is compromised."
+
+      - alert: ThurvtlUploadsStranded
+        expr: increase(thurvtl_chunk_upload_stranded_total[15m]) > 0
+        for: 0m
+        labels: { severity: warning, product: thurvtl }
+        annotations:
+          summary: "Uploads stranded LocalOnly (reason {{ $labels.reason }})"
+          description: "The worker could not resolve a backend or owning entity; those chunks stay local until the next write or a daemon-restart recovery scan."
+
+  - name: thurvsa
+    rules:
+      - alert: ThurvsaDaemonDown
+        expr: up{job=~"thurvsa.*"} == 0
+        for: 2m
+        labels: { severity: critical, product: thurvsa }
+        annotations:
+          summary: "thurvsad is not being scraped (instance {{ $labels.instance }})"
+          description: "Prometheus has not scraped thurvsad for 2m — the daemon is down or the HTTP listener is unreachable."
+
+      - alert: ThurvsaDiskCacheNearFull
+        expr: max by (backend) (thurvsa_pool_used_bytes / thurvsa_pool_cap_bytes) > 0.9
+        for: 10m
+        labels: { severity: warning, product: thurvsa }
+        annotations:
+          summary: "Disk cache >90% full (backend {{ $labels.backend }})"
+          description: "Raise disk_cache.max_size_gb (auto) or disk_cache.size_gb (explicit), or investigate why uploads aren't draining."
+
+      - alert: ThurvsaBackpressureSustained
+        expr: rate(thurvsa_pool_backpressure_waits_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning, product: thurvsa }
+        annotations:
+          summary: "Host writes are blocking on a full pool (backend {{ $labels.backend }})"
+          description: "Writes are outpacing backend uploads; initiators will see SCSI NOT READY if this persists."
+
+      - alert: ThurvsaUploadQueueBacklog
+        expr: thurvsa_upload_queue_depth > 100
+        for: 10m
+        labels: { severity: warning, product: thurvsa }
+        annotations:
+          summary: "Upload backlog above 100 pages"
+          description: "Pages are sealing into the local pool faster than the upload worker drains them to the backend. Check backend reachability/throughput."
+
+      - alert: ThurvsaStoragePermanentErrors
+        expr: rate(thurvsa_storage_permanent_errors_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical, product: thurvsa }
+        annotations:
+          summary: "Permanent backend errors (backend {{ $labels.backend }}, class {{ $labels.class }})"
+          description: "The retry layer short-circuits Auth/Authz/NotFound/RegionMismatch — any nonzero rate means broken credentials or config drift."
+
+      - alert: ThurvsaAuditChainReset
+        expr: increase(thurvsa_audit_chain_resets_total[10m]) > 0
+        for: 0m
+        labels: { severity: critical, product: thurvsa }
+        annotations:
+          summary: "Audit-log hash chain reset"
+          description: "The BLAKE3-chained audit log broke continuity — investigate tampering or disk corruption."
+
+      - alert: ThurvsaAuditQueueDrops
+        expr: increase(thurvsa_audit_queue_drops_total[10m]) > 0
+        for: 0m
+        labels: { severity: warning, product: thurvsa }
+        annotations:
+          summary: "Audit entries dropped on a full queue"
+          description: "The audit writer fell behind and dropped entries — audit completeness is compromised."
+
+      - alert: ThurvsaUploadsStranded
+        expr: increase(thurvsa_chunk_upload_stranded_total[15m]) > 0
+        for: 0m
+        labels: { severity: warning, product: thurvsa }
+        annotations:
+          summary: "Uploads stranded LocalOnly (reason {{ $labels.reason }})"
+          description: "The worker could not resolve a backend or owning entity; those pages stay local until the next write or a daemon-restart recovery scan."

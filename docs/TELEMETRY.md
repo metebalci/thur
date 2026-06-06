@@ -89,6 +89,12 @@ instrument name yourself, or you will get it twice. The internal name
 is `pool_backpressure_wait` with unit `s`; what Prometheus actually
 exposes is `thurvtl_pool_backpressure_wait_seconds` (or `thurvsa_*`).
 
+The same trap applies to the `_total` suffix Prometheus puts on every
+monotonic counter: the exporter appends it, so the internal instrument
+name must omit it too. An instrument literally named `pool_evictions_total`
+exports as `pool_evictions_total_total` — so the internal name is
+`pool_evictions`, and Prometheus exposes `thurvtl_pool_evictions_total`.
+
 There is also a `service.name` resource attribute (`thurvtl` or
 `thurvsa`) carried on the `target_info` series. It encodes the same
 product distinction a second time, which is intentional: dashboards
@@ -175,6 +181,22 @@ rate(thurvtl_pool_backpressure_waits_total[5m]) > 0
 # means broken credentials or config drift.
 rate(thurvtl_storage_permanent_errors_total[5m]) > 0
 ```
+
+## Reference dashboards & alert rules
+
+You do not have to build the above from scratch. Checked-in reference
+assets live under [`dist/grafana/`](../dist/grafana/): one Grafana
+dashboard per product (`thurvtl-dashboard.json` / `thurvsa-dashboard.json`,
+each with `$datasource` / `$job` / `$backend` template variables) and a
+`alerts.yaml` of Prometheus alerting rules covering the watch-worthy
+conditions — disk cache near full, sustained backpressure, the
+`upload_queue_depth` backlog crossing 100, permanent backend errors, and
+audit-chain integrity. They are BYO-Prometheus wiring and pair with — they
+do not replace — the daemon's own email/webhook alerting in
+[`ALERTING.md`](ALERTING.md). Import and load instructions are in
+[`dist/grafana/README.md`](../dist/grafana/README.md). The dashboards are
+hand-maintained (not `build.rs`-generated like the rest of `dist/`), so if
+you extend the instrument inventory, extend them too.
 
 ## A note on the Prometheus exporter crate
 

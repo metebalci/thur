@@ -280,6 +280,7 @@ impl MemoryBufferManager {
             tape.prefetched_chunks.clear();
             tape.last_read_chunk = None;
         }
+        self.publish_upload_queue_depth();
     }
 
     /// Handle block written event
@@ -314,6 +315,7 @@ impl MemoryBufferManager {
                 None
             }
         };
+        self.publish_upload_queue_depth();
 
         if let Some((usage, limit, pending)) = warn_payload {
             warn!(
@@ -520,6 +522,25 @@ impl MemoryBufferManager {
             dispatched_bytes,
             tape.write_buffer_usage,
         );
+        self.publish_upload_queue_depth();
+    }
+
+    /// Push the current daemon-wide upload backlog — the sum of every
+    /// loaded tape's pending-upload set — to the `upload_queue_depth`
+    /// gauge. Called after every mutation of any tape's `pending_uploads`
+    /// (chunk-seal insert, dispatch removal, unload clear), mirroring the
+    /// absolute-push idiom of `iscsi_sessions_active` / `prefetch_queue_depth`.
+    fn publish_upload_queue_depth(&self) {
+        shared_telemetry::record::upload_queue_depth(self.current_upload_queue_depth());
+    }
+
+    /// Daemon-wide upload backlog: the sum of every loaded tape's
+    /// pending-upload set. The value pushed to the gauge.
+    fn current_upload_queue_depth(&self) -> i64 {
+        self.tapes
+            .values()
+            .map(|t| t.pending_uploads.len())
+            .sum::<usize>() as i64
     }
 
     /// Blocking drain used only on the cartridge-unload path: dispatch
@@ -730,6 +751,23 @@ mod tests {
         let tape = mgr.tapes.get("T1").expect("tape tracked");
         assert_eq!(tape.write_buffer_usage, 0);
         assert!(tape.pending_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_queue_depth_aggregates_across_tapes_and_tracks_lifecycle() {
+        let (mut mgr, _u, _p) = make_manager();
+        assert_eq!(mgr.current_upload_queue_depth(), 0);
+        // Two tapes, distinct chunks each — depth is the daemon-wide sum.
+        mgr.on_block_written("T1", 0, 0, 1000).await;
+        mgr.on_block_written("T1", 1, 1, 1000).await;
+        mgr.on_block_written("T2", 0, 0, 1000).await;
+        assert_eq!(mgr.current_upload_queue_depth(), 3);
+        // Dispatch drains T1's pending set; T2's stays.
+        mgr.trigger_upload_batch("T1");
+        assert_eq!(mgr.current_upload_queue_depth(), 1);
+        // Unload clears the remaining tape's backlog.
+        mgr.on_cartridge_unloaded("T2", 0).await;
+        assert_eq!(mgr.current_upload_queue_depth(), 0);
     }
 
     #[tokio::test]
