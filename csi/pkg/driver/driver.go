@@ -10,8 +10,11 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
 
 	"github.com/metebalci/thur/csi/pkg/grpcserver"
+	"github.com/metebalci/thur/csi/pkg/iscsi"
 	"github.com/metebalci/thur/csi/pkg/vsa"
 )
 
@@ -71,6 +74,7 @@ type Config struct {
 	TargetPortal    string
 	ChapStoreKind   string
 	SecretNamespace string
+	NodeStateDir    string
 }
 
 // Driver is the top-level CSI driver.
@@ -100,7 +104,12 @@ func (d *Driver) Run() error {
 		})
 	}
 	if d.cfg.Mode.servesNode() {
-		csi.RegisterNodeServer(srv.Server(), &nodeServer{driver: d})
+		csi.RegisterNodeServer(srv.Server(), &nodeServer{
+			driver:   d,
+			attacher: iscsi.NewAttacher(utilexec.New()),
+			mounter:  mount.NewSafeFormatAndMount(mount.New(""), utilexec.New()),
+			stateDir: d.cfg.NodeStateDir,
+		})
 	}
 
 	klog.InfoS("starting thurvsa-csi",

@@ -25,6 +25,23 @@ func controllerCapabilities() []*csi.ControllerServiceCapability {
 	return caps
 }
 
+// nodeCapabilities is the set of node RPCs the driver implements. EXPAND_VOLUME
+// is added with the node-expand milestone.
+func nodeCapabilities() []*csi.NodeServiceCapability {
+	rpcs := []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+	}
+	caps := make([]*csi.NodeServiceCapability, 0, len(rpcs))
+	for _, r := range rpcs {
+		caps = append(caps, &csi.NodeServiceCapability{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{Type: r},
+			},
+		})
+	}
+	return caps
+}
+
 // isSupportedAccessMode reports whether mode is one the driver supports. v1 is
 // single-node only (per-volume CHAP + a single iSCSI session is single-attach).
 func isSupportedAccessMode(mode csi.VolumeCapability_AccessMode_Mode) bool {
