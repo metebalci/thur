@@ -21,8 +21,20 @@ const maxVolumeNameLen = 64
 // immutable PVC UID) and stable for the volume's lifetime, and the admin API is
 // name-keyed, so every later controller op addresses the daemon directly.
 func volumeName(csiName string) (string, error) {
+	return sanitizeName(csiName)
+}
+
+// snapshotName maps a CSI snapshot name (the external-snapshotter passes
+// snapshot-<uid>) to a valid VSA snapshot name. Snapshots share the volume-name
+// charset and length rules (core-block validate_name), so the sanitizer is the
+// same. The snapshot half of the "<volume>/<snapshot>" CSI SnapshotId.
+func snapshotName(csiName string) (string, error) {
+	return sanitizeName(csiName)
+}
+
+func sanitizeName(csiName string) (string, error) {
 	if csiName == "" {
-		return "", fmt.Errorf("empty volume name")
+		return "", fmt.Errorf("empty name")
 	}
 	if isValidVolumeName(csiName) {
 		return csiName, nil
