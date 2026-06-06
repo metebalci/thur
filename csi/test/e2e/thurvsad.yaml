@@ -1,0 +1,66 @@
+# thurvsad for the kind e2e: a single privileged, hostNetwork pod that serves
+# the iSCSI target on the node IP:3260 and exposes its admin socket on a
+# hostPath the CSI controller also mounts. A local storage backend + CHAP auth
+# is all the lifecycle test needs. NOT a production topology — see
+# csi/test/e2e/README.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thurvsad-config
+  namespace: thurvsa-system
+data:
+  thurvsa.yaml: |
+    data_dir: /var/lib/thurvsa
+    storage:
+      backends:
+        local:
+          type: local
+          root_dir: /var/lib/thurvsa/storage-local
+    iscsi:
+      auth:
+        method: CHAP
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: thurvsad
+  namespace: thurvsa-system
+  labels:
+    app: thurvsad
+spec:
+  selector:
+    matchLabels:
+      app: thurvsad
+  template:
+    metadata:
+      labels:
+        app: thurvsad
+    spec:
+      # Pin to the appliance node (the same node the CSI controller pins to).
+      nodeSelector:
+        thurvsa.csi/appliance: "true"
+      hostNetwork: true
+      containers:
+        - name: thurvsad
+          image: ghcr.io/metebalci/thurvsa:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: THUR_CONFIG
+              value: /etc/thurvsa/thurvsa.yaml
+          volumeMounts:
+            - { name: config, mountPath: /etc/thurvsa }
+            - { name: run, mountPath: /run/thurvsa }
+            - { name: data, mountPath: /var/lib/thurvsa }
+      volumes:
+        - name: config
+          configMap:
+            name: thurvsad-config
+        - name: run
+          hostPath:
+            path: /run/thurvsa
+            type: DirectoryOrCreate
+        - name: data
+          hostPath:
+            path: /var/lib/thurvsa
+            type: DirectoryOrCreate

@@ -1,0 +1,102 @@
+name: csi-e2e
+
+# Gated end-to-end test for the CSI driver on a single-node kind cluster
+# (issue #15, M10). MANUAL ONLY (workflow_dispatch): iSCSI inside kind-in-docker
+# depends on the runner's kernel modules + an iscsid in the node container, so
+# the bring-up below is expected to need iteration against real runs before it
+# is promoted to a nightly `schedule:`. The cluster-agnostic lifecycle
+# assertions live in csi/test/e2e/lifecycle.sh and are reusable as-is.
+#
+# Prereqs encoded here that may need tuning per run:
+#   - thurvsad runs as the ghcr.io/<owner>/thurvsa:latest image; the
+#     peer-cred gid the controller must match (--set thurvsaGid) is the group
+#     owning /run/thurvsa/admin.sock inside that container (root=0 as a start).
+#   - the iSCSI initiator (node plugin) needs iscsid + iscsi_tcp inside the
+#     kind node container.
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 4 * * *"   # promote to nightly once green
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  DRIVER_IMAGE: thurvsa-csi:e2e
+  NS_SYS: thurvsa-system
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install kind + kubectl
+        run: |
+          curl -fsSL -o kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x kind && sudo mv kind /usr/local/bin/
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - uses: azure/setup-helm@v4
+
+      - name: Load iSCSI kernel module on the runner
+        run: sudo modprobe iscsi_tcp
+
+      - name: Create kind cluster
+        run: kind create cluster --name thur --wait 120s
+
+      - name: Provision iSCSI initiator inside the kind node
+        run: |
+          node=$(docker ps --filter "name=thur-control-plane" --format '{{.Names}}')
+          docker exec "$node" bash -c "apt-get update && apt-get install -y open-iscsi && (iscsid || service iscsid start || true)"
+
+      - name: Build + load the driver image
+        run: |
+          docker build -t "${DRIVER_IMAGE}" -f csi/Containerfile csi
+          kind load docker-image "${DRIVER_IMAGE}" --name thur
+
+      - name: Install the external-snapshotter (CRDs + controller)
+        run: |
+          base=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.1.0
+          kubectl apply -f "$base/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml"
+          kubectl apply -f "$base/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml"
+          kubectl apply -f "$base/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml"
+          kubectl apply -f "$base/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
+          kubectl apply -f "$base/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
+
+      - name: Bring up thurvsad on the appliance node
+        run: |
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          kubectl label node "$node" thurvsa.csi/appliance=true
+          kubectl create namespace "${NS_SYS}"
+          kubectl apply -f csi/test/e2e/thurvsad.yaml
+          kubectl -n "${NS_SYS}" rollout status ds/thurvsad --timeout=180s
+
+      - name: Install the driver
+        run: |
+          node_ip=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          helm install thurvsa-csi csi/deploy/helm/thurvsa-csi \
+            --namespace "${NS_SYS}" \
+            --set driver.image.repository=thurvsa-csi \
+            --set driver.image.tag=e2e \
+            --set driver.image.pullPolicy=Never \
+            --set thurvsaGid=0 \
+            --set iscsi.targetPortal="${node_ip}:3260" \
+            --set storageClass.create=true \
+            --set snapshotClass.create=true
+          kubectl -n "${NS_SYS}" rollout status deploy/thurvsa-csi-thurvsa-csi-controller --timeout=180s
+          kubectl -n "${NS_SYS}" rollout status ds/thurvsa-csi-thurvsa-csi-node --timeout=180s
+
+      - name: Run the lifecycle test
+        run: ./csi/test/e2e/lifecycle.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n "${NS_SYS}" logs ds/thurvsad --tail=100 || true
+          kubectl -n "${NS_SYS}" logs deploy/thurvsa-csi-thurvsa-csi-controller -c thurvsa-csi --tail=100 || true
+          kubectl -n "${NS_SYS}" logs ds/thurvsa-csi-thurvsa-csi-node -c thurvsa-csi --tail=100 || true
