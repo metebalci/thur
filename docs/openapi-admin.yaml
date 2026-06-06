@@ -1,0 +1,544 @@
+# Copyright (c) 2026 Mete Balci
+# SPDX-License-Identifier: Apache-2.0
+#
+# Machine-readable contract for the MUTATING subset of thurvsad's admin API
+# that the Kubernetes CSI driver (csi/) consumes (issue #15).
+#
+# This is the counterpart to docs/openapi.yaml. That file documents the
+# read-only NETWORK surface (GETs on the TCP listener). This file documents the
+# mutating verbs the CSI controller calls over the local peer-cred Unix admin
+# socket (/run/thurvsa/admin.sock) — create/delete/resize/snapshot/clone a
+# volume and provision per-volume CHAP admission. They are deliberately kept in
+# a separate spec because they have a different transport (Unix socket, not
+# TCP) and a different auth model (kernel SO_PEERCRED group membership, not the
+# web-admin password) than the read-only surface.
+#
+# Scope is exactly the routes the CSI driver depends on, not the whole admin
+# socket surface. The Go client that consumes this contract is csi/pkg/vsa; its
+# request/response types mirror these schemas field-for-field.
+#
+# SYNC GUARD: vsa/daemon/tests/admin_openapi_sync.rs parses the admin-socket
+# router (vsa/daemon/src/admin/mod.rs) and fails the build unless every path
+# below is a real route AND the set of documented paths equals the driver's
+# contract allowlist. Change a route the driver uses -> update this file in the
+# same change, or the daemon test crate fails.
+
+openapi: 3.0.3
+
+info:
+  title: Thur VSA admin API (CSI driver contract)
+  version: "1.0"
+  description: |
+    The mutating thurvsad admin-socket verbs the Thur VSA Kubernetes CSI
+    driver depends on. Reachable only over the local peer-cred Unix admin
+    socket; the caller must be in the daemon's `thurvsa` group. Not a network
+    API today — but the request/response shapes are transport-agnostic, so a
+    future TCP network admin API can adopt this contract unchanged.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: Thur
+    url: https://github.com/metebalci/thur
+
+servers:
+  - url: "http://thurvsa"
+    description: >
+      Placeholder host. The client dials the Unix socket
+      /run/thurvsa/admin.sock (or $THURVSA_ADMIN_SOCKET); the host in the URL
+      is ignored by the daemon and exists only to satisfy HTTP/1.1.
+
+tags:
+  - name: vsa
+    description: Served by thurvsad over its admin Unix socket.
+
+paths:
+  /api/v1/volumes:
+    get:
+      tags: [vsa]
+      summary: List volumes
+      description: Every registered volume's row. The driver uses this to resolve a volume's uuid/lun by name (idempotent CreateVolume retries).
+      operationId: adminListVolumes
+      responses:
+        "200":
+          description: Volume list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeList"
+    post:
+      tags: [vsa]
+      summary: Create a volume
+      operationId: adminCreateVolume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVolumeRequest"
+      responses:
+        "201":
+          description: Volume created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeRow"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  "/api/v1/volumes/{name}":
+    delete:
+      tags: [vsa]
+      summary: Destroy a volume
+      operationId: adminDestroyVolume
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      responses:
+        "200":
+          description: Volume destroyed.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  "/api/v1/volumes/{name}/resize":
+    post:
+      tags: [vsa]
+      summary: Resize a volume
+      description: The driver only grows (sends size_bytes). Grow signals connected hosts via a CAPACITY DATA HAS CHANGED unit attention.
+      operationId: adminResizeVolume
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResizeRequest"
+      responses:
+        "200":
+          description: Resized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResizeResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  "/api/v1/volumes/{name}/snapshots":
+    get:
+      tags: [vsa]
+      summary: List a volume's snapshots
+      operationId: adminListSnapshots
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      responses:
+        "200":
+          description: Snapshot list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotList"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [vsa]
+      summary: Create a snapshot
+      operationId: adminCreateSnapshot
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "201":
+          description: Snapshot created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotRow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  "/api/v1/volumes/{name}/snapshots/{snap}":
+    delete:
+      tags: [vsa]
+      summary: Destroy a snapshot
+      operationId: adminDestroySnapshot
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+        - name: snap
+          in: path
+          required: true
+          description: Snapshot name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Snapshot destroyed.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  "/api/v1/volumes/{name}/clone":
+    post:
+      tags: [vsa]
+      summary: Clone a volume
+      description: Create a new writable volume from the named source, optionally seeded from one of its snapshots.
+      operationId: adminCloneVolume
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CloneVolumeRequest"
+      responses:
+        "201":
+          description: Clone created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeRow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/iscsi/users:
+    post:
+      tags: [vsa]
+      summary: Add a CHAP user
+      description: Mint a per-volume CHAP user admitted to the given volumes. Password must be at least 12 bytes; volumes must be non-empty.
+      operationId: adminAddIscsiUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddUserRequest"
+      responses:
+        "201":
+          description: User created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRow"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/iscsi/users/grant:
+    post:
+      tags: [vsa]
+      summary: Grant a user access to volumes (set union)
+      operationId: adminGrantIscsiUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantRequest"
+      responses:
+        "200":
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/iscsi/users/revoke:
+    post:
+      tags: [vsa]
+      summary: Revoke a user's access to volumes (set difference)
+      description: Refuses (409) if it would empty the admission set; use remove for the terminal case.
+      operationId: adminRevokeIscsiUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantRequest"
+      responses:
+        "200":
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /api/v1/iscsi/users/remove:
+    post:
+      tags: [vsa]
+      summary: Remove a CHAP user
+      operationId: adminRemoveIscsiUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NameOnlyRequest"
+      responses:
+        "200":
+          description: User removed.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  parameters:
+    VolumeName:
+      name: name
+      in: path
+      required: true
+      description: Volume name.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Conflict (duplicate name, or guarded by reservation / non-empty set).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    CreateVolumeRequest:
+      type: object
+      required: [name, size_bytes]
+      properties:
+        name:
+          type: string
+          description: Volume name (1-64 chars, [A-Za-z0-9_-]).
+        size_bytes:
+          type: integer
+          format: int64
+          description: Logical size, 4 KiB-sector aligned.
+        page_size_bytes:
+          type: integer
+          format: int64
+          description: Chunk/page unit, power of two (default 65536).
+        backend:
+          type: string
+          description: Cloud backend name; required only when 2+ backends are configured.
+        dedup:
+          type: string
+          enum: [local, global]
+          description: Dedup scope (default local).
+        worm:
+          type: boolean
+        encrypt:
+          type: boolean
+        key_hex:
+          type: string
+        keystore:
+          type: string
+        dek_source:
+          type: string
+          enum: [daemon, backend]
+        sync_after:
+          type: string
+          enum: [cloud, disk, memory]
+        lun:
+          type: integer
+          format: int64
+          description: Operator-pinned LUN; omit to auto-assign the smallest free LUN.
+
+    VolumeRow:
+      type: object
+      required: [lun, name, size_bytes, sector_bytes, page_size_bytes, backend, dedup_scope, worm, uuid]
+      properties:
+        lun:
+          type: integer
+          format: int64
+        name:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        sector_bytes:
+          type: integer
+          format: int64
+        page_size_bytes:
+          type: integer
+          format: int64
+        backend:
+          type: string
+        dedup_scope:
+          type: string
+          enum: [local, global]
+        worm:
+          type: boolean
+        uuid:
+          type: string
+          description: 16-byte volume identity, lowercase hex. Immutable; the CSI VolumeId.
+
+    VolumeList:
+      type: object
+      required: [volumes]
+      properties:
+        volumes:
+          type: array
+          items:
+            $ref: "#/components/schemas/VolumeRow"
+
+    ResizeRequest:
+      type: object
+      description: Exactly one of size_bytes (grow/shrink) or shrink_to_fit. The CSI driver only ever sends size_bytes (grow).
+      properties:
+        size_bytes:
+          type: integer
+          format: int64
+        shrink_to_fit:
+          type: boolean
+
+    ResizeResponse:
+      type: object
+      required: [volume, previous, size_bytes]
+      properties:
+        volume:
+          type: string
+        previous:
+          type: integer
+          format: int64
+        size_bytes:
+          type: integer
+          format: int64
+
+    CloneVolumeRequest:
+      type: object
+      required: [new_name]
+      properties:
+        new_name:
+          type: string
+        from_snapshot:
+          type: string
+          description: Source snapshot name; omit to clone the live source.
+        lun:
+          type: integer
+          format: int64
+
+    CreateSnapshotRequest:
+      type: object
+      required: [snapshot]
+      properties:
+        snapshot:
+          type: string
+
+    SnapshotRow:
+      type: object
+      required: [snapshot, size_bytes, created_at]
+      properties:
+        volume:
+          type: string
+          description: Present on the create response; omitted on list rows.
+        snapshot:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+
+    SnapshotList:
+      type: object
+      required: [volume, snapshots]
+      properties:
+        volume:
+          type: string
+        snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnapshotRow"
+
+    AddUserRequest:
+      type: object
+      required: [username, password, volumes]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          description: At least 12 bytes (RFC 3720).
+        mutual_chap:
+          type: boolean
+        volumes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+
+    GrantRequest:
+      type: object
+      required: [name, volumes]
+      description: Body for both grant (set union) and revoke (set difference).
+      properties:
+        name:
+          type: string
+        volumes:
+          type: array
+          items:
+            type: string
+
+    NameOnlyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    UserRow:
+      type: object
+      required: [username, mutual_chap, disabled]
+      properties:
+        username:
+          type: string
+        mutual_chap:
+          type: boolean
+        partition:
+          type: string
+          nullable: true
+        volumes:
+          type: array
+          items:
+            type: string
+        disabled:
+          type: boolean
+        in_grace:
+          type: boolean
+        previous_expires_at:
+          type: string
+          format: date-time
+          nullable: true
