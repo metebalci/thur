@@ -79,6 +79,20 @@ func (a *Attacher) Attach(ctx context.Context, c Connector) (string, error) {
 	return a.resolve(ctx, c)
 }
 
+// Rescan re-scans the target's sessions so the kernel observes a grown LUN,
+// then re-resolves and returns the (unchanged) device path. Used by node-side
+// volume expansion.
+func (a *Attacher) Rescan(ctx context.Context, c Connector) (string, error) {
+	portal := normalizePortal(c.Portal)
+	c.Portal = portal
+	if out, err := a.run(ctx, "-m", "node", "-T", c.TargetIQN, "-p", portal, "-R"); err != nil {
+		if !tolerable(out) {
+			return "", fmt.Errorf("iscsi rescan %s: %s: %w", c.TargetIQN, strings.TrimSpace(out), err)
+		}
+	}
+	return a.resolve(ctx, c)
+}
+
 // Detach logs out of the target and removes its node DB record. Tolerates a
 // missing session/record so NodeUnstageVolume is idempotent.
 func (a *Attacher) Detach(ctx context.Context, iqn, portal string) error {

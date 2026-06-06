@@ -14,6 +14,7 @@ func controllerCapabilities() []*csi.ControllerServiceCapability {
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 	}
 	caps := make([]*csi.ControllerServiceCapability, 0, len(rpcs))
 	for _, r := range rpcs {
@@ -26,11 +27,11 @@ func controllerCapabilities() []*csi.ControllerServiceCapability {
 	return caps
 }
 
-// nodeCapabilities is the set of node RPCs the driver implements. EXPAND_VOLUME
-// is added with the node-expand milestone.
+// nodeCapabilities is the set of node RPCs the driver implements.
 func nodeCapabilities() []*csi.NodeServiceCapability {
 	rpcs := []csi.NodeServiceCapability_RPC_Type{
 		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+		csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 	}
 	caps := make([]*csi.NodeServiceCapability, 0, len(rpcs))
 	for _, r := range rpcs {

@@ -22,6 +22,7 @@ import (
 // faked in tests).
 type attacher interface {
 	Attach(ctx context.Context, c iscsi.Connector) (string, error)
+	Rescan(ctx context.Context, c iscsi.Connector) (string, error)
 	Detach(ctx context.Context, iqn, portal string) error
 }
 
@@ -34,6 +35,11 @@ type volumeMounter interface {
 	IsLikelyNotMountPoint(file string) (bool, error)
 }
 
+// resizeFs grows a filesystem in place (*mount.ResizeFs in production).
+type resizeFs interface {
+	Resize(devicePath, deviceMountPath string) (bool, error)
+}
+
 // nodeServer implements csi.NodeServer: it attaches the LUN over iSCSI with the
 // per-volume CHAP creds from PublishContext, then formats + mounts it. It never
 // talks to the admin socket.
@@ -42,6 +48,7 @@ type nodeServer struct {
 	driver   *Driver
 	attacher attacher
 	mounter  volumeMounter
+	resizer  resizeFs
 	stateDir string
 }
 
@@ -182,6 +189,32 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	}
 	_ = os.Remove(s.connPath(req.GetVolumeId()))
 	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	if req.GetVolumeId() == "" || req.GetVolumePath() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id and volume_path are required")
+	}
+	conn, err := s.loadConn(req.GetVolumeId())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "no iSCSI connector state for %q; volume must be staged on this node", req.GetVolumeId())
+		}
+		return nil, status.Errorf(codes.Internal, "load connector: %v", err)
+	}
+	// Rescan so the kernel observes the grown LUN.
+	device, err := s.attacher.Rescan(ctx, conn)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "iscsi rescan: %v", err)
+	}
+	// Raw block volumes have no filesystem to grow; the rescan is enough.
+	if req.GetVolumeCapability().GetBlock() != nil {
+		return &csi.NodeExpandVolumeResponse{}, nil
+	}
+	if _, err := s.resizer.Resize(device, req.GetVolumePath()); err != nil {
+		return nil, status.Errorf(codes.Internal, "resize filesystem on %s: %v", device, err)
+	}
+	return &csi.NodeExpandVolumeResponse{CapacityBytes: req.GetCapacityRange().GetRequiredBytes()}, nil
 }
 
 // ---- helpers ----

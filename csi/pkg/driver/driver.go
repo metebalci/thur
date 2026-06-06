@@ -108,6 +108,7 @@ func (d *Driver) Run() error {
 			driver:   d,
 			attacher: iscsi.NewAttacher(utilexec.New()),
 			mounter:  mount.NewSafeFormatAndMount(mount.New(""), utilexec.New()),
+			resizer:  mount.NewResizeFs(utilexec.New()),
 			stateDir: d.cfg.NodeStateDir,
 		})
 	}

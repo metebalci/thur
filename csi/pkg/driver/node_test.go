@@ -17,9 +17,10 @@ import (
 )
 
 type fakeAttacher struct {
-	device   string
-	attached []iscsi.Connector
-	detached [][2]string
+	device    string
+	attached  []iscsi.Connector
+	rescanned []iscsi.Connector
+	detached  [][2]string
 }
 
 func (f *fakeAttacher) Attach(_ context.Context, c iscsi.Connector) (string, error) {
@@ -27,9 +28,23 @@ func (f *fakeAttacher) Attach(_ context.Context, c iscsi.Connector) (string, err
 	return f.device, nil
 }
 
+func (f *fakeAttacher) Rescan(_ context.Context, c iscsi.Connector) (string, error) {
+	f.rescanned = append(f.rescanned, c)
+	return f.device, nil
+}
+
 func (f *fakeAttacher) Detach(_ context.Context, iqn, portal string) error {
 	f.detached = append(f.detached, [2]string{iqn, portal})
 	return nil
+}
+
+type fakeResizer struct {
+	resized [][2]string
+}
+
+func (r *fakeResizer) Resize(devicePath, deviceMountPath string) (bool, error) {
+	r.resized = append(r.resized, [2]string{devicePath, deviceMountPath})
+	return true, nil
 }
 
 type fakeMounter struct {
@@ -65,16 +80,23 @@ func (m *fakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
 }
 
 func testNode(t *testing.T) (*nodeServer, *fakeAttacher, *fakeMounter) {
+	ns, fa, fm, _ := testNodeR(t)
+	return ns, fa, fm
+}
+
+func testNodeR(t *testing.T) (*nodeServer, *fakeAttacher, *fakeMounter, *fakeResizer) {
 	t.Helper()
 	fa := &fakeAttacher{device: "/dev/sdx"}
 	fm := newFakeMounter()
+	fr := &fakeResizer{}
 	ns := &nodeServer{
 		driver:   New(Config{Name: DefaultDriverName, NodeID: "node-1"}),
 		attacher: fa,
 		mounter:  fm,
+		resizer:  fr,
 		stateDir: t.TempDir(),
 	}
-	return ns, fa, fm
+	return ns, fa, fm, fr
 }
 
 func nodePubCtx() map[string]string {
@@ -204,6 +226,74 @@ func TestNodeUnstageIdempotent(t *testing.T) {
 	}
 	if len(fa.detached) != 0 {
 		t.Errorf("detach should not run without persisted state: %+v", fa.detached)
+	}
+}
+
+func TestNodeExpandFilesystem(t *testing.T) {
+	ns, fa, _, fr := testNodeR(t)
+	ctx := context.Background()
+	staging := filepath.Join(t.TempDir(), "staging")
+	volPath := filepath.Join(t.TempDir(), "published")
+
+	// Stage first so the connector is persisted for the rescan.
+	if _, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+		VolumeId: "pvc-x", StagingTargetPath: staging,
+		VolumeCapability: singleNodeCaps()[0], PublishContext: nodePubCtx(),
+	}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	resp, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{
+		VolumeId: "pvc-x", VolumePath: volPath,
+		CapacityRange:    &csi.CapacityRange{RequiredBytes: 2 << 30},
+		VolumeCapability: singleNodeCaps()[0],
+	})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if resp.GetCapacityBytes() != 2<<30 {
+		t.Errorf("capacity = %d, want %d", resp.GetCapacityBytes(), 2<<30)
+	}
+	if len(fa.rescanned) != 1 {
+		t.Errorf("session not rescanned: %+v", fa.rescanned)
+	}
+	if len(fr.resized) != 1 || fr.resized[0] != [2]string{"/dev/sdx", volPath} {
+		t.Errorf("filesystem not resized with (device, volPath): %+v", fr.resized)
+	}
+}
+
+func TestNodeExpandBlockSkipsResize(t *testing.T) {
+	ns, fa, _, fr := testNodeR(t)
+	ctx := context.Background()
+	staging := filepath.Join(t.TempDir(), "staging")
+	if _, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+		VolumeId: "pvc-b", StagingTargetPath: staging,
+		VolumeCapability: blockCap(), PublishContext: nodePubCtx(),
+	}); err != nil {
+		t.Fatalf("stage block: %v", err)
+	}
+	if _, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{
+		VolumeId: "pvc-b", VolumePath: "/dev/whatever",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30}, VolumeCapability: blockCap(),
+	}); err != nil {
+		t.Fatalf("expand block: %v", err)
+	}
+	if len(fa.rescanned) != 1 {
+		t.Errorf("block volume must still be rescanned")
+	}
+	if len(fr.resized) != 0 {
+		t.Errorf("block volume must not resize a filesystem: %+v", fr.resized)
+	}
+}
+
+func TestNodeExpandNoConnector(t *testing.T) {
+	ns, _, _, _ := testNodeR(t)
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId: "never-staged", VolumePath: filepath.Join(t.TempDir(), "p"),
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition without staged connector, got %v", err)
 	}
 }
 
