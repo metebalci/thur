@@ -3,11 +3,11 @@
 
 //! End-to-end DR test for delta-page index backup.
 //!
-//! Exercises: write a cartridge, run `backup_manifest_to_cloud`,
+//! Exercises: write a cartridge, run `backup_manifest_to_storage`,
 //! wipe the cartridge directory entirely (simulating cold-bucket
 //! disaster recovery on a fresh host), reopen the cartridge from the
-//! cloud-only state, and verify that every previously-written block
-//! reads back identically. Without index pages landing in cloud, this
+//! storage-only state, and verify that every previously-written block
+//! reads back identically. Without index pages landing in storage, this
 //! test would fail at step 4 because `chunks.idx` and `blocks-p0.idx`
 //! would be empty after wipe.
 
@@ -27,7 +27,7 @@ async fn cold_bucket_dr_via_index_pages() {
     let label = "DR0001";
     // 1. Create + write some blocks (block bytes deterministic so we
     // can verify after restore).
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes,
         label,
         CartridgeOpenMode::Create {
@@ -55,7 +55,7 @@ async fn cold_bucket_dr_via_index_pages() {
     cart.flush_and_seal().unwrap();
 
     // 2. Backup — ships index pages + manifest sentinel.
-    cart.backup_manifest_to_cloud().await.unwrap();
+    cart.backup_manifest_to_storage().await.unwrap();
 
     // Sanity: backend now contains chunk pool entries + manifest +
     // at least one chunks page + one blocks-p0 page.
@@ -74,11 +74,11 @@ async fn cold_bucket_dr_via_index_pages() {
         .collect();
     assert!(
         !chunks_pages.is_empty(),
-        "expected at least one chunks/page-* in cloud"
+        "expected at least one chunks/page-* in storage"
     );
     assert!(
         !blocks_pages.is_empty(),
-        "expected at least one blocks-p0/page-* in cloud"
+        "expected at least one blocks-p0/page-* in storage"
     );
     let sentinel = manifest_keys
         .iter()
@@ -91,7 +91,7 @@ async fn cold_bucket_dr_via_index_pages() {
     );
 
     // 3. Drop the cartridge handle and wipe its on-disk state
-    // entirely — simulates a fresh host with only the cloud bucket.
+    // entirely — simulates a fresh host with only the storage bucket.
     drop(cart);
     let cart_root = tapes.join(label);
     fs::remove_dir_all(&cart_root).unwrap();
@@ -99,7 +99,7 @@ async fn cold_bucket_dr_via_index_pages() {
 
     // 4. Reopen — must auto-restore manifest and stitch index pages
     // back into chunks.idx + blocks-p0.idx.
-    let mut cart2 = Cartridge::open_with_cloud_async(
+    let mut cart2 = Cartridge::open_with_storage_async(
         &tapes,
         label,
         CartridgeOpenMode::Open,

@@ -7,7 +7,7 @@
 //! upload state, location, compression). Last-accessed timestamps used
 //! to live in the same record, but every read of a chunk would
 //! `pwrite` the chunks-index page and dirty a 1 MiB delta that the
-//! manifest-backup path then shipped to cloud — pure write
+//! manifest-backup path then shipped to storage — pure write
 //! amplification driven by what is, fundamentally, a local cache hint.
 //!
 //! `lru.idx` splits that hot column out:
@@ -17,7 +17,7 @@
 //!   index. `next_id` matches `chunks.idx` next_id; the file grows in
 //!   lockstep on append and shrinks in lockstep on truncate.
 //! - **Local-only.** No `DirtyPageTracker` sidecar. Never registered
-//!   with `index_backup`. Never enumerated for cloud restore. A fresh
+//!   with `index_backup`. Never enumerated for storage restore. A fresh
 //!   host doing cold-bucket DR rebuilds it from scratch as zeros.
 //! - Reset / corrupt / missing ⇒ rebuild as zero-filled to match the
 //!   chunks.idx record count. First eviction cycle picks oldest
@@ -57,7 +57,7 @@ pub const VERSION: u32 = 1;
 /// Per-cartridge LRU sidecar file. One u64 per chunk_id, positional.
 ///
 /// Owns no `DirtyPageTracker` — this file is purely a local cache
-/// hint and is intentionally invisible to the cloud-backup path.
+/// hint and is intentionally invisible to the storage-backup path.
 #[derive(Debug)]
 pub struct LruIndexFile {
     path: PathBuf,
@@ -161,7 +161,7 @@ impl LruIndexFile {
 
     /// Append zero-valued slots until `next_id == target`. Used at
     /// cartridge open to bring the LRU file in line with `chunks.idx`
-    /// when the latter was restored from cloud or grew while the LRU
+    /// when the latter was restored from storage or grew while the LRU
     /// sidecar was missing/stale.
     pub fn grow_to(&self, target: u64) -> Result<()> {
         let cur = self.next_id.load(Ordering::Acquire);

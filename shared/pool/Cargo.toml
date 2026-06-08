@@ -32,7 +32,7 @@ shared-alerting = { path = "../alerting" }
 
 # DiskCacheSize parses out of YAML as either an integer GB count
 # or the literal "auto" string; the per-backend disk_cache_size_gb
-# override under `cloud.backends:` uses the same shape. Custom
+# override under `storage.backends:` uses the same shape. Custom
 # Deserialize on the enum needs serde.
 serde = { version = "1", features = ["derive"] }
 

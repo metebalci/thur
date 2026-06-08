@@ -13,7 +13,7 @@
 //! Test runners that populate the store stay library-local: thurvtl
 //! drives a library-vs-drive split (`run_library_diagnostic` checks
 //! `library.json` + `inventory.json` + every cartridge manifest +
-//! every cloud backend). The drive-tier runner [`run_drive_diagnostic`]
+//! every storage backend). The drive-tier runner [`run_drive_diagnostic`]
 //! is shared because it only reads the loaded cartridge's
 //! `manifest.json`.
 
@@ -262,7 +262,7 @@ mod tests {
     fn self_test_results_page_layout() {
         let store = DiagnosticStore::new();
         store.record(0, DiagnosticEntry::pass());
-        store.record(0, DiagnosticEntry::fail("simulated cloud auth fail"));
+        store.record(0, DiagnosticEntry::fail("simulated storage auth fail"));
 
         let data = build_self_test_results_page(&store, 0);
         // Header

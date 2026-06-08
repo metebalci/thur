@@ -41,7 +41,7 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
-/// Format a backend (cloud) byte counter, appending its share of the
+/// Format a backend (storage) byte counter, appending its share of the
 /// matching host counter — e.g. `2.31 TiB (50% of host)`. On the
 /// write side that ratio is the dedup + compression saving; on the
 /// read side it is the fraction of host bytes that missed cache. The

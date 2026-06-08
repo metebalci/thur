@@ -7,7 +7,7 @@
 //! daemon does the data-collection (one `MonitorSnapshot` JSON per
 //! tick over the `system.monitor` job stream); this module renders
 //! and maintains the short ring buffer the screen needs to compute
-//! the 60-second cloud window and the 5-minute audit window.
+//! the 60-second storage window and the 5-minute audit window.
 //!
 //! No new TUI deps: clear-screen + cursor-home is two ANSI escapes.
 //! SIGINT handling is implicit — the user's Ctrl-C drops the job

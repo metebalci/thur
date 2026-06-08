@@ -3,13 +3,13 @@
 
 //! Local backend for testing and development
 //!
-//! This backend stores chunks and manifests in the local filesystem without any cloud operations.
+//! This backend stores chunks and manifests in the local filesystem without any storage operations.
 //! It implements the ObjectStoreBackend trait but all operations are local - no network calls.
 //!
 //! This is useful for:
-//! - Development and testing without cloud dependencies
+//! - Development and testing without storage dependencies
 //! - Air-gapped environments
-//! - Scenarios where cloud storage is not needed
+//! - Scenarios where storage storage is not needed
 
 use crate::Result;
 use crate::error::ObjectStoreError;
@@ -45,13 +45,13 @@ pub const INJECT_ENV_VAR: &str = "THUR_STORAGE_INJECT_FAIL";
 /// Retry budget per op when injection is wired through `retry_async`.
 /// Small on purpose: a smoke test that exhausts the budget on a
 /// `timeout@*` rule should complete in under 10 seconds (exponential
-/// jittered backoff starting at 1s). Real cloud backends use 3–5.
+/// jittered backoff starting at 1s). Real storage backends use 3–5.
 const MAX_LOCAL_INJECT_RETRIES: u32 = 2;
 
-/// Local filesystem backend (no cloud operations)
+/// Local filesystem backend (no storage operations)
 ///
 /// This backend stores all data locally in a directory structure that mimics
-/// the cloud storage layout (chunks/, manifests/). All operations are synchronous
+/// the storage storage layout (chunks/, manifests/). All operations are synchronous
 /// file I/O wrapped in async.
 #[derive(Debug, Clone)]
 pub struct LocalBackend {
@@ -246,7 +246,7 @@ impl ObjectStoreBackend for LocalBackend {
         Option<crate::compression::CompressionAlgo>,
     )> {
         // Wrap in retry_async so injection-driven synthetic errors
-        // flow through the same classify-and-retry surface real cloud
+        // flow through the same classify-and-retry surface real storage
         // backends use — exposing `failed (attempt N/M):` and
         // `failed with permanent error (...)` log lines that the
         // failure-path shell tests grep for. With no injection the

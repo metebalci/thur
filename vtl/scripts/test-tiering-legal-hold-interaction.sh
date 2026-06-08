@@ -4,27 +4,27 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL Tiering x Legal Hold Interaction (cloud-native)
+# Thur VTL Tiering x Legal Hold Interaction (storage-native)
 #
 # Asserts the safety-critical gate where cartridge tiering meets legal
 # hold: a cartridge under legal hold is NEVER moved by tiering — it is
 # excluded at plan time (TieringPlanReport.excluded_legal_hold) and
 # never attempted by run-now. Clearing the hold lifts the exclusion.
 #
-# Legal hold is cloud-native (provider per-object hold is the only
-# source of truth), so this REQUIRES a cloud backend with Object Lock /
+# Legal hold is storage-native (provider per-object hold is the only
+# source of truth), so this REQUIRES a storage backend with Object Lock /
 # legal-hold enabled and cannot run against `local`. See
 # test-legal-hold-lifecycle.sh for the backend/bucket requirements;
 # selection is identical (THURVTL_TEST_BACKEND, retention_mode: none,
 # Object Lock enabled on the bucket).
 #
-# Fixture: two data-bearing cartridges on the cloud backend (`hot`):
+# Fixture: two data-bearing cartridges on the storage backend (`hot`):
 #   TIERHOLD1 — under legal hold
 #   TIERMOVE1 — not held
 # A single policy matches barcode prefix "TIER" -> local backend `cold`.
 #
-# Assertions (depend only on cloud upload + legal-hold reads + the plan
-# engine — NOT on the cloud->local move actually completing, which is
+# Assertions (depend only on storage upload + legal-hold reads + the plan
+# engine — NOT on the storage->local move actually completing, which is
 # covered by test-lifecycle-cartridge-migrate.sh):
 #   - plan: TIERHOLD1 in excluded_legal_hold, not in moves;
 #           TIERMOVE1 in moves (hot -> cold); under_legal_hold == 1
@@ -147,7 +147,7 @@ trap cleanup EXIT INT TERM
 
 resolve_backend() {
     if [[ -z "${THURVTL_TEST_BACKEND:-}" ]]; then
-        log_error "THURVTL_TEST_BACKEND is not set (cloud, Object-Lock-enabled backend required)."
+        log_error "THURVTL_TEST_BACKEND is not set (storage, Object-Lock-enabled backend required)."
         echo "Example: THURVTL_TEST_BACKEND=governance $0"
         exit 1
     fi
@@ -176,7 +176,7 @@ resolve_backend() {
     local retention
     retention=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
     if [[ "$BACKEND_TYPE" == "local" ]]; then
-        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is cloud-native."
+        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is storage-native."
         exit 1
     fi
     if [[ "$retention" != "none" ]]; then
@@ -219,10 +219,10 @@ check_prerequisites() {
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
 }
 
-# Cloud backend as `hot` (retention_mode forced none, prefix scoped),
+# Storage backend as `hot` (retention_mode forced none, prefix scoped),
 # local `cold` as the tiering target, and a barcode-prefix policy.
 create_test_config() {
-    log_info "Creating test configuration (cloud backend cloned from $SOURCE_BACKENDS)..."
+    log_info "Creating test configuration (storage backend cloned from $SOURCE_BACKENDS)..."
     mkdir -p "$TEST_DIR/data" "$TEST_DIR/cold"
     if [[ -n "${SUDO_USER:-}" ]]; then
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
@@ -333,7 +333,7 @@ test_plan_excludes_held() {
 
 # run-now: held cartridge excluded and NOT moved (manifest.backend stays
 # hot). We assert on JSON content + manifest, not on run-now's exit code
-# (the unheld cartridge's cloud->local move is exercised elsewhere).
+# (the unheld cartridge's storage->local move is exercised elsewhere).
 test_run_now_never_moves_held() {
     local run
     run=$("$CLI_PATH" --config "$TEST_CONFIG" system tiering run-now --json 2>/dev/null)
@@ -402,7 +402,7 @@ main() {
     write_slot 1 "$HELD_BC" || { log_error "write to $HELD_BC failed"; exit 1; }
     write_slot 2 "$MOVE_BC" || { log_error "write to $MOVE_BC failed"; exit 1; }
 
-    log_info "Waiting for both cloud sentinels (up to ${MANIFEST_WAIT_SECS}s each)..."
+    log_info "Waiting for both storage sentinels (up to ${MANIFEST_WAIT_SECS}s each)..."
     storage_wait_for_key "manifests/${HELD_BC}/manifest-latest.json" "$MANIFEST_WAIT_SECS" \
         || { log_error "sentinel for $HELD_BC never landed"; exit 1; }
     storage_wait_for_key "manifests/${MOVE_BC}/manifest-latest.json" "$MANIFEST_WAIT_SECS" \

@@ -63,7 +63,8 @@ fn routes_in(src: &str) -> BTreeSet<String> {
 
 /// Top-level keys under `paths:` in the spec.
 fn spec_paths(root: &Path) -> BTreeSet<String> {
-    let text = std::fs::read_to_string(root.join("docs/reference/openapi.yaml")).expect("read openapi.yaml");
+    let text = std::fs::read_to_string(root.join("docs/reference/openapi.yaml"))
+        .expect("read openapi.yaml");
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("openapi.yaml is valid YAML");
     doc.get("paths")
         .and_then(|p| p.as_mapping())

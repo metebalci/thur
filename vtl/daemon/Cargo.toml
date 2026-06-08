@@ -18,7 +18,7 @@ bytes = "1"
 core-mediachanger = { path = "../../core/mediachanger" }
 shared-admin-audit = { path = "../../shared/admin-audit" }
 shared-admin-auth = { path = "../../shared/admin-auth" }
-shared-admin-cloud-check = { path = "../../shared/admin-cloud-check" }
+shared-admin-storage-check = { path = "../../shared/admin-storage-check" }
 shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
 shared-admin-monitor = { path = "../../shared/admin-monitor" }
@@ -89,7 +89,7 @@ async-trait = "0.1"
 # turns an async block with `yield` into a `Stream<Item = Result<Bytes,
 # Infallible>>` that axum's `Body::from_stream` accepts.
 async-stream = "0.3"
-# `futures::stream::buffer_unordered` for the pipelined cloud-upload
+# `futures::stream::buffer_unordered` for the pipelined storage-upload
 # worker. The drain-batch JoinSet pattern gated the whole batch on its
 # slowest task; the pipelined variant launches a fresh upload as soon
 # as any in-flight one settles.

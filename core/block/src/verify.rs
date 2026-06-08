@@ -12,18 +12,18 @@
 //!   binding checks; a failure is a hard error.
 //! * **chunk presence** — every chunk hash the page table references
 //!   resolves to a pool file. A referenced chunk absent from the local
-//!   pool is a *warning* (it may simply be evicted to cloud-only); the
-//!   optional cloud sweep is what turns genuine loss into an error.
+//!   pool is a *warning* (it may simply be evicted to storage-only); the
+//!   optional storage sweep is what turns genuine loss into an error.
 //! * **local pool orphan sweep** — chunks in the pool that no live
 //!   volume references. Surfaced as GC hints, never errors.
 //!
-//! The two pool sweeps (local orphan scan, cloud HEAD sweep) are the
+//! The two pool sweeps (local orphan scan, storage HEAD sweep) are the
 //! cross-product `shared-verify-core` primitives — the same code the
 //! tape verifier runs. What stays here is block-specific: the
 //! page-table integrity check and the report shape.
 //!
 //! Two entry points mirror the tape side: [`verify_local`] runs only
-//! the on-disk checks; [`verify_with_cloud`] layers a per-backend HEAD
+//! the on-disk checks; [`verify_with_storage`] layers a per-backend HEAD
 //! sweep on top.
 
 use std::collections::{HashMap, HashSet};
@@ -31,7 +31,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use shared_object_store::ObjectStoreConfig;
-use shared_verify_core::{CloudEntity, LiveChunkSet, VerifyTarget};
+use shared_verify_core::{LiveChunkSet, StorageEntity, VerifyTarget};
 
 use crate::chunk_pool::ChunkPool;
 use crate::page_index::PageIndex;
@@ -87,10 +87,10 @@ pub struct VolumeReport {
     pub allocated_pages: u64,
     /// Distinct chunk hashes the page table references whose pool file
     /// is absent locally. A warning, not an error — eviction to
-    /// cloud-only is normal; the cloud sweep confirms genuine loss.
+    /// storage-only is normal; the storage sweep confirms genuine loss.
     pub local_chunks_missing: u64,
-    /// Chunks absent from the cloud bucket on HEAD. `None` when the
-    /// cloud sweep was skipped.
+    /// Chunks absent from the storage bucket on HEAD. `None` when the
+    /// storage sweep was skipped.
     pub storage_chunks_missing: Option<u64>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
@@ -105,7 +105,7 @@ pub struct PoolReport {
     pub namespaces: Vec<NamespaceReport>,
     pub orphan_namespace_dirs: Vec<String>,
     pub gc_hints: Vec<String>,
-    /// Cloud-side counters. `None` when the cloud sweep was skipped.
+    /// Storage-side counters. `None` when the storage sweep was skipped.
     pub storage: Option<StorageReport>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
@@ -155,10 +155,10 @@ impl VerifyTarget for BlockVerifyTarget {
         out
     }
 
-    fn cloud_entities(&self) -> Vec<CloudEntity> {
+    fn storage_entities(&self) -> Vec<StorageEntity> {
         self.entities
             .iter()
-            .map(|e| CloudEntity {
+            .map(|e| StorageEntity {
                 label: e.volume.clone(),
                 backend: e.backend.clone(),
                 namespace: e.namespace.clone(),
@@ -169,7 +169,7 @@ impl VerifyTarget for BlockVerifyTarget {
 }
 
 /// Local-only consistency pass. Use when the operator passed
-/// `--skip-cloud`; otherwise call [`verify_with_cloud`].
+/// `--skip-storage`; otherwise call [`verify_with_storage`].
 pub fn verify_local(
     data_dir: &Path,
     scope: &VerifyScope,
@@ -178,16 +178,16 @@ pub fn verify_local(
     Ok(report)
 }
 
-/// Local pass plus a per-backend cloud HEAD sweep. Backend errors are
+/// Local pass plus a per-backend storage HEAD sweep. Backend errors are
 /// recorded into the report and the sweep continues — one degraded
 /// backend shouldn't mask another's findings.
-pub async fn verify_with_cloud(
+pub async fn verify_with_storage(
     data_dir: &Path,
     scope: &VerifyScope,
-    cloud_cfg: &ObjectStoreConfig,
+    storage_cfg: &ObjectStoreConfig,
 ) -> Result<VolumeVerifyReport, VolumeError> {
     let (mut report, target) = verify_inner(data_dir, scope)?;
-    cloud_sweep(&mut report, &target, cloud_cfg).await;
+    storage_sweep(&mut report, &target, storage_cfg).await;
     Ok(report)
 }
 
@@ -284,7 +284,7 @@ fn verify_inner(
         if vr.local_chunks_missing > 0 {
             vr.warnings.push(format!(
                 "{} referenced chunk(s) absent from the local pool — evicted to \
-                 cloud-only, or lost; the cloud sweep confirms which",
+                 storage-only, or lost; the storage sweep confirms which",
                 vr.local_chunks_missing
             ));
         }
@@ -356,16 +356,16 @@ fn pool_report_from_sweep(sweep: shared_verify_core::PoolSweep) -> PoolReport {
     p
 }
 
-/// Per-backend cloud HEAD sweep. Local-type backends are skipped.
-async fn cloud_sweep(
+/// Per-backend storage HEAD sweep. Local-type backends are skipped.
+async fn storage_sweep(
     report: &mut VolumeVerifyReport,
     target: &BlockVerifyTarget,
-    cloud_cfg: &ObjectStoreConfig,
+    storage_cfg: &ObjectStoreConfig,
 ) {
     let backends: HashSet<String> = target.entities.iter().map(|e| e.backend.clone()).collect();
 
     for backend_name in backends {
-        match cloud_cfg.backend_entry(&backend_name) {
+        match storage_cfg.backend_entry(&backend_name) {
             Ok(entry) => {
                 if entry.backend_type() == "local" {
                     continue;
@@ -375,7 +375,7 @@ async fn cloud_sweep(
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
                     pr.errors.push(format!(
                         "backend '{}' referenced by a volume but not defined under \
-                         `cloud.backends:` — skipping cloud sweep",
+                         `storage.backends:` — skipping storage sweep",
                         backend_name
                     ));
                 }
@@ -383,7 +383,7 @@ async fn cloud_sweep(
             }
         }
 
-        let backend = match cloud_cfg.create_backend_named(&backend_name).await {
+        let backend = match storage_cfg.create_backend_named(&backend_name).await {
             Ok(b) => b,
             Err(e) => {
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
@@ -400,7 +400,8 @@ async fn cloud_sweep(
         if let Some(e) = &sweep.list_error
             && let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name)
         {
-            pr.errors.push(format!("cloud chunks/ list failed: {}", e));
+            pr.errors
+                .push(format!("storage chunks/ list failed: {}", e));
         }
 
         for ent in &sweep.per_entity {
@@ -408,14 +409,14 @@ async fn cloud_sweep(
                 vr.storage_chunks_missing = Some(ent.chunks_missing);
                 for hf in &ent.head_errors {
                     vr.warnings.push(format!(
-                        "cloud HEAD failed for chunk {}: {}",
+                        "storage HEAD failed for chunk {}: {}",
                         short_hash(&hf.hash),
                         hf.message
                     ));
                 }
                 if ent.chunks_missing > 0 {
                     vr.errors.push(format!(
-                        "{} chunk(s) missing from cloud (cold-bucket DR will fail)",
+                        "{} chunk(s) missing from storage (cold-bucket DR will fail)",
                         ent.chunks_missing
                     ));
                 }

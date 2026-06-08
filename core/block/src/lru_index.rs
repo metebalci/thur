@@ -16,7 +16,7 @@
 //!   way `pages.idx` is. Reading past the current file size
 //!   returns 0, which we treat as "never accessed" for sort
 //!   purposes — same convention as `pages.idx` unallocated.
-//! - **Local-only.** Never uploaded to cloud. A fresh host
+//! - **Local-only.** Never uploaded to storage. A fresh host
 //!   doing cold-bucket DR rebuilds it from scratch as zeros.
 //! - Missing / corrupt header ⇒ rebuilt empty. First eviction
 //!   cycle picks oldest uniformly; subsequent cycles converge as
@@ -71,7 +71,7 @@ pub enum LruIndexError {
 /// `page_id`, positional. Sparse — unallocated page ids consume no
 /// disk on ext4/btrfs/xfs/zfs.
 ///
-/// Purely a local cache hint — never uploaded to cloud, never
+/// Purely a local cache hint — never uploaded to storage, never
 /// registered with the manifest-backup path. Losing the file
 /// recovers gracefully (first eviction cycle picks uniformly).
 #[derive(Debug)]

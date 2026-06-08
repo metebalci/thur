@@ -23,28 +23,28 @@ pub struct PendingUpload {
     /// match outcomes to its own index records without keeping a
     /// side map.
     pub item_id: u64,
-    /// BLAKE3 hex of the chunk's content. Pool path and cloud key
+    /// BLAKE3 hex of the chunk's content. Pool path and storage key
     /// both derive from this.
     pub hash: String,
     /// On-disk pool path the upload reads from. Absolute. The
     /// uploader does `tokio::fs::read` against this — the file must
     /// be present until the upload completes.
     pub local_path: PathBuf,
-    /// Cloud key (already namespaced per [`DedupScope`] by the
+    /// Storage key (already namespaced per [`DedupScope`] by the
     /// caller — pool's `object_key` / `object_key_for` helpers do this).
     /// The uploader doesn't reinterpret it; it just PUTs there.
     pub object_key: String,
     /// Source's dedup scope. Under [`DedupScope::Global`] the
-    /// uploader does a cloud-side HEAD probe to skip the PUT on a
+    /// uploader does a storage-side HEAD probe to skip the PUT on a
     /// sibling-cartridge / sibling-volume dedup hit. Under
-    /// [`DedupScope::Local`] the cloud key is namespaced per
+    /// [`DedupScope::Local`] the storage key is namespaced per
     /// cartridge / volume by construction so the HEAD is guaranteed
     /// to miss — wasted RTT, skipped. Worst-case cost on skip: a
     /// daemon crash that loses the per-product "uploaded" flag
     /// re-PUTs the same bytes on resume; correct, just a bandwidth
     /// nick.
     pub dedup: DedupScope,
-    /// Cloud backend name (matches the `cloud.backends.<name>` key
+    /// Storage backend name (matches the `storage.backends.<name>` key
     /// in each product's yaml). Used purely for telemetry labelling
     /// — the upload worker already routes via the backend handle, so
     /// this field is informational, not a routing input.
@@ -62,19 +62,19 @@ pub struct UploadOutcome {
     pub item_id: u64,
     /// Echoed from [`PendingUpload::object_key`].
     pub object_key: String,
-    /// True iff cross-namespace dedup fired (cloud HEAD hit under
+    /// True iff cross-namespace dedup fired (storage HEAD hit under
     /// `Global`) and no PUT was performed. In that case
     /// `put_compression` is unset — the existing object's compression
     /// is whatever the original PUT chose, which the new caller
     /// shouldn't claim authority over.
     pub dedup_hit: bool,
     /// Algorithm the upload worker applied for this PUT, or `None`
-    /// when the cloud copy is uncompressed (or `dedup_hit` is true).
+    /// when the storage copy is uncompressed (or `dedup_hit` is true).
     /// Block side doesn't currently track this — VSA's compression
     /// is unset; the field is preserved for future use plus VTL
     /// parity.
     pub put_compression: Option<CompressionAlgo>,
-    /// On-wire bytes PUT to cloud for this chunk — post-compression,
+    /// On-wire bytes PUT to storage for this chunk — post-compression,
     /// i.e. the real backend storage cost. `None` when no PUT
     /// happened (`dedup_hit` is true) so the caller's backend-bytes
     /// meter doesn't count an object it never transferred. Consumed

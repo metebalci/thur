@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Cartridge archive — snapshot a cartridge's full state to a
-//! different cloud backend as a self-contained, frozen blob with no
+//! different storage backend as a self-contained, frozen blob with no
 //! live cartridge representation.
 //!
 //! Unlike [`crate::cartridge_migrate`], archive does not mutate the
 //! source cartridge: the source's manifest, indexes, local pool, and
-//! cloud objects are unchanged. The archive is a parallel object
+//! storage objects are unchanged. The archive is a parallel object
 //! tree on the target backend keyed by `(barcode, label)`. Multiple
 //! archives of the same cartridge can coexist under distinct labels.
 //!
@@ -57,8 +57,8 @@ pub struct ArchiveOptions<'a> {
     /// `<data_dir>/tapes/`.
     pub tapes_dir: &'a Path,
     pub barcode: &'a str,
-    /// The source cartridge's bound cloud backend (handle), used to
-    /// fetch chunks marked `CloudOnly` that aren't in the local pool.
+    /// The source cartridge's bound storage backend (handle), used to
+    /// fetch chunks marked `StorageOnly` that aren't in the local pool.
     /// May be the same `ObjectStoreBackend` impl as `target` if the operator
     /// is archiving back to the cartridge's own bucket under a
     /// different prefix.
@@ -85,7 +85,7 @@ pub struct ArchiveReport {
     pub chunks_total: u64,
     pub chunks_uploaded: u64,
     pub chunks_from_local_pool: u64,
-    pub chunks_from_source_cloud: u64,
+    pub chunks_from_source_storage: u64,
     pub bytes_uploaded: u64,
     /// Index files captured: `chunks.idx` + every `blocks-p<N>.idx`.
     pub index_files_uploaded: u64,
@@ -110,7 +110,7 @@ enum DedupSlice {
 }
 
 impl DedupSlice {
-    fn cloud_namespace(self, barcode: &str) -> Option<&str> {
+    fn storage_namespace(self, barcode: &str) -> Option<&str> {
         match self {
             DedupSlice::Local => Some(barcode),
             DedupSlice::Global => None,
@@ -170,7 +170,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
             "manifest has no `backend` field — cartridge not bound",
         ));
     }
-    let namespace = slice.dedup.cloud_namespace(opts.barcode);
+    let namespace = slice.dedup.storage_namespace(opts.barcode);
 
     // Archive collision check. Refuse if the target already has an
     // archive at this prefix — operator must pick a different label.
@@ -179,7 +179,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
         .target
         .chunk_exists(&archive_sentinel)
         .await
-        .map_err(cloud_err)?
+        .map_err(storage_err)?
     {
         return Err(SmcError::InvalidOp(
             "archive with this label already exists on the target — pick a different label",
@@ -228,7 +228,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
     }
 
     // Phase 1: copy chunks. Prefer local pool when present (avoids
-    // a source-cloud round-trip); fall back to source cloud.
+    // a source-storage round-trip); fall back to source storage.
     log(&format!(
         "archiving {} chunks to {}: archives/{}/{}/",
         hashes.len(),
@@ -247,13 +247,13 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
                 opts.source
                     .download_chunk(&src_key)
                     .await
-                    .map_err(cloud_err)?,
+                    .map_err(storage_err)?,
                 false,
             )
         };
         // Sanity: BLAKE3-verify. Defends against on-disk bit rot for
-        // the local-pool branch (the cloud-refetch branch is already
-        // covered by the cloud-integrity guard in the source's
+        // the local-pool branch (the storage-refetch branch is already
+        // covered by the storage-integrity guard in the source's
         // download_chunk path, but defense in depth is cheap).
         let actual = blake3_hex(&bytes);
         if &actual != hash {
@@ -266,13 +266,13 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
         opts.target
             .upload_chunk(&dst_key, &bytes)
             .await
-            .map_err(cloud_err)?;
+            .map_err(storage_err)?;
         report.chunks_uploaded += 1;
         report.bytes_uploaded += size;
         if from_local {
             report.chunks_from_local_pool += 1;
         } else {
-            report.chunks_from_source_cloud += 1;
+            report.chunks_from_source_storage += 1;
         }
         if (i + 1).is_multiple_of(64) {
             log(&format!("archived {}/{} chunks", i + 1, hashes.len()));
@@ -292,11 +292,11 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
         // Versioned: re-archiving the same barcode+label overwrites
         // the same key with new index contents. `upload_versioned`
         // bypasses the meta-cache so the second archive's bytes
-        // actually reach cloud.
+        // actually reach storage.
         opts.target
             .upload_versioned(&key, &bytes)
             .await
-            .map_err(cloud_err)?;
+            .map_err(storage_err)?;
         report.index_files_uploaded += 1;
     }
     // Each partition's block index file. Don't depend on knowing how
@@ -320,7 +320,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
         opts.target
             .upload_versioned(&key, &bytes)
             .await
-            .map_err(cloud_err)?;
+            .map_err(storage_err)?;
         report.index_files_uploaded += 1;
     }
 
@@ -333,7 +333,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
     opts.target
         .upload_manifest(&runtime_key, &runtime_json)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
 
     // Phase 3b: stamp the manifest with archive provenance and upload
     // last (sentinel-last; the manifest object is what callers HEAD
@@ -344,7 +344,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
     opts.target
         .upload_manifest(&archive_sentinel, &stamped)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
 
     log("archive complete");
     Ok(report)
@@ -386,7 +386,7 @@ fn open_local_pool(tapes_dir: &Path, backend: &str, namespace: Option<&str>) -> 
     Ok(pool)
 }
 
-fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+fn storage_err(e: shared_object_store::ObjectStoreError) -> SmcError {
     SmcError::ObjectStoreError(e.to_string())
 }
 

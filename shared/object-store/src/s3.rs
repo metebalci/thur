@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! S3 backend for cloud storage tier
+//! S3 backend for storage storage tier
 //!
 //! Provides upload/download operations for chunks and manifests with:
 //! - Automatic retry with exponential backoff
@@ -22,7 +22,7 @@ use aws_sdk_s3::primitives::ByteStream;
 /// service errors, dispatch failures (network vs. credential signing),
 /// timeouts, and construction failures.
 ///
-/// Returned strings carry a short tag that the cloud-config classifier
+/// Returned strings carry a short tag that the storage-config classifier
 /// matches against (e.g. `dispatch failure (io:`, `dispatch failure (user:`).
 fn describe_sdk_error<E, R>(op: &str, err: &SdkError<E, R>) -> String
 where
@@ -334,7 +334,7 @@ impl S3Backend {
         let full_key = self.full_key(key);
         let uncompressed_size = data.len() as u64;
 
-        // Compress if a cloud-side algorithm is configured.
+        // Compress if a storage-side algorithm is configured.
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {

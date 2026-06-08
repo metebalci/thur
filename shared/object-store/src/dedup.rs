@@ -37,7 +37,7 @@ pub enum DedupScope {
     Local,
     /// Shared per-backend pool. Identical bytes from any pair of
     /// `Global` namespaces on the same backend collapse into one
-    /// pool entry / one cloud object — cross-namespace dedup.
+    /// pool entry / one storage object — cross-namespace dedup.
     #[default]
     Global,
 }

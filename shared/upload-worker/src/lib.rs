@@ -1,14 +1,14 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloud-upload pipeline scaffold shared by the tape (core-stream /
+//! Storage-upload pipeline scaffold shared by the tape (core-stream /
 //! thurvtl) and block (core-block / thurvsa) products.
 //!
 //! Two surfaces:
 //!
 //! - [`upload_chunk_inert`] — stateless async function that uploads a
 //!   single [`PendingUpload`] to a [`ObjectStoreBackend`], doing the
-//!   cloud-side dedup HEAD probe (under `DedupScope::Global`) before
+//!   storage-side dedup HEAD probe (under `DedupScope::Global`) before
 //!   the PUT. Returns an [`UploadOutcome`] the caller can use to update
 //!   product-specific index state. No cartridge / volume borrow held
 //!   during the await; safe to run from a parallel worker task.

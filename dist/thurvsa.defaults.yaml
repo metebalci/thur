@@ -224,7 +224,7 @@ disk_cache:
   disk_free_min_gb: 5
   # Max seconds a page-seal will park on backpressure before
   # surfacing SBC-3 NOT READY + ASC/ASCQ 0x04/0x07. Tune up only if
-  # the eviction worker's recovery latency outruns the cloud's
+  # the eviction worker's recovery latency outruns the storage's
   # PUT-then-HEAD cadence.
   backpressure_max_wait_seconds: 30
   # How often the eviction worker re-scans every backend's pool
@@ -510,7 +510,7 @@ audit:
 # Off by default; flip enabled to true and list at least one sink.
 # Five event classes fire alerts: audit-log append failures,
 # CHAP login failures (per-user threshold), disk-cache watermark /
-# backpressure-timeout, cloud-backend reachability, and orphaned
+# backpressure-timeout, storage-backend reachability, and orphaned
 # storage objects. Each class has an on/off knob under `events:`.
 #
 # Sinks support two types: `email` (SMTP via lettre) and `webhook`

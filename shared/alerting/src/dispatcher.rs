@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Owns the rate limiter, sinks, CHAP per-user counters, and the
-//! cloud-check last-status map (for backend-reachability transitions).
+//! storage-check last-status map (for backend-reachability transitions).
 //!
 //! Why one struct and not three. v1 has one global handle per
 //! daemon; splitting state into multiple statics is more surface

@@ -14,7 +14,7 @@
 //! Five event classes (all fire from the daemon, all individually
 //! mutable via YAML on/off knobs):
 //!
-//! - `BackendReachability` — emitted from `system cloud_check` job.
+//! - `BackendReachability` — emitted from `system storage_check` job.
 //! - `AuditFailure` — emitted from the audit writer task on append
 //!   failure (disk write / fsync / chain-state).
 //! - `DiskCacheBackpressure` — emitted on watermark crossing +
@@ -107,7 +107,7 @@ pub mod record {
         }
     }
 
-    /// `cloud check` cycle: a backend either started failing or
+    /// `storage check` cycle: a backend either started failing or
     /// recovered. `outcome` is `"failure"` or `"recovery"`.
     pub fn backend_reachability(backend: &str, outcome: &str, error: Option<&str>) {
         let severity = match outcome {

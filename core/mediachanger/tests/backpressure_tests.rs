@@ -5,7 +5,7 @@
 //! `PoolBudget` gate at chunk-seal time.
 //!
 //! Production wiring (daemon-side):
-//!   * Daemon constructs one `Arc<PoolBudget>` per `cloud.backends`
+//!   * Daemon constructs one `Arc<PoolBudget>` per `storage.backends`
 //!     entry at startup.
 //!   * `DriveManager::set_pool_budgets` plumbs them into every
 //!     loaded cartridge via `Cartridge::set_pool_budget`.

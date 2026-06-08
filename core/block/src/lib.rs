@@ -4,7 +4,7 @@
 //! core-block — SBC-3 block-storage product core.
 //!
 //! Sibling to `core-mediachanger`. Houses SBC-3 logic, the per-volume
-//! page table, and the write-back / cloud-tier pipeline. Cloud
+//! page table, and the write-back / storage-tier pipeline. Storage
 //! backends + retry / compression primitives come from
 //! `shared-object-store`; the content-addressed chunk pool lives in
 //! `shared-pool` — the cross-product restructure shipped in Step 5
@@ -27,7 +27,7 @@ pub mod volume;
 pub use cache::{DEFAULT_CACHE_BUDGET_BYTES, PageCache, RangeError, rebind_is_sound};
 pub use chunk_pool::{ChunkPool, ChunkPoolError};
 // `DiskCacheSize` / `DiskCacheBounds` live in `shared-pool` so the
-// YAML default and the per-entry `cloud.backends:` override can't
+// YAML default and the per-entry `storage.backends:` override can't
 // drift; re-exported here so vsa-daemon doesn't need a direct
 // shared-pool dep just for the type.
 pub use disk_cache::{DiskCacheManager, refresh_pool_budget_from_volumes};

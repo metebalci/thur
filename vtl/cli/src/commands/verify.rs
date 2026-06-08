@@ -140,15 +140,15 @@ fn print_human(r: &VerifyReport, verbose: bool) {
         if let Some(missing) = c.storage_chunks_missing
             && missing > 0
         {
-            println!("      missing from cloud: {}", missing);
+            println!("      missing from storage: {}", missing);
         }
-        if let Some(missing_pages) = c.cloud_index_pages_missing
+        if let Some(missing_pages) = c.storage_index_pages_missing
             && missing_pages > 0
         {
-            println!("      cloud index pages missing: {}", missing_pages);
+            println!("      storage index pages missing: {}", missing_pages);
         }
-        if let Some(false) = c.cloud_sentinel_present {
-            println!("      cloud sentinel manifest-latest.json: MISSING");
+        if let Some(false) = c.storage_sentinel_present {
+            println!("      storage sentinel manifest-latest.json: MISSING");
         }
         let oob: u64 = c.partitions.iter().map(|p| p.chunk_id_oob).sum();
         let off: u64 = c.partitions.iter().map(|p| p.offset_oob).sum();
@@ -280,8 +280,8 @@ mod tests {
                 "local_chunks_missing": 0,
                 "local_chunks_size_mismatch": 0,
                 "storage_chunks_missing": null,
-                "cloud_index_pages_missing": null,
-                "cloud_sentinel_present": null,
+                "storage_index_pages_missing": null,
+                "storage_sentinel_present": null,
                 "errors": ["e1", "e2", "e3", "e4"],
                 "warnings": [],
             }],

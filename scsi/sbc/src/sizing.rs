@@ -143,9 +143,9 @@ mod tests {
     use tempfile::TempDir;
 
     async fn fixture_cache(data_dir: &std::path::Path, size: u64) -> Arc<PageCache> {
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),

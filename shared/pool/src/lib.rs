@@ -3,7 +3,7 @@
 
 //! Content-addressed chunk pool — the shared substrate every product
 //! type uses to dedupe data chunks against each other on disk and
-//! upload to cloud.
+//! upload to storage.
 //!
 //! Sealed chunks live at:
 //!
@@ -12,8 +12,8 @@
 //! ```
 //!
 //! where:
-//! - `<backend>` is the named cloud backend the chunk is bound to.
-//!   Per-backend sharding gives unambiguous "which cloud holds the
+//! - `<backend>` is the named storage backend the chunk is bound to.
+//!   Per-backend sharding gives unambiguous "which storage holds the
 //!   authoritative copy" semantics on cache eviction and refetch.
 //! - `<namespace>` is optional — present when dedup scope is `Local`
 //!   (per-cartridge for tape, per-volume for block), absent under
@@ -35,7 +35,7 @@
 //! - **Not refcounted.** Garbage collection is a separate manifest-
 //!   walking pass per product (thurvtl's `system gc`, thurvsa's pending
 //!   GC sweep).
-//! - **Not aware of the cloud.** [`ChunkPool::object_key`] computes the
+//! - **Not aware of the storage.** [`ChunkPool::object_key`] computes the
 //!   key shape; uploads are driven by the consuming product.
 //! - **Not aware of higher-level identity.** Hashes are global within
 //!   a (backend, namespace) pair.
@@ -141,7 +141,7 @@ pub enum ChunkPoolError {
 
     /// Bytes a caller asked us to insert under `expected` don't actually
     /// hash to `expected`. Surfaced by [`ChunkPool::insert_verified_bytes`]
-    /// — the cloud-download integrity guard. Caller-side: treat as
+    /// — the storage-download integrity guard. Caller-side: treat as
     /// permanent (don't retry blindly), let it bubble to the SCSI layer.
     #[error("content hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
@@ -232,7 +232,7 @@ impl ChunkPool {
             .join(format!("{hash_hex}.dat"))
     }
 
-    /// Cloud key for a chunk in this pool — honours the pool's own
+    /// Storage key for a chunk in this pool — honours the pool's own
     /// namespace (under `Local` dedup the namespace segment is
     /// preserved so sibling-volume chunks don't collide in a shared
     /// bucket). The per-backend shard is stripped because each
@@ -244,7 +244,7 @@ impl ChunkPool {
         Self::object_key_for(self.namespace.as_deref(), hash_hex)
     }
 
-    /// Cloud key with the namespace passed in explicitly. Useful when
+    /// Storage key with the namespace passed in explicitly. Useful when
     /// the caller has the namespace string but no live `ChunkPool`
     /// (e.g. legal-hold / verify paths walking manifests).
     pub fn object_key_for(namespace: Option<&str>, hash_hex: &str) -> String {
@@ -326,9 +326,9 @@ impl ChunkPool {
     }
 
     /// Insert bytes the caller obtained from an untrusted source
-    /// (cloud download, prefetcher) under the content hash the caller
+    /// (storage download, prefetcher) under the content hash the caller
     /// *expects*. Hashes the bytes here and refuses the insert if
-    /// they don't match `expected_hash` — this is the cloud
+    /// they don't match `expected_hash` — this is the storage
     /// bit-rot / wrong-bytes guard.
     ///
     /// Distinct from [`Self::insert_bytes`] (which discovers the
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_key_strips_backend_keeps_namespace() {
+    fn storage_key_strips_backend_keeps_namespace() {
         let tmp = TempDir::new().unwrap();
         let global = ChunkPool::new(tmp.path(), "primary").unwrap();
         assert_eq!(global.object_key("deadbeef"), "chunks/de/ad/deadbeef.dat");
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_key_for_static_form_no_namespace() {
+    fn storage_key_for_static_form_no_namespace() {
         assert_eq!(
             ChunkPool::object_key_for(None, "deadbeef"),
             "chunks/de/ad/deadbeef.dat"
@@ -617,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_key_for_static_form_with_namespace() {
+    fn storage_key_for_static_form_with_namespace() {
         assert_eq!(
             ChunkPool::object_key_for(Some("TAPE001"), "deadbeef"),
             "chunks/TAPE001/de/ad/deadbeef.dat"
@@ -687,7 +687,7 @@ mod tests {
     fn insert_verified_bytes_accepts_matching_hash() {
         let tmp = TempDir::new().unwrap();
         let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
-        let bytes = b"cloud-fetched chunk".to_vec();
+        let bytes = b"storage-fetched chunk".to_vec();
         let expected = hex::encode(blake3::hash(&bytes).as_bytes());
 
         assert!(

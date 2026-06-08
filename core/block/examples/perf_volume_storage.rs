@@ -8,13 +8,13 @@
 // costs on top of the in-process chunker.
 //
 // Usage:
-//   cargo run --release -p core-block --example perf_volume_cloud -- \
+//   cargo run --release -p core-block --example perf_volume_storage -- \
 //     <config.yaml> <backend_name> <total_mb> <block_kib> [fixture]
 // where:
 //   config.yaml   = path to a daemon YAML conffile with `backend_name`
-//                   defined under `cloud.backends:`
+//                   defined under `storage.backends:`
 //                   (local / S3 / GCS / Azure)
-//   backend_name  = key under `cloud.backends:` to load
+//   backend_name  = key under `storage.backends:` to load
 //   total_mb      = total bytes to write (MiB)
 //   block_kib     = host-write chunk size handed to write_bytes (KiB)
 //   fixture       = random | compressible (default random)
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = tmp.path();
 
     println!(
-        "perf_volume_cloud: backend={backend_name} total={total_mb}MiB block={block_kib}KiB \
+        "perf_volume_storage: backend={backend_name} total={total_mb}MiB block={block_kib}KiB \
          fixture={fixture} page={}KiB sector={}B",
         DEFAULT_PAGE_SIZE_BYTES / 1024,
         DEFAULT_SECTOR_BYTES

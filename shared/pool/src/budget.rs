@@ -11,7 +11,7 @@
 //! condvar until the eviction worker releases bytes — or returns
 //! [`BackpressureError`] after `deadline`.
 //!
-//! One `PoolBudget` is constructed per `cloud.backends` entry at daemon
+//! One `PoolBudget` is constructed per `storage.backends` entry at daemon
 //! startup. The eviction worker's `release` calls wake any
 //! `try_reserve` waiters. Shutdown / `Drop`-time flushes bypass the
 //! gate via [`PoolBudget::force_reserve`] — bounded overshoot is
@@ -20,7 +20,7 @@
 //! ## Per-namespace usage tracking
 //!
 //! The cap stays per-backend (matches the YAML `disk_cache.size_gb`
-//! knob, which is per-`cloud.backends` entry), but the budget tracks
+//! knob, which is per-`storage.backends` entry), but the budget tracks
 //! reserved bytes broken down by namespace alongside the backend total.
 //! Every reserve / release call carries an `Option<&str>` namespace
 //! tag: `None` for the global-dedup pool, `Some(uuid_hex)` for each
@@ -105,7 +105,7 @@ impl PoolState {
 /// Per-backend hard cap on local pool occupancy, with sync
 /// `Mutex`+`Condvar` semantics so the chunk-seal path can block
 /// without forcing the whole write path async. One `PoolBudget` is
-/// constructed per `cloud.backends` entry at daemon startup; the
+/// constructed per `storage.backends` entry at daemon startup; the
 /// eviction / upload worker calls `release` whenever an evicted chunk
 /// frees pool bytes (and a chunk-seal that hits the cap will wake from
 /// its condvar wait).
@@ -129,7 +129,7 @@ impl PoolState {
 /// Numbers are measured in bytes throughout; the config knob
 /// (`disk_cache.size_gb`) is in GB but converted at construction.
 pub struct PoolBudget {
-    /// Backend name (matches the `cloud.backends` entry). Used as the
+    /// Backend name (matches the `storage.backends` entry). Used as the
     /// `backend` attribute on every `<product>_pool_*` instrument
     /// emitted from this budget. Empty string for the unbounded
     /// CLI/test budget — those samples are dropped at the global
@@ -137,7 +137,7 @@ pub struct PoolBudget {
     backend: String,
     /// Hard cap in bytes for this backend's slice of the chunk pool.
     /// Daemon supplies it from either the per-entry `disk_cache_size_gb`
-    /// override on the `cloud-backends.json` entry or — if no override
+    /// override on the `storage-backends.json` entry or — if no override
     /// is set — the YAML `disk_cache.size_gb` default.
     ///
     /// Atomic so the eviction worker can call [`PoolBudget::set_cap_bytes`]

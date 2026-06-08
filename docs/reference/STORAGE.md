@@ -109,7 +109,7 @@ stored explicitly). Magic `NVCI`. Carries:
   chunk can never exceed 4 GiB.
 - raw 32-byte BLAKE3 `hash`.
 - flags byte packing `hash_present` / `uploaded` / `location`
-  (LocalOnly|CloudOnly|Both) / backend-side `compression`.
+  (LocalOnly|StorageOnly|Both) / backend-side `compression`.
 
 `hash` is `Some(hex)` once sealed into the pool, `None` while in
 `.staging/`. Every per-chunk mutation (mark uploaded, transition
@@ -145,7 +145,7 @@ loss on crash is tolerated by design.
 MiB-page bitmap, monotonic epoch). Every `pwrite_at` / `truncate_to`
 mark-before-writes the affected pages; `fsync` persists the sidecar.
 
-`backup_manifest_to_cloud` ships only the dirty pages to:
+`backup_manifest_to_storage` ships only the dirty pages to:
 
 - `manifests/<barcode>/chunks/page-<NNNNNN>.dat`
 - `manifests/<barcode>/blocks-p<N>/page-<NNNNNN>.dat`
@@ -162,7 +162,7 @@ how big to grow each file.
 
 Without this layer a cold-bucket restore can fetch chunks but can't
 map LBA → chunk_id → hash. With it,
-`Cartridge::open_with_cloud_async` in Open mode allows the cartridge
+`Cartridge::open_with_storage_async` in Open mode allows the cartridge
 directory to be entirely missing locally as long as a storage backend is
 configured, and rebuilds `chunks.idx` + `blocks-p<N>.idx` from the
 backend copy before opening them.
@@ -183,7 +183,7 @@ volatile drive state, never persisted.
 ## Read path — cache miss and read-ahead
 
 The SCSI READ handler runs synchronously against the loaded cartridge's
-on-disk pool, so the cloud round-trips that hide read latency live in two
+on-disk pool, so the storage round-trips that hide read latency live in two
 out-of-band async hooks the daemon fires *around* each tape READ (the
 sync read itself can't `await`):
 
@@ -196,7 +196,7 @@ sync read itself can't `await`):
    (`prefetch_hits_total` / `prefetch_misses_total`).
 
 2. **Background read-ahead.** Sequential restores would still stall one
-   cloud round-trip per chunk if every read waited on its own refetch, so
+   storage round-trip per chunk if every read waited on its own refetch, so
    after the on-demand step the daemon fans the next
    `memory_buffers.read_prefetch_chunks_ahead` chunks (default 2) out to a
    per-backend `PrefetchManager`. It downloads them in the background —
@@ -207,7 +207,7 @@ sync read itself can't `await`):
    already warmed ahead of the head as `tape_read_buffer_used`.
 
 Both hooks route through `ChunkPool::insert_verified_bytes`, so every
-cloud-fetched chunk is BLAKE3-verified against its content address before
+storage-fetched chunk is BLAKE3-verified against its content address before
 it enters the pool (see *Integrity layers* below) and accounted against
 the per-backend disk-cache budget.
 
@@ -361,8 +361,8 @@ nested two levels deep so the daemon's discovery walk (which lists
 descend into `snapshots/`.
 
 Snapshot create quiesces first — it flushes the volume's `PageCache` and
-awaits its pending cloud uploads — so the frozen index references only
-cloud-durable chunks (eviction may drop a snapshot-only chunk's local
+awaits its pending storage uploads — so the frozen index references only
+storage-durable chunks (eviction may drop a snapshot-only chunk's local
 copy and refetch it from the backend on read). The copy runs under the
 cache lock, briefly pausing the volume's host I/O; `pages.idx` is sparse,
 so the pause scales with allocated pages, and `std::fs::copy` reflinks on
@@ -422,7 +422,7 @@ the live `pages.idx` byte-for-byte from the frozen copy through the *same*
 file descriptor (no reopen, no UUID rebind — unlike clone, which mints a
 fresh identity) and matches its length exactly, so any pages allocated
 after the snapshot are dropped. It then resets the `upload.idx` / `lru.idx`
-sidecars to empty: the snapshot references only cloud-durable chunks
+sidecars to empty: the snapshot references only storage-durable chunks
 (snapshot-create's quiesce contract), so every page is honestly
 `Uploaded` again.
 

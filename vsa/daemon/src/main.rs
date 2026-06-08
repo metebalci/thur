@@ -149,23 +149,15 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Refuse to start if a legacy `<data_dir>/cloud-backends.json` is
-    // still around — pre-alpha.2 kept backend definitions there; they
-    // now live in the YAML conffile under `cloud.backends:`. The
-    // operator has to copy the entries over and delete the JSON file
-    // before the daemon will come up.
-    shared_object_store::reject_legacy_cloud_backends_json(&data_dir, &config_path)
-        .map_err(anyhow::Error::msg)?;
-
-    // Same one-shot migration guard for the keystore-backends JSON
+    // One-shot migration guard for the keystore-backends JSON
     // sidecar — now under `keystore.backends:` in the YAML conffile.
     shared_keystore::reject_legacy_keystore_backends_json(&data_dir, &config_path)
         .map_err(anyhow::Error::msg)?;
 
-    // Validate cloud backend definitions (from YAML cloud.backends:).
+    // Validate storage backend definitions (from YAML storage.backends:).
     cfg.storage
         .validate_backends()
-        .with_context(|| "validate cloud.backends in YAML conffile")?;
+        .with_context(|| "validate storage.backends in YAML conffile")?;
 
     // Daemon-owned operational state files. Empty templates are
     // auto-created on first boot so the operator doesn't have to learn
@@ -211,13 +203,13 @@ async fn main() -> Result<()> {
     // --test mode: run in-process smoke against core_block + scsi_sbc and
     // exit. Skips telemetry / audit / iSCSI bind so it's safe to run
     // alongside a live daemon. Each smoke uses its own tempdir so the
-    // operator's data_dir / cloud-backends stay untouched.
+    // operator's data_dir / storage-backends stay untouched.
     if cli.test {
         return smoke::run_all().await;
     }
 
     // Telemetry: install the process-global handle before anything
-    // else so audit / cloud / iscsi record sites pick it up. Both the
+    // else so audit / storage / iscsi record sites pick it up. Both the
     // `service.name` resource attribute and the instrument-name prefix
     // come from `shared_naming::DISK` so thurvsa's metrics show up as
     // `thurvsa_*` distinct from thurvtl's `thurvtl_*` series.
@@ -313,7 +305,7 @@ async fn main() -> Result<()> {
     let audit_ratelimit = Some((ratelimiter, flush_handle));
     let audit_lifecycle = Some((channel, writer));
 
-    // Resolve the operator's `cloud.upload.max_concurrent` once at
+    // Resolve the operator's `storage.upload.max_concurrent` once at
     // boot (auto-scale sentinel `0` -> min(16, num_cpus * 4)). The
     // value caps parallel in-flight page flushes per volume; same
     // knob VTL's upload worker honors. Logged with source so the
@@ -329,7 +321,7 @@ async fn main() -> Result<()> {
 
     // Per-backend pool budgets. Each backend gets its own cap:
     // either the per-entry `disk_cache_size_gb` override from
-    // cloud-backends.json, or the YAML `disk_cache.size_gb`
+    // storage-backends.json, or the YAML `disk_cache.size_gb`
     // default. Both share the `DiskCacheSize` shape (`auto` |
     // <gb>); `auto` entries split the 50%-of-free share evenly so
     // two `auto` backends can't combined commit 100% of free
@@ -433,7 +425,7 @@ async fn main() -> Result<()> {
 
     // Async upload-worker channel. The sender goes to every
     // VolumeWriter via `with_upload_sender` so `write_page_unsynced`
-    // can enqueue PUTs without awaiting cloud. The worker (spawned
+    // can enqueue PUTs without awaiting storage. The worker (spawned
     // after discovery so it sees a fully-populated registry) drains
     // the receiver and calls `apply_page_upload_outcome` per
     // completion. None of this affects the inline test path —
@@ -459,7 +451,7 @@ async fn main() -> Result<()> {
     // outcome back through the owning `VolumeWriter`. Spawned after
     // discovery so registry lookups always resolve. Concurrency cap
     // matches the per-volume flush concurrency — both are sized off
-    // the same `cloud.upload.max_concurrent` knob.
+    // the same `storage.upload.max_concurrent` knob.
     // Wrap discovery's backends map in the same Arc<Mutex> AdminState
     // will hold so runtime adds via `get_or_init_backend` are visible
     // to the worker. Pre-fix the worker held a snapshot taken here;
@@ -483,7 +475,7 @@ async fn main() -> Result<()> {
 
     // Crash-recovery scan: walk every volume's `upload.idx` and
     // re-enqueue pages still marked `LocalOnly` (chunk in pool,
-    // cloud PUT never acked because of a prior crash). Runs before
+    // storage PUT never acked because of a prior crash). Runs before
     // the iSCSI listener accepts host writes so survivors get back
     // into the upload queue ahead of fresh traffic.
     upload_worker::scan_and_enqueue_localonly(&data_dir, &registry, &upload_tx).await;
@@ -983,7 +975,7 @@ async fn main() -> Result<()> {
         let recent_seal_pin_seconds = cfg.disk_cache.recent_seal_pin_seconds;
         let default_size = cfg.disk_cache.size_gb;
         let bounds = cfg.disk_cache.bounds();
-        let cloud_config_clone = cfg.storage.clone();
+        let storage_config_clone = cfg.storage.clone();
         let backend_names: Vec<String> = pool_budgets.keys().cloned().collect();
         Some(tokio::spawn(async move {
             run_disk_cache_eviction_worker(
@@ -995,7 +987,7 @@ async fn main() -> Result<()> {
                 recent_seal_pin_seconds,
                 default_size,
                 bounds,
-                cloud_config_clone,
+                storage_config_clone,
             )
             .await;
         }))
@@ -1026,7 +1018,7 @@ async fn main() -> Result<()> {
         if interval > 0 {
             let storage_config = Arc::new(cfg.storage.clone());
             Some(tokio::spawn(async move {
-                shared_admin_cloud_check::run_reachability_ticker(storage_config, interval).await;
+                shared_admin_storage_check::run_reachability_ticker(storage_config, interval).await;
             }))
         } else {
             None
@@ -1095,7 +1087,7 @@ async fn main() -> Result<()> {
     // Drain dirty pages from every per-volume cache and stop the
     // flush workers before the audit channel shutdown — losing
     // host-acked WRITEs on a clean shutdown would be much worse
-    // than waiting a few seconds for cloud uploads.
+    // than waiting a few seconds for storage uploads.
     //
     // Iterate the live registry (not the boot-time `caches` Vec) so
     // volumes that were created via the admin socket after startup
@@ -1121,7 +1113,7 @@ async fn main() -> Result<()> {
     for handle in flush_handles {
         // Best-effort: workers should exit on their own once they
         // observe the shutdown flag. Don't block forever if a worker
-        // is wedged on a cloud retry.
+        // is wedged on a storage retry.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
@@ -1293,7 +1285,7 @@ async fn run_disk_cache_eviction_worker(
             }
             cm.set_recent_seal_pin_seconds(recent_seal_pin_seconds);
             cm.set_current_usage(used);
-            // Synchronous fs-only eviction (no cloud round-trip): offload
+            // Synchronous fs-only eviction (no storage round-trip): offload
             // the candidate-enumeration walk + fs::remove_file loop to a
             // blocking thread.
             let result = match tokio::task::spawn_blocking(move || cm.evict_lru_chunks()).await {

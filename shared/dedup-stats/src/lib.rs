@@ -27,7 +27,7 @@ pub struct EntityScan {
     /// Human label: cartridge barcode or volume name. Unique within
     /// one report; echoed back on the matching [`EntityContribution`].
     pub label: String,
-    /// Cloud backend name.
+    /// Storage backend name.
     pub backend: String,
     /// `Some(ns)` for a local-scope (per-entity) pool, `None` for the
     /// backend-global shared pool. The `(backend, namespace)` pair

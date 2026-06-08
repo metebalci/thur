@@ -30,7 +30,7 @@ shared-iscsi = { path = "../../shared/iscsi" }
 # `smc_core::ChunkStore` is a re-exported alias for
 # `shared_pool::ChunkPool` so internal call sites compile unchanged.
 shared-pool = { path = "../../shared/pool" }
-# Local pool + cloud HEAD verification sweeps shared with the block
+# Local pool + storage HEAD verification sweeps shared with the block
 # product; `verify.rs` keeps the tape library/partition checks.
 shared-verify-core = { path = "../../shared/verify-core" }
 # Tape-side primitives (cartridge, indexes, chunking, encryption,

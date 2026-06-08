@@ -29,7 +29,7 @@ fn default_cartridge_dedup() -> &'static str {
 // CLI never reads `thurvtl.yaml` — it only talks to the daemon
 // over the admin Unix socket. Default chunk size / chunking / dedup
 // are compiled-in; per-invocation overrides come from CLI flags.
-// The daemon validates against its live cloud config (backend list,
+// The daemon validates against its live storage config (backend list,
 // retention_mode for WORM), locks the library, expands multi-
 // barcodes, runs `Cartridge::create_with_chunking`, rolls back on
 // failure, and emits audit entries.
@@ -386,7 +386,7 @@ pub async fn cmd_info(identifier: &str, json: bool) -> Result<()> {
         };
         println!("Location: {} slot {}", loc_disp, slot);
     }
-    println!("Cloud backend: {}", info.backend);
+    println!("Storage backend: {}", info.backend);
     println!("WORM: {}", if info.worm { "yes" } else { "no" });
     println!("Total blocks: {}", info.total_blocks);
     println!("Filemarks: {}", info.filemarks);
@@ -412,7 +412,7 @@ pub async fn cmd_info(identifier: &str, json: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // legal-hold — thin daemon-call wrappers
 //
-// The daemon owns the cloud handle (lazy-initialized via storage_config),
+// The daemon owns the storage handle (lazy-initialized via storage_config),
 // applies the per-object hold using the same core-mediachanger helpers
 // the CLI used to call directly, refuses if the cartridge is loaded,
 // and emits the audit entry. CLI work is just: serialize request,
@@ -527,7 +527,7 @@ pub async fn cmd_legal_hold_status(barcode: &str, full: bool) -> Result<()> {
     match resp {
         LegalHoldStatusResp::Empty { barcode, .. } => {
             println!(
-                "Cartridge '{}' has no objects in cloud yet — no hold state to report.",
+                "Cartridge '{}' has no objects in storage yet — no hold state to report.",
                 barcode
             );
         }

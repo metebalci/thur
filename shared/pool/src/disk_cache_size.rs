@@ -4,7 +4,7 @@
 //! `disk_cache.size_gb` config shape — accepts either an explicit
 //! GB count (`size_gb: 4`) or the literal string `auto`
 //! (`size_gb: auto`), parsed identically out of YAML
-//! (`<product>.yaml`) and JSON (`cloud-backends.json`'s per-entry
+//! (`<product>.yaml`) and JSON (`storage-backends.json`'s per-entry
 //! `disk_cache_size_gb` override). Shared across both daemons so
 //! the YAML default and the JSON per-backend override can never
 //! drift.

@@ -8,7 +8,7 @@
 //!      LTO drives do (SLDC: streaming sliding-window LZ77, no entropy
 //!      coding) — minimal per-block setup overhead, ~3 GiB/s/core, no
 //!      compression-level knob to tune.
-//!   2. **Cloud-side** (per-chunk, on upload). Default: Zstd. Chunks
+//!   2. **Storage-side** (per-chunk, on upload). Default: Zstd. Chunks
 //!      are 1-128 MiB so the heavier algorithm pays for itself.
 //!
 //! Both layers are pluggable. The chosen algorithm's name is recorded
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// the honest answer for an emulated VTL.
 pub const COMPRESSION_ALGORITHM_DEFAULT: u32 = 0x0000_0000;
 
-/// Default zstd level used by cloud-side compression when zstd is
+/// Default zstd level used by storage-side compression when zstd is
 /// selected. zstd ranges 1..=22; level 3 is the broadly-balanced
 /// default. LZ4 has no equivalent knob.
 pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
@@ -50,7 +50,7 @@ pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
 pub enum CompressionAlgo {
     /// LZ4 (frame format). Drive-side default.
     Lz4,
-    /// Zstandard. Cloud-side default; also available drive-side for
+    /// Zstandard. Storage-side default; also available drive-side for
     /// callers that want maximum ratio over speed.
     Zstd,
     /// SLDC — ECMA-321 Streaming Lossless Data Compression, the
@@ -157,7 +157,7 @@ impl Default for DriveCompressionState {
     }
 }
 
-/// Cloud-side compression configuration (per-chunk on upload). When
+/// Storage-side compression configuration (per-chunk on upload). When
 /// `algorithm` is `None`, chunks are uploaded uncompressed.
 #[derive(Debug, Clone, Copy)]
 pub struct CompressionConfig {
@@ -171,7 +171,7 @@ impl CompressionConfig {
         Self { algorithm, level }
     }
 
-    /// Cloud compression off (uncompressed PUTs).
+    /// Storage compression off (uncompressed PUTs).
     pub fn disabled() -> Self {
         Self {
             algorithm: None,
@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_zstd_for_cloud() {
+    fn config_default_is_zstd_for_storage() {
         let cfg = CompressionConfig::default();
         assert_eq!(cfg.algorithm, Some(CompressionAlgo::Zstd));
         assert!(cfg.enabled());

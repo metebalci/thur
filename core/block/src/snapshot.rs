@@ -33,7 +33,7 @@
 //! ## Consistency
 //!
 //! Snapshot create quiesces the parent (flush dirty pages to the pool,
-//! await cloud acks, fdatasync the index) before copying — so the
+//! await storage acks, fdatasync the index) before copying — so the
 //! snapshot is crash-consistent up to the snapshot point. Application
 //! consistency is the host's job (fsync / fs-freeze before snapshot),
 //! the standard array-side contract.
@@ -133,7 +133,7 @@ pub struct SnapshotManifest {
     #[serde(with = "uuid_hex")]
     pub parent_uuid: [u8; 16],
     pub created_at: DateTime<Utc>,
-    /// Cloud backend the parent's chunks live under.
+    /// Storage backend the parent's chunks live under.
     pub backend: String,
     pub dedup_scope: DedupScope,
     /// The family chunk-pool namespace (see module docs). Equal to the

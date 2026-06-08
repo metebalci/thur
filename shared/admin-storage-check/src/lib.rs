@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cross-product cloud-backend reachability checks.
+//! Cross-product storage-backend reachability checks.
 //!
 //! Two entry points, both driven by the parsed [`ObjectStoreConfig`]:
 //!
-//! - [`run_cloud_check`] — the `system.cloud_check` job handler. Both
+//! - [`run_storage_check`] — the `system.storage_check` job handler. Both
 //!   daemons route the job kind here (CLI verb: `system storage
 //!   check`); it verifies reachability/auth on every configured
 //!   backend, streams per-step progress through the [`JobEmitter`],
@@ -30,13 +30,13 @@ use std::time::Duration;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_object_store::{ObjectStoreCheckStep, ObjectStoreConfig, validate_object_store_backend};
 
-/// `system.cloud_check` job: verify reachability/auth on every
-/// configured cloud backend.
+/// `system.storage_check` job: verify reachability/auth on every
+/// configured storage backend.
 ///
 /// Body is ignored (`{}`); the backends come from the daemon's already-
 /// loaded `ObjectStoreConfig`, passed in as an `Arc` so the spawning
 /// dispatch arm doesn't have to clone the whole config.
-pub async fn run_cloud_check(emitter: JobEmitter, config: Arc<ObjectStoreConfig>) {
+pub async fn run_storage_check(emitter: JobEmitter, config: Arc<ObjectStoreConfig>) {
     let cfg = config.as_ref();
     let names = cfg.backend_names();
 
@@ -61,7 +61,7 @@ pub async fn run_cloud_check(emitter: JobEmitter, config: Arc<ObjectStoreConfig>
         // Bridge the sync `validate_object_store_backend` step callback into
         // async event emission. The callback is sync; we collect into
         // a Vec then ship the lines after each backend completes.
-        // (Cloud check steps are a handful per backend — buffering is
+        // (Storage check steps are a handful per backend — buffering is
         // fine. If a future kind has thousands of sync callbacks
         // we'd want a sync->async bridge instead.)
         let mut steps: Vec<ObjectStoreCheckStep> = Vec::new();
@@ -123,7 +123,7 @@ pub async fn run_cloud_check(emitter: JobEmitter, config: Arc<ObjectStoreConfig>
     if failed.is_empty() {
         emitter
             .info(format!(
-                "Cloud check passed for all configured backends ({}).",
+                "Storage check passed for all configured backends ({}).",
                 names.join(", ")
             ))
             .await;
@@ -136,7 +136,7 @@ pub async fn run_cloud_check(emitter: JobEmitter, config: Arc<ObjectStoreConfig>
         emitter.emit(JobEvent::done(0)).await;
     } else {
         let summary = format!(
-            "Cloud check FAILED for: {}  (passed: {}/{})",
+            "Storage check FAILED for: {}  (passed: {}/{})",
             failed.join(", "),
             names.len() - failed.len(),
             names.len(),
@@ -217,13 +217,13 @@ mod tests {
     use shared_admin_server::JobRegistry;
 
     #[tokio::test]
-    async fn cloud_check_passes_with_no_backends() {
+    async fn storage_check_passes_with_no_backends() {
         // Empty config => zero backends => the all-passed branch, no
         // panic, reaches a terminal Done event.
         let config = Arc::new(ObjectStoreConfig::default());
         let registry = JobRegistry::new();
-        let (_id, _started, emitter) = registry.create("system.cloud_check").await;
-        run_cloud_check(emitter, config).await;
+        let (_id, _started, emitter) = registry.create("system.storage_check").await;
+        run_storage_check(emitter, config).await;
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
 //! 2. **PeriodicReader → OtlpExporter** (opt-in via
 //!    `telemetry.otlp.enabled`): pushes the same instruments over OTLP
 //!    on a configurable interval to a Collector or any OTLP-compatible
-//!    backend (Datadog / Honeycomb / Grafana Cloud / New Relic /
+//!    backend (Datadog / Honeycomb / Grafana Storage / New Relic /
 //!    self-hosted Tempo / Loki for the future logs layer / …).
 //!
 //! Both readers walk the same in-memory state, so a counter incremented
@@ -96,7 +96,7 @@ pub struct TelemetryConfig {
 /// In-process counters mirrored alongside the OTel instruments so the
 /// `system monitor` job handler can read them back without scraping
 /// `/metrics`. OTel's SDK is write-only from the producer side, so for
-/// the windowed views the monitor verb computes (cloud ops/bytes/errors
+/// the windowed views the monitor verb computes (storage ops/bytes/errors
 /// per backend, pool backpressure waits/waiters, audit entries) we keep
 /// a parallel set of atomics here.
 ///
@@ -106,7 +106,7 @@ pub struct TelemetryConfig {
 /// counter struct under an `Arc`).
 #[derive(Default)]
 pub struct LiveStats {
-    /// Per-cloud-backend cumulative counters.
+    /// Per-storage-backend cumulative counters.
     storage: Mutex<HashMap<String, Arc<StorageCounters>>>,
     /// Per-pool-backend cumulative counters + an instantaneous waiter
     /// gauge.
@@ -183,7 +183,10 @@ pub struct ChunkSnapshot {
 
 impl LiveStats {
     fn storage_for(&self, backend: &str) -> Arc<StorageCounters> {
-        let mut map = self.storage.lock().expect("LiveStats cloud mutex poisoned");
+        let mut map = self
+            .storage
+            .lock()
+            .expect("LiveStats storage mutex poisoned");
         Arc::clone(map.entry(backend.to_string()).or_default())
     }
 
@@ -389,7 +392,7 @@ struct TelemetryInner {
     /// fast path is actually taken vs the bytes-copy fallback.
     scsi_xcopy_segments_total: Counter<u64>,
 
-    // ── cloud (per-backend op latency / bytes / errors) ──
+    // ── storage (per-backend op latency / bytes / errors) ──
     storage_requests_total: Counter<u64>,
     storage_request_seconds: Histogram<f64>,
     storage_bytes_total: Counter<u64>,
@@ -564,7 +567,7 @@ impl Telemetry {
     }
 
     /// VSA per-volume page-cache eviction. `outcome` is `clean` (LRU
-    /// page dropped without a cloud upload) or `dirty` (LRU page
+    /// page dropped without a storage upload) or `dirty` (LRU page
     /// flushed through `VolumeWriter::write_page` before drop —
     /// pathological-pressure tail; if this counter grows non-trivially
     /// relative to host writes the cache budget is undersized).
@@ -615,7 +618,7 @@ impl Telemetry {
             .add(1, &[KeyValue::new("path", path.to_string())]);
     }
 
-    /// cloud.* — `op` is one of `put`/`get`/`head`/`delete`,
+    /// storage.* — `op` is one of `put`/`get`/`head`/`delete`,
     /// `outcome` is `ok`/`error`.
     pub fn storage_record_request(
         &self,
@@ -720,7 +723,7 @@ impl Telemetry {
             .record_chunk_unique_bytes(backend, bytes);
     }
 
-    /// Cloud-side HEAD-before-PUT probes (Global scope only — Local
+    /// Storage-side HEAD-before-PUT probes (Global scope only — Local
     /// scope namespaces by barcode so the HEAD is guaranteed to miss
     /// and is skipped). Pair with `chunk_storage_head_hits_total` for
     /// the upload-skip rate.
@@ -730,7 +733,7 @@ impl Telemetry {
             .add(1, &[KeyValue::new("backend", backend.to_string())]);
     }
 
-    /// Cloud-side HEAD probes that found the object already present —
+    /// Storage-side HEAD probes that found the object already present —
     /// upload was skipped. The complement of (probes - hits) is the
     /// PUTs the daemon actually issued.
     pub fn chunk_inc_storage_head_hit(&self, backend: &str) {
@@ -742,7 +745,7 @@ impl Telemetry {
     /// Meta-cache served the lookup from `Probed` or `Uploaded` state
     /// — no backend round-trip. Pair with the `head_probes` /
     /// `head_hits` counters above for a full breakdown of how the
-    /// daemon's "is X already in cloud?" decisions get answered.
+    /// daemon's "is X already in storage?" decisions get answered.
     pub fn chunk_inc_storage_cache_hit(&self, backend: &str) {
         self.inner
             .chunk_storage_cache_hits_total
@@ -932,7 +935,7 @@ impl TelemetryInner {
             cache_evictions_total: meter
                 .u64_counter(name("cache_evictions"))
                 .with_description(
-                    "VSA per-volume page-cache evictions, labeled clean vs dirty (dirty = required a cloud flush)",
+                    "VSA per-volume page-cache evictions, labeled clean vs dirty (dirty = required a storage flush)",
                 )
                 .build(),
             cache_miss_after_eviction_seconds: meter
@@ -961,28 +964,28 @@ impl TelemetryInner {
                 .with_description("EXTENDED COPY segments executed by path (fast/slow)")
                 .build(),
 
-            // cloud
+            // storage
             storage_requests_total: meter
                 .u64_counter(name("storage_requests"))
-                .with_description("Cloud requests by backend/op/outcome")
+                .with_description("Storage requests by backend/op/outcome")
                 .build(),
             storage_request_seconds: meter
                 .f64_histogram(name("storage_request"))
-                .with_description("Cloud request latency by backend/op/outcome")
+                .with_description("Storage request latency by backend/op/outcome")
                 .with_unit("s")
                 .build(),
             storage_bytes_total: meter
                 .u64_counter(name("storage_transferred"))
-                .with_description("Cloud bytes transferred by backend/op/outcome")
+                .with_description("Storage bytes transferred by backend/op/outcome")
                 .with_unit("By")
                 .build(),
             storage_retries_total: meter
                 .u64_counter(name("storage_retries"))
-                .with_description("Cloud retry attempts by backend/error class")
+                .with_description("Storage retry attempts by backend/error class")
                 .build(),
             storage_permanent_errors_total: meter
                 .u64_counter(name("storage_permanent_errors"))
-                .with_description("Permanent cloud errors that bypassed retry")
+                .with_description("Permanent storage errors that bypassed retry")
                 .build(),
 
             // chunk
@@ -1008,16 +1011,16 @@ impl TelemetryInner {
                 .build(),
             chunk_bytes_uploaded_total: meter
                 .u64_counter(name("chunk_uploaded"))
-                .with_description("Chunk bytes successfully PUT to cloud")
+                .with_description("Chunk bytes successfully PUT to storage")
                 .with_unit("By")
                 .build(),
             chunk_storage_head_probes_total: meter
                 .u64_counter(name("chunk_storage_head_probes"))
-                .with_description("Cloud-side HEAD-before-PUT probes (Global scope)")
+                .with_description("Storage-side HEAD-before-PUT probes (Global scope)")
                 .build(),
             chunk_storage_head_hits_total: meter
                 .u64_counter(name("chunk_storage_head_hits"))
-                .with_description("Cloud HEAD probes that found the object already present")
+                .with_description("Storage HEAD probes that found the object already present")
                 .build(),
             chunk_storage_cache_hits_total: meter
                 .u64_counter(name("chunk_storage_cache_hits"))
@@ -1096,7 +1099,7 @@ impl TelemetryInner {
                 .build(),
             prefetch_misses_total: meter
                 .u64_counter(name("prefetch_misses"))
-                .with_description("Reads that found nothing prefetched and waited on cloud")
+                .with_description("Reads that found nothing prefetched and waited on storage")
                 .build(),
 
             // audit
@@ -1220,7 +1223,7 @@ pub enum TelemetryError {
 }
 
 /// Process-global telemetry handle. Set once at daemon boot via
-/// [`set_global`]. Core call sites (cartridge, audit, cloud backends)
+/// [`set_global`]. Core call sites (cartridge, audit, storage backends)
 /// record through the [`record`] free functions below, which no-op
 /// when the global is unset (CLI / unit tests / `--test` smoke runs).
 ///
@@ -1388,13 +1391,13 @@ pub mod record {
         }
     }
     /// A host read found its chunk already local (served from a prefetch
-    /// / earlier warm), no cloud round-trip needed.
+    /// / earlier warm), no storage round-trip needed.
     pub fn prefetch_hit() {
         if let Some(t) = global() {
             t.prefetch_inc_hit();
         }
     }
-    /// A host read found its chunk missing and had to wait on a cloud
+    /// A host read found its chunk missing and had to wait on a storage
     /// download.
     pub fn prefetch_miss() {
         if let Some(t) = global() {

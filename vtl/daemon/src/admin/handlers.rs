@@ -342,10 +342,10 @@ pub struct CartridgeInfo {
     pub host_bytes_written: u64,
     /// Lifetime plaintext bytes served to the host on READ.
     pub host_bytes_read: u64,
-    /// Lifetime on-wire bytes PUT to cloud — post-dedup,
+    /// Lifetime on-wire bytes PUT to storage — post-dedup,
     /// post-compression.
     pub backend_bytes_written: u64,
-    /// Lifetime bytes fetched from cloud on a chunk cache miss.
+    /// Lifetime bytes fetched from storage on a chunk cache miss.
     pub backend_bytes_read: u64,
 }
 
@@ -1014,7 +1014,7 @@ pub struct CartridgeCreateRequest {
     /// preserving zero-pad width.
     #[serde(default = "default_multi")]
     pub multi: u32,
-    /// Cloud backend name. Required when 2+ backends configured;
+    /// Storage backend name. Required when 2+ backends configured;
     /// inferred when only one backend exists.
     #[serde(default)]
     pub backend: Option<String>,
@@ -1128,7 +1128,7 @@ pub async fn cartridge_create(
     // mutex across an `.await`. We pre-mint one (uuid, plain_dek,
     // wrapped_dek) tuple per barcode upfront; if the create loop
     // fails downstream the tuples are just discarded (nothing was
-    // persisted server-side beyond cloud RPCs that the wrapped blob
+    // persisted server-side beyond storage RPCs that the wrapped blob
     // makes opaque).
     let resolved_keystore: Option<&str> = if req.encrypt {
         match state
@@ -1379,7 +1379,7 @@ fn parse_chunking_mode(req: &CartridgeCreateRequest) -> Result<(ChunkingMode, St
     Ok((chunking, chunking_str))
 }
 
-/// Resolve the cloud backend name: explicit request field wins;
+/// Resolve the storage backend name: explicit request field wins;
 /// otherwise auto-pick when exactly one backend is configured; refuse
 /// when 2+ backends are configured without an explicit choice.
 fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<String, String> {
@@ -1397,7 +1397,7 @@ fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<S
         }
         (None, 1) => Ok(backend_names.into_iter().next().unwrap_or_default()),
         (None, _) => Err(format!(
-            "backend is required when multiple cloud backends are configured. Available: {}",
+            "backend is required when multiple storage backends are configured. Available: {}",
             backend_names.join(", ")
         )),
     }

@@ -3,7 +3,7 @@
 
 //! Async job runner for long-running admin operations.
 //!
-//! `system gc` / `verify` / `stats` / `cloud check` / `audit *` /
+//! `system gc` / `verify` / `stats` / `storage check` / `audit *` /
 //! `license` finish in milliseconds on small libraries and minutes
 //! at TB scale; the operator wants live progress in either case.
 //! Rather than holding a single HTTP request open for the whole run

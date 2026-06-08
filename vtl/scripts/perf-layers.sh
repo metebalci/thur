@@ -15,7 +15,7 @@
 #                         -> core/smc/examples/perf_write
 #   L2 in-process+storage : same as L1, sealed chunks uploaded inline
 #                         against the configured backend.
-#                         -> core/smc/examples/perf_cart_cloud
+#                         -> core/smc/examples/perf_cart_storage
 #   L3 iscsi-tar        : daemon + iSCSI + library init + cartridge
 #                         create + mtx load + `tar -b 256` (128 KiB
 #                         blocks) -> /dev/nstN -> mtx unload.
@@ -106,13 +106,13 @@ done
 [[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/release/thurvtld"
 [[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/release/thurvtl"
 PERF_WRITE="${REPO_DIR}/target/release/examples/perf_write"
-PERF_CART_CLOUD="${REPO_DIR}/target/release/examples/perf_cart_cloud"
+PERF_CART_STORAGE="${REPO_DIR}/target/release/examples/perf_cart_storage"
 
 if [[ ! -x "$DAEMON_PATH" || ! -x "$CLI_PATH" ]]; then
     log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build --release"
     exit 1
 fi
-if [[ ! -x "$PERF_WRITE" || ! -x "$PERF_CART_CLOUD" ]]; then
+if [[ ! -x "$PERF_WRITE" || ! -x "$PERF_CART_STORAGE" ]]; then
     log_error "Missing perf examples. Run: cargo build --release -p core-mediachanger --examples"
     exit 1
 fi
@@ -411,7 +411,7 @@ run_l2() {
         local tmp; tmp=$(mktemp -d "$PERF_BASE_DIR/l2-${fixture}-XXXX")
         local t0 t1 t2
         t0=$(date +%s%N)
-        "$PERF_CART_CLOUD" "$PERF_BACKENDS_FILE" "$PERF_BACKEND_NAME" \
+        "$PERF_CART_STORAGE" "$PERF_BACKENDS_FILE" "$PERF_BACKEND_NAME" \
             fastcdc "$TOTAL_MB" 256 "$fixture" \
             > "$tmp/run.log" 2>&1 || {
             log_error "L2 $fixture failed (see $tmp/run.log)"

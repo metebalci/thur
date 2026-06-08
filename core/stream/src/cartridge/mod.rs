@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-// Cloud-tiering surface (S3 chunk upload, manifest backup/restore,
-// version retention) lives in cartridge/cloud.rs to keep this file
+// Storage-tiering surface (S3 chunk upload, manifest backup/restore,
+// version retention) lives in cartridge/storage.rs to keep this file
 // scoped to the on-disk write/read state machine.
-mod cloud;
+mod storage;
 
 // Chunk-seal pipeline (new_chunk, seal_current_chunk,
 // roll_chunk_if_needed, seal_and_start_new_chunk,
@@ -70,9 +70,9 @@ pub fn lto_default_capacity_gb(lto_generation: u8) -> u64 {
 
 /// Options controlling [`Cartridge::open_with`] / [`Cartridge::open_async_with`].
 ///
-/// Defaults: no cloud backend, default chunk size (`CHUNK_ROLL_BYTES`),
+/// Defaults: no storage backend, default chunk size (`CHUNK_ROLL_BYTES`),
 /// unlimited capacity, no LTO generation. Builder methods
-/// (`with_cloud`, `with_chunk_size`, `with_capacity_gb`,
+/// (`with_storage`, `with_chunk_size`, `with_capacity_gb`,
 /// `with_lto_generation`) tweak individual fields.
 ///
 /// `lto_generation` and `capacity_gb` interact: when `lto_generation`
@@ -82,7 +82,7 @@ pub fn lto_default_capacity_gb(lto_generation: u8) -> u64 {
 /// directly.
 #[derive(Default)]
 pub struct CartridgeOpenOptions {
-    cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+    storage_backend: Option<Box<dyn ObjectStoreBackend>>,
     chunk_size_bytes: Option<u64>,
     capacity_gb: u64,
     lto_generation: u8,
@@ -127,8 +127,8 @@ impl CartridgeOpenOptions {
         Self::default()
     }
 
-    pub fn with_cloud(mut self, cloud_backend: Option<Box<dyn ObjectStoreBackend>>) -> Self {
-        self.cloud_backend = cloud_backend;
+    pub fn with_storage(mut self, storage_backend: Option<Box<dyn ObjectStoreBackend>>) -> Self {
+        self.storage_backend = storage_backend;
         self
     }
 
@@ -204,7 +204,7 @@ impl CartridgeOpenOptions {
 
 #[derive(Debug, Clone)]
 pub enum CartridgeOpenMode {
-    /// Create a fresh cartridge bound to the named cloud backend.
+    /// Create a fresh cartridge bound to the named storage backend.
     /// The backend name, WORM flag, and dedup scope are sticky for
     /// the cartridge's lifetime. `worm: true` enforces append-only
     /// semantics — see [`Manifest::worm`] and the SCSI WORM sense
@@ -274,7 +274,7 @@ struct Manifest {
     /// 0 = unknown/legacy (for backward compatibility)
     #[serde(default)]
     lto_generation: u8,
-    /// Sticky cloud backend name this cartridge is bound to. Set at
+    /// Sticky storage backend name this cartridge is bound to. Set at
     /// create time, persisted in the manifest, never changed for the
     /// life of the cartridge. The open path rejects manifests with an
     /// empty `backend` field.
@@ -286,7 +286,7 @@ struct Manifest {
     /// cartridge enforces append-only semantics: WRITE / WRITE
     /// FILEMARKS at any LBA other than the active partition's
     /// `next_lba` (EOD) is refused, and ERASE / FORMAT MEDIUM /
-    /// ALLOW OVERWRITE are refused outright. Cloud-side immutability
+    /// ALLOW OVERWRITE are refused outright. Storage-side immutability
     /// is layered on top via the bound backend's `retention_mode`
     /// (the bucket is the contract).
     #[serde(default)]
@@ -561,7 +561,7 @@ impl From<BlockKindSerde> for BlockKind {
 }
 
 /// Directory-backed cartridge with content-addressed chunk storage and
-/// optional cloud tiering.
+/// optional storage tiering.
 ///
 /// Layout:
 ///   <root>/manifest.json
@@ -596,7 +596,7 @@ pub struct Cartridge {
     /// Per-cartridge LRU sidecar at `<root>/lru.idx`. One u64 per
     /// chunk_id, positional, mirrored 1:1 with `chunk_index`. Holds
     /// last-accessed epoch seconds — split out of `chunks.idx` so the
-    /// read path's `touch` doesn't dirty cloud-replicated metadata
+    /// read path's `touch` doesn't dirty storage-replicated metadata
     /// pages. Local-only; never uploaded; rebuilt as zeros on cold
     /// start. See `lru_index.rs`.
     lru_index: LruIndexFile,
@@ -614,8 +614,8 @@ pub struct Cartridge {
     cur_file: File,
     // tape "head": next LBA to read in the *active partition* (BOT = 0)
     head_lba: u64,
-    // optional cloud backend for cloud tiering (S3, GCS, etc.)
-    cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+    // optional storage backend for storage tiering (S3, GCS, etc.)
+    storage_backend: Option<Box<dyn ObjectStoreBackend>>,
     // optional prefetch manager for aggressive prefetching
     prefetch_manager: Option<Arc<PrefetchManager>>,
     /// Per-cartridge chunking strategy. Resolved at open/create time
@@ -663,7 +663,7 @@ pub struct Cartridge {
     /// Indexed parallel to `manifest.partitions`. Open exactly once
     /// per cartridge load; written eagerly on every block / filemark.
     block_indexes: Vec<BlockIndexFile>,
-    /// Volatile legal-hold flag, snapshot of the cloud sentinel
+    /// Volatile legal-hold flag, snapshot of the storage sentinel
     /// (`manifests/<barcode>/manifest-latest.json` hold state) read
     /// once at drive-load time and pinned for the cartridge's
     /// in-memory lifetime. When `true`, every host write opcode
@@ -677,7 +677,7 @@ pub struct Cartridge {
     /// lifetime. Out-of-band hold changes (e.g. `aws-cli put-object-legal-hold`
     /// while the cartridge is in a drive) don't affect this flag mid-load
     /// — the auto-hold-on-upload worker (which re-reads the sentinel
-    /// per upload) is the safety net for cloud-side preservation in
+    /// per upload) is the safety net for storage-side preservation in
     /// that residual race.
     legal_held: bool,
     /// Running total of sealed-chunk bytes (everything in `chunk_index`
@@ -853,38 +853,38 @@ pub(super) fn now_timestamp() -> u64 {
 }
 
 impl Cartridge {
-    /// Open a cartridge with default settings (no cloud backend, default
+    /// Open a cartridge with default settings (no storage backend, default
     /// chunk size, unlimited capacity). Convenience wrapper over
     /// [`Cartridge::open_with`] with [`CartridgeOpenOptions::default`].
     pub fn open<P: AsRef<Path>>(root: P, label: &str, mode: CartridgeOpenMode) -> Result<Self> {
         Self::open_with(root, label, mode, CartridgeOpenOptions::default())
     }
 
-    /// Open a cartridge with a cloud backend; everything else default.
+    /// Open a cartridge with a storage backend; everything else default.
     /// Convenience wrapper over [`Cartridge::open_with`].
     ///
     /// **Sync version**: if the local manifest is missing or corrupt, the
-    /// open fails — cloud-side manifest restore needs an async runtime.
-    /// Use [`Cartridge::open_with_cloud_async`] for the cold-bucket DR
+    /// open fails — storage-side manifest restore needs an async runtime.
+    /// Use [`Cartridge::open_with_storage_async`] for the cold-bucket DR
     /// path.
-    pub fn open_with_cloud<P: AsRef<Path>>(
+    pub fn open_with_storage<P: AsRef<Path>>(
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Self> {
         Self::open_with(
             root,
             label,
             mode,
-            CartridgeOpenOptions::new().with_cloud(cloud_backend),
+            CartridgeOpenOptions::new().with_storage(storage_backend),
         )
     }
 
     /// Open a cartridge with the full options surface (sync). For the
-    /// cold-bucket DR path (cloud-side manifest restore on a missing /
+    /// cold-bucket DR path (storage-side manifest restore on a missing /
     /// corrupt local manifest), use [`Cartridge::open_async_with`] —
-    /// the sync path bails on missing-local-manifest because cloud
+    /// the sync path bails on missing-local-manifest because storage
     /// restore needs an async runtime.
     pub fn open_with<P: AsRef<Path>>(
         root: P,
@@ -910,18 +910,18 @@ impl Cartridge {
                 opts.chunk_size_bytes.unwrap_or(CHUNK_ROLL_BYTES),
                 opts.capacity_gb,
                 opts.lto_generation,
-                opts.cloud_backend,
+                opts.storage_backend,
                 opts.at_rest_create,
             ),
             CartridgeOpenMode::Open => {
-                let m = Self::load_manifest_sync(&root, &opts.cloud_backend)?;
+                let m = Self::load_manifest_sync(&root, &opts.storage_backend)?;
                 let runtime = Runtime::load(&root)?;
                 Self::finalize_open_from_manifest(
                     tapes_dir,
                     root,
                     m,
                     runtime,
-                    opts.cloud_backend,
+                    opts.storage_backend,
                     opts.at_rest_open_dek,
                     opts.view_only,
                 )
@@ -929,38 +929,38 @@ impl Cartridge {
         }
     }
 
-    /// Async variant of [`Cartridge::open_with_cloud`]. Convenience
+    /// Async variant of [`Cartridge::open_with_storage`]. Convenience
     /// wrapper over [`Cartridge::open_async_with`].
-    pub async fn open_with_cloud_async<P: AsRef<Path>>(
+    pub async fn open_with_storage_async<P: AsRef<Path>>(
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Self> {
         Self::open_async_with(
             root,
             label,
             mode,
-            CartridgeOpenOptions::new().with_cloud(cloud_backend),
+            CartridgeOpenOptions::new().with_storage(storage_backend),
         )
         .await
     }
 
-    /// Variant of [`Cartridge::open_with_cloud_async`] that also
+    /// Variant of [`Cartridge::open_with_storage_async`] that also
     /// injects a plaintext DEK for the at-rest encrypt/decrypt seam.
     /// Required when the manifest's `encryption` field is `Some(...)`
     /// — the daemon unwraps the DEK via the named keystore backend
     /// before calling. `dek: None` is fine for unencrypted
     /// cartridges; for encrypted cartridges it opens the cartridge
     /// without data-path access (upload worker, GC).
-    pub async fn open_with_cloud_and_dek_async<P: AsRef<Path>>(
+    pub async fn open_with_storage_and_dek_async<P: AsRef<Path>>(
         root: P,
         label: &str,
         mode: CartridgeOpenMode,
-        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: Option<Box<dyn ObjectStoreBackend>>,
         dek: Option<[u8; shared_crypto::KEY_LEN]>,
     ) -> Result<Self> {
-        let mut opts = CartridgeOpenOptions::new().with_cloud(cloud_backend);
+        let mut opts = CartridgeOpenOptions::new().with_storage(storage_backend);
         if let Some(d) = dek {
             opts = opts.with_dek_for_open(d);
         }
@@ -969,8 +969,8 @@ impl Cartridge {
 
     /// Open a cartridge with the full options surface (async). Supports
     /// cold-bucket DR: if the cartridge directory is missing locally
-    /// and a cloud backend is configured, the manifest + index pages
-    /// are pulled from cloud before the cartridge opens.
+    /// and a storage backend is configured, the manifest + index pages
+    /// are pulled from storage before the cartridge opens.
     pub async fn open_async_with<P: AsRef<Path>>(
         root: P,
         label: &str,
@@ -995,18 +995,18 @@ impl Cartridge {
                 opts.chunk_size_bytes.unwrap_or(CHUNK_ROLL_BYTES),
                 opts.capacity_gb,
                 opts.lto_generation,
-                opts.cloud_backend,
+                opts.storage_backend,
                 opts.at_rest_create,
             ),
             CartridgeOpenMode::Open => {
                 let (m, runtime) =
-                    Self::load_manifest_async(&root, label, &opts.cloud_backend).await?;
+                    Self::load_manifest_async(&root, label, &opts.storage_backend).await?;
                 Self::finalize_open_from_manifest(
                     tapes_dir,
                     root,
                     m,
                     runtime,
-                    opts.cloud_backend,
+                    opts.storage_backend,
                     opts.at_rest_open_dek,
                     opts.view_only,
                 )
@@ -1019,7 +1019,7 @@ impl Cartridge {
     /// --chunking ...`. The chunking strategy is sticky for the
     /// cartridge's lifetime.
     ///
-    /// Create a fresh cartridge bound to the named cloud backend. The
+    /// Create a fresh cartridge bound to the named storage backend. The
     /// backend name and WORM flag are sticky for the cartridge's
     /// lifetime — every chunk upload, manifest backup, prefetch, and
     /// refetch routes through this backend, never any other; WORM
@@ -1028,7 +1028,7 @@ impl Cartridge {
     /// `lto_generation = 0` means unlimited capacity; otherwise capacity
     /// is derived from the LTO generation table.
     ///
-    /// `backend_name` should be a valid entry in `cloud.backends` (the
+    /// `backend_name` should be a valid entry in `storage.backends` (the
     /// daemon validates this at startup). Set `worm = true` for a
     /// Write-Once-Read-Many cartridge.
     pub fn create_with_chunking<P: AsRef<Path>>(
@@ -1112,7 +1112,7 @@ impl Cartridge {
     /// Build the on-disk skeleton for a fresh cartridge: directory,
     /// initial chunk-index / lru.idx records, first staging chunk file,
     /// then the in-memory `Cartridge` struct. Shared by sync and async
-    /// open paths — no I/O on the cloud here, all sync filesystem work.
+    /// open paths — no I/O on the storage here, all sync filesystem work.
     fn finalize_create(
         tapes_dir: &Path,
         root: PathBuf,
@@ -1123,7 +1123,7 @@ impl Cartridge {
         chunk_size_bytes: u64,
         capacity_gb: u64,
         lto_generation: u8,
-        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: Option<Box<dyn ObjectStoreBackend>>,
         at_rest: Option<AtRestCreateParams>,
     ) -> Result<Self> {
         if root.exists() {
@@ -1174,7 +1174,7 @@ impl Cartridge {
             cur_chunk: first,
             cur_file: f,
             head_lba: 0, // BOT
-            cloud_backend,
+            storage_backend,
             prefetch_manager: None,
             chunking,
             cdc_state,
@@ -1208,7 +1208,7 @@ impl Cartridge {
         root: PathBuf,
         m: Manifest,
         runtime: Runtime,
-        cloud_backend: Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: Option<Box<dyn ObjectStoreBackend>>,
         at_rest_dek: Option<[u8; shared_crypto::KEY_LEN]>,
         view_only: bool,
     ) -> Result<Self> {
@@ -1234,7 +1234,7 @@ impl Cartridge {
         let (cur_chunk_id, cur_chunk, cur_file) =
             Self::resume_or_create_active(&root, partition_count, &chunk_index, &lru_index)?;
         // Bring lru.idx in lockstep with chunks.idx: cold-start restore
-        // (where chunks.idx came from cloud and lru.idx is freshly
+        // (where chunks.idx came from storage and lru.idx is freshly
         // empty) needs zero-fill up to next_id.
         lru_index.grow_to(chunk_index.next_id())?;
         let (chunking, cdc_state) = build_chunking_state(&root, &m, cur_chunk_id, &cur_chunk)?;
@@ -1252,7 +1252,7 @@ impl Cartridge {
             cur_chunk,
             cur_file,
             head_lba: 0, // start at BOT of active partition
-            cloud_backend,
+            storage_backend,
             prefetch_manager: None,
             chunking,
             cdc_state,
@@ -1272,13 +1272,13 @@ impl Cartridge {
     }
 
     /// Load a cartridge manifest from disk. Sync variant — bails if the
-    /// local manifest is missing or corrupt and a cloud backend is
-    /// configured (cloud restore needs the async runtime).
+    /// local manifest is missing or corrupt and a storage backend is
+    /// configured (storage restore needs the async runtime).
     fn load_manifest_sync(
         root: &Path,
-        cloud_backend: &Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: &Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<Manifest> {
-        if !root.exists() && cloud_backend.is_none() {
+        if !root.exists() && storage_backend.is_none() {
             return Err(SmcError::InvalidOp("cartridge does not exist"));
         }
         let manifest_path = root.join("manifest.json");
@@ -1287,28 +1287,28 @@ impl Cartridge {
                 Ok(manifest) => Ok(manifest),
                 Err(parse_err) => {
                     tracing::warn!(
-                        "Local manifest corrupt: {}, cloud restore requires async context",
+                        "Local manifest corrupt: {}, storage restore requires async context",
                         parse_err
                     );
-                    if cloud_backend.is_some() {
+                    if storage_backend.is_some() {
                         Err(SmcError::InvalidOp(
-                            "Local manifest corrupt and cloud restore requires async context. Use the async open path.",
+                            "Local manifest corrupt and storage restore requires async context. Use the async open path.",
                         ))
                     } else {
                         Err(SmcError::InvalidOp(
-                            "Local manifest corrupt and no cloud backend available",
+                            "Local manifest corrupt and no storage backend available",
                         ))
                     }
                 }
             },
             Err(_) => {
-                if cloud_backend.is_some() {
+                if storage_backend.is_some() {
                     Err(SmcError::InvalidOp(
-                        "Local manifest missing and cloud restore requires async context. Use the async open path.",
+                        "Local manifest missing and storage restore requires async context. Use the async open path.",
                     ))
                 } else {
                     Err(SmcError::InvalidOp(
-                        "manifest.json not found and no cloud backend available",
+                        "manifest.json not found and no storage backend available",
                     ))
                 }
             }
@@ -1317,17 +1317,17 @@ impl Cartridge {
 
     /// Load a cartridge manifest + runtime sidecar. Async variant —
     /// supports cold-bucket DR: if either local file is missing or
-    /// corrupt and a cloud backend is configured, fetch the bundle
-    /// from cloud and write both files to disk before returning.
+    /// corrupt and a storage backend is configured, fetch the bundle
+    /// from storage and write both files to disk before returning.
     /// Restores indexes before the local manifest so a torn upload
     /// leaves the on-disk state correctly missing rather than lying
     /// about the chunks it can't yet describe.
     async fn load_manifest_async(
         root: &Path,
         label: &str,
-        cloud_backend: &Option<Box<dyn ObjectStoreBackend>>,
+        storage_backend: &Option<Box<dyn ObjectStoreBackend>>,
     ) -> Result<(Manifest, Runtime)> {
-        if !root.exists() && cloud_backend.is_none() {
+        if !root.exists() && storage_backend.is_none() {
             return Err(SmcError::InvalidOp("cartridge does not exist"));
         }
         let manifest_path = root.join("manifest.json");
@@ -1335,7 +1335,9 @@ impl Cartridge {
             Ok(mf) => match serde_json::from_reader(mf) {
                 Ok(manifest) => Some(manifest),
                 Err(parse_err) => {
-                    tracing::warn!("Local manifest corrupt: {parse_err}, attempting cloud restore");
+                    tracing::warn!(
+                        "Local manifest corrupt: {parse_err}, attempting storage restore"
+                    );
                     None
                 }
             },
@@ -1349,24 +1351,24 @@ impl Cartridge {
             return Ok((m, r));
         }
 
-        // Either file missing or corrupt — try cloud restore for the bundle.
-        let Some(backend) = cloud_backend else {
+        // Either file missing or corrupt — try storage restore for the bundle.
+        let Some(backend) = storage_backend else {
             return Err(SmcError::InvalidOp(
-                "Local manifest or runtime missing/corrupt and no cloud backend available",
+                "Local manifest or runtime missing/corrupt and no storage backend available",
             ));
         };
         tracing::info!(
-            "Local manifest or runtime not usable, attempting cloud restore for {}",
+            "Local manifest or runtime not usable, attempting storage restore for {}",
             label
         );
         let (manifest_json, runtime_json) =
-            Self::restore_manifest_from_cloud(label, backend.as_ref()).await?;
+            Self::restore_manifest_from_storage(label, backend.as_ref()).await?;
         fs::create_dir_all(root)?;
         // Restore the index files first — a torn restore leaves the
         // sentinel files absent rather than lying about index state.
         // The runtime sidecar carries `index_epoch` (post-split), so
         // pass the runtime JSON to the index-restore step.
-        Self::restore_indexes_from_cloud(root, label, &runtime_json, backend.as_ref()).await?;
+        Self::restore_indexes_from_storage(root, label, &runtime_json, backend.as_ref()).await?;
         // Write manifest.json first, then runtime.json. A crash
         // between the two leaves runtime.json absent — Runtime::load
         // refuses with a clear error and the next open path can
@@ -1382,7 +1384,7 @@ impl Cartridge {
         f.write_all(runtime_json.as_bytes())?;
         f.flush()?;
         fs::rename(tmp, &runtime_path)?;
-        tracing::info!("Restored manifest + runtime from cloud to local files");
+        tracing::info!("Restored manifest + runtime from storage to local files");
         let m: Manifest = serde_json::from_str(&manifest_json)?;
         let r: Runtime = serde_json::from_str(&runtime_json)?;
         Ok((m, r))
@@ -1656,7 +1658,7 @@ impl Cartridge {
         self.head_lba = lba + 1;
 
         self.lru_index.touch(self.cur_chunk_id, now_timestamp())?;
-        if self.cloud_backend.is_some() {
+        if self.storage_backend.is_some() {
             self.cur_chunk.location = LocationTag::LocalOnly;
             self.cur_chunk.uploaded = false;
         }
@@ -1790,7 +1792,7 @@ impl Cartridge {
     }
 
     /// Read a block by LBA from the active partition (sync version - assumes
-    /// chunk is local). For cloud-backed cartridges, use read_block_async instead.
+    /// chunk is local). For storage-backed cartridges, use read_block_async instead.
     pub fn read_block(&mut self, lba: u64) -> Result<Block> {
         let bi = self.block_at_active(lba)?;
 
@@ -1828,10 +1830,10 @@ impl Cartridge {
     /// Peek the chunk-index entry for an LBA without mutating any state.
     /// Returns the chunk id, hash (if sealed), and the local pool path
     /// the iSCSI READ path would resolve to. Used by the daemon's
-    /// out-of-band cloud-prefetch hook so it can refetch a missing
+    /// out-of-band storage-prefetch hook so it can refetch a missing
     /// chunk *before* re-entering `read_block` (sync) — the SCSI READ
     /// opcode handler runs `read_next` which has no async surface for
-    /// a cloud round-trip itself.
+    /// a storage round-trip itself.
     ///
     /// Returns `None` if the LBA is out of range, the chunk metadata
     /// is missing, or the chunk is still in staging (no hash yet).
@@ -1865,7 +1867,7 @@ impl Cartridge {
     ///
     /// `current_chunk_id` is the chunk backing the next read LBA; the
     /// window covers `current+1 ..= current+ahead`. Only sealed,
-    /// cloud-resident chunks are actionable downstream — staging chunks
+    /// storage-resident chunks are actionable downstream — staging chunks
     /// (`hash == None`) are included in the snapshot with their real
     /// location so `on_read` skips them. Returns `None` when prefetch is
     /// disabled (`ahead == 0`) or the head sits past end-of-data (no
@@ -1890,7 +1892,7 @@ impl Cartridge {
                     id,
                     ChunkLocationInfo {
                         in_local_cache,
-                        in_s3: matches!(rec.location, LocationTag::CloudOnly | LocationTag::Both),
+                        in_s3: matches!(rec.location, LocationTag::StorageOnly | LocationTag::Both),
                         hash: rec.hash,
                     },
                 );
@@ -1996,9 +1998,9 @@ impl Cartridge {
         encryption::decrypt_block(&state.key, &iv, &buf)
     }
 
-    /// Read a block by LBA from the active partition with cloud download
+    /// Read a block by LBA from the active partition with storage download
     /// if needed (async version). Handles cache misses by downloading from
-    /// the configured cloud backend.
+    /// the configured storage backend.
     pub async fn read_block_async(&mut self, lba: u64) -> Result<Block> {
         let bi = self.block_at_active(lba)?;
 
@@ -2014,20 +2016,20 @@ impl Cartridge {
         let chunk_id = bi.chunk_id;
         let mut chunk = self.read_chunk_rec(chunk_id)?;
 
-        // Decide whether to fetch from cloud. Two cases trigger a fetch:
-        //   1. chunk_index says CloudOnly — the chunk was evicted from
+        // Decide whether to fetch from storage. Two cases trigger a fetch:
+        //   1. chunk_index says StorageOnly — the chunk was evicted from
         //      the pool while this cartridge was alive (cache eviction
         //      worker).
         //   2. chunk_index says Both / LocalOnly but the pool file is
         //      gone — typical after a cold-start daemon faces a wiped
-        //      chunks directory. Trust the cloud as the durable copy.
+        //      chunks directory. Trust the storage as the durable copy.
         let pool_has_chunk = chunk
             .hash
             .as_deref()
             .map(|h| self.chunk_store.exists(h))
             .unwrap_or(false);
         let needs_fetch =
-            chunk.hash.is_some() && (chunk.location == LocationTag::CloudOnly || !pool_has_chunk);
+            chunk.hash.is_some() && (chunk.location == LocationTag::StorageOnly || !pool_has_chunk);
 
         if needs_fetch {
             let hash = chunk
@@ -2035,12 +2037,12 @@ impl Cartridge {
                 .as_ref()
                 .expect("needs_fetch implies hash.is_some()")
                 .clone();
-            let backend = self.cloud_backend.as_ref().ok_or(SmcError::InvalidOp(
-                "chunk missing from local pool and no cloud backend configured to refetch",
+            let backend = self.storage_backend.as_ref().ok_or(SmcError::InvalidOp(
+                "chunk missing from local pool and no storage backend configured to refetch",
             ))?;
             let object_key = self.chunk_store.object_key_in_store(&hash);
             tracing::info!(
-                "Cache miss: downloading chunk {} (hash {}..) from cloud",
+                "Cache miss: downloading chunk {} (hash {}..) from storage",
                 chunk_id,
                 &hash[..8]
             );
@@ -2056,7 +2058,7 @@ impl Cartridge {
 
             // Hand the BLAKE3 verify + atomic tmp+rename to
             // `ChunkPool::insert_verified_bytes`. The verify catches
-            // cloud bit-rot or a wrong-bytes-for-hash response (the
+            // storage bit-rot or a wrong-bytes-for-hash response (the
             // pool would otherwise store the bad bytes under the
             // expected filename); on mismatch the error flows out as
             // `SmcError::ContentHashMismatch` → SCSI MEDIUM ERROR
@@ -2144,7 +2146,7 @@ impl Cartridge {
     pub fn label(&self) -> &str {
         &self.manifest.label
     }
-    /// Sticky cloud backend name this cartridge is bound to. Set at
+    /// Sticky storage backend name this cartridge is bound to. Set at
     /// create time, persisted in the manifest. The open path rejects
     /// manifests with a missing `backend` field.
     pub fn backend(&self) -> &str {
@@ -2214,13 +2216,13 @@ impl Cartridge {
         Ok(())
     }
     /// Whether the cartridge's volatile legal-hold flag is on. Snapshot
-    /// of the cloud sentinel taken at drive-load time. Drives the SCSI
+    /// of the storage sentinel taken at drive-load time. Drives the SCSI
     /// write-protect gate on the five mutating opcodes; never persisted.
     pub fn legal_held(&self) -> bool {
         self.legal_held
     }
     /// Set the volatile legal-hold flag. Called by the daemon's drive
-    /// load path after reading the cloud sentinel
+    /// load path after reading the storage sentinel
     /// (`manifest-latest.json`). Must be called before the cartridge
     /// is exposed to any SCSI write opcode; the CLI's `legal-hold
     /// set/clear` refuses against loaded cartridges so this snapshot
@@ -2231,7 +2233,7 @@ impl Cartridge {
 
     /// Single gate for every host write opcode.
     ///
-    /// * Legal-hold (`legal_held` flag, snapshot of the cloud sentinel)
+    /// * Legal-hold (`legal_held` flag, snapshot of the storage sentinel)
     ///   refuses the operation outright with `LegalHoldViolation` →
     ///   plain WRITE PROTECTED 0x27/0x00 at the iSCSI layer.
     /// * WORM (`manifest.worm` sticky) refuses with `WormViolation` →
@@ -2308,13 +2310,13 @@ impl Cartridge {
         self.runtime.host_bytes_read
     }
 
-    /// Lifetime on-wire bytes PUT to cloud for this cartridge's
+    /// Lifetime on-wire bytes PUT to storage for this cartridge's
     /// chunks — post-dedup, post-compression.
     pub fn backend_bytes_written(&self) -> u64 {
         self.runtime.backend_bytes_written
     }
 
-    /// Lifetime bytes fetched from cloud on a chunk cache miss.
+    /// Lifetime bytes fetched from storage on a chunk cache miss.
     pub fn backend_bytes_read(&self) -> u64 {
         self.runtime.backend_bytes_read
     }
@@ -2492,7 +2494,7 @@ impl Cartridge {
     /// Real LTO drives don't expose a per-block hash to the host —
     /// drive-internal ECC + recorded-block CRC handle integrity. Our
     /// equivalent: chunk-level BLAKE3 (`ChunkMeta.hash`) checked at
-    /// chunk seal and at fetch-from-cloud, plus AES-GCM auth tag on
+    /// chunk seal and at fetch-from-storage, plus AES-GCM auth tag on
     /// encrypted blocks and codec frame CRC on compressed blocks.
     /// `read_block` already runs decrypt + decompress, so reaching
     /// here with a valid `Block` means those checks passed.
@@ -2911,7 +2913,7 @@ impl Cartridge {
                             ),
                             in_s3: matches!(
                                 rec.location,
-                                LocationTag::CloudOnly | LocationTag::Both
+                                LocationTag::StorageOnly | LocationTag::Both
                             ),
                             hash: rec.hash,
                         },
@@ -3190,24 +3192,24 @@ impl Cartridge {
 /// Sealed chunk metadata for the upcoming SCSI READ at a given LBA.
 /// Returned by [`Cartridge::peek_chunk_for_lba`] for the iSCSI
 /// daemon's prefetch hook so it can refetch a missing chunk from
-/// cloud (async) before re-entering the sync read path that doesn't
-/// have its own cloud-fallback surface.
+/// storage (async) before re-entering the sync read path that doesn't
+/// have its own storage-fallback surface.
 #[derive(Debug, Clone)]
 pub struct NextReadChunk {
     pub chunk_id: u64,
     pub hash: String,
     /// Local pool path the read path will resolve to.
     pub store_path: PathBuf,
-    /// Cloud key the prefetch hook should fetch — already namespaced
+    /// Storage key the prefetch hook should fetch — already namespaced
     /// per the source cartridge's dedup policy.
     pub object_key: String,
-    /// Sticky cloud backend the cartridge is bound to, drawn from
-    /// `cloud.backends` in the daemon config. The prefetch hook
+    /// Sticky storage backend the cartridge is bound to, drawn from
+    /// `storage.backends` in the daemon config. The prefetch hook
     /// resolves this name through its backend registry.
     pub backend_name: String,
     /// Clone of the source cartridge's `ChunkStore` (backend +
     /// dedup-scope namespace baked in). The iSCSI read-prefetch hook
-    /// routes the cloud-fetched bytes back through
+    /// routes the storage-fetched bytes back through
     /// `ChunkStore::insert_verified_bytes` on this handle so the
     /// download is BLAKE3-verified, lands in the right per-backend /
     /// per-namespace pool layout, and its `namespace()` keys the
@@ -3225,7 +3227,7 @@ pub struct NextReadChunk {
 pub struct PrefetchWindow {
     /// Cartridge label, used as the prefetch active-task key prefix.
     pub cartridge_id: String,
-    /// Sticky cloud backend the cartridge is bound to. Keys the daemon's
+    /// Sticky storage backend the cartridge is bound to. Keys the daemon's
     /// per-backend `PrefetchManager`.
     pub backend_name: String,
     /// Chunk backing the next read LBA. `on_read` fetches
@@ -3254,7 +3256,7 @@ pub struct PrefetchWindow {
 /// shared struct (tape passes a chunk id, block passes a page id).
 pub use shared_upload_worker::PendingUpload as PendingUploadPayload;
 
-/// Outcome of [`Cartridge::backup_manifest_to_cloud`]: every cloud key
+/// Outcome of [`Cartridge::backup_manifest_to_storage`]: every storage key
 /// that was freshly PUT during the pass — versioned manifest backup,
 /// the `manifest-latest.json` sentinel, and the per-file index page
 /// objects (`manifests/<barcode>/<label>/page-<NNNNNN>.dat`). The
@@ -3281,9 +3283,9 @@ pub struct ManifestBackupOutcome {
 /// `chunk_id` is `item_id` on the shared struct.
 pub use shared_upload_worker::UploadOutcome as ChunkUploadOutcome;
 
-/// Stateless companion to [`Cartridge::upload_chunk_to_cloud`].
+/// Stateless companion to [`Cartridge::upload_chunk_to_storage`].
 /// Re-exported from `shared_upload_worker::upload_chunk_inert` so the
-/// tape and block products share the cloud-side dedup probe + PUT
+/// tape and block products share the storage-side dedup probe + PUT
 /// logic. See that crate's docs for the per-step rationale.
 pub use shared_upload_worker::upload_chunk_inert;
 

@@ -46,7 +46,7 @@ use crate::payload::{PendingUpload, UploadOutcome};
 /// `disk_cache_evict_notify.notify_one()` — moved into the
 /// `on_complete` closure the daemon passes in).
 pub async fn run_upload_pipeline<F, Fut>(
-    cloud_backend: &dyn ObjectStoreBackend,
+    storage_backend: &dyn ObjectStoreBackend,
     label: &str,
     payloads: Vec<PendingUpload>,
     max_concurrent: usize,
@@ -79,7 +79,7 @@ where
         .map(|payload| {
             let on_complete = &on_complete;
             async move {
-                match upload_chunk_inert(cloud_backend, &payload).await {
+                match upload_chunk_inert(storage_backend, &payload).await {
                     Ok(outcome) => {
                         debug!(
                             "Successfully uploaded item {} for {}",
@@ -255,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn global_dedup_hit_skips_put_but_still_fires_hook() {
         let backend = MockBackend::default();
-        // Cloud-side HEAD returns true for every key → dedup hit; no PUT.
+        // Storage-side HEAD returns true for every key → dedup hit; no PUT.
         *backend.head_returns.lock().unwrap() = true;
 
         let tmp = TempDir::new().unwrap();

@@ -380,9 +380,9 @@ mod tests {
 
     async fn handler_with_one_volume() -> (TempDir, SbcScsiDispatcher) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         VolumeManifest::new(
@@ -478,9 +478,9 @@ mod tests {
     /// the per-command reservation-UA pop can be exercised.
     async fn handler_with_ua() -> (TempDir, SbcScsiDispatcher, Arc<UnitAttentionTracker>) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),
@@ -568,9 +568,9 @@ mod tests {
     /// — enough surface to verify admission filters one out.
     async fn handler_with_two_volumes() -> (TempDir, SbcScsiDispatcher) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         let registry = TestRegistry::new();
         for (lun, name) in [(0u64, "vol1"), (1u64, "vol2")] {

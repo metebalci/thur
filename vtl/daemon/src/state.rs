@@ -12,7 +12,7 @@
 //! contend.
 //!
 //! Construction order matters: the daemon's startup pipeline builds
-//! the `Library`, audit log, pool budgets, and cloud-backend registry
+//! the `Library`, audit log, pool budgets, and storage-backend registry
 //! before instantiating `DaemonState`, so this constructor only does
 //! the cheap wiring (DriveManager, SessionManager, UnitAttention,
 //! DiagnosticStore) and the `Arc` wrapping.
@@ -66,10 +66,10 @@ pub struct DaemonStateConfig {
     /// Runtime registry of constructed `Arc<dyn ObjectStoreBackend>`
     /// instances (one per name in `storage_config.backends`). Built at
     /// boot from `storage_config`.
-    pub cloud_backends: ObjectStoreRegistry,
-    /// Full `cloud:` section of the YAML conffile — tuning knobs plus
-    /// the named backend definitions under `cloud.backends:`. Distinct
-    /// from `cloud_backends` (the runtime registry above).
+    pub storage_backends: ObjectStoreRegistry,
+    /// Full `storage:` section of the YAML conffile — tuning knobs plus
+    /// the named backend definitions under `storage.backends:`. Distinct
+    /// from `storage_backends` (the runtime registry above).
     pub storage_config: Arc<ObjectStoreConfig>,
     /// Parsed `tiering:` block (operator-driven cartridge tiering
     /// policies). Validated at boot against `storage.backends`; the
@@ -126,9 +126,9 @@ pub struct DaemonState {
     pub audit_ratelimiter: Arc<AuditRateLimiter>,
     /// Runtime registry of constructed `Arc<dyn ObjectStoreBackend>`
     /// instances (one per name in `storage_config.backends`).
-    pub cloud_backends: ObjectStoreRegistry,
-    /// Full `cloud:` section of the YAML conffile — tuning knobs plus
-    /// the named backend definitions under `cloud.backends:`.
+    pub storage_backends: ObjectStoreRegistry,
+    /// Full `storage:` section of the YAML conffile — tuning knobs plus
+    /// the named backend definitions under `storage.backends:`.
     pub storage_config: Arc<ObjectStoreConfig>,
     /// Parsed `tiering:` block (operator-driven cartridge tiering
     /// policies). Read by the `system.tiering.*` job handlers.
@@ -139,7 +139,7 @@ pub struct DaemonState {
     /// target).
     pub keystore_config: Arc<shared_keystore::KeystoreYamlConfig>,
     pub diagnostic_store: Arc<DiagnosticStore>,
-    /// Long-running admin jobs (`system gc`, `verify`, `cloud check`,
+    /// Long-running admin jobs (`system gc`, `verify`, `storage check`,
     /// …). Populated as work is dispatched through the
     /// `/api/v1/jobs/*` endpoints; see `admin::jobs`.
     pub jobs: Arc<JobRegistry>,
@@ -225,7 +225,7 @@ impl DaemonState {
             audit_log: cfg.audit_log,
             audit_dir: cfg.audit_dir,
             audit_ratelimiter: cfg.audit_ratelimiter,
-            cloud_backends: cfg.cloud_backends,
+            storage_backends: cfg.storage_backends,
             storage_config: cfg.storage_config,
             tiering: cfg.tiering,
             keystore_config: cfg.keystore_config,
@@ -286,7 +286,7 @@ mod tests {
             audit_log: None,
             audit_dir: dir.path().join("audit"),
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
-            cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
+            storage_backends: Arc::new(TokioMutex::new(HashMap::new())),
             storage_config: Arc::new(ObjectStoreConfig::default()),
             tiering: Arc::new(TieringConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),

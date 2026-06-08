@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // VTL L2 streaming-write throughput benchmark — extends perf_write
-// with an inline upload phase against a configured cloud backend.
+// with an inline upload phase against a configured storage backend.
 // Plumbs Cartridge::write_data → flush_and_seal → <configured backend>;
 // the harness-level "L2 − L1" delta exposes what the network upload
 // costs on top of the in-process chunker.
 //
 // Usage:
-//   cargo run --release -p core-mediachanger --example perf_cart_cloud -- \
+//   cargo run --release -p core-mediachanger --example perf_cart_storage -- \
 //     <config.yaml> <backend_name> <mode> <total_mb> <block_kib> [fixture]
 // where:
 //   config.yaml   = path to a daemon YAML conffile with `backend_name`
-//                   defined under `cloud.backends:`
+//                   defined under `storage.backends:`
 //                   (local / S3 / GCS / Azure)
-//   backend_name  = key under `cloud.backends:` to load
+//   backend_name  = key under `storage.backends:` to load
 //   mode          = fixed-128 | fastcdc | fastcdc-128 (see perf_write.rs)
 //   total_mb      = total bytes to write (MiB)
 //   block_kib     = host-write block size handed to write_data (KiB)
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&tapes_dir)?;
 
     println!(
-        "perf_cart_cloud: backend={backend_name} mode={mode} total={total_mb}MiB \
+        "perf_cart_storage: backend={backend_name} mode={mode} total={total_mb}MiB \
          block={block_kib}KiB fixture={fixture} chunking={:?}",
         chunking
     );

@@ -38,11 +38,11 @@ pub fn dispatch(
     state: Arc<DaemonState>,
 ) -> Result<(), String> {
     match kind {
-        "system.cloud_check" => {
+        "system.storage_check" => {
             // Handler lifted to the shared crate so VSA mounts the same
             // job; the per-product input is just the storage config.
             let _ = body;
-            tokio::spawn(shared_admin_cloud_check::run_cloud_check(
+            tokio::spawn(shared_admin_storage_check::run_storage_check(
                 emitter,
                 Arc::clone(&state.storage_config),
             ));
@@ -168,7 +168,7 @@ mod tests {
             audit_log: None,
             audit_dir: dir.join("audit"),
             audit_ratelimiter: Arc::new(AuditRateLimiter::new(Duration::from_secs(60))),
-            cloud_backends: Arc::new(TokioMutex::new(HashMap::new())),
+            storage_backends: Arc::new(TokioMutex::new(HashMap::new())),
             storage_config: Arc::new(ObjectStoreConfig::default()),
             tiering: Arc::new(core_mediachanger::TieringConfig::default()),
             keystore_config: Arc::new(shared_keystore::KeystoreYamlConfig::default()),

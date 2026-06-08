@@ -17,7 +17,7 @@
 //!
 //! Default listen address is `0.0.0.0:9090` — mirrors thurvtl's
 //! `:9090` posture so an operator running both daemons on the
-//! same host can scrape each port independently. CHAP / cloud
+//! same host can scrape each port independently. CHAP / storage
 //! secrets are out of band on this listener; volume mutations go
 //! through the admin Unix socket instead.
 //!

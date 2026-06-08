@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `cartridge.migrate` job — move or rebind a cartridge between
-//! cloud backends. Drives [`core_mediachanger::cartridge_migrate::run_migrate`].
+//! storage backends. Drives [`core_mediachanger::cartridge_migrate::run_migrate`].
 //!
 //! Body params: `{ "barcode": "...", "target_backend": "...",
 //!                 "mode": "move" | "rebind",
@@ -10,13 +10,13 @@
 //!                 "dry_run": false }`.
 //!
 //! Refuse-gates layered on top of the primitive:
-//!   - target backend named in `cloud-backends.json`
+//!   - target backend named in `storage-backends.json`
 //!   - source ≠ target (also caught by the primitive; checked here
 //!     for a clearer operator message)
 //!   - cartridge not loaded in any drive
 //!   - WORM cartridges require the target's `retention_mode` to be
 //!     governance or compliance
-//!   - migrate from a `local` backend (no cloud presence to copy
+//!   - migrate from a `local` backend (no storage presence to copy
 //!     from) is refused for `--mode=move`; `rebind` is still valid
 //!     for moving the cartridge's "binding" between local roots
 //!
@@ -383,11 +383,11 @@ async fn preflight(params: &MigrateParams, state: &DaemonState) -> Result<(), St
     if params.target_backend.is_empty() {
         return Err("target_backend must be non-empty".to_string());
     }
-    // Target backend must be defined under `cloud.backends:`.
+    // Target backend must be defined under `storage.backends:`.
     let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.target_backend) {
         return Err(format!(
-            "target backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",
+            "target backend '{}' not defined under `storage.backends:` in YAML conffile (known: {})",
             params.target_backend,
             names.join(", ")
         ));

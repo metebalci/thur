@@ -14,10 +14,10 @@
 //!
 //! - Entities are volumes (`pages.idx`), not cartridges
 //!   (`chunks.idx`); the report carries no `location` column because
-//!   `pages.idx` records no local/cloud tag.
+//!   `pages.idx` records no local/storage tag.
 //! - `pages.idx` records carry no chunk size, so sizes come from the
 //!   pool's `iter_chunks()`. A chunk a volume references but that has
-//!   been evicted to cloud-only is not locally sizeable — it is
+//!   been evicted to storage-only is not locally sizeable — it is
 //!   excluded from the byte figures (the page still counts toward
 //!   `allocated_pages`). `system stats` is a local-pool tuning view.
 

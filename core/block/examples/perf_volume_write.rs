@@ -4,7 +4,7 @@
 // VSA L1 streaming-write throughput benchmark — random data, in-process,
 // LocalBackend only. Counterpart of core/smc/examples/perf_write.rs on the
 // VTL side; the perf-layers harness compares this row against the higher
-// layers (L2 = +cloud, L3 = iSCSI raw, L4 = iSCSI+ext4).
+// layers (L2 = +storage, L3 = iSCSI raw, L4 = iSCSI+ext4).
 //
 // Usage:
 //   cargo run --release -p core-block --example perf_volume_write -- \
@@ -81,13 +81,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_SECTOR_BYTES
     );
 
-    // LocalBackend lives under <data_dir>/local-cloud so the chunk pool
+    // LocalBackend lives under <data_dir>/local-storage so the chunk pool
     // (which writes to <data_dir>/chunks/<backend>/...) is on the same
     // filesystem — matches the daemon's on-disk shape closely enough that
     // the L1 number is representative of a real LocalBackend deployment.
-    let cloud_root = data_dir.join("local-cloud");
-    std::fs::create_dir_all(&cloud_root)?;
-    let backend = LocalBackend::new(&cloud_root).await?;
+    let storage_root = data_dir.join("local-storage");
+    std::fs::create_dir_all(&storage_root)?;
+    let backend = LocalBackend::new(&storage_root).await?;
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let total_bytes: usize = total_mb * 1024 * 1024;
@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // flush_all drains every dirty page through the writer →
     // ChunkPool → LocalBackend. This captures the chunk-seal +
     // upload cost as a separate phase, mirroring perf_write's seal
-    // line. It's the "in-process" half of the cloud upload — L2
+    // line. It's the "in-process" half of the storage upload — L2
     // replaces LocalBackend with a real backend to expose what the
     // network adds on top.
     let flush_start = Instant::now();

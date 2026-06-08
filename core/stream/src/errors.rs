@@ -26,12 +26,12 @@ pub enum SmcError {
         actual: String,
     },
 
-    /// Chunk-level integrity failure: bytes fetched from the cloud
+    /// Chunk-level integrity failure: bytes fetched from the storage
     /// (refetch on cache miss, prefetcher, or thurvsa page read
     /// fallback) didn't hash to the content-address the caller asked
     /// for. Surfaced by `ChunkPool::insert_verified_bytes`. Distinct
     /// from `VerifyFailed` (LBA-keyed, block-level VERIFY opcode);
-    /// this one is chunk-keyed, surfaces a corrupted cloud object.
+    /// this one is chunk-keyed, surfaces a corrupted storage object.
     /// Mapped at the iSCSI layer to CHECK CONDITION + MEDIUM ERROR
     /// (0x03) + ASC/ASCQ 0x11/0x00 ("UNRECOVERED READ ERROR") so
     /// backup software treats it as a per-block read failure rather
@@ -39,28 +39,28 @@ pub enum SmcError {
     #[error("content hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch { expected: String, actual: String },
 
-    #[error("cloud error: {0}")]
+    #[error("storage error: {0}")]
     ObjectStoreError(String),
 
-    /// HTTP 412 Precondition Failed from a cloud op. On the legal-hold
+    /// HTTP 412 Precondition Failed from a storage op. On the legal-hold
     /// path this is "your AAD identity has the right role but the
     /// container's immutability policy disallows the requested
-    /// operation" — distinct from `CloudConflict` (a racing concurrent
+    /// operation" — distinct from `StorageConflict` (a racing concurrent
     /// change) and from the generic `ObjectStoreError` catch-all (5xx /
     /// throttling / unclassified). Carries the provider's response
     /// body so the operator can read the actual policy decision
     /// without diving into a server log.
-    #[error("cloud precondition failed (HTTP 412): {0}")]
-    CloudPreconditionFailed(String),
+    #[error("storage precondition failed (HTTP 412): {0}")]
+    StoragePreconditionFailed(String),
 
-    /// HTTP 409 Conflict from a cloud op. On the legal-hold path this
+    /// HTTP 409 Conflict from a storage op. On the legal-hold path this
     /// usually means an idempotent retry raced another writer (a
     /// concurrent `Set Blob Legal Hold`, container being recreated,
     /// container locked while we PUT). Distinct from
-    /// `CloudPreconditionFailed` so an operator can tell "policy says
+    /// `StoragePreconditionFailed` so an operator can tell "policy says
     /// no" from "try again later."
-    #[error("cloud conflict (HTTP 409): {0}")]
-    CloudConflict(String),
+    #[error("storage conflict (HTTP 409): {0}")]
+    StorageConflict(String),
 
     #[error("invalid session TSIH: {0}")]
     InvalidSession(u16),
@@ -145,7 +145,7 @@ pub enum SmcError {
     WormViolation,
 
     /// Cartridge under legal hold: any host write opcode is refused.
-    /// The held flag is read from the cloud sentinel
+    /// The held flag is read from the storage sentinel
     /// (`manifests/<barcode>/manifest-latest.json`) once at drive load
     /// and pinned for the duration of the load. Mapped at the iSCSI
     /// layer to CHECK CONDITION + DATA PROTECT (key 0x07) + ASC/ASCQ
@@ -218,7 +218,7 @@ pub enum SmcError {
 pub type Result<T> = std::result::Result<T, SmcError>;
 
 /// Bridge `shared_object_store::ObjectStoreError` into `SmcError`. Keeps every
-/// existing `?` propagation working unchanged after the cloud layer
+/// existing `?` propagation working unchanged after the storage layer
 /// was lifted out of core-mediachanger. Mapping is one-to-one against the
 /// pre-extraction variants:
 ///
@@ -228,8 +228,8 @@ pub type Result<T> = std::result::Result<T, SmcError>;
 ///   they exist to drive the object-store retry loop's fail-fast decision,
 ///   not to carry a distinct SCSI-sense meaning, so they collapse to the
 ///   generic message variant once they cross into core-mediachanger.
-/// - `ObjectStoreError::PreconditionFailed(msg)` → `SmcError::CloudPreconditionFailed(msg)`
-/// - `ObjectStoreError::Conflict(msg)` → `SmcError::CloudConflict(msg)`
+/// - `ObjectStoreError::PreconditionFailed(msg)` → `SmcError::StoragePreconditionFailed(msg)`
+/// - `ObjectStoreError::Conflict(msg)` → `SmcError::StorageConflict(msg)`
 /// - `ObjectStoreError::NotSupported(msg)` → `SmcError::NotSupported(msg)`
 /// - `ObjectStoreError::Compression(msg)` → `SmcError::CompressionError(msg)`
 /// - `ObjectStoreError::Io(e)` → `SmcError::Io(e)`
@@ -244,8 +244,8 @@ impl From<shared_object_store::ObjectStoreError> for SmcError {
             | O::RegionMismatch(s)
             | O::Network(s)
             | O::Timeout(s) => Self::ObjectStoreError(s),
-            O::PreconditionFailed(s) => Self::CloudPreconditionFailed(s),
-            O::Conflict(s) => Self::CloudConflict(s),
+            O::PreconditionFailed(s) => Self::StoragePreconditionFailed(s),
+            O::Conflict(s) => Self::StorageConflict(s),
             O::NotSupported(s) => Self::NotSupported(s),
             O::Compression(s) => Self::CompressionError(s),
             O::Io(e) => Self::Io(e),
@@ -271,7 +271,7 @@ impl From<shared_pool::ChunkPoolError> for SmcError {
 }
 
 /// Bridge `shared_upload_worker::UploadInertError` into `SmcError`.
-/// Keeps `Cartridge::upload_chunk_to_cloud`'s `?` propagation working
+/// Keeps `Cartridge::upload_chunk_to_storage`'s `?` propagation working
 /// after `upload_chunk_inert` moved into the shared crate. The shared
 /// error carries either a `ObjectStoreError` or a local IO failure
 /// (file read of the chunk's pool path); both fan out to the existing
@@ -290,7 +290,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cloud_error_routes_to_the_matching_smc_variant() {
+    fn storage_error_routes_to_the_matching_smc_variant() {
         let cases: Vec<(shared_object_store::ObjectStoreError, SmcError)> = vec![
             (
                 shared_object_store::ObjectStoreError::Other("x".into()),
@@ -298,11 +298,11 @@ mod tests {
             ),
             (
                 shared_object_store::ObjectStoreError::PreconditionFailed("p".into()),
-                SmcError::CloudPreconditionFailed("p".into()),
+                SmcError::StoragePreconditionFailed("p".into()),
             ),
             (
                 shared_object_store::ObjectStoreError::Conflict("c".into()),
-                SmcError::CloudConflict("c".into()),
+                SmcError::StorageConflict("c".into()),
             ),
             (
                 shared_object_store::ObjectStoreError::NotSupported("n".into()),
@@ -369,12 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn upload_inert_error_routes_cloud_and_io_arms() {
-        let cloud = shared_upload_worker::UploadInertError::ObjectStore(
+    fn upload_inert_error_routes_storage_and_io_arms() {
+        let storage = shared_upload_worker::UploadInertError::ObjectStore(
             shared_object_store::ObjectStoreError::Other("svc".into()),
         );
         assert!(matches!(
-            SmcError::from(cloud),
+            SmcError::from(storage),
             SmcError::ObjectStoreError(_)
         ));
 

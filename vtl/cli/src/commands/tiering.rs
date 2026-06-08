@@ -6,7 +6,7 @@
 //!
 //! The daemon owns the on-disk inventory during operation, so routing
 //! the walk through the admin socket gives a synchronized view and
-//! lets the daemon do the per-cartridge legal-hold cloud reads. The
+//! lets the daemon do the per-cartridge legal-hold storage reads. The
 //! CLI streams the job events, decodes the `TieringPlanReport` from the
 //! terminal Result line, and renders human or JSON output.
 //!

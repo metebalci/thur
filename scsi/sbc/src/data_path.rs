@@ -11,7 +11,7 @@
 //! affected page(s), splices the host bytes in at sector grain, and
 //! marks the page dirty for asynchronous flush. SYNCHRONIZE CACHE
 //! turns into a real fence — it awaits the cache's flush of every
-//! dirty page in the requested LBA range through to cloud-ack.
+//! dirty page in the requested LBA range through to storage-ack.
 //!
 //! COMPARE AND WRITE serializes through a per-LUN async mutex so
 //! the read+compare+write triple is atomic against other CAWs on
@@ -23,7 +23,7 @@
 //! UNMAP at sub-page grain zeros the affected sectors and marks
 //! the page dirty (so the next flush commits the partial erase).
 //! UNMAP that fully covers a page drops the cached entry and
-//! synchronously clears the page-index slot; the cloud-side chunk
+//! synchronously clears the page-index slot; the storage-side chunk
 //! lingers in the per-backend pool until `system gc` reclaims it.
 
 use std::collections::BTreeMap;
@@ -203,7 +203,7 @@ pub(super) async fn write(
 
 /// READ (10) / READ (16). Walks the requested LBA range through
 /// the cache; missing pages fall through to the underlying
-/// `VolumeWriter::read_page` (cloud or local pool) and unallocated
+/// `VolumeWriter::read_page` (storage or local pool) and unallocated
 /// pages return zeros per SBC-3 §5.7. Sub-sector reads work end-
 /// to-end via the cache. Reservation-gated for ExclusiveAccess /
 /// *_ExclusiveAccessRegistrantsOnly / ExclusiveAccessAllRegistrants
@@ -507,7 +507,7 @@ pub(super) async fn unmap(
 ///
 ///   00b  No compare. The device server reads each requested block
 ///        from medium and reports any unrecovered read errors. For
-///        a cloud-backed virtual volume that means the cache /
+///        a storage-backed virtual volume that means the cache /
 ///        VolumeWriter pipeline successfully resolved every page.
 ///   01b  Compare with data-out. Initiator supplies one block of
 ///        data per logical block; mismatch surfaces as MISCOMPARE.
@@ -1582,7 +1582,7 @@ fn build_failed_segment_details_response() -> Vec<u8> {
 /// sense. Internal validation errors that should have been caught
 /// upstream collapse to INVALID FIELD IN CDB (defensive); upload
 /// backpressure surfaces as NOT READY OPERATION IN PROGRESS so
-/// backup software retries; cloud / io / hash failures collapse to
+/// backup software retries; storage / io / hash failures collapse to
 /// MEDIUM ERROR + WRITE ERROR.
 fn map_write_error(e: &UploaderError) -> SenseData {
     match e {
@@ -2150,9 +2150,9 @@ mod tests {
         size_bytes: u64,
         worm: bool,
     ) -> Arc<PageCache> {
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),
@@ -3821,9 +3821,9 @@ mod tests {
         b: &str,
     ) -> (TempDir, Arc<PageCache>, Arc<PageCache>) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         for name in [a, b] {
             VolumeManifest::new(
@@ -3848,9 +3848,9 @@ mod tests {
     /// One independent volume backed by its own tempdir + LocalBackend.
     async fn fresh_volume(name: &str) -> (TempDir, Arc<PageCache>) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             name.into(),
@@ -4673,9 +4673,9 @@ mod tests {
     ) -> (TempDir, Arc<PageCache>, Arc<PageCache>) {
         use core_block::volume::VolumeEncryptionAlgorithm;
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         let mk = |name: &str| {
             VolumeManifest::new(
@@ -4842,10 +4842,10 @@ mod tests {
         // PARAMETER LIST and record the job Failed, never silently
         // corrupt the destination.
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
         let backend: Arc<dyn ObjectStoreBackend> =
-            Arc::new(LocalBackend::new(&cloud_root).await.unwrap());
+            Arc::new(LocalBackend::new(&storage_root).await.unwrap());
         let mk = |name: &str, page: u32| {
             VolumeManifest::new(
                 name.into(),

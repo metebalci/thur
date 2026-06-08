@@ -117,16 +117,16 @@ const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
 // Re-imported at the top of this module so existing handler bodies
 // keep building unchanged.
 
-/// Cloud-prefetch hook for the SCSI READ path. Peeks the loaded
+/// Storage-prefetch hook for the SCSI READ path. Peeks the loaded
 /// cartridge for the chunk backing the next read LBA and, if the
 /// local pool file is missing, pulls it from the cartridge's bound
-/// cloud backend (lazy-initialized via the shared
+/// storage backend (lazy-initialized via the shared
 /// [`ObjectStoreRegistry`]) and writes it into the pool. This
 /// covers two failure modes:
 ///   1. Cold-start daemon facing a wiped chunks directory (e.g.
 ///      operator nuked `/chunks/`, or the host was reimaged) —
 ///      the in-memory `Cartridge` was just opened by drive_manager
-///      with no cloud backend, so its sync read path has no
+///      with no storage backend, so its sync read path has no
 ///      refetch surface.
 ///   2. Cache eviction during a live iSCSI session that pruned a
 ///      chunk this drive's loaded cartridge had marked Both —
@@ -134,7 +134,7 @@ const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
 ///      drive's in-memory cartridge still believes Both.
 ///
 /// Best-effort: returns Ok if there's nothing to do (no chunk for
-/// the LBA, file already present, or cartridge cloud-blind by
+/// the LBA, file already present, or cartridge storage-blind by
 /// configuration). Any error is propagated to the caller, which
 /// logs it at debug and lets the sync read path surface its own
 /// I/O error.
@@ -163,7 +163,7 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 
     if next.store_path.is_file() {
         // The next read's chunk is already local — served without a
-        // cloud round-trip (a prefetch / earlier warm paid off).
+        // storage round-trip (a prefetch / earlier warm paid off).
         shared_telemetry::record::prefetch_hit();
         return Ok(());
     }
@@ -215,12 +215,12 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 
     let downloaded = bytes.len() as u64;
 
-    // The next read's chunk was missing and we waited on a cloud
+    // The next read's chunk was missing and we waited on a storage
     // download to serve it (a prefetch-miss).
     shared_telemetry::record::prefetch_miss();
 
     // Persist through the pool API rather than a raw `fs::write`. This
-    // (a) BLAKE3-verifies the cloud bytes against the expected hash
+    // (a) BLAKE3-verifies the storage bytes against the expected hash
     // before they enter the pool (closing the bit-rot / wrong-bytes gap
     // the raw write skipped), (b) does an atomic tmp+rename so a
     // concurrent reader never sees a torn file, and (c) lands in the
@@ -256,7 +256,7 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 
     // Attribute the downloaded bytes to the loaded cartridge's
     // lifetime `backend_bytes_read` counter. The sync read path
-    // (`read_block`) cannot bump it itself — the cloud fetch happens
+    // (`read_block`) cannot bump it itself — the storage fetch happens
     // here, outside `with_drive`, exactly so the drive lock is not
     // held across the await. Re-enter the lock for the cheap bump.
     // A miss (drive unloaded between the peek and here) just drops
@@ -275,8 +275,8 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 /// the next read needs (blocking, for read correctness), this fans the
 /// `chunks_ahead` chunks *following* it out to the shared
 /// [`PrefetchManager`], which downloads them in the background so a
-/// sequential restore doesn't stall on cloud latency chunk-by-chunk.
-/// Best-effort: a disabled knob, a cloud-blind cartridge, an empty
+/// sequential restore doesn't stall on storage latency chunk-by-chunk.
+/// Best-effort: a disabled knob, a storage-blind cartridge, an empty
 /// look-ahead, or an unreachable backend all simply no-op.
 ///
 /// The manager is driven from here rather than from `Cartridge` because
@@ -416,13 +416,13 @@ async fn get_or_build_prefetch_manager(
     )
 }
 
-/// Read the cloud sentinel
+/// Read the storage sentinel
 /// (`manifests/<barcode>/manifest-latest.json`) and return whether
 /// legal-hold is on. Best-effort: any failure (backend doesn't support
 /// legal hold, sentinel missing, network error) returns `false` — the
-/// auto-hold-on-upload worker is the safety net for cloud-side
+/// auto-hold-on-upload worker is the safety net for storage-side
 /// preservation, and the host gets the conservative "not held" surface
-/// rather than blocking writes on transient cloud problems.
+/// rather than blocking writes on transient storage problems.
 ///
 /// Lazy-inits the bound backend in the shared registry on first miss
 /// (mirroring `ensure_chunk_local_for_next_read`) so the same handle
@@ -717,7 +717,7 @@ fn dispatch_scsi(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
 // wraps `handle_scsi_command` in `tokio::task::spawn_blocking` so the
 // sync `Cartridge` operations (which can park on `PoolBudget` for up
 // to `backpressure_max_wait_seconds`) never wedge an async worker. No
-// `await` allowed inside any handler. Cloud-hitting work stays in
+// `await` allowed inside any handler. Storage-hitting work stays in
 // `serve_connection` around the dispatch (legal-hold post-hook,
 // chunk prefetch).
 //

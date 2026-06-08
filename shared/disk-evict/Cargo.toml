@@ -14,7 +14,7 @@ workspace = true
 # half byte-for-byte); the genuinely shared pieces live here so they
 # can't drift. The per-product wakeup source (VTL: upload-completion
 # Notify + backstop; VSA: interval) and the actual evict call (VTL's
-# async cloud-backup evict vs VSA's sync fs-only evict) stay in each
+# async storage-backup evict vs VSA's sync fs-only evict) stay in each
 # daemon — only the cap-resolution and the within-budget alert/log
 # decision are lifted.
 

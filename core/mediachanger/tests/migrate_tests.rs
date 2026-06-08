@@ -38,7 +38,7 @@ async fn seed_cartridge(
 ) -> Vec<Vec<u8>> {
     let backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(bucket).await.expect("test setup"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         tapes,
         label,
         CartridgeOpenMode::Create {
@@ -70,12 +70,14 @@ async fn seed_cartridge(
         .map(|(id, _, _)| id)
         .collect();
     for id in pending {
-        cart.upload_chunk_to_cloud(id).await.expect("upload chunk");
+        cart.upload_chunk_to_storage(id)
+            .await
+            .expect("upload chunk");
     }
 
-    cart.backup_manifest_to_cloud()
+    cart.backup_manifest_to_storage()
         .await
-        .expect("backup_manifest_to_cloud");
+        .expect("backup_manifest_to_storage");
     drop(cart);
     written
 }
@@ -265,7 +267,7 @@ async fn migrate_move_global_dedup_round_trip() {
     // Re-open against the new backend; reads still match the fixture.
     let target_again: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes,
         "TAPE001",
         CartridgeOpenMode::Open,
@@ -472,7 +474,7 @@ async fn migrate_rebind_verify_happy_path() {
     // Reads off the new backend match the fixture.
     let target_again: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&dst_bucket).await.expect("test setup"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes,
         "TAPE_RB",
         CartridgeOpenMode::Open,

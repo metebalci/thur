@@ -17,7 +17,7 @@ workspace = true
 core-block = { path = "../../core/block" }
 shared-admin-audit = { path = "../../shared/admin-audit" }
 shared-admin-auth = { path = "../../shared/admin-auth" }
-shared-admin-cloud-check = { path = "../../shared/admin-cloud-check" }
+shared-admin-storage-check = { path = "../../shared/admin-storage-check" }
 shared-admin-http = { path = "../../shared/admin-http" }
 shared-admin-iscsi = { path = "../../shared/admin-iscsi" }
 shared-admin-monitor = { path = "../../shared/admin-monitor" }
@@ -37,7 +37,7 @@ shared-iscsi = { path = "../../shared/iscsi", features = ["http"] }
 shared-keystore = { path = "../../shared/keystore" }
 shared-naming = { path = "../../shared/naming" }
 # PoolBudget + per-backend chunk-pool gate. Daemon constructs one
-# `Arc<PoolBudget>` per `cloud.backends` entry at boot, threads it
+# `Arc<PoolBudget>` per `storage.backends` entry at boot, threads it
 # into every VolumeWriter via discover_and_register, and drives the
 # eviction worker.
 shared-pool = { path = "../../shared/pool" }

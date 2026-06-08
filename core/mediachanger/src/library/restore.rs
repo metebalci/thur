@@ -3,7 +3,7 @@
 
 //! Cross-region DR restore driver — `thurvtl library restore`.
 //!
-//! Bring a fresh host up from a cold mirror bucket. The cloud bucket
+//! Bring a fresh host up from a cold mirror bucket. The storage bucket
 //! already holds, per cartridge:
 //!   manifests/<barcode>/manifest-latest.json   (sentinel)
 //!   manifests/<barcode>/manifest-<ts>.json     (versioned)
@@ -12,11 +12,11 @@
 //!   chunks/.../<hash>.dat                       (content-addressed pool)
 //!
 //! This module wraps the single-cartridge cold-bucket primitive
-//! ([`Cartridge::open_with_cloud_async`] in
+//! ([`Cartridge::open_with_storage_async`] in
 //! `core/ssc/src/cartridge/mod.rs::load_manifest_async`) with a
 //! discovery + batch driver. Chunks are NOT downloaded here; they
 //! lazy-load on first host READ via the existing
-//! `read_block_async` cloud-refetch path. Restore is metadata-only.
+//! `read_block_async` storage-refetch path. Restore is metadata-only.
 
 use crate::cartridge::{Cartridge, CartridgeOpenMode};
 use crate::errors::Result;
@@ -77,7 +77,7 @@ impl RestoreReport {
 /// are returned — index-page-only entries (torn upload, in-progress
 /// new cartridge) are skipped silently. Result is sorted
 /// lexicographically.
-pub async fn discover_cloud_cartridges(backend: &dyn ObjectStoreBackend) -> Result<Vec<String>> {
+pub async fn discover_storage_cartridges(backend: &dyn ObjectStoreBackend) -> Result<Vec<String>> {
     let keys = backend.list_objects("manifests/").await?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for key in keys {
@@ -117,7 +117,7 @@ pub async fn run_restore(
     allow_existing: bool,
     dry_run: bool,
 ) -> Result<RestoreReport> {
-    let discovered = discover_cloud_cartridges(backend).await?;
+    let discovered = discover_storage_cartridges(backend).await?;
 
     let filter_set: BTreeSet<&str> = barcode_filter.iter().map(|s| s.as_str()).collect();
     let (selected, filtered_out): (Vec<String>, Vec<String>) =
@@ -162,7 +162,7 @@ pub async fn run_restore(
             });
             continue;
         }
-        let result = Cartridge::open_with_cloud_async(
+        let result = Cartridge::open_with_storage_async(
             tapes_dir,
             barcode,
             CartridgeOpenMode::Open,
@@ -201,7 +201,7 @@ mod tests {
     /// open path treats it as a legacy manifest (no per-partition
     /// blocks index needed for the test). Manifest carries the
     /// canonical fields `Cartridge::open` insists on.
-    fn write_cloud_sentinel(backend_dir: &Path, barcode: &str) {
+    fn write_storage_sentinel(backend_dir: &Path, barcode: &str) {
         let sentinel = backend_dir.join(format!("manifests/{barcode}/manifest-latest.json"));
         fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         let body = format!(
@@ -214,7 +214,7 @@ mod tests {
 
     /// Write only an index-page object — no sentinel. Mimics a torn
     /// upload (page-uploads went through, sentinel-write crashed).
-    fn write_cloud_orphan_page(backend_dir: &Path, barcode: &str) {
+    fn write_storage_orphan_page(backend_dir: &Path, barcode: &str) {
         let page = backend_dir.join(format!("manifests/{barcode}/chunks/page-000000.dat"));
         fs::create_dir_all(page.parent().unwrap()).unwrap();
         fs::write(&page, b"orphan-page").unwrap();
@@ -224,10 +224,10 @@ mod tests {
     async fn discover_returns_sorted_sentinel_only() {
         let dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(dir.path()).await.unwrap();
-        write_cloud_sentinel(dir.path(), "TAPE002");
-        write_cloud_sentinel(dir.path(), "TAPE001");
-        write_cloud_orphan_page(dir.path(), "TAPE_TORN");
-        let found = discover_cloud_cartridges(&backend).await.unwrap();
+        write_storage_sentinel(dir.path(), "TAPE002");
+        write_storage_sentinel(dir.path(), "TAPE001");
+        write_storage_orphan_page(dir.path(), "TAPE_TORN");
+        let found = discover_storage_cartridges(&backend).await.unwrap();
         assert_eq!(found, vec!["TAPE001".to_string(), "TAPE002".to_string()]);
     }
 
@@ -235,7 +235,7 @@ mod tests {
     async fn discover_empty_backend_returns_empty() {
         let dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(dir.path()).await.unwrap();
-        let found = discover_cloud_cartridges(&backend).await.unwrap();
+        let found = discover_storage_cartridges(&backend).await.unwrap();
         assert!(found.is_empty(), "{:?}", found);
     }
 
@@ -243,7 +243,7 @@ mod tests {
     async fn run_restore_dry_run_writes_nothing() {
         let backend_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
-        write_cloud_sentinel(backend_dir.path(), "TAPE001");
+        write_storage_sentinel(backend_dir.path(), "TAPE001");
 
         let data_dir = TempDir::new().unwrap();
         let tapes = data_dir.path().join("tapes");
@@ -271,7 +271,7 @@ mod tests {
         // we care about is failure-isolation.
         let backend_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
-        write_cloud_sentinel(backend_dir.path(), "TAPE_A");
+        write_storage_sentinel(backend_dir.path(), "TAPE_A");
         let bad = backend_dir
             .path()
             .join("manifests/TAPE_B/manifest-latest.json");
@@ -305,9 +305,9 @@ mod tests {
     async fn run_restore_barcode_filter_attempts_only_selected() {
         let backend_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
-        write_cloud_sentinel(backend_dir.path(), "TAPE001");
-        write_cloud_sentinel(backend_dir.path(), "TAPE002");
-        write_cloud_sentinel(backend_dir.path(), "TAPE003");
+        write_storage_sentinel(backend_dir.path(), "TAPE001");
+        write_storage_sentinel(backend_dir.path(), "TAPE002");
+        write_storage_sentinel(backend_dir.path(), "TAPE003");
 
         let data_dir = TempDir::new().unwrap();
         let tapes = data_dir.path().join("tapes");
@@ -342,7 +342,7 @@ mod tests {
     async fn run_restore_existing_dir_skipped_or_failed() {
         let backend_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
-        write_cloud_sentinel(backend_dir.path(), "TAPE001");
+        write_storage_sentinel(backend_dir.path(), "TAPE001");
 
         let data_dir = TempDir::new().unwrap();
         let tapes = data_dir.path().join("tapes");

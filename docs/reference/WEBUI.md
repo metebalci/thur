@@ -120,7 +120,7 @@ One read handler is deliberately left off the TCP surface: VTL's
 `legal_hold_status`. It is the single read endpoint that performs
 network backend I/O (it queries the object store's lock state), and
 keeping the TCP surface local-state-only means a Web UI poll can never
-fan out into cloud calls.
+fan out into storage calls.
 
 ## The auth dependency
 

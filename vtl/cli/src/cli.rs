@@ -634,7 +634,7 @@ enum CartridgeAction {
         #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
         multi: u32,
 
-        /// Cloud backend name to bind this cartridge to.
+        /// Storage backend name to bind this cartridge to.
         ///
         /// Required when the config defines multiple backends in
         /// `storage.backends`; optional (and inferred) when only one
@@ -650,7 +650,7 @@ enum CartridgeAction {
         /// MEDIUM / ALLOW OVERWRITE are refused outright. Sticky for
         /// the cartridge's lifetime. The chosen backend must have
         /// retention_mode set (governance or compliance) — the
-        /// bucket-level immutability is what enforces WORM cloud-side.
+        /// bucket-level immutability is what enforces WORM storage-side.
         #[arg(long)]
         worm: bool,
 
@@ -658,7 +658,7 @@ enum CartridgeAction {
         ///
         /// `global` joins the shared per-backend pool — identical
         /// bytes from any pair of `global` cartridges on the same
-        /// backend collapse into one pool file / one cloud object
+        /// backend collapse into one pool file / one storage object
         /// (cross-cartridge dedup, the headline storage feature).
         /// `local` namespaces every chunk under the cartridge's
         /// barcode — chunks are isolated per-cartridge (compliance /
@@ -689,7 +689,7 @@ enum CartridgeAction {
         keystore: Option<String>,
     },
 
-    /// Archive a cartridge to a different cloud backend.
+    /// Archive a cartridge to a different storage backend.
     ///
     /// Produces a frozen, self-contained snapshot at
     /// `archives/<barcode>/<label>/` on the target backend.
@@ -713,7 +713,7 @@ enum CartridgeAction {
         dry_run: bool,
     },
 
-    /// Move a cartridge to a different cloud backend.
+    /// Move a cartridge to a different storage backend.
     ///
     /// Same barcode, same logical identity; only the bound backend
     /// changes. Two modes: `move` copies every chunk + manifest
@@ -789,12 +789,12 @@ enum CartridgeAction {
         barcode: String,
     },
 
-    /// Per-cartridge legal hold (cloud-native).
+    /// Per-cartridge legal hold (storage-native).
     ///
     /// Provider primitives are the only source of truth — no local
     /// "is held" flag is kept. Refuses against the local backend.
     /// Applies the hold to every chunk + manifest backup the
-    /// cartridge references on its bound cloud backend.
+    /// cartridge references on its bound storage backend.
     LegalHold {
         #[command(subcommand)]
         action: LegalHoldAction,
@@ -849,7 +849,7 @@ enum CartridgeKeyAction {
 
 #[derive(Subcommand)]
 enum LegalHoldAction {
-    /// Engage legal hold on the cartridge's cloud objects.
+    /// Engage legal hold on the cartridge's storage objects.
     Set {
         /// Cartridge barcode.
         barcode: String,
@@ -866,7 +866,7 @@ enum LegalHoldAction {
         reason: Option<String>,
     },
 
-    /// Release legal hold on the cartridge's cloud objects.
+    /// Release legal hold on the cartridge's storage objects.
     Clear {
         /// Cartridge barcode.
         barcode: String,
@@ -882,7 +882,7 @@ enum LegalHoldAction {
         reason: Option<String>,
     },
 
-    /// Read legal-hold state from the cloud provider.
+    /// Read legal-hold state from the storage provider.
     ///
     /// Defaults to a single sentinel read on
     /// `manifests/<barcode>/manifest-latest.json` — the apply/clear
@@ -971,17 +971,17 @@ enum LibraryAction {
         json: bool,
     },
 
-    /// Restore cartridges from a cloud backend after disaster recovery.
+    /// Restore cartridges from a storage backend after disaster recovery.
     ///
     /// Walks `manifests/` under the named backend, downloads each
     /// cartridge's manifest + index pages, and populates storage
     /// slots in barcode-sort order. Requires the `library:` block in
     /// thurvtl.yaml to be set and the daemon to have started at
     /// least once (so `library.json` is materialized — chassis
-    /// topology is not cloud-replicated). Chunks lazy-load on first
+    /// topology is not storage-replicated). Chunks lazy-load on first
     /// host read.
     Restore {
-        /// Cloud backend name to restore from.
+        /// Storage backend name to restore from.
         ///
         /// Required when `storage.backends:` in the YAML conffile declares
         /// more than one backend; inferred when exactly one is configured.
@@ -1047,7 +1047,7 @@ enum LibraryAction {
     /// Run the SPC-4 self-test against the changer LUN.
     ///
     /// Walks library.json + inventory.json + every cartridge's
-    /// manifest.json, and probes every configured cloud backend.
+    /// manifest.json, and probes every configured storage backend.
     /// Result is stamped into the LU0 ring buffer so the next host
     /// RECEIVE DIAGNOSTIC RESULTS reflects this CLI-issued probe.
     /// Exit 0 on PASS, 1 on FAIL.

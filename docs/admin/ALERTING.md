@@ -24,7 +24,7 @@ noisier in practice).
 
 | Class | Severity | Source | Dedup key |
 |---|---|---|---|
-| `backend_reachability` | error / info | `system.cloud_check` job — operator-invoked `system storage check` (both products, shared handler in `shared-admin-cloud-check`) — plus the opt-in `storage.check_interval_seconds` periodic ticker (both products) | `<backend>:<failure\|recovery>` |
+| `backend_reachability` | error / info | `system.storage_check` job — operator-invoked `system storage check` (both products, shared handler in `shared-admin-storage-check`) — plus the opt-in `storage.check_interval_seconds` periodic ticker (both products) | `<backend>:<failure\|recovery>` |
 | `audit_failure` | error | `shared/audit/src/audit_channel.rs` writer task on `AuditLog::append` Err (disk write / fsync / chain-state), via a function-pointer hook installed at boot (avoids the shared-alerting → shared-audit dep cycle) | `<op>` |
 | `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve`; VSA `lru.idx` sidecar persistently unwritable (eviction degrades to first-seen), latched once per volume in `core/block/src/uploader.rs` | `<backend>:watermark` / `<backend>:backpressure` / `<volume>:lru_index` |
 | `chap_failures` | warn | `shared/iscsi/src/transport.rs` CHAP path, surfaced by the daemon's `LoginAuditSink` adapter (VTL `IscsiLibraryLoginAudit`, VSA `IscsiDiskLoginAudit`). Per-user counter in the dispatcher; WARN fires once the user crosses `alerting.chap_failures_threshold` (default 3) inside one window | `chap:<user>` |
@@ -261,6 +261,6 @@ Both daemons:
    `list` verb show the real type without re-reading YAML.
 
 Resolved (issue #74): the periodic backend-reachability ticker
-(`storage.check_interval_seconds`) and VSA's `system.cloud_check` job
+(`storage.check_interval_seconds`) and VSA's `system.storage_check` job
 both shipped — the job handler + ticker now live in the shared
-`shared-admin-cloud-check` crate, mounted on both daemons.
+`shared-admin-storage-check` crate, mounted on both daemons.

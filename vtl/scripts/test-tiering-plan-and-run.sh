@@ -12,7 +12,7 @@
 # style of test-lifecycle-cartridge-migrate.sh: the cartridges carry no
 # sealed data, which is enough surface for the policy-engine + migrate-
 # primitive wiring these tests assert. End-to-end tiering with real
-# chunks + legal-hold exclusion against a cloud backend lives in
+# chunks + legal-hold exclusion against a storage backend lives in
 # test-tiering-legal-hold-interaction.sh.
 #
 # This script asserts:

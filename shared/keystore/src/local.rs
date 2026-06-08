@@ -16,7 +16,7 @@
 //! disk to do anything with it.
 //!
 //! Threat model documented in `docs/admin/ENCRYPTION.md` § VSA volume
-//! encryption. In short: protects ciphertext in cloud buckets +
+//! encryption. In short: protects ciphertext in storage buckets +
 //! local pool against a bucket leak / cold-disk theft; does **not**
 //! protect against a compromised thurvsad host (the daemon
 //! has to be able to read the key to write encrypted volumes). KMS /

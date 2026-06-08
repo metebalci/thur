@@ -23,7 +23,7 @@ shared-crypto = { path = "../../shared/crypto" }
 shared-pool = { path = "../../shared/pool" }
 # Telemetry record::* free functions consumed by cartridge / disk_cache.
 shared-telemetry = { path = "../../shared/telemetry" }
-# Cloud-upload pipeline scaffolding lifted out so the block product
+# Storage-upload pipeline scaffolding lifted out so the block product
 # can share PendingUpload / UploadOutcome / upload_chunk_inert. The
 # cartridge module re-exports these types under their historical names
 # (PendingUploadPayload / ChunkUploadOutcome) for call-site continuity.
@@ -55,5 +55,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tempfile = "3"
 # Property-based tests over FastCDC find_cut / StreamingChunker::feed.
 proptest = "1"
-# In-memory CloudBackend mock for the legal-hold unit tests.
+# In-memory StorageBackend mock for the legal-hold unit tests.
 async-trait = "0.1"

@@ -3,7 +3,7 @@
 
 //! Library-side legal-hold helpers.
 //!
-//! The cartridge sentinel logic + cloud-key collection lives in
+//! The cartridge sentinel logic + storage-key collection lives in
 //! `core_stream::legal_hold` (Step 5 Milestone 5.B.1). What stays here
 //! is the inventory-aware "is this cartridge currently mounted in a
 //! drive?" lookup — it reads `LibraryInventory`, which is smc-side

@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 //
-// First-party cloud-backend throughput benchmark — dev wrapper.
+// First-party storage-backend throughput benchmark — dev wrapper.
 //
 // Operators on a packaged install should prefer the daemon-down CLI
-// verbs `thurvtl system cloud benchmark` / `thurvsa system
-// cloud benchmark`, which parse the daemon YAML conffile and call the
+// verbs `thurvtl system storage benchmark` / `thurvsa system
+// storage benchmark`, which parse the daemon YAML conffile and call the
 // same engine via `shared-object-store-bench`. This example exists so
 // developers can drive the engine against an ad-hoc YAML file without
 // building either CLI binary.
@@ -23,15 +23,15 @@ use shared_object_store_bench::{BenchOptions, BenchTarget};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(about = "First-party cloud-backend throughput benchmark (dev)")]
+#[command(about = "First-party storage-backend throughput benchmark (dev)")]
 struct Args {
-    /// Path to a daemon YAML conffile carrying a `cloud.backends:`
+    /// Path to a daemon YAML conffile carrying a `storage.backends:`
     /// block. Required.
     #[arg(long)]
     config: PathBuf,
 
     /// Backend name to benchmark. Repeatable. Defaults to every
-    /// backend defined under `cloud.backends:` (deterministic order).
+    /// backend defined under `storage.backends:` (deterministic order).
     #[arg(long = "backend")]
     backends: Vec<String>,
 
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if backend_names.is_empty() {
         return Err(format!(
-            "no backends defined under `cloud.backends:` in {:?}",
+            "no backends defined under `storage.backends:` in {:?}",
             args.config
         )
         .into());

@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared cloud backend configuration parsing and validation.
+//! Shared storage backend configuration parsing and validation.
 //!
 //! Used by both `thurvtld` (on startup) and `thurvtl`
-//! (`cloud check` command) so they parse `thurvtl.yaml` identically
+//! (`storage check` command) so they parse `thurvtl.yaml` identically
 //! and exercise the same validation steps.
 
 use crate::azure::AzureBackend;
@@ -83,7 +83,7 @@ pub struct ObjectStoreConfig {
     pub check_interval_seconds: u64,
 }
 
-/// One named entry in `cloud.backends`. The discriminant is the YAML
+/// One named entry in `storage.backends`. The discriminant is the YAML
 /// `type:` field — exactly one of S3 / GCS / Azure / Local per entry,
 /// enforced by the enum shape.
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
@@ -121,7 +121,7 @@ impl BackendEntry {
     }
 }
 
-/// Operator-declared bucket immutability mode for a cloud backend.
+/// Operator-declared bucket immutability mode for a storage backend.
 /// Validated against the bucket's actual `lock_state()` at startup;
 /// any mismatch is a hard fail. The bucket is the contract — this
 /// field tells Thur VTL what to expect, not what to configure.
@@ -405,7 +405,7 @@ pub struct AzureBackendConfig {
     #[serde(default)]
     pub prefix: String,
     /// Optional custom endpoint URL. Use `http://127.0.0.1:10000/<account>`
-    /// for Azurite, or a sovereign-cloud endpoint. When omitted the SDK
+    /// for Azurite, or a sovereign-storage endpoint. When omitted the SDK
     /// defaults to `https://<account>.blob.core.windows.net`.
     #[serde(default)]
     pub endpoint_url: Option<String>,
@@ -456,7 +456,7 @@ pub struct UploadConfig {
     /// memory per backend per cartridge. The auto cap of 16 keeps
     /// the in-flight footprint at 128 MiB per backend per cartridge
     /// for 8 MiB chunks while capturing most of the available
-    /// throughput on cloud backends (S3 / GCS / Azure all saturate
+    /// throughput on storage backends (S3 / GCS / Azure all saturate
     /// well before c=32 on a single 10 Gbps link).
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
@@ -517,13 +517,13 @@ impl Default for UploadConfig {
     }
 }
 
-/// YAML schema for `cloud.compression`. `algorithm` accepts
+/// YAML schema for `storage.compression`. `algorithm` accepts
 /// `none` / `lz4` / `zstd` (lowercase strings); when `none`, the
 /// upload worker uploads chunks uncompressed. `level` only applies
 /// to `zstd` and is ignored for `lz4` and `none`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CompressionConfigYaml {
-    #[serde(default = "default_cloud_algorithm")]
+    #[serde(default = "default_storage_algorithm")]
     pub algorithm: CompressionAlgoYaml,
     #[serde(default = "default_compression_level")]
     pub level: i32,
@@ -531,7 +531,7 @@ pub struct CompressionConfigYaml {
 
 /// Algorithm choice as it appears in YAML — adds an explicit `none`
 /// variant on top of the core `CompressionAlgo` enum so operators can
-/// disable cloud-side compression with a single key.
+/// disable storage-side compression with a single key.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionAlgoYaml {
@@ -540,7 +540,7 @@ pub enum CompressionAlgoYaml {
     Zstd,
 }
 
-fn default_cloud_algorithm() -> CompressionAlgoYaml {
+fn default_storage_algorithm() -> CompressionAlgoYaml {
     CompressionAlgoYaml::Zstd
 }
 fn default_compression_level() -> i32 {
@@ -675,7 +675,7 @@ impl ObjectStoreConfig {
         };
         // Wrap every constructed backend in the meta-cache. Call sites
         // can't bypass — once the registry hands a Box<dyn ObjectStoreBackend>
-        // back, every cloud op rides through the cache. Memoizes
+        // back, every storage op rides through the cache. Memoizes
         // upload + positive HEAD facts; singleflights concurrent PUTs
         // to the same key (the GCS-mkfs zero-page collapse). Versioned
         // writes use upload_versioned, which the wrapper passes through
@@ -721,34 +721,6 @@ impl ObjectStoreConfig {
     }
 }
 
-/// Refuse to start if a legacy `<data_dir>/cloud-backends.json` is
-/// still present — pre-alpha.2 installs kept backend definitions in
-/// that file, which has since moved into the YAML conffile under
-/// `cloud.backends:`. The daemon halts rather than silently ignore the
-/// stale state.
-pub fn reject_legacy_cloud_backends_json(
-    data_dir: &std::path::Path,
-    config_path: &std::path::Path,
-) -> std::result::Result<(), String> {
-    let legacy = data_dir.join("cloud-backends.json");
-    if !legacy.exists() {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to start: {legacy} exists.\n\
-         \n\
-         Cloud backend definitions now live in the YAML conffile.\n\
-         Copy each entry from {legacy} into the `cloud.backends:`\n\
-         block of {config_path}, then remove {legacy}. The JSON\n\
-         shape maps 1:1 to YAML — keys and field names are unchanged.\n\
-         \n\
-         See the Thur docs (docs/admin/AUTH.md) at\n\
-         https://github.com/metebalci/thur for the YAML shape per provider.",
-        legacy = legacy.display(),
-        config_path = config_path.display(),
-    ))
-}
-
 impl CompressionConfigYaml {
     pub fn to_core(&self) -> CoreCompressionConfig {
         let algo = match self.algorithm {
@@ -760,11 +732,11 @@ impl CompressionConfigYaml {
     }
 }
 
-/// Coarse classification of a cloud-check failure, so callers can render
+/// Coarse classification of a storage-check failure, so callers can render
 /// a short, human-readable diagnosis and tailored hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// Could not reach the cloud provider at all (DNS, TCP, TLS, wrong endpoint URL).
+    /// Could not reach the storage provider at all (DNS, TCP, TLS, wrong endpoint URL).
     Network,
     /// Provider rejected the credentials (missing, expired, signature mismatch).
     Auth,
@@ -797,7 +769,7 @@ impl FailureKind {
     pub fn diagnosis(self) -> &'static str {
         match self {
             FailureKind::Network => {
-                "Cannot reach the cloud provider — DNS, network, TLS, or endpoint URL."
+                "Cannot reach the storage provider — DNS, network, TLS, or endpoint URL."
             }
             FailureKind::Auth => {
                 "Credentials were rejected — missing, expired, or wrong access key / secret."
@@ -823,7 +795,7 @@ impl FailureKind {
                 "\
               - DNS: can the host resolve the provider hostname?\n\
               - Outbound HTTPS (TCP 443) reachable? Try: curl -v https://<bucket>.s3.<region>.amazonaws.com/\n\
-              - For MinIO/Wasabi: is cloud.s3.endpoint_url correct and reachable?\n\
+              - For MinIO/Wasabi: is storage.s3.endpoint_url correct and reachable?\n\
               - Proxy / firewall blocking the connection?"
             }
             FailureKind::Auth => {
@@ -835,7 +807,7 @@ impl FailureKind {
             }
             FailureKind::Authz => {
                 "\
-              Cloud permissions for Thur VTL split across two surfaces:\n\
+              Storage permissions for Thur VTL split across two surfaces:\n\
               data plane (chunks/manifests) AND, only for WORM backends with\n\
               retention_mode != none, the management plane (lock_state query).\n\
               \n\
@@ -867,12 +839,12 @@ impl FailureKind {
             FailureKind::NotFound => {
                 "\
               - Does the bucket exist? (`aws s3 ls` or `gsutil ls`)\n\
-              - Is cloud.<backend>.bucket spelled correctly?\n\
+              - Is storage.<backend>.bucket spelled correctly?\n\
               - For GCS: is project_id correct?"
             }
             FailureKind::RegionMismatch => {
                 "\
-              - Set cloud.s3.region to the bucket's actual region.\n\
+              - Set storage.s3.region to the bucket's actual region.\n\
               - Check with: aws s3api get-bucket-location --bucket <name>"
             }
             FailureKind::Timeout => {
@@ -957,10 +929,10 @@ pub(crate) fn http_status_to_failure_kind(status: u16) -> FailureKind {
     }
 }
 
-/// Errors returned by cloud config / validation operations.
+/// Errors returned by storage config / validation operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreConfigError {
-    #[error("backend name '{0}' not defined under `cloud.backends:` in the YAML conffile")]
+    #[error("backend name '{0}' not defined under `storage.backends:` in the YAML conffile")]
     UnknownBackend(String),
     #[error(
         "auth env var '{0}' is not set. The backend's `auth` block names \
@@ -1060,11 +1032,11 @@ pub struct ObjectStoreCheckStep {
     pub detail: String,
 }
 
-/// Validate that a single named cloud backend is reachable and has
+/// Validate that a single named storage backend is reachable and has
 /// the permissions Thur VTL needs (list, write, delete).
 ///
 /// For the `local` backend this only verifies that the backend can be
-/// constructed (the root directory is writable), since there is no cloud
+/// constructed (the root directory is writable), since there is no storage
 /// authentication or network round-trip to test.
 ///
 /// `step_cb` is called after each successful step so callers can render
@@ -1185,7 +1157,7 @@ async fn check_retention_state<F: FnMut(ObjectStoreCheckStep)>(
                 // Provider-aware vocabulary. "Object Lock" on AWS,
                 // "retention policy" on GCS, "immutability policy"
                 // on Azure — the operator-facing message uses the
-                // term they'll find in their cloud's own UI.
+                // term they'll find in their storage's own UI.
                 let bt = cfg
                     .backend_entry(name)
                     .ok()
@@ -1306,7 +1278,7 @@ async fn probe_data_plane<F: FnMut(ObjectStoreCheckStep)>(
     // S3Backend / GcsBackend prepend their configured prefix internally,
     // so we must pass RELATIVE paths here, not the full key with prefix.
     let configured_prefix = cfg.prefix_named(name);
-    let test_key_rel = ".thurvtl-cloud-check";
+    let test_key_rel = ".thurvtl-storage-check";
     // For human-readable messages only:
     let display_prefix = configured_prefix.to_string();
     let display_key = format!("{}{}", configured_prefix, test_key_rel);
@@ -1379,13 +1351,13 @@ mod tests {
 
     /// Parse a YAML snippet into the full ObjectStoreConfig.
     fn parse(s: &str) -> ObjectStoreConfig {
-        serde_yaml::from_str(s).expect("cloud config parses")
+        serde_yaml::from_str(s).expect("storage config parses")
     }
 
     /// Alias retained for tests that only exercise the
     /// upload/compression/skip-flag side without a backends block.
     fn parse_cfg(yaml: &str) -> ObjectStoreConfig {
-        serde_yaml::from_str(yaml).expect("cloud config parses")
+        serde_yaml::from_str(yaml).expect("storage config parses")
     }
 
     #[test]
@@ -1659,7 +1631,7 @@ backends:
 
     #[test]
     fn empty_backends_map_validates_ok() {
-        // An empty `cloud.backends:` map is fine at boot — cartridge /
+        // An empty `storage.backends:` map is fine at boot — cartridge /
         // volume ops that reference a backend fail at op time with
         // `UnknownBackend`. The daemon itself starts cleanly.
         let cfg = parse("backends: {}");
@@ -2087,7 +2059,7 @@ backends:
     // ----- FailureKind diagnostic strings --------------------------
     //
     // `label` / `diagnosis` / `hints` are pure lookup tables wired
-    // into the CLI's `cloud check` output; pin every variant so a
+    // into the CLI's `storage check` output; pin every variant so a
     // missing arm fails the build.
 
     #[test]
@@ -2167,31 +2139,6 @@ backends:
         assert_eq!(mismatch.kind(), FailureKind::Other);
         // Display formatting carries the backend name.
         assert!(format!("{mismatch}").contains("'n'"));
-    }
-
-    // ----- reject_legacy_cloud_backends_json -----------------------
-
-    #[test]
-    fn reject_legacy_json_passes_when_absent() {
-        let temp = tempfile::TempDir::new().unwrap();
-        reject_legacy_cloud_backends_json(
-            temp.path(),
-            std::path::Path::new("/etc/thurvtl/thurvtl.yaml"),
-        )
-        .expect("absent legacy file is OK");
-    }
-
-    #[test]
-    fn reject_legacy_json_refuses_when_present() {
-        let temp = tempfile::TempDir::new().unwrap();
-        std::fs::write(temp.path().join("cloud-backends.json"), "{}").unwrap();
-        let err = reject_legacy_cloud_backends_json(
-            temp.path(),
-            std::path::Path::new("/etc/thurvtl/thurvtl.yaml"),
-        )
-        .expect_err("legacy file must refuse start");
-        assert!(err.contains("cloud-backends.json"));
-        assert!(err.contains("cloud.backends:"));
     }
 
     // ----- CompressionConfigYaml::to_core --------------------------

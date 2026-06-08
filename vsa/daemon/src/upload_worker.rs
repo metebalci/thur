@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Async cloud-upload worker for VSA. Block-side counterpart to
+//! Async storage-upload worker for VSA. Block-side counterpart to
 //! `vtl/daemon/src/upload_worker.rs`.
 //!
 //! Architecture:
@@ -14,13 +14,13 @@
 //! - This worker drains the receiver, looks up the volume's
 //!   `VolumeWriter` via the registry, runs
 //!   `shared_upload_worker::upload_chunk_inert` against the volume's
-//!   cloud backend (which does the cloud-side HEAD probe under
+//!   storage backend (which does the storage-side HEAD probe under
 //!   `Global` dedup), and on success calls
 //!   `VolumeWriter::apply_page_upload_outcome` — which flips the
 //!   sidecar back to `Uploaded` and notifies any
 //!   `PageCache::synchronize_bytes` waiter parked on the page range.
 //! - A [`Semaphore`] caps in-flight uploads at the operator's
-//!   `cloud.upload.max_concurrent` (mirrors VTL's knob; sentinel `0`
+//!   `storage.upload.max_concurrent` (mirrors VTL's knob; sentinel `0`
 //!   resolves to `min(16, num_cpus * 4)`).
 //!
 //! Why not [`shared_upload_worker::run_upload_pipeline`]? That
@@ -34,7 +34,7 @@
 //! Crash recovery: on daemon boot
 //! [`scan_and_enqueue_localonly`] walks every volume's
 //! `upload.idx`, finds pages still marked `LocalOnly` (chunk in
-//! pool, cloud PUT never acked), and re-enqueues them through the
+//! pool, storage PUT never acked), and re-enqueues them through the
 //! same channel. The worker drains them indistinguishably from
 //! live writes.
 
@@ -188,7 +188,7 @@ async fn run_one_task(
 
 /// Crash-recovery scan. Walks every volume under `data_dir`, opens
 /// each `upload.idx`, and re-enqueues a task for every page still
-/// marked `LocalOnly` (pool chunk present but cloud PUT never
+/// marked `LocalOnly` (pool chunk present but storage PUT never
 /// acked). Called at daemon boot before any host write path is
 /// live.
 ///

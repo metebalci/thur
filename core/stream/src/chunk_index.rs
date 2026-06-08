@@ -14,7 +14,7 @@
 //!
 //! Last-accessed timestamps for disk-cache LRU eviction live in a
 //! separate `lru.idx` sidecar (`lru_index.rs`) — they're a local
-//! cache hint and don't belong in the cloud-replicated index.
+//! cache hint and don't belong in the storage-replicated index.
 //! Splitting them out keeps `chunks.idx` pages clean during reads,
 //! so the manifest-backup path stops shipping deltas on read-only
 //! workloads.
@@ -92,7 +92,7 @@ pub const VERSION: u32 = 1;
 // Flag layout (1 byte):
 //   bit 0     hash_present (1 = sealed, 0 = unsealed staging chunk)
 //   bit 1     uploaded
-//   bits 2-3  location (0=LocalOnly, 1=CloudOnly, 2=Both)
+//   bits 2-3  location (0=LocalOnly, 1=StorageOnly, 2=Both)
 //   bits 4-6  compression (0=None, 1=Lz4, 2=Zstd, 3=Sldc, 4..=7 reserved)
 //   bit 7     reserved
 const FLAG_HASH_PRESENT: u8 = 0b0000_0001;
@@ -108,7 +108,7 @@ use crate::compression_codec::{pack_compression, unpack_compression};
 #[repr(u8)]
 pub enum LocationTag {
     LocalOnly = 0,
-    CloudOnly = 1,
+    StorageOnly = 1,
     Both = 2,
     // 3 reserved
 }
@@ -117,7 +117,7 @@ impl LocationTag {
     fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::LocalOnly),
-            1 => Some(Self::CloudOnly),
+            1 => Some(Self::StorageOnly),
             2 => Some(Self::Both),
             _ => None,
         }
@@ -127,7 +127,7 @@ impl LocationTag {
 /// One chunk index record, in memory. 64 bytes on disk.
 ///
 /// `hash` is the lowercase hex form of the chunk's BLAKE3 (matches the
-/// rest of the codebase — `ChunkStore` paths, cloud keys, and audit
+/// rest of the codebase — `ChunkStore` paths, storage keys, and audit
 /// records are all hex). The on-disk format stores the raw 32-byte
 /// digest; hex translation happens at this struct's boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,7 +394,7 @@ impl ChunkIndexFile {
         &self.path
     }
 
-    /// Borrow the dirty-page tracker. Used by the cloud-backup path
+    /// Borrow the dirty-page tracker. Used by the storage-backup path
     /// to snapshot dirty pages before uploading and to clear them
     /// after each successful PUT.
     pub fn dirty_tracker(&self) -> &DirtyPageTracker {
@@ -499,7 +499,7 @@ mod tests {
         let r = ChunkRec {
             size: 1024,
             hash: Some(sample_hash(0x01)),
-            location: LocationTag::CloudOnly,
+            location: LocationTag::StorageOnly,
             uploaded: true,
             compression: Some(CompressionAlgo::Lz4),
         };

@@ -214,7 +214,7 @@ for the entire operation:
    (`log`, `progress`, `result`, `done`) until the terminal `Done`.
 
 Job kinds (`vtl/daemon/src/admin/job_dispatch/mod.rs`): `system.gc`,
-`system.verify`, `system.stats`, `system.cloud_check` (legacy name; CLI verb is `system storage check`),
+`system.verify`, `system.stats`, `system.storage_check` (CLI verb `system storage check`),
 `system.audit.{tail,export,verify,rotate}`,
 `system.{library,drive}.self_test`, `system.alerting.test`,
 `cartridge.{migrate,archive}`, `library.restore_archive`.
@@ -238,7 +238,7 @@ can replay the full transcript.
   asks whether the chunks the manifests claim to exist are actually
   present, with the right size and within-bounds block records. A storage
   sweep is on by default and can be skipped with `--skip-storage`; when
-  active it HEADs every `CloudOnly` and `Both` chunk, every index-page
+  active it HEADs every `StorageOnly` and `Both` chunk, every index-page
   object, and the `manifest-latest.json` sentinel. Implementation:
   `core/mediachanger/src/verify.rs`. On VSA the same verb walks each
   volume's `pages.idx` (header integrity + every referenced chunk

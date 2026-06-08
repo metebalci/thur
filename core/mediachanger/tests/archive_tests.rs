@@ -34,7 +34,7 @@ async fn seed(
 ) -> Vec<Vec<u8>> {
     let backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(bucket).await.expect("backend"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         tapes,
         label,
         CartridgeOpenMode::Create {
@@ -65,11 +65,13 @@ async fn seed(
         .map(|(id, _, _)| id)
         .collect();
     for id in pending {
-        cart.upload_chunk_to_cloud(id).await.expect("upload chunk");
+        cart.upload_chunk_to_storage(id)
+            .await
+            .expect("upload chunk");
     }
-    cart.backup_manifest_to_cloud()
+    cart.backup_manifest_to_storage()
         .await
-        .expect("backup_manifest_to_cloud");
+        .expect("backup_manifest_to_storage");
     drop(cart);
     written
 }
@@ -142,7 +144,7 @@ async fn archive_global_dedup_round_trip() {
     // Local pool path is preferred — every chunk should come from
     // the local pool here since we just sealed.
     assert_eq!(report.chunks_from_local_pool, report.chunks_total);
-    assert_eq!(report.chunks_from_source_cloud, 0);
+    assert_eq!(report.chunks_from_source_storage, 0);
 
     // Source cartridge is unmodified.
     let src_manifest_after = fs::read(tapes.join("TAPE_A1").join("manifest.json")).expect("read");

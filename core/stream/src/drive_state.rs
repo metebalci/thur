@@ -15,7 +15,7 @@
 //! `DriveManager` at daemon startup; written atomically (tmp +
 //! rename) every time a host issues MODE SELECT with SP=1.
 //! Deliberately *not* part of any cartridge's `manifest.json` — the
-//! manifest rides through the cloud-backup pipeline and may live on
+//! manifest rides through the storage-backup pipeline and may live on
 //! a retention-locked / object-locked backend, whereas drive-side
 //! configuration must remain freely re-writable. Same local-only
 //! treatment as `lru.idx`.

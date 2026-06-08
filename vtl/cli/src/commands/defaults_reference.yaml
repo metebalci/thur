@@ -344,7 +344,7 @@ storage:
 # `thurvtl system tiering plan` to preview the migrations these
 # policies would trigger (it walks the inventory and prints proposed
 # per-cartridge moves with byte estimates). Cartridges under a
-# cloud-native legal hold are always excluded. Each `migrate_to` must
+# storage-native legal hold are always excluded. Each `migrate_to` must
 # name a backend defined under `storage.backends:`; the daemon refuses
 # to start otherwise.
 tiering:
@@ -542,7 +542,7 @@ keystore:
 # Off by default; flip enabled to true and list at least one sink.
 # Five event classes fire alerts: audit-log append failures, CHAP login
 # failures (per-user threshold), disk-cache watermark /
-# backpressure-timeout, cloud-backend reachability
+# backpressure-timeout, storage-backend reachability
 # (operator-invoked `system storage check`), and orphaned storage
 # objects. Each class has an on/off knob under `events:`.
 #

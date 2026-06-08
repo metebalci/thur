@@ -8,7 +8,7 @@
 //! ERASE), active partition (mutated by LOCATE), pending partition
 //! layout (staged by MODE SELECT 0x11), host-set capacity
 //! proportion (SET CAPACITY), the index-backup epoch map (refreshed
-//! by every cloud manifest backup), and four lifetime byte counters
+//! by every storage manifest backup), and four lifetime byte counters
 //! — host/backend, written/read — that show the host-vs-backend
 //! contrast (dedup + compression saving on the write side, cache
 //! effectiveness on the read side).
@@ -128,20 +128,20 @@ pub(super) struct Runtime {
 
     /// Lifetime plaintext bytes served to the host on READ — counted
     /// after drive-side decrypt + decompress. Counts reads satisfied
-    /// from the local pool and from a cloud refetch alike.
+    /// from the local pool and from a storage refetch alike.
     /// `#[serde(default)]` so a pre-counter `runtime.json` (which had
     /// only `host_bytes_written`) reads this back as 0.
     #[serde(default)]
     pub host_bytes_read: u64,
 
-    /// Lifetime on-wire bytes PUT to cloud for this cartridge's
+    /// Lifetime on-wire bytes PUT to storage for this cartridge's
     /// chunks — post-dedup, post-compression, i.e. the real backend
     /// storage cost. `#[serde(default)]` for the same legacy-file
     /// reason.
     #[serde(default)]
     pub backend_bytes_written: u64,
 
-    /// Lifetime bytes fetched from cloud on a chunk cache miss
+    /// Lifetime bytes fetched from storage on a chunk cache miss
     /// (live-session prefetch hook + the async refetch path). The
     /// downloaded chunk bytes as they land in the pool.
     /// `#[serde(default)]` for the same legacy-file reason.

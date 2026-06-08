@@ -30,7 +30,7 @@ use shared_dedup_stats::{EntityScan, compute_dedup};
 pub struct LocationCounts {
     pub local_only: u64,
     pub both: u64,
-    pub cloud_only: u64,
+    pub storage_only: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -242,7 +242,7 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
             match rec.location {
                 LocationTag::LocalOnly => location.local_only += 1,
                 LocationTag::Both => location.both += 1,
-                LocationTag::CloudOnly => location.cloud_only += 1,
+                LocationTag::StorageOnly => location.storage_only += 1,
             }
         }
 
@@ -303,7 +303,10 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
         b.logical_bytes = b.logical_bytes.saturating_add(c.logical_bytes);
         b.location.local_only = b.location.local_only.saturating_add(c.location.local_only);
         b.location.both = b.location.both.saturating_add(c.location.both);
-        b.location.cloud_only = b.location.cloud_only.saturating_add(c.location.cloud_only);
+        b.location.storage_only = b
+            .location
+            .storage_only
+            .saturating_add(c.location.storage_only);
     }
     for bd in backend_dedup {
         if let Some(b) = backend_map.get_mut(&bd.backend) {
@@ -347,7 +350,7 @@ mod tests {
             size,
             hash: Some(hash.to_string()),
             location,
-            uploaded: matches!(location, LocationTag::Both | LocationTag::CloudOnly),
+            uploaded: matches!(location, LocationTag::Both | LocationTag::StorageOnly),
             compression: None,
         })
         .unwrap();
@@ -369,7 +372,7 @@ mod tests {
         let t2 = tapes.join("TAPE002");
         write_manifest(&t2, "TAPE002", "primary", "global");
         let cif2 = ChunkIndexFile::open_or_create(&t2).unwrap();
-        append_sealed(&cif2, &hex_hash(0xAA), 1024, LocationTag::CloudOnly);
+        append_sealed(&cif2, &hex_hash(0xAA), 1024, LocationTag::StorageOnly);
         append_sealed(&cif2, &hex_hash(0xCC), 4096, LocationTag::Both);
         cif2.fsync().unwrap();
 
@@ -380,7 +383,7 @@ mod tests {
         assert_eq!(b.unique_pool_bytes, 7168);
         assert_eq!(b.location.both, 2);
         assert_eq!(b.location.local_only, 1);
-        assert_eq!(b.location.cloud_only, 1);
+        assert_eq!(b.location.storage_only, 1);
 
         let t1_stats = r
             .cartridges

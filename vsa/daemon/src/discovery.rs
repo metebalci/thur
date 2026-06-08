@@ -53,7 +53,7 @@ pub struct DiscoveredVolume {
 #[allow(clippy::too_many_arguments)]
 pub async fn discover_and_register(
     data_dir: &Path,
-    cloud: &ObjectStoreConfig,
+    storage: &ObjectStoreConfig,
     keystore_config: &KeystoreYamlConfig,
     max_concurrent_flushes: usize,
     pool_budgets: &HashMap<String, Arc<PoolBudget>>,
@@ -145,14 +145,14 @@ pub async fn discover_and_register(
         if backends.contains_key(&m.backend) {
             continue;
         }
-        if !cloud.backends.contains_key(&m.backend) {
+        if !storage.backends.contains_key(&m.backend) {
             return Err(anyhow!(
-                "volume '{}' references storage backend '{}' which is not defined under `cloud.backends:` in the YAML conffile",
+                "volume '{}' references storage backend '{}' which is not defined under `storage.backends:` in the YAML conffile",
                 m.name,
                 m.backend
             ));
         }
-        let backend_box = cloud
+        let backend_box = storage
             .create_backend_named(&m.backend)
             .await
             .with_context(|| {
@@ -171,12 +171,12 @@ pub async fn discover_and_register(
         tokio::spawn(async move {
             match warmup_arc.warmup_prefix("chunks/").await {
                 Ok(n) => tracing::info!(
-                    "cloud cache warmup: seeded {} chunks/ keys for backend '{}'",
+                    "storage cache warmup: seeded {} chunks/ keys for backend '{}'",
                     n,
                     warmup_name
                 ),
                 Err(e) => tracing::warn!(
-                    "cloud cache warmup failed for backend '{}': {} (continuing with cold cache)",
+                    "storage cache warmup failed for backend '{}': {} (continuing with cold cache)",
                     warmup_name,
                     e
                 ),
@@ -187,7 +187,7 @@ pub async fn discover_and_register(
 
     // One KeyStoreBackend per unique encryption.keystore_backend
     // referenced in the discovered manifests. Same shape as the
-    // cloud-backend cache above; mounted into AdminState so admin
+    // storage-backend cache above; mounted into AdminState so admin
     // handlers re-use the authenticated KMS / Vault clients.
     let mut keystores: BTreeMap<String, Arc<dyn KeyStoreBackend>> = BTreeMap::new();
     for m in &manifests {
@@ -373,9 +373,9 @@ backends:
     #[tokio::test]
     async fn empty_data_dir_returns_empty_registry() {
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
 
         let (reg, vols, _caches, _backends, _keystores) = discover_and_register(
             tmp.path(),
@@ -396,9 +396,9 @@ backends:
     #[tokio::test]
     async fn assigns_luns_in_alphabetical_order() {
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
 
         create_volume(tmp.path(), "zeta", "devbox");
         create_volume(tmp.path(), "alpha", "devbox");
@@ -428,9 +428,9 @@ backends:
         // End-to-end smoke: discovery → registry → SCSI handler →
         // INQUIRY against the discovered LUN comes back GOOD.
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
         create_volume(tmp.path(), "vol1", "devbox");
 
         let (registry, vols, _caches, _backends, _keystores) = discover_and_register(
@@ -476,9 +476,9 @@ backends:
     #[tokio::test]
     async fn unknown_backend_in_manifest_is_rejected() {
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
 
         // Volume points at a backend name not in thurvsa.yaml.
         create_volume(tmp.path(), "vol1", "ghost");
@@ -534,9 +534,9 @@ backends:
         // discovery with both names + the LUN in the error message,
         // so the operator can pick which one to renumber.
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
 
         create_volume_with_lun(tmp.path(), "alpha", "devbox", 5);
         create_volume_with_lun(tmp.path(), "beta", "devbox", 5);
@@ -571,9 +571,9 @@ backends:
         // around the explicit one. Proves the migration path doesn't
         // collide with already-pinned LUNs.
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
 
         create_volume_with_lun(tmp.path(), "pinned", "devbox", 0);
         create_volume(tmp.path(), "auto_a", "devbox");
@@ -604,9 +604,9 @@ backends:
         // Two volumes pointing at the same backend should not blow
         // the daemon up — and discovery should succeed end-to-end.
         let tmp = TempDir::new().expect("tempdir");
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-        let cfg = local_storage_config(&cloud_root);
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+        let cfg = local_storage_config(&storage_root);
         create_volume(tmp.path(), "a", "devbox");
         create_volume(tmp.path(), "b", "devbox");
 

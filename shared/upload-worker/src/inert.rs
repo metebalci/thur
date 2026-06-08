@@ -27,7 +27,7 @@ pub enum UploadInertError {
 }
 
 /// Stateless companion to per-product `pending_upload_payload`
-/// helpers: performs the cloud-side dedup probe (under
+/// helpers: performs the storage-side dedup probe (under
 /// [`DedupScope::Global`]) and PUT against an externally-supplied
 /// backend, without holding any per-product borrow. Returns the
 /// outcome so the owning cartridge / volume can apply manifest /
@@ -43,9 +43,9 @@ pub async fn upload_chunk_inert(
 ) -> Result<UploadOutcome, UploadInertError> {
     let object_key = payload.object_key.clone();
 
-    // Cloud-side dedup HEAD probe is only useful under `Global`
+    // Storage-side dedup HEAD probe is only useful under `Global`
     // scope, where a sibling cartridge / volume may have already
-    // uploaded the same hash. Under `Local` the cloud key is
+    // uploaded the same hash. Under `Local` the storage key is
     // namespaced by construction, so the HEAD is guaranteed to miss
     // — wasted round-trip per chunk.
     if matches!(payload.dedup, DedupScope::Global) {
@@ -53,7 +53,7 @@ pub async fn upload_chunk_inert(
         if backend.chunk_exists(&object_key).await? {
             shared_telemetry::record::chunk_storage_head_hit(&payload.backend_name);
             tracing::debug!(
-                "Cloud-side dedup hit for item {} (hash {}..); skipping upload",
+                "Storage-side dedup hit for item {} (hash {}..); skipping upload",
                 payload.item_id,
                 &payload.hash[..8.min(payload.hash.len())]
             );
@@ -79,7 +79,7 @@ pub async fn upload_chunk_inert(
         })?;
     let logical_bytes = data.len() as u64;
     tracing::debug!(
-        "Uploading item {} (hash {}..) to cloud: {} ({} bytes)",
+        "Uploading item {} (hash {}..) to storage: {} ({} bytes)",
         payload.item_id,
         &payload.hash[..8.min(payload.hash.len())],
         object_key,
@@ -119,7 +119,7 @@ mod tests {
     async fn put_then_head_hit_short_circuits_under_global() {
         let (tmp, backend) = local_backend().await;
         let local = tmp.path().join("payload.dat");
-        std::fs::write(&local, b"hello cloud").unwrap();
+        std::fs::write(&local, b"hello storage").unwrap();
 
         let p = PendingUpload {
             item_id: 7,
@@ -131,11 +131,11 @@ mod tests {
         };
 
         // First PUT — `put_bytes` is the on-wire size (LocalBackend
-        // does not compress, so it equals the 11-byte payload).
+        // does not compress, so it equals the 13-byte payload).
         let o1 = upload_chunk_inert(backend.as_ref(), &p).await.unwrap();
         assert!(!o1.dedup_hit);
-        assert_eq!(o1.put_bytes, Some(11));
-        // Second call sees cloud HEAD hit; no PUT, dedup_hit=true,
+        assert_eq!(o1.put_bytes, Some(13));
+        // Second call sees storage HEAD hit; no PUT, dedup_hit=true,
         // and `put_bytes` is None so the caller doesn't double-count.
         let o2 = upload_chunk_inert(backend.as_ref(), &p).await.unwrap();
         assert!(o2.dedup_hit);
@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_probe_error_propagates_as_cloud_error_and_no_put_attempted() {
+    async fn head_probe_error_propagates_as_storage_error_and_no_put_attempted() {
         use crate::test_support::MockBackend;
         use shared_object_store::ObjectStoreError;
 
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_error_after_head_miss_propagates_as_cloud_error() {
+    async fn put_error_after_head_miss_propagates_as_storage_error() {
         use crate::test_support::MockBackend;
         use shared_object_store::ObjectStoreError;
 

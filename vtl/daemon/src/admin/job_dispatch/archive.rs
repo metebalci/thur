@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `cartridge.archive` job — snapshot a cartridge to a different
-//! cloud backend as a frozen, self-contained blob.
+//! storage backend as a frozen, self-contained blob.
 //!
 //! Drives [`core_mediachanger::cartridge_archive::run_archive`].
 //!
@@ -10,7 +10,7 @@
 //!                 "label": "...",
 //!                 "dry_run": false }`.
 //!
-//! Refuse-gates: target backend named in cloud-backends.json,
+//! Refuse-gates: target backend named in storage-backends.json,
 //! source ≠ target (the archive prefix would collide with the live
 //! cartridge's manifest backups under shared backend), cartridge not
 //! loaded in a drive, target's `retention_mode` matches WORM state
@@ -187,7 +187,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
                 "chunks_total": report.chunks_total,
                 "chunks_uploaded": report.chunks_uploaded,
                 "chunks_from_local_pool": report.chunks_from_local_pool,
-                "chunks_from_source_cloud": report.chunks_from_source_cloud,
+                "chunks_from_source_storage": report.chunks_from_source_storage,
                 "bytes_uploaded": report.bytes_uploaded,
                 "index_files_uploaded": report.index_files_uploaded,
                 "dry_run": report.dry_run,
@@ -224,7 +224,7 @@ async fn preflight(params: &ArchiveParams, state: &DaemonState) -> Result<(), St
     let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.target_backend) {
         return Err(format!(
-            "target backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",
+            "target backend '{}' not defined under `storage.backends:` in YAML conffile (known: {})",
             params.target_backend,
             names.join(", ")
         ));

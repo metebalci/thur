@@ -7,7 +7,7 @@
 //! shape. They differed only in their wakeup source (VTL wakes on an
 //! upload-completion `Notify` plus a backstop tick; VSA ticks on a
 //! fixed interval) and in the actual evict call (VTL's
-//! `evict_lru_chunks` is async and backs chunks up to cloud before
+//! `evict_lru_chunks` is async and backs chunks up to storage before
 //! deleting; VSA's is a synchronous fs-only trim).
 //!
 //! This crate lifts the two pieces that are genuinely identical:

@@ -12,8 +12,8 @@
 //!   confirm every barcode in inventory has a readable
 //!   `tapes/<barcode>/manifest.json`, and run the full
 //!   `validate_object_store_backend` probe (auth + write + delete) against
-//!   every named entry in `cloud.backends`. Mirrors the operator-side
-//!   `thurvtl system cloud check`.
+//!   every named entry in `storage.backends`. Mirrors the operator-side
+//!   `thurvtl system storage check`.
 //! - **LU1+ (sequential-access drive)**: if a cartridge is loaded,
 //!   re-read its `manifest.json` and confirm it parses; if no cartridge
 //!   is loaded, the test is a trivial pass.
@@ -37,7 +37,7 @@ use scsi_ssc::drive_manager::DriveManager;
 /// LU0 self-test. Walks `<data_dir>/library/library.json` +
 /// `inventory.json`, confirms every barcode in inventory has a
 /// readable `manifest.json`, and runs the full
-/// `validate_object_store_backend` probe against every named cloud backend.
+/// `validate_object_store_backend` probe against every named storage backend.
 /// Returns the first failure as a `DiagnosticEntry::fail` so
 /// SEND DIAGNOSTIC can surface CHECK CONDITION immediately.
 pub async fn run_library_diagnostic(
@@ -165,7 +165,7 @@ mod tests {
     use core_mediachanger::ObjectStoreConfig;
 
     /// A `ObjectStoreConfig` with no named backends — the library
-    /// diagnostic skips the cloud-probe loop entirely.
+    /// diagnostic skips the storage-probe loop entirely.
     fn empty_storage_config() -> ObjectStoreConfig {
         ObjectStoreConfig::default()
     }

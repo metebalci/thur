@@ -10,7 +10,7 @@
 //!   manifests + page indexes and the per-backend chunk pool under
 //!   `<data_dir>/chunks/<backend>/...`. Symmetric to thurvtl's
 //!   `data_dir`.
-//! - `cloud`: the shared `ObjectStoreConfig` schema (named `backends:`
+//! - `storage`: the shared `ObjectStoreConfig` schema (named `backends:`
 //!   map + retry / compression knobs) consumed by
 //!   `shared-object-store`'s backend constructors.
 //! - `iscsi.auth`: optional CHAP block. Schema mirrors thurvtl's
@@ -95,7 +95,7 @@ pub struct DaemonConfig {
 /// Mirrors thurvtl's `disk_cache:` block byte-for-byte — both
 /// products share the same `shared_pool::PoolBudget` primitive and
 /// the same `disk_cache_size_gb` per-entry override on
-/// `cloud-backends.json`.
+/// `storage-backends.json`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiskCacheSettings {
     /// Default per-backend disk-cache budget. Either an explicit GB
@@ -105,7 +105,7 @@ pub struct DiskCacheSettings {
     /// floored at `min_size_gb`. Multi-backend installs with several
     /// `auto` entries split the 50%-of-free share evenly so two
     /// `auto` backends can't combined commit 100% of free space.
-    /// Individual `cloud-backends.json` entries may override per-
+    /// Individual `storage-backends.json` entries may override per-
     /// entry via their own `disk_cache_size_gb` field — same shape
     /// (`auto | <gb>`).
     #[serde(default)]
@@ -135,7 +135,7 @@ pub struct DiskCacheSettings {
     /// surfacing SBC-3 NOT READY + ASC/ASCQ 0x04/0x07. Host backup
     /// software treats that as transient and retries. Tune up only
     /// if the eviction worker's recovery latency outruns the
-    /// cloud's PUT-then-HEAD cadence.
+    /// storage's PUT-then-HEAD cadence.
     #[serde(default = "default_backpressure_max_wait_seconds")]
     pub backpressure_max_wait_seconds: u64,
     /// How often the eviction worker re-scans every backend's pool
@@ -714,8 +714,8 @@ mod tests {
 
     #[test]
     fn loads_minimal_config() {
-        // Backends moved to <data_dir>/cloud-backends.json; YAML only
-        // carries cloud.upload/compression/skip_retention_mode_check.
+        // Backends moved to <data_dir>/storage-backends.json; YAML only
+        // carries storage.upload/compression/skip_retention_mode_check.
         let f = write_config(
             r#"
 data_dir: /var/lib/thurvsa

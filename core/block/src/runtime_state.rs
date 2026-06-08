@@ -31,17 +31,17 @@ pub struct VolumeRuntime {
     /// UNMAP; reset to 0 at create.
     pub host_bytes_written: u64,
     /// Bytes served to the host for READs — logical, pre-dedup. Counts
-    /// reads satisfied from cache and from cloud alike.
+    /// reads satisfied from cache and from storage alike.
     /// `#[serde(default)]` so a pre-counter `runtime.json` (which had
     /// only `host_bytes_written`) deserialises this to 0.
     #[serde(default)]
     pub host_bytes_read: u64,
-    /// Bytes actually PUT to cloud for this volume — post-dedup,
+    /// Bytes actually PUT to storage for this volume — post-dedup,
     /// post-compression, i.e. the real backend storage cost.
     /// `#[serde(default)]` for the same legacy-file reason.
     #[serde(default)]
     pub backend_bytes_written: u64,
-    /// Bytes fetched from cloud on a page cache miss. Decompressed
+    /// Bytes fetched from storage on a page cache miss. Decompressed
     /// page bytes — equal to the on-wire size while chunks are stored
     /// uncompressed (VSA does not currently compress volume chunks).
     /// `#[serde(default)]` for the same legacy-file reason.
@@ -162,15 +162,15 @@ mod tests {
         assert_eq!(r.backend_bytes_read, 0);
         // Default `sync_after` is the safest tier — explicit so a
         // future change to the enum default doesn't silently flip
-        // newly-created volumes off cloud-durable.
+        // newly-created volumes off storage-durable.
         assert_eq!(r.sync_after, SyncAfter::Storage);
     }
 
     #[test]
-    fn legacy_runtime_json_without_sync_after_defaults_to_cloud() {
+    fn legacy_runtime_json_without_sync_after_defaults_to_storage() {
         // Pre-knob runtime.json had only host_bytes_written +
         // modified_at. Deserialise with `#[serde(default)]` and
-        // make sure the missing fields land on safe defaults — Cloud
+        // make sure the missing fields land on safe defaults — Storage
         // for sync_after, 0 for the three later counter fields.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("runtime.json");

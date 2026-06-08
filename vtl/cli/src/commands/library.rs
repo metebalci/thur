@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::output::{create_table, format_bytes, with_host_ratio};
 
-/// Restore cartridges from a cloud backend (cross-region DR).
+/// Restore cartridges from a storage backend (cross-region DR).
 ///
 /// Daemon-down. Discovers every cartridge with a `manifest-latest.json`
 /// sentinel under the named backend's `manifests/` prefix, pulls each
@@ -17,7 +17,7 @@ use crate::output::{create_table, format_bytes, with_host_ratio};
 /// lazy-load on first host read once the daemon starts. Requires
 /// the `library:` block to be configured in thurvtl.yaml and the
 /// daemon to have started at least once so `library.json` is
-/// materialized — chassis topology is not cloud-replicated.
+/// materialized — chassis topology is not storage-replicated.
 pub async fn cmd_restore(
     data_dir: &str,
     config_path: &str,
@@ -36,7 +36,7 @@ pub async fn cmd_restore(
     if !library_root.join("library.json").exists() {
         anyhow::bail!(
             "library not initialized at {}; configure `library:` in /etc/thurvtl/thurvtl.yaml and start the daemon once \
-             so it materializes library.json (chassis topology is not cloud-replicated and must be operator-declared)",
+             so it materializes library.json (chassis topology is not storage-replicated and must be operator-declared)",
             library_root.display()
         );
     }
@@ -44,17 +44,17 @@ pub async fn cmd_restore(
     // Parse the daemon's YAML conffile. We read it directly because
     // the daemon is down — every other CLI verb routes through the
     // admin socket so the daemon owns the live state.
-    let cloud_cfg = load_storage_config_from_yaml(config_path)?;
+    let storage_cfg = load_storage_config_from_yaml(config_path)?;
 
     // Resolve the backend name: --backend wins, otherwise infer when
     // exactly one is configured (mirrors `cartridge create`).
     let backend_name = match backend_arg {
         Some(name) => name.to_string(),
         None => {
-            let names = cloud_cfg.backend_names();
+            let names = storage_cfg.backend_names();
             match names.len() {
                 0 => anyhow::bail!(
-                    "no backends defined under `cloud.backends:` in {}; add one before restoring",
+                    "no backends defined under `storage.backends:` in {}; add one before restoring",
                     config_path
                 ),
                 1 => names
@@ -62,7 +62,7 @@ pub async fn cmd_restore(
                     .next()
                     .expect("len() == 1 implies one element"),
                 _ => anyhow::bail!(
-                    "--backend NAME is required when `cloud.backends:` in {} declares multiple backends; configured: {}",
+                    "--backend NAME is required when `storage.backends:` in {} declares multiple backends; configured: {}",
                     config_path,
                     names.join(", ")
                 ),
@@ -71,11 +71,11 @@ pub async fn cmd_restore(
     };
     // Verify the backend exists before going further (clearer error
     // than failing later during instantiation).
-    cloud_cfg
+    storage_cfg
         .backend_entry(&backend_name)
         .map_err(|e| anyhow::anyhow!("backend '{}': {}", backend_name, e))?;
 
-    let backend_box = cloud_cfg
+    let backend_box = storage_cfg
         .create_backend_named(&backend_name)
         .await
         .with_context(|| format!("instantiate storage backend '{}'", backend_name))?;
@@ -95,7 +95,7 @@ pub async fn cmd_restore(
         dry_run,
     )
     .await
-    .context("cloud cartridge restore")?;
+    .context("storage cartridge restore")?;
 
     print_restore_report(&report);
 
@@ -846,7 +846,7 @@ pub async fn cmd_restore_archive(
     Ok(exit)
 }
 
-/// Parse the daemon YAML conffile and extract its `cloud:` section.
+/// Parse the daemon YAML conffile and extract its `storage:` section.
 /// The rest of the YAML is ignored — daemon-down CLI verbs that only
 /// need to know about backends shouldn't pay the cost of parsing the
 /// full daemon Config struct (which transitively pulls in every
@@ -1022,13 +1022,13 @@ mod tests {
     }
 
     #[test]
-    fn load_storage_config_from_yaml_empty_cloud_block_defaults() {
+    fn load_storage_config_from_yaml_empty_storage_block_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = dir.path().join("thurvtl.yaml");
         std::fs::write(&cfg, "data_dir: /srv/thur\n").expect("write cfg");
-        let cloud = load_storage_config_from_yaml(cfg.to_str().expect("utf8"))
-            .expect("parse yaml with no cloud block");
-        assert!(cloud.backend_names().is_empty());
+        let storage = load_storage_config_from_yaml(cfg.to_str().expect("utf8"))
+            .expect("parse yaml with no storage block");
+        assert!(storage.backend_names().is_empty());
     }
 
     #[test]

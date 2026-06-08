@@ -40,8 +40,8 @@ pub struct CreateSnapshotRequest {
 /// snapshot of a live volume's page table.
 ///
 /// Requires the volume to be registered (live): snapshot-create flushes
-/// the volume's cache and awaits its pending cloud uploads so the frozen
-/// index references only cloud-durable chunks. The copy briefly pauses
+/// the volume's cache and awaits its pending storage uploads so the frozen
+/// index references only storage-durable chunks. The copy briefly pauses
 /// the volume's host I/O (it runs under the cache's inner lock); the
 /// `pages.idx` is sparse, so the pause scales with allocated pages.
 pub async fn create(

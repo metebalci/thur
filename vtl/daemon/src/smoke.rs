@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `--test` mode smoke harness. Runs in-process against a fresh data dir
-//! and exercises the cartridge / library / cloud / prefetch / parallel-upload
+//! and exercises the cartridge / library / storage / prefetch / parallel-upload
 //! paths plus a small failure-scenario sweep. Not part of normal daemon
 //! startup; main.rs dispatches into here when `--test` is set.
 
@@ -206,7 +206,7 @@ pub(crate) async fn run_changer_smoke_test(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// S3 smoke test: comprehensive test of cloud tiering functionality
+/// S3 smoke test: comprehensive test of storage tiering functionality
 /// Tests:
 /// - Write data with S3 backend
 /// - Upload chunks to S3
@@ -221,8 +221,8 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
 
     info!("=== S3 SMOKE TEST START ===");
 
-    // Create cloud backend
-    let cloud_backend: Box<dyn core_mediachanger::ObjectStoreBackend> = cfg
+    // Create storage backend
+    let storage_backend: Box<dyn core_mediachanger::ObjectStoreBackend> = cfg
         .storage
         .create_backend_named(&cfg.storage.backend_names()[0])
         .await?;
@@ -240,7 +240,7 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
         tokio::fs::remove_dir_all(&tape_dir).await.ok();
     }
 
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Create {
@@ -248,7 +248,7 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
             worm: false,
             dedup: core_mediachanger::DedupScope::Local,
         },
-        Some(cloud_backend.clone()),
+        Some(storage_backend.clone()),
     )
     .await?;
 
@@ -270,18 +270,18 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
     info!("S3-SMOKE: Found {} pending uploads", pending.len());
 
     for (chunk_id, _s3_key, _local_path) in pending {
-        cart.upload_chunk_to_cloud(chunk_id).await?;
+        cart.upload_chunk_to_storage(chunk_id).await?;
         info!("S3-SMOKE: Uploaded chunk {}", chunk_id);
     }
 
     // Test 3: Backup manifest to S3
     info!("S3-SMOKE: Test 3 - Backup manifest to S3");
-    cart.backup_manifest_to_cloud().await?;
+    cart.backup_manifest_to_storage().await?;
     info!("S3-SMOKE: Manifest backed up to S3");
 
     // Verify manifest exists in S3
     let manifest_key = format!("manifests/{}/manifest-latest.json", tape_label);
-    let manifest_exists = cloud_backend.chunk_exists(&manifest_key).await?;
+    let manifest_exists = storage_backend.chunk_exists(&manifest_key).await?;
     if manifest_exists {
         info!("S3-SMOKE: Manifest exists in S3: {}", manifest_key);
     } else {
@@ -302,7 +302,7 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
 
     // Mark chunk as evicted (simulate cache eviction). With content-addressed
     // shared storage, marking the chunk S3Only is enough — the read path
-    // sees the location flag and routes through the cloud download branch
+    // sees the location flag and routes through the storage download branch
     // even if the pool file is still on disk.
     let chunk_id = 1; // First chunk
     if let Ok(()) = cart.mark_chunk_evicted(chunk_id) {
@@ -341,11 +341,11 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
     }
 
     // Open cartridge again - should restore from S3
-    match Cartridge::open_with_cloud_async(
+    match Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Open,
-        Some(cloud_backend.clone()),
+        Some(storage_backend.clone()),
     )
     .await
     {
@@ -375,7 +375,7 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
 
     // Create multiple manifest versions
     for _i in 0..15 {
-        cart.backup_manifest_to_cloud().await?;
+        cart.backup_manifest_to_storage().await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     info!("S3-SMOKE: Created 15 manifest versions");
@@ -389,7 +389,7 @@ pub(crate) async fn run_s3_smoke_test(cfg: &Config) -> Result<()> {
 
     // Verify only 10 versions remain (plus manifest-latest.json)
     let prefix = format!("manifests/{}/", tape_label);
-    let keys = cloud_backend.list_objects(&prefix).await?;
+    let keys = storage_backend.list_objects(&prefix).await?;
     let versioned_count = keys
         .iter()
         .filter(|k| k.contains("manifest-") && !k.ends_with("manifest-latest.json"))
@@ -426,7 +426,7 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
     }
 
     // Create S3 backend
-    let cloud_backend = Arc::new(
+    let storage_backend = Arc::new(
         cfg.storage
             .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
@@ -437,7 +437,10 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
         enabled: cfg.memory_buffers.read_prefetch_chunks_ahead > 0,
         chunks_ahead: cfg.memory_buffers.read_prefetch_chunks_ahead,
     };
-    let prefetch_mgr = Arc::new(PrefetchManager::new(cloud_backend.clone(), prefetch_config));
+    let prefetch_mgr = Arc::new(PrefetchManager::new(
+        storage_backend.clone(),
+        prefetch_config,
+    ));
 
     let cart_root = PathBuf::from(&cfg.data_dir).join("tapes");
     tokio::fs::create_dir_all(&cart_root).await?;
@@ -452,7 +455,7 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
         tokio::fs::remove_dir_all(&tape_dir).await.ok();
     }
 
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Create {
@@ -460,7 +463,7 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
             worm: false,
             dedup: core_mediachanger::DedupScope::Local,
         },
-        Some((**cloud_backend).clone_box()),
+        Some((**storage_backend).clone_box()),
     )
     .await?;
 
@@ -485,13 +488,13 @@ pub(crate) async fn run_prefetch_smoke_test(cfg: &Config) -> Result<()> {
     cart.flush_and_seal()?;
     let pending = cart.get_pending_uploads();
     for (chunk_id, _s3_key, _local_path) in pending {
-        cart.upload_chunk_to_cloud(chunk_id).await?;
+        cart.upload_chunk_to_storage(chunk_id).await?;
         info!("PREFETCH-SMOKE: Uploaded chunk {}", chunk_id);
     }
 
     // Test 4: Evict the first sealed chunk to force S3 download during
     // reads. With content-addressed shared storage we just flip the
-    // location to CloudOnly; the read path takes the cloud download
+    // location to StorageOnly; the read path takes the storage download
     // branch on the strength of that flag alone (the local pool file
     // staying around is fine — `read_block_async` keys off the manifest
     // location, not directory existence).
@@ -571,7 +574,7 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
     info!("=== PARALLEL UPLOAD SMOKE TEST START ===");
 
     // Create S3 backend
-    let cloud_backend = cfg
+    let storage_backend = cfg
         .storage
         .create_backend_named(&cfg.storage.backend_names()[0])
         .await?;
@@ -592,7 +595,7 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
         tokio::fs::remove_dir_all(&tape_dir).await.ok();
     }
 
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Create {
@@ -600,7 +603,7 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
             worm: false,
             dedup: core_mediachanger::DedupScope::Local,
         },
-        Some(cloud_backend.clone()),
+        Some(storage_backend.clone()),
     )
     .await?;
 
@@ -646,21 +649,21 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
 
     // Spawn upload tasks
     for (chunk_id, _s3_key, _local_path) in batch {
-        let cloud_backend_clone = cloud_backend.clone();
+        let storage_backend_clone = storage_backend.clone();
         let cart_root_clone = cart_root.clone();
         let tape_label_clone = tape_label.to_string();
 
         join_set.spawn(async move {
-            let mut cart_clone = Cartridge::open_with_cloud_async(
+            let mut cart_clone = Cartridge::open_with_storage_async(
                 &cart_root_clone,
                 &tape_label_clone,
                 CartridgeOpenMode::Open,
-                Some(cloud_backend_clone),
+                Some(storage_backend_clone),
             )
             .await?;
 
             let upload_start = Instant::now();
-            cart_clone.upload_chunk_to_cloud(chunk_id).await?;
+            cart_clone.upload_chunk_to_storage(chunk_id).await?;
             let upload_duration = upload_start.elapsed();
 
             info!(
@@ -721,7 +724,7 @@ pub(crate) async fn run_parallel_upload_smoke_test(cfg: &Config) -> Result<()> {
 /// End-to-end test of `run_event_driven_upload_worker`: spin up the
 /// worker against a real Cartridge + LocalBackend, send one UploadRequest
 /// through the mpsc channel, then close the channel and assert the
-/// worker drained the request, the manifest landed in cloud, and the
+/// worker drained the request, the manifest landed in storage, and the
 /// chunks flipped to `uploaded=true`.
 ///
 /// First direct coverage of the worker — keeps the helper split honest
@@ -738,7 +741,7 @@ pub(crate) async fn run_upload_worker_smoke_test(cfg: &Config) -> Result<()> {
     info!("=== UPLOAD WORKER SMOKE TEST START ===");
 
     let backend_name = cfg.storage.backend_names()[0].clone();
-    let cloud_backend = cfg.storage.create_backend_named(&backend_name).await?;
+    let storage_backend = cfg.storage.create_backend_named(&backend_name).await?;
 
     let cart_root = PathBuf::from(&cfg.data_dir).join("tapes");
     tokio::fs::create_dir_all(&cart_root).await?;
@@ -749,7 +752,7 @@ pub(crate) async fn run_upload_worker_smoke_test(cfg: &Config) -> Result<()> {
         tokio::fs::remove_dir_all(&tape_dir).await.ok();
     }
 
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Create {
@@ -757,7 +760,7 @@ pub(crate) async fn run_upload_worker_smoke_test(cfg: &Config) -> Result<()> {
             worm: false,
             dedup: core_mediachanger::DedupScope::Local,
         },
-        Some(cloud_backend.clone()),
+        Some(storage_backend.clone()),
     )
     .await?;
 
@@ -804,24 +807,24 @@ pub(crate) async fn run_upload_worker_smoke_test(cfg: &Config) -> Result<()> {
     }
 
     let manifest_key = format!("manifests/{}/manifest-latest.json", tape_label);
-    let manifest_exists = cloud_backend.chunk_exists(&manifest_key).await?;
+    let manifest_exists = storage_backend.chunk_exists(&manifest_key).await?;
     if manifest_exists {
         info!(
-            "UPLOAD-WORKER-SMOKE: Manifest landed in cloud at {}",
+            "UPLOAD-WORKER-SMOKE: Manifest landed in storage at {}",
             manifest_key
         );
     } else {
         warn!(
-            "UPLOAD-WORKER-SMOKE: Manifest not in cloud at {}",
+            "UPLOAD-WORKER-SMOKE: Manifest not in storage at {}",
             manifest_key
         );
     }
 
-    let restored_cart = Cartridge::open_with_cloud_async(
+    let restored_cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Open,
-        Some(cloud_backend.clone()),
+        Some(storage_backend.clone()),
     )
     .await?;
     let pending_after = restored_cart.get_pending_uploads();
@@ -852,7 +855,7 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
 
     info!("=== PERFORMANCE BENCHMARKS START ===");
 
-    let cloud_backend = Arc::new(
+    let storage_backend = Arc::new(
         cfg.storage
             .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
@@ -869,7 +872,7 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
         tokio::fs::remove_dir_all(&tape_dir).await.ok();
     }
 
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &cart_root,
         tape_label,
         CartridgeOpenMode::Create {
@@ -877,7 +880,7 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
             worm: false,
             dedup: core_mediachanger::DedupScope::Local,
         },
-        Some((**cloud_backend).clone_box()),
+        Some((**storage_backend).clone_box()),
     )
     .await?;
 
@@ -914,7 +917,7 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
     cart.flush_and_seal()?;
     let pending = cart.get_pending_uploads();
     for (chunk_id, _s3_key, _local_path) in pending {
-        cart.upload_chunk_to_cloud(chunk_id).await?;
+        cart.upload_chunk_to_storage(chunk_id).await?;
     }
     info!("PERF: All chunks uploaded to S3");
 
@@ -926,12 +929,15 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
         enabled: true,
         chunks_ahead: cfg.memory_buffers.read_prefetch_chunks_ahead,
     };
-    let prefetch_mgr = Arc::new(PrefetchManager::new(cloud_backend.clone(), prefetch_config));
+    let prefetch_mgr = Arc::new(PrefetchManager::new(
+        storage_backend.clone(),
+        prefetch_config,
+    ));
     cart.set_prefetch_manager(prefetch_mgr.clone());
 
     // Evict chunk 0 (the first sealed chunk) to force a cold S3 download
-    // on the first read. CloudOnly is enough — `read_block_async`
-    // routes through the cloud branch off the manifest flag alone.
+    // on the first read. StorageOnly is enough — `read_block_async`
+    // routes through the storage branch off the manifest flag alone.
     cart.mark_chunk_evicted(0)?;
 
     cart.rewind_async().await;
@@ -962,13 +968,13 @@ pub(crate) async fn run_performance_benchmarks(cfg: &Config) -> Result<()> {
         chunks_ahead: 0,
     };
     let prefetch_mgr_disabled = Arc::new(PrefetchManager::new(
-        cloud_backend.clone(),
+        storage_backend.clone(),
         prefetch_config_disabled,
     ));
     cart.set_prefetch_manager(prefetch_mgr_disabled);
 
     // Evict chunk 0 again — the previous benchmark's first read
-    // transitioned it back to Both, so this restores the CloudOnly
+    // transitioned it back to Both, so this restores the StorageOnly
     // start state for the prefetch-disabled run.
     cart.mark_chunk_evicted(0)?;
 
@@ -1021,7 +1027,7 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
 
     info!("=== FAILURE SCENARIO TESTS START ===");
 
-    let cloud_backend = Arc::new(
+    let storage_backend = Arc::new(
         cfg.storage
             .create_backend_named(&cfg.storage.backend_names()[0])
             .await?,
@@ -1038,7 +1044,10 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
             enabled: true,
             chunks_ahead: cfg.memory_buffers.read_prefetch_chunks_ahead,
         };
-        let prefetch_mgr = Arc::new(PrefetchManager::new(cloud_backend.clone(), prefetch_config));
+        let prefetch_mgr = Arc::new(PrefetchManager::new(
+            storage_backend.clone(),
+            prefetch_config,
+        ));
 
         let tape_label = "FAILTEST001";
         let tape_dir = cart_root.join(tape_label);
@@ -1046,7 +1055,7 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
             tokio::fs::remove_dir_all(&tape_dir).await.ok();
         }
 
-        let mut cart = Cartridge::open_with_cloud_async(
+        let mut cart = Cartridge::open_with_storage_async(
             &cart_root,
             tape_label,
             CartridgeOpenMode::Create {
@@ -1054,7 +1063,7 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
                 worm: false,
                 dedup: core_mediachanger::DedupScope::Local,
             },
-            Some((**cloud_backend).clone_box()),
+            Some((**storage_backend).clone_box()),
         )
         .await?;
 
@@ -1072,12 +1081,12 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
         cart.flush_and_seal()?;
         let pending = cart.get_pending_uploads();
         for (chunk_id, _s3_key, _local_path) in pending {
-            cart.upload_chunk_to_cloud(chunk_id).await?;
+            cart.upload_chunk_to_storage(chunk_id).await?;
         }
 
         // Evict the first sealed chunk to force an S3 download — the
         // location flag alone is enough to route the read through the
-        // cloud branch.
+        // storage branch.
         cart.mark_chunk_evicted(0)?;
 
         // Start sequential read to trigger prefetch
@@ -1121,7 +1130,7 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
             tokio::fs::remove_dir_all(&tape_dir).await.ok();
         }
 
-        let mut cart = Cartridge::open_with_cloud_async(
+        let mut cart = Cartridge::open_with_storage_async(
             &cart_root,
             tape_label,
             CartridgeOpenMode::Create {
@@ -1129,7 +1138,7 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
                 worm: false,
                 dedup: core_mediachanger::DedupScope::Local,
             },
-            Some((**cloud_backend).clone_box()),
+            Some((**storage_backend).clone_box()),
         )
         .await?;
 
@@ -1143,12 +1152,12 @@ pub(crate) async fn run_failure_scenario_tests(cfg: &Config) -> Result<()> {
         cart.flush_and_seal()?;
         let pending = cart.get_pending_uploads();
         for (chunk_id, _s3_key, _local_path) in pending {
-            cart.upload_chunk_to_cloud(chunk_id).await?;
+            cart.upload_chunk_to_storage(chunk_id).await?;
             info!("FAIL-TEST: Uploaded chunk {} (with compression)", chunk_id);
         }
 
         // Evict chunk 0 and read back from S3 (will be decompressed).
-        // Location flag alone routes the read through the cloud branch.
+        // Location flag alone routes the read through the storage branch.
         cart.mark_chunk_evicted(0)?;
 
         let decompressed_block = cart.read_block_async(lba).await?;

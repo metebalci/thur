@@ -178,7 +178,7 @@ pub fn log_route_table(listen: &str, scheme: &str, webui_enabled: bool, password
 
 /// Handler for `/info` — read-only snapshot of library topology
 /// (chassis-level slot / drive counts, LTO generation, partition
-/// names, chassis serial). No CHAP / cloud creds; sensitive
+/// names, chassis serial). No CHAP / storage creds; sensitive
 /// per-partition inventory stays on the admin socket.
 async fn info_handler(State(state): State<HttpState>) -> impl IntoResponse {
     let library = state

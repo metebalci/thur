@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-local "what's already in the cloud" cache layered over
+//! Process-local "what's already in the storage" cache layered over
 //! [`ObjectStoreBackend`].
 //!
-//! The cloud is authoritative; the daemon's view of the cloud is a
+//! The storage is authoritative; the daemon's view of the storage is a
 //! warm local cache. Once we've confirmed a fact this lifetime — we
 //! PUT key X, we HEAD'd Y as present, the LIST saw Z — we don't
 //! re-ask. This collapses the canonical pathological workload (50+
@@ -14,9 +14,9 @@
 //! cost on dedup-friendly workloads.
 //!
 //! Three states per key:
-//!  - [`CloudState::Probed`]: LIST or positive HEAD confirmed presence.
-//!  - [`CloudState::Uploaded`]: we ran the PUT and cached its return tuple.
-//!  - [`CloudState::InFlight`]: a PUT is in flight; subscribers await one
+//!  - [`StorageState::Probed`]: LIST or positive HEAD confirmed presence.
+//!  - [`StorageState::Uploaded`]: we ran the PUT and cached its return tuple.
+//!  - [`StorageState::InFlight`]: a PUT is in flight; subscribers await one
 //!    [`Shared`] future and receive identical results.
 //!
 //! Failure is conservative: a failed singleflight removes the entry so
@@ -36,8 +36,8 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// What we know about a single cloud key.
-enum CloudState {
+/// What we know about a single storage key.
+enum StorageState {
     /// LIST or HEAD confirmed presence. We don't have the upload-side
     /// return tuple; on a coalesced `upload_chunk` hit we synthesize
     /// `(data.len(), None, None)` — matches what existing dedup-hit
@@ -72,18 +72,18 @@ struct UploadOutcome {
 pub struct CachingObjectStoreBackend {
     inner: Arc<dyn ObjectStoreBackend>,
     name: String,
-    known: Arc<Mutex<HashMap<String, CloudState>>>,
+    known: Arc<Mutex<HashMap<String, StorageState>>>,
 }
 
-// `CloudState::InFlight` carries a `Shared<BoxFuture>` which is not
+// `StorageState::InFlight` carries a `Shared<BoxFuture>` which is not
 // `Debug`. Hand-derive a minimal Debug impl so the wrapper itself
 // (which the trait requires) compiles.
-impl std::fmt::Debug for CloudState {
+impl std::fmt::Debug for StorageState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CloudState::Probed => f.write_str("Probed"),
-            CloudState::Uploaded { .. } => f.write_str("Uploaded"),
-            CloudState::InFlight(_) => f.write_str("InFlight"),
+            StorageState::Probed => f.write_str("Probed"),
+            StorageState::Uploaded { .. } => f.write_str("Uploaded"),
+            StorageState::InFlight(_) => f.write_str("InFlight"),
         }
     }
 }
@@ -130,13 +130,13 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let action = {
             let map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
-                Some(CloudState::Uploaded {
+                Some(StorageState::Uploaded {
                     uncompressed,
                     compressed,
                     algo,
                 }) => Action::ReturnTuple(*uncompressed, *compressed, *algo),
-                Some(CloudState::Probed) => Action::ReturnSynth,
-                Some(CloudState::InFlight(fut)) => Action::Await(fut.clone()),
+                Some(StorageState::Probed) => Action::ReturnSynth,
+                Some(StorageState::InFlight(fut)) => Action::Await(fut.clone()),
                 None => Action::Miss,
             }
         };
@@ -185,15 +185,15 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let waiter = {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
-                Some(CloudState::Uploaded {
+                Some(StorageState::Uploaded {
                     uncompressed,
                     compressed,
                     algo,
                 }) => return Ok((*uncompressed, *compressed, *algo)),
-                Some(CloudState::Probed) => return Ok((data.len() as u64, None, None)),
-                Some(CloudState::InFlight(existing)) => existing.clone(),
+                Some(StorageState::Probed) => return Ok((data.len() as u64, None, None)),
+                Some(StorageState::InFlight(existing)) => existing.clone(),
                 None => {
-                    map.insert(key.to_string(), CloudState::InFlight(shared.clone()));
+                    map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
                     shared
                 }
             }
@@ -205,7 +205,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Ok(outcome) => {
                 map.insert(
                     key.to_string(),
-                    CloudState::Uploaded {
+                    StorageState::Uploaded {
                         uncompressed: outcome.uncompressed,
                         compressed: outcome.compressed,
                         algo: outcome.algo,
@@ -218,7 +218,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 // entry is still our `InFlight` — if a successful retry
                 // by another caller has already overwritten it with
                 // `Uploaded`, leave that alone.
-                if matches!(map.get(key), Some(CloudState::InFlight(_))) {
+                if matches!(map.get(key), Some(StorageState::InFlight(_))) {
                     map.remove(key);
                 }
                 Err(ObjectStoreError::Other(arc_err.to_string()))
@@ -243,11 +243,11 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let action = {
             let map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
-                Some(CloudState::Uploaded { uncompressed, .. }) => {
+                Some(StorageState::Uploaded { uncompressed, .. }) => {
                     Action::ReturnSize(*uncompressed)
                 }
-                Some(CloudState::InFlight(fut)) => Action::Await(fut.clone()),
-                Some(CloudState::Probed) | None => Action::Miss,
+                Some(StorageState::InFlight(fut)) => Action::Await(fut.clone()),
+                Some(StorageState::Probed) | None => Action::Miss,
             }
         };
         match action {
@@ -286,11 +286,11 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let waiter = {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
-                Some(CloudState::Uploaded { uncompressed, .. }) => return Ok(*uncompressed),
-                Some(CloudState::InFlight(existing)) => existing.clone(),
+                Some(StorageState::Uploaded { uncompressed, .. }) => return Ok(*uncompressed),
+                Some(StorageState::InFlight(existing)) => existing.clone(),
                 // For Probed (no size known) and None: install the singleflight.
                 _ => {
-                    map.insert(key.to_string(), CloudState::InFlight(shared.clone()));
+                    map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
                     shared
                 }
             }
@@ -302,7 +302,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Ok(outcome) => {
                 map.insert(
                     key.to_string(),
-                    CloudState::Uploaded {
+                    StorageState::Uploaded {
                         uncompressed: outcome.uncompressed,
                         compressed: outcome.compressed,
                         algo: outcome.algo,
@@ -311,7 +311,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 Ok(outcome.uncompressed)
             }
             Err(arc_err) => {
-                if matches!(map.get(key), Some(CloudState::InFlight(_))) {
+                if matches!(map.get(key), Some(StorageState::InFlight(_))) {
                     map.remove(key);
                 }
                 Err(ObjectStoreError::Other(arc_err.to_string()))
@@ -363,8 +363,8 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let action = {
             let map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
-                Some(CloudState::Probed | CloudState::Uploaded { .. }) => HeadAction::Hit,
-                Some(CloudState::InFlight(fut)) => HeadAction::Await(fut.clone()),
+                Some(StorageState::Probed | StorageState::Uploaded { .. }) => HeadAction::Hit,
+                Some(StorageState::InFlight(fut)) => HeadAction::Await(fut.clone()),
                 None => HeadAction::Miss,
             }
         };
@@ -388,7 +388,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let exists = self.inner.chunk_exists(key).await?;
         if exists {
             let mut map = self.known.lock().expect("cache mutex poisoned");
-            map.entry(key.to_string()).or_insert(CloudState::Probed);
+            map.entry(key.to_string()).or_insert(StorageState::Probed);
         }
         Ok(exists)
     }
@@ -409,7 +409,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             for k in keys {
                 if let Entry::Vacant(slot) = map.entry(k) {
-                    slot.insert(CloudState::Probed);
+                    slot.insert(StorageState::Probed);
                     seeded += 1;
                 }
             }
@@ -1008,7 +1008,7 @@ mod tests {
     /// Exercises the trivial pass-through trait methods on the cache
     /// wrapper (download_chunks_parallel, upload_manifest,
     /// download_manifest, list_objects, lock_state,
-    /// {set,get}_object_legal_hold) plus the Debug impl for CloudState.
+    /// {set,get}_object_legal_hold) plus the Debug impl for StorageState.
     /// One call per method — no caching semantics to assert.
     #[tokio::test]
     async fn trivial_passthroughs_delegate_to_inner() {
@@ -1045,7 +1045,7 @@ mod tests {
             .await
             .expect("get legal hold");
         assert!(!held);
-        // Debug printout exercises CloudState::Probed/Uploaded/InFlight arms.
+        // Debug printout exercises StorageState::Probed/Uploaded/InFlight arms.
         cache.upload_chunk("u", b"x").await.unwrap(); // Uploaded
         c.head_returns.store(true, Ordering::SeqCst);
         assert!(cache.chunk_exists("p").await.unwrap()); // Probed

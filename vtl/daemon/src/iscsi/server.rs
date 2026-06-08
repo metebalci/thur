@@ -26,7 +26,7 @@ use super::handler::IscsiLibraryHandler;
 use crate::state::DaemonState;
 use shared_iscsi::auth::parse_chap_algorithms;
 
-/// Shared cloud-backend registry: backend-name → already-initialized
+/// Shared storage-backend registry: backend-name → already-initialized
 /// `ObjectStoreBackend` handle. Lazy-populated on first use; the iSCSI READ
 /// prefetch hook and the daemon's upload/cache workers all resolve
 /// backend handles through this map.
@@ -163,7 +163,7 @@ impl IscsiServer {
             data_dir: self.state.data_dir.clone(),
             audit_log: self.state.audit_log.clone(),
             audit_ratelimiter: Arc::clone(&self.state.audit_ratelimiter),
-            cloud_backends: Arc::clone(&self.state.cloud_backends),
+            storage_backends: Arc::clone(&self.state.storage_backends),
             storage_config: Arc::clone(&self.state.storage_config),
             pool_budgets: self.state.pool_budgets.clone(),
             diagnostic_store: Arc::clone(&self.state.diagnostic_store),

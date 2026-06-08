@@ -40,13 +40,13 @@ pub struct DriveManager {
     /// Zstd level — only consulted when `drive_compression_algorithm`
     /// is `Zstd`. Ignored for `Lz4` / `Sldc`.
     drive_compression_zstd_level: i32,
-    /// Per-backend pool budgets, keyed by `cloud.backends` entry name.
+    /// Per-backend pool budgets, keyed by `storage.backends` entry name.
     /// Wired into every cartridge at load time so chunk-seal applies
     /// upload backpressure when the local pool is at its hard cap.
     /// Empty map (and `backpressure_deadline = 60 s`) is the test /
     /// non-daemon default.
     pool_budgets: HashMap<String, Arc<PoolBudget>>,
-    /// Per-backend ghost lists, keyed by `cloud.backends` entry name.
+    /// Per-backend ghost lists, keyed by `storage.backends` entry name.
     /// Wired into every cartridge at load time so the cache-miss
     /// read path can record `cache_miss_after_eviction` histogram
     /// entries.
@@ -567,7 +567,7 @@ impl DriveManager {
         // backend isn't present in `pool_budgets` keep the
         // `unbounded` default — no gate, every seal succeeds. That
         // shouldn't happen at runtime (the daemon validates backend
-        // names against `cloud.backends` at startup) but it makes
+        // names against `storage.backends` at startup) but it makes
         // tests / partial setups behave sanely.
         if let Some(budget) = self.pool_budgets.get(cartridge.backend()) {
             cartridge.set_pool_budget(budget.clone(), self.backpressure_deadline);
@@ -659,7 +659,7 @@ impl DriveManager {
 
     /// Stamp the volatile legal-hold flag on the cartridge loaded in
     /// `drive_id`. Called by the iSCSI MOVE MEDIUM post-hook after
-    /// reading the cloud sentinel
+    /// reading the storage sentinel
     /// (`manifests/<barcode>/manifest-latest.json`). No-op (warns) if
     /// no cartridge is loaded — the post-hook only runs on a successful
     /// load so this should not happen in practice.
@@ -670,7 +670,7 @@ impl DriveManager {
                 cart.set_legal_held(held);
                 if held {
                     info!(
-                        "Drive {} legal-hold flag SET from cloud sentinel - host writes will return WRITE PROTECTED",
+                        "Drive {} legal-hold flag SET from storage sentinel - host writes will return WRITE PROTECTED",
                         drive_id
                     );
                 }

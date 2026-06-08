@@ -66,7 +66,7 @@ iscsi:
   listen: "127.0.0.1:3260"
 http:
   listen: "127.0.0.1:9090"
-cloud:
+storage:
   backends:
     smoke:
       type: local
@@ -83,7 +83,7 @@ iscsi:
   listen: "127.0.0.1:3260"
 http:
   listen: "127.0.0.1:9090"
-cloud:
+storage:
   backends:
     smoke:
       type: local

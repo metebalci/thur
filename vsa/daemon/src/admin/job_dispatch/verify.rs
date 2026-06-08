@@ -5,12 +5,12 @@
 //!
 //! Block-side parallel of `vtl/daemon/src/admin/job_dispatch/verify.rs`.
 //! Walks every volume's `pages.idx` (integrity + chunk presence), then
-//! sweeps each per-backend pool. Optional cloud HEAD pass (default on;
-//! `skip_cloud=true` skips it). Emits the structured
+//! sweeps each per-backend pool. Optional storage HEAD pass (default on;
+//! `skip_storage=true` skips it). Emits the structured
 //! `VolumeVerifyReport` as a Result event so the CLI can render
 //! verbose / json variants without re-contacting the daemon.
 
-use core_block::verify::{VerifyScope, VolumeVerifyReport, verify_local, verify_with_cloud};
+use core_block::verify::{VerifyScope, VolumeVerifyReport, verify_local, verify_with_storage};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 
@@ -43,7 +43,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
     if params.skip_storage {
         emitter
             .info(format!(
-                "Verifying volumes at {} (cloud sweep skipped)",
+                "Verifying volumes at {} (storage sweep skipped)",
                 data_dir.display()
             ))
             .await;
@@ -72,14 +72,14 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             };
         finish(&emitter, report).await;
     } else {
-        let cloud_cfg = state.storage.as_ref().clone();
+        let storage_cfg = state.storage.as_ref().clone();
         emitter
             .info(format!(
-                "Verifying volumes at {} (cloud HEAD sweep enabled)",
+                "Verifying volumes at {} (storage HEAD sweep enabled)",
                 data_dir.display()
             ))
             .await;
-        let report = match verify_with_cloud(&data_dir, &scope, &cloud_cfg).await {
+        let report = match verify_with_storage(&data_dir, &scope, &storage_cfg).await {
             Ok(r) => r,
             Err(e) => {
                 emitter
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn verify_params_rejects_wrong_type() {
-        // `skip_cloud` is a bool — a string must fail to deserialize.
+        // `skip_storage` is a bool — a string must fail to deserialize.
         let bad = serde_json::from_value::<VerifyParams>(serde_json::json!({
             "skip_storage": "yes",
         }));

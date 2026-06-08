@@ -12,7 +12,7 @@
 // where:
 //   working_set_mb = resident hot set (MiB). The cache budget is set
 //                    to exactly this, so the whole set stays in RAM
-//                    and every timed read is a cache HIT (no cloud /
+//                    and every timed read is a cache HIT (no storage /
 //                    pool round trip). This is also the LRU list
 //                    length n — at the 64 KiB-page default,
 //                    256 MiB = 4096 resident pages.
@@ -77,9 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tmp = tempfile::tempdir()?;
     let data_dir = tmp.path();
-    let cloud_root = data_dir.join("local-cloud");
-    std::fs::create_dir_all(&cloud_root)?;
-    let backend = LocalBackend::new(&cloud_root).await?;
+    let storage_root = data_dir.join("local-storage");
+    std::fs::create_dir_all(&storage_root)?;
+    let backend = LocalBackend::new(&storage_root).await?;
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     // Volume exactly the size of the resident set; cache budget set so

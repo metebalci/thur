@@ -132,7 +132,7 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .backend
         .chunk_exists(&sentinel_key)
         .await
-        .map_err(cloud_err)?
+        .map_err(storage_err)?
     {
         return Err(SmcError::InvalidOp(
             "archive manifest sentinel not found on backend; check --backend / --barcode / --label",
@@ -154,13 +154,13 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .backend
         .download_manifest(&sentinel_key)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
     let runtime_key = format!("{}runtime.json", archive_prefix);
     let original_runtime = opts
         .backend
         .download_manifest(&runtime_key)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
     let dedup_local = manifest_is_local_dedup(&original_manifest)?;
     let rewritten_manifest =
         rewrite_manifest_for_local(&original_manifest, local_barcode, opts.backend_name)?;
@@ -195,7 +195,7 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .backend
         .download_chunk(&chunks_idx_key)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
     write_atomic(&ChunkIndexFile::path_for(&cart_root), &chunks_idx_bytes)?;
     report.index_files_downloaded += 1;
 
@@ -205,7 +205,7 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .backend
         .list_objects(&archive_prefix)
         .await
-        .map_err(cloud_err)?;
+        .map_err(storage_err)?;
     let partition_keys: Vec<String> = keys_under_archive
         .iter()
         .filter(|k| {
@@ -218,7 +218,11 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .cloned()
         .collect();
     for key in &partition_keys {
-        let body = opts.backend.download_chunk(key).await.map_err(cloud_err)?;
+        let body = opts
+            .backend
+            .download_chunk(key)
+            .await
+            .map_err(storage_err)?;
         let filename = key.strip_prefix(&archive_prefix).ok_or_else(|| {
             SmcError::ObjectStoreError("listed key missing archive prefix".to_string())
         })?;
@@ -252,7 +256,11 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         let s1 = if hash.len() >= 2 { &hash[..2] } else { "00" };
         let s2 = if hash.len() >= 4 { &hash[2..4] } else { "00" };
         let key = format!("{}chunks/{}/{}/{}.dat", archive_prefix, s1, s2, hash);
-        let chunk_bytes = opts.backend.download_chunk(&key).await.map_err(cloud_err)?;
+        let chunk_bytes = opts
+            .backend
+            .download_chunk(&key)
+            .await
+            .map_err(storage_err)?;
         pool.insert_verified_bytes(&hash, &chunk_bytes)?;
         downloaded += 1;
         bytes += chunk_bytes.len() as u64;
@@ -289,7 +297,7 @@ fn validate_barcode(barcode: &str) -> Result<()> {
     Ok(())
 }
 
-fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+fn storage_err(e: shared_object_store::ObjectStoreError) -> SmcError {
     SmcError::ObjectStoreError(e.to_string())
 }
 

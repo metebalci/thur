@@ -24,7 +24,7 @@ shared-admin-monitor = { path = "../admin-monitor" }
 # offline-verifies a copied audit directory (`verify_chain`).
 shared-admin-proto = { path = "../admin-proto" }
 shared-audit = { path = "../audit" }
-# `system monitor` reuses `fmt::format_bytes` for the pool / cloud
+# `system monitor` reuses `fmt::format_bytes` for the pool / storage
 # byte columns.
 shared-cli = { path = "../cli" }
 shared-naming = { path = "../naming" }

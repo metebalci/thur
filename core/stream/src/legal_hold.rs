@@ -3,7 +3,7 @@
 
 //! Cartridge-level legal hold orchestration.
 //!
-//! Source of truth is the cloud provider's per-object hold primitive
+//! Source of truth is the storage provider's per-object hold primitive
 //! (S3 `PutObjectLegalHold`, GCS `eventBasedHold`, Azure
 //! `Set Blob Legal Hold`). Thur VTL keeps **no** local "is held" flag
 //! — set/clear walks every chunk key the cartridge's manifest
@@ -11,7 +11,7 @@
 //! state back. The trade-off is that a held cartridge's iSCSI surface
 //! is unchanged: the host won't see a write-protect signal; it will
 //! see opaque upload/delete failures only when the daemon tries to
-//! mutate a held cloud object. The promise is data preservation, not
+//! mutate a held storage object. The promise is data preservation, not
 //! host-visible write rejection.
 //!
 //! ## The sentinel: `manifests/<barcode>/manifest-latest.json`
@@ -44,7 +44,7 @@ use std::sync::Arc;
 // core-stream can compile without core-mediachanger as a dependency. Callers
 // import it via `core_mediachanger::find_drive_for_loaded_cartridge`.
 
-/// Subset of `manifest.json` we need to enumerate cloud keys without
+/// Subset of `manifest.json` we need to enumerate storage keys without
 /// pulling in the whole `Cartridge` machinery (which would drag in a
 /// `ObjectStoreBackend` and a runtime). Backend-flat: pool keys are
 /// `chunks/<aa>/<bb>/<hash>.dat`; the manifest backups live under
@@ -55,7 +55,7 @@ struct ManifestSlice {
     #[serde(default)]
     chunks: Vec<ManifestChunkSlice>,
     /// Sticky dedup scope (see `Cartridge`/`Manifest`). Under `Local`
-    /// the chunk + manifest cloud keys are namespaced under the
+    /// the chunk + manifest storage keys are namespaced under the
     /// cartridge barcode — so legal-hold key enumeration must match.
     #[serde(default)]
     dedup: crate::cartridge::DedupScope,
@@ -65,7 +65,7 @@ struct ManifestSlice {
 struct ManifestChunkSlice {
     /// `Some(hex)` once the chunk has been sealed into the pool. `None`
     /// means the chunk is still in `.staging/` and was never uploaded —
-    /// nothing to hold cloud-side.
+    /// nothing to hold storage-side.
     #[serde(default)]
     hash: Option<String>,
 }
@@ -96,7 +96,7 @@ pub fn manifest_latest_sentinel_key(barcode: &str) -> String {
     format!("manifests/{}/manifest-latest.json", barcode)
 }
 
-/// Split a cartridge's cloud keys into `(others, sentinel)`. Used by
+/// Split a cartridge's storage keys into `(others, sentinel)`. Used by
 /// set/clear so callers can apply the body before/after the sentinel.
 pub struct CartridgeKeys {
     /// Every chunk + every versioned manifest backup the cartridge
@@ -109,7 +109,7 @@ pub struct CartridgeKeys {
 }
 
 /// Read a cartridge's `manifest.json` from disk and enumerate the
-/// cloud keys that should be put under (or released from) legal hold.
+/// storage keys that should be put under (or released from) legal hold.
 /// The sentinel (`manifest-latest.json`) is split out from `others`
 /// so callers can sequence apply/clear in the right order.
 ///
@@ -203,7 +203,7 @@ pub async fn apply_legal_hold_to_keys(
     }
 }
 
-/// High-level: apply legal hold to the cartridge's full set of cloud
+/// High-level: apply legal hold to the cartridge's full set of storage
 /// keys with the sentinel-last (set) / sentinel-first (clear)
 /// ordering described in the module docs. The sentinel is only set
 /// after every other key succeeds; it's only cleared first when

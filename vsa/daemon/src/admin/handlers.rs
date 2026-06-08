@@ -16,7 +16,7 @@
 //! handled inside the registry (`RwLock`); admin handlers only ever
 //! see the high-level `register` / `unregister_by_name` API.
 //!
-//! Per-create cloud-backend instantiation reuses the cache the
+//! Per-create storage-backend instantiation reuses the cache the
 //! daemon's discovery pass populated at boot. New backend names not
 //! seen at boot are instantiated on first create and cached for the
 //! life of the daemon, so a follow-up create against the same
@@ -106,7 +106,7 @@ pub struct AdminState {
     /// each runtime-created `VolumeWriter` so its
     /// `write_page_unsynced` takes the async dispatch path (vs.
     /// falling back to the inline upload, which blocks the SCSI
-    /// write on cloud and skips the `backend_bytes_written`
+    /// write on storage and skips the `backend_bytes_written`
     /// counter).
     pub upload_tx: mpsc::Sender<UploadTask>,
     /// iSCSI / NVMe-TCP session manager. Cloned from the transport's
@@ -376,7 +376,7 @@ pub async fn info(
     Ok(Json(out))
 }
 
-/// Resolve the cloud backend name: explicit request field wins;
+/// Resolve the storage backend name: explicit request field wins;
 /// otherwise auto-pick when exactly one backend is configured; refuse
 /// when 2+ backends are configured without an explicit choice.
 fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<String, String> {
@@ -394,7 +394,7 @@ fn resolve_backend(state: &AdminState, req_backend: &Option<String>) -> Result<S
         }
         (None, 1) => Ok(backend_names.into_iter().next().unwrap_or_default()),
         (None, _) => Err(format!(
-            "backend is required when multiple cloud backends are configured. Available: {}",
+            "backend is required when multiple storage backends are configured. Available: {}",
             backend_names.join(", ")
         )),
     }
@@ -581,7 +581,7 @@ pub async fn create(
         (status, Json(json!({ "error": e.to_string() })))
     })?;
 
-    // The just-created runtime.json carries `sync_after = Cloud`
+    // The just-created runtime.json carries `sync_after = Storage`
     // (VolumeRuntime::new_zero). Rewrite it with the operator's
     // choice before the VolumeWriter opens, so the atomic boots up
     // on the right tier. Failure here rolls back the volume —
@@ -667,10 +667,10 @@ pub async fn create(
         }
     }
 
-    // Resolve the cloud backend — reuse the cached client when
+    // Resolve the storage backend — reuse the cached client when
     // already instantiated, otherwise instantiate now and cache for
     // future creates.
-    let cloud_backend = match get_or_init_backend(&state, &backend).await {
+    let storage_backend = match get_or_init_backend(&state, &backend).await {
         Ok(b) => b,
         Err(e) => {
             // Roll back the volume directory + any keystore entry so
@@ -691,17 +691,17 @@ pub async fn create(
         Some(key) => VolumeWriter::open_with_key(
             &state.data_dir,
             &created.name,
-            cloud_backend,
+            storage_backend,
             *key.as_bytes(),
         ),
-        None => VolumeWriter::open(&state.data_dir, &created.name, cloud_backend),
+        None => VolumeWriter::open(&state.data_dir, &created.name, storage_backend),
     };
     let writer = match writer {
         Ok(w) => {
             // Mirror discovery.rs:269-282 — both builders are
             // required for the volume to use the async upload path
             // (`write_page_unsynced` enqueues to the worker) instead
-            // of the inline path (blocking SCSI WRITE on cloud + no
+            // of the inline path (blocking SCSI WRITE on storage + no
             // `backend_bytes_written` bump). Their absence was a
             // silent runtime-create regression that left every
             // post-boot volume with a flat counter.
@@ -1043,7 +1043,7 @@ pub async fn clone_volume(
 
     // Open the writer against the shared backend + family pool and bring
     // the clone online (same tail as `create`).
-    let cloud_backend = match get_or_init_backend(&state, &src.backend).await {
+    let storage_backend = match get_or_init_backend(&state, &src.backend).await {
         Ok(b) => b,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&clone_dir);
@@ -1101,11 +1101,11 @@ pub async fn clone_volume(
         VolumeWriter::open_with_key(
             &state.data_dir,
             &created.name,
-            cloud_backend,
+            storage_backend,
             *secret.as_bytes(),
         )
     } else {
-        VolumeWriter::open(&state.data_dir, &created.name, cloud_backend)
+        VolumeWriter::open(&state.data_dir, &created.name, storage_backend)
     };
     let writer = match open_result {
         Ok(w) => Arc::new(
@@ -1191,9 +1191,9 @@ fn rebind_page_index_uuid(idx_path: &std::path::Path, new_uuid: &[u8; 16]) -> st
 /// Per-volume chunks under `<data_dir>/chunks/<backend>/<volume>/`
 /// (Local dedup scope) or in the shared per-backend pool (Global)
 /// are left in place — the future `system gc` sweep will reclaim
-/// orphaned chunks. Cloud objects matching the volume namespace are
+/// orphaned chunks. Storage objects matching the volume namespace are
 /// likewise out of scope for this primitive; operators who want to
-/// reclaim cloud bytes today can run a backend-specific cleanup
+/// reclaim storage bytes today can run a backend-specific cleanup
 /// against the volume's UUID prefix.
 ///
 /// Today there is no host-quiescence safety check: the dispatcher
@@ -1214,7 +1214,7 @@ pub async fn destroy(
     })?;
 
     // Flush dirty pages and stop the worker before tearing the
-    // volume down — host-acked writes that haven't yet reached cloud
+    // volume down — host-acked writes that haven't yet reached storage
     // would otherwise be silently lost on a destroy. We don't fail
     // the request on flush errors: the chunks we couldn't upload
     // would be orphaned by the destroy anyway, so a warning is
@@ -1367,7 +1367,7 @@ pub async fn destroy(
 /// `POST /api/v1/volumes/:name/sync-after` — flip the volume's
 /// SCSI SYNCHRONIZE CACHE durability tier at runtime.
 ///
-/// Body shape: `{ "mode": "cloud" | "disk" | "memory" }`. The
+/// Body shape: `{ "mode": "storage" | "disk" | "memory" }`. The
 /// handler updates the `VolumeWriter`'s atomic + rewrites
 /// `runtime.json` so the choice survives a daemon restart. The
 /// flip takes effect on the next SYNC; in-flight SYNCs finish
@@ -1604,7 +1604,7 @@ pub struct CreateVolumeRequest {
     pub size_bytes: u64,
     #[serde(default = "default_page_size_bytes")]
     pub page_size_bytes: u32,
-    /// Cloud backend name from `cloud.backends:` in the YAML
+    /// Storage backend name from `storage.backends:` in the YAML
     /// conffile. `None` (operator omitted `--backend`) is resolved
     /// daemon-side: inferred when exactly one backend is configured,
     /// refused with a clear error when 2+ are.
@@ -1641,9 +1641,9 @@ pub struct CreateVolumeRequest {
     /// backend.
     #[serde(default)]
     pub dek_source: Option<String>,
-    /// Initial SCSI SYNCHRONIZE CACHE durability tier — `"cloud"`,
+    /// Initial SCSI SYNCHRONIZE CACHE durability tier — `"storage"`,
     /// `"disk"`, or `"memory"`. `None` (or absent in the request
-    /// body) defaults to `cloud` (the safest tier and the
+    /// body) defaults to `storage` (the safest tier and the
     /// pre-knob behaviour). Mutable later via `POST
     /// /api/v1/volumes/{name}/sync-after`.
     #[serde(default)]

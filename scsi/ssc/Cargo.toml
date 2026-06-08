@@ -13,7 +13,7 @@ workspace = true
 # Tape-cartridge primitives + per-drive state + LTO encryption types,
 # plus the `DriveTopology` trait the dispatcher walks drives through.
 core-stream = { path = "../../core/stream" }
-# `TapeDeviceFacade` trait, audit channel, cloud config, legal-hold
+# `TapeDeviceFacade` trait, audit channel, storage config, legal-hold
 # sentinel helpers, library-side `DriveInfo`, and the `SmcError` type
 # the SSC sense walker pattern-matches on.
 core-mediachanger = { path = "../../core/mediachanger" }

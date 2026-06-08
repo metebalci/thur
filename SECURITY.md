@@ -29,7 +29,7 @@ A useful report has:
 
 - **Product** — Thur VTL or Thur VSA (or shared code affecting both).
 - **Version** — the `--version` string from the affected binary.
-- **Deployment** — transport (iSCSI / NVMe-TCP), cloud backend in
+- **Deployment** — transport (iSCSI / NVMe-TCP), storage backend in
   use, and host OS.
 - **Reproduction** — minimal steps to reproduce, and what an attacker
   gains.
@@ -58,7 +58,7 @@ In scope:
 - Encryption and key handling — tape AME, per-volume DEKs, keystore
   backends.
 - Audit-log chain integrity.
-- Credential handling — CHAP / mutual-CHAP, NVMe-TCP TLS-PSK, cloud
+- Credential handling — CHAP / mutual-CHAP, NVMe-TCP TLS-PSK, storage
   backend credentials, the `<product>.env` file.
 
 Out of scope:

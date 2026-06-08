@@ -11,8 +11,8 @@
 //!   daemon's eviction worker. Mirrors `core_stream::DiskCacheManager`
 //!   structurally and shares the same refcount-safe contract:
 //!   eviction must skip any chunk whose pages still have a pending
-//!   cloud upload, because dropping a pool entry that doesn't yet
-//!   have a cloud copy is data loss. The per-volume `upload.idx`
+//!   storage upload, because dropping a pool entry that doesn't yet
+//!   have a storage copy is data loss. The per-volume `upload.idx`
 //!   sidecar records `LocalOnly` vs `Uploaded`; the eviction filter
 //!   `OR`s across every referencing page so a chunk shared by an
 //!   uploaded page and a pending-upload page stays pinned until the
@@ -101,7 +101,7 @@ pub fn refresh_pool_budget_from_volumes(
 }
 
 /// Per-backend eviction state. The daemon owns one
-/// `DiskCacheManager` per configured cloud backend; total cache
+/// `DiskCacheManager` per configured storage backend; total cache
 /// budget is shared at the daemon-coordinator layer (per-backend
 /// `PoolBudget` map).
 ///
@@ -115,7 +115,7 @@ pub fn refresh_pool_budget_from_volumes(
 /// among the **uploaded** chunks until usage is back under cap.
 /// A chunk pinned by even a single `LocalOnly` reference stays
 /// resident until the upload worker drains — dropping it before
-/// the cloud PUT acks would be the only-copy data-loss path the
+/// the storage PUT acks would be the only-copy data-loss path the
 /// pre-async-upload era didn't have to worry about. `read_page`
 /// refetches on pool miss transparently.
 pub struct DiskCacheManager {
@@ -268,7 +268,7 @@ impl DiskCacheManager {
     /// `VolumeWriter` parked on backpressure wakes immediately.
     ///
     /// Filters out any chunk whose pages still have a `LocalOnly`
-    /// upload-state record (cloud PUT not yet acked). The chunk
+    /// upload-state record (storage PUT not yet acked). The chunk
     /// stays pinned until the upload worker flips the sidecar back
     /// to `Uploaded` — at which point the next eviction tick (or
     /// the upload-completion `Notify`) considers it again.
@@ -296,7 +296,7 @@ impl DiskCacheManager {
             // legacy chunk written before async upload landed (no
             // upload.idx entry) was synchronously uploaded under
             // the old write path, so dropping it from the pool is
-            // safe — `read_page` will refetch from cloud on miss.
+            // safe — `read_page` will refetch from storage on miss.
             c.uploaded = uploaded
                 .get(&c.namespace)
                 .and_then(|m| m.get(&c.hash))
@@ -477,9 +477,9 @@ impl DiskCacheManager {
     /// Snapshots (issue #13) are deliberately **not** walked here. A
     /// snapshot's frozen `pages.idx` only references chunks that were
     /// already `Uploaded` at snapshot time (snapshot-create quiesces:
-    /// it flushes dirty pages to the pool and awaits cloud acks before
+    /// it flushes dirty pages to the pool and awaits storage acks before
     /// freezing), and content-addressed chunks are immutable, so a
-    /// snapshot-only chunk is always cloud-durable. With no entry here
+    /// snapshot-only chunk is always storage-durable. With no entry here
     /// it falls to the safe defaults in `evict_lru_chunks`
     /// (`uploaded = true`, `last_accessed = 0`) — evictable as a cold,
     /// already-uploaded chunk, exactly right. Walking snapshots would
@@ -548,7 +548,7 @@ impl DiskCacheManager {
             // *present but unreadable* (or uncreatable) — a real IO
             // / permission fault, not the legacy case. We must not
             // treat those pages as evictable: a momentary fault
-            // could otherwise delete pool chunks whose cloud PUT
+            // could otherwise delete pool chunks whose storage PUT
             // hasn't landed (later 404 on read). Pin conservatively
             // — mark every page of this volume LocalOnly for this
             // pass (which also preserves the cross-volume AND pin
@@ -1039,7 +1039,7 @@ mod tests {
     /// read as all-Uploaded), the eviction pass must pin every page of
     /// that volume rather than treat them as Uploaded → evictable.
     /// Otherwise a momentary fault could delete a pool chunk whose
-    /// cloud PUT hasn't landed (later 404 on read).
+    /// storage PUT hasn't landed (later 404 on read).
     #[test]
     fn evict_lru_chunks_pins_when_sidecar_unreadable() {
         use crate::page_index::PageIndex;

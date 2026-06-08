@@ -118,7 +118,7 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
                 .with_information(*lba as u32)
                 .build()
         }
-        // Chunk integrity failure on cloud refetch: same UNRECOVERED
+        // Chunk integrity failure on storage refetch: same UNRECOVERED
         // READ ERROR (0x11/0x00) the LBA-keyed VerifyFailed uses, no
         // information field (the corrupted chunk spans many LBAs).
         // Backup software (Veeam / NetBackup / tar / Bacula) treats

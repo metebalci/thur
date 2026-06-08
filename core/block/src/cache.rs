@@ -8,7 +8,7 @@
 //! page WRITE / READ / CAW / UNMAP turn into read-modify-write
 //! through a per-page in-memory buffer. The buffer is the single
 //! source of truth for "what is the host-visible content of this
-//! page right now"; the underlying `VolumeWriter` handles cloud
+//! page right now"; the underlying `VolumeWriter` handles storage
 //! durability when a dirty page eventually flushes.
 //!
 //! ## Crash semantics
@@ -18,13 +18,13 @@
 //! SCSI write-back contract (no FUA, no SYNC = no durability
 //! guarantee). After SYNCHRONIZE CACHE returns, every page in the
 //! requested LBA range has been flushed through `VolumeWriter::
-//! write_page` to the cloud.
+//! write_page` to the storage.
 //!
 //! ## Concurrency
 //!
 //! One [`tokio::sync::Mutex`] guards the cache state. Loads and
-//! flushes drop the lock during the cloud IO and re-acquire to
-//! commit, so a slow cloud read doesn't block unrelated cache
+//! flushes drop the lock during the storage IO and re-acquire to
+//! commit, so a slow storage read doesn't block unrelated cache
 //! operations on different pages. The dispatcher already serializes
 //! conflicting CAW operations via a per-LUN async mutex; concurrent
 //! plain WRITE/READ on the same LBA range is host-side undefined
@@ -37,7 +37,7 @@
 //! one exists; otherwise it flushes the LRU dirty page through
 //! `VolumeWriter::write_page_unsynced` first. Eviction runs inline
 //! on the load/insert path that pushed the cache over budget; the
-//! inner cache lock is dropped during the cloud upload so other
+//! inner cache lock is dropped during the storage upload so other
 //! cache operations (notably parallel `flush_all` cohort members)
 //! don't block on the eviction's PUT. Each eviction bumps
 //! `thurvsa_cache_evictions_total{outcome=clean|dirty}` so an
@@ -84,7 +84,7 @@ const DIRTY_WATERMARK_DENOMINATOR: usize = 2;
 /// Background flush tick. The worker also wakes on the dirty
 /// notification, so this is just a backstop for quiet writers — a
 /// host that writes once and stops still gets its bytes committed
-/// to cloud within roughly this window.
+/// to storage within roughly this window.
 const FLUSH_TICK: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +311,7 @@ pub enum RangeError {
 
 /// Per-volume page cache. Holds the underlying `VolumeWriter` so a
 /// single boot-time construction binds the cache to its volume +
-/// cloud backend; the daemon hands `Arc<PageCache>` to the SCSI
+/// storage backend; the daemon hands `Arc<PageCache>` to the SCSI
 /// dispatcher in place of `Arc<VolumeWriter>`.
 pub struct PageCache {
     writer: Arc<VolumeWriter>,
@@ -328,13 +328,13 @@ pub struct PageCache {
     /// writes).
     host_bytes_written: AtomicU64,
     /// Monotonic count of host-visible bytes served for READs. Bumped
-    /// per `read_bytes`, cache hits and cloud misses alike.
+    /// per `read_bytes`, cache hits and storage misses alike.
     host_bytes_read: AtomicU64,
-    /// Monotonic count of bytes PUT to cloud for this volume —
+    /// Monotonic count of bytes PUT to storage for this volume —
     /// post-dedup, post-compression. Bumped from the daemon's upload
     /// worker as each chunk's PUT completes.
     backend_bytes_written: AtomicU64,
-    /// Monotonic count of bytes fetched from cloud on a page cache
+    /// Monotonic count of bytes fetched from storage on a page cache
     /// miss. Bumped in `acquire_page` from `VolumeWriter::read_page`.
     backend_bytes_read: AtomicU64,
     /// `true` when any of the four counters above has advanced past
@@ -347,7 +347,7 @@ pub struct PageCache {
     /// Upper bound on concurrent in-flight `flush_one` calls when
     /// draining the dirty set. `1` (the legacy default) preserves the
     /// pre-parallel behavior; the VSA daemon resolves the operator's
-    /// `cloud.upload.max_concurrent` and passes the result via
+    /// `storage.upload.max_concurrent` and passes the result via
     /// [`PageCache::with_budget_and_concurrency`]. `0` is clamped to
     /// `1` defensively.
     max_concurrent_flushes: usize,
@@ -374,7 +374,7 @@ impl PageCache {
     /// `max_concurrent_flushes` is the upper bound on parallel
     /// in-flight `VolumeWriter::write_page` calls during `flush_all` /
     /// `flush_pages_in_range` / `run_flush_worker`. The VSA daemon
-    /// resolves it from `cloud.upload.max_concurrent` via
+    /// resolves it from `storage.upload.max_concurrent` via
     /// [`shared_object_store::UploadConfig::resolve_max_concurrent`] at boot
     /// and passes the resolved value here. `0` is clamped to `1` so
     /// the drain loop always makes forward progress.
@@ -425,12 +425,12 @@ impl PageCache {
         self.host_bytes_read.load(Ordering::Relaxed)
     }
 
-    /// Current in-memory cloud-PUT byte counter.
+    /// Current in-memory storage-PUT byte counter.
     pub fn backend_bytes_written(&self) -> u64 {
         self.backend_bytes_written.load(Ordering::Relaxed)
     }
 
-    /// Current in-memory cloud-fetch byte counter.
+    /// Current in-memory storage-fetch byte counter.
     pub fn backend_bytes_read(&self) -> u64 {
         self.backend_bytes_read.load(Ordering::Relaxed)
     }
@@ -492,7 +492,7 @@ impl PageCache {
         self.bump(&self.backend_bytes_read, n);
     }
 
-    /// Add `n` to the cloud-PUT byte meter. `pub` because the
+    /// Add `n` to the storage-PUT byte meter. `pub` because the
     /// daemon's upload worker bumps it from outside this module as
     /// each chunk's PUT completes.
     pub fn bump_backend_bytes_written(&self, n: u64) {
@@ -583,7 +583,7 @@ impl PageCache {
     }
 
     /// Write `data.len()` bytes starting at `byte_offset`. Sub-page
-    /// writes RMW: load the affected page (cache → pool → cloud →
+    /// writes RMW: load the affected page (cache → pool → storage →
     /// zero-fill if unallocated), splice in the host bytes, mark
     /// dirty. Full-page writes skip the load and install the bytes
     /// directly. Range must lie entirely within the volume.
@@ -664,7 +664,7 @@ impl PageCache {
     /// is cleared synchronously (matching the previous page-aligned
     /// behavior). Sub-page UNMAP zeros the affected sectors and
     /// marks the page dirty so the next flush commits the partial
-    /// erase to cloud. Range must lie within the volume.
+    /// erase to storage. Range must lie within the volume.
     pub async fn unmap_bytes(&self, byte_offset: u64, len: u64) -> Result<(), UploaderError> {
         if len == 0 {
             return Ok(());
@@ -696,10 +696,10 @@ impl PageCache {
     /// SBC-3 EXTENDED COPY (XCOPY) fast path. Copies `len` bytes
     /// from `src_byte_offset` to `dst_byte_offset`, skipping the
     /// chunk-pool round trip when the source page is clean and its
-    /// chunk is already in cloud: the destination's page-index entry
+    /// chunk is already in storage: the destination's page-index entry
     /// is rebound to the source's chunk hash, the cached destination
     /// page (if any) is invalidated, and the pool's natural dedup
-    /// means no new bytes hit cloud.
+    /// means no new bytes hit storage.
     ///
     /// All three offsets and `len` must be whole multiples of
     /// [`Self::page_size`]; the caller is responsible for range
@@ -710,7 +710,7 @@ impl PageCache {
     /// Three per-page cases:
     /// 1. Source dirty in cache — copy the cached bytes into a new
     ///    dirty entry at the destination. One page-size memcpy, no
-    ///    cloud IO.
+    ///    storage IO.
     /// 2. Source clean and upload state is `Uploaded` — rebind
     ///    the destination's page-index entry to the source's chunk
     ///    hash (or clear it when the source is a sparse hole) and
@@ -718,14 +718,14 @@ impl PageCache {
     ///    now has two page-index references; GC reclaims it only
     ///    once both go away.
     /// 3. Source clean but upload state is `LocalOnly` (chunk not
-    ///    yet acknowledged by cloud) — fall back to a full
+    ///    yet acknowledged by storage) — fall back to a full
     ///    bytes-copy. The chunk isn't safe to alias yet because
     ///    the destination's pending-upload tracker doesn't share
     ///    the source's PUT.
     ///
     /// Counts as host-written bytes (the destination range was
     /// "written" from the host's perspective), but does not bump
-    /// the cloud-PUT counter on the fast path — no new bytes
+    /// the storage-PUT counter on the fast path — no new bytes
     /// crossed the pool boundary.
     pub async fn clone_page_range(
         &self,
@@ -812,7 +812,7 @@ impl PageCache {
     /// - [`SyncAfter::Storage`] (default) — flush dirty cache pages
     ///   to the pool + enqueue uploads, then await the pending
     ///   tracker so every PUT for the synced range has acked. The
-    ///   host's `fsync(2)` settles to "bytes are in cloud."
+    ///   host's `fsync(2)` settles to "bytes are in storage."
     /// - [`SyncAfter::Disk`] — flush dirty cache pages to the pool
     ///   only; return without waiting on the upload worker. Host
     ///   `fsync(2)` settles to "bytes are in the local pool." A
@@ -838,9 +838,9 @@ impl PageCache {
             Some(r) => r,
             None => return Ok(()),
         };
-        // Phase 1 (Disk + Cloud): cache → pool + enqueue.
+        // Phase 1 (Disk + Storage): cache → pool + enqueue.
         self.flush_pages_in_range(first, last).await?;
-        // Phase 2 (Cloud only): drain the pending-upload tracker.
+        // Phase 2 (Storage only): drain the pending-upload tracker.
         // No-op under inline dispatch (pending tracker stays
         // empty) and on already-drained ranges.
         if matches!(self.writer.sync_after(), SyncAfter::Storage) {
@@ -884,13 +884,13 @@ impl PageCache {
     /// reclaimable (issue #13). The snapshot references the same chunks
     /// as the parent; nothing in the pool is copied.
     ///
-    /// The frozen index must reference only **cloud-uploaded** chunks:
+    /// The frozen index must reference only **storage-uploaded** chunks:
     /// a snapshot-only chunk (one the parent later overwrites) may have
-    /// its local copy evicted and be refetched from cloud on read, so
-    /// it must be cloud-durable. The sequence guarantees that:
+    /// its local copy evicted and be refetched from storage on read, so
+    /// it must be storage-durable. The sequence guarantees that:
     ///
     /// 1. [`Self::flush_all`] drains dirty cache pages into the pool +
-    ///    page index and awaits every pending cloud PUT, so the
+    ///    page index and awaits every pending storage PUT, so the
     ///    snapshot captures all daemon-cached writes (crash-consistent;
     ///    the host fsyncs / fs-freezes for application consistency) and
     ///    every currently-referenced chunk is uploaded.
@@ -1001,7 +1001,7 @@ impl PageCache {
             }
             // Drain dirty pages opportunistically; ignore individual
             // flush errors (logged inside `flush_one`) so a transient
-            // cloud blip doesn't kill the worker.
+            // storage blip doesn't kill the worker.
             let _ = self.flush_all().await;
         }
     }
@@ -1057,14 +1057,14 @@ impl PageCache {
             }
         }
 
-        // Cache miss → fetch from the writer (cloud or pool). Drop
+        // Cache miss → fetch from the writer (storage or pool). Drop
         // the lock during the await so unrelated cache ops don't
-        // block on a slow cloud read.
+        // block on a slow storage read.
         let bytes = match self.writer.read_page(page_id).await? {
-            Some((bytes, cloud_bytes)) => {
-                // `cloud_bytes` is 0 on a local-pool hit and >0 only
-                // on a real cloud fetch; the bump no-ops on 0.
-                self.bump_backend_bytes_read(cloud_bytes);
+            Some((bytes, storage_bytes)) => {
+                // `storage_bytes` is 0 on a local-pool hit and >0 only
+                // on a real storage fetch; the bump no-ops on 0.
+                self.bump_backend_bytes_read(storage_bytes);
                 bytes
             }
             None => vec![0u8; self.page_size as usize],
@@ -1078,7 +1078,7 @@ impl PageCache {
         let bytes = Arc::new(bytes);
 
         // Make room for the new entry. `evict_to_fit` releases the
-        // inner lock during any required cloud upload, so concurrent
+        // inner lock during any required storage upload, so concurrent
         // flushes don't stall on this path.
         self.evict_to_fit(1).await?;
 
@@ -1204,7 +1204,7 @@ impl PageCache {
 
     /// UNMAP a full page: drop any cached entry (clean or dirty —
     /// the host explicitly told us to forget it) and clear the
-    /// underlying page-index slot synchronously. Cloud chunks linger
+    /// underlying page-index slot synchronously. Storage chunks linger
     /// until `system gc` reclaims them.
     async fn unmap_full_page(&self, page_id: PageId) -> Result<(), UploaderError> {
         {
@@ -1220,7 +1220,7 @@ impl PageCache {
     /// release the inner mutex before calling, and re-acquire
     /// after. Each iteration takes the lock just long enough to
     /// pick a candidate and either drop it (clean) or snapshot its
-    /// bytes (dirty); the cloud upload itself happens off-lock so
+    /// bytes (dirty); the storage upload itself happens off-lock so
     /// concurrent cache operations — notably parallel `flush_drain`
     /// cohort members — don't stall on the eviction's PUT.
     ///
@@ -1232,7 +1232,7 @@ impl PageCache {
     async fn evict_to_fit(&self, wanted: usize) -> Result<(), UploaderError> {
         loop {
             // Snapshot a candidate under the lock. Either consume
-            // the clean drop here (no cloud IO needed) or hand back
+            // the clean drop here (no storage IO needed) or hand back
             // a dirty-page snapshot for the off-lock flush below. The
             // dirty snapshot is an `Arc` clone (a refcount bump), so
             // the lock is held only long enough to pick the victim.
@@ -1329,8 +1329,8 @@ impl PageCache {
     }
 
     /// Flush every dirty page whose id falls in `[first, last]`.
-    /// Awaits each cloud upload sequentially — concurrent flushes
-    /// against the same cloud backend can saturate it; thurvsa
+    /// Awaits each storage upload sequentially — concurrent flushes
+    /// against the same storage backend can saturate it; thurvsa
     /// workloads don't currently need parallel sync flushes.
     pub async fn flush_pages_in_range(
         &self,
@@ -1670,9 +1670,9 @@ mod tests {
 
     async fn fixture_cache(size_bytes: u64) -> (TempDir, Arc<PageCache>, Arc<VolumeWriter>) {
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let backend = LocalBackend::new(&cloud).await.unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let backend = LocalBackend::new(&storage).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),
@@ -1750,7 +1750,7 @@ mod tests {
         let dst = PageIndex::path_for(&snap_dir);
         cache.snapshot_pages_idx(dst.clone()).await.unwrap();
 
-        // Load-bearing invariant: the snapshot's chunk is cloud-uploaded
+        // Load-bearing invariant: the snapshot's chunk is storage-uploaded
         // (so eviction may safely drop its local copy and refetch).
         assert!(
             matches!(
@@ -2160,10 +2160,10 @@ mod tests {
         // Tiny budget — 2 pages — so a third page write forces
         // eviction.
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
         let backend: Arc<dyn ObjectStoreBackend> =
-            Arc::new(LocalBackend::new(&cloud).await.unwrap());
+            Arc::new(LocalBackend::new(&storage).await.unwrap());
         VolumeManifest::new(
             "vol1".into(),
             8 * (1u64 << 20),
@@ -2193,16 +2193,16 @@ mod tests {
             "page 0 must be flushed before eviction"
         );
 
-        // Read it back through the cache — falls through to cloud,
+        // Read it back through the cache — falls through to storage,
         // pulls the page back in, returns the bytes we wrote.
         let read_back = cache.read_bytes(0, PAGE).await.unwrap();
         assert_eq!(read_back, pattern(0, PAGE));
     }
 
     #[tokio::test]
-    async fn write_then_read_through_cache_does_not_round_trip_to_cloud() {
+    async fn write_then_read_through_cache_does_not_round_trip_to_storage() {
         // Sanity: a write followed by a read of the same page should
-        // hit the cache, not re-fetch from cloud. Indirectly tested
+        // hit the cache, not re-fetch from storage. Indirectly tested
         // by checking the page-index entry stays absent until SYNC.
         let (_tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
         let bytes = pattern(0xAB, SECTOR);
@@ -2259,7 +2259,7 @@ mod tests {
 
     #[test]
     fn page_range_for_bytes_handles_aligned_and_unaligned() {
-        // Smoke-test the helper without spinning up a cloud backend.
+        // Smoke-test the helper without spinning up a storage backend.
         // We can't hold a PageCache without one, so test the math via
         // a tiny shadow type that mirrors `page_size`. The real
         // function is exercised end-to-end by the synchronize tests.
@@ -2334,7 +2334,7 @@ mod tests {
         assert_eq!(cache.host_bytes_read(), 0);
         cache.write_bytes(0, &pattern(0x10, PAGE)).await.unwrap();
         // Reads count toward host_bytes_read whether served from the
-        // page cache or fetched from cloud.
+        // page cache or fetched from storage.
         cache.read_bytes(0, SECTOR).await.unwrap();
         assert_eq!(cache.host_bytes_read(), SECTOR as u64);
         cache.read_bytes(0, PAGE).await.unwrap();
@@ -2342,27 +2342,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_bytes_read_counts_cloud_fetch_on_pool_miss() {
+    async fn backend_bytes_read_counts_storage_fetch_on_pool_miss() {
         let (tmp, cache, writer) = fixture_cache(4 * (1u64 << 20)).await;
         let page = pattern(0x5A, PAGE);
         cache.write_bytes(0, &page).await.unwrap();
         cache.flush_all().await.unwrap();
 
         // Drop the chunk from the local pool so the next read can
-        // only be satisfied from cloud.
+        // only be satisfied from storage.
         for (hash, _) in writer.pool().iter_chunks().unwrap() {
             writer.pool().remove(&hash).unwrap();
         }
 
         // A fresh cache over the same volume has an empty in-memory
-        // page map, so the read falls through to read_page -> cloud.
+        // page map, so the read falls through to read_page -> storage.
         let cache2 = PageCache::new(writer.clone());
         assert_eq!(cache2.backend_bytes_read(), 0);
         let got = cache2.read_bytes(0, PAGE).await.unwrap();
         assert_eq!(got, page);
         assert_eq!(cache2.backend_bytes_read(), PAGE as u64);
 
-        // The cloud-fetch counter persists like the others.
+        // The storage-fetch counter persists like the others.
         cache2.flush_all().await.unwrap();
         let vol_dir = VolumeManifest::dir_for(tmp.path(), "vol1");
         let r = crate::runtime_state::VolumeRuntime::load(&vol_dir).unwrap();
@@ -2388,7 +2388,7 @@ mod tests {
         // LocalBackend doesn't compress and the fixture is not
         // encrypted, so the PUT bytes equal the page size exactly.
         assert_eq!(r.backend_bytes_written, PAGE as u64);
-        // No cloud miss in this test, so backend_bytes_read stays 0.
+        // No storage miss in this test, so backend_bytes_read stays 0.
         assert_eq!(r.backend_bytes_read, 0);
     }
 
@@ -2474,7 +2474,7 @@ mod tests {
 
     use shared_object_store::compression::CompressionAlgo;
     use shared_object_store::object_store_backend::LockState;
-    use shared_object_store::{ObjectStoreError, Result as CloudResult};
+    use shared_object_store::{ObjectStoreError, Result as StorageResult};
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
@@ -2485,7 +2485,7 @@ mod tests {
     /// parallel drain timing; tracks max simultaneous in-flight
     /// `upload_chunk` callers; fails any call whose key is in the
     /// shared `fail_keys` set (mutable post-construction so tests
-    /// can compute the exact cloud key from the live writer's pool
+    /// can compute the exact storage key from the live writer's pool
     /// and inject it). Every other trait method delegates unchanged.
     #[derive(Debug)]
     struct DelayingBackend {
@@ -2522,7 +2522,7 @@ mod tests {
             &self,
             key: &str,
             data: &[u8],
-        ) -> CloudResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
+        ) -> StorageResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let n = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             // Update max watermark with a compare-exchange loop —
             // multiple concurrent callers may all see the same `n` and
@@ -2549,35 +2549,35 @@ mod tests {
             self.inner.upload_chunk(key, data).await
         }
 
-        async fn upload_chunk_zerocopy(&self, key: &str, file_path: &Path) -> CloudResult<u64> {
+        async fn upload_chunk_zerocopy(&self, key: &str, file_path: &Path) -> StorageResult<u64> {
             self.inner.upload_chunk_zerocopy(key, file_path).await
         }
 
-        async fn download_chunk(&self, key: &str) -> CloudResult<Vec<u8>> {
+        async fn download_chunk(&self, key: &str) -> StorageResult<Vec<u8>> {
             self.inner.download_chunk(key).await
         }
 
-        async fn download_chunks_parallel(&self, keys: &[String]) -> CloudResult<Vec<Vec<u8>>> {
+        async fn download_chunks_parallel(&self, keys: &[String]) -> StorageResult<Vec<Vec<u8>>> {
             self.inner.download_chunks_parallel(keys).await
         }
 
-        async fn upload_manifest(&self, key: &str, json: &str) -> CloudResult<()> {
+        async fn upload_manifest(&self, key: &str, json: &str) -> StorageResult<()> {
             self.inner.upload_manifest(key, json).await
         }
 
-        async fn download_manifest(&self, key: &str) -> CloudResult<String> {
+        async fn download_manifest(&self, key: &str) -> StorageResult<String> {
             self.inner.download_manifest(key).await
         }
 
-        async fn chunk_exists(&self, key: &str) -> CloudResult<bool> {
+        async fn chunk_exists(&self, key: &str) -> StorageResult<bool> {
             self.inner.chunk_exists(key).await
         }
 
-        async fn list_objects(&self, key_prefix: &str) -> CloudResult<Vec<String>> {
+        async fn list_objects(&self, key_prefix: &str) -> StorageResult<Vec<String>> {
             self.inner.list_objects(key_prefix).await
         }
 
-        async fn delete_object(&self, key: &str) -> CloudResult<()> {
+        async fn delete_object(&self, key: &str) -> StorageResult<()> {
             self.inner.delete_object(key).await
         }
 
@@ -2585,15 +2585,15 @@ mod tests {
             "delaying"
         }
 
-        async fn lock_state(&self) -> CloudResult<LockState> {
+        async fn lock_state(&self) -> StorageResult<LockState> {
             self.inner.lock_state().await
         }
 
-        async fn set_object_legal_hold(&self, key: &str, held: bool) -> CloudResult<()> {
+        async fn set_object_legal_hold(&self, key: &str, held: bool) -> StorageResult<()> {
             self.inner.set_object_legal_hold(key, held).await
         }
 
-        async fn get_object_legal_hold(&self, key: &str) -> CloudResult<bool> {
+        async fn get_object_legal_hold(&self, key: &str) -> StorageResult<bool> {
             self.inner.get_object_legal_hold(key).await
         }
 
@@ -2619,9 +2619,9 @@ mod tests {
         Arc<DelayingBackend>,
     ) {
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let local = LocalBackend::new(&cloud).await.unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let local = LocalBackend::new(&storage).await.unwrap();
         let local: Arc<dyn ObjectStoreBackend> = Arc::new(local);
         let delaying = DelayingBackend::new(Arc::clone(&local), delay);
         let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
@@ -2724,7 +2724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eviction_releases_lock_during_cloud_upload() {
+    async fn eviction_releases_lock_during_storage_upload() {
         // Regression test for the eviction lock-drop refactor.
         //
         // Setup: tiny 2-page budget + a backend that sleeps 200 ms
@@ -2732,7 +2732,7 @@ mod tests {
         // budget with both pages dirty. Spawn a task that writes
         // page 2 — install_full_page must evict (the LRU dirty page,
         // i.e. page 0), and the eviction's `write_page_unsynced`
-        // blocks for 200 ms in the cloud upload.
+        // blocks for 200 ms in the storage upload.
         //
         // During those 200 ms the inner mutex must be released so
         // the concurrent `read_bytes(page=1)` below — which only
@@ -2741,9 +2741,10 @@ mod tests {
         // lock through the upload; that path would make this read
         // block ≥ 200 ms.
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let local: Arc<dyn ObjectStoreBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let local: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&storage).await.unwrap());
         let delaying = DelayingBackend::new(Arc::clone(&local), Duration::from_millis(200));
         let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
         VolumeManifest::new(
@@ -2788,7 +2789,7 @@ mod tests {
         assert_eq!(bytes, pattern(1, PAGE), "cached page 1 must be readable");
         assert!(
             read_elapsed < Duration::from_millis(100),
-            "read_bytes took {read_elapsed:?} — eviction must release the lock through the cloud upload, not hold it"
+            "read_bytes took {read_elapsed:?} — eviction must release the lock through the storage upload, not hold it"
         );
 
         evicting.await.unwrap();
@@ -2801,7 +2802,7 @@ mod tests {
         // cancel ready futures when one returns Err.
         let (_tmp, cache, writer, delaying) =
             fixture_cache_with_concurrency(16 * (1u64 << 20), 8, Duration::from_millis(5)).await;
-        // Compute the exact local-scope cloud key for page 3's
+        // Compute the exact local-scope storage key for page 3's
         // contents now that the writer (and its volume uuid) exist.
         let page3_hash = blake3::hash(&pattern(3, PAGE)).to_hex().to_string();
         let fail_key = writer.pool().object_key(&page3_hash);
@@ -3002,9 +3003,9 @@ mod tests {
         Arc<VolumeWriter>,
     ) {
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let backend = LocalBackend::new(&cloud).await.unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let backend = LocalBackend::new(&storage).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         for name in ["src_vol", "dst_vol"] {
             VolumeManifest::new(
@@ -3031,7 +3032,7 @@ mod tests {
     #[tokio::test]
     async fn clone_page_range_into_cross_volume_global_takes_hash_fast_path() {
         // Global dedup: both volumes share the per-backend pool.
-        // Cross-volume clone must rebind hashes without touching cloud
+        // Cross-volume clone must rebind hashes without touching storage
         // bytes — verified by reading the rebound page-index slot.
         let (_tmp, c_src, c_dst, w_src, w_dst) =
             fixture_two_caches(8 * (1u64 << 20), DedupScope::Global).await;
@@ -3122,9 +3123,9 @@ mod tests {
 
     async fn enc_backend() -> (TempDir, Arc<dyn ObjectStoreBackend>) {
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let backend = LocalBackend::new(&cloud).await.unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let backend = LocalBackend::new(&storage).await.unwrap();
         (tmp, Arc::new(backend) as Arc<dyn ObjectStoreBackend>)
     }
 
@@ -3498,10 +3499,10 @@ mod tests {
         // So page 1 (not page 0) gets flushed out, even though page 0
         // was written first.
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
         let backend: Arc<dyn ObjectStoreBackend> =
-            Arc::new(LocalBackend::new(&cloud).await.unwrap());
+            Arc::new(LocalBackend::new(&storage).await.unwrap());
         VolumeManifest::new(
             "vol1".into(),
             8 * (1u64 << 20),
@@ -3588,15 +3589,16 @@ mod tests {
     async fn eviction_losing_version_race_keeps_page_dirty_with_latest_bytes() {
         // Exercises the "Some(_) lost the race" arm of `evict_to_fit`:
         // a dirty page is snapshotted for eviction, the lock is dropped
-        // for the (slow) cloud upload, and a concurrent host write
+        // for the (slow) storage upload, and a concurrent host write
         // re-dirties that same page mid-upload (bumping its version).
         // On re-lock the eviction must NOT drop the page — it leaves it
         // dirty so the latest bytes survive, and evicts a different
         // victim instead.
         let tmp = TempDir::new().unwrap();
-        let cloud = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud).unwrap();
-        let local: Arc<dyn ObjectStoreBackend> = Arc::new(LocalBackend::new(&cloud).await.unwrap());
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let local: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&storage).await.unwrap());
         let delaying = DelayingBackend::new(Arc::clone(&local), Duration::from_millis(200));
         let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
         VolumeManifest::new(

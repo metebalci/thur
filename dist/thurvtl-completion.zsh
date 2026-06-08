@@ -71,7 +71,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (restore)
 _arguments "${_arguments_options[@]}" : \
-'--backend=[Cloud backend name to restore from]:BACKEND:_default' \
+'--backend=[Storage backend name to restore from]:BACKEND:_default' \
 '*--barcodes=[Restore only these barcodes (comma-separated)]:BARCODES:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -330,7 +330,7 @@ _arguments "${_arguments_options[@]}" : \
 '--chunking-min-kb=[FastCDC minimum chunk size in kilobytes (advanced)]:CHUNKING_MIN_KB:_default' \
 '--chunking-max-kb=[FastCDC maximum chunk size in kilobytes (advanced)]:CHUNKING_MAX_KB:_default' \
 '--multi=[Create N cartridges in one call (default 1)]:MULTI:_default' \
-'--backend=[Cloud backend name to bind this cartridge to]:BACKEND:_default' \
+'--backend=[Storage backend name to bind this cartridge to]:BACKEND:_default' \
 '--dedup=[Dedup scope\: \`global\` (default) or \`local\`]:DEDUP:(local global)' \
 '--keystore=[Keystore backend that wraps this cartridge'\''s DEK]:KEYSTORE:_default' \
 '-c+[Path to configuration file]:CONFIG:_default' \
@@ -2444,14 +2444,14 @@ _thurvtl_commands() {
 _thurvtl__subcmd__cartridge_commands() {
     local commands; commands=(
 'create:Create new blank cartridge (places in first available slot)' \
-'archive:Archive a cartridge to a different cloud backend' \
-'migrate:Move a cartridge to a different cloud backend' \
+'archive:Archive a cartridge to a different storage backend' \
+'migrate:Move a cartridge to a different storage backend' \
 'import:Import existing cartridge from filesystem' \
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (cloud-native)' \
+'legal-hold:Per-cartridge legal hold (storage-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2476,14 +2476,14 @@ _thurvtl__subcmd__cartridge__subcmd__export_commands() {
 _thurvtl__subcmd__cartridge__subcmd__help_commands() {
     local commands; commands=(
 'create:Create new blank cartridge (places in first available slot)' \
-'archive:Archive a cartridge to a different cloud backend' \
-'migrate:Move a cartridge to a different cloud backend' \
+'archive:Archive a cartridge to a different storage backend' \
+'migrate:Move a cartridge to a different storage backend' \
 'import:Import existing cartridge from filesystem' \
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (cloud-native)' \
+'legal-hold:Per-cartridge legal hold (storage-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2540,9 +2540,9 @@ _thurvtl__subcmd__cartridge__subcmd__help__subcmd__key__subcmd__show_commands() 
 (( $+functions[_thurvtl__subcmd__cartridge__subcmd__help__subcmd__legal-hold_commands] )) ||
 _thurvtl__subcmd__cartridge__subcmd__help__subcmd__legal-hold_commands() {
     local commands; commands=(
-'set:Engage legal hold on the cartridge'\''s cloud objects' \
-'clear:Release legal hold on the cartridge'\''s cloud objects' \
-'status:Read legal-hold state from the cloud provider' \
+'set:Engage legal hold on the cartridge'\''s storage objects' \
+'clear:Release legal hold on the cartridge'\''s storage objects' \
+'status:Read legal-hold state from the storage provider' \
     )
     _describe -t commands 'thurvtl cartridge help legal-hold commands' commands "$@"
 }
@@ -2632,9 +2632,9 @@ _thurvtl__subcmd__cartridge__subcmd__key__subcmd__show_commands() {
 (( $+functions[_thurvtl__subcmd__cartridge__subcmd__legal-hold_commands] )) ||
 _thurvtl__subcmd__cartridge__subcmd__legal-hold_commands() {
     local commands; commands=(
-'set:Engage legal hold on the cartridge'\''s cloud objects' \
-'clear:Release legal hold on the cartridge'\''s cloud objects' \
-'status:Read legal-hold state from the cloud provider' \
+'set:Engage legal hold on the cartridge'\''s storage objects' \
+'clear:Release legal hold on the cartridge'\''s storage objects' \
+'status:Read legal-hold state from the storage provider' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl cartridge legal-hold commands' commands "$@"
@@ -2647,9 +2647,9 @@ _thurvtl__subcmd__cartridge__subcmd__legal-hold__subcmd__clear_commands() {
 (( $+functions[_thurvtl__subcmd__cartridge__subcmd__legal-hold__subcmd__help_commands] )) ||
 _thurvtl__subcmd__cartridge__subcmd__legal-hold__subcmd__help_commands() {
     local commands; commands=(
-'set:Engage legal hold on the cartridge'\''s cloud objects' \
-'clear:Release legal hold on the cartridge'\''s cloud objects' \
-'status:Read legal-hold state from the cloud provider' \
+'set:Engage legal hold on the cartridge'\''s storage objects' \
+'clear:Release legal hold on the cartridge'\''s storage objects' \
+'status:Read legal-hold state from the storage provider' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thurvtl cartridge legal-hold help commands' commands "$@"
@@ -2894,14 +2894,14 @@ _thurvtl__subcmd__help_commands() {
 _thurvtl__subcmd__help__subcmd__cartridge_commands() {
     local commands; commands=(
 'create:Create new blank cartridge (places in first available slot)' \
-'archive:Archive a cartridge to a different cloud backend' \
-'migrate:Move a cartridge to a different cloud backend' \
+'archive:Archive a cartridge to a different storage backend' \
+'migrate:Move a cartridge to a different storage backend' \
 'import:Import existing cartridge from filesystem' \
 'export:Export cartridge to filesystem' \
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (cloud-native)' \
+'legal-hold:Per-cartridge legal hold (storage-native)' \
 'key:At-rest encryption DEK management' \
     )
     _describe -t commands 'thurvtl help cartridge commands' commands "$@"
@@ -2952,9 +2952,9 @@ _thurvtl__subcmd__help__subcmd__cartridge__subcmd__key__subcmd__show_commands() 
 (( $+functions[_thurvtl__subcmd__help__subcmd__cartridge__subcmd__legal-hold_commands] )) ||
 _thurvtl__subcmd__help__subcmd__cartridge__subcmd__legal-hold_commands() {
     local commands; commands=(
-'set:Engage legal hold on the cartridge'\''s cloud objects' \
-'clear:Release legal hold on the cartridge'\''s cloud objects' \
-'status:Read legal-hold state from the cloud provider' \
+'set:Engage legal hold on the cartridge'\''s storage objects' \
+'clear:Release legal hold on the cartridge'\''s storage objects' \
+'status:Read legal-hold state from the storage provider' \
     )
     _describe -t commands 'thurvtl help cartridge legal-hold commands' commands "$@"
 }
@@ -3150,7 +3150,7 @@ _thurvtl__subcmd__help__subcmd__library_commands() {
     local commands; commands=(
 'info:Show library information' \
 'bounds:Show min / current / max for num_slots and num_drives' \
-'restore:Restore cartridges from a cloud backend after disaster recovery' \
+'restore:Restore cartridges from a storage backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \
@@ -3612,7 +3612,7 @@ _thurvtl__subcmd__library_commands() {
     local commands; commands=(
 'info:Show library information' \
 'bounds:Show min / current / max for num_slots and num_drives' \
-'restore:Restore cartridges from a cloud backend after disaster recovery' \
+'restore:Restore cartridges from a storage backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \
@@ -3631,7 +3631,7 @@ _thurvtl__subcmd__library__subcmd__help_commands() {
     local commands; commands=(
 'info:Show library information' \
 'bounds:Show min / current / max for num_slots and num_drives' \
-'restore:Restore cartridges from a cloud backend after disaster recovery' \
+'restore:Restore cartridges from a storage backend after disaster recovery' \
 'restore-archive:Pull a frozen archive back into a live cartridge' \
 'monitor:Monitor library activity in real-time' \
 'self-test:Run the SPC-4 self-test against the changer LUN' \

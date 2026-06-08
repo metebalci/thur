@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-/// Manages local cache eviction for cartridges with cloud backing.
+/// Manages local cache eviction for cartridges with storage backing.
 /// With content-addressed shared storage, eviction must refcount-check
 /// across every cartridge before deleting a chunk file from the pool —
 /// the same hash may be referenced by tapes that haven't been opened
 /// for read yet.
 ///
 /// **Backend-scoped**: each DiskCacheManager handles exactly one named
-/// cloud backend's pool (`<data_dir>/chunks/<backend_name>/`). With
+/// storage backend's pool (`<data_dir>/chunks/<backend_name>/`). With
 /// per-backend pool sharding (multi_backend), every cartridge's chunks
 /// live exactly under one backend, so a DiskCacheManager's scans (usage
 /// calculation, eviction candidates, pinned hashes) filter manifests
@@ -253,7 +253,7 @@ impl DiskCacheManager {
     /// Returns the number of bytes freed
     pub async fn evict_lru_chunks(
         &mut self,
-        cloud_backend: Option<&dyn ObjectStoreBackend>,
+        storage_backend: Option<&dyn ObjectStoreBackend>,
     ) -> Result<u64> {
         if self.current_bytes <= self.cache_bytes {
             debug!(
@@ -330,7 +330,7 @@ impl DiskCacheManager {
         // single oldest chunk is processed first; we then drain *all*
         // its candidates before moving on. Old code opened the
         // cartridge fresh per chunk, which loaded chunk_index +
-        // every block_index + dirty_pages + the cloud handle for
+        // every block_index + dirty_pages + the storage handle for
         // every flip of one record's `location` field — for 1000
         // evictable chunks across 50 cartridges that was 1000 full
         // cartridge-opens vs 50 here.
@@ -353,8 +353,8 @@ impl DiskCacheManager {
             }
             let chunks = by_label.remove(&label).unwrap_or_default();
             // Open the cartridge once for this label.
-            let cartridge = if let Some(backend) = cloud_backend {
-                Cartridge::open_with_cloud(
+            let cartridge = if let Some(backend) = storage_backend {
+                Cartridge::open_with_storage(
                     &tapes_root,
                     &label,
                     crate::cartridge::CartridgeOpenMode::Open,
@@ -509,7 +509,7 @@ impl DiskCacheManager {
     /// Build the set of hashes that any cartridge *of this backend*
     /// still wants kept on disk, keyed by namespace. A hash is "pinned"
     /// if any cartridge lists it with `location = LocalOnly`. `Both` is
-    /// fine to evict (the cartridge has confirmed the cloud copy);
+    /// fine to evict (the cartridge has confirmed the storage copy);
     /// `S3Only` already considers it gone locally.
     ///
     /// Map shape:
@@ -569,7 +569,7 @@ impl DiskCacheManager {
         cartridge: &mut Cartridge,
         pinned: &HashMap<Option<String>, HashSet<String>>,
     ) -> Result<u64> {
-        // Always update this cartridge's view to CloudOnly.
+        // Always update this cartridge's view to StorageOnly.
         cartridge.mark_chunk_evicted(candidate.chunk_id)?;
 
         // Refcount within the candidate's namespace. `Global` chunks

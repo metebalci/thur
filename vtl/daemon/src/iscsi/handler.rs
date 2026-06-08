@@ -8,20 +8,20 @@
 //! the 50+ per-opcode `handle_*` arms below it). The handler owns
 //! `Arc` handles into every subsystem dispatch needs (DriveManager,
 //! Library, UnitAttentionTracker, DiagnosticStore, audit channel,
-//! cloud backend registry) — those used to live as scattered locals
+//! storage backend registry) — those used to live as scattered locals
 //! inside the old `serve_connection` loop.
 //!
 //! Pre- / post-dispatch hooks that sit *around* the SCSI layer (not
 //! part of the SCSI surface itself) live here too:
 //!
-//! - **Cloud-prefetch hook** (READ on a tape LUN): pulls the chunk
-//!   backing the next-read LBA from cloud into the local pool before
+//! - **Storage-prefetch hook** (READ on a tape LUN): pulls the chunk
+//!   backing the next-read LBA from storage into the local pool before
 //!   the sync read path runs. Best-effort — failures fall through.
 //! - **SEND DIAGNOSTIC self-test pre-hook**: runs the async LUN-routed
 //!   self-test and stamps the result in `DiagnosticStore` so the sync
 //!   `handle_send_diagnostic` arm can read it back.
 //! - **MOVE MEDIUM legal-hold post-hook**: after a successful
-//!   load-into-drive, reads the cloud sentinel
+//!   load-into-drive, reads the storage sentinel
 //!   (`manifests/<barcode>/manifest-latest.json`) and stamps the
 //!   volatile `legal_held` flag on the drive.
 //!
@@ -61,11 +61,11 @@ pub struct IscsiLibraryHandler {
     pub(crate) data_dir: PathBuf,
     pub(crate) audit_log: Option<AuditChannel>,
     pub(crate) audit_ratelimiter: Arc<AuditRateLimiter>,
-    pub(crate) cloud_backends: ObjectStoreRegistry,
+    pub(crate) storage_backends: ObjectStoreRegistry,
     pub(crate) storage_config: Arc<ObjectStoreConfig>,
     /// Per-backend pool budgets. The read-prefetch hook releases a
     /// reservation against the matching backend when it warms a
-    /// cloud-fetched chunk into the local pool, keeping
+    /// storage-fetched chunk into the local pool, keeping
     /// `current_bytes()` exact for the eviction worker.
     pub(crate) pool_budgets: HashMap<String, Arc<PoolBudget>>,
     pub(crate) diagnostic_store: Arc<DiagnosticStore>,
@@ -157,8 +157,8 @@ impl ScsiHandler for IscsiLibraryHandler {
         let pdu_lun = (req.lun & 0xFF) as u8;
         let tsih = req.tsih;
 
-        // Cloud-prefetch hook for tape READs (CDB op 0x08, LUN >= 1).
-        // Pulls the chunk backing the next read LBA from cloud into
+        // Storage-prefetch hook for tape READs (CDB op 0x08, LUN >= 1).
+        // Pulls the chunk backing the next read LBA from storage into
         // the local pool if missing — best-effort, errors fall
         // through.
         if pdu_lun >= 1 && cdb_opcode == 0x08 {
@@ -167,27 +167,27 @@ impl ScsiHandler for IscsiLibraryHandler {
                 &self.drive_manager,
                 drive_id,
                 tsih,
-                &self.cloud_backends,
+                &self.storage_backends,
                 &self.storage_config,
                 &self.pool_budgets,
             )
             .await
             {
                 tracing::debug!(
-                    "iSCSI prefetch: refetch hook returned {} - read will proceed without cloud refetch",
+                    "iSCSI prefetch: refetch hook returned {} - read will proceed without storage refetch",
                     e
                 );
             }
 
             // Background N-chunk read-ahead (issue #97): fan the chunks
             // *following* the next read out to the shared PrefetchManager
-            // so a sequential restore doesn't stall on cloud latency
+            // so a sequential restore doesn't stall on storage latency
             // chunk-by-chunk. Fire-and-forget; never blocks the read.
             protocol::prefetch_read_ahead(
                 &self.drive_manager,
                 drive_id,
                 tsih,
-                &self.cloud_backends,
+                &self.storage_backends,
                 &self.storage_config,
                 &self.prefetch_managers,
                 self.read_prefetch_chunks_ahead,
@@ -297,7 +297,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         };
 
         // MOVE MEDIUM legal-hold post-hook: if a cartridge was just
-        // loaded into a drive, read its cloud sentinel and stamp the
+        // loaded into a drive, read its storage sentinel and stamp the
         // volatile `legal_held` flag on the drive so host writes
         // return WRITE PROTECTED for the duration of the load.
         if matches!(resp.status, protocol::ScsiStatus::Good)
@@ -306,7 +306,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 self.drive_manager.get_loaded_cartridge_info(drive_id)
         {
             let held = protocol::read_legal_hold_at_load(
-                &self.cloud_backends,
+                &self.storage_backends,
                 &self.storage_config,
                 &backend_name,
                 &barcode,

@@ -40,9 +40,11 @@ async fn fixture() -> (
 ) {
     let tmp = TempDir::new().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
-    let cloud_root = data_dir.join("cloud");
-    std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-    let backend = LocalBackend::new(&cloud_root).await.expect("local backend");
+    let storage_root = data_dir.join("storage");
+    std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+    let backend = LocalBackend::new(&storage_root)
+        .await
+        .expect("local backend");
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let name = "vol-async";
@@ -230,7 +232,7 @@ async fn synchronize_cache_disk_mode_returns_without_waiting_for_upload() {
 /// `memory` mode: SYNC is a pure no-op. The RAM cache stays dirty;
 /// neither pool nor upload runs as a result of SYNC. Proves it by
 /// asserting that the page-index entry for the written page is
-/// still absent after SYNC returns (in `cloud` mode that would be
+/// still absent after SYNC returns (in `storage` mode that would be
 /// `Some(hash)`).
 #[tokio::test]
 async fn synchronize_cache_memory_mode_is_no_op() {
@@ -306,7 +308,7 @@ async fn pending_upload_payload_round_trips_via_writer() {
         .expect("payload some");
     assert_eq!(payload.item_id, 3);
     assert_eq!(payload.dedup, DedupScope::Local);
-    // Local-scope cloud keys are namespaced by the volume UUID hex,
+    // Local-scope storage keys are namespaced by the volume UUID hex,
     // not the (mutable) volume name.
     let ns = writer
         .manifest()

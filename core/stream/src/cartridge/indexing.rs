@@ -7,8 +7,8 @@
 //! machine in mod.rs isn't tangled up with bookkeeping over
 //! `blocks-p<N>.idx` and `chunks.idx`. Behaviour-identical move:
 //! method bodies, signatures, ordering preserved. Methods stay
-//! `pub(super) fn` so the write/read paths in mod.rs and the cloud
-//! pipeline in `cartridge/cloud.rs` can call them; nothing leaks to
+//! `pub(super) fn` so the write/read paths in mod.rs and the storage
+//! pipeline in `cartridge/storage.rs` can call them; nothing leaks to
 //! the wider crate.
 //!
 //! Covers:

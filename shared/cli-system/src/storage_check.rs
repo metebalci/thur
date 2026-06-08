@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cross-product `system storage check` — daemon-routed cloud
+//! Cross-product `system storage check` — daemon-routed storage
 //! reachability probe.
 //!
 //! The daemon already holds a parsed `storage.backends` config; routing
@@ -22,7 +22,7 @@ pub async fn cmd_storage_check(identity: &'static ProductIdentity) -> Result<()>
     let client = AdminClient::auto_discover(identity);
     let exit = client
         .run_job(
-            "system.cloud_check",
+            "system.storage_check",
             &serde_json::json!({}),
             |ev| match ev {
                 JobEvent::Log { level, message } => {
@@ -48,7 +48,7 @@ pub async fn cmd_storage_check(identity: &'static ProductIdentity) -> Result<()>
             },
         )
         .await
-        .context("cloud check job stream")?;
+        .context("storage check job stream")?;
     if exit != 0 {
         std::process::exit(exit);
     }

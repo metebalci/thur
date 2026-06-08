@@ -179,8 +179,8 @@ mod tests {
     }
 
     /// A report exercising every print branch: volume with errors +
-    /// warnings, failed pages.idx, missing local + cloud chunks, a pool
-    /// with namespaces, cloud counters, GC hints, and orphan dirs.
+    /// warnings, failed pages.idx, missing local + storage chunks, a pool
+    /// with namespaces, storage counters, GC hints, and orphan dirs.
     #[test]
     fn populated_report_prints_all_branches() {
         let mut vol = VolumeReport {

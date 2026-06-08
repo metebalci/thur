@@ -4455,19 +4455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shared-admin-cloud-check"
-version = "0.1.0-dev.4"
-dependencies = [
- "serde_json",
- "shared-admin-server",
- "shared-alerting",
- "shared-object-store",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "shared-admin-http"
 version = "0.1.0-dev.4"
 dependencies = [
@@ -4545,6 +4532,19 @@ dependencies = [
  "shared-admin-proto",
  "tokio",
  "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "shared-admin-storage-check"
+version = "0.1.0-dev.4"
+dependencies = [
+ "serde_json",
+ "shared-admin-server",
+ "shared-alerting",
+ "shared-object-store",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -5627,11 +5627,11 @@ dependencies = [
  "serde_yaml",
  "shared-admin-audit",
  "shared-admin-auth",
- "shared-admin-cloud-check",
  "shared-admin-http",
  "shared-admin-iscsi",
  "shared-admin-monitor",
  "shared-admin-server",
+ "shared-admin-storage-check",
  "shared-admin-webui",
  "shared-alerting",
  "shared-audit",
@@ -5725,12 +5725,12 @@ dependencies = [
  "sha3",
  "shared-admin-audit",
  "shared-admin-auth",
- "shared-admin-cloud-check",
  "shared-admin-http",
  "shared-admin-iscsi",
  "shared-admin-monitor",
  "shared-admin-proto",
  "shared-admin-server",
+ "shared-admin-storage-check",
  "shared-admin-webui",
  "shared-alerting",
  "shared-audit",

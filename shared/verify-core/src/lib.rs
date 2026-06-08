@@ -1,18 +1,18 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cross-product chunk-pool + cloud verification core.
+//! Cross-product chunk-pool + storage verification core.
 //!
 //! Both products' `system verify` reduce to the same two sweeps over
 //! the content-addressed chunk pool:
 //!
 //! * **local pool orphan sweep** — for each `(backend, namespace)`
 //!   pool, which on-disk chunks are not referenced by any live entity?
-//! * **cloud HEAD sweep** — for each entity, are the chunks it expects
-//!   in cloud actually present? And which cloud objects are orphans?
+//! * **storage HEAD sweep** — for each entity, are the chunks it expects
+//!   in storage actually present? And which storage objects are orphans?
 //!
 //! A product implements [`VerifyTarget`] — its live chunk set and its
-//! per-entity cloud expectations — and the two sweep functions do the
+//! per-entity storage expectations — and the two sweep functions do the
 //! rest. Everything *around* the sweeps (tape library/partition checks,
 //! block page-table integrity, the product's `VerifyReport` shape, the
 //! gc-hint wording) stays per-product. The tape side additionally HEADs
@@ -29,11 +29,11 @@ use futures::stream::StreamExt;
 use shared_object_store::ObjectStoreBackend;
 use shared_pool::ChunkPool;
 
-/// Concurrency for the cloud-sweep HEAD storm. Matches the upload
+/// Concurrency for the storage-sweep HEAD storm. Matches the upload
 /// pipeline's bounded fan-out: low enough to stay under per-provider
 /// rate limits, high enough to hide RTT across a multi-million-object
 /// sweep.
-pub const CLOUD_VERIFY_CONCURRENCY: usize = 16;
+pub const STORAGE_VERIFY_CONCURRENCY: usize = 16;
 
 /// Live (referenced) chunk hashes bucketed by `(backend, namespace)`.
 /// `namespace` is `None` for the backend-global shared pool,
@@ -41,31 +41,31 @@ pub const CLOUD_VERIFY_CONCURRENCY: usize = 16;
 pub type LiveChunkSet = HashMap<(String, Option<String>), HashSet<String>>;
 
 /// One entity (a VTL cartridge or a VSA volume) and the chunk hashes
-/// it expects to find in its cloud bucket.
+/// it expects to find in its storage bucket.
 #[derive(Debug, Clone)]
-pub struct CloudEntity {
-    /// Identifies the entity in the returned [`EntityCloudResult`] —
+pub struct StorageEntity {
+    /// Identifies the entity in the returned [`EntityStorageResult`] —
     /// cartridge directory name / volume name.
     pub label: String,
-    /// Cloud backend the entity is bound to.
+    /// Storage backend the entity is bound to.
     pub backend: String,
     /// `None` for the shared pool, `Some(ns)` for a local-scope pool.
     pub namespace: Option<String>,
-    /// Chunk hashes (hex) that should exist in the cloud bucket.
+    /// Chunk hashes (hex) that should exist in the storage bucket.
     pub chunk_hashes: Vec<String>,
 }
 
 /// What a product hands the verification core.
 ///
-/// `Send + Sync` so the cloud sweep future stays `Send` — both
+/// `Send + Sync` so the storage sweep future stays `Send` — both
 /// daemons run it under `tokio::spawn`.
 pub trait VerifyTarget: Send + Sync {
     /// Every live chunk hash, bucketed by `(backend, namespace)`.
     /// Drives the local pool orphan sweep.
     fn live_chunks(&self) -> LiveChunkSet;
 
-    /// Per-entity cloud-expected chunks. Drives the cloud HEAD sweep.
-    fn cloud_entities(&self) -> Vec<CloudEntity>;
+    /// Per-entity storage-expected chunks. Drives the storage HEAD sweep.
+    fn storage_entities(&self) -> Vec<StorageEntity>;
 
     /// Distinct backends in use. Default: the backends named in
     /// [`Self::live_chunks`].
@@ -109,16 +109,16 @@ pub struct PoolSweep {
     pub errors: Vec<String>,
 }
 
-/// A failed cloud HEAD — surfaced so the caller can warn with cause.
+/// A failed storage HEAD — surfaced so the caller can warn with cause.
 #[derive(Debug, Clone)]
 pub struct HeadFailure {
     pub hash: String,
     pub message: String,
 }
 
-/// One entity's cloud chunk-presence result.
+/// One entity's storage chunk-presence result.
 #[derive(Debug, Default, Clone)]
-pub struct EntityCloudResult {
+pub struct EntityStorageResult {
     pub label: String,
     /// Expected chunks that HEAD reported absent (or errored).
     pub chunks_missing: u64,
@@ -126,10 +126,10 @@ pub struct EntityCloudResult {
     pub head_errors: Vec<HeadFailure>,
 }
 
-/// One backend's cloud chunk sweep result.
+/// One backend's storage chunk sweep result.
 #[derive(Debug, Default, Clone)]
-pub struct CloudChunkSweep {
-    pub per_entity: Vec<EntityCloudResult>,
+pub struct StorageChunkSweep {
+    pub per_entity: Vec<EntityStorageResult>,
     /// Total objects under `chunks/`.
     pub chunk_objects: u64,
     /// `chunks/` objects referenced by no entity bound to this backend.
@@ -252,21 +252,21 @@ fn sweep_pool_chunks(
     sweep
 }
 
-/// Sweep one backend's cloud bucket: HEAD every chunk each entity
+/// Sweep one backend's storage bucket: HEAD every chunk each entity
 /// bound to `backend_name` expects, then list `chunks/` to count
 /// orphan objects.
 pub async fn sweep_storage(
     target: &dyn VerifyTarget,
     backend_name: &str,
     backend: &dyn ObjectStoreBackend,
-) -> CloudChunkSweep {
-    let entities: Vec<CloudEntity> = target
-        .cloud_entities()
+) -> StorageChunkSweep {
+    let entities: Vec<StorageEntity> = target
+        .storage_entities()
         .into_iter()
         .filter(|e| e.backend == backend_name)
         .collect();
 
-    let mut per_entity: Vec<EntityCloudResult> = Vec::new();
+    let mut per_entity: Vec<EntityStorageResult> = Vec::new();
     let mut expected: HashSet<String> = HashSet::new();
 
     for ent in &entities {
@@ -289,7 +289,7 @@ pub async fn sweep_storage(
                 let res = backend.chunk_exists(&key).await;
                 (hash, res)
             }))
-            .buffer_unordered(CLOUD_VERIFY_CONCURRENCY)
+            .buffer_unordered(STORAGE_VERIFY_CONCURRENCY)
             .collect()
             .await;
 
@@ -308,14 +308,14 @@ pub async fn sweep_storage(
                 }
             }
         }
-        per_entity.push(EntityCloudResult {
+        per_entity.push(EntityStorageResult {
             label: ent.label.clone(),
             chunks_missing,
             head_errors,
         });
     }
 
-    let mut sweep = CloudChunkSweep {
+    let mut sweep = StorageChunkSweep {
         per_entity,
         ..Default::default()
     };

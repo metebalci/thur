@@ -1,5 +1,5 @@
 [package]
-name = "shared-admin-cloud-check"
+name = "shared-admin-storage-check"
 version.workspace = true
 edition = "2024"
 license.workspace = true
@@ -9,8 +9,8 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-# Cross-product cloud-backend reachability checks. Both daemons
-# (thurvtl, thurvsa) route the `system.cloud_check` job kind here and
+# Cross-product storage-backend reachability checks. Both daemons
+# (thurvtl, thurvsa) route the `system.storage_check` job kind here and
 # spawn the opt-in periodic reachability ticker from their main loops;
 # the only per-product input is the parsed `ObjectStoreConfig`, passed
 # in as an `Arc`. Kept out of `shared-object-store` (which owns the

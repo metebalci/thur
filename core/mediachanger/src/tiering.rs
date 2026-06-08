@@ -21,7 +21,7 @@
 //!
 //! Two invariants are enforced here rather than left to callers:
 //!   - **Legal-held cartridges are never tiered.** Legal hold is
-//!     cloud-native-only with no transfer logic; relocating a held
+//!     storage-native-only with no transfer logic; relocating a held
 //!     cartridge would silently drop the hold. Held cartridges are
 //!     excluded outright, no per-policy opt-in.
 //!   - **First match wins.** Policies are an ordered rule list; the
@@ -63,7 +63,7 @@ pub struct TieringPolicy {
 /// an accidental "migrate everything" rule.
 ///
 /// Only predicates that are cheap (O(1) from the manifest/inventory)
-/// and survive a DR/cloud restore are supported. `age_days_since_last_write`
+/// and survive a DR/storage restore are supported. `age_days_since_last_write`
 /// is deliberately absent: it would have to come from the local-only
 /// `lru.idx`, which is zero-filled on restore, so it silently misfires
 /// (see the issue's Deferred section).
@@ -96,7 +96,7 @@ pub struct CartridgeFacts {
     /// Backend the cartridge is currently bound to (the manifest
     /// `backend`).
     pub current_backend: String,
-    /// Cloud-native legal-hold state. A held cartridge is excluded
+    /// Storage-native legal-hold state. A held cartridge is excluded
     /// from tiering outright.
     pub legal_held: bool,
 }

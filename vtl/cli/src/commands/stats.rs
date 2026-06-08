@@ -18,7 +18,7 @@ use shared_admin_proto::JobEvent;
 struct LocationCounts {
     local_only: u64,
     both: u64,
-    cloud_only: u64,
+    storage_only: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,8 +129,8 @@ fn print_human(r: &StatsReport) {
             saved_pct,
         );
         println!(
-            "Location:          LocalOnly={}, Both={}, CloudOnly={} (evicted from disk)",
-            b.location.local_only, b.location.both, b.location.cloud_only,
+            "Location:          LocalOnly={}, Both={}, StorageOnly={} (evicted from disk)",
+            b.location.local_only, b.location.both, b.location.storage_only,
         );
         println!();
 
@@ -162,10 +162,10 @@ fn print_human(r: &StatsReport) {
 
     print_skipped(r);
 
-    println!("Note: cloud HEAD-skip rate (upload-time dedup) is exposed");
+    println!("Note: storage HEAD-skip rate (upload-time dedup) is exposed");
     println!("via the daemon's /metrics endpoint as");
-    println!("  thurvtl_chunk_cloud_head_hits_total /");
-    println!("  thurvtl_chunk_cloud_head_probes_total");
+    println!("  thurvtl_chunk_storage_head_hits_total /");
+    println!("  thurvtl_chunk_storage_head_probes_total");
     println!("This walker covers seal-time pool dedup only.");
 }
 
@@ -247,7 +247,7 @@ mod tests {
                 "sealed_chunks": 100,
                 "logical_bytes": 4000000,
                 "unique_pool_bytes": 1000000,
-                "location": {"local_only": 1, "both": 2, "cloud_only": 3},
+                "location": {"local_only": 1, "both": 2, "storage_only": 3},
             }],
             "cartridges": [{
                 "barcode": "TAPE001",
@@ -258,7 +258,7 @@ mod tests {
                 "cart_unique_bytes": 800000,
                 "exclusive_bytes": 500000,
                 "shared_bytes": 300000,
-                "location": {"local_only": 0, "both": 0, "cloud_only": 0},
+                "location": {"local_only": 0, "both": 0, "storage_only": 0},
             }],
             "skipped": [],
         }))
@@ -271,6 +271,6 @@ mod tests {
         let c = LocationCounts::default();
         assert_eq!(c.local_only, 0);
         assert_eq!(c.both, 0);
-        assert_eq!(c.cloud_only, 0);
+        assert_eq!(c.storage_only, 0);
     }
 }

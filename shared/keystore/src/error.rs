@@ -19,7 +19,7 @@ use thiserror::Error;
 /// surface from the pre-trait days. The transport variants
 /// (`Network` / `Timeout` / `Auth` / `Authz` / `NotFound`) parallel
 /// `shared_object_store::FailureKind` so admin handlers can classify and
-/// retry uniformly across keystore + cloud paths.
+/// retry uniformly across keystore + storage paths.
 #[derive(Error, Debug)]
 pub enum KeyStoreError {
     #[error("io: {0}")]
@@ -70,7 +70,7 @@ pub enum KeyStoreError {
 
     /// Anything else: 5xx from the backend, unclassified SDK noise,
     /// JSON decode failures on a backend response. Treated as
-    /// transient to keep the retry budget aligned with cloud.
+    /// transient to keep the retry budget aligned with storage.
     #[error("keystore: {0}")]
     Other(String),
 }

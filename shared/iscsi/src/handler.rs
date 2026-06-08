@@ -76,7 +76,7 @@ pub trait ScsiHandler: Send + Sync + 'static {
     }
 
     /// Run one SCSI command end-to-end. Implementations may pre-/
-    /// post-process around the actual dispatch (thurvtl does cloud
+    /// post-process around the actual dispatch (thurvtl does storage
     /// chunk prefetch on READ, MOVE MEDIUM legal-hold sentinel
     /// readback, async SEND DIAGNOSTIC self-test, etc. — those
     /// behaviors are thurvtl-internal and don't leak into the

@@ -18,7 +18,7 @@
 #                         storage-backends.json). Default is the
 #                         self-managed `local-test` entry the script
 #                         creates under $TEST_DIR/local-storage.
-#                         -> core/sbc/examples/perf_volume_cloud
+#                         -> core/sbc/examples/perf_volume_storage
 #   L3 iscsi-raw        : daemon + iSCSI + dd to /dev/sdX (raw block,
 #                         bypasses any filesystem)
 #   L4 iscsi-ext4       : daemon + iSCSI + mkfs.ext4 + mount + dd to a
@@ -105,13 +105,13 @@ done
 [[ -z "$DAEMON_PATH" ]] && DAEMON_PATH="${REPO_DIR}/target/release/thurvsad"
 [[ -z "$CLI_PATH" ]] && CLI_PATH="${REPO_DIR}/target/release/thurvsa"
 PERF_VOLUME_WRITE="${REPO_DIR}/target/release/examples/perf_volume_write"
-PERF_VOLUME_CLOUD="${REPO_DIR}/target/release/examples/perf_volume_cloud"
+PERF_VOLUME_STORAGE="${REPO_DIR}/target/release/examples/perf_volume_storage"
 
 if [[ ! -x "$DAEMON_PATH" || ! -x "$CLI_PATH" ]]; then
     log_error "Missing daemon ($DAEMON_PATH) or cli ($CLI_PATH). Run: cargo build --release"
     exit 1
 fi
-if [[ ! -x "$PERF_VOLUME_WRITE" || ! -x "$PERF_VOLUME_CLOUD" ]]; then
+if [[ ! -x "$PERF_VOLUME_WRITE" || ! -x "$PERF_VOLUME_STORAGE" ]]; then
     log_error "Missing perf examples. Run: cargo build --release -p core-block --examples"
     exit 1
 fi
@@ -415,7 +415,7 @@ run_l2() {
         local tmp; tmp=$(mktemp -d "$PERF_BASE_DIR/l2-${fixture}-XXXX")
         local t0 t1 t2
         t0=$(date +%s%N)
-        "$PERF_VOLUME_CLOUD" "$PERF_BACKENDS_FILE" "$PERF_BACKEND_NAME" \
+        "$PERF_VOLUME_STORAGE" "$PERF_BACKENDS_FILE" "$PERF_BACKEND_NAME" \
             "$TOTAL_MB" 256 "$fixture" \
             > "$tmp/run.log" 2>&1 || {
             log_error "L2 $fixture failed (see $tmp/run.log)"

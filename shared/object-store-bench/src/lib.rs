@@ -1,16 +1,16 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! First-party cloud-backend throughput benchmark engine.
+//! First-party storage-backend throughput benchmark engine.
 //!
 //! Drives N parallel `ObjectStoreBackend::upload_chunk` / `download_chunk` /
 //! `delete_object` calls through the same SDK + network path the
 //! daemon uses, so the numbers it reports are the actual ceiling the
 //! daemon can reach against a given backend.
 //!
-//! The CLI wrappers (`thurvtl system cloud benchmark`,
-//! `thurvsa system cloud benchmark`) and the
-//! `shared/cloud/examples/bench.rs` dev example all funnel through
+//! The CLI wrappers (`thurvtl system storage benchmark`,
+//! `thurvsa system storage benchmark`) and the
+//! `shared/storage/examples/bench.rs` dev example all funnel through
 //! [`run`]. Output: parseable `[BENCH] ...` lines on stdout; cell
 //! errors are surfaced as `[BENCH-ERR]` on stderr without aborting
 //! sibling cells.
@@ -103,11 +103,11 @@ pub enum BenchError {
     },
 }
 
-/// Operator-facing entry point shared by `thurvtl system cloud
-/// benchmark` and `thurvsa system cloud benchmark`.
+/// Operator-facing entry point shared by `thurvtl system storage
+/// benchmark` and `thurvsa system storage benchmark`.
 ///
 /// Reads the daemon's YAML conffile, validates the requested `backends`
-/// list against the `cloud.backends:` block (empty = every named
+/// list against the `storage.backends:` block (empty = every named
 /// backend), constructs one [`ObjectStoreBackend`] per name, and hands the
 /// lot to [`run`]. Daemon-down: doesn't touch the admin socket so
 /// operators can validate a freshly-configured backend before the
@@ -119,7 +119,7 @@ pub async fn run_from_config_path(
     backends: Vec<String>,
     opts: BenchOptions,
 ) -> Result<(), BenchError> {
-    let cfg = load_cloud_config(config_path)?;
+    let cfg = load_storage_config(config_path)?;
 
     let backend_names: Vec<String> = if backends.is_empty() {
         cfg.backend_names()
@@ -135,7 +135,7 @@ pub async fn run_from_config_path(
     };
     if backend_names.is_empty() {
         return Err(BenchError::InvalidArg(format!(
-            "no backends defined under `cloud.backends:` in {}; add one before benchmarking",
+            "no backends defined under `storage.backends:` in {}; add one before benchmarking",
             config_path.display()
         )));
     }
@@ -158,24 +158,24 @@ pub async fn run_from_config_path(
     run(targets, opts).await
 }
 
-/// Parse the daemon conffile and extract its `cloud:` section. The
+/// Parse the daemon conffile and extract its `storage:` section. The
 /// rest of the YAML is ignored — the bench engine only cares about the
-/// `cloud.backends:` map.
-fn load_cloud_config(config_path: &Path) -> Result<ObjectStoreConfig, BenchError> {
+/// `storage.backends:` map.
+fn load_storage_config(config_path: &Path) -> Result<ObjectStoreConfig, BenchError> {
     #[derive(serde::Deserialize)]
-    struct CloudOnly {
+    struct StorageOnly {
         #[serde(default)]
-        cloud: ObjectStoreConfig,
+        storage: ObjectStoreConfig,
     }
     let body = std::fs::read_to_string(config_path).map_err(|e| BenchError::LoadConfig {
         path: config_path.to_path_buf(),
         message: e.to_string(),
     })?;
-    let parsed: CloudOnly = serde_yaml::from_str(&body).map_err(|e| BenchError::LoadConfig {
+    let parsed: StorageOnly = serde_yaml::from_str(&body).map_err(|e| BenchError::LoadConfig {
         path: config_path.to_path_buf(),
         message: e.to_string(),
     })?;
-    Ok(parsed.cloud)
+    Ok(parsed.storage)
 }
 
 /// Run the bench against every (target × chunk_size × concurrency)
@@ -375,7 +375,7 @@ fn print_sweep_preview(
     println!("  total ops: {}", total_ops);
 
     println!();
-    println!("NOTE: this benchmark issues real cloud API calls (PUT/GET/DELETE) and");
+    println!("NOTE: this benchmark issues real storage API calls (PUT/GET/DELETE) and");
     println!("transfers real bytes — it will cost money on metered backends.");
     println!();
     // Illustrative rates: $5 per 1M ops is a generous ceiling across
@@ -585,7 +585,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use shared_object_store::{
-        CompressionAlgo, LockState, ObjectStoreError, Result as CloudResult,
+        CompressionAlgo, LockState, ObjectStoreError, Result as StorageResult,
     };
     use std::io::Write;
     use std::path::Path as StdPath;
@@ -640,7 +640,7 @@ mod tests {
             &self,
             _key: &str,
             data: &[u8],
-        ) -> CloudResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
+        ) -> StorageResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let n = self.uploads.fetch_add(1, Ordering::Relaxed);
             if Some(n) == self.fail_upload_at {
                 return Err(ObjectStoreError::Other("mock upload failure".into()));
@@ -652,11 +652,11 @@ mod tests {
             &self,
             _key: &str,
             _file_path: &StdPath,
-        ) -> CloudResult<u64> {
+        ) -> StorageResult<u64> {
             unreachable!("bench never calls upload_chunk_zerocopy")
         }
 
-        async fn download_chunk(&self, _key: &str) -> CloudResult<Vec<u8>> {
+        async fn download_chunk(&self, _key: &str) -> StorageResult<Vec<u8>> {
             let n = self.downloads.fetch_add(1, Ordering::Relaxed);
             if Some(n) == self.fail_download_at {
                 return Err(ObjectStoreError::Other("mock download failure".into()));
@@ -664,27 +664,27 @@ mod tests {
             Ok(vec![0u8; self.download_size])
         }
 
-        async fn download_chunks_parallel(&self, _keys: &[String]) -> CloudResult<Vec<Vec<u8>>> {
+        async fn download_chunks_parallel(&self, _keys: &[String]) -> StorageResult<Vec<Vec<u8>>> {
             unreachable!("bench never calls download_chunks_parallel")
         }
 
-        async fn upload_manifest(&self, _key: &str, _json: &str) -> CloudResult<()> {
+        async fn upload_manifest(&self, _key: &str, _json: &str) -> StorageResult<()> {
             unreachable!("bench never calls upload_manifest")
         }
 
-        async fn download_manifest(&self, _key: &str) -> CloudResult<String> {
+        async fn download_manifest(&self, _key: &str) -> StorageResult<String> {
             unreachable!("bench never calls download_manifest")
         }
 
-        async fn chunk_exists(&self, _key: &str) -> CloudResult<bool> {
+        async fn chunk_exists(&self, _key: &str) -> StorageResult<bool> {
             unreachable!("bench never calls chunk_exists")
         }
 
-        async fn list_objects(&self, _key_prefix: &str) -> CloudResult<Vec<String>> {
+        async fn list_objects(&self, _key_prefix: &str) -> StorageResult<Vec<String>> {
             unreachable!("bench never calls list_objects")
         }
 
-        async fn delete_object(&self, _key: &str) -> CloudResult<()> {
+        async fn delete_object(&self, _key: &str) -> StorageResult<()> {
             self.deletes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -693,15 +693,15 @@ mod tests {
             "mock"
         }
 
-        async fn lock_state(&self) -> CloudResult<LockState> {
+        async fn lock_state(&self) -> StorageResult<LockState> {
             unreachable!("bench never calls lock_state")
         }
 
-        async fn set_object_legal_hold(&self, _key: &str, _held: bool) -> CloudResult<()> {
+        async fn set_object_legal_hold(&self, _key: &str, _held: bool) -> StorageResult<()> {
             unreachable!("bench never calls set_object_legal_hold")
         }
 
-        async fn get_object_legal_hold(&self, _key: &str) -> CloudResult<bool> {
+        async fn get_object_legal_hold(&self, _key: &str) -> StorageResult<bool> {
             unreachable!("bench never calls get_object_legal_hold")
         }
 
@@ -768,29 +768,29 @@ mod tests {
     }
 
     #[test]
-    fn load_cloud_config_rejects_a_missing_file() {
-        let err = load_cloud_config(Path::new("/nonexistent/thur-bench-test.yaml"));
+    fn load_storage_config_rejects_a_missing_file() {
+        let err = load_storage_config(Path::new("/nonexistent/thur-bench-test.yaml"));
         assert!(matches!(err, Err(BenchError::LoadConfig { .. })));
     }
 
     #[test]
-    fn load_cloud_config_rejects_invalid_yaml() {
+    fn load_storage_config_rejects_invalid_yaml() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let path = tmp.path().join("bad.yaml");
         let mut f = std::fs::File::create(&path).expect("create");
-        f.write_all(b"cloud: [this is not a map").expect("write");
+        f.write_all(b"storage: [this is not a map").expect("write");
         assert!(matches!(
-            load_cloud_config(&path),
+            load_storage_config(&path),
             Err(BenchError::LoadConfig { .. }),
         ));
     }
 
     #[test]
-    fn load_cloud_config_parses_a_minimal_config() {
+    fn load_storage_config_parses_a_minimal_config() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let path = tmp.path().join("ok.yaml");
         std::fs::write(&path, "{}").expect("write");
-        let cfg = load_cloud_config(&path).expect("parse");
+        let cfg = load_storage_config(&path).expect("parse");
         assert!(cfg.backend_names().is_empty());
     }
 

@@ -286,7 +286,7 @@ impl KeyStoreBackend for AwsKmsBackend {
 /// service errors carry typed `code()` strings we map straight onto
 /// `Auth` / `Authz` / `NotFound`; dispatch failures route to
 /// `Network` / `Timeout`. Everything else goes to `Other` which is
-/// retryable per the design (mirrors `is_retryable` of cloud).
+/// retryable per the design (mirrors `is_retryable` of storage).
 fn classify_kms_err<E, R>(op: &str, err: SdkError<E, R>) -> KeyStoreError
 where
     E: ProvideErrorMetadata + std::fmt::Debug,

@@ -6,7 +6,7 @@
 //! The single-cartridge cold-bucket round-trip is already covered by
 //! `index_backup_tests::cold_bucket_dr_via_index_pages`. This test
 //! exercises what's new on top of that primitive: discovery from the
-//! cloud bucket alone, the batch driver that fans out per-cartridge,
+//! storage bucket alone, the batch driver that fans out per-cartridge,
 //! the filter, and the on-disk state seeded by the restore pass.
 
 mod common;
@@ -20,7 +20,7 @@ use core_mediachanger::{
 use std::fs;
 
 /// Create a cartridge bound to the test LocalBackend, write `n_blocks`
-/// of deterministic data, force seal + manifest backup to cloud, drop
+/// of deterministic data, force seal + manifest backup to storage, drop
 /// the cartridge. Returns the data so callers can verify reads later.
 async fn seed_cartridge(
     tapes: &std::path::Path,
@@ -28,7 +28,7 @@ async fn seed_cartridge(
     label: &str,
     n_blocks: usize,
 ) -> Vec<Vec<u8>> {
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         tapes,
         label,
         CartridgeOpenMode::Create {
@@ -52,9 +52,9 @@ async fn seed_cartridge(
         written.push(data);
     }
     cart.flush_and_seal().expect("flush_and_seal");
-    cart.backup_manifest_to_cloud()
+    cart.backup_manifest_to_storage()
         .await
-        .expect("backup_manifest_to_cloud");
+        .expect("backup_manifest_to_storage");
     written
 }
 
@@ -64,7 +64,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     let backend_dir = work.path().join("backend");
     fs::create_dir_all(&backend_dir).unwrap();
 
-    // Source side: three cartridges land in the cloud bucket. Each
+    // Source side: three cartridges land in the storage bucket. Each
     // gets its own backend handle because Cartridge::open takes
     // ownership of the box.
     let source_tapes = work.path().join("source_tapes");
@@ -78,7 +78,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     }
 
     // Wipe the source tapes dir so the restore truly has nothing
-    // local to lean on — the only state remaining is in the cloud
+    // local to lean on — the only state remaining is in the storage
     // bucket at `backend_dir`.
     fs::remove_dir_all(&source_tapes).unwrap();
 
@@ -132,12 +132,12 @@ async fn run_restore_batch_round_trip_three_cartridges() {
     }
 
     // Reopen each cartridge and read back every block — proves the
-    // restored metadata + the chunk-pool refs in cloud are sufficient
+    // restored metadata + the chunk-pool refs in storage are sufficient
     // for the cartridge to serve reads.
     for (label, original) in &originals {
         let backend: Box<dyn ObjectStoreBackend> =
             Box::new(LocalBackend::new(&backend_dir).await.unwrap());
-        let mut cart = Cartridge::open_with_cloud_async(
+        let mut cart = Cartridge::open_with_storage_async(
             &target_tapes,
             label,
             CartridgeOpenMode::Open,

@@ -8,7 +8,7 @@
 //! backend, and hands them to `shared-object-store-bench`. Doesn't
 //! touch the admin socket so it works pre-daemon-start.
 //!
-//! The sibling `system storage check` verb (daemon-routed cloud
+//! The sibling `system storage check` verb (daemon-routed storage
 //! reachability probe) lives in `shared-cli-system` so VTL and VSA
 //! share one implementation.
 

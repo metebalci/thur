@@ -1,13 +1,13 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cartridge migration — move a cartridge from one cloud backend to
+//! Cartridge migration — move a cartridge from one storage backend to
 //! another. Same barcode, same logical identity; only the bound
 //! backend changes.
 //!
 //! Two modes:
 //!
-//! - **Move** — copy every cloud-referenced chunk from source to
+//! - **Move** — copy every storage-referenced chunk from source to
 //!   target (BLAKE3-verified inline), copy the manifest + index page
 //!   backups, move the local pool files under the new backend prefix,
 //!   atomically flip `manifest.backend`, then delete source objects.
@@ -158,9 +158,9 @@ enum DedupSlice {
 }
 
 impl DedupSlice {
-    /// Cloud-key namespace for chunks in this dedup scope.
+    /// Storage-key namespace for chunks in this dedup scope.
     /// `Local` → the cartridge barcode; `Global` → none (shared pool).
-    fn cloud_namespace(self, barcode: &str) -> Option<&str> {
+    fn storage_namespace(self, barcode: &str) -> Option<&str> {
         match self {
             DedupSlice::Local => Some(barcode),
             DedupSlice::Global => None,
@@ -174,7 +174,7 @@ impl DedupSlice {
 ///   - `Err(NotSupported)` — the source backend can't carry a hold
 ///     (e.g. `local`), so the cartridge is not held → proceed.
 ///   - any other `Err` — fail-safe: refuse to migrate when the hold
-///     state cannot be confirmed (a transient cloud error must not be
+///     state cannot be confirmed (a transient storage error must not be
 ///     read as "not held").
 fn hold_check_permits(result: std::result::Result<bool, ObjectStoreError>) -> Result<()> {
     match result {
@@ -206,12 +206,12 @@ fn worm_lock_permits(is_worm: bool, state: LockState) -> Result<()> {
 /// the YAML-declared `retention_mode`, which a scheduler — or an
 /// operator who edited the conffile after boot — can drift out of sync
 /// with the bucket; this is the authoritative check against the bucket
-/// itself. No-op (no cloud call) for non-WORM cartridges.
+/// itself. No-op (no storage call) for non-WORM cartridges.
 async fn verify_worm_target_lock(target: &dyn ObjectStoreBackend, is_worm: bool) -> Result<()> {
     if !is_worm {
         return Ok(());
     }
-    let state = target.lock_state().await.map_err(cloud_err)?;
+    let state = target.lock_state().await.map_err(storage_err)?;
     worm_lock_permits(is_worm, state)
 }
 
@@ -254,7 +254,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
     }
 
     // Legal-hold gate. A held cartridge must never be relocated: the
-    // hold is cloud-native (provider object-lock) with no cross-backend
+    // hold is storage-native (provider object-lock) with no cross-backend
     // transfer path, so moving its chunks would silently drop it. Read
     // the source-side sentinel and refuse if held. Fires before the
     // dry-run short-circuit so a preview can't claim a held cartridge
@@ -264,7 +264,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
     let hold_key = manifest_latest_sentinel_key(opts.barcode);
     hold_check_permits(opts.source.get_object_legal_hold(&hold_key).await)?;
 
-    let namespace = slice.dedup.cloud_namespace(opts.barcode);
+    let namespace = slice.dedup.storage_namespace(opts.barcode);
 
     // Walk chunks.idx, collecting hashes + sizes. We hold the index
     // file open only across this loop; the cartridge is not mutated.
@@ -319,9 +319,9 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.target_name
             ));
             for (i, (hash, key)) in chunk_hashes.iter().zip(chunk_keys.iter()).enumerate() {
-                let exists_on_target = opts.target.chunk_exists(key).await.map_err(cloud_err)?;
+                let exists_on_target = opts.target.chunk_exists(key).await.map_err(storage_err)?;
                 if !exists_on_target {
-                    let bytes = opts.source.download_chunk(key).await.map_err(cloud_err)?;
+                    let bytes = opts.source.download_chunk(key).await.map_err(storage_err)?;
                     let actual = blake3_hex(&bytes);
                     if &actual != hash {
                         return Err(SmcError::ContentHashMismatch {
@@ -333,7 +333,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                     opts.target
                         .upload_chunk(key, &bytes)
                         .await
-                        .map_err(cloud_err)?;
+                        .map_err(storage_err)?;
                     report.chunks_copied += 1;
                     report.bytes_copied += size;
                 }
@@ -354,7 +354,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 .source
                 .list_objects(&manifest_prefix)
                 .await
-                .map_err(cloud_err)?;
+                .map_err(storage_err)?;
             for key in &manifest_keys {
                 copy_one_object(opts.source, opts.target, key).await?;
                 report.manifest_objects_copied += 1;
@@ -414,7 +414,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 ));
                 let mut missing: Vec<String> = Vec::new();
                 for key in &chunk_keys {
-                    if opts.target.chunk_exists(key).await.map_err(cloud_err)? {
+                    if opts.target.chunk_exists(key).await.map_err(storage_err)? {
                         report.chunks_verified += 1;
                     } else {
                         missing.push(key.clone());
@@ -430,7 +430,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                         .target
                         .chunk_exists(&sentinel)
                         .await
-                        .map_err(cloud_err)?
+                        .map_err(storage_err)?
                     {
                         missing.push(sentinel);
                     }
@@ -463,7 +463,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
 }
 
 /// Translate `shared_object_store` errors into `SmcError` for `?` propagation.
-fn cloud_err(e: shared_object_store::ObjectStoreError) -> SmcError {
+fn storage_err(e: shared_object_store::ObjectStoreError) -> SmcError {
     SmcError::ObjectStoreError(e.to_string())
 }
 
@@ -489,20 +489,20 @@ async fn copy_one_object(
     // `download_chunk` decompresses on read, `upload_chunk` re-applies
     // the target's config on the way back.
     if key.ends_with(".json") {
-        let body = source.download_manifest(key).await.map_err(cloud_err)?;
+        let body = source.download_manifest(key).await.map_err(storage_err)?;
         target
             .upload_manifest(key, &body)
             .await
-            .map_err(cloud_err)?;
+            .map_err(storage_err)?;
     } else {
         // Index pages: versioned key (re-migrating the same cartridge
         // would copy potentially-different bytes under the same key).
         // `upload_versioned` bypasses the meta-cache.
-        let bytes = source.download_chunk(key).await.map_err(cloud_err)?;
+        let bytes = source.download_chunk(key).await.map_err(storage_err)?;
         target
             .upload_versioned(key, &bytes)
             .await
-            .map_err(cloud_err)?;
+            .map_err(storage_err)?;
     }
     Ok(())
 }
@@ -534,7 +534,7 @@ fn rewrite_manifest_backend(cart_root: &Path, new_backend: &str) -> Result<()> {
 /// — matches [`shared_pool::ChunkPool::pool_dir`].
 ///
 /// Returns the count of files actually renamed (missing source files
-/// are skipped silently — chunks marked `CloudOnly` in the index are
+/// are skipped silently — chunks marked `StorageOnly` in the index are
 /// not expected to be local).
 #[allow(clippy::too_many_arguments)]
 fn move_local_pool_files(
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn hold_check_treats_not_supported_as_unheld() {
-        // A local backend can't carry a cloud-native hold.
+        // A local backend can't carry a storage-native hold.
         let r = hold_check_permits(Err(ObjectStoreError::NotSupported("local".into())));
         assert!(r.is_ok());
     }

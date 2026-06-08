@@ -22,12 +22,12 @@
 //!   anything.
 //!
 //! Two entry points: [`verify_local`] runs only the on-disk checks;
-//! [`verify_with_cloud`] does the same plus a per-backend HEAD sweep
-//! against every cloud bucket cartridges are bound to (chunks marked
-//! CloudOnly/Both, every index-page object up to `index_epoch[label].pages`,
+//! [`verify_with_storage`] does the same plus a per-backend HEAD sweep
+//! against every storage bucket cartridges are bound to (chunks marked
+//! StorageOnly/Both, every index-page object up to `index_epoch[label].pages`,
 //! and the `manifests/<barcode>/manifest-latest.json` sentinel —
 //! together that proves cold-bucket DR readiness). Local-type
-//! backends are silently skipped during the cloud phase.
+//! backends are silently skipped during the storage phase.
 
 use crate::block_index::BlockIndexFile;
 use crate::chunk_index::{ChunkIndexFile, ChunkRec, LocationTag};
@@ -37,7 +37,7 @@ use crate::object_store_backend::ObjectStoreBackend;
 use crate::object_store_config::ObjectStoreConfig;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use shared_verify_core::{CloudEntity, LiveChunkSet, VerifyTarget};
+use shared_verify_core::{LiveChunkSet, StorageEntity, VerifyTarget};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -45,7 +45,7 @@ use std::path::Path;
 /// `(chunk_id, hash, recorded_size, location_flag)` — one entry per
 /// hashed chunk in chunks.idx. Used by [`verify_local_pool`] for the
 /// presence/size walk and stashed verbatim into
-/// [`CartridgeChunkSet::records`] for the later cloud sweep.
+/// [`CartridgeChunkSet::records`] for the later storage sweep.
 type CartChunkRec = (u64, String, u64, LocationTag);
 
 /// Manifest-derived working values [`verify_one_cartridge`] needs
@@ -54,7 +54,7 @@ struct ManifestInfo {
     /// Raw parsed manifest.json — index_epoch is read out later.
     value: serde_json::Value,
     /// `backend` field (post-empty-string filter). `None` triggers a
-    /// non-fatal error in `r` and gates the local-pool + cloud sweep.
+    /// non-fatal error in `r` and gates the local-pool + storage sweep.
     backend: Option<String>,
     /// `<dir_name>` when manifest declares `dedup: local`, otherwise
     /// `None` (global pool — the default).
@@ -65,27 +65,27 @@ struct ManifestInfo {
 }
 
 /// Per-cartridge view used by both consistency checks (does the local
-/// pool have this hash?) and the cloud sweep (does the bucket have
+/// pool have this hash?) and the storage sweep (does the bucket have
 /// this hash?).
 #[derive(Debug, Clone)]
 struct CartridgeChunkSet {
     backend: String,
     namespace: Option<String>,
-    /// Manifest's `label` field — the authoritative barcode for cloud
+    /// Manifest's `label` field — the authoritative barcode for storage
     /// keys (`manifests/<barcode>/...`). Mirrors gc.rs's
     /// `collect_live_index_pages` choice; on-disk dir name and
     /// manifest label normally match but the manifest is the contract.
     barcode_label: String,
     /// (chunk_id, hash, recorded size, location flag).
     records: Vec<CartChunkRec>,
-    /// `manifest.index_epoch[label].pages` — count of pages the cloud
+    /// `manifest.index_epoch[label].pages` — count of pages the storage
     /// is supposed to hold per index file. Empty for cartridges
     /// predating delta-page index backup.
     index_pages: BTreeMap<String, u32>,
 }
 
 /// [`VerifyTarget`] adapter over the cartridge chunk-sets — feeds the
-/// shared local-pool + cloud sweeps in `shared-verify-core`. The
+/// shared local-pool + storage sweeps in `shared-verify-core`. The
 /// tape-specific checks (library, partitions, index pages, sentinel)
 /// stay in this module; only the chunk-pool sweeps are shared.
 struct TapeVerifyTarget<'a> {
@@ -106,20 +106,20 @@ impl VerifyTarget for TapeVerifyTarget<'_> {
         out
     }
 
-    fn cloud_entities(&self) -> Vec<CloudEntity> {
+    fn storage_entities(&self) -> Vec<StorageEntity> {
         self.cart_sets
             .iter()
-            .map(|(dir, c)| CloudEntity {
+            .map(|(dir, c)| StorageEntity {
                 label: dir.clone(),
                 backend: c.backend.clone(),
                 namespace: c.namespace.clone(),
-                // Only CloudOnly / Both chunks are expected in the
+                // Only StorageOnly / Both chunks are expected in the
                 // bucket; LocalOnly chunks have never been uploaded.
                 chunk_hashes: c
                     .records
                     .iter()
                     .filter(|(_, _, _, loc)| {
-                        matches!(loc, LocationTag::CloudOnly | LocationTag::Both)
+                        matches!(loc, LocationTag::StorageOnly | LocationTag::Both)
                     })
                     .map(|(_, h, _, _)| h.clone())
                     .collect(),
@@ -199,15 +199,15 @@ pub struct CartridgeReport {
     pub local_chunks_missing: u64,
     /// Hashes whose pool file size doesn't match the recorded size.
     pub local_chunks_size_mismatch: u64,
-    /// Cloud chunks (CloudOnly / Both) not present in the bucket on
-    /// HEAD. `None` when the cloud sweep was skipped.
+    /// Storage chunks (StorageOnly / Both) not present in the bucket on
+    /// HEAD. `None` when the storage sweep was skipped.
     pub storage_chunks_missing: Option<u64>,
     /// Index-page objects under `manifests/<barcode>/<label>/page-NNNN.dat`
-    /// missing in the bucket. `None` when the cloud sweep was skipped.
-    pub cloud_index_pages_missing: Option<u64>,
+    /// missing in the bucket. `None` when the storage sweep was skipped.
+    pub storage_index_pages_missing: Option<u64>,
     /// `Some(true)` if `manifests/<barcode>/manifest-latest.json`
     /// exists, `Some(false)` if missing, `None` if skipped.
-    pub cloud_sentinel_present: Option<bool>,
+    pub storage_sentinel_present: Option<bool>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -242,7 +242,7 @@ pub struct PoolReport {
     pub warnings: Vec<String>,
 }
 
-/// Cloud-side companion to PoolReport. Sizes aren't reported because
+/// Storage-side companion to PoolReport. Sizes aren't reported because
 /// `list_objects` doesn't return them — we'd have to HEAD every key
 /// just to size orphans, which doubles the request count for what's
 /// already a hint.
@@ -267,25 +267,25 @@ pub struct NamespacePoolReport {
 }
 
 /// Run the local consistency pass against `data_dir`. Use this when
-/// the operator passed `--skip-cloud`; otherwise call
-/// [`verify_with_cloud`] which layers the bucket HEAD sweep on top.
+/// the operator passed `--skip-storage`; otherwise call
+/// [`verify_with_storage`] which layers the bucket HEAD sweep on top.
 pub fn verify_local(data_dir: &Path, scope: &VerifyScope) -> Result<VerifyReport> {
     let (report, _cart_sets) = verify_local_inner(data_dir, scope)?;
     Ok(report)
 }
 
-/// Local pass + cloud HEAD sweep against every backend referenced by
+/// Local pass + storage HEAD sweep against every backend referenced by
 /// at least one cartridge. `local`-type backends are silently skipped
-/// (no cloud surface). Errors talking to a backend are recorded as
+/// (no storage surface). Errors talking to a backend are recorded as
 /// PoolReport errors and verify continues — one degraded backend
 /// shouldn't mask another's findings.
-pub async fn verify_with_cloud(
+pub async fn verify_with_storage(
     data_dir: &Path,
     scope: &VerifyScope,
-    cloud_cfg: &ObjectStoreConfig,
+    storage_cfg: &ObjectStoreConfig,
 ) -> Result<VerifyReport> {
     let (mut report, cart_sets) = verify_local_inner(data_dir, scope)?;
-    cloud_sweep(&mut report, &cart_sets, cloud_cfg).await;
+    storage_sweep(&mut report, &cart_sets, storage_cfg).await;
     Ok(report)
 }
 
@@ -552,7 +552,7 @@ fn read_manifest(dir: &Path, dir_name: &str, r: &mut CartridgeReport) -> Option<
 ///
 /// On success returns `(next_id, chunk_sizes, records_for_set)` where
 /// `records_for_set` is the subset of records with a hash (the only
-/// ones the local-pool + cloud-sweep care about).
+/// ones the local-pool + storage-sweep care about).
 fn read_chunks_index(
     dir: &Path,
     r: &mut CartridgeReport,
@@ -681,8 +681,8 @@ fn verify_local_pool(
 
 /// Stash the cartridge's chunk-set into `cart_sets` for the
 /// later pool sweep. The barcode_label comes from the manifest's
-/// `label` field (drives cloud key prefixes); index_pages come from
-/// `manifest.index_epoch[label].pages` (count of pages the cloud is
+/// `label` field (drives storage key prefixes); index_pages come from
+/// `manifest.index_epoch[label].pages` (count of pages the storage is
 /// supposed to hold per index file — empty for cartridges predating
 /// delta-page index backup).
 fn register_cart_set(
@@ -845,40 +845,40 @@ fn short_hash(h: &str) -> String {
     format!("{}..", &h[..n])
 }
 
-/// Run the per-backend cloud HEAD sweep. For each backend referenced
+/// Run the per-backend storage HEAD sweep. For each backend referenced
 /// by at least one cartridge in `cart_sets`:
-///   1. HEAD every chunk that should exist in cloud (CloudOnly/Both),
+///   1. HEAD every chunk that should exist in storage (StorageOnly/Both),
 ///      counted into the relevant cartridge's `storage_chunks_missing`.
 ///   2. HEAD every index page `0..pages` per `index_epoch[label]`,
-///      counted into `cloud_index_pages_missing`.
+///      counted into `storage_index_pages_missing`.
 ///   3. HEAD `manifests/<barcode>/manifest-latest.json` and record it
-///      as the cartridge's `cloud_sentinel_present`.
+///      as the cartridge's `storage_sentinel_present`.
 ///   4. List `chunks/...` and `manifests/<barcode>/` for orphan
 ///      detection (GC hints, mirrors the local pool sweep).
 ///
-/// Local-type backends are skipped — there's no cloud surface, only
+/// Local-type backends are skipped — there's no storage surface, only
 /// the on-disk filesystem path the local pass already covered. A
 /// backend that fails to come up is recorded as a PoolReport error
 /// and the sweep moves on.
-async fn cloud_sweep(
+async fn storage_sweep(
     report: &mut VerifyReport,
     cart_sets: &BTreeMap<String, CartridgeChunkSet>,
-    cloud_cfg: &ObjectStoreConfig,
+    storage_cfg: &ObjectStoreConfig,
 ) {
-    // Mirror local pass: one cloud sweep per backend that has at least
+    // Mirror local pass: one storage sweep per backend that has at least
     // one cartridge bound to it. Cartridges bound to a backend not in
-    // `cloud.backends:` are recorded as a manifest-side error (config
+    // `storage.backends:` are recorded as a manifest-side error (config
     // drift) — surface and skip.
     let backends_in_use: HashSet<String> = cart_sets.values().map(|c| c.backend.clone()).collect();
 
     for backend_name in backends_in_use {
-        // Skip local backends — no cloud surface.
-        let backend_type = match cloud_cfg.backend_entry(&backend_name) {
+        // Skip local backends — no storage surface.
+        let backend_type = match storage_cfg.backend_entry(&backend_name) {
             Ok(entry) => entry.backend_type(),
             Err(_) => {
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
                     pr.errors.push(format!(
-                        "backend '{}' referenced by cartridge but not defined under `cloud.backends:` — skipping cloud sweep",
+                        "backend '{}' referenced by cartridge but not defined under `storage.backends:` — skipping storage sweep",
                         backend_name
                     ));
                 }
@@ -889,7 +889,7 @@ async fn cloud_sweep(
             continue;
         }
 
-        let backend = match cloud_cfg.create_backend_named(&backend_name).await {
+        let backend = match storage_cfg.create_backend_named(&backend_name).await {
             Ok(b) => b,
             Err(e) => {
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
@@ -902,32 +902,33 @@ async fn cloud_sweep(
             }
         };
 
-        sweep_one_backend_cloud(report, cart_sets, &backend_name, &*backend).await;
+        sweep_one_backend_storage(report, cart_sets, &backend_name, &*backend).await;
     }
 }
 
-/// Per-backend cloud sweep. The chunk dimension — HEAD presence plus
+/// Per-backend storage sweep. The chunk dimension — HEAD presence plus
 /// the `chunks/` orphan scan — is the cross-product `shared-verify-core`
 /// sweep. The index-page and manifest-sentinel HEADs are tape-only and
 /// stay here.
-async fn sweep_one_backend_cloud(
+async fn sweep_one_backend_storage(
     report: &mut VerifyReport,
     cart_sets: &BTreeMap<String, CartridgeChunkSet>,
     backend_name: &str,
     backend: &dyn ObjectStoreBackend,
 ) {
-    let mut cloud_pool = StoragePoolReport::default();
+    let mut storage_pool = StoragePoolReport::default();
 
-    // Chunk dimension — the local pool orphan sweep's cloud twin,
+    // Chunk dimension — the local pool orphan sweep's storage twin,
     // shared with the block product.
     let target = TapeVerifyTarget { cart_sets };
     let chunk_sweep = shared_verify_core::sweep_storage(&target, backend_name, backend).await;
-    cloud_pool.chunk_objects = chunk_sweep.chunk_objects;
-    cloud_pool.chunk_orphans = chunk_sweep.chunk_orphans;
+    storage_pool.chunk_objects = chunk_sweep.chunk_objects;
+    storage_pool.chunk_orphans = chunk_sweep.chunk_orphans;
     if let Some(e) = &chunk_sweep.list_error
         && let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name)
     {
-        pr.errors.push(format!("cloud chunks/ list failed: {}", e));
+        pr.errors
+            .push(format!("storage chunks/ list failed: {}", e));
     }
     // Per-cartridge missing-chunk counts; HEAD errors become warnings.
     let mut chunk_missing: HashMap<String, u64> = HashMap::new();
@@ -938,7 +939,7 @@ async fn sweep_one_backend_cloud(
         {
             for hf in &ent.head_errors {
                 cr.warnings.push(format!(
-                    "cloud HEAD failed for chunk {}: {}",
+                    "storage HEAD failed for chunk {}: {}",
                     short_hash(&hf.hash),
                     hf.message
                 ));
@@ -979,7 +980,7 @@ async fn sweep_one_backend_cloud(
                 .into_iter()
                 .map(|key| async move { backend.chunk_exists(&key).await }),
         )
-        .buffer_unordered(shared_verify_core::CLOUD_VERIFY_CONCURRENCY)
+        .buffer_unordered(shared_verify_core::STORAGE_VERIFY_CONCURRENCY)
         .collect()
         .await;
         let missing_pages: u64 = page_results
@@ -997,17 +998,17 @@ async fn sweep_one_backend_cloud(
     for (dir, missing_chunks, missing_pages, sentinel_present) in per_cart_results {
         if let Some(cr) = report.cartridges.iter_mut().find(|cr| cr.dir == dir) {
             cr.storage_chunks_missing = Some(missing_chunks);
-            cr.cloud_index_pages_missing = Some(missing_pages);
-            cr.cloud_sentinel_present = Some(sentinel_present);
+            cr.storage_index_pages_missing = Some(missing_pages);
+            cr.storage_sentinel_present = Some(sentinel_present);
             if missing_chunks > 0 {
                 cr.errors.push(format!(
-                    "{} chunk(s) missing from cloud (cold-bucket DR will fail)",
+                    "{} chunk(s) missing from storage (cold-bucket DR will fail)",
                     missing_chunks
                 ));
             }
             if missing_pages > 0 {
                 cr.errors.push(format!(
-                    "{} index-page object(s) missing from cloud (cold-bucket restore can't rebuild indexes)",
+                    "{} index-page object(s) missing from storage (cold-bucket restore can't rebuild indexes)",
                     missing_pages
                 ));
             }
@@ -1020,14 +1021,14 @@ async fn sweep_one_backend_cloud(
                 // error (we know the cartridge has been backed up).
                 if !cr.partitions.is_empty()
                     && cr.chunks_with_hash > 0
-                    && cr.cloud_index_pages_missing.unwrap_or(0) == 0
+                    && cr.storage_index_pages_missing.unwrap_or(0) == 0
                 {
                     cr.warnings.push(
-                        "cloud sentinel manifest-latest.json missing — cartridge has chunks but never been backed up to cloud".into(),
+                        "storage sentinel manifest-latest.json missing — cartridge has chunks but never been backed up to storage".into(),
                     );
                 } else {
                     cr.warnings
-                        .push("cloud sentinel manifest-latest.json missing".into());
+                        .push("storage sentinel manifest-latest.json missing".into());
                 }
             }
         }
@@ -1043,7 +1044,7 @@ async fn sweep_one_backend_cloud(
             Err(e) => {
                 if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
                     pr.errors
-                        .push(format!("cloud {} list failed: {}", prefix, e));
+                        .push(format!("storage {} list failed: {}", prefix, e));
                 }
                 continue;
             }
@@ -1056,33 +1057,33 @@ async fn sweep_one_backend_cloud(
                 continue;
             }
             if !all_expected_page_keys.contains(&key) {
-                cloud_pool.index_page_orphans += 1;
+                storage_pool.index_page_orphans += 1;
             }
         }
     }
 
     // Surface GC hints + attach to PoolReport.
     if let Some(pr) = report.pool.iter_mut().find(|p| p.backend == backend_name) {
-        if cloud_pool.chunk_orphans > 0 {
+        if storage_pool.chunk_orphans > 0 {
             pr.gc_hints.push(format!(
-                "cloud has {} orphan chunk object(s) — `system gc --cloud` would free them",
-                cloud_pool.chunk_orphans
+                "storage has {} orphan chunk object(s) — `system gc --storage` would free them",
+                storage_pool.chunk_orphans
             ));
         }
-        if cloud_pool.index_page_orphans > 0 {
+        if storage_pool.index_page_orphans > 0 {
             pr.gc_hints.push(format!(
-                "cloud has {} stale index-page object(s) — `system gc --cloud` would free them",
-                cloud_pool.index_page_orphans
+                "storage has {} stale index-page object(s) — `system gc --storage` would free them",
+                storage_pool.index_page_orphans
             ));
         }
-        pr.storage = Some(cloud_pool);
+        pr.storage = Some(storage_pool);
     }
 }
 
 fn location_str(l: LocationTag) -> &'static str {
     match l {
         LocationTag::LocalOnly => "LocalOnly",
-        LocationTag::CloudOnly => "CloudOnly",
+        LocationTag::StorageOnly => "StorageOnly",
         LocationTag::Both => "Both",
     }
 }
@@ -1291,10 +1292,10 @@ mod tests {
         assert!(report.error_count() >= 1);
     }
 
-    /// Build a Both-located cartridge plus the cloud objects it
-    /// references (chunk, one index page, sentinel) so the cloud
+    /// Build a Both-located cartridge plus the storage objects it
+    /// references (chunk, one index page, sentinel) so the storage
     /// sweep finds a clean library.
-    fn make_cloud_cart(
+    fn make_storage_cart(
         data_dir: &Path,
         backend_dir: &Path,
         barcode: &str,
@@ -1353,7 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_sweep_clean_library() {
+    async fn storage_sweep_clean_library() {
         use crate::local::LocalBackend;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1373,25 +1374,25 @@ mod tests {
         let backend_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
         let h = "e".repeat(64);
-        make_cloud_cart(dd, backend_dir.path(), "TAPE001", &h, b"hello");
+        make_storage_cart(dd, backend_dir.path(), "TAPE001", &h, b"hello");
 
         let (mut report, cart_sets) = verify_local_inner(dd, &VerifyScope::default()).unwrap();
-        sweep_one_backend_cloud(&mut report, &cart_sets, "primary", &backend).await;
+        sweep_one_backend_storage(&mut report, &cart_sets, "primary", &backend).await;
 
         let c = &report.cartridges[0];
         assert_eq!(c.storage_chunks_missing, Some(0), "{:#?}", c);
-        assert_eq!(c.cloud_index_pages_missing, Some(0));
-        assert_eq!(c.cloud_sentinel_present, Some(true));
+        assert_eq!(c.storage_index_pages_missing, Some(0));
+        assert_eq!(c.storage_sentinel_present, Some(true));
         let p = report.pool.iter().find(|p| p.backend == "primary").unwrap();
-        let cp = p.storage.as_ref().expect("cloud sweep ran");
+        let cp = p.storage.as_ref().expect("storage sweep ran");
         assert_eq!(cp.chunk_orphans, 0);
         assert_eq!(cp.index_page_orphans, 0);
-        // No cloud-side errors should bubble up to the cartridge.
+        // No storage-side errors should bubble up to the cartridge.
         assert!(c.errors.is_empty(), "{:#?}", c.errors);
     }
 
     #[tokio::test]
-    async fn cloud_sweep_flags_missing_chunk_and_index_page() {
+    async fn storage_sweep_flags_missing_chunk_and_index_page() {
         use crate::local::LocalBackend;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1411,9 +1412,9 @@ mod tests {
         let backend_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
         let h = "f".repeat(64);
-        make_cloud_cart(dd, backend_dir.path(), "TAPE002", &h, b"data");
+        make_storage_cart(dd, backend_dir.path(), "TAPE002", &h, b"data");
 
-        // Now delete the chunk + index page from "cloud" — sentinel
+        // Now delete the chunk + index page from "storage" — sentinel
         // stays so we exercise the missing-chunk / missing-page paths
         // in isolation.
         fs::remove_file(backend_dir.path().join(format!(
@@ -1431,31 +1432,31 @@ mod tests {
         .unwrap();
 
         let (mut report, cart_sets) = verify_local_inner(dd, &VerifyScope::default()).unwrap();
-        sweep_one_backend_cloud(&mut report, &cart_sets, "primary", &backend).await;
+        sweep_one_backend_storage(&mut report, &cart_sets, "primary", &backend).await;
 
         let c = &report.cartridges[0];
         assert_eq!(c.storage_chunks_missing, Some(1));
-        assert_eq!(c.cloud_index_pages_missing, Some(1));
-        assert_eq!(c.cloud_sentinel_present, Some(true));
+        assert_eq!(c.storage_index_pages_missing, Some(1));
+        assert_eq!(c.storage_sentinel_present, Some(true));
         // Both must have produced error entries on the cartridge.
         assert!(
             c.errors
                 .iter()
-                .any(|e| e.contains("chunk(s) missing from cloud")),
+                .any(|e| e.contains("chunk(s) missing from storage")),
             "{:#?}",
             c.errors
         );
         assert!(
             c.errors
                 .iter()
-                .any(|e| e.contains("index-page object(s) missing from cloud")),
+                .any(|e| e.contains("index-page object(s) missing from storage")),
             "{:#?}",
             c.errors
         );
     }
 
     #[tokio::test]
-    async fn cloud_sweep_orphan_chunk_is_gc_hint_not_error() {
+    async fn storage_sweep_orphan_chunk_is_gc_hint_not_error() {
         use crate::local::LocalBackend;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1475,9 +1476,9 @@ mod tests {
         let backend_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
         let h = "9".repeat(64);
-        make_cloud_cart(dd, backend_dir.path(), "TAPE003", &h, b"hi");
+        make_storage_cart(dd, backend_dir.path(), "TAPE003", &h, b"hi");
 
-        // Drop a stray cloud object no manifest points at.
+        // Drop a stray storage object no manifest points at.
         let stray = "1".repeat(64);
         let stray_key = format!("chunks/{}/{}/{}.dat", &stray[..2], &stray[2..4], stray);
         let stray_obj = backend_dir.path().join(&stray_key);
@@ -1485,7 +1486,7 @@ mod tests {
         fs::write(&stray_obj, b"orphan").unwrap();
 
         let (mut report, cart_sets) = verify_local_inner(dd, &VerifyScope::default()).unwrap();
-        sweep_one_backend_cloud(&mut report, &cart_sets, "primary", &backend).await;
+        sweep_one_backend_storage(&mut report, &cart_sets, "primary", &backend).await;
 
         let c = &report.cartridges[0];
         // The cartridge itself stays clean.

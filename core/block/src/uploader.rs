@@ -22,15 +22,15 @@
 //!   [`PageCache::synchronize_bytes`] waiter parked on that page
 //!   range. The SBC-3 SYNCHRONIZE CACHE handler awaits the
 //!   pending tracker so the host's `fsync(2)` still means
-//!   "bytes are in cloud."
+//!   "bytes are in storage."
 //! - **Inline (tests, CLI)** — no sender wired; `write_page_unsynced`
 //!   runs `upload_chunk_inert` itself before returning. Same
 //!   correctness contract as the pre-async era — every successful
-//!   call returns with the cloud copy already durable.
+//!   call returns with the storage copy already durable.
 //!
 //! Crash semantics — async path: a crash with surviving
 //! `LocalOnly` markers leaves chunks present in the pool but not
-//! yet in cloud. The daemon's boot-time `scan_and_enqueue_localonly`
+//! yet in storage. The daemon's boot-time `scan_and_enqueue_localonly`
 //! walks every volume's `upload.idx`, finds the survivors, and
 //! re-enqueues them; the worker drains them indistinguishably from
 //! live writes. PUTs are idempotent on every supported backend, so
@@ -213,8 +213,8 @@ pub enum UploaderError {
     #[error("volume: {0}")]
     Volume(#[from] VolumeError),
 
-    #[error("cloud: {0}")]
-    Cloud(#[from] ObjectStoreError),
+    #[error("storage: {0}")]
+    Storage(#[from] ObjectStoreError),
 
     #[error("upload-worker: {0}")]
     UploadWorker(#[from] shared_upload_worker::UploadInertError),
@@ -314,20 +314,20 @@ pub struct WritePageOutcome {
     pub page_id: PageId,
     pub hash_hex: String,
     /// `true` if the page bytes were already in the local pool
-    /// (within-volume dedup hit). Informational; the cloud upload
-    /// path makes its own decision via [`Self::cloud_dedup_hit`].
+    /// (within-volume dedup hit). Informational; the storage upload
+    /// path makes its own decision via [`Self::storage_dedup_hit`].
     pub local_dedup_hit: bool,
-    /// `true` if the cloud upload was skipped because a HEAD probe
+    /// `true` if the storage upload was skipped because a HEAD probe
     /// found the object already present. Only ever `true` under
-    /// [`DedupScope::Global`] — `Local`-scope cloud keys are
+    /// [`DedupScope::Global`] — `Local`-scope storage keys are
     /// volume-namespaced, so the HEAD is guaranteed to miss except
     /// under retry-after-crash, where an idempotent re-PUT is
     /// preferable to a race-prone HEAD-skip.
-    pub cloud_dedup_hit: bool,
+    pub storage_dedup_hit: bool,
     /// On-wire bytes the upload actually transferred, when known
     /// at return time. `Some(n)` on the inline upload path (no
     /// async sender — `n` is `upload_chunk_inert`'s `put_bytes`,
-    /// `None` when that inner call short-circuited on a cloud HEAD
+    /// `None` when that inner call short-circuited on a storage HEAD
     /// hit). `None` on the async path, where the worker bumps the
     /// per-volume `backend_bytes_written` meter itself after the
     /// PUT completes — the caller has no PUT size to report at
@@ -338,7 +338,7 @@ pub struct WritePageOutcome {
 /// Bundle of (manifest + page index + pool + backend) needed to
 /// service writes against a single volume. The backend is held by
 /// `Arc` so the daemon can share one client across volumes that
-/// happen to point at the same cloud entry. Single-writer per
+/// happen to point at the same storage entry. Single-writer per
 /// volume is the contract — concurrent `write_page` calls against
 /// the same `VolumeWriter` are not synchronized internally; the
 /// SBC-3 session layer fences them upstream.
@@ -391,13 +391,13 @@ pub struct VolumeWriter {
     /// wired in its upload worker (the common production path);
     /// `None` for tests / CLI tools that want the legacy
     /// "synchronous seal" behaviour where `write_page_unsynced`
-    /// awaits the cloud PUT before returning. The daemon supplies
+    /// awaits the storage PUT before returning. The daemon supplies
     /// this via [`Self::with_upload_sender`].
     upload_sender: Option<mpsc::Sender<UploadTask>>,
     /// In-flight upload tracker, populated in async mode only.
     /// `PageCache::synchronize_bytes` consults it to drain the
     /// upload queue inside SCSI SYNCHRONIZE CACHE so the host's
-    /// fsync still means "bytes are in cloud."
+    /// fsync still means "bytes are in storage."
     pending_uploads: PendingUploads,
     /// Hot-path lock-free cache of the volume's current
     /// [`SyncAfter`] tier. Initialised from `runtime.json` at
@@ -450,7 +450,7 @@ impl Drop for VolumeWriter {
 }
 
 impl VolumeWriter {
-    /// Open an existing volume against the given cloud backend.
+    /// Open an existing volume against the given storage backend.
     /// `backend` must already be authenticated and ready to upload
     /// — we do no additional validation here.
     ///
@@ -595,7 +595,7 @@ impl VolumeWriter {
 
     /// Wire in the daemon's async upload-worker sender. Once set,
     /// every [`Self::write_page_unsynced`] call enqueues an
-    /// [`UploadTask`] and returns without awaiting cloud — the
+    /// [`UploadTask`] and returns without awaiting storage — the
     /// worker drives the PUT in the background and calls
     /// [`Self::apply_page_upload_outcome`] when it's done. Without
     /// this builder (tests, CLI), the writer falls back to the
@@ -867,7 +867,7 @@ impl VolumeWriter {
     /// 1. BLAKE3-hash the page bytes (delegated to [`ChunkPool::insert_bytes`]).
     /// 2. Insert into the local chunk pool — atomic; no-op if the
     ///    hash was already there.
-    /// 3. Upload to the cloud backend. Under `Global` scope a HEAD
+    /// 3. Upload to the storage backend. Under `Global` scope a HEAD
     ///    probe gates the upload so cross-volume dedup hits skip
     ///    the PUT.
     /// 4. Record `(page_id, hash)` in the page index (pwrite + fsync).
@@ -971,7 +971,7 @@ impl VolumeWriter {
             // our reservation never consumed new disk — release it
             // before continuing so the budget reflects reality.
             //
-            // This is safe even though eviction / a CloudOnly state
+            // This is safe even though eviction / a StorageOnly state
             // can leave a chunk's bytes absent while the page index
             // still references the hash: `insert_bytes` guarantees on
             // `Ok` that `store_path(hash)` is present on disk
@@ -1045,12 +1045,12 @@ impl VolumeWriter {
         // return — the worker drives `upload_chunk_inert` and calls
         // `apply_page_upload_outcome` on completion. Without one
         // (tests, CLI), run the upload inline so the legacy
-        // "returns means cloud-durable" semantic stands.
+        // "returns means storage-durable" semantic stands.
         //
         // `inline_put_bytes` is the on-wire PUT size for the inline
         // path; the async path leaves it `None` because the worker
         // handles its own `backend_bytes_written` bump after the PUT.
-        let cloud_dedup_hit;
+        let storage_dedup_hit;
         let inline_put_bytes: Option<u64>;
         if let Some(sender) = &self.upload_sender {
             self.pending_uploads.mark_pending(page_id).await;
@@ -1071,7 +1071,7 @@ impl VolumeWriter {
             // We don't know yet whether the worker's HEAD probe
             // will hit; report it as miss for now. Outcome wired
             // through telemetry on the worker side.
-            cloud_dedup_hit = false;
+            storage_dedup_hit = false;
             inline_put_bytes = None;
         } else {
             // Inline path — used by tests and any future CLI tool
@@ -1080,7 +1080,7 @@ impl VolumeWriter {
             // does the HEAD probe (Global only) + PUT, then we
             // flip the sidecar back to Uploaded.
             let outcome = upload_chunk_inert(&*self.backend, &payload_obj).await?;
-            cloud_dedup_hit = outcome.dedup_hit;
+            storage_dedup_hit = outcome.dedup_hit;
             // Forward `put_bytes` up to the caller so it can bump
             // `PageCache::backend_bytes_written` — the async worker
             // does this itself, but the inline path has no `cache`
@@ -1100,7 +1100,7 @@ impl VolumeWriter {
             page_id = page_id,
             hash = &hash_hex[..16.min(hash_hex.len())],
             local_dedup_hit = !was_new,
-            cloud_dedup_hit,
+            storage_dedup_hit,
             async_dispatch = self.upload_sender.is_some(),
             "thurvsa page write sealed (unsynced)"
         );
@@ -1109,7 +1109,7 @@ impl VolumeWriter {
             page_id,
             hash_hex,
             local_dedup_hit: !was_new,
-            cloud_dedup_hit,
+            storage_dedup_hit,
             put_bytes: inline_put_bytes,
         })
     }
@@ -1123,12 +1123,12 @@ impl VolumeWriter {
 
     /// Read a page's bytes back. Returns `Ok(None)` if `page_id`
     /// is unallocated (sparse hole or never written). Tries the
-    /// local pool first; on miss, downloads from cloud, verifies the
+    /// local pool first; on miss, downloads from storage, verifies the
     /// bytes hash to the expected page hash, and warms the local
     /// pool before returning.
     ///
     /// BLAKE3 verify via `ChunkPool::insert_verified_bytes` catches
-    /// cloud bit-rot / wrong-bytes-for-hash; mismatch surfaces as
+    /// storage bit-rot / wrong-bytes-for-hash; mismatch surfaces as
     /// `UploaderError::ChunkPool(ChunkPoolError::HashMismatch)` and
     /// the SBC-3 layer maps that to MEDIUM ERROR + UNRECOVERED READ
     /// ERROR (0x03 / 0x11 / 0x00).
@@ -1146,7 +1146,7 @@ impl VolumeWriter {
     }
 
     /// Read one page back. The `u64` in the success tuple is the
-    /// cloud-fetched byte count: `0` on a local-pool hit, the
+    /// storage-fetched byte count: `0` on a local-pool hit, the
     /// downloaded length on a cache miss — the caller folds it into
     /// `PageCache`'s `backend_bytes_read` meter.
     pub async fn read_page(
@@ -1168,17 +1168,17 @@ impl VolumeWriter {
         Ok(Some(out))
     }
 
-    /// Fetch the chunk identified by `hash` (local pool, else cloud
+    /// Fetch the chunk identified by `hash` (local pool, else storage
     /// refetch) and, for an encrypted volume, decrypt it under this
     /// volume's identity using `derive_iv(dek_uuid(), page_id, iv_salt)`.
-    /// Returns `(plaintext, cloud_bytes)` where `cloud_bytes` is the
+    /// Returns `(plaintext, storage_bytes)` where `storage_bytes` is the
     /// cache-miss download size (`0` on a local-pool hit). For an
     /// unencrypted volume the pool bytes are returned verbatim.
     ///
     /// Shared by [`Self::read_page`] (which supplies the page's own
     /// `pages.idx` hash + salt) and [`Self::decrypt_page_at`] (which
     /// supplies an explicit snapshot hash + salt for the ODX recrypt
-    /// path), so the cloud-miss accounting, ghost-list probe, and
+    /// path), so the storage-miss accounting, ghost-list probe, and
     /// decrypt logic can never diverge between the two.
     async fn fetch_and_decrypt(
         &self,
@@ -1187,9 +1187,9 @@ impl VolumeWriter {
         iv_salt: u64,
     ) -> Result<(Vec<u8>, u64), UploaderError> {
         let hash_hex = hex::encode(hash);
-        // `cloud_bytes` is the cache-miss download size — 0 on a
-        // local-pool hit, the fetched length on a cloud miss.
-        let (payload, cloud_bytes) = if self.pool.exists(&hash_hex) {
+        // `storage_bytes` is the cache-miss download size — 0 on a
+        // local-pool hit, the fetched length on a storage miss.
+        let (payload, storage_bytes) = if self.pool.exists(&hash_hex) {
             (self.pool.read_bytes(&hash_hex)?, 0u64)
         } else {
             if let Some(gl) = self.ghost_list.as_ref()
@@ -1199,7 +1199,7 @@ impl VolumeWriter {
             }
             let object_key = self.pool.object_key(&hash_hex);
             let bytes = self.backend.download_chunk(&object_key).await?;
-            let cloud_bytes = bytes.len() as u64;
+            let storage_bytes = bytes.len() as u64;
             // Cache-miss refetch grows the local pool — account it
             // against the budget so `current_bytes()` stays equal to
             // on-disk pool bytes (the eviction worker reads the budget
@@ -1216,12 +1216,12 @@ impl VolumeWriter {
             let was_new = self.pool.insert_verified_bytes(&hash_hex, &bytes)?;
             if was_new {
                 self.pool_budget
-                    .force_reserve(cloud_bytes, self.manifest.pool_namespace().as_deref());
+                    .force_reserve(storage_bytes, self.manifest.pool_namespace().as_deref());
             }
-            (bytes, cloud_bytes)
+            (bytes, storage_bytes)
         };
         // Decrypt-on-read: for encrypted volumes the bytes we just
-        // pulled from pool / cloud are ciphertext-plus-tag and must
+        // pulled from pool / storage are ciphertext-plus-tag and must
         // be peeled back to plaintext before returning to the SCSI
         // READ handler. IV is re-derived from the same identity tuple
         // used at write time — `(crypto_uuid, page_id, iv_salt)` — with
@@ -1236,9 +1236,9 @@ impl VolumeWriter {
                     CryptoError::Input(_) => UploaderError::Decrypt("invalid decrypt input"),
                     CryptoError::Encrypt => UploaderError::Decrypt("encrypt error during decrypt"),
                 })?;
-            Ok((plaintext, cloud_bytes))
+            Ok((plaintext, storage_bytes))
         } else {
-            Ok((payload, cloud_bytes))
+            Ok((payload, storage_bytes))
         }
     }
 
@@ -1262,7 +1262,7 @@ impl VolumeWriter {
         hash: &ChunkHash,
         iv_salt: u64,
     ) -> Result<Vec<u8>, UploaderError> {
-        let (plaintext, _cloud_bytes) = self.fetch_and_decrypt(page_id, hash, iv_salt).await?;
+        let (plaintext, _storage_bytes) = self.fetch_and_decrypt(page_id, hash, iv_salt).await?;
         Ok(plaintext)
     }
 }
@@ -1347,14 +1347,14 @@ mod tests {
     }
 
     /// Stand up a 4 MiB volume with the given dedup scope and a
-    /// LocalBackend rooted at `<tmp>/cloud`. Returns
+    /// LocalBackend rooted at `<tmp>/storage`. Returns
     /// (data_dir, volume_name, backend).
     async fn fixture(scope: DedupScope) -> (TempDir, String, Arc<dyn ObjectStoreBackend>) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         let name = "vol1".to_string();
@@ -1391,15 +1391,15 @@ mod tests {
 
         let outcome = writer.write_page(7, &bytes).await.unwrap();
         assert!(!outcome.local_dedup_hit);
-        assert!(!outcome.cloud_dedup_hit);
+        assert!(!outcome.storage_dedup_hit);
         assert_eq!(outcome.hash_hex.len(), 64);
 
         // Read straight after write: the chunk is in the local pool,
-        // so no cloud fetch — the byte count is 0.
+        // so no storage fetch — the byte count is 0.
         let read_back = writer.read_page(7).await.unwrap();
         assert_eq!(read_back, Some((bytes.clone(), 0)));
 
-        // Index records it, pool has it, cloud has it.
+        // Index records it, pool has it, storage has it.
         assert!(writer.page_index().get(7).unwrap().is_some());
         assert!(writer.pool().exists(&outcome.hash_hex));
         let object_key = writer.pool().object_key(&outcome.hash_hex);
@@ -1427,18 +1427,18 @@ mod tests {
 
         // Simulate the eviction worker dropping the local pool file:
         // remove + release, exactly the (size, namespace=None) pairing
-        // `evict_lru_chunks` uses for a Global-scope chunk. Cloud copy
+        // `evict_lru_chunks` uses for a Global-scope chunk. Storage copy
         // stays, so the next read is a genuine local-pool miss.
         writer.pool().remove(&outcome.hash_hex).unwrap();
         budget.release(seal_bytes, None);
         assert_eq!(budget.current_bytes(), 0);
         assert!(!writer.pool().exists(&outcome.hash_hex));
 
-        // Read → cache miss → download from cloud → re-warm the pool.
+        // Read → cache miss → download from storage → re-warm the pool.
         // The refetch must re-reserve exactly the chunk bytes.
-        let (got, cloud_bytes) = writer.read_page(7).await.unwrap().unwrap();
+        let (got, storage_bytes) = writer.read_page(7).await.unwrap().unwrap();
         assert_eq!(got, bytes);
-        assert!(cloud_bytes > 0, "a miss must report a cloud fetch");
+        assert!(storage_bytes > 0, "a miss must report a storage fetch");
         assert_eq!(
             budget.current_bytes(),
             seal_bytes,
@@ -1447,9 +1447,9 @@ mod tests {
 
         // Second read: the chunk is resident again → local hit → no
         // reserve. The budget must not double-count.
-        let (got2, cloud_bytes2) = writer.read_page(7).await.unwrap().unwrap();
+        let (got2, storage_bytes2) = writer.read_page(7).await.unwrap().unwrap();
         assert_eq!(got2, bytes);
-        assert_eq!(cloud_bytes2, 0, "second read is a local-pool hit");
+        assert_eq!(storage_bytes2, 0, "second read is a local-pool hit");
         assert_eq!(
             budget.current_bytes(),
             seal_bytes,
@@ -1539,32 +1539,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_scope_skips_upload_on_cloud_hit() {
+    async fn global_scope_skips_upload_on_storage_hit() {
         let (tmp, name, backend) = fixture(DedupScope::Global).await;
         let writer = VolumeWriter::open(tmp.path(), &name, backend.clone()).unwrap();
         let bytes = page_bytes(0x77);
 
         let first = writer.write_page(0, &bytes).await.unwrap();
-        assert!(!first.cloud_dedup_hit, "first write must upload");
+        assert!(!first.storage_dedup_hit, "first write must upload");
 
         // Second write of the same bytes to a different page id —
-        // the cloud HEAD probe should hit and skip the PUT.
+        // the storage HEAD probe should hit and skip the PUT.
         let second = writer.write_page(1, &bytes).await.unwrap();
-        assert!(second.cloud_dedup_hit, "second write should HEAD-hit");
+        assert!(second.storage_dedup_hit, "second write should HEAD-hit");
     }
 
     #[tokio::test]
-    async fn local_scope_does_not_head_probe_cloud() {
+    async fn local_scope_does_not_head_probe_storage() {
         let (tmp, name, backend) = fixture(DedupScope::Local).await;
         let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
         let bytes = page_bytes(0x33);
 
         let first = writer.write_page(0, &bytes).await.unwrap();
         let second = writer.write_page(1, &bytes).await.unwrap();
-        // Local scope never reports a cloud HEAD hit even though the
+        // Local scope never reports a storage HEAD hit even though the
         // bytes are identical — re-PUTs are cheap and idempotent.
-        assert!(!first.cloud_dedup_hit);
-        assert!(!second.cloud_dedup_hit);
+        assert!(!first.storage_dedup_hit);
+        assert!(!second.storage_dedup_hit);
     }
 
     #[tokio::test]
@@ -1749,10 +1749,10 @@ mod tests {
     async fn set_size_shrink_refuses_worm_but_allows_grow() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
         let backend: Arc<dyn ObjectStoreBackend> =
-            Arc::new(LocalBackend::new(&cloud_root).await.unwrap());
+            Arc::new(LocalBackend::new(&storage_root).await.unwrap());
         let name = "wormvol".to_string();
         VolumeManifest::new(
             name.clone(),
@@ -1791,9 +1791,9 @@ mod tests {
     ) -> (TempDir, String, Arc<dyn ObjectStoreBackend>, [u8; KEY_LEN]) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         let name = "vol-enc".to_string();
@@ -1879,9 +1879,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decrypt_page_at_errors_when_chunk_is_absent_from_pool_and_cloud() {
+    async fn decrypt_page_at_errors_when_chunk_is_absent_from_pool_and_storage() {
         // The ODX recrypt input addresses a chunk by an explicit hash.
-        // If that chunk lives in neither the local pool nor cloud (a
+        // If that chunk lives in neither the local pool nor storage (a
         // stale token, or a source page evicted before it uploaded), the
         // fetch must surface an error — not a decrypt failure, and never
         // silent wrong plaintext.

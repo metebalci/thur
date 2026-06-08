@@ -21,11 +21,11 @@ mod partitions;
 // no operator surface for those values anywhere.
 pub mod reconcile;
 
-// Cross-region DR restore driver — discover cartridges in a cloud
+// Cross-region DR restore driver — discover cartridges in a storage
 // bucket and reconstruct the local cartridge directories via the
 // existing single-cartridge cold-bucket path. The CLI's
 // `library restore` verb wires this with the YAML conffile's
-// `cloud.backends:` block + an inventory rebuild.
+// `storage.backends:` block + an inventory rebuild.
 pub mod restore;
 
 // Pull a frozen archive (produced by `cartridge_archive`) back into a

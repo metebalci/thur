@@ -6,7 +6,7 @@
 //! `core/smc/tests/backpressure_tests.rs`.
 //!
 //! Production wiring (daemon-side):
-//!   * Daemon constructs one `Arc<PoolBudget>` per `cloud.backends`
+//!   * Daemon constructs one `Arc<PoolBudget>` per `storage.backends`
 //!     entry at startup and seeds it via
 //!     `core_block::refresh_pool_budget_from_volumes`.
 //!   * `discover_and_register` plumbs each budget into every
@@ -39,9 +39,11 @@ const PAGE: usize = DEFAULT_PAGE_SIZE_BYTES as usize;
 async fn fixture(budget: Arc<PoolBudget>, deadline: Duration) -> (TempDir, Arc<VolumeWriter>) {
     let tmp = TempDir::new().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
-    let cloud_root = data_dir.join("cloud");
-    std::fs::create_dir_all(&cloud_root).expect("mkdir cloud");
-    let backend = LocalBackend::new(&cloud_root).await.expect("local backend");
+    let storage_root = data_dir.join("storage");
+    std::fs::create_dir_all(&storage_root).expect("mkdir storage");
+    let backend = LocalBackend::new(&storage_root)
+        .await
+        .expect("local backend");
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
     let name = "vol-bp";

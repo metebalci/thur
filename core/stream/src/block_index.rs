@@ -383,7 +383,7 @@ impl BlockIndexFile {
         &self.path
     }
 
-    /// Borrow the dirty-page tracker. Used by the cloud-backup path
+    /// Borrow the dirty-page tracker. Used by the storage-backup path
     /// to snapshot dirty pages before uploading and to clear them
     /// after each successful PUT.
     pub fn dirty_tracker(&self) -> &DirtyPageTracker {

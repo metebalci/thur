@@ -9,16 +9,16 @@
 //!
 //! - The live set comes from each volume's `pages.idx` (the
 //!   `page_id -> chunk_hash` map), not a tape's chunk index.
-//! - There is no cloud index-page sweep. VSA uploads only chunk
+//! - There is no storage index-page sweep. VSA uploads only chunk
 //!   objects (`chunks/[<ns>/]<aa>/<bb>/<hash>.dat`); it persists no
 //!   `manifests/<...>/page-NNN` objects, so VTL's
-//!   `run_cloud_index_pages_gc` has no analogue here.
+//!   `run_storage_index_pages_gc` has no analogue here.
 //!
 //! The namespace for a `Local`-scope volume is its UUID hex
 //! ([`VolumeManifest::pool_namespace`]); `Global`-scope volumes share
 //! the per-backend pool (namespace `None`).
 //!
-//! Body params: `{ "dry_run": bool, "cloud": bool }`.
+//! Body params: `{ "dry_run": bool, "storage": bool }`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -143,14 +143,14 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             .await
         {
             emitter
-                .error(format!("cloud gc on backend {}: {}", backend_name, e))
+                .error(format!("storage gc on backend {}: {}", backend_name, e))
                 .await;
         }
         emitter.info("").await;
     }
     if !params.storage {
         emitter
-            .info("(Skipping cloud GC — re-run with cloud:true to clean buckets too.)")
+            .info("(Skipping storage GC — re-run with storage:true to clean buckets too.)")
             .await;
         emitter.info("").await;
     }
@@ -169,7 +169,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
 
     let result = serde_json::json!({
         "dry_run": params.dry_run,
-        "cloud": params.storage,
+        "storage": params.storage,
         "bytes_freed_local": total_freed,
         "backends": local_summary,
     });
@@ -184,7 +184,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             "gc.run",
             AuditActor::system(),
             serde_json::json!({
-                "cloud": params.storage,
+                "storage": params.storage,
                 "bytes_freed_local": total_freed,
                 "backends": backend_names,
             }),
@@ -504,7 +504,7 @@ async fn run_storage_gc(
         if dry_run {
             emitter
                 .info(format!(
-                    "  [dry-run] would delete cloud object {} (hash {}.., {})",
+                    "  [dry-run] would delete storage object {} (hash {}.., {})",
                     key,
                     &parsed.hash[..parsed.hash.len().min(8)],
                     ns_label,
@@ -514,7 +514,7 @@ async fn run_storage_gc(
             backend.delete_object(key).await?;
             emitter
                 .info(format!(
-                    "  deleted cloud object {} (hash {}.., {})",
+                    "  deleted storage object {} (hash {}.., {})",
                     key,
                     &parsed.hash[..parsed.hash.len().min(8)],
                     ns_label,
@@ -524,7 +524,7 @@ async fn run_storage_gc(
     }
     emitter
         .info(format!(
-            "  Cloud bucket: {} total chunk objects, {} orphans removed",
+            "  Storage bucket: {} total chunk objects, {} orphans removed",
             total, orphans
         ))
         .await;
@@ -536,7 +536,7 @@ struct ParsedChunkKey {
     hash: String,
 }
 
-/// Parse a cloud chunk key — `chunks/[<ns>/]<aa>/<bb>/<hash>.dat` —
+/// Parse a storage chunk key — `chunks/[<ns>/]<aa>/<bb>/<hash>.dat` —
 /// into its namespace + hash. The key shape is produced by
 /// `ChunkPool::object_key_for`, shared with VTL. Anything that doesn't
 /// match (other prefixes, malformed hash) → `None`.

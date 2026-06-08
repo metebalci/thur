@@ -10,7 +10,7 @@
 //! stopping the daemon — `chunks.idx` mutations and pool sweeps
 //! serialize against each other through the daemon's existing locks.
 //!
-//! Body params: `{ "dry_run": bool, "cloud": bool }`.
+//! Body params: `{ "dry_run": bool, "storage": bool }`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -135,10 +135,10 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             .await
             {
                 emitter
-                    .error(format!("cloud gc on backend {}: {}", backend_name, e))
+                    .error(format!("storage gc on backend {}: {}", backend_name, e))
                     .await;
             }
-            if let Err(e) = run_cloud_index_pages_gc(
+            if let Err(e) = run_storage_index_pages_gc(
                 &emitter,
                 &state.storage_config,
                 backend_name,
@@ -149,7 +149,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             {
                 emitter
                     .error(format!(
-                        "cloud index-page gc on backend {}: {}",
+                        "storage index-page gc on backend {}: {}",
                         backend_name, e
                     ))
                     .await;
@@ -159,7 +159,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     }
     if !params.storage {
         emitter
-            .info("(Skipping cloud GC — re-run with cloud:true to clean buckets too.)")
+            .info("(Skipping storage GC — re-run with storage:true to clean buckets too.)")
             .await;
         emitter.info("").await;
     }
@@ -178,7 +178,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
 
     let result = serde_json::json!({
         "dry_run": params.dry_run,
-        "cloud": params.storage,
+        "storage": params.storage,
         "bytes_freed_local": total_freed,
         "backends": local_summary,
     });
@@ -194,7 +194,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             "gc.run",
             actor,
             serde_json::json!({
-                "cloud": params.storage,
+                "storage": params.storage,
                 "bytes_freed_local": total_freed,
                 "backends": backend_names,
             }),
@@ -476,7 +476,7 @@ async fn run_storage_gc(
         if dry_run {
             emitter
                 .info(format!(
-                    "  [dry-run] would delete cloud object {} (hash {}.., {})",
+                    "  [dry-run] would delete storage object {} (hash {}.., {})",
                     key,
                     &parsed.hash[..parsed.hash.len().min(8)],
                     ns_label,
@@ -486,7 +486,7 @@ async fn run_storage_gc(
             backend.delete_object(key).await?;
             emitter
                 .info(format!(
-                    "  deleted cloud object {} (hash {}.., {})",
+                    "  deleted storage object {} (hash {}.., {})",
                     key,
                     &parsed.hash[..parsed.hash.len().min(8)],
                     ns_label,
@@ -496,7 +496,7 @@ async fn run_storage_gc(
     }
     emitter
         .info(format!(
-            "  Cloud bucket: {} total chunk objects, {} orphans removed",
+            "  Storage bucket: {} total chunk objects, {} orphans removed",
             total, orphans
         ))
         .await;
@@ -532,7 +532,7 @@ fn is_two_hex(s: &str) -> bool {
     s.len() == 2 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-async fn run_cloud_index_pages_gc(
+async fn run_storage_index_pages_gc(
     emitter: &JobEmitter,
     cfg: &core_mediachanger::ObjectStoreConfig,
     backend_name: &str,
@@ -550,7 +550,7 @@ async fn run_cloud_index_pages_gc(
     let (total, orphans) = sweep_index_pages(emitter, &*backend, &scoped, dry_run).await?;
     emitter
         .info(format!(
-            "  Cloud index pages: {} total page objects scanned, {} orphans removed",
+            "  Storage index pages: {} total page objects scanned, {} orphans removed",
             total, orphans
         ))
         .await;

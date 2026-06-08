@@ -14,12 +14,12 @@
 //!      ([`core_mediachanger::plan_moves`]) with `legal_held = false`
 //!      to get the provisional move set — the cartridges a policy
 //!      would relocate.
-//!   3. For *only* those candidates, read cloud-native legal-hold
+//!   3. For *only* those candidates, read storage-native legal-hold
 //!      state (one HEAD per cartridge, bounded concurrency). Held
 //!      cartridges are excluded (hard rule); read failures are
 //!      surfaced as skips; candidates on a `local` backend are treated
 //!      as never-held (local storage has no hold concept). This keeps
-//!      the cloud round-trips proportional to the candidate set, not
+//!      the storage round-trips proportional to the candidate set, not
 //!      the whole library.
 //!
 //! Execution (`run-now`) and the legal-hold refusal gate on the
@@ -45,10 +45,10 @@ use super::migrate::migrate_one;
 use crate::state::DaemonState;
 
 /// Bounded concurrency for the per-cartridge legal-hold HEADs. Matches
-/// `shared_verify_core::CLOUD_VERIFY_CONCURRENCY`.
+/// `shared_verify_core::STORAGE_VERIFY_CONCURRENCY`.
 const HOLD_CHECK_CONCURRENCY: usize = 16;
 
-/// Per-cartridge facts read off local disk (no cloud I/O). The
+/// Per-cartridge facts read off local disk (no storage I/O). The
 /// legal-hold bit is filled in later, only for move candidates.
 struct DiskFacts {
     barcode: String,
@@ -213,7 +213,7 @@ fn run_report_from_plan(
 }
 
 /// Shared plan computation for `plan` and `run-now`: scan the
-/// inventory, evaluate the policies, then read cloud-native legal hold
+/// inventory, evaluate the policies, then read storage-native legal hold
 /// for the move candidates. Returns the full plan, or an error string
 /// if the blocking disk scan panicked.
 async fn compute_plan(
@@ -244,7 +244,7 @@ async fn compute_plan(
     //    legal-held exclusion is equivalent to dropping held
     //    cartridges from this candidate set afterwards (a held
     //    cartridge it skips produces no move either way), so we only
-    //    pay the cloud round-trip for cartridges a policy would move.
+    //    pay the storage round-trip for cartridges a policy would move.
     let provisional_facts: Vec<CartridgeFacts> = disk
         .iter()
         .map(|d| CartridgeFacts {
@@ -292,7 +292,7 @@ async fn compute_plan(
         let handle = handles.get(&mv.source_backend).cloned();
         async move {
             match handle {
-                // A local backend cannot carry a cloud-native hold, so
+                // A local backend cannot carry a storage-native hold, so
                 // short-circuit rather than issuing a read that would
                 // error with NotSupported and wrongly skip the move.
                 Some(h) if h.backend_type() == "local" => (mv, Some(Ok(false))),

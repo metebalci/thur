@@ -187,7 +187,7 @@ fn build_pages(page_code: u8, subpage_code: u8, pc: PageControl) -> Result<Vec<u
 /// thurvsa advertises WCE=1 (write-back enabled), RCD=1 (no read
 /// cache), and DRA=1 (no read-ahead). thurvsa's in-memory PageCache
 /// is genuinely write-back: WRITE returns GOOD as soon as bytes
-/// land in the cache, before the page-index entry + cloud chunk
+/// land in the cache, before the page-index entry + storage chunk
 /// upload commit. SBC-3 §6.4.6.4: WCE=1 tells the host that GOOD
 /// status on WRITE does *not* imply durability and that
 /// SYNCHRONIZE CACHE is required to fence dirty cache to media.
@@ -489,9 +489,9 @@ mod tests {
         size_bytes: u64,
         worm: bool,
     ) -> Arc<PageCache> {
-        let cloud_root = data_dir.join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = data_dir.join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         VolumeManifest::new(
             "vol1".into(),

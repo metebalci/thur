@@ -4,27 +4,27 @@
 //! Per-volume upload-state sidecar for `pages.idx`.
 //!
 //! The page index says "page N has hash H." This sidecar says "is
-//! that hash actually in cloud yet?" — the bit the async upload
+//! that hash actually in storage yet?" — the bit the async upload
 //! worker needs to gate eviction and the bit
 //! [`crate::cache::PageCache::synchronize_bytes`] needs to await
 //! before SCSI SYNCHRONIZE CACHE returns.
 //!
 //! Two responsibilities, one byte each:
 //!
-//! - `0x00 = Uploaded` — pool chunk (if present) is also in cloud;
+//! - `0x00 = Uploaded` — pool chunk (if present) is also in storage;
 //!   safe to evict. Also the legacy default for volumes created
 //!   before async upload landed (no sidecar present ⇒ open creates
 //!   one full of zeros ⇒ every pre-existing page reads as Uploaded,
 //!   which is honest because the synchronous-seal era always had the
-//!   cloud copy before `write_page` returned).
+//!   storage copy before `write_page` returned).
 //! - `0x01 = LocalOnly` — pool has the chunk, the upload worker
 //!   hasn't acked the PUT yet. Eviction must skip this hash;
 //!   SYNCHRONIZE CACHE for any range containing this page must
 //!   wait. The worker flips it back to Uploaded on completion.
 //!
-//! No `CloudOnly` state: post-eviction the page-index still records
+//! No `StorageOnly` state: post-eviction the page-index still records
 //! the hash, the pool entry is gone, and `read_page` transparently
-//! refetches from cloud via `ChunkPool::insert_verified_bytes`.
+//! refetches from storage via `ChunkPool::insert_verified_bytes`.
 //! Tracking "currently not in pool" doesn't add safety the
 //! page-index + cache layer doesn't already provide.
 //!
@@ -47,13 +47,13 @@
 //!
 //! ```text
 //! 0x00  Uploaded     (also: unallocated, legacy default)
-//! 0x01  LocalOnly    (pool has it, cloud upload pending)
+//! 0x01  LocalOnly    (pool has it, storage upload pending)
 //! ```
 //!
 //! Sparse — unallocated page ids consume no disk. Missing / corrupt
 //! header ⇒ rebuilt empty (safe: every chunk reads as Uploaded, the
 //! eviction filter behaves the same as today's pre-async invariant).
-//! The sidecar is local-only — never uploaded to cloud, never
+//! The sidecar is local-only — never uploaded to storage, never
 //! registered with the manifest-backup path.
 
 use std::fs::{File, OpenOptions};
@@ -86,11 +86,11 @@ pub const FILENAME: &str = "upload.idx";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum UploadState {
-    /// Pool chunk (if present) is also in cloud. Safe to evict.
+    /// Pool chunk (if present) is also in storage. Safe to evict.
     /// Also the legacy default for volumes created before async
     /// upload landed.
     Uploaded = 0x00,
-    /// Pool has the chunk, cloud upload still pending. Eviction
+    /// Pool has the chunk, storage upload still pending. Eviction
     /// must skip; SYNCHRONIZE CACHE awaits.
     LocalOnly = 0x01,
 }
@@ -121,7 +121,7 @@ pub enum UploadIndexError {
 /// per `page_id`, positional. Sparse — unallocated page ids consume
 /// no disk on ext4/btrfs/xfs/zfs.
 ///
-/// Local-only — never uploaded to cloud, never on the
+/// Local-only — never uploaded to storage, never on the
 /// manifest-backup path. Losing the file recovers gracefully (every
 /// slot reads as `Uploaded`, which is the safe default).
 #[derive(Debug)]
@@ -235,7 +235,7 @@ impl UploadIndexFile {
     /// Truncate back to a bare header so every page reads `Uploaded`
     /// again — the sidecar half of an in-place snapshot restore (issue
     /// #85). The frozen index a restore installs references only
-    /// cloud-durable chunks (the snapshot-create contract), so there is
+    /// storage-durable chunks (the snapshot-create contract), so there is
     /// nothing `LocalOnly` to track; clearing the sidecar is honest and
     /// keeps the boot-recovery scan from re-enqueuing stale pages. Same
     /// inode/fd, so a live writer keeps using the handle. `fdatasync`

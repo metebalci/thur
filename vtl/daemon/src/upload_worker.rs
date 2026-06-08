@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Event-driven cloud upload worker (Phase 4: Event-Driven Uploads).
+//! Event-driven storage upload worker (Phase 4: Event-Driven Uploads).
 //!
 //! Listens for upload requests from MemoryBufferManager and uploads
-//! chunks to the per-cartridge sticky cloud backend. Triggered by
+//! chunks to the per-cartridge sticky storage backend. Triggered by
 //! buffer fullness or cartridge unload events.
 //!
 //! Bounded-concurrency PUT pipeline + per-completion retry-classified
@@ -39,7 +39,7 @@ pub(crate) async fn run_event_driven_upload_worker(
     mut upload_rx: mpsc::Receiver<memory_buffer_manager::UploadRequest>,
     disk_cache_evict_notify: Arc<Notify>,
 ) -> Result<()> {
-    // Per-backend cloud registry. Built lazily as we see the first
+    // Per-backend storage registry. Built lazily as we see the first
     // upload request for each backend; legacy single-backend deploys
     // populate just one entry. Initialization is a real network/auth
     // round-trip for S3/GCS/Azure, so doing it lazily keeps a quiet
@@ -78,14 +78,14 @@ pub(crate) async fn run_event_driven_upload_worker(
             request.chunk_ids.len()
         );
 
-        let Some(cloud_backend) =
+        let Some(storage_backend) =
             resolve_backend(cfg, &request, &cfg.storage, &mut registry, &tapes_root).await
         else {
             continue;
         };
 
         let Some((mut cart, auto_hold)) =
-            open_cart_and_hold_flag(&tapes_root, &request.tape_id, cloud_backend).await
+            open_cart_and_hold_flag(&tapes_root, &request.tape_id, storage_backend).await
         else {
             continue;
         };
@@ -93,7 +93,7 @@ pub(crate) async fn run_event_driven_upload_worker(
         // Snapshot per-chunk upload payloads from the (mutably) owned
         // cartridge once. Skips ids that are already uploaded, unsealed,
         // or missing from the manifest — same effective filtering
-        // `upload_chunk_to_cloud` would have done internally.
+        // `upload_chunk_to_storage` would have done internally.
         let pending_payloads: Vec<PendingUploadPayload> = request
             .chunk_ids
             .iter()
@@ -108,13 +108,13 @@ pub(crate) async fn run_event_driven_upload_worker(
         }
 
         let outcomes = run_upload_pipeline(
-            cloud_backend,
+            storage_backend,
             &request.tape_id,
             pending_payloads,
             max_concurrent,
             |outcome| {
                 vtl_post_upload_hook(
-                    cloud_backend,
+                    storage_backend,
                     &request.tape_id,
                     auto_hold,
                     &disk_cache_evict_notify,
@@ -127,7 +127,7 @@ pub(crate) async fn run_event_driven_upload_worker(
         apply_outcomes_and_backup_manifest(
             &mut cart,
             &outcomes,
-            cloud_backend,
+            storage_backend,
             &request.tape_id,
             auto_hold,
         )
@@ -181,12 +181,12 @@ async fn resolve_backend<'a>(
                 let handle = tokio::spawn(async move {
                     match warmup.warmup_prefix("chunks/").await {
                         Ok(n) => tracing::info!(
-                            "cloud cache warmup: seeded {} chunks/ keys for backend '{}'",
+                            "storage cache warmup: seeded {} chunks/ keys for backend '{}'",
                             n,
                             warmup_name
                         ),
                         Err(e) => warn!(
-                            "cloud cache warmup failed for backend '{}': {} (continuing with cold cache)",
+                            "storage cache warmup failed for backend '{}': {} (continuing with cold cache)",
                             warmup_name, e
                         ),
                     }
@@ -197,7 +197,7 @@ async fn resolve_backend<'a>(
                         && e.is_panic()
                     {
                         warn!(
-                            "cloud cache warmup task for backend '{}' panicked: {} (continuing with cold cache)",
+                            "storage cache warmup task for backend '{}' panicked: {} (continuing with cold cache)",
                             observe_name, e
                         );
                     }
@@ -222,7 +222,7 @@ async fn resolve_backend<'a>(
     )
 }
 
-/// Open the cartridge against `cloud_backend` and read its legal-hold
+/// Open the cartridge against `storage_backend` and read its legal-hold
 /// sentinel. Returns `None` on cart-open failure (logged warn); a hold-read
 /// failure is logged at debug and treated as "not held".
 ///
@@ -242,14 +242,14 @@ async fn resolve_backend<'a>(
 async fn open_cart_and_hold_flag(
     tapes_root: &Path,
     tape_id: &str,
-    cloud_backend: &dyn ObjectStoreBackend,
+    storage_backend: &dyn ObjectStoreBackend,
 ) -> Option<(Cartridge, bool)> {
     let cart = match Cartridge::open_with(
         tapes_root,
         tape_id,
         CartridgeOpenMode::Open,
         CartridgeOpenOptions::new()
-            .with_cloud(Some(cloud_backend.clone_box()))
+            .with_storage(Some(storage_backend.clone_box()))
             .with_view_only(),
     ) {
         Ok(c) => c,
@@ -267,7 +267,7 @@ async fn open_cart_and_hold_flag(
     // yet because nothing has ever been uploaded for this cartridge,
     // or the backend does not support hold — local) is treated as
     // "not held" and logged at debug.
-    let backend_arc: Arc<dyn ObjectStoreBackend> = Arc::from(cloud_backend.clone_box());
+    let backend_arc: Arc<dyn ObjectStoreBackend> = Arc::from(storage_backend.clone_box());
     let auto_hold = match core_mediachanger::read_cartridge_held(backend_arc, tape_id.to_string())
         .await
     {
@@ -298,14 +298,14 @@ async fn open_cart_and_hold_flag(
 /// signal behind its batchmates — the hook fires per-task before
 /// the outcome is yielded into the result vector.
 async fn vtl_post_upload_hook(
-    cloud_backend: &dyn ObjectStoreBackend,
+    storage_backend: &dyn ObjectStoreBackend,
     tape_id: &str,
     auto_hold: bool,
     disk_cache_evict_notify: &Arc<Notify>,
     outcome: ChunkUploadOutcome,
 ) {
     if auto_hold
-        && let Err(e) = cloud_backend
+        && let Err(e) = storage_backend
             .set_object_legal_hold(&outcome.object_key, true)
             .await
     {
@@ -319,7 +319,7 @@ async fn vtl_post_upload_hook(
 
 /// Apply successful chunk-upload outcomes to the cartridge's chunk index
 /// (O(1) pwrite per outcome via `apply_chunk_upload_outcome`) and back up
-/// the manifest to cloud. If the cartridge is held, re-apply per-object
+/// the manifest to storage. If the cartridge is held, re-apply per-object
 /// holds to the new index pages, the versioned backup, and the
 /// `manifest-latest` sentinel — body→sentinel ordering matches the
 /// explicit `legal-hold set` path.
@@ -330,7 +330,7 @@ async fn vtl_post_upload_hook(
 async fn apply_outcomes_and_backup_manifest(
     cart: &mut Cartridge,
     outcomes: &[ChunkUploadOutcome],
-    cloud_backend: &dyn ObjectStoreBackend,
+    storage_backend: &dyn ObjectStoreBackend,
     tape_id: &str,
     auto_hold: bool,
 ) {
@@ -340,21 +340,21 @@ async fn apply_outcomes_and_backup_manifest(
         }
     }
 
-    match cart.backup_manifest_to_cloud().await {
+    match cart.backup_manifest_to_storage().await {
         Ok(outcome) => {
             if auto_hold {
                 // Body first (index pages + versioned backup), sentinel
                 // last. Best-effort per key: a failure logs but does not
                 // tear down the upload (data is already durable).
                 for page_key in &outcome.index_page_keys {
-                    if let Err(e) = cloud_backend.set_object_legal_hold(page_key, true).await {
+                    if let Err(e) = storage_backend.set_object_legal_hold(page_key, true).await {
                         warn!(
                             "Auto-hold: failed to apply legal hold to index page {} for {}: {}",
                             page_key, tape_id, e
                         );
                     }
                 }
-                if let Err(e) = cloud_backend
+                if let Err(e) = storage_backend
                     .set_object_legal_hold(&outcome.versioned_key, true)
                     .await
                 {
@@ -363,7 +363,7 @@ async fn apply_outcomes_and_backup_manifest(
                         outcome.versioned_key, tape_id, e
                     );
                 }
-                if let Err(e) = cloud_backend
+                if let Err(e) = storage_backend
                     .set_object_legal_hold(&outcome.latest_key, true)
                     .await
                 {

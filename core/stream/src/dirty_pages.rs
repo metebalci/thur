@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-file dirty-page tracker for delta cloud backup.
+//! Per-file dirty-page tracker for delta storage backup.
 //!
 //! Used by `BlockIndexFile` and `ChunkIndexFile` to track which 1 MiB
-//! pages of the index have changed since the last cloud upload, so the
+//! pages of the index have changed since the last storage upload, so the
 //! manifest-backup path can PUT only the dirty pages instead of the
 //! whole file. Both index files are flat fixed-record arrays at known
 //! offsets, so a coarse page-level dirty bitmap captures all the

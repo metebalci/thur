@@ -4,14 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL Legal Hold Lifecycle (cloud-native)
+# Thur VTL Legal Hold Lifecycle (storage-native)
 #
 # End-to-end CLI coverage of `thurvtl cartridge legal-hold
 # {set,clear,status}` and the migrate gate that refuses a held
-# cartridge. Legal hold is cloud-native — the provider's per-object
+# cartridge. Legal hold is storage-native — the provider's per-object
 # hold primitive (S3 PutObjectLegalHold / GCS eventBasedHold / Azure
 # legal hold) is the only source of truth, so this test REQUIRES a
-# cloud backend whose bucket/container has Object Lock (S3) or the
+# storage backend whose bucket/container has Object Lock (S3) or the
 # equivalent legal-hold capability enabled. It cannot run against a
 # `local` backend and skips cleanly when one is selected.
 #
@@ -28,7 +28,7 @@
 # Selection: set THURVTL_TEST_BACKEND to the name of an entry under
 # `storage.backends:` in $THURVTL_SOURCE_BACKENDS (default
 # private/storage-backends.yaml). That entry MUST:
-#   - not be `type: local`            (legal hold is cloud-only)
+#   - not be `type: local`            (legal hold is storage-only)
 #   - have `retention_mode: none`     (so the daemon starts and the
 #                                       test can clear its own holds)
 #   - point at a bucket with Object Lock ENABLED (PutObjectLegalHold
@@ -164,7 +164,7 @@ trap cleanup EXIT INT TERM
 resolve_backend() {
     if [[ -z "${THURVTL_TEST_BACKEND:-}" ]]; then
         log_error "THURVTL_TEST_BACKEND is not set."
-        echo "Legal hold is cloud-native; set it to a non-local, Object-Lock-enabled backend"
+        echo "Legal hold is storage-native; set it to a non-local, Object-Lock-enabled backend"
         echo "defined in $SOURCE_BACKENDS. Example:"
         echo "  THURVTL_TEST_BACKEND=governance $0"
         exit 1
@@ -199,8 +199,8 @@ resolve_backend() {
     retention=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
 
     if [[ "$BACKEND_TYPE" == "local" ]]; then
-        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is cloud-native and cannot be tested locally."
-        echo "Select a cloud backend whose bucket has Object Lock / legal-hold enabled."
+        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is storage-native and cannot be tested locally."
+        echo "Select a storage backend whose bucket has Object Lock / legal-hold enabled."
         exit 1
     fi
     # We declare retention_mode: none in the test config regardless (the
@@ -255,12 +255,12 @@ check_prerequisites() {
     log_info "All prerequisites met (daemon=$DAEMON_PATH, cli=$CLI_PATH)"
 }
 
-# Test config: the chosen cloud backend cloned in as `testbackend`
+# Test config: the chosen storage backend cloned in as `testbackend`
 # (retention_mode forced to none, prefix scoped to the test run), plus
 # a throwaway local `migsink` used only as the migrate --dry-run target
 # (the gate reads the SOURCE sentinel, so no real movement happens).
 create_test_config() {
-    log_info "Creating test configuration (cloud backend cloned from $SOURCE_BACKENDS)..."
+    log_info "Creating test configuration (storage backend cloned from $SOURCE_BACKENDS)..."
     mkdir -p "$TEST_DIR/data" "$TEST_DIR/migsink"
     if [[ -n "${SUDO_USER:-}" ]]; then
         chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$TEST_DIR"
@@ -330,7 +330,7 @@ run_test() {
     echo ""
 }
 
-# Write a data-bearing cartridge and wait for the cloud sentinel
+# Write a data-bearing cartridge and wait for the storage sentinel
 # (manifests/<bc>/manifest-latest.json) — legal hold has nothing to act
 # on until objects exist on the backend.
 test_write_and_seal() {
@@ -340,7 +340,7 @@ test_write_and_seal() {
     tar -C "$TEST_DIR/fixture" -cf "$NOREWIND_DEVICE" . || return 1
     mt -f "$NOREWIND_DEVICE" rewind || return 1
     mtx -f "$CHANGER_DEVICE" unload 1 0 >/dev/null 2>&1 || return 1
-    log_info "Waiting for cloud sentinel (up to ${MANIFEST_WAIT_SECS}s)..."
+    log_info "Waiting for storage sentinel (up to ${MANIFEST_WAIT_SECS}s)..."
     storage_wait_for_key "manifests/${BARCODE}/manifest-latest.json" "$MANIFEST_WAIT_SECS"
 }
 
@@ -399,7 +399,7 @@ test_status_not_held_after_clear() {
 
 # With the hold cleared, the gate no longer blocks. We assert the
 # refusal is gone (output no longer cites legal hold) rather than a
-# clean exit 0 — a cloud->local dry-run may still decline for unrelated
+# clean exit 0 — a storage->local dry-run may still decline for unrelated
 # reasons, but it must not be a legal-hold refusal. Cross-backend move
 # mechanics are covered by test-lifecycle-cartridge-migrate.sh.
 test_migrate_permitted_after_clear() {
@@ -414,7 +414,7 @@ test_migrate_permitted_after_clear() {
 
 main() {
     echo "================================================"
-    echo "Thur VTL Legal Hold Lifecycle (cloud-native)"
+    echo "Thur VTL Legal Hold Lifecycle (storage-native)"
     echo "================================================"
     echo ""
 
@@ -438,7 +438,7 @@ main() {
     echo "-------------------------------------"
     echo ""
 
-    run_test "write data + seal cloud sentinel"          test_write_and_seal
+    run_test "write data + seal storage sentinel"          test_write_and_seal
     run_test "status: not held initially"                test_status_not_held_initially
     run_test "set legal hold"                            test_set_hold
     run_test "status: HELD"                              test_status_held

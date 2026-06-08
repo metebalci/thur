@@ -26,10 +26,10 @@ getrandom = "0.3"
 # fine, the surface is already extracted and stable.
 shared-object-store = { path = "../../shared/object-store" }
 shared-pool = { path = "../../shared/pool" }
-# Local pool + cloud HEAD verification sweeps, shared with the tape
+# Local pool + storage HEAD verification sweeps, shared with the tape
 # product; `verify.rs` adds the block page-table integrity check.
 shared-verify-core = { path = "../../shared/verify-core" }
-# Cloud-upload pipeline scaffold (PendingUpload / UploadOutcome,
+# Storage-upload pipeline scaffold (PendingUpload / UploadOutcome,
 # upload_chunk_inert, run_upload_pipeline). VolumeWriter constructs
 # PendingUpload at the hand-off boundary; an in-process
 # upload_chunk_inert is the fallback when no async dispatcher is
@@ -69,7 +69,7 @@ tempfile = "3"
 # itself is runtime-agnostic — only tests need a runtime.
 tokio = { version = "1", features = ["macros", "rt"] }
 # Cache parallel-flush tests build a delaying decorator around
-# `CloudBackend`; the trait uses #[async_trait] so the impl must too.
+# `StorageBackend`; the trait uses #[async_trait] so the impl must too.
 async-trait = "0.1"
-# perf_volume_cloud example parses the daemon YAML conffile.
+# perf_volume_storage example parses the daemon YAML conffile.
 serde_yaml = "0.9"

@@ -129,9 +129,9 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `PathBuf` (no trait — the handlers need nothing else). Deliberately
   kept out of `shared-audit` so that lower-level crate stays free of
   the `JobEmitter` / job-protocol deps.
-- **shared-admin-cloud-check** — cross-product cloud-backend
-  reachability. `run_cloud_check(JobEmitter, Arc<ObjectStoreConfig>)`
-  is the `system.cloud_check` job handler both daemons mount (CLI verb
+- **shared-admin-storage-check** — cross-product storage-backend
+  reachability. `run_storage_check(JobEmitter, Arc<ObjectStoreConfig>)`
+  is the `system.storage_check` job handler both daemons mount (CLI verb
   `system storage check`); `run_reachability_ticker(Arc<ObjectStoreConfig>, u64)`
   is the opt-in periodic ticker each daemon spawns when
   `storage.check_interval_seconds` is non-zero, and `probe_backends_once`
@@ -221,7 +221,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   within-budget utilization line, fires the soft-watermark alert, and
   returns whether eviction is needed. The wakeup source (VTL:
   upload-completion `Notify` + 5-min backstop; VSA: interval tick) and
-  the evict call itself (VTL's async cloud-backup evict vs VSA's sync
+  the evict call itself (VTL's async storage-backup evict vs VSA's sync
   fs-only trim) genuinely differ and stay per-daemon; both now offload
   the blocking usage walk + eviction to `spawn_blocking`.
 - **shared-object-store** — storage-backend abstraction. `object_store_backend.rs` (the
@@ -326,7 +326,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-verify-core** — cross-product chunk-pool + storage
   verification sweeps for `system verify`. A product implements the
   `VerifyTarget` trait — `live_chunks()` (the `(backend, namespace) ->
-  {hash}` map) and `cloud_entities()` (per-entity storage expectations).
+  {hash}` map) and `storage_entities()` (per-entity storage expectations).
   `sweep_local_pool(data_dir, target)` returns one `PoolSweep` per
   backend (the local orphan scan over every `(backend, namespace)`
   pool); `sweep_storage(target, backend_name, backend)` runs the bounded
@@ -490,7 +490,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   in-process smoke tests and exits. Admin socket at
   `/run/thurvtl/admin.sock` — `admin/mod.rs` builds the product router,
   merges `jobs_router` (dispatch in `admin/job_dispatch/*.rs`: gc /
-  verify / stats / cloud_check (routed to `shared-admin-cloud-check`; CLI verb `system storage check`) / self_test / audit / archive /
+  verify / stats / storage_check (routed to `shared-admin-storage-check`; CLI verb `system storage check`) / self_test / audit / archive /
   restore_archive / migrate / alerting) and the alerting route, and
   hands off to `run_admin_server`.
 - **vtl-cli** (binary `thurvtl`) — top-level subcommands `library`,

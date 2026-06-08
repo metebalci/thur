@@ -56,7 +56,7 @@ pub trait MonitorState: Clone + Send + Sync + 'static {
     /// In-process counter sidecar from `shared-telemetry`. Cloned per
     /// tick; the underlying counters are shared.
     fn live_stats(&self) -> Arc<LiveStats>;
-    /// All cloud-backend pool budgets, keyed by backend name. The
+    /// All storage-backend pool budgets, keyed by backend name. The
     /// monitor renderer flattens each budget's per-namespace
     /// breakdown into one [`PoolEntry`] per (backend, namespace).
     fn pool_budgets(&self) -> HashMap<String, Arc<PoolBudget>>;

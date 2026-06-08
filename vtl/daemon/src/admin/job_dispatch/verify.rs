@@ -5,7 +5,7 @@
 //!
 //! Walks library/inventory, every cartridge's manifest /
 //! `chunks.idx` / `blocks-p<N>.idx`, then sweeps each per-backend
-//! pool. Optional cloud HEAD pass (default on; `skip_cloud=true`
+//! pool. Optional storage HEAD pass (default on; `skip_storage=true`
 //! skips it). Emits the full structured `VerifyReport` as a Result
 //! event so the CLI can render verbose / json variants without re-
 //! contacting the daemon.
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crate::state::DaemonState;
-use core_mediachanger::verify::{VerifyScope, verify_local, verify_with_cloud};
+use core_mediachanger::verify::{VerifyScope, verify_local, verify_with_storage};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 
@@ -48,7 +48,7 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     if params.skip_storage {
         emitter
             .info(format!(
-                "Verifying library at {} (cloud sweep skipped)",
+                "Verifying library at {} (storage sweep skipped)",
                 data_dir.display()
             ))
             .await;
@@ -76,14 +76,14 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
             };
         finish(&emitter, report).await;
     } else {
-        let cloud_cfg = state.storage_config.as_ref().clone();
+        let storage_cfg = state.storage_config.as_ref().clone();
         emitter
             .info(format!(
-                "Verifying library at {} (cloud HEAD sweep enabled)",
+                "Verifying library at {} (storage HEAD sweep enabled)",
                 data_dir.display()
             ))
             .await;
-        let report = match verify_with_cloud(&data_dir, &scope, &cloud_cfg).await {
+        let report = match verify_with_storage(&data_dir, &scope, &storage_cfg).await {
             Ok(r) => r,
             Err(e) => {
                 emitter
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_params_parses_skip_cloud_and_barcodes() {
+    fn verify_params_parses_skip_storage_and_barcodes() {
         let p: VerifyParams = serde_json::from_value(
             serde_json::json!({"skip_storage": true, "barcodes": ["A", "B"]}),
         )

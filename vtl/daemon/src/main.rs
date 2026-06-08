@@ -403,7 +403,7 @@ impl Default for MemoryBuffersConfig {
     }
 }
 
-/// Content-addressed chunk pool budget, applied **per cloud backend**.
+/// Content-addressed chunk pool budget, applied **per storage backend**.
 /// Each backend gets its own slice at `<data_dir>/chunks/<backend>/...`
 /// independent of per-tape `memory_buffers` (those are RAM staging).
 /// `size_gb` is a **hard cap**: chunk-seal applies upload backpressure
@@ -419,7 +419,7 @@ struct DiskCacheConfig {
     /// floored at `min_size_gb`. Multi-backend installs with several
     /// `auto` entries split the 50%-of-free share evenly so two
     /// `auto` backends can't combined commit 100% of free space.
-    /// Individual `cloud-backends.json` entries may override per-
+    /// Individual `storage-backends.json` entries may override per-
     /// entry via their own `disk_cache_size_gb` field — same shape
     /// (`auto | <gb>`) so explicit and auto entries can coexist on
     /// one daemon.
@@ -518,7 +518,7 @@ impl Default for DiskCacheConfig {
     }
 }
 
-// Cloud backend configuration is shared with the CLI in core-mediachanger.
+// Storage backend configuration is shared with the CLI in core-mediachanger.
 // Re-exported via aliases here so existing field/var names keep working.
 use core_mediachanger::{ObjectStoreConfig, TieringConfig};
 
@@ -808,11 +808,11 @@ fn default_chap_algorithms() -> Vec<String> {
     ]
 }
 
-/// Peek a cartridge's `manifest.json` and return its sticky cloud
+/// Peek a cartridge's `manifest.json` and return its sticky storage
 /// backend name. Returns None if the manifest is missing, unreadable,
 /// malformed, or has no `backend` field — the caller should treat
 /// that as "skip this cartridge for now," because the manifest can be
-/// lazily restored from cloud at load time.
+/// lazily restored from storage at load time.
 fn read_cartridge_backend(tapes_root: &std::path::Path, tape_id: &str) -> Option<String> {
     let manifest_path = tapes_root.join(tape_id).join("manifest.json");
     let json = std::fs::read_to_string(&manifest_path).ok()?;
@@ -883,21 +883,17 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to acquire daemon lock: {}", e))?;
     info!("Daemon lock acquired");
 
-    // Refuse to start if a legacy `<data_dir>/cloud-backends.json` is
-    // still around — pre-alpha.2 kept backend definitions there; they
-    // now live in the YAML conffile under `cloud.backends:`. Force the
-    // operator to migrate the entries rather than silently ignore them.
+    // Refuse to start if a legacy keystore-backends.json sidecar is still
+    // around — definitions now live in the YAML under `keystore.backends:`.
     let data_dir_path = std::path::PathBuf::from(&cfg.data_dir);
     let config_path_buf = std::path::PathBuf::from(&config_path);
-    shared_object_store::reject_legacy_cloud_backends_json(&data_dir_path, &config_path_buf)
-        .map_err(anyhow::Error::msg)?;
     shared_keystore::reject_legacy_keystore_backends_json(&data_dir_path, &config_path_buf)
         .map_err(anyhow::Error::msg)?;
     cfg.storage
         .validate_backends()
-        .map_err(|e| anyhow::anyhow!("validate cloud.backends in {}: {}", config_path, e))?;
+        .map_err(|e| anyhow::anyhow!("validate storage.backends in {}: {}", config_path, e))?;
     info!(
-        "cloud: {} backend(s) configured",
+        "storage: {} backend(s) configured",
         cfg.storage.backends.len()
     );
 
@@ -934,7 +930,7 @@ async fn main() -> Result<()> {
 
     // Bring up the library: materialize from the YAML `library:`
     // block on first start, diff-and-reconcile on every subsequent
-    // start. Done before cloud validation so the cartridge ↔ backend
+    // start. Done before storage validation so the cartridge ↔ backend
     // referential check below has the manifest list available.
     info!("Bringing up library from YAML library: block...");
     let lib_root = std::path::PathBuf::from(&cfg.data_dir).join("library");
@@ -967,7 +963,7 @@ async fn main() -> Result<()> {
     // 🔸 Validate every named backend up front. Sequential, bails on
     // first failure so the operator gets a focused error instead of a
     // wall of partial results.
-    info!("Validating cloud backend configuration...");
+    info!("Validating storage backend configuration...");
     for name in cfg.storage.backend_names() {
         info!("  -> validating backend '{}'", name);
         core_mediachanger::validate_object_store_backend(&cfg.storage, &name, |step| {
@@ -976,11 +972,11 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("backend '{}': {}", name, e))?;
     }
-    info!("Cloud backend validation complete");
+    info!("Storage backend validation complete");
 
     // 🔸 Cartridge ↔ backend referential integrity. Every cartridge
     // manifest carries a sticky `backend` field; refuse to start if
-    // any cartridge references a name not in `cloud.backends`. The
+    // any cartridge references a name not in `storage.backends`. The
     // operator must either re-add the missing backend or
     // export-and-delete the orphaned cartridge.
     {
@@ -997,7 +993,7 @@ async fn main() -> Result<()> {
                 let json = std::fs::read_to_string(&manifest_path)?;
                 let v: serde_json::Value = match serde_json::from_str(&json) {
                     Ok(v) => v,
-                    // Corrupt manifests are recoverable from cloud at
+                    // Corrupt manifests are recoverable from storage at
                     // load time; skip rather than block startup.
                     Err(_) => continue,
                 };
@@ -1014,7 +1010,7 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|| "<unknown>".to_string());
                     return Err(anyhow::anyhow!(
                         "cartridge '{}' references storage backend '{}' which is not configured \
-                         in cloud.backends ({}). Either add the backend to thurvtl.yaml or \
+                         in storage.backends ({}). Either add the backend to thurvtl.yaml or \
                          export and delete the cartridge.",
                         label,
                         cartridge_backend,
@@ -1106,7 +1102,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Log cloud backend configuration. One line per named entry.
+    // Log storage backend configuration. One line per named entry.
     for name in cfg.storage.backend_names() {
         match cfg.storage.backend_entry(&name) {
             Ok(core_mediachanger::BackendEntry::S3(s3)) => info!(
@@ -1181,7 +1177,7 @@ async fn main() -> Result<()> {
             .unwrap_or(0),
     );
     // Install the process-global handle so core call sites
-    // (cartridge / cloud / audit / iscsi) can record without taking a
+    // (cartridge / storage / audit / iscsi) can record without taking a
     // Telemetry argument. set_global is idempotent — a second `--test`
     // pass is a no-op rather than a panic.
     let _ = core_mediachanger::metrics::set_global(metrics.clone());
@@ -1264,7 +1260,7 @@ async fn main() -> Result<()> {
             info!("Library smoke test passed");
         }
 
-        // Run cloud backend smoke tests (cloud backend is always configured now)
+        // Run storage backend smoke tests (storage backend is always configured now)
         info!(">>> Running S3 smoke test...");
         if let Err(e) = smoke::run_s3_smoke_test(&cfg).await {
             warn!("S3 smoke test failed: {e:?}");
@@ -1363,7 +1359,7 @@ async fn main() -> Result<()> {
     let disk_cache_evict_notify = Arc::new(tokio::sync::Notify::new());
 
     // 🔸 Per-backend pool budgets. Each backend gets its own cap: either
-    // the per-entry `disk_cache_size_gb` override from cloud-backends.json,
+    // the per-entry `disk_cache_size_gb` override from storage-backends.json,
     // or the YAML `disk_cache.size_gb` default. Both share the
     // `DiskCacheSize` shape (`auto` | <gb>); `auto` entries split the
     // 50%-of-free share evenly so two `auto` backends can't combined
@@ -1466,7 +1462,7 @@ async fn main() -> Result<()> {
     };
 
     // 🔸 Start event-driven upload worker (Phase 4: Event-Driven Uploads)
-    info!("Starting event-driven cloud upload worker");
+    info!("Starting event-driven storage upload worker");
     let cfg_clone = cfg.clone();
     let disk_cache_evict_notify_upload = Arc::clone(&disk_cache_evict_notify);
     let upload_worker_handle = tokio::spawn(async move {
@@ -1479,7 +1475,7 @@ async fn main() -> Result<()> {
     });
 
     // 🔸 Start event-driven prefetch worker (Phase 5: Event-Driven Prefetch)
-    info!("Starting event-driven cloud prefetch worker");
+    info!("Starting event-driven storage prefetch worker");
     let cfg_clone = cfg.clone();
     let prefetch_worker_handle = tokio::spawn(async move {
         if let Err(e) = run_event_driven_prefetch_worker(&cfg_clone, prefetch_rx).await {
@@ -1689,12 +1685,12 @@ async fn main() -> Result<()> {
     );
 
     // The audit log is shared so SCSI/CHAP entries land in the same
-    // chain as daemon.start / library / cartridge mutations. Cloud
+    // chain as daemon.start / library / cartridge mutations. Storage
     // backend registry is shared with upload / cache workers so we
     // don't pay the auth round-trip more than once per backend; the
     // SCSI READ prefetch hook resolves cartridges' sticky
     // `manifest.backend` through it on cache miss.
-    let cloud_backends_registry: iscsi::server::ObjectStoreRegistry =
+    let storage_backends_registry: iscsi::server::ObjectStoreRegistry =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let storage_config_arc = std::sync::Arc::new(cfg.storage.clone());
     let keystore_config_arc = std::sync::Arc::new(cfg.keystore.clone());
@@ -1731,7 +1727,7 @@ async fn main() -> Result<()> {
         audit_log: audit_log.clone(),
         audit_dir: audit_log_dir.clone(),
         audit_ratelimiter: std::sync::Arc::clone(&audit_ratelimiter),
-        cloud_backends: std::sync::Arc::clone(&cloud_backends_registry),
+        storage_backends: std::sync::Arc::clone(&storage_backends_registry),
         storage_config: std::sync::Arc::clone(&storage_config_arc),
         tiering: std::sync::Arc::new(cfg.tiering.clone()),
         keystore_config: std::sync::Arc::clone(&keystore_config_arc),
@@ -1756,7 +1752,7 @@ async fn main() -> Result<()> {
         if interval > 0 {
             let storage_config = std::sync::Arc::clone(&storage_config_arc);
             Some(tokio::spawn(async move {
-                shared_admin_cloud_check::run_reachability_ticker(storage_config, interval).await;
+                shared_admin_storage_check::run_reachability_ticker(storage_config, interval).await;
             }))
         } else {
             None
@@ -2243,21 +2239,21 @@ async fn run_disk_cache_eviction_worker(
                 continue;
             }
 
-            // Build a fresh cloud backend for the eviction pass.
+            // Build a fresh storage backend for the eviction pass.
             // Eviction is rare; the construction cost is negligible.
-            let cloud_backend = match cfg.storage.create_backend_named(&backend).await {
+            let storage_backend = match cfg.storage.create_backend_named(&backend).await {
                 Ok(b) => Some(b),
                 Err(e) => {
                     warn!(
                         "Cache eviction: backend '{}' init failed ({e}); \
-                         evicting without cloud backup",
+                         evicting without storage backup",
                         backend
                     );
                     None
                 }
             };
 
-            match cm.evict_lru_chunks(cloud_backend.as_deref()).await {
+            match cm.evict_lru_chunks(storage_backend.as_deref()).await {
                 Ok(freed) if freed > 0 => {
                     info!(
                         "Cache eviction freed {} bytes from backend '{}'",
@@ -2351,7 +2347,7 @@ mod config_parse_tests {
     }
 
     /// `thurvtl.defaults.yaml` leaves `data_dir` and the contents of
-    /// `cloud.backends:` commented out (operator-set). Inject the
+    /// `storage.backends:` commented out (operator-set). Inject the
     /// minimum required values and parse — proves the daemon accepts
     /// every default key.
     #[test]

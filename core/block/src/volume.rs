@@ -72,13 +72,13 @@ pub const UNASSIGNED_LUN: u64 = u64::MAX;
 pub const DEFAULT_SECTOR_BYTES: u32 = 4096;
 
 /// Default page size — the unit at which the volume is chunked,
-/// uploaded to cloud, and cached locally. 64 KiB keeps random
-/// 4 KiB writes at 16× amplification while keeping the cloud
+/// uploaded to storage, and cached locally. 64 KiB keeps random
+/// 4 KiB writes at 16× amplification while keeping the storage
 /// object count manageable on a multi-TB volume.
 pub const DEFAULT_PAGE_SIZE_BYTES: u32 = 64 * 1024;
 
 /// Upper bound on operator-supplied volume names. Filesystem-safe
-/// and short enough for inclusion in cloud object keys.
+/// and short enough for inclusion in storage object keys.
 pub const MAX_VOLUME_NAME_LEN: usize = 64;
 
 /// Dedup scope for the chunk pool. Mirrors thurvtl's notion: `Local`
@@ -109,15 +109,15 @@ pub fn parse_dedup_scope(s: &str) -> Result<DedupScope, VolumeError> {
 /// Three tiers, descending durability:
 ///
 /// - [`SyncAfter::Storage`] (default) — SYNC blocks until every dirty
-///   page in the synced range is in the cloud object store. Bytes
+///   page in the synced range is in the storage object store. Bytes
 ///   survive host-disk loss, daemon-process crash, and power loss.
-///   Slowest tier; matches the operator contract that cloud-backed
+///   Slowest tier; matches the operator contract that storage-backed
 ///   storage exists to provide.
 /// - [`SyncAfter::Disk`] — SYNC blocks until every dirty page is in
 ///   the local pool file on disk. Bytes survive daemon-process
 ///   crash and power loss; **lost** if the daemon host's disk fails
 ///   before the upload worker drains. For scratch volumes or
-///   workloads that don't carry the value of the cloud-durability
+///   workloads that don't carry the value of the storage-durability
 ///   guarantee.
 /// - [`SyncAfter::Memory`] — SYNC is a no-op; bytes remain only in
 ///   the RAM `PageCache` until the periodic flush worker tick (or
@@ -372,10 +372,10 @@ pub struct VolumeManifest {
     pub size_bytes: u64,
     /// SBC-3 advertised logical-block size. 4 KiB by default.
     pub sector_bytes: u32,
-    /// Page size — unit of chunk seal / cloud upload / disk cache.
+    /// Page size — unit of chunk seal / storage upload / disk cache.
     /// Power of two, multiple of `sector_bytes`.
     pub page_size_bytes: u32,
-    /// Cloud backend name (matches a key under `cloud.backends` in
+    /// Storage backend name (matches a key under `storage.backends` in
     /// `thurvsa.yaml`). Sticky for the volume's lifetime.
     pub backend: String,
     /// Stable host-visible LUN. Pinned at create time and persisted
@@ -401,7 +401,7 @@ pub struct VolumeManifest {
     /// At-rest encryption settings. `None` is the default for both
     /// schema v1 (which had no field) and operator-created v2 volumes
     /// that didn't pass `--encrypt`. `Some(...)` flips the encrypt-
-    /// before-pool-insert / decrypt-after-cloud-fetch path in
+    /// before-pool-insert / decrypt-after-storage-fetch path in
     /// [`crate::uploader::VolumeWriter`] on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<VolumeEncryptionMeta>,
@@ -860,10 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_after_default_is_cloud() {
+    fn sync_after_default_is_storage() {
         // Load-bearing for the contract: every new volume + every
         // legacy runtime.json without the field comes up on
-        // cloud-durable.
+        // storage-durable.
         assert_eq!(SyncAfter::default(), SyncAfter::Storage);
     }
 
@@ -872,7 +872,7 @@ mod tests {
         for m in [SyncAfter::Storage, SyncAfter::Disk, SyncAfter::Memory] {
             assert_eq!(SyncAfter::from_u8(m.as_u8()), m);
         }
-        // Unrecognised byte → Cloud (safe default; matches the
+        // Unrecognised byte → Storage (safe default; matches the
         // doc comment on from_u8).
         assert_eq!(SyncAfter::from_u8(0xFF), SyncAfter::Storage);
     }

@@ -299,7 +299,7 @@ impl AzureKvAuth {
     }
 }
 
-/// `gcpkms` backend config. Targets one symmetric CryptoKey in Cloud
+/// `gcpkms` backend config. Targets one symmetric CryptoKey in Storage
 /// KMS. `key_name` is the full resource name
 /// (`projects/P/locations/L/keyRings/R/cryptoKeys/K`); the backend
 /// passes it verbatim to `EncryptRequest::name` /

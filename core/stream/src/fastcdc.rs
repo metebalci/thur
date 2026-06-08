@@ -73,7 +73,7 @@ pub const DEFAULT_MIN_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const DEFAULT_AVG_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Default maximum chunk size. Beyond this, a cut is forced regardless
-/// of content. Caps tail latency for cloud upload.
+/// of content. Caps tail latency for storage upload.
 pub const DEFAULT_MAX_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Build a Gear-hash cut mask with `bits` set, drawn from a fixed bit

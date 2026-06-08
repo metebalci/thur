@@ -8,7 +8,7 @@
 //! the structured Result line out of the job stream and pretty-prints
 //! it. Block-side parallel of the tape CLI's `system stats`; the
 //! report has no `location` column because `pages.idx` records no
-//! local/cloud tag.
+//! local/storage tag.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -150,7 +150,7 @@ fn print_human(r: &StatsReport) {
     print_skipped(r);
 
     println!("Note: byte figures cover chunks resident in the local pool;");
-    println!("chunks evicted to cloud-only count toward page totals but are");
+    println!("chunks evicted to storage-only count toward page totals but are");
     println!("not sized here. This walker covers seal-time pool dedup.");
 }
 

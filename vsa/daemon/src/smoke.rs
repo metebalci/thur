@@ -4,10 +4,10 @@
 //! `--test` mode in-process smoke harness for thurvsad.
 //!
 //! Mirrors `vtl-daemon`'s `--test` smoke: spins up the SBC stack
-//! against a private tempdir (own volume, own local cloud backend),
+//! against a private tempdir (own volume, own local storage backend),
 //! dispatches a fixed series of SCSI commands through the live
 //! `SbcScsiDispatcher`, and exits non-zero if anything misbehaves.
-//! Operator's `<data_dir>` and `cloud-backends.json` are not touched.
+//! Operator's `<data_dir>` and `storage-backends.json` are not touched.
 //!
 //! Coverage today:
 //! - volume bring-up + REPORT LUNS + INQUIRY identity
@@ -91,10 +91,10 @@ pub(crate) async fn run_all() -> Result<()> {
 async fn build_smoke_dispatcher() -> Result<(SbcScsiDispatcher, TempDir)> {
     let tmp = TempDir::new()?;
     let data_dir = tmp.path().to_path_buf();
-    let cloud_root = data_dir.join("cloud");
-    std::fs::create_dir_all(&cloud_root)?;
+    let storage_root = data_dir.join("storage");
+    std::fs::create_dir_all(&storage_root)?;
 
-    let backend = LocalBackend::new(&cloud_root)
+    let backend = LocalBackend::new(&storage_root)
         .await
         .map_err(|e| anyhow!("LocalBackend init failed: {e}"))?;
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);

@@ -57,7 +57,7 @@ The restore runs in four phases:
    rather than restored.
 2. **Per-cartridge restore.** Each selected barcode goes through the
    single-cartridge cold-bucket path
-   (`Cartridge::open_with_cloud_async` → the missing-locally branch of
+   (`Cartridge::open_with_storage_async` → the missing-locally branch of
    `load_manifest_async`), which fetches `manifest-latest.json`, then
    every index page enumerated in `index_epoch`, and writes both to
    `<data_dir>/tapes/<barcode>/`. A failure on one cartridge does
@@ -227,7 +227,7 @@ One entry per invocation:
 
 Both Ok and Err paths audited (failures carry `result: Error(reason)`).
 
-Migration of any kind refuses a cartridge under a cloud-native legal
+Migration of any kind refuses a cartridge under a storage-native legal
 hold (the hold has no cross-backend transfer path), so neither
 `cartridge migrate` nor `system tiering run-now` can relocate a held
 cartridge.
@@ -324,7 +324,7 @@ backend, and `archived_at`, an ISO-8601 UTC timestamp.
 
 `cartridge.archived` — `barcode`, `from_backend`, `to_backend`,
 `label`, `archived_at`, `chunks_total`, `chunks_uploaded`,
-`chunks_from_local_pool`, `chunks_from_source_cloud`,
+`chunks_from_local_pool`, `chunks_from_source_storage`,
 `bytes_uploaded`, `index_files_uploaded`, `dry_run`. Both Ok and Err
 paths.
 

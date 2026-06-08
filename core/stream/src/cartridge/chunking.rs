@@ -136,7 +136,7 @@ impl Cartridge {
         // Appliance-side at-rest encryption seam. When the cartridge
         // was opened with a DEK (manifest.encryption is Some), wrap
         // the staged chunk in an AES-256-GCM envelope before pool
-        // insertion. The pool — and the cloud objects it eventually
+        // insertion. The pool — and the storage objects it eventually
         // syncs — store ciphertext. The dedup hash is therefore over
         // ciphertext: same-content cartridges with different DEKs
         // produce different hashes (no cross-cartridge dedup with
@@ -209,7 +209,7 @@ impl Cartridge {
         // pre-dedup bytes hosts have written; `chunk_unique_bytes_total`
         // rolls up only the bytes that actually grew the pool.
         // `chunk_dedup_hits_total` covers local-pool dedup at seal time
-        // (cloud HEAD-hit dedup is recorded separately at upload time).
+        // (storage HEAD-hit dedup is recorded separately at upload time).
         // Operator-facing dedup ratio = logical / unique.
         let backend_name = &self.manifest.backend;
         let scope_str = match self.manifest.dedup {

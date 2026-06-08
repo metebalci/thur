@@ -1086,9 +1086,9 @@ mod tests {
 
     async fn fixture_dispatcher_with_worm(worm: bool) -> (TempDir, NvmeNvmDispatcher) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
 
         VolumeManifest::new(
@@ -2003,9 +2003,9 @@ mod tests {
     /// fence one out.
     async fn fixture_two_ns() -> (TempDir, NvmeNvmDispatcher) {
         let tmp = TempDir::new().unwrap();
-        let cloud_root = tmp.path().join("cloud");
-        std::fs::create_dir_all(&cloud_root).unwrap();
-        let backend = LocalBackend::new(&cloud_root).await.unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend = LocalBackend::new(&storage_root).await.unwrap();
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
         let reg = TestRegistry::default();
         for (nsid, name) in [(1u32, "ns1"), (2u32, "ns2")] {

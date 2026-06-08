@@ -1690,7 +1690,7 @@ be partitioned along with them.
 |-------|-------|-------|
 | `0..4` | `size` | u32 LE; sealed on-disk byte count. Width matches `BlockRec.offset` (u32) — a chunk can never hold more than 4 GiB |
 | `4..36` | `hash` | 32-byte raw BLAKE3 of sealed chunk bytes; valid iff `hash_present` flag is set (zeroed for unsealed staging chunks) |
-| `36` | `flags` | bit 0 = `hash_present` (sealed); bit 1 = `uploaded`; bits 2-3 = `location` (0=LocalOnly, 1=CloudOnly, 2=Both); bits 4-6 = compression algo (0=none, 1=lz4, 2=zstd, 3=sldc); bit 7 reserved |
+| `36` | `flags` | bit 0 = `hash_present` (sealed); bit 1 = `uploaded`; bits 2-3 = `location` (0=LocalOnly, 1=StorageOnly, 2=Both); bits 4-6 = compression algo (0=none, 1=lz4, 2=zstd, 3=sldc); bit 7 reserved |
 | `37..64` | reserved | 27 B, zeroed |
 
 The next id is derived the same way the block index derives its next
@@ -2263,7 +2263,7 @@ The `prefetch` and `tape` buffer instruments are VTL-only and driven by
 the SCSI read path (issue #97). On every tape READ the daemon first
 ensures the chunk the next read needs is local — `prefetch_hits_total`
 counts the reads that found it already resident, `prefetch_misses_total`
-the reads that had to wait on a cloud download — then fans the following
+the reads that had to wait on a storage download — then fans the following
 `memory_buffers.read_prefetch_chunks_ahead` chunks out to a background
 `PrefetchManager` so a sequential restore doesn't stall chunk-by-chunk.
 `prefetch_queue_depth` is the absolute count of in-flight background

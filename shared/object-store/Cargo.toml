@@ -30,7 +30,7 @@ tracing = "0.1"
 
 # Compression (chunk-level pre-upload; same primitives drive
 # tape-side compression in core-mediachanger but the bytes-in / bytes-out
-# functions live here so cloud backends can compress without a
+# functions live here so storage backends can compress without a
 # circular dep).
 zstd = "0.13"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
@@ -39,7 +39,7 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 rand = "0.9"
 
 # DiskCacheSize is reused on the per-entry `disk_cache_size_gb`
-# override under `cloud.backends:` (same shape as the YAML default —
+# override under `storage.backends:` (same shape as the YAML default —
 # the two parsers can't drift).
 shared-pool = { path = "../pool" }
 
@@ -54,7 +54,7 @@ aws-config = { version = "1", default-features = false, features = ["behavior-ve
 aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio", "behavior-version-latest"] }
 
-# Google Cloud Storage SDK. Migrated 2026-05-11 from yoshidan's
+# Google Storage Storage SDK. Migrated 2026-05-11 from yoshidan's
 # `gcloud-storage` 1.x (the community crate, formerly named
 # `google-cloud-storage` 0.x before yoshidan donated the crate name
 # to Google) to Google's official `google-cloud-storage` 1.x line

@@ -23,7 +23,7 @@ workspace = true
 # twice.
 #
 # Postinst scripts deliberately do NOT enable or start the unit. The
-# daemon needs an edited /etc/thurvsa/thurvsa.yaml (at least one cloud
+# daemon needs an edited /etc/thurvsa/thurvsa.yaml (at least one storage
 # backend uncommented) before it can usefully run; auto-enable would
 # just produce noisy failed-unit logs. Operator runs `systemctl
 # enable --now thurvsad` after configuring.

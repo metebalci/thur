@@ -101,9 +101,9 @@ on-disk paths group by purpose.
   #4's `shared_admin_auth` gate directly; per-product inventory GETs
   stay per-daemon. Mutations are out of scope (issue #91). Design in
   [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
-- `shared/admin-cloud-check` (`shared-admin-cloud-check`) —
-  cross-product cloud-backend reachability. `run_cloud_check` is the
-  `system.cloud_check` job handler both daemons mount (CLI verb
+- `shared/admin-storage-check` (`shared-admin-storage-check`) —
+  cross-product storage-backend reachability. `run_storage_check` is the
+  `system.storage_check` job handler both daemons mount (CLI verb
   `system storage check`); `run_reachability_ticker` is the opt-in
   periodic ticker each daemon spawns when
   `storage.check_interval_seconds` is non-zero. Both reuse
@@ -154,7 +154,7 @@ on-disk paths group by purpose.
   `check_usage_or_alert` (the within-budget utilization log + soft-
   watermark alert, returning whether eviction is needed). The wakeup
   source (VTL: upload-completion `Notify` + backstop; VSA: interval)
-  and the evict call (VTL's async cloud-backup evict vs VSA's sync
+  and the evict call (VTL's async storage-backup evict vs VSA's sync
   fs-only trim) genuinely differ and stay per-product; both daemons
   now offload the blocking usage walk + eviction to `spawn_blocking`.
 - `shared/iscsi` (`shared-iscsi`) — iSCSI transport, CHAP auth,

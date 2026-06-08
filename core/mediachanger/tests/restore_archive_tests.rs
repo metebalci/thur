@@ -40,7 +40,7 @@ async fn seed(
 ) -> Vec<Vec<u8>> {
     let backend: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(bucket).await.expect("be"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         tapes,
         label,
         CartridgeOpenMode::Create {
@@ -70,11 +70,13 @@ async fn seed(
         .map(|(id, _, _)| id)
         .collect();
     for id in pending {
-        cart.upload_chunk_to_cloud(id).await.expect("upload chunk");
+        cart.upload_chunk_to_storage(id)
+            .await
+            .expect("upload chunk");
     }
-    cart.backup_manifest_to_cloud()
+    cart.backup_manifest_to_storage()
         .await
-        .expect("backup_manifest_to_cloud");
+        .expect("backup_manifest_to_storage");
     drop(cart);
     written
 }
@@ -146,10 +148,14 @@ async fn archive_then_restore_round_trip() {
     // Re-open the restored cartridge and read every block.
     let read_be: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let mut cart =
-        Cartridge::open_with_cloud_async(&tapes, "TAPE_RT", CartridgeOpenMode::Open, Some(read_be))
-            .await
-            .expect("reopen");
+    let mut cart = Cartridge::open_with_storage_async(
+        &tapes,
+        "TAPE_RT",
+        CartridgeOpenMode::Open,
+        Some(read_be),
+    )
+    .await
+    .expect("reopen");
     cart.rewind();
     for (i, expected) in written.iter().enumerate() {
         let block = cart.read_block_async(i as u64).await.expect("read");
@@ -226,7 +232,7 @@ async fn restore_archive_rename_via_as_barcode() {
     // Read every block from the restored cartridge.
     let read_be: Box<dyn ObjectStoreBackend> =
         Box::new(LocalBackend::new(&bucket).await.expect("be"));
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes,
         "TAPE_RESTORED",
         CartridgeOpenMode::Open,

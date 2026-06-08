@@ -46,18 +46,18 @@ type ActiveTaskMap = Arc<Mutex<HashMap<ActiveTaskKey, JoinHandle<()>>>>;
 pub struct PrefetchManager {
     /// Active prefetch tasks: (cartridge_id, chunk_id) -> JoinHandle
     active_tasks: ActiveTaskMap,
-    /// Cloud backend for downloading chunks
-    cloud_backend: Arc<Box<dyn ObjectStoreBackend>>,
+    /// Storage backend for downloading chunks
+    storage_backend: Arc<Box<dyn ObjectStoreBackend>>,
     /// Configuration
     config: PrefetchConfig,
 }
 
 impl PrefetchManager {
     /// Create a new prefetch manager
-    pub fn new(cloud_backend: Arc<Box<dyn ObjectStoreBackend>>, config: PrefetchConfig) -> Self {
+    pub fn new(storage_backend: Arc<Box<dyn ObjectStoreBackend>>, config: PrefetchConfig) -> Self {
         Self {
             active_tasks: Arc::new(Mutex::new(HashMap::new())),
-            cloud_backend,
+            storage_backend,
             config,
         }
     }
@@ -163,7 +163,7 @@ impl PrefetchManager {
             return;
         }
 
-        // Need a hash to address the chunk in both cloud and local store.
+        // Need a hash to address the chunk in both storage and local store.
         let hash = match location_info.hash {
             Some(h) => h,
             None => {
@@ -176,20 +176,20 @@ impl PrefetchManager {
         };
 
         info!(
-            "Starting prefetch for {}/chunk-{} (hash {}..) from cloud",
+            "Starting prefetch for {}/chunk-{} (hash {}..) from storage",
             cartridge_id,
             chunk_id,
             &hash[..8.min(hash.len())]
         );
 
         // Spawn background download task
-        let cloud_backend = self.cloud_backend.clone();
+        let storage_backend = self.storage_backend.clone();
         let tasks_handle = self.active_tasks.clone();
         let task_key_clone = task_key.clone();
 
         let task = tokio::spawn(async move {
             match download_chunk_to_store(
-                cloud_backend.as_ref().as_ref(),
+                storage_backend.as_ref().as_ref(),
                 &hash,
                 &chunk_store,
                 &pool_budget,
@@ -265,19 +265,19 @@ impl PrefetchManager {
 pub struct ChunkLocationInfo {
     /// Is chunk in local cache (shared chunk store)?
     pub in_local_cache: bool,
-    /// Is chunk in cloud?
+    /// Is chunk in storage?
     pub in_s3: bool,
     /// BLAKE3 hex of the sealed chunk's bytes; `None` for unsealed chunks.
     pub hash: Option<String>,
 }
 
-/// Download a chunk from cloud and insert it into `chunk_store`.
+/// Download a chunk from storage and insert it into `chunk_store`.
 ///
 /// Routes through `ChunkPool::insert_verified_bytes`, which honors the
 /// cartridge's backend name + optional dedup-local namespace, gives us
 /// an atomic tmp+rename, drops a concurrent dedup-race winner cleanly,
 /// **and verifies the downloaded bytes hash to `hash` before the pool
-/// accepts them** — closes the cloud-bit-rot / wrong-bytes-for-hash
+/// accepts them** — closes the storage-bit-rot / wrong-bytes-for-hash
 /// gap that prefetch shared with the SCSI-READ refetch path.
 ///
 /// Pre-Batch-F the worker wrote directly under
@@ -287,7 +287,7 @@ pub struct ChunkLocationInfo {
 /// `DiskCacheManager` walks `<root>/chunks/<backend>/...` only.
 /// Going through the pool API fixes that too.
 ///
-/// The cloud key uses `chunk_store.object_key_in_store(hash)`, matching
+/// The storage key uses `chunk_store.object_key_in_store(hash)`, matching
 /// the `--dedup local` per-cartridge prefix the SCSI READ /
 /// upload-worker paths already speak.
 async fn download_chunk_to_store(
@@ -357,7 +357,7 @@ mod tests {
     }
 
     /// Issue #97 acceptance: a read of chunk K with a configured
-    /// look-ahead of N actually pulls K+1..K+N from cloud into the local
+    /// look-ahead of N actually pulls K+1..K+N from storage into the local
     /// pool in the background. Uses a real `LocalBackend` round-trip
     /// rather than a mock so the BLAKE3-verified pool insert is exercised
     /// end-to-end.
@@ -367,19 +367,24 @@ mod tests {
         use std::time::Duration;
 
         let pool_dir = tempfile::TempDir::new().unwrap();
-        let cloud_dir = tempfile::TempDir::new().unwrap();
+        let storage_dir = tempfile::TempDir::new().unwrap();
 
         let store = ChunkStore::new(pool_dir.path(), "primary").expect("pool");
-        let backend = LocalBackend::new(cloud_dir.path()).await.expect("backend");
+        let backend = LocalBackend::new(storage_dir.path())
+            .await
+            .expect("backend");
 
-        // Two look-ahead chunks (K+1, K+2) live only in cloud. Seed the
+        // Two look-ahead chunks (K+1, K+2) live only in storage. Seed the
         // backend at exactly the key the prefetcher will request.
         let mut planned = Vec::new();
         for (i, fill) in [(11u64, 0x11u8), (12u64, 0x22u8)] {
             let data = vec![fill; 4096];
             let hash = blake3::hash(&data).to_hex().to_string();
             let key = store.object_key_in_store(&hash);
-            backend.upload_chunk(&key, &data).await.expect("seed cloud");
+            backend
+                .upload_chunk(&key, &data)
+                .await
+                .expect("seed storage");
             planned.push((i, hash));
         }
 
@@ -391,7 +396,7 @@ mod tests {
             },
         );
 
-        // Location oracle: the two look-ahead chunks are cloud-only
+        // Location oracle: the two look-ahead chunks are storage-only
         // (cache miss), everything else absent.
         let snapshot: HashMap<u64, ChunkLocationInfo> = planned
             .iter()

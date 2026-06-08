@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloud-tiering surface on [`Cartridge`].
+//! Storage-tiering surface on [`Cartridge`].
 //!
 //! Lifted out of `cartridge/mod.rs` (was a ~3000-line single `impl
 //! Cartridge`) so the S3-tiering + manifest-backup paths read on
@@ -10,14 +10,14 @@
 //!
 //! Covers:
 //! - chunk-upload pipeline (`get_pending_uploads`,
-//!   `upload_chunk_to_cloud`, `pending_upload_payload`,
+//!   `upload_chunk_to_storage`, `pending_upload_payload`,
 //!   `apply_chunk_upload_outcome`, `mark_chunk_evicted`)
 //! - hash / eviction snapshots
 //!   (`referenced_chunk_hashes`, `evictable_chunks`,
-//!   `has_cloud_backend`, `root_path`)
+//!   `has_storage_backend`, `root_path`)
 //! - manifest backup / restore + version retention
-//!   (`backup_manifest_to_cloud`, `restore_manifest_from_cloud`,
-//!   `restore_indexes_from_cloud`, `cleanup_old_manifest_versions`)
+//!   (`backup_manifest_to_storage`, `restore_manifest_from_storage`,
+//!   `restore_indexes_from_storage`, `cleanup_old_manifest_versions`)
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ impl Cartridge {
     /// Get list of sealed chunks that need to be uploaded.
     /// Returns (chunk_id, hash, local_store_path) tuples. Unsealed
     /// (active staging) chunks are excluded — only sealed chunks have a
-    /// stable content hash and a stable cloud key.
+    /// stable content hash and a stable storage key.
     pub fn get_pending_uploads(&self) -> Vec<(u64, String, PathBuf)> {
         let mut pending = Vec::new();
         for entry in self.chunk_index.iter() {
@@ -52,18 +52,18 @@ impl Cartridge {
         pending
     }
 
-    /// Upload a specific chunk to cloud storage (called by background worker).
+    /// Upload a specific chunk to storage storage (called by background worker).
     /// Skips the upload if another cartridge already pushed an object with
-    /// the same hash — this is the cross-cartridge dedup hit on the cloud
+    /// the same hash — this is the cross-cartridge dedup hit on the storage
     /// side. Either way, the cartridge's manifest is updated to reflect
     /// the chunk is now safe to evict.
     ///
-    /// Returns the cloud key the chunk lives at on success — the caller
+    /// Returns the storage key the chunk lives at on success — the caller
     /// (upload worker) needs this to honor an active legal hold by
     /// re-applying the per-object hold flag after the PUT (the PUT
     /// creates a fresh object version on lock-enabled buckets, and the
     /// hold is per-version).
-    pub async fn upload_chunk_to_cloud(&mut self, chunk_id: u64) -> Result<String> {
+    pub async fn upload_chunk_to_storage(&mut self, chunk_id: u64) -> Result<String> {
         let payload = match self.pending_upload_payload(chunk_id) {
             Some(p) => p,
             None => {
@@ -81,14 +81,14 @@ impl Cartridge {
         };
 
         let backend = self
-            .cloud_backend
+            .storage_backend
             .as_deref()
-            .ok_or(SmcError::InvalidOp("no cloud backend configured"))?;
+            .ok_or(SmcError::InvalidOp("no storage backend configured"))?;
 
         let outcome = upload_chunk_inert(backend, &payload).await?;
         self.apply_chunk_upload_outcome(&outcome);
         if !outcome.dedup_hit {
-            tracing::info!("Successfully uploaded chunk {} to cloud", chunk_id);
+            tracing::info!("Successfully uploaded chunk {} to storage", chunk_id);
         }
         Ok(outcome.object_key)
     }
@@ -118,7 +118,7 @@ impl Cartridge {
 
     /// Apply the outcome of a [`upload_chunk_inert`] call to this
     /// cartridge's chunk-index: flip `uploaded = true`, set
-    /// `location = Both`, capture cloud-side compression info on a
+    /// `location = Both`, capture storage-side compression info on a
     /// fresh PUT. Also bumps the lifetime `backend_bytes_written`
     /// counter by the on-wire bytes PUT (skipped on a dedup hit,
     /// where `put_bytes` is `None` — nothing was transferred). The
@@ -167,9 +167,9 @@ impl Cartridge {
             ));
         }
 
-        chunk.location = LocationTag::CloudOnly;
+        chunk.location = LocationTag::StorageOnly;
         self.update_chunk_rec(chunk_id, &chunk)?;
-        tracing::debug!("Marked chunk {} as evicted (CloudOnly)", chunk_id);
+        tracing::debug!("Marked chunk {} as evicted (StorageOnly)", chunk_id);
         Ok(())
     }
 
@@ -206,8 +206,8 @@ impl Cartridge {
     }
 
     /// Check if S3 backend is configured
-    pub fn has_cloud_backend(&self) -> bool {
-        self.cloud_backend.is_some()
+    pub fn has_storage_backend(&self) -> bool {
+        self.storage_backend.is_some()
     }
 
     /// Get the root path of this cartridge
@@ -217,7 +217,7 @@ impl Cartridge {
 
     // --- Manifest Backup/Restore Methods ---
 
-    /// Backup manifest to cloud storage with versioning. Three layers:
+    /// Backup manifest to storage storage with versioning. Three layers:
     ///
     /// 1. Ship every dirty page of `chunks.idx` and each
     ///    `blocks-p<N>.idx` to
@@ -236,11 +236,11 @@ impl Cartridge {
     /// Returns `(versioned_key, latest_key)` so the upload worker can
     /// extend an active legal hold over the freshly-PUT manifest
     /// objects.
-    pub async fn backup_manifest_to_cloud(&mut self) -> Result<ManifestBackupOutcome> {
+    pub async fn backup_manifest_to_storage(&mut self) -> Result<ManifestBackupOutcome> {
         let backend = self
-            .cloud_backend
+            .storage_backend
             .as_ref()
-            .ok_or(SmcError::InvalidOp("no cloud backend configured"))?
+            .ok_or(SmcError::InvalidOp("no storage backend configured"))?
             .clone();
 
         let label = self.manifest.label.clone();
@@ -268,9 +268,9 @@ impl Cartridge {
             index_page_keys.extend(page_keys);
         }
 
-        // Bundle manifest + runtime into one cloud sentinel object.
+        // Bundle manifest + runtime into one storage sentinel object.
         // Identity stays creation-frozen on disk, but cold-bucket DR
-        // needs both halves; the alternative (two cloud objects) costs
+        // needs both halves; the alternative (two storage objects) costs
         // a HEAD per restore and an extra failure mode on PUT.
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "manifest": &self.manifest,
@@ -289,8 +289,8 @@ impl Cartridge {
         tracing::debug!("Updated latest manifest bundle in S3: {}", latest_key);
 
         // Persist the (now updated) `index_epoch` map locally. Without
-        // this, a crash between cloud upload and the next unrelated
-        // persist leaves on-disk and cloud manifests out of sync —
+        // this, a crash between storage upload and the next unrelated
+        // persist leaves on-disk and storage manifests out of sync —
         // cold-bucket DR could read stale local epochs and miss the
         // page-uploads we just shipped.
         self.persist_runtime()?;
@@ -302,11 +302,11 @@ impl Cartridge {
         })
     }
 
-    /// Restore a `manifest-latest.json` bundle from cloud. Returns
+    /// Restore a `manifest-latest.json` bundle from storage. Returns
     /// the manifest + runtime JSON halves (`(manifest_json,
     /// runtime_json)`) for the caller to persist locally. Bundle
     /// shape: `{"manifest": {...identity...}, "runtime": {...sidecar...}}`.
-    pub async fn restore_manifest_from_cloud(
+    pub async fn restore_manifest_from_storage(
         label: &str,
         backend: &dyn ObjectStoreBackend,
     ) -> Result<(String, String)> {
@@ -323,10 +323,10 @@ impl Cartridge {
         );
         let bundle: serde_json::Value = serde_json::from_str(&body)?;
         let manifest_v = bundle.get("manifest").cloned().ok_or(SmcError::InvalidOp(
-            "cloud manifest bundle missing 'manifest' field",
+            "storage manifest bundle missing 'manifest' field",
         ))?;
         let runtime_v = bundle.get("runtime").cloned().ok_or(SmcError::InvalidOp(
-            "cloud manifest bundle missing 'runtime' field",
+            "storage manifest bundle missing 'runtime' field",
         ))?;
         let manifest_json = serde_json::to_string(&manifest_v)?;
         let runtime_json = serde_json::to_string(&runtime_v)?;
@@ -334,22 +334,22 @@ impl Cartridge {
     }
 
     /// Restore the per-cartridge index files (`chunks.idx` +
-    /// `blocks-p<N>.idx`) from cloud by replaying the page sequence
+    /// `blocks-p<N>.idx`) from storage by replaying the page sequence
     /// recorded in the runtime sidecar's `index_epoch` map. Used in
     /// the cold-bucket DR path immediately after
-    /// `restore_manifest_from_cloud` and before
+    /// `restore_manifest_from_storage` and before
     /// `BlockIndexFile::open_or_create` / `ChunkIndexFile::open_or_create`.
     ///
     /// `cart_root` is the per-cartridge directory (e.g.
     /// `<data_dir>/tapes/<barcode>/`). Pre-existing index files at
-    /// those paths are overwritten — the cloud copy is authoritative
+    /// those paths are overwritten — the storage copy is authoritative
     /// in this code path. Empty `index_epoch` map (legacy bundle
     /// written before delta-page index backup shipped) is a no-op
     /// returning Ok — the caller's open path will then create empty
     /// index files; correctness in that case is the operator's
     /// problem (the data is unrecoverable without per-block / per-
     /// chunk metadata, but that's a pre-existing gap).
-    pub async fn restore_indexes_from_cloud(
+    pub async fn restore_indexes_from_storage(
         cart_root: &Path,
         label: &str,
         runtime_json: &str,
@@ -386,7 +386,7 @@ impl Cartridge {
                 continue;
             };
             tracing::info!(
-                "Restoring index file '{}' for {} from cloud ({} pages, file_size={} B)",
+                "Restoring index file '{}' for {} from storage ({} pages, file_size={} B)",
                 file_label,
                 label,
                 epoch.pages,
@@ -401,9 +401,9 @@ impl Cartridge {
     /// Cleanup old manifest versions, keeping only the last N versions
     pub async fn cleanup_old_manifest_versions(&self, keep_count: usize) -> Result<usize> {
         let backend = self
-            .cloud_backend
+            .storage_backend
             .as_ref()
-            .ok_or(SmcError::InvalidOp("no cloud backend configured"))?;
+            .ok_or(SmcError::InvalidOp("no storage backend configured"))?;
 
         let label = &self.manifest.label;
         let prefix = format!("manifests/{}/", label);

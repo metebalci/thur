@@ -58,7 +58,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-admin-audit` | 64% | shared | `system.audit.*` job handlers — reached via the daemon audit verbs |
 | `shared-admin-auth` | 96% | **control-plane critical** | Argon2id PHC hashing, password store, `AuthState`, HTTP Basic gate middleware |
 | `shared-admin-client` | 70% | shared | admin Unix-socket dialer, NDJSON job-stream consumer |
-| `shared-admin-cloud-check` | 44%† | shared | cloud reachability `system.cloud_check` job + periodic ticker — reached via the daemon storage-check verb |
+| `shared-admin-storage-check` | 44%† | shared | storage reachability `system.storage_check` job + periodic ticker — reached via the daemon storage-check verb |
 | `shared-admin-http` | 80% | shared | admin HTTP listener, TLS config, self-signed cert gen / regen |
 | `shared-admin-iscsi` | 81% | shared | cross-product iSCSI admin handlers — reached via both daemons |
 | `shared-admin-monitor` | 93% | shared | `system.monitor` tick loop, snapshot encoding, rate-window math |
@@ -85,7 +85,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-upload-worker` | 89% | **control-plane critical** | backend-upload PUT + HEAD-probe primitive |
 | `shared-verify-core` | 85% | **control-plane critical** | pool + storage verify sweeps — exercised via the `core-*` verify tests |
 
-† `shared-admin-cloud-check` and `shared-disk-evict` show **unit-mode**
+† `shared-admin-storage-check` and `shared-disk-evict` show **unit-mode**
 line coverage (`scripts/coverage.sh --crates`); their request paths fire
 mainly through the daemon job + shell suites, so the integrated run adds
 coverage not captured here. Re-measure with `scripts/coverage.sh
@@ -210,7 +210,7 @@ full backup / filesystem round-trip.
 | `test-lifecycle-cartridge-migrate.sh` | cartridge migrate + archive between backends |
 | `test-lifecycle-dr-restore.sh` | cross-region disaster-recovery restore |
 | `test-tiering-plan-and-run.sh` | tiering plan / run-now / status CLI surface (two local backends) |
-| `test-legal-hold-lifecycle.sh` | cloud-native legal hold set/clear/status + migrate-gate refusal (Object-Lock backend) |
+| `test-legal-hold-lifecycle.sh` | storage-native legal hold set/clear/status + migrate-gate refusal (Object-Lock backend) |
 | `test-tiering-legal-hold-interaction.sh` | tiering excludes a legal-held cartridge from plan + run-now (Object-Lock backend) |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
 

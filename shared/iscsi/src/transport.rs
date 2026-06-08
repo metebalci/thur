@@ -21,7 +21,7 @@
 //!   FFP loop, dispatching SCSI commands through
 //!   [`crate::ScsiHandler::dispatch`].
 //!
-//! Audit / business-logic hooks (legal-hold sentinel readback, cloud
+//! Audit / business-logic hooks (legal-hold sentinel readback, storage
 //! prefetch on READ, MOVE MEDIUM post-hooks, async SEND DIAGNOSTIC
 //! self-test) stay inside the consuming product's `ScsiHandler` impl
 //! — the transport calls `dispatch` and writes back the response, no

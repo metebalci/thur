@@ -12,7 +12,7 @@
 //!                 "allow_existing": false,
 //!                 "dry_run": false }`.
 //!
-//! Refuse-gates: backend named in cloud-backends.json, library
+//! Refuse-gates: backend named in storage-backends.json, library
 //! initialized (the primitive's `add_or_create_tape` call needs a
 //! living `Library` mutex which only exists after `library init`),
 //! free storage slot available.
@@ -198,7 +198,7 @@ fn preflight(params: &RestoreArchiveParams, state: &DaemonState) -> Result<(), S
     let names = state.storage_config.backend_names();
     if !names.iter().any(|n| n == &params.backend) {
         return Err(format!(
-            "backend '{}' not defined under `cloud.backends:` in YAML conffile (known: {})",
+            "backend '{}' not defined under `storage.backends:` in YAML conffile (known: {})",
             params.backend,
             names.join(", ")
         ));

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Azure Blob Storage backend for cloud storage tier.
+//! Azure Blob Storage backend for storage storage tier.
 //!
 //! Mirrors `s3.rs` / `gcs.rs`. Provides upload/download operations for chunks
 //! and manifests with:
@@ -91,10 +91,10 @@ pub struct AzureBackend {
     account: String,
     container_name: String,
     prefix: String,
-    /// Optional custom data-plane endpoint (Azurite, sovereign cloud).
+    /// Optional custom data-plane endpoint (Azurite, sovereign storage).
     /// Stored alongside the SDK client because the management-plane
     /// REST call (`lock_state`) has to honor the same endpoint
-    /// override when targeting non-public clouds. (The SDK already
+    /// override when targeting non-public storages. (The SDK already
     /// honors it for data-plane ops.)
     endpoint_url: Option<String>,
     compression_config: CompressionConfig,
@@ -149,7 +149,7 @@ impl AzureBackend {
     ///    login`).
     ///
     /// `endpoint_url` is optional and used for Azurite or sovereign
-    /// clouds. If omitted, `https://<account>.blob.core.windows.net/`
+    /// storages. If omitted, `https://<account>.blob.core.windows.net/`
     /// is used.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -941,8 +941,8 @@ impl ObjectStoreBackend for AzureBackend {
                 // differentiate these to know whether to ask
                 // AAD/policy ("immutability disallows") or just retry
                 // ("concurrent writer raced"):
-                //   412 Precondition Failed → CloudPreconditionFailed
-                //   409 Conflict            → CloudConflict
+                //   412 Precondition Failed → StoragePreconditionFailed
+                //   409 Conflict            → StorageConflict
                 //   anything else           → ObjectStoreError (existing default)
                 use azure_core::http::StatusCode;
                 Err(match e.http_status() {

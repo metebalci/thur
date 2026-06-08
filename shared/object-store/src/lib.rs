@@ -45,8 +45,7 @@ pub use local::LocalBackend;
 pub use object_store_backend::{LockState, ObjectStoreBackend};
 pub use object_store_config::{
     BackendEntry, FailureKind, ObjectStoreCheckStep, ObjectStoreConfig, ObjectStoreConfigError,
-    RetentionMode, classify, is_retryable, reject_legacy_cloud_backends_json,
-    validate_object_store_backend,
+    RetentionMode, classify, is_retryable, validate_object_store_backend,
 };
 pub use object_store_helpers::{full_key, retry_async};
 pub use s3::S3Backend;

@@ -18,8 +18,8 @@ use super::{Library, LoadedCartridge};
 impl Library {
     /// Add an existing or new cartridge to the first free cartridge slot.
     /// If the tape directory doesn't exist yet, it will be created as an
-    /// empty cartridge bound to the named cloud backend. Pass
-    /// `backend_name` matching an entry in `cloud.backends`.
+    /// empty cartridge bound to the named storage backend. Pass
+    /// `backend_name` matching an entry in `storage.backends`.
     pub fn add_or_create_tape(&mut self, barcode: &str, backend_name: &str) -> Result<u32> {
         // ensure tape dir exists (create empty cartridge if needed)
         let tape_root = self.tapes_dir.join(barcode);

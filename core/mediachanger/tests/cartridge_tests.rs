@@ -500,7 +500,7 @@ fn test_worm_cartridge_refuses_erase_and_format_and_allow_overwrite() {
 /// (`test-backup-storage.sh`, 2026-05-03): the manifest still claims
 /// `Both` for every chunk, but the pool file under
 /// `<data_dir>/chunks/<backend>/<aa>/<bb>/<hash>.dat` is missing. The
-/// async read path must refetch from cloud on miss instead of
+/// async read path must refetch from storage on miss instead of
 /// surfacing the OS NotFound to the SCSI layer.
 #[tokio::test]
 async fn read_block_async_refetches_when_pool_file_missing() {
@@ -525,26 +525,26 @@ async fn read_block_async_refetches_when_pool_file_missing() {
         // drop seals trailing chunk via flush_and_seal
     }
 
-    // Reopen with a cloud backend and push the chunk to "the cloud".
+    // Reopen with a storage backend and push the chunk to "the storage".
     let backend: Box<dyn core_mediachanger::ObjectStoreBackend> = Box::new(
         LocalBackend::new(&bucket_path)
             .await
             .expect("create LocalBackend"),
     );
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes_path,
         "REFETCH001",
         CartridgeOpenMode::Open,
         Some(backend),
     )
     .await
-    .expect("reopen with cloud backend");
+    .expect("reopen with storage backend");
     let pending = cart.get_pending_uploads();
     assert!(!pending.is_empty(), "expected at least one chunk to upload");
     for (chunk_id, _hash, _path) in &pending {
-        cart.upload_chunk_to_cloud(*chunk_id)
+        cart.upload_chunk_to_storage(*chunk_id)
             .await
-            .expect("upload chunk to cloud");
+            .expect("upload chunk to storage");
     }
     let pool_path_for_chunk = pending[0].2.clone();
     drop(cart);
@@ -566,14 +566,14 @@ async fn read_block_async_refetches_when_pool_file_missing() {
     // Re-establish the chunk store layout (cartridge open expects it).
     let _store = ChunkStore::new(dir.path(), "primary").expect("recreate chunk store dir");
 
-    // Reopen with the same cloud backend and read — must transparently
+    // Reopen with the same storage backend and read — must transparently
     // refetch the chunk from the bucket and re-cache it locally.
     let backend2: Box<dyn core_mediachanger::ObjectStoreBackend> = Box::new(
         LocalBackend::new(&bucket_path)
             .await
             .expect("reopen LocalBackend"),
     );
-    let mut cart = Cartridge::open_with_cloud_async(
+    let mut cart = Cartridge::open_with_storage_async(
         &tapes_path,
         "REFETCH001",
         CartridgeOpenMode::Open,
@@ -589,7 +589,7 @@ async fn read_block_async_refetches_when_pool_file_missing() {
         pool_path_for_chunk.is_file(),
         "pool file should be restored after refetch"
     );
-    // The cache miss pulled the chunk down from cloud, and the read
+    // The cache miss pulled the chunk down from storage, and the read
     // then served the 4096-byte plaintext block to the host.
     assert!(
         cart.backend_bytes_read() >= test_data.len() as u64,
@@ -598,7 +598,7 @@ async fn read_block_async_refetches_when_pool_file_missing() {
     assert_eq!(cart.host_bytes_read(), test_data.len() as u64);
 }
 
-/// Without a configured cloud backend, a wiped pool should surface a
+/// Without a configured storage backend, a wiped pool should surface a
 /// clear error rather than the raw OS NotFound. Read-only or
 /// air-gapped local-backend deployments need to know they cannot
 /// recover a chunk that's missing from the local pool.
@@ -637,7 +637,7 @@ async fn read_block_async_errors_when_pool_missing_and_no_backend() {
         .expect_err("read must fail when chunk missing and no backend");
     let msg = format!("{err}");
     assert!(
-        msg.contains("missing from local pool") || msg.contains("no cloud backend"),
+        msg.contains("missing from local pool") || msg.contains("no storage backend"),
         "expected clear missing-pool error, got: {msg}"
     );
 }

@@ -32,7 +32,7 @@
 //! epoch. The cartridge manifest's `manifest-latest.json` sentinel
 //! grows an `index_epoch` map (file label → `IndexEpoch { pages,
 //! page_size, epoch, file_size }`) recording, per index file, the
-//! count of pages that exist in cloud and the file's logical size in
+//! count of pages that exist in storage and the file's logical size in
 //! bytes. The sentinel is re-PUT after every successful upload pass,
 //! and is the *last* object written so a torn upload leaves the
 //! sentinel pointing at the previous (consistent) epoch — same
@@ -66,7 +66,7 @@ use std::os::unix::fs::FileExt;
 /// to pre-allocate the file before stitching pages back in.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexEpoch {
-    /// Number of pages currently in cloud for this file.
+    /// Number of pages currently in storage for this file.
     pub pages: u32,
     /// Page size in bytes. Carried alongside in case we ever change
     /// the constant; restore matches against the stamped value.
@@ -93,7 +93,7 @@ pub struct IndexFileRef<'a> {
 /// `manifests/<barcode>/<label>/page-<NNNNNN>.dat` keyspace and clear
 /// the tracker bits as each PUT succeeds. Returns the resulting
 /// `IndexEpoch` (to be stamped into the sentinel) plus the list of
-/// page cloud keys that were freshly PUT this pass — the daemon's
+/// page storage keys that were freshly PUT this pass — the daemon's
 /// auto-hold-on-upload worker uses that list to extend an active
 /// legal hold to the new index-page objects.
 ///
@@ -143,7 +143,7 @@ pub async fn upload_one_index(
     ))
 }
 
-/// Build the cloud key for a single index page.
+/// Build the storage key for a single index page.
 pub fn page_key(barcode: &str, label: &str, page: u32) -> String {
     format!("manifests/{}/{}/page-{:06}.dat", barcode, label, page)
 }
@@ -198,7 +198,7 @@ pub async fn restore_one_index(
     }
     file.sync_data()?;
     // Initialize a clean sidecar so the next mutation cycle starts
-    // tracking from epoch 0 of the local copy. The cloud epoch is
+    // tracking from epoch 0 of the local copy. The storage epoch is
     // separately recorded in the manifest sentinel.
     let tracker = DirtyPageTracker::open_or_create(dest)?;
     tracker.persist()?;
