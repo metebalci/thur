@@ -1,13 +1,13 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sync guard for `docs/openapi.yaml` (issue #12).
+//! Sync guard for `docs/reference/openapi.yaml` (issue #12).
 //!
 //! Parses thurvsad's TCP HTTP router source (`src/http.rs`) for the
 //! routes it `.route(...)`-mounts and fails if any of them is missing
 //! from the hand-written spec's `paths`. This is what keeps the spec
 //! "in sync with the code, not the docs" without a code-gen pipeline:
-//! add a TCP route, update `docs/openapi.yaml` in the same change, or
+//! add a TCP route, update `docs/reference/openapi.yaml` in the same change, or
 //! this test goes red.
 //!
 //! Forward direction only (every route is documented). The reverse —
@@ -18,16 +18,16 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Walk up from this crate's dir until we find the repo root (the dir
-/// holding `docs/openapi.yaml`).
+/// holding `docs/reference/openapi.yaml`).
 fn repo_root() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if dir.join("docs/openapi.yaml").is_file() {
+        if dir.join("docs/reference/openapi.yaml").is_file() {
             return dir;
         }
         assert!(
             dir.pop(),
-            "could not locate docs/openapi.yaml above {}",
+            "could not locate docs/reference/openapi.yaml above {}",
             env!("CARGO_MANIFEST_DIR")
         );
     }
@@ -63,7 +63,7 @@ fn routes_in(src: &str) -> BTreeSet<String> {
 
 /// Top-level keys under `paths:` in the spec.
 fn spec_paths(root: &Path) -> BTreeSet<String> {
-    let text = std::fs::read_to_string(root.join("docs/openapi.yaml")).expect("read openapi.yaml");
+    let text = std::fs::read_to_string(root.join("docs/reference/openapi.yaml")).expect("read openapi.yaml");
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("openapi.yaml is valid YAML");
     doc.get("paths")
         .and_then(|p| p.as_mapping())
@@ -88,7 +88,7 @@ fn every_tcp_route_is_documented() {
     let missing: Vec<&String> = routes.iter().filter(|r| !documented.contains(*r)).collect();
     assert!(
         missing.is_empty(),
-        "thurvsad TCP routes missing from docs/openapi.yaml: {missing:?}\n\
+        "thurvsad TCP routes missing from docs/reference/openapi.yaml: {missing:?}\n\
          add them to the spec (and a sync-guard entry) in the same change"
     );
 }

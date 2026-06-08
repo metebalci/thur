@@ -636,7 +636,7 @@ phase_b2_assert_compression_metadata() {
     # The daemon writes a `compression` marker (algorithm only) into
     # each chunk object's backend metadata on upload; the download path
     # keys decompression off it, the same way S3 / GCS / Azure all do
-    # (docs/DEDUP.md "Backend-side compression", issue #10). The config
+    # (docs/reference/DEDUP.md "Backend-side compression", issue #10). The config
     # above pins zstd, so every chunk object must carry compression=zstd.
     # Reading it back through the cloud CLI confirms the marker actually
     # landed on the wire (the daemon's read side is unit-tested).

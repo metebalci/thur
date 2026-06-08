@@ -306,7 +306,7 @@ pub struct NvmetcpSettings {
     pub subnqn: Option<String>,
     /// Wire encryption + auth. Default `disabled` keeps the existing
     /// cleartext behavior; flip to `psk` for TLS 1.3 with pre-shared
-    /// keys per NVMe-TCP §3.6.1.5 (see [`docs/AUTH.md`]
+    /// keys per NVMe-TCP §3.6.1.5 (see [`docs/admin/NETWORK_SECURITY.md`]
     /// § NVMe/TCP TLS-PSK).
     #[serde(default)]
     pub tls: NvmetcpTlsSettings,
@@ -314,7 +314,7 @@ pub struct NvmetcpSettings {
     /// Default `none`; `dhchap` requires every host to pass a
     /// challenge/response before any command. Orthogonal to `tls`:
     /// `auth.mode: dhchap` with `tls.mode: psk` runs DH-HMAC-CHAP
-    /// inside a TLS-PSK channel ("dhchap+tls"). See [`docs/AUTH.md`]
+    /// inside a TLS-PSK channel ("dhchap+tls"). See [`docs/admin/NETWORK_SECURITY.md`]
     /// § NVMe/TCP DH-HMAC-CHAP.
     #[serde(default)]
     pub auth: NvmetcpAuthSettings,

@@ -10,7 +10,7 @@
 //! `ProductIdentity` so `thurvtl` and `thurvsa` share one
 //! implementation.
 //!
-//! Exit codes per `docs/SPEC.md`:
+//! Exit codes per `docs/reference/SPEC.md`:
 //!   0 — success / chain valid
 //!   1 — chain break detected (verify) / refused without accept_break (rotate)
 //!   2 — IO / file-missing error / transport error

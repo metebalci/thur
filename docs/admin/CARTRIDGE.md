@@ -4,8 +4,8 @@ This document is the design and behavior reference for cartridge creation,
 WORM enforcement, and legal hold. The CLI flags are documented in the
 binary's `--help` output. Cross-backend and cross-region operations
 (`cartridge migrate`, `cartridge archive`, `library restore-archive`,
-`library restore`) are covered in [`SPEC.md`](SPEC.md) §§ Cartridge
-migration / Cartridge archive / Restore-archive / Cross-region DR.
+`library restore`) are covered in
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md).
 
 ## Pre-creation required
 
@@ -47,7 +47,7 @@ fires. `local` namespaces every chunk under the cartridge's barcode —
 no sharing across cartridges (compliance / tenant isolation,
 per-cartridge cleanup). Sticky for life; both modes content-address by
 BLAKE3, only the scope of sharing differs. Full model in
-[`DEDUP.md`](DEDUP.md).
+[`DEDUP.md`](../reference/DEDUP.md).
 
 ## WORM
 
@@ -243,7 +243,7 @@ zero-plaintext-at-rest even if the backup app forgets to enable AME.
 The per-cartridge DEK is wrapped by an entry under `keystore.backends:`
 in the YAML conffile. Six backends ship (`local`, `awskms`, `vault`,
 `azurekv`, `gcpkms`, `kmip`) — the same set VSA uses. See
-[`AUTH.md`](AUTH.md) § *VTL keystore backends* for the keystore
+[`ENCRYPTION.md`](ENCRYPTION.md) § *VTL keystore backends* for the keystore
 lifecycle, AME composition rules, and the dedup tradeoff
 (cross-cartridge dedup is defeated when at-rest is on — the same
 tradeoff VSA pays on encrypted volumes).

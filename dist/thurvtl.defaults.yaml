@@ -242,7 +242,7 @@ iscsi:
 # the "storage" naming leaves room for a future block-shaped backend
 # variant without another rename.
 #
-# See docs/AUTH.md for the per-backend `auth:` block shapes
+# See docs/admin/AUTH.md for the per-backend `auth:` block shapes
 # (S3 / GCS / Azure / local).
 storage:
   # Opt out of bucket-immutability validation at startup and in
@@ -445,7 +445,7 @@ http:
 #   2. OTLP push — opt-in via telemetry.otlp.enabled. Periodic reader
 #      pushes the same metric snapshot to a Collector / SaaS backend.
 # Both readers see the same instrument values; record once, both
-# surfaces emit. Full instrument inventory in docs/SPEC.md § Telemetry.
+# surfaces emit. Full instrument inventory in docs/reference/SPEC.md § Telemetry.
 telemetry:
   # OTLP push exporter. Omit the otlp: block (or set enabled: false) to
   # serve only the Prometheus /metrics endpoint.
@@ -478,7 +478,7 @@ telemetry:
 # for the cartridge's lifetime; move via `cartridge key migrate
 # --to NEW`.
 #
-# See docs/AUTH.md § VSA keystore backends for the full
+# See docs/admin/ENCRYPTION.md § VSA keystore backends for the full
 # per-provider `auth:` block schema (Static / Env / Profile / SP /
 # SP-Env / SA-Key / ADC / Token / AppRole / ClientCert / ...).
 keystore:
@@ -552,7 +552,7 @@ keystore:
 #
 # Test a sink end-to-end with `thurvtl alerting test SINK_NAME`.
 # Full design + worked PagerDuty / Slack / Discord examples:
-# docs/ALERTING.md.
+# docs/admin/ALERTING.md.
 alerting:
   # Master switch. enabled=false (default) means no alerts fire, no
   # sinks are constructed, the dispatcher is not installed. Flip to

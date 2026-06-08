@@ -133,7 +133,7 @@ iscsi:
 #     # Generate per-host keys on the initiator with
 #     # `nvme gen-tls-key --identity 1 --hmac 1 --subsysnqn=... --hostnqn=...`
 #     # and paste the NVMeTLSkey-... string into the identity file
-#     # under that host's NQN entry. See docs/AUTH.md
+#     # under that host's NQN entry. See docs/admin/NETWORK_SECURITY.md
 #     # § NVMe/TCP TLS-PSK.
 #     mode: "disabled"
 #     # Override the identity-file path. Default:
@@ -155,7 +155,7 @@ iscsi:
 #     # Generate a per-host secret on the initiator with
 #     # `nvme gen-dhchap-key --hostnqn=...` and register it with
 #     # `thurvsa nvmetcp dhchap add --host-nqn=... --key=DHHC-1:... --volume=...`.
-#     # See docs/AUTH.md § NVMe/TCP DH-HMAC-CHAP.
+#     # See docs/admin/NETWORK_SECURITY.md § NVMe/TCP DH-HMAC-CHAP.
 #     mode: "none"
 #     # Override the identity-file path. Default:
 #     # <data_dir>/nvmetcp-dhchap.json.
@@ -315,7 +315,7 @@ http:
 # the "storage" naming leaves room for a future block-shaped backend
 # variant without another rename.
 #
-# See docs/AUTH.md for the per-backend `auth:` block shapes
+# See docs/admin/AUTH.md for the per-backend `auth:` block shapes
 # (S3 / GCS / Azure / local).
 storage:
   # Opt out of bucket-immutability validation at startup. When true,
@@ -410,7 +410,7 @@ storage:
 # plaintext unless created with --encrypt. Sticky for the volume's
 # lifetime. Backend configuration (KMS key ID, Vault address +
 # AppRole creds, etc.) lives under `keystore.backends:` below —
-# see docs/AUTH.md § VSA keystore backends.
+# see docs/admin/ENCRYPTION.md § VSA keystore backends.
 #
 # Per-volume DEK lifecycle verbs (all daemon-down — stop thurvsad first):
 #
@@ -436,7 +436,7 @@ keystore:
 
   # Named keystore-backend definitions. Each entry's `type:` picks
   # the provider (local | awskms | vault | azurekv | gcpkms | kmip).
-  # See docs/AUTH.md § VSA keystore backends for the full
+  # See docs/admin/ENCRYPTION.md § VSA keystore backends for the full
   # per-provider `auth:` block schema (Static / Env / Profile / SP /
   # SP-Env / SA-Key / ADC / Token / AppRole / ClientCert / ...).
   # Default: empty. Volume ops that reference a backend by name fail
@@ -517,7 +517,7 @@ audit:
 #
 # Test a sink end-to-end with `thurvsa alerting test SINK_NAME`.
 # Full design + worked PagerDuty / Slack / Discord examples:
-# docs/ALERTING.md.
+# docs/admin/ALERTING.md.
 alerting:
   # Master switch. enabled=false (default) means no alerts fire, no
   # sinks are constructed, the dispatcher is not installed. Flip to

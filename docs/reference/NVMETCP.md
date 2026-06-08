@@ -620,7 +620,7 @@ enables **bidirectional** auth: when the host sends a challenge
 host requesting mutual auth without a configured controller secret is failed.
 Secrets rotate with a grace window (`previous_dhchap_key` +
 `previous_expires_at`) — both authenticate while the window is open. Operator
-surface + secret-store schema in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
+surface + secret-store schema in [`NETWORK_SECURITY.md`](../admin/NETWORK_SECURITY.md) § NVMe/TCP DH-HMAC-CHAP.
 
 Because `nvmetcp-dhchap.json` and `nvmetcp-psks.json` are structurally the
 same rotatable per-host record, the daemon's `nvmetcp dhchap` and `nvmetcp

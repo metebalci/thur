@@ -7,7 +7,7 @@
 # `severity` label on each rule is the hook your Alertmanager routes on.
 #
 # These pair with — they do not replace — the daemon's own first-party
-# email/webhook alerting (docs/ALERTING.md). They are for shops already
+# email/webhook alerting (docs/admin/ALERTING.md). They are for shops already
 # running Prometheus + Alertmanager against the always-on `/metrics`
 # endpoint.
 #
@@ -24,7 +24,7 @@
 #   validation failures -> storage_permanent_errors_total +  (StoragePermanentErrors,
 #                          audit_chain_resets_total           AuditChainReset)
 #   session disconnects -> handled by the daemon's CHAP-failure / login-audit
-#                          alert class (docs/ALERTING.md), not a Prometheus rule.
+#                          alert class (docs/admin/ALERTING.md), not a Prometheus rule.
 
 groups:
   - name: thurvtl

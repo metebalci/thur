@@ -5,7 +5,7 @@ daemon performs. Each entry is hash-chained to the one before it, so
 post-hoc tampering — removing an entry, altering a field, reordering records
 — produces a detectable break in the chain. The wire and file format
 (filenames, JSONL schema, `prev_hash`/`entry_hash` calculation, CLI exit
-codes) is specified in [`SPEC.md`](SPEC.md) § Audit Log. This document
+codes) is specified in [`SPEC.md`](../reference/SPEC.md) § Audit Log. This document
 covers how the daemon implements that design and the operational workflow for
 administrators.
 

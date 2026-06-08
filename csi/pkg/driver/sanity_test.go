@@ -23,7 +23,7 @@ import (
 // ControllerPublishVolume mints (or reuses) a per-node CHAP user and grants it
 // the volume; the node id is the credential key, not a handle into a node
 // registry, so there is nothing to validate it against. Documented in
-// docs/CSI.md. The skip is a Ginkgo flag default so a bare `go test ./...`
+// docs/admin/CSI.md. The skip is a Ginkgo flag default so a bare `go test ./...`
 // also honors it.
 func TestMain(m *testing.M) {
 	_ = flag.Set("ginkgo.skip", "should fail when the node does not exist")

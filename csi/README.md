@@ -15,7 +15,7 @@ Controller and/or Node services:
 
 This is a self-contained Go module under the Thur monorepo; it has its own
 `go.mod` and is invisible to the Rust cargo workspace. Design and operator docs
-live in [`../docs/CSI.md`](../docs/CSI.md).
+live in [`../docs/admin/CSI.md`](../docs/admin/CSI.md).
 
 ## Build
 

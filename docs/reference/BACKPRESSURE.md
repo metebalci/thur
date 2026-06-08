@@ -78,7 +78,7 @@ end-to-end between both products:
   per-namespace counter exists for reporting only, surfaced via the
   `system monitor` job stream's `PoolEntry` payload as one row per
   (backend, namespace). Prometheus instruments stay backend-only so
-  existing operator dashboards don't break (see `docs/SPEC.md` §
+  existing operator dashboards don't break (see `docs/reference/SPEC.md` §
   Telemetry).
 
 - **Two trigger conditions.** A reservation blocks if **either** is true:

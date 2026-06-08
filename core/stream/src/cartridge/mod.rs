@@ -2434,7 +2434,7 @@ impl Cartridge {
         // Existing convention: GiB (1024^3) — kept for compatibility
         // with cartridges already on disk. LTO marketing capacities
         // are decimal, so an LTO-7 here is ~6.44 TiB raw; documented
-        // in docs/SPEC.md.
+        // in docs/reference/SPEC.md.
         let native = self.manifest.capacity_gb.saturating_mul(1024 * 1024 * 1024);
         let p = self.runtime.set_capacity_proportion;
         if p == 0 || p == u16::MAX {

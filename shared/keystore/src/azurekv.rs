@@ -33,7 +33,7 @@
 //! the embedded context doesn't match the call's `wrap_context`, then
 //! pass `ct` to KV. A stolen `wrapped_dek` repurposed against a
 //! different call site fails this check before the bytes ever reach
-//! the vault. Documented in `docs/AUTH.md` § VSA keystore
+//! the vault. Documented in `docs/admin/ENCRYPTION.md` § VSA keystore
 //! backends.
 
 use std::sync::Arc;

@@ -603,7 +603,7 @@ storage_list() {
 # value (`zstd` / `lz4` / `none`) or empty if absent / unreadable.
 # Backend-agnostic: S3 user metadata, GCS custom metadata, Azure blob
 # metadata. Used to assert the per-object compression marker the
-# download path keys decompression off (docs/DEDUP.md "Backend-side
+# download path keys decompression off (docs/reference/DEDUP.md "Backend-side
 # compression").
 storage_object_compression_meta() {
     local key="$1"

@@ -3,7 +3,7 @@
 This document covers per-crate API surfaces, module breakdowns, and the
 adapter layers that connect crates to each other. Top-level orientation —
 which crates exist and why, how the two products share infrastructure — is
-in [`../CLAUDE.md`](../CLAUDE.md) § Workspace Layout. This document is the
+in [`../../CLAUDE.md`](../../CLAUDE.md) § Workspace Layout. This document is the
 deeper reference you reach for when you need to know exactly what a crate
 exports and how the pieces fit together.
 
@@ -120,7 +120,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   Depends one way on `shared-admin-auth` / `shared-admin-monitor` /
   `shared-admin-server` / `shared-audit`; only the two daemons depend on
   it. Per-product inventory GETs stay per-daemon (typed on each
-  product's `AdminState`). Design in [`WEBUI.md`](WEBUI.md).
+  product's `AdminState`). Design in [`WEBUI.md`](../reference/WEBUI.md).
 - **shared-admin-audit** — cross-product `system.audit.*` job handlers:
   `run_tail` / `run_export` / `run_verify` / `run_rotate`, each
   `(JobEmitter, serde_json::Value, PathBuf)`. Both daemons route those
@@ -164,7 +164,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   Audit-append failures bridge in via an `AppendFailureHook` function
   pointer installed at boot — this breaks what would otherwise be a
   circular dependency between `shared-audit` and `shared-alerting`.
-  Design in [`ALERTING.md`](ALERTING.md).
+  Design in [`ALERTING.md`](../admin/ALERTING.md).
 - **shared-cli-alerting** — cross-product CLI for `alerting list` (GET
   `/api/v1/system/alerting`) and `alerting test <SINK> [--severity …]`
   (drives the `system.alerting.test` job). Daemon-routed only.

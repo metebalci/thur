@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sync guard for `docs/openapi-admin.yaml` — the admin-socket mutating
+//! Sync guard for `docs/reference/openapi-admin.yaml` — the admin-socket mutating
 //! contract subset the Kubernetes CSI driver (`csi/`) consumes (issue #15).
 //!
 //! Unlike `openapi_sync.rs` (which guards the read-only TCP surface in
@@ -11,7 +11,7 @@
 //! admin-password, …). It asserts:
 //!   1. every contract route is a real route in `admin/mod.rs` (the allowlist
 //!      can't name a route that has been renamed or removed), and
-//!   2. `docs/openapi-admin.yaml` documents exactly that contract subset — no
+//!   2. `docs/reference/openapi-admin.yaml` documents exactly that contract subset — no
 //!      undocumented contract route, no documented path without a backing
 //!      route.
 //! Change a route the driver uses -> update both the allowlist below and the
@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 /// The admin-socket routes the CSI driver depends on (path level; methods are
 /// documented per-path in the spec). Mirror of `csi/pkg/vsa` call sites and the
-/// `paths:` in `docs/openapi-admin.yaml`.
+/// `paths:` in `docs/reference/openapi-admin.yaml`.
 const CSI_CONTRACT: &[&str] = &[
     "/api/v1/iscsi/users",
     "/api/v1/iscsi/users/grant",
@@ -37,16 +37,16 @@ const CSI_CONTRACT: &[&str] = &[
 ];
 
 /// Walk up from this crate's dir until we find the repo root (the dir holding
-/// `docs/openapi-admin.yaml`).
+/// `docs/reference/openapi-admin.yaml`).
 fn repo_root() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if dir.join("docs/openapi-admin.yaml").is_file() {
+        if dir.join("docs/reference/openapi-admin.yaml").is_file() {
             return dir;
         }
         assert!(
             dir.pop(),
-            "could not locate docs/openapi-admin.yaml above {}",
+            "could not locate docs/reference/openapi-admin.yaml above {}",
             env!("CARGO_MANIFEST_DIR")
         );
     }
@@ -80,7 +80,7 @@ fn routes_in(src: &str) -> BTreeSet<String> {
 
 /// Top-level keys under `paths:` in the admin spec.
 fn spec_paths(root: &Path) -> BTreeSet<String> {
-    let text = std::fs::read_to_string(root.join("docs/openapi-admin.yaml"))
+    let text = std::fs::read_to_string(root.join("docs/reference/openapi-admin.yaml"))
         .expect("read openapi-admin.yaml");
     let doc: serde_yaml::Value =
         serde_yaml::from_str(&text).expect("openapi-admin.yaml is valid YAML");
@@ -113,7 +113,7 @@ fn csi_contract_routes_exist_and_match_spec() {
     assert_eq!(
         documented,
         contract,
-        "docs/openapi-admin.yaml paths must equal the CSI contract subset\n\
+        "docs/reference/openapi-admin.yaml paths must equal the CSI contract subset\n\
          documented-but-not-contract: {:?}\n\
          contract-but-not-documented: {:?}",
         documented.difference(&contract).collect::<Vec<_>>(),

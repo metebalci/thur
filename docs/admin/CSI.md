@@ -62,9 +62,9 @@ moving to a future TCP network admin API is a dialer plus an auth header, not a
 rewrite of the call sites.
 
 The mutating admin verbs the driver depends on are a documented contract.
-Rather than extend [`openapi.yaml`](openapi.yaml) — which is deliberately the
+Rather than extend [`openapi.yaml`](../reference/openapi.yaml) — which is deliberately the
 **read-only network** spec (#12), with mutations declared out of scope — the
-driver's contract lives in its own [`openapi-admin.yaml`](openapi-admin.yaml).
+driver's contract lives in its own [`openapi-admin.yaml`](../reference/openapi-admin.yaml).
 A guard test (`vsa/daemon/tests/admin_openapi_sync.rs`) holds an allowlist of
 exactly the ten routes the driver uses and asserts each is a real route in
 `admin/mod.rs` *and* that the spec documents exactly that subset — so renaming
@@ -118,7 +118,7 @@ session, the daemon's per-CHAP-user admission is **dynamic**: a `grant` reaches
 sessions that are already up, and the daemon raises a REPORTED LUNS DATA HAS
 CHANGED Unit Attention so the node re-reads REPORT LUNS. The node's stage path
 issues an explicit SCSI rescan after login for the same reason. See
-[`docs/CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md) § SBC-3 — dynamic LUN
+[`docs/reference/CONFORMANCE_SCSI.md`](../reference/CONFORMANCE_SCSI.md) § SBC-3 — dynamic LUN
 admission.
 
 The secret store is an interface. The Kubernetes-backed store is the default;
@@ -254,10 +254,10 @@ csi-sanity's fakes can't cover) is the gated e2e suite (`csi/test/e2e`, issue
 ## Release
 
 The driver releases on its own `csi-v*` tags, independent of the daemon's `v*`
-SemVer (see [RELEASING.md](RELEASING.md) § CSI driver). A tag publishes a
+SemVer (see [RELEASING.md](../dev/RELEASING.md) § CSI driver). A tag publishes a
 multi-arch image to `ghcr.io/<owner>/thurvsa-csi:<version>` and the Helm chart
 as an OCI artifact to `ghcr.io/<owner>/charts/thurvsa-csi:<version>`, via
-[`.github/workflows/csi-release.yml`](../.github/workflows/csi-release.yml). The
-per-PR gate is [`.github/workflows/csi.yml`](../.github/workflows/csi.yml)
+[`.github/workflows/csi-release.yml`](../../.github/workflows/csi-release.yml). The
+per-PR gate is [`.github/workflows/csi.yml`](../../.github/workflows/csi.yml)
 (path-scoped to `csi/**`): gofmt, vet, staticcheck, build, test, plus `helm
 lint`/`template` and `kubeconform` on the rendered manifests.

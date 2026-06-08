@@ -37,7 +37,7 @@ use crate::mode_state::DrivePageStore;
 pub struct DriveState {
     /// Opaque per-drive page blobs. The SCSI consumer (scsi-ssc) uses
     /// these to round-trip MODE SELECT SP=1 bodies. See
-    /// [`DrivePageStore`] and `docs/SPEC.md` § "MODE SELECT round-trip".
+    /// [`DrivePageStore`] and `docs/reference/SPEC.md` § "MODE SELECT round-trip".
     #[serde(default, skip_serializing_if = "DrivePageStore::is_empty")]
     pub mode_pages: DrivePageStore,
 

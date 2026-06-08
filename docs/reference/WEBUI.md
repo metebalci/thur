@@ -125,7 +125,7 @@ fan out into cloud calls.
 ## The auth dependency
 
 The Web UI does not own its own authentication. It hangs on the
-web-admin password gate (issue #4), documented in [`AUTH.md`](AUTH.md) §
+web-admin password gate (issue #4), documented in [`NETWORK_SECURITY.md`](../admin/NETWORK_SECURITY.md) §
 Admin password. That gate splits the listener into an **open** group —
 `/health` and `/metrics`, left unauthenticated so Prometheus scrapes and
 liveness probes keep working — and a **protected** group that carries
@@ -135,7 +135,7 @@ same middleware and in-process verifier that guards `/sessions` and
 `/info`; there is no second password and no Web UI login form.
 
 Whether that protected group is actually gated is the operator's choice,
-via `http.auth.method` (see [`AUTH.md`](AUTH.md) § _The gate is
+via `http.auth.method` (see [`NETWORK_SECURITY.md`](../admin/NETWORK_SECURITY.md) § _The gate is
 optional_). The **default is `None`**: the read-only console is served
 open, on the assumption that the management listener sits on an isolated
 or trusted network — the same posture the iSCSI data plane defaults to,
@@ -147,7 +147,7 @@ apart from "wrong password."
 
 Because HTTP Basic ships credentials base64-encoded rather than
 encrypted, when you do enable the gate the standing recommendation from
-[`AUTH.md`](AUTH.md) applies: enable the admin HTTP TLS listener
+[`NETWORK_SECURITY.md`](../admin/NETWORK_SECURITY.md) applies: enable the admin HTTP TLS listener
 (`http.tls.*`) before relying on the password over anything but loopback.
 
 ## Where the code lives

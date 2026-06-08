@@ -3,7 +3,7 @@
 This document covers how the two CLIs are structured, how they discover
 the admin socket, how individual commands are classified by their required
 daemon state, and how long-running operations are handled. Top-level
-orientation is in [`../CLAUDE.md`](../CLAUDE.md) § CLI Surface.
+orientation is in [`../../CLAUDE.md`](../../CLAUDE.md) § CLI Surface.
 
 ## thurvtl
 
@@ -164,7 +164,7 @@ the 0640 conffile.
   `vtl/cli/src/privdrop.rs` then drops privileges before any I/O — euid
   0 → `setgid` → `initgroups` → `setuid` to `--user`, defaulting to
   `thurvtl` — so `sudo` does not leave root-owned files behind. The
-  cross-region DR runbook is in [`SPEC.md`](SPEC.md) § Cross-region DR.
+  cross-region DR runbook is in [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md) § Cross-region DR.
 
 - **Daemon-routed (live):** all cartridge ops except `key` (including
   `archive`, `migrate`, `import`, `export`, `reset-stats`, and

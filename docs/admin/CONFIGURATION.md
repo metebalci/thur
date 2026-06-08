@@ -66,7 +66,7 @@ description — is available as `thurvtl config defaults` or
 |---|---|---|
 | `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen portal(s). Accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{bind, advertise?, tpgt?}` objects — each entry binds its own listener (`bind`) and SendTargets advertises every entry as `TargetAddress=<advertise\|bind>,<tpgt>`, enabling multi-portal path redundancy without MC/S. Bare-string entries (and objects omitting `tpgt`) auto-assign sequential Target Portal Group Tags by input position (1, 2, …). Multiple portals sharing one TPGT (a group) is legal and is the prerequisite shape ALUA Target Port Groups will plug into; the same `bind` listed twice is rejected. The Login Response `TargetPortalGroupTag` echoes the arrival portal's TPGT (RFC 7143 §12.10). With no `advertise`, a wildcard `bind` (`0.0.0.0:*`, `[::]:*`) is substituted with the connection's actual local IP; set `advertise` (a full `ip:port`, emitted verbatim) when the bind isn't reachable by initiators — NAT, Docker bridge + published ports, reverse proxy, multi-homed host. A wildcard `advertise` is rejected at startup. |
 | `iscsi.target_iqn` | `iqn.2025-10.com.metebalci:thurvtl` / `:thurvsa` | Target IQN advertised to initiators. |
-| `iscsi.reservations.initiator_port` | `iqn-isid` | Which initiator-port identity SCSI-3 persistent reservations key by. `iqn-isid` (default): the full, spec-literal iSCSI port (initiator IQN + ISID) — models per-path (`mpathpersist`-style) registration; a host reclaims a reservation across a reconnect only if it reuses its ISID (Windows / VMware / session reinstatement do). `iqn`: key by IQN alone (ISID ignored) — a host reclaims across any reconnect / target restart even if its ISID changes (open-iscsi mints a fresh ISID per login), at the cost of collapsing all of a host's concurrent sessions to one registrant. NVMe/TCP is unaffected (keys by the host-stable HOSTID). See [`docs/SPEC.md`](SPEC.md) § Persistent reservations. |
+| `iscsi.reservations.initiator_port` | `iqn-isid` | Which initiator-port identity SCSI-3 persistent reservations key by. `iqn-isid` (default): the full, spec-literal iSCSI port (initiator IQN + ISID) — models per-path (`mpathpersist`-style) registration; a host reclaims a reservation across a reconnect only if it reuses its ISID (Windows / VMware / session reinstatement do). `iqn`: key by IQN alone (ISID ignored) — a host reclaims across any reconnect / target restart even if its ISID changes (open-iscsi mints a fresh ISID per login), at the cost of collapsing all of a host's concurrent sessions to one registrant. NVMe/TCP is unaffected (keys by the host-stable HOSTID). See [`docs/reference/SPEC.md`](../reference/SPEC.md) § Persistent reservations. |
 | `iscsi.session_timeout_seconds` | `300` | Per-session inactivity timeout. **VTL only.** |
 | `iscsi.auth.method` | `None` | `None` (unauthenticated) or `CHAP`. |
 | `iscsi.auth.allowed_algorithms` | `[SHA3-256, SHA-256, SHA-1, MD5]` | Allowed CHAP digests, strongest first. Empty list falls back to all four. |
@@ -275,7 +275,7 @@ The keystore section configures the pluggable DEK keystore, which backs
 at-rest encryption for VSA volumes and VTL cartridges. Encryption is opted
 into per volume or per cartridge at create time, not in the YAML conffile —
 the YAML just makes the named backends available. Per-provider `auth:`
-schema: [`AUTH.md`](AUTH.md) § keystore backends.
+schema: [`ENCRYPTION.md`](ENCRYPTION.md) § keystore backends.
 
 | Key | Default | Description |
 |---|---|---|
@@ -322,7 +322,7 @@ YAML, and on every subsequent start diffs the YAML against
 any cartridge would be orphaned). Partition layout is the only piece
 operators still mutate imperatively, via
 `thurvtl library partition {create,modify,…}` (daemon-down). Full
-schema: [`SPEC.md`](SPEC.md) § Library Topology.
+schema: [`SPEC.md`](../reference/SPEC.md) § Library Topology.
 
 ### `inventory.json` — VTL
 
@@ -330,7 +330,7 @@ schema: [`SPEC.md`](SPEC.md) § Library Topology.
 which barcode sits where, each cartridge's home slot, and drive-load
 state. The daemon updates it on changer moves, and `thurvtl changer`
 operations update it from the CLI. Schema alongside `library.json` in
-[`SPEC.md`](SPEC.md).
+[`SPEC.md`](../reference/SPEC.md).
 
 ### `iscsi-users.json` — both
 
@@ -371,8 +371,8 @@ Managed by `thurvsa nvmetcp psks
 re-read on every TLS handshake and once post-Connect for the
 admission lookup, so operator edits take effect on the next *new*
 connection without restart. PSK generation and wiring:
-[`AUTH.md`](AUTH.md) § NVMe/TCP TLS-PSK and
-[`NVMETCP.md`](NVMETCP.md).
+[`NETWORK_SECURITY.md`](NETWORK_SECURITY.md) § NVMe/TCP TLS-PSK and
+[`NVMETCP.md`](../reference/NVMETCP.md).
 
 ### `nvmetcp-dhchap.json` — VSA
 
@@ -391,8 +391,8 @@ Managed by `thurvsa nvmetcp dhchap
 {add,remove,disable,enable,grant,revoke,rotate,set-ctrl-key,clear-ctrl-key,list}`.
 The file is re-read on every Connect, so operator edits take effect on
 the next *new* connection without restart. Secret generation and wiring:
-[`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP and
-[`NVMETCP.md`](NVMETCP.md).
+[`NETWORK_SECURITY.md`](NETWORK_SECURITY.md) § NVMe/TCP DH-HMAC-CHAP and
+[`NVMETCP.md`](../reference/NVMETCP.md).
 
 ### `admin-password.json` — both
 

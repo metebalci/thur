@@ -8,7 +8,7 @@ need. The two packages co-exist cleanly on the same host because they use
 disjoint system users, data directories, unit names, and iSCSI ports.
 
 Releases are cut by a **tag-triggered CI workflow**
-([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+([`.github/workflows/release.yml`](../../.github/workflows/release.yml)).
 The maintainer signs and pushes a `v<version>` tag with
 `release/tag-release.sh`; CI then builds the artifacts in the
 canonical Debian 11 builder container, runs the per-distro smoke
@@ -323,7 +323,7 @@ the exact version only, without floating `latest`. The version is the tag
 minus the `csi-v` prefix and is stamped into the binary (`-ldflags -X
 main.version`), the image tag, and the Helm chart + app version. The
 per-PR gate is `csi.yml` (path-scoped to `csi/**`). Driver design and the
-deploy chart are in [CSI.md](CSI.md).
+deploy chart are in [CSI.md](../admin/CSI.md).
 
 ## Package repository
 

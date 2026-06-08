@@ -280,7 +280,7 @@ common choice for Linux NVMe/TCP on trusted networks (`nvme connect
 `tls = psk` runs the exchange inside a TLS-PSK channel ("dhchap+tls").
 Implemented against the Linux kernel host as the interop reference; design
 walkthrough in [`NVMETCP.md`](NVMETCP.md) § DH-HMAC-CHAP, secret-store +
-operator surface in [`AUTH.md`](AUTH.md) § NVMe/TCP DH-HMAC-CHAP.
+operator surface in [`NETWORK_SECURITY.md`](../admin/NETWORK_SECURITY.md) § NVMe/TCP DH-HMAC-CHAP.
 
 | Item | Status | Spec | Notes |
 |------|--------|:----:|-------|
@@ -610,26 +610,26 @@ relevant source files are:
 NVMe code paths:
 
 - NVM Command Set dispatcher:
-  [`../nvme/nvm/src/dispatcher.rs`](../nvme/nvm/src/dispatcher.rs)
+  [`../../nvme/nvm/src/dispatcher.rs`](../../nvme/nvm/src/dispatcher.rs)
   (`NvmeNvmDispatcher::dispatch_io` / `dispatch_admin`).
 - NVM opcode enum:
-  [`../nvme/nvm/src/opcode.rs`](../nvme/nvm/src/opcode.rs).
+  [`../../nvme/nvm/src/opcode.rs`](../../nvme/nvm/src/opcode.rs).
 - Reservation command adapter (parses RR wire fields, drives the
   shared `ReservationManager` by HOSTID, renders the Report):
-  [`../nvme/nvm/src/reservations.rs`](../nvme/nvm/src/reservations.rs).
+  [`../../nvme/nvm/src/reservations.rs`](../../nvme/nvm/src/reservations.rs).
 - Admin opcode enum + Fabrics types + Identify CNS + Controller
   registers + log-page + reservation wire shapes (RESCAP / ONCS /
   RTYPE map / Reservation Status Data Structure):
-  [`../nvme/base/src/`](../nvme/base/src/) (`opcode.rs`,
+  [`../../nvme/base/src/`](../../nvme/base/src/) (`opcode.rs`,
   `fabrics.rs`, `identify.rs`, `log_page.rs`, `reservation.rs`).
 - NVMe/TCP transport (PDU codec, per-connection state machine,
   fabrics interception, R2T flow, fused-pair tracking):
-  [`../nvme/tcp/src/`](../nvme/tcp/src/) (`pdu.rs`, `server.rs`).
+  [`../../nvme/tcp/src/`](../../nvme/tcp/src/) (`pdu.rs`, `server.rs`).
 - TLS-PSK derivation and `ClientHelloCallback` integration:
-  [`../nvme/tcp/src/tls.rs`](../nvme/tcp/src/tls.rs),
-  [`../nvme/tcp/src/identity.rs`](../nvme/tcp/src/identity.rs).
+  [`../../nvme/tcp/src/tls.rs`](../../nvme/tcp/src/tls.rs),
+  [`../../nvme/tcp/src/identity.rs`](../../nvme/tcp/src/identity.rs).
 - Daemon-side `NamespaceLookup` impl (NSID → `PageCache`):
-  [`../vsa/daemon/src/registry.rs`](../vsa/daemon/src/registry.rs).
+  [`../../vsa/daemon/src/registry.rs`](../../vsa/daemon/src/registry.rs).
 
 When a new NVM opcode / admin opcode / fabrics command / PDU type /
 CNS value / FID / LID / TLS knob ships, update this table in the

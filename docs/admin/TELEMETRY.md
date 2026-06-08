@@ -5,7 +5,7 @@ that machinery is put together and how an operator turns the raw
 numbers into alerts. It is the operator-facing picture. If you need the
 exact byte-level surface — every instrument with its type, unit, and
 attribute keys, plus the `telemetry.otlp.*` config block — that lives
-in [`SPEC.md`](SPEC.md) § Telemetry.
+in [`SPEC.md`](../reference/SPEC.md) § Telemetry.
 
 ## How metrics leave the daemon
 
@@ -106,7 +106,7 @@ OTLP Collector hop.
 
 ## What each subsystem watches
 
-The full instrument table is in [`SPEC.md`](SPEC.md) § Telemetry. At
+The full instrument table is in [`SPEC.md`](../reference/SPEC.md) § Telemetry. At
 the subsystem level, the metrics break down like this — each row is a
 coherent area of the daemon and the files that instrument it:
 
@@ -185,7 +185,7 @@ rate(thurvtl_storage_permanent_errors_total[5m]) > 0
 ## Reference dashboards & alert rules
 
 You do not have to build the above from scratch. Checked-in reference
-assets live under [`dist/grafana/`](../dist/grafana/): one Grafana
+assets live under [`dist/grafana/`](../../dist/grafana/): one Grafana
 dashboard per product (`thurvtl-dashboard.json` / `thurvsa-dashboard.json`,
 each with `$datasource` / `$job` / `$backend` template variables) and a
 `alerts.yaml` of Prometheus alerting rules covering the watch-worthy
@@ -194,7 +194,7 @@ conditions — disk cache near full, sustained backpressure, the
 audit-chain integrity. They are BYO-Prometheus wiring and pair with — they
 do not replace — the daemon's own email/webhook alerting in
 [`ALERTING.md`](ALERTING.md). Import and load instructions are in
-[`dist/grafana/README.md`](../dist/grafana/README.md). The dashboards are
+[`dist/grafana/README.md`](../../dist/grafana/README.md). The dashboards are
 hand-maintained (not `build.rs`-generated like the rest of `dist/`), so if
 you extend the instrument inventory, extend them too.
 

@@ -4,7 +4,7 @@
 # Machine-readable contract for the MUTATING subset of thurvsad's admin API
 # that the Kubernetes CSI driver (csi/) consumes (issue #15).
 #
-# This is the counterpart to docs/openapi.yaml. That file documents the
+# This is the counterpart to docs/reference/openapi.yaml. That file documents the
 # read-only NETWORK surface (GETs on the TCP listener). This file documents the
 # mutating verbs the CSI controller calls over the local peer-cred Unix admin
 # socket (/run/thurvsa/admin.sock) — create/delete/resize/snapshot/clone a

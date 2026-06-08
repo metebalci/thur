@@ -33,7 +33,7 @@
 //! matches the call's `wrap_context`, then feed iv/ct/tag back
 //! through KMIP `Decrypt` along with the rebound AAD.
 //!
-//! Threat model + auth flow: see `docs/AUTH.md` § VSA keystore
+//! Threat model + auth flow: see `docs/admin/ENCRYPTION.md` § VSA keystore
 //! backends.
 
 use std::sync::Arc;

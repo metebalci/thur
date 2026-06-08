@@ -47,7 +47,7 @@ shared-pool = { path = "../pool" }
 # `sso` features; `rustls` enables the legacy rustls 0.21 path
 # (rustls-webpki 0.101 — flagged by Dependabot) and we use the
 # `default-https-client` modern rustls path instead. `sso` is
-# unused (we authenticate via docs/AUTH.md flows, not AWS
+# unused (we authenticate via docs/admin/AUTH.md flows, not AWS
 # SSO) and pulls the same legacy path through aws-sdk-sso /
 # ssooidc / sts defaults.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process"] }

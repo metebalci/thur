@@ -1,9 +1,11 @@
 # CLAUDE.md
 
 Guidance for Claude Code working in this repo. Deep reference material lives
-under the top-level `docs/` tree — one flat directory, product scope on the
-filename; this file is the orientation pass — see § Design Docs for the full
-index.
+under the top-level `docs/` tree, organized into four audience sets:
+`docs/QUICKSTART.md`, `docs/admin/` (operations / the Admin Guide),
+`docs/reference/` (wire spec, conformance, internals), and `docs/dev/`
+(contributor docs). This file is the orientation pass — see § Design Docs
+for the full index.
 
 ## Project Overview
 
@@ -17,7 +19,7 @@ and co-resident on the same host:
   specific physical chassis. Sequential-access cartridges,
   library/changer (caps 65535 storage slots and 255 drives — 16-bit
   SMC element address for slots, iSCSI single-byte LUN encoding for
-  drives, see [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) §
+  drives, see [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md) §
   Topology bounds; one Import/Export element is reported, hardwired,
   for backup-software compat — the operator-visible
   `cartridge import` / `cartridge export` CLI works against storage
@@ -37,14 +39,15 @@ Both daemons cleanly co-exist on the same host: disjoint system users
 data dirs, unit names, and admin sockets. iSCSI / HTTP ports default to the
 same number on both — operators override one in YAML for co-residency. The
 SCSI surface we present (and where we deliberately diverge from typical
-LTO hardware) is in [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md).
-Wire-level contracts in [`docs/SPEC.md`](docs/SPEC.md).
+LTO hardware) is in [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md).
+Wire-level contracts in [`docs/reference/SPEC.md`](docs/reference/SPEC.md).
 
 ## Workspace Layout
 
 Layout C umbrella tree (shipped 2026-05-10): crates live under
 `shared/`, `core/`, `thurvtl/`, and `thurvsa/`. Design docs
-live in the top-level `docs/` tree. Crate names are
+live under the top-level `docs/` tree, split into `admin/`,
+`reference/`, and `dev/` sets. Crate names are
 unchanged (`shared-pool`, `core-stream`, `thurvtld`, …) — only
 on-disk paths group by purpose.
 
@@ -88,7 +91,7 @@ on-disk paths group by purpose.
   daemon-routed set handler that hashes the plaintext server-side.
   Both daemons mount it today; `shared-admin-webui` reuses it. Sibling
   of `shared-admin-iscsi`; kept out of the transport-only
-  `shared-admin-http`. Design in [`docs/AUTH.md`](docs/AUTH.md).
+  `shared-admin-http`. Design in [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md).
 - `shared/admin-webui` (`shared-admin-webui`) — the read-only Web UI
   (issue #5) embedded in both daemons' TCP HTTP listeners. Owns the
   static `/ui/*` bundle (no-build HTML/CSS/JS, `include_dir!` embedded
@@ -97,7 +100,7 @@ on-disk paths group by purpose.
   handlers (`monitor` snapshot, `jobs/recent`, `audit/tail`). Reuses
   #4's `shared_admin_auth` gate directly; per-product inventory GETs
   stay per-daemon. Mutations are out of scope (issue #91). Design in
-  [`docs/WEBUI.md`](docs/WEBUI.md).
+  [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
 - `shared/admin-cloud-check` (`shared-admin-cloud-check`) —
   cross-product cloud-backend reachability. `run_cloud_check` is the
   `system.cloud_check` job handler both daemons mount (CLI verb
@@ -177,7 +180,7 @@ on-disk paths group by purpose.
   Tagged-enum config + auth resolution mirrors `shared-object-store`.
   Wrapped DEK lives in the volume manifest's `encryption.wrapped_dek`
   for non-local backends; local keeps the sidecar as the storage.
-  Schema in [`docs/AUTH.md`](docs/AUTH.md) §
+  Schema in [`docs/admin/ENCRYPTION.md`](docs/admin/ENCRYPTION.md) §
   VSA keystore backends. Operators move a volume's wrap-target with
   `thurvsa volume key migrate NAME --to NAME` (daemon-down).
 - `shared/audit` (`shared-audit`) — append-only BLAKE3-chained log +
@@ -286,7 +289,7 @@ on-disk paths group by purpose.
   issue #66). TLS-PSK auth, CRC32C header/data digests (issue #78), and
   a single-subsystem discovery controller have all shipped; still out of
   scope: multi-outstanding R2T — rationale in
-  [`docs/NVMETCP.md`](docs/NVMETCP.md) § *Out of scope*.
+  [`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md) § *Out of scope*.
 - `core/ssc` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
   cartridge, block/chunk/lru indexes, dirty-page tracker, index-page
   backups, prefetch, FastCDC, AES-GCM encryption, disk-cache + pool
@@ -306,7 +309,7 @@ on-disk paths group by purpose.
 
 Per-crate API surfaces, module breakdowns, cross-crate re-exports, and the
 adapter layers between products are in
-[`docs/WORKSPACE.md`](docs/WORKSPACE.md).
+[`docs/dev/WORKSPACE.md`](docs/dev/WORKSPACE.md).
 
 ## Architecture (high-level)
 
@@ -319,22 +322,22 @@ adapter layers between products are in
   optionally overridden per entry under `storage.backends:` via
   `disk_cache_size_gb`), shared across that backend's pool +
   local-scope namespaces. Cartridge dir layout in
-  [`docs/STORAGE.md`](docs/STORAGE.md); dedup details in
-  [`docs/DEDUP.md`](docs/DEDUP.md); cartridge lifecycle
+  [`docs/reference/STORAGE.md`](docs/reference/STORAGE.md); dedup details in
+  [`docs/reference/DEDUP.md`](docs/reference/DEDUP.md); cartridge lifecycle
   (create / WORM / legal hold) in
-  [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md); cross-backend
+  [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md); cross-backend
   + cross-region ops (`cartridge migrate`, `cartridge archive`,
   `library restore-archive`, `library restore`) in
-  [`docs/SPEC.md`](docs/SPEC.md).
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md).
 - **Pipelines** — both products park host writes against a per-backend
   `shared_pool::PoolBudget` and surface SCSI NOT READY (0x04/0x07) on
   timeout. Thur VTL runs an event-driven broadcast bus → bounded mpsc
   workers; chunk-seal is gated at the staging-rename boundary
-  ([`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md)). Thur VSA
+  ([`docs/reference/BACKPRESSURE.md`](docs/reference/BACKPRESSURE.md)). Thur VSA
   runs a per-volume `PageCache` (write-back + RMW) backed by a
   `VolumeWriter` pool/storage pipeline; page-seal is gated before
   `pool.insert_bytes`, eviction is per-volume `lru.idx`-driven
-  ([`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md)).
+  ([`docs/reference/BACKPRESSURE.md`](docs/reference/BACKPRESSURE.md)).
   SYNCHRONIZE CACHE is a real fence on VSA.
 - **Audit** — single BLAKE3-chained JSONL log per daemon, daily rotation,
   always on (no `enabled` knob). Single-writer
@@ -342,9 +345,9 @@ adapter layers between products are in
   to `<audit_dir>/pending/` for replay on next start. Host-driven failure
   paths are rate-limited via `AuditRateLimiter` (60 s window).
   Rotated files are retained indefinitely (no pruner). Full design in
-  [`docs/AUDIT.md`](docs/AUDIT.md); schema +
+  [`docs/admin/AUDIT.md`](docs/admin/AUDIT.md); schema +
   rate-limited-rollup shape in
-  [`docs/SPEC.md`](docs/SPEC.md) § Audit Log.
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md) § Audit Log.
 - **Backend retries** — S3/GCS/Azure classify errors and **fail fast on
   permanent errors** (`Auth` / `Authz` / `NotFound` / `RegionMismatch`);
   only `Network` / `Timeout` / `Other` (5xx, throttling, unclassified)
@@ -356,8 +359,8 @@ adapter layers between products are in
   `shared_naming::PRODUCT.metric_prefix`; `service.name` resource
   attribute (`thurvtl` / `thurvsa`) carries the distinction
   redundantly. Design in
-  [`docs/TELEMETRY.md`](docs/TELEMETRY.md); full instrument
-  table in [`docs/SPEC.md`](docs/SPEC.md) § Telemetry.
+  [`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md); full instrument
+  table in [`docs/reference/SPEC.md`](docs/reference/SPEC.md) § Telemetry.
 - **Web-admin password** — the TCP HTTP listener splits its router into
   an OPEN group (`/health` + `/metrics`, unauthenticated for Prometheus
   + liveness) and a PROTECTED group (everything else, gated by HTTP
@@ -365,7 +368,7 @@ adapter layers between products are in
   admin`, fixed username `webadmin`). No password configured fails
   closed (503 + challenge); wrong creds 401. The prerequisite for the
   Web UI (issue #4, set via `system set-admin-password`). Design in
-  [`docs/AUTH.md`](docs/AUTH.md).
+  [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md).
 - **Web UI** — a read-only operator console (issue #5) embedded in each
   daemon's TCP HTTP listener, on by default (`http.webui.enabled`). The
   PROTECTED group also serves a static `/ui/*` bundle (no-build
@@ -374,7 +377,7 @@ adapter layers between products are in
   recent jobs + audit tail). GET-only on TCP — every mutating verb stays
   on the peer-cred admin socket. Lives in `shared-admin-webui`; reuses
   the #4 password gate. Mutations are issue #91. Design in
-  [`docs/WEBUI.md`](docs/WEBUI.md).
+  [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
 - **Alerting** — opt-in first-party email (SMTP via lettre) + generic
   webhook (HTTP POST with Tera-templated body — one path covers
   PagerDuty, Slack, Discord, ntfy.sh, ServiceNow) sinks. Five event
@@ -387,7 +390,7 @@ adapter layers between products are in
   window (default 300 s) wraps `AuditRateLimiter`. No retries on sink
   failure — drop, log, count via
   `<product>_alerts_fired_total{outcome}`. Full design in
-  [`docs/ALERTING.md`](docs/ALERTING.md).
+  [`docs/admin/ALERTING.md`](docs/admin/ALERTING.md).
 - **Daemon lock** — `<data_dir>/.daemon.lock` PID lockfile; CLI mutating
   commands refuse if alive. Stale locks auto-clear.
 
@@ -425,9 +428,9 @@ thurvtld --test    # in-process smoke (cartridge/library/S3/prefetch/…)
 Production install paths (`.deb` / `.rpm`) and recipes are in
 [`README.md`](README.md). Storage credentials wiring (per-backend `auth:`
 blocks, default chains, the per-product `<product>.env` daemon env
-file) in [`docs/AUTH.md`](docs/AUTH.md). Release-cut flow + glibc-floor
+file) in [`docs/admin/AUTH.md`](docs/admin/AUTH.md). Release-cut flow + glibc-floor
 strategy + OpenSSL vendoring in
-[`docs/RELEASING.md`](docs/RELEASING.md).
+[`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
 
 ### Auto-maintained artifacts
 
@@ -475,7 +478,7 @@ Required key: `data_dir` (both). YAML carries install-time + tuning
 knobs only. Every config file (YAML conffiles, daemon-managed JSON,
 the `<product>.env` file) plus a key-by-key YAML reference is
 catalogued in
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
+[`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md).
 
 `<data_dir>` is the **daemon's data dir**, not the library's — the library
 is one component (`<data_dir>/library/`) alongside other daemon-managed
@@ -495,9 +498,9 @@ re-materializes `library.json` from the YAML `library:` block.
   Partition layout managed via `thurvtl library partition
   {create,modify,…}` (still imperative — partitions are deliberate,
   not declarative). Logical-partition design in
-  [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) § Multi-partition
+  [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md) § Multi-partition
   libraries; schema in
-  [`docs/SPEC.md`](docs/SPEC.md) § Library Topology.
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md) § Library Topology.
 - `iscsi-users.json` — CHAP user list + mutual-CHAP target credentials.
   The YAML carries only `iscsi.auth.method` (`None | CHAP`) and
   `iscsi.auth.allowed_algorithms`. VTL users may carry a `partition:`
@@ -556,7 +559,7 @@ start; there's no imperative chassis-mutation verb. Long-running
 ops (`gc` / `verify` / `stats` / `storage check` / self-tests) ride a two-step
 job protocol on the same socket. Full split, admin socket discovery, sudo
 / privdrop behavior, and the job protocol in
-[`docs/CLI.md`](docs/CLI.md).
+[`docs/admin/CLI.md`](docs/admin/CLI.md).
 
 ## Integration Tests
 
@@ -626,56 +629,61 @@ product-agnostic in the unprefixed top-level `scripts/` dir.
 
 ## Design Docs
 
-All under the top-level `docs/` tree — one flat directory, product scope
-carried on the filename. `README.md` and `CLAUDE.md` stay at the repo
-root (CLAUDE.md must, for auto-loading).
+All under the top-level `docs/` tree, organized into four audience sets:
+`docs/QUICKSTART.md` (install -> first cartridge/volume), `docs/admin/`
+(the Admin Guide — operations), `docs/reference/` (wire spec, conformance,
+internals), and `docs/dev/` (contributor docs). `docs/README.md` is the
+operator-facing doc map; `README.md` and `CLAUDE.md` stay at the repo root
+(CLAUDE.md must, for auto-loading).
 
 - Architecture deep-dives:
-  [`docs/STORAGE.md`](docs/STORAGE.md),
-  [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md),
-  [`docs/DEDUP.md`](docs/DEDUP.md),
-  [`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md),
-  [`docs/AUDIT.md`](docs/AUDIT.md),
-  [`docs/AUTH.md`](docs/AUTH.md),
-  [`docs/WEBUI.md`](docs/WEBUI.md),
-  [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
+  [`docs/reference/STORAGE.md`](docs/reference/STORAGE.md),
+  [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md),
+  [`docs/reference/DEDUP.md`](docs/reference/DEDUP.md),
+  [`docs/reference/BACKPRESSURE.md`](docs/reference/BACKPRESSURE.md),
+  [`docs/admin/AUDIT.md`](docs/admin/AUDIT.md),
+  [`docs/admin/AUTH.md`](docs/admin/AUTH.md),
+  [`docs/admin/ENCRYPTION.md`](docs/admin/ENCRYPTION.md),
+  [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md),
+  [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md),
+  [`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md).
 - Conformance:
-  [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) — the whole
+  [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md) — the whole
   SCSI surface in three parts: SPC-4 / SAM-5 / iSCSI / CHAP (shared
   baseline), SSC-4 / SMC-3 + tape VPD / SECURITY PROTOCOL Tape Data
   Encryption + the behavioral model and deliberate divergences from
   typical LTO hardware (VTL), and SBC-3 (VSA).
-  [`docs/CONFORMANCE_NVME.md`](docs/CONFORMANCE_NVME.md) (NVMe
+  [`docs/reference/CONFORMANCE_NVME.md`](docs/reference/CONFORMANCE_NVME.md) (NVMe
   Base / NVM Command Set / NVMe-oF / NVMe-TCP, incl. TLS-PSK),
-  [`docs/NVMETCP.md`](docs/NVMETCP.md) (NVMe/TCP transport
+  [`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md) (NVMe/TCP transport
   design walkthrough for VSA: crate split, opcode → PageCache
   mapping, NQN, auth roadmap).
 - Kubernetes:
-  [`docs/CSI.md`](docs/CSI.md) — the Thur VSA CSI driver (Go subtree
+  [`docs/admin/CSI.md`](docs/admin/CSI.md) — the Thur VSA CSI driver (Go subtree
   under `csi/`, issue #15): admin-socket client, per-volume CHAP
   isolation, RPC→admin-call mapping, the Helm chart, and the `csi-v*`
   release cadence.
 - Wire-level reference:
-  [`docs/SPEC.md`](docs/SPEC.md) — SCSI opcodes, VPD / mode /
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md) — SCSI opcodes, VPD / mode /
   log pages, manifest schema, library / inventory schema, chunk-pool
   layout, backend object-key shape, iSCSI / LTO emulation IDs, telemetry
   inventory. Update in lockstep with the code.
-  [`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3.0 contract for the
+  [`docs/reference/openapi.yaml`](docs/reference/openapi.yaml) — OpenAPI 3.0 contract for the
   read-only TCP `/api/v1` admin surface (the network-facing GET subset;
   mutating verbs are Unix-socket-only and out of scope). Kept in sync by
   `{vtl,vsa}/daemon/tests/openapi_sync.rs`.
-  [`docs/openapi-admin.yaml`](docs/openapi-admin.yaml) — the admin-socket
+  [`docs/reference/openapi-admin.yaml`](docs/reference/openapi-admin.yaml) — the admin-socket
   mutating contract subset the CSI driver consumes. Kept in sync by
   `vsa/daemon/tests/admin_openapi_sync.rs`.
 - Workspace + CLI references:
-  [`docs/WORKSPACE.md`](docs/WORKSPACE.md),
-  [`docs/CLI.md`](docs/CLI.md).
+  [`docs/dev/WORKSPACE.md`](docs/dev/WORKSPACE.md),
+  [`docs/admin/CLI.md`](docs/admin/CLI.md).
 - Release:
-  [`docs/RELEASING.md`](docs/RELEASING.md).
+  [`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
 - Roadmap: tracked as GitHub issues. Labels: `vtl` / `vsa` for
   scope (cross-product items carry both); `bug` / `enhancement` /
   `idea` / `doc` for kind. Release-blocking items use `bug`.
-  [`docs/LTO-9.md`](docs/LTO-9.md) — what LTO-9 support would
+  [`docs/dev/LTO-9.md`](docs/dev/LTO-9.md) — what LTO-9 support would
   need, why a VTL cares less about LTO-9 than physical hardware
   would, and the reasoning for deferring past 1.0.0 GA.
 
@@ -694,12 +702,12 @@ padding, CmdSN / StatSN, 128 KiB segments).
 - When you make a change, update the documentation immediately. If you
   change configuration, also change `config defaults` output (the
   in-crate `defaults_reference.yaml`) and the key-by-key reference in
-  [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
+  [`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md).
   Wire-level
   surface changes (SCSI opcodes / VPD / mode / log pages, manifest schema,
   library / inventory schema, on-disk chunk-pool layout, backend object-key
   shape, iSCSI / LTO emulation IDs) MUST also update
-  [`docs/SPEC.md`](docs/SPEC.md) — it is the external
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md) — it is the external
   technical reference and must stay in sync with the code.
 - The `dist/` artifacts are regenerated by `build.rs` on `cargo build`.
   Don't hand-edit; if bytes change after a CLI edit, commit them as part of
@@ -707,7 +715,7 @@ padding, CmdSN / StatSN, 128 KiB segments).
 - New code needs tests. Every non-trivial module carries a `#[cfg(test)]`
   block; per-crate coverage floors (80% critical / 50% shared / 30% daemons)
   and the `scripts/coverage.sh` workflow are in
-  [`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md).
+  [`docs/dev/TESTCOVERAGE.md`](docs/dev/TESTCOVERAGE.md).
 - Do not use emojis in print statements.
 - When you create temporary files or folders, create them under `/tmp`.
 - Do not consider backward compatibility unless specifically instructed to

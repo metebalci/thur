@@ -594,17 +594,17 @@ NVMe block transport.
 A conformance table is only worth reading if it tracks the code, so
 this section anchors each part of Part 1 to the files that implement
 it. The shared-iscsi transport — login, PDU framing, the R2T loop,
-and CHAP — is in [`../shared/iscsi/src/`](../shared/iscsi/src/),
+and CHAP — is in [`../../shared/iscsi/src/`](../../shared/iscsi/src/),
 spread across `transport.rs`, `auth.rs`, `session.rs`, and
 `unit_attention.rs`. The SCSI dispatch that sits on top is
 per-product:
 
-- thurvtl tape: [`../vtl/daemon/src/iscsi/protocol.rs`](../vtl/daemon/src/iscsi/protocol.rs)
+- thurvtl tape: [`../../vtl/daemon/src/iscsi/protocol.rs`](../../vtl/daemon/src/iscsi/protocol.rs)
   (`handle_scsi_command` / `dispatch_scsi`). Per-page handlers in
   `scsi/ssc/src/scsi/{mode_pages.rs, log_pages.rs,
   encryption_pages.rs, attributes.rs}`; library-touching handlers in
   `scsi/ssc/src/dispatch/handlers.rs` and `scsi/smc/src/dispatch/`.
-- thurvsa block: [`../scsi/sbc/src/dispatcher.rs`](../scsi/sbc/src/dispatcher.rs)
+- thurvsa block: [`../../scsi/sbc/src/dispatcher.rs`](../../scsi/sbc/src/dispatcher.rs)
   (`SbcScsiDispatcher::dispatch`). Per-opcode arms in
   `scsi/sbc/src/{data_path.rs, mode_sense.rs, reservations.rs,
   probes.rs, maintenance.rs}`.
@@ -958,8 +958,8 @@ whole, using the daemon-managed DEK and a per-chunk IV of
 order. The whole feature is opt-in per cartridge — `cartridge create
 --encrypt --keystore NAME` — and the choice is recorded in
 `manifest.encryption`. The deeper treatment is in
-[`CARTRIDGE.md`](CARTRIDGE.md) § *At-rest encryption (appliance-side)*
-and [`AUTH.md`](AUTH.md) § *VTL keystore backends*.
+[`CARTRIDGE.md`](../admin/CARTRIDGE.md) § *At-rest encryption (appliance-side)*
+and [`ENCRYPTION.md`](../admin/ENCRYPTION.md) § *VTL keystore backends*.
 
 #### MAM attributes — host writes persisted in a sidecar
 
@@ -1138,7 +1138,7 @@ tape-drive LUN, since they all read it from the same
 
 As in Part 1, the tape-side tables are anchored to the code that
 backs them. Opcode dispatch starts in
-[`../vtl/daemon/src/iscsi/protocol.rs`](../vtl/daemon/src/iscsi/protocol.rs)
+[`../../vtl/daemon/src/iscsi/protocol.rs`](../../vtl/daemon/src/iscsi/protocol.rs)
 (`handle_scsi_command` / `dispatch_scsi`). From there, the per-page
 handlers live in
 `scsi/ssc/src/scsi/{mode_pages.rs, log_pages.rs, encryption_pages.rs,
@@ -1265,7 +1265,7 @@ This is what lets the Kubernetes CSI driver use **one CHAP user per node**
 (issue #15): all VSA volumes share one target IQN, so a node holds a
 single iSCSI session, and each volume the node mounts is incrementally
 granted to that node's user and picked up on the existing session by a
-post-login rescan. See [`CSI.md`](CSI.md) § Per-node CHAP isolation.
+post-login rescan. See [`CSI.md`](../admin/CSI.md) § Per-node CHAP isolation.
 
 ---
 
@@ -1349,7 +1349,7 @@ restored separately. The gap is tracked in the issue tracker.
   and nothing else. A stolen manifest is useless without the
   keystore.
 
-**On the data path** ([`../core/block/src/uploader.rs`](../core/block/src/uploader.rs)):
+**On the data path** ([`../../core/block/src/uploader.rs`](../../core/block/src/uploader.rs)):
 
 - **Write:** plaintext page → AES-256-GCM encrypt with IV =
   `derive_iv(crypto_uuid, page_id, iv_salt)` → ciphertext+tag
@@ -1366,7 +1366,7 @@ restored separately. The gap is tracked in the issue tracker.
   disk (in `pages.idx`). A pre-salt (v1) record reads `iv_salt = 0`,
   reproducing the original IV so existing encrypted volumes keep
   decrypting. Same re-derivation pattern as VTL tape AME
-  ([`../core/stream/src/block_index.rs`](../core/stream/src/block_index.rs)).
+  ([`../../core/stream/src/block_index.rs`](../../core/stream/src/block_index.rs)).
 - Key zeroized on `VolumeWriter::Drop` (volume close, daemon
   shutdown).
 
@@ -1452,7 +1452,7 @@ back to host-side READ/WRITE.
 ## How this table stays honest
 
 The block-side tables map back to the SBC-3 dispatcher at
-[`../scsi/sbc/src/dispatcher.rs`](../scsi/sbc/src/dispatcher.rs)
+[`../../scsi/sbc/src/dispatcher.rs`](../../scsi/sbc/src/dispatcher.rs)
 (`SbcScsiDispatcher::dispatch`), which fans each opcode out to a
 dedicated module:
 
@@ -1469,8 +1469,8 @@ dedicated module:
 
 The data path those opcodes drive — the per-volume in-memory cache
 and the storage-upload pipeline — is in
-[`../core/block/src/cache.rs`](../core/block/src/cache.rs) and
-[`../core/block/src/uploader.rs`](../core/block/src/uploader.rs).
+[`../../core/block/src/cache.rs`](../../core/block/src/cache.rs) and
+[`../../core/block/src/uploader.rs`](../../core/block/src/uploader.rs).
 
 The same rule closes the document as opened it: a new SBC-3 opcode,
 VPD page, or mode page is reflected in this table in the same commit

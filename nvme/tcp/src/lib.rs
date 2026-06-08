@@ -33,7 +33,7 @@
 //!
 //! The transport's behavioral model, opcode -> PageCache mapping, NQN
 //! handling, reservation-notification path, and TLS-PSK / DH-HMAC-CHAP
-//! design are in `docs/NVMETCP.md`.
+//! design are in `docs/reference/NVMETCP.md`.
 
 #![forbid(unsafe_code)]
 

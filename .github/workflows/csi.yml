@@ -12,12 +12,12 @@ on:
     branches: [main]
     paths:
       - "csi/**"
-      - "docs/openapi-admin.yaml"
+      - "docs/reference/openapi-admin.yaml"
       - ".github/workflows/csi.yml"
   pull_request:
     paths:
       - "csi/**"
-      - "docs/openapi-admin.yaml"
+      - "docs/reference/openapi-admin.yaml"
       - ".github/workflows/csi.yml"
   workflow_dispatch:
 

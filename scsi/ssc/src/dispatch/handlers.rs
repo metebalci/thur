@@ -1890,7 +1890,7 @@ pub fn handle_maintenance_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             // (scsi_smc::dispatch::pr_enforce); the drives fence the
             // medium read/write path. RESERVE/RELEASE (6/10) and SEND
             // VOLUME TAG are accepted as no-ops for backup-software
-            // compatibility — see docs/SPEC.md "Reservations" and
+            // compatibility — see docs/reference/SPEC.md "Reservations" and
             // "SEND VOLUME TAG".
             let opcodes_tape: &[u8] = &[
                 0x00, 0x01, 0x03, 0x04, 0x05, 0x08, 0x0A, 0x0B, 0x10, 0x11, 0x12, 0x13, 0x15, 0x19,

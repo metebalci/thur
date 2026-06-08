@@ -16,7 +16,7 @@
 //! that field absent and keeps its sidecar at
 //! `<data_dir>/keys/<uuid>.key`.
 //!
-//! Design / threat model: see `docs/AUTH.md` § VSA keystore
+//! Design / threat model: see `docs/admin/ENCRYPTION.md` § VSA keystore
 //! backends.
 
 #![forbid(unsafe_code)]

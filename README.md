@@ -165,7 +165,7 @@ sudo usermod -aG thurvsa $USER     # ...and thurvsa, on a co-resident host
 Every release artifact ships a detached `.asc` GPG signature (except
 dev and alpha builds) — verify it before installing. Key fingerprint
 and the build / signing process are in
-[`docs/RELEASING.md`](docs/RELEASING.md).
+[`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
 
 Other install paths:
 
@@ -250,7 +250,7 @@ thurvsa config defaults > thurvsa.yaml
 ```
 
 Every config file and YAML key is catalogued in
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Both the daemon and
+[`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md). Both the daemon and
 CLI resolve `--config PATH` first, otherwise
 `/etc/<product>/<product>.yaml`.
 
@@ -294,13 +294,13 @@ start on failure. Validate ahead of time, without starting the
 daemon, with `thurvtl system storage check`.
 
 - **Credentials** — `auth:` blocks, default chains, the daemon env
-  file, multi-provider layouts: [`docs/AUTH.md`](docs/AUTH.md).
+  file, multi-provider layouts: [`docs/admin/AUTH.md`](docs/admin/AUTH.md).
 - **S3-compatible provider matrix** — Backblaze B2, Wasabi, Hetzner,
-  OVHcloud, …: [`docs/S3_BACKENDS.md`](docs/S3_BACKENDS.md).
+  OVHcloud, …: [`docs/admin/S3_BACKENDS.md`](docs/admin/S3_BACKENDS.md).
 - **WORM, legal hold, at-rest encryption** (incl. provider bucket
-  setup): [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md).
+  setup): [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md).
 - **Cross-region DR, cartridge migration / archive** —
-  [`docs/SPEC.md`](docs/SPEC.md).
+  [`docs/admin/DISASTER_RECOVERY.md`](docs/admin/DISASTER_RECOVERY.md).
 
 ### Thur VTL library
 
@@ -377,7 +377,7 @@ thurvtl system stats                     # dedup analytics
 ```
 
 Cartridge lifecycle — creation flags, WORM, legal hold, at-rest
-encryption — is in [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md).
+encryption — is in [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md).
 
 ## Examples
 
@@ -413,7 +413,7 @@ sudo nvme connect -t tcp -a <target_ip> -s 4420 \
 ```
 
 The NVMe/TCP transport design (handshake, R2T flow, auth) is in
-[`docs/NVMETCP.md`](docs/NVMETCP.md).
+[`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md).
 
 ## Create a volume
 
@@ -457,44 +457,47 @@ sudo blockdev --rereadpt /dev/sdb        # or /dev/nvme0n1
 
 # Documentation
 
-**Operations:** [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
-[`docs/CLI.md`](docs/CLI.md),
-[`docs/AUTH.md`](docs/AUTH.md),
-[`docs/AUDIT.md`](docs/AUDIT.md),
-[`docs/TELEMETRY.md`](docs/TELEMETRY.md),
-[`docs/ALERTING.md`](docs/ALERTING.md),
-[`docs/RELEASING.md`](docs/RELEASING.md).
+**Operations:** [`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md),
+[`docs/admin/CLI.md`](docs/admin/CLI.md),
+[`docs/admin/AUTH.md`](docs/admin/AUTH.md),
+[`docs/admin/ENCRYPTION.md`](docs/admin/ENCRYPTION.md),
+[`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md),
+[`docs/admin/DISASTER_RECOVERY.md`](docs/admin/DISASTER_RECOVERY.md),
+[`docs/admin/AUDIT.md`](docs/admin/AUDIT.md),
+[`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md),
+[`docs/admin/ALERTING.md`](docs/admin/ALERTING.md),
+[`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
 
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) catalogues every
+[`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md) catalogues every
 configuration file and YAML key; the same per-key reference is what
 `<product> config defaults` prints, checked in under
 [`dist/`](dist/).
 
 **Conformance** — per-spec coverage tables plus the behavioral model:
 
-- [`docs/CONFORMANCE_SCSI.md`](docs/CONFORMANCE_SCSI.md) — SPC-4 /
+- [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md) — SPC-4 /
   SAM-5 / iSCSI / CHAP (shared baseline), the SSC-4 / SMC-3 tape
   surface with deliberate divergences from typical LTO hardware, and
   the SBC-3 block surface.
-- [`docs/CONFORMANCE_NVME.md`](docs/CONFORMANCE_NVME.md) —
+- [`docs/reference/CONFORMANCE_NVME.md`](docs/reference/CONFORMANCE_NVME.md) —
   NVMe Base / NVM Command Set / NVMe-oF / NVMe-TCP.
 
 **Wire-level & storage reference:**
 
-- [`docs/SPEC.md`](docs/SPEC.md) — VTL wire surface, schemas,
-  on-disk + storage-backend layout, DR / migration / archive.
-- [`docs/STORAGE.md`](docs/STORAGE.md),
-  [`docs/DEDUP.md`](docs/DEDUP.md),
-  [`docs/CARTRIDGE.md`](docs/CARTRIDGE.md),
-  [`docs/BACKPRESSURE.md`](docs/BACKPRESSURE.md),
-  [`docs/NVMETCP.md`](docs/NVMETCP.md).
+- [`docs/reference/SPEC.md`](docs/reference/SPEC.md) — VTL wire surface, schemas,
+  on-disk + storage-backend layout.
+- [`docs/reference/STORAGE.md`](docs/reference/STORAGE.md),
+  [`docs/reference/DEDUP.md`](docs/reference/DEDUP.md),
+  [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md),
+  [`docs/reference/BACKPRESSURE.md`](docs/reference/BACKPRESSURE.md),
+  [`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md).
 
 **Development:**
 
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source,
+- [`docs/dev/DEVELOPMENT.md`](docs/dev/DEVELOPMENT.md) — building from source,
   the test suite, running a daemon from the build tree.
 - [`CLAUDE.md`](CLAUDE.md) — architecture orientation and repo map.
-- [`docs/TESTCOVERAGE.md`](docs/TESTCOVERAGE.md) — per-crate line
+- [`docs/dev/TESTCOVERAGE.md`](docs/dev/TESTCOVERAGE.md) — per-crate line
   coverage and the end-to-end suite catalogue.
 - Roadmap and open work — tracked as
   [GitHub issues](https://github.com/metebalci/thur/issues).

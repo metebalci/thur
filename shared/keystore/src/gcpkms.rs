@@ -18,7 +18,7 @@
 //! the right key without also presenting the matching context bytes
 //! — same protection profile AWS KMS gives us via encryption context.
 //!
-//! Threat model + auth flow: see `docs/AUTH.md` § VSA keystore
+//! Threat model + auth flow: see `docs/admin/ENCRYPTION.md` § VSA keystore
 //! backends.
 
 use async_trait::async_trait;

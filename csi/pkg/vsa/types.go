@@ -10,7 +10,7 @@ package vsa
 //   - vsa/daemon/src/admin/snapshots.rs (CreateSnapshotRequest + responses)
 //   - shared/admin-iscsi/src/lib.rs      (AddRequest, GrantRequest,
 //     RevokeRequest, NameOnlyRequest, UserRow)
-// They are also documented in docs/openapi-admin.yaml, guarded by
+// They are also documented in docs/reference/openapi-admin.yaml, guarded by
 // vsa/daemon/tests/admin_openapi_sync.rs.
 
 // CreateVolumeRequest is the POST /api/v1/volumes body. Optional fields are

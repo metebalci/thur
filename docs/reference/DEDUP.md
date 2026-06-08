@@ -12,7 +12,7 @@ shared mechanism first, then the per-product specifics.
   volume, the volume-encryption interaction.
 
 This is the single explanation of how deduplication works. Other docs
-(`README.md`, `docs/SPEC.md`, `CLAUDE.md`,
+(`README.md`, `docs/reference/SPEC.md`, `CLAUDE.md`,
 `dist/thurvtl.defaults.yaml`) link here rather than repeating it.
 
 ## The shared mechanism

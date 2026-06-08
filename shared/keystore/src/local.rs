@@ -15,7 +15,7 @@
 //! attack surface: the attacker would already need the keystore on
 //! disk to do anything with it.
 //!
-//! Threat model documented in `docs/AUTH.md` § VSA volume
+//! Threat model documented in `docs/admin/ENCRYPTION.md` § VSA volume
 //! encryption. In short: protects ciphertext in cloud buckets +
 //! local pool against a bucket leak / cold-disk theft; does **not**
 //! protect against a compromised thurvsad host (the daemon

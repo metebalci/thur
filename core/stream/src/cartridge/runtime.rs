@@ -94,7 +94,7 @@ pub(super) struct Runtime {
     /// each `blocks-p<N>.idx`. Restore reads this map to learn the
     /// page count + file size needed to stitch a pristine local copy
     /// back together — see `index_backup.rs` for the wire format and
-    /// `docs/SPEC.md` § Index Page Backup.
+    /// `docs/reference/SPEC.md` § Index Page Backup.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub index_epoch: BTreeMap<String, IndexEpoch>,
 

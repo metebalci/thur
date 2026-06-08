@@ -40,7 +40,7 @@ library:
 # "Storage backend" is the umbrella term — local-filesystem and any
 # S3-compatible object store (AWS S3, GCS, Azure Blob, AIStore,
 # MinIO, Ceph RGW, …) all live here. See /usr/share/doc/thurvtl/AUTH.md
-# (or docs/AUTH.md in source) for the per-provider `auth:` block
+# (or docs/admin/AUTH.md in source) for the per-provider `auth:` block
 # schema in detail.
 #
 # storage:
@@ -91,7 +91,7 @@ library:
 # the values. Each encrypted cartridge binds to one named backend at
 # create time via `--keystore NAME`.
 #
-# See /usr/share/doc/thurvtl/AUTH.md (or docs/AUTH.md in
+# See /usr/share/doc/thurvtl/AUTH.md (or docs/admin/AUTH.md in
 # source) for the per-provider `auth:` block schema in detail.
 #
 # keystore:

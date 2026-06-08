@@ -727,7 +727,7 @@ impl Library {
         // VTL ships as a clean LTO-8 drive. We keep the LTO-7
         // descriptor in REPORT DENSITY SUPPORT (matching real LTO-8
         // drive backwards-read advertisement) but don't model
-        // LTO-7 cartridge creation. See docs/CONFORMANCE_SCSI.md.
+        // LTO-7 cartridge creation. See docs/reference/CONFORMANCE_SCSI.md.
         if lto_generation != 8 {
             return Err(SmcError::InvalidOp("lto_generation must be 8"));
         }

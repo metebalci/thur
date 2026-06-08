@@ -585,7 +585,7 @@ enum CartridgeAction {
         ///
         /// The VTL ships as a clean LTO-8 drive — only `8` is
         /// accepted today. The flag is kept for forward-compat with
-        /// future LTO-9 support (see docs/LTO-9.md). Falls back
+        /// future LTO-9 support (see docs/dev/LTO-9.md). Falls back
         /// to the library default when omitted.
         #[arg(long, value_parser = clap::value_parser!(u8).range(8..=8))]
         lto_generation: Option<u8>,
