@@ -154,7 +154,7 @@ if [ "$1" = "1" ]; then
 Thur VSA installed. To get running:
   1. Edit /etc/thurvsa/thurvsa.yaml — minimal starter; data_dir
      defaults to /var/lib/thurvsa, you just uncomment a
-     cloud.backends entry. Full reference for every key:
+     storage.backends entry. Full reference for every key:
      /usr/share/doc/thurvsa/thurvsa.defaults.yaml
   2. sudo systemctl enable --now thurvsad
   3. thurvsa volume create myvol --size 100G

@@ -41,25 +41,25 @@ sudo usermod -aG thurvtl $USER     # and/or thurvsa
 
 ### 1. Configure
 
-Edit `/etc/thurvtl/thurvtl.yaml` down to three things — a data dir, one
-storage backend, and the chassis declaration:
+The packaged starter `/etc/thurvtl/thurvtl.yaml` already sets `data_dir`
+(`/var/lib/thurvtl`) and a default library (40 slots, 3 drives, LTO-8),
+so the **only** thing you must add is a storage backend. Uncomment the
+`storage:` block and its `local` example (no cloud account needed):
 
 ```yaml
-data_dir: /var/lib/thurvtl
+# data_dir and the library: block are already set by the starter;
+# this is the one block you uncomment. Name the backend anything.
 storage:
   backends:
-    local:
+    primary:
       type: local
       root_dir: /var/lib/thurvtl/storage-local
-library:
-  num_slots: 40       # storage slots
-  num_drives: 2       # tape drives
-  lto_generation: 8   # LTO-8
 ```
 
-The daemon materializes `<data_dir>/library/library.json` from the
-`library:` block on first start. `thurvtl config defaults` prints the
-full annotated reference for every key.
+To change the chassis later, edit the starter's `library:` block — the
+daemon materializes `<data_dir>/library/library.json` from it on first
+start. `thurvtl config defaults` prints the annotated reference for
+every key.
 
 ### 2. Run
 
@@ -114,14 +114,17 @@ in [`admin/CONNECTING.md`](admin/CONNECTING.md).
 
 ### 1. Configure
 
-Edit `/etc/thurvsa/thurvsa.yaml` — a data dir and one backend is the
-minimum (no `library:` block; VSA serves block volumes):
+The packaged starter `/etc/thurvsa/thurvsa.yaml` already sets `data_dir`
+(`/var/lib/thurvsa`). The **only** thing you must add is a storage
+backend — uncomment the `storage:` block and its `local` example (no
+`library:` block; VSA serves block volumes):
 
 ```yaml
-data_dir: /var/lib/thurvsa
+# data_dir is already set by the starter; this is the one block you
+# uncomment. Name the backend anything.
 storage:
   backends:
-    local:
+    primary:
       type: local
       root_dir: /var/lib/thurvsa/storage-local
 # transports: [iscsi]        # default; use [iscsi, nvmetcp] to serve both
