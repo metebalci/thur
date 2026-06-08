@@ -200,8 +200,8 @@ refuses to start with a `LibraryConfig` error and writes nothing.
 | 0x03 | REQUEST SENSE | Fixed + descriptor format |
 | 0x12 | INQUIRY | Standard + VPD pages |
 | 0xA0 | REPORT LUNS | LUN 0 (changer) + LUN 1..N (drives) |
-| 0x1A | MODE SENSE(6) | |
-| 0x5A | MODE SENSE(10) | |
+| 0x1A | MODE SENSE(6) | 8-byte short block descriptor (block length 0 = variable-block) unless DBD=1. |
+| 0x5A | MODE SENSE(10) | LLBAA=1 returns the 16-byte long-LBA block descriptor (64-bit block count 0 + 32-bit block length 0 = variable-block); LLBAA=0 the 8-byte short form; DBD=1 suppresses it. |
 | 0x15 | MODE SELECT(6) | |
 | 0x55 | MODE SELECT(10) | |
 | 0x4D | LOG SENSE | |

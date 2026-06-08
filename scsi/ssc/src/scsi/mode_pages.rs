@@ -143,14 +143,31 @@ pub fn handle_mode_sense_10(
     let mut response = Vec::new();
 
     // MODE PARAMETER HEADER (8 bytes for MODE SENSE(10)).
-    // medium_type=0 (default), device_specific=0.
-    write_mode_param_header_10(&mut response, 0x00, 0x00, llbaa, if dbd { 0 } else { 8 });
+    // medium_type=0 (default), device_specific=0. Declared
+    // block-descriptor length must match what we actually emit below:
+    // 16 for the long-LBA descriptor, 8 for the short one, 0 when DBD
+    // suppresses it.
+    let block_descriptor_length: u16 = if dbd {
+        0
+    } else if llbaa {
+        16
+    } else {
+        8
+    };
+    write_mode_param_header_10(&mut response, 0x00, 0x00, llbaa, block_descriptor_length);
 
     // Add block descriptor if not disabled
     if !dbd {
         if llbaa {
-            // Long LBA block descriptor (32 bytes)
-            response.extend_from_slice(&[0; 32]); // Simplified for MVP
+            // Long LBA block descriptor (SPC-3 §7.5.6, 16 bytes):
+            // 64-bit NUMBER OF LOGICAL BLOCKS (0 = all available) +
+            // 4 reserved + 32-bit BLOCK LENGTH (0 = variable-block
+            // mode). Same variable-block semantics as the short
+            // descriptor below — just the long format the host
+            // requested via LLBAA=1.
+            response.extend_from_slice(&[0x00; 8]); // number of logical blocks = 0
+            response.extend_from_slice(&[0x00; 4]); // reserved
+            response.extend_from_slice(&[0x00; 4]); // block length 0 = variable
         } else {
             // Short block descriptor (8 bytes). Same rationale as MODE SENSE(6):
             // advertise block length 0 to keep the kernel in variable-block mode.
@@ -1580,5 +1597,71 @@ mod tests {
         assert_eq!(layout.additional_partitions, 1);
         assert_eq!(layout.psum, 2); // MiB
         assert_eq!(layout.partition_sizes, vec![1024, 0xFFFF]);
+    }
+
+    #[test]
+    fn mode_sense_10_llbaa_emits_16_byte_long_block_descriptor() {
+        // Issue #98: LLBAA=1 must declare a 16-byte long-LBA block
+        // descriptor in the header AND emit exactly that many bytes (the
+        // old stub declared 8 but emitted 32 zeros).
+        let data = handle_mode_sense_10(
+            0x0A,
+            0xF0,
+            PageControl::Current,
+            false, // dbd
+            true,  // llbaa
+            snap(1),
+            comp_off(),
+            &empty_saved(),
+        )
+        .expect("MODE SENSE(10) LLBAA=1 should succeed");
+
+        // Header byte 4: LONGLBA bit set.
+        assert_eq!(data[4] & 0x01, 0x01, "LONGLBA bit set");
+        // Header bytes 6-7: declared block-descriptor length == 16.
+        assert_eq!(
+            u16::from_be_bytes([data[6], data[7]]),
+            16,
+            "declared long-LBA block-descriptor length"
+        );
+        // The 16 descriptor bytes — variable-block tape: all zero.
+        assert_eq!(
+            &data[8..24],
+            &[0u8; 16],
+            "long-LBA descriptor is variable-block zeros"
+        );
+        // Page 0x0A header (PS|SPF|0x0A = 0xCA) begins exactly after the
+        // 16-byte descriptor — proves emitted length == declared length.
+        assert_eq!(data[24], 0xCA, "page header follows the 16-byte descriptor");
+        // MODE DATA LENGTH (bytes 0-1) accounts for the whole response.
+        assert_eq!(
+            u16::from_be_bytes([data[0], data[1]]) as usize,
+            data.len() - 2,
+            "MODE DATA LENGTH = total - 2"
+        );
+    }
+
+    #[test]
+    fn mode_sense_10_short_descriptor_unchanged() {
+        // LLBAA=0 regression guard: 8-byte short descriptor, page at
+        // offset 8 + 8 = 16.
+        let data = handle_mode_sense_10(
+            0x0A,
+            0xF0,
+            PageControl::Current,
+            false,
+            false,
+            snap(1),
+            comp_off(),
+            &empty_saved(),
+        )
+        .expect("MODE SENSE(10) LLBAA=0 should succeed");
+        assert_eq!(data[4] & 0x01, 0x00, "LONGLBA bit clear");
+        assert_eq!(
+            u16::from_be_bytes([data[6], data[7]]),
+            8,
+            "short block-descriptor length"
+        );
+        assert_eq!(data[16], 0xCA, "page header follows the 8-byte descriptor");
     }
 }
