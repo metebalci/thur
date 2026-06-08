@@ -4,11 +4,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL Legal Hold Lifecycle (storage-native)
+# Thur VTL Legal Hold Lifecycle (cloud-native)
 #
 # End-to-end CLI coverage of `thurvtl cartridge legal-hold
 # {set,clear,status}` and the migrate gate that refuses a held
-# cartridge. Legal hold is storage-native — the provider's per-object
+# cartridge. Legal hold is cloud-native — the provider's per-object
 # hold primitive (S3 PutObjectLegalHold / GCS eventBasedHold / Azure
 # legal hold) is the only source of truth, so this test REQUIRES a
 # storage backend whose bucket/container has Object Lock (S3) or the
@@ -28,7 +28,7 @@
 # Selection: set THURVTL_TEST_BACKEND to the name of an entry under
 # `storage.backends:` in $THURVTL_SOURCE_BACKENDS (default
 # private/storage-backends.yaml). That entry MUST:
-#   - not be `type: local`            (legal hold is storage-only)
+#   - not be `type: local`            (legal hold is cloud-only)
 #   - have `retention_mode: none`     (so the daemon starts and the
 #                                       test can clear its own holds)
 #   - point at a bucket with Object Lock ENABLED (PutObjectLegalHold
@@ -164,7 +164,7 @@ trap cleanup EXIT INT TERM
 resolve_backend() {
     if [[ -z "${THURVTL_TEST_BACKEND:-}" ]]; then
         log_error "THURVTL_TEST_BACKEND is not set."
-        echo "Legal hold is storage-native; set it to a non-local, Object-Lock-enabled backend"
+        echo "Legal hold is cloud-native; set it to a non-local, Object-Lock-enabled backend"
         echo "defined in $SOURCE_BACKENDS. Example:"
         echo "  THURVTL_TEST_BACKEND=governance $0"
         exit 1
@@ -199,7 +199,7 @@ resolve_backend() {
     retention=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
 
     if [[ "$BACKEND_TYPE" == "local" ]]; then
-        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is storage-native and cannot be tested locally."
+        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is cloud-native and cannot be tested locally."
         echo "Select a storage backend whose bucket has Object Lock / legal-hold enabled."
         exit 1
     fi
@@ -414,7 +414,7 @@ test_migrate_permitted_after_clear() {
 
 main() {
     echo "================================================"
-    echo "Thur VTL Legal Hold Lifecycle (storage-native)"
+    echo "Thur VTL Legal Hold Lifecycle (cloud-native)"
     echo "================================================"
     echo ""
 

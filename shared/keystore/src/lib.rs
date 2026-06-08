@@ -45,7 +45,7 @@ pub use keystore_config::{
     GcpKmsBackendConfig, KeystoreBackendEntry, KeystoreYamlConfig, KmipBackendConfig, KmipCaBundle,
     KmipCredential, KmipMtls, LocalBackendConfig, ResolvedAwsKmsAuth, ResolvedAzureKvAuth,
     ResolvedGcpKmsAuth, ResolvedKmipCaBundle, ResolvedKmipCredential, ResolvedKmipMtls,
-    ResolvedVaultAuth, VaultAuth, VaultBackendConfig, reject_legacy_keystore_backends_json,
+    ResolvedVaultAuth, VaultAuth, VaultBackendConfig,
 };
 pub use kmip::KmipBackend;
 pub use local::{KEYS_SUBDIR, LocalBackend};

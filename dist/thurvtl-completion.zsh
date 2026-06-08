@@ -2451,7 +2451,7 @@ _thurvtl__subcmd__cartridge_commands() {
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (storage-native)' \
+'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2483,7 +2483,7 @@ _thurvtl__subcmd__cartridge__subcmd__help_commands() {
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (storage-native)' \
+'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2901,7 +2901,7 @@ _thurvtl__subcmd__help__subcmd__cartridge_commands() {
 'list:List all cartridges with metadata' \
 'info:Show detailed cartridge information' \
 'reset-stats:Reset a cartridge'\''s activity stats to zero' \
-'legal-hold:Per-cartridge legal hold (storage-native)' \
+'legal-hold:Per-cartridge legal hold (cloud-native)' \
 'key:At-rest encryption DEK management' \
     )
     _describe -t commands 'thurvtl help cartridge commands' commands "$@"

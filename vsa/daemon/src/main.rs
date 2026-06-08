@@ -149,11 +149,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // One-shot migration guard for the keystore-backends JSON
-    // sidecar — now under `keystore.backends:` in the YAML conffile.
-    shared_keystore::reject_legacy_keystore_backends_json(&data_dir, &config_path)
-        .map_err(anyhow::Error::msg)?;
-
     // Validate storage backend definitions (from YAML storage.backends:).
     cfg.storage
         .validate_backends()

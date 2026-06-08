@@ -702,34 +702,6 @@ impl KeystoreYamlConfig {
     }
 }
 
-/// Refuse to start if a legacy `<data_dir>/keystore-backends.json` is
-/// still present — pre-alpha.3 installs kept keystore-backend
-/// definitions in that file, which has since moved into the YAML
-/// conffile under `keystore.backends:`. The daemon halts rather than
-/// silently ignore the stale state.
-pub fn reject_legacy_keystore_backends_json(
-    data_dir: &Path,
-    config_path: &Path,
-) -> std::result::Result<(), String> {
-    let legacy = data_dir.join("keystore-backends.json");
-    if !legacy.exists() {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to start: {legacy} exists.\n\
-         \n\
-         Keystore-backend definitions now live in the YAML conffile.\n\
-         Copy each entry from {legacy} into the `keystore.backends:`\n\
-         block of {config_path}, then remove {legacy}. The JSON\n\
-         shape maps 1:1 to YAML — keys and field names are unchanged.\n\
-         \n\
-         See the Thur docs (docs/admin/ENCRYPTION.md) at\n\
-         https://github.com/metebalci/thur for the YAML shape per provider.",
-        legacy = legacy.display(),
-        config_path = config_path.display(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,23 +737,6 @@ backends:
     fn empty_yaml_decodes_to_default() {
         let cfg: KeystoreYamlConfig = serde_yaml::from_str("").expect("decode");
         assert!(cfg.backends.is_empty());
-    }
-
-    #[test]
-    fn reject_legacy_no_file_ok() {
-        let dir = TempDir::new().unwrap();
-        let cfg_path = dir.path().join("thurvsa.yaml");
-        reject_legacy_keystore_backends_json(dir.path(), &cfg_path).unwrap();
-    }
-
-    #[test]
-    fn reject_legacy_with_file_errors() {
-        let dir = TempDir::new().unwrap();
-        let cfg_path = dir.path().join("thurvsa.yaml");
-        let legacy = dir.path().join("keystore-backends.json");
-        std::fs::write(&legacy, b"{}").unwrap();
-        let err = reject_legacy_keystore_backends_json(dir.path(), &cfg_path).unwrap_err();
-        assert!(err.contains("keystore.backends:"));
     }
 
     #[test]

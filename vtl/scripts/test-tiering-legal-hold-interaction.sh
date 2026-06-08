@@ -4,14 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 #
-# Thur VTL Tiering x Legal Hold Interaction (storage-native)
+# Thur VTL Tiering x Legal Hold Interaction (cloud-native)
 #
 # Asserts the safety-critical gate where cartridge tiering meets legal
 # hold: a cartridge under legal hold is NEVER moved by tiering — it is
 # excluded at plan time (TieringPlanReport.excluded_legal_hold) and
 # never attempted by run-now. Clearing the hold lifts the exclusion.
 #
-# Legal hold is storage-native (provider per-object hold is the only
+# Legal hold is cloud-native (provider per-object hold is the only
 # source of truth), so this REQUIRES a storage backend with Object Lock /
 # legal-hold enabled and cannot run against `local`. See
 # test-legal-hold-lifecycle.sh for the backend/bucket requirements;
@@ -176,7 +176,7 @@ resolve_backend() {
     local retention
     retention=$(yq -r ".storage.backends.\"$THURVTL_TEST_BACKEND\".retention_mode // \"none\"" "$SOURCE_BACKENDS")
     if [[ "$BACKEND_TYPE" == "local" ]]; then
-        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is storage-native."
+        log_error "Backend '$THURVTL_TEST_BACKEND' is type 'local' — legal hold is cloud-native."
         exit 1
     fi
     if [[ "$retention" != "none" ]]; then

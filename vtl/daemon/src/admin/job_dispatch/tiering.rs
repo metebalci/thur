@@ -14,7 +14,7 @@
 //!      ([`core_mediachanger::plan_moves`]) with `legal_held = false`
 //!      to get the provisional move set — the cartridges a policy
 //!      would relocate.
-//!   3. For *only* those candidates, read storage-native legal-hold
+//!   3. For *only* those candidates, read cloud-native legal-hold
 //!      state (one HEAD per cartridge, bounded concurrency). Held
 //!      cartridges are excluded (hard rule); read failures are
 //!      surfaced as skips; candidates on a `local` backend are treated
@@ -213,7 +213,7 @@ fn run_report_from_plan(
 }
 
 /// Shared plan computation for `plan` and `run-now`: scan the
-/// inventory, evaluate the policies, then read storage-native legal hold
+/// inventory, evaluate the policies, then read cloud-native legal hold
 /// for the move candidates. Returns the full plan, or an error string
 /// if the blocking disk scan panicked.
 async fn compute_plan(
@@ -292,7 +292,7 @@ async fn compute_plan(
         let handle = handles.get(&mv.source_backend).cloned();
         async move {
             match handle {
-                // A local backend cannot carry a storage-native hold, so
+                // A local backend cannot carry a cloud-native hold, so
                 // short-circuit rather than issuing a read that would
                 // error with NotSupported and wrongly skip the move.
                 Some(h) if h.backend_type() == "local" => (mv, Some(Ok(false))),

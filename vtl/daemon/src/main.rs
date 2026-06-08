@@ -883,12 +883,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to acquire daemon lock: {}", e))?;
     info!("Daemon lock acquired");
 
-    // Refuse to start if a legacy keystore-backends.json sidecar is still
-    // around — definitions now live in the YAML under `keystore.backends:`.
     let data_dir_path = std::path::PathBuf::from(&cfg.data_dir);
-    let config_path_buf = std::path::PathBuf::from(&config_path);
-    shared_keystore::reject_legacy_keystore_backends_json(&data_dir_path, &config_path_buf)
-        .map_err(anyhow::Error::msg)?;
     cfg.storage
         .validate_backends()
         .map_err(|e| anyhow::anyhow!("validate storage.backends in {}: {}", config_path, e))?;

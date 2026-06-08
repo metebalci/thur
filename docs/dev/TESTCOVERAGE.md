@@ -210,7 +210,7 @@ full backup / filesystem round-trip.
 | `test-lifecycle-cartridge-migrate.sh` | cartridge migrate + archive between backends |
 | `test-lifecycle-dr-restore.sh` | cross-region disaster-recovery restore |
 | `test-tiering-plan-and-run.sh` | tiering plan / run-now / status CLI surface (two local backends) |
-| `test-legal-hold-lifecycle.sh` | storage-native legal hold set/clear/status + migrate-gate refusal (Object-Lock backend) |
+| `test-legal-hold-lifecycle.sh` | cloud-native legal hold set/clear/status + migrate-gate refusal (Object-Lock backend) |
 | `test-tiering-legal-hold-interaction.sh` | tiering excludes a legal-held cartridge from plan + run-now (Object-Lock backend) |
 | `test-pipeline-layers.sh` | dedup / compression / encryption layer matrix |
 

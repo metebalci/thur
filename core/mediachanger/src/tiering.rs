@@ -21,7 +21,7 @@
 //!
 //! Two invariants are enforced here rather than left to callers:
 //!   - **Legal-held cartridges are never tiered.** Legal hold is
-//!     storage-native-only with no transfer logic; relocating a held
+//!     cloud-native-only with no transfer logic; relocating a held
 //!     cartridge would silently drop the hold. Held cartridges are
 //!     excluded outright, no per-policy opt-in.
 //!   - **First match wins.** Policies are an ordered rule list; the

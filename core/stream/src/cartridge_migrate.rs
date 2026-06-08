@@ -254,7 +254,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
     }
 
     // Legal-hold gate. A held cartridge must never be relocated: the
-    // hold is storage-native (provider object-lock) with no cross-backend
+    // hold is cloud-native (provider object-lock) with no cross-backend
     // transfer path, so moving its chunks would silently drop it. Read
     // the source-side sentinel and refuse if held. Fires before the
     // dry-run short-circuit so a preview can't claim a held cartridge
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn hold_check_treats_not_supported_as_unheld() {
-        // A local backend can't carry a storage-native hold.
+        // A local backend can't carry a cloud-native hold.
         let r = hold_check_permits(Err(ObjectStoreError::NotSupported("local".into())));
         assert!(r.is_ok());
     }

@@ -122,8 +122,7 @@ keystore:
 This is the same schema as the pre-alpha.3 `keystore-backends.json`
 file — only the location moved into the conffile and the `version`
 envelope was dropped. Because JSON is valid YAML, old JSON entries copy
-in 1:1. A leftover `<data_dir>/keystore-backends.json` is treated as a
-stale artifact and makes the daemon refuse to start.
+in 1:1.
 
 Each keystore backend's `auth:` block mirrors the strict-override
 semantics of the storage `S3Auth` and `AzureAuth` blocks in

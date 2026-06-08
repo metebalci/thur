@@ -789,7 +789,7 @@ enum CartridgeAction {
         barcode: String,
     },
 
-    /// Per-cartridge legal hold (storage-native).
+    /// Per-cartridge legal hold (cloud-native).
     ///
     /// Provider primitives are the only source of truth — no local
     /// "is held" flag is kept. Refuses against the local backend.

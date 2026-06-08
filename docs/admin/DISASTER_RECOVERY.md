@@ -227,7 +227,7 @@ One entry per invocation:
 
 Both Ok and Err paths audited (failures carry `result: Error(reason)`).
 
-Migration of any kind refuses a cartridge under a storage-native legal
+Migration of any kind refuses a cartridge under a cloud-native legal
 hold (the hold has no cross-backend transfer path), so neither
 `cartridge migrate` nor `system tiering run-now` can relocate a held
 cartridge.

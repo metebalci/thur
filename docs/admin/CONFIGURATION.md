@@ -215,7 +215,7 @@ deliberately omitted — the only "last write" signal available today
 is a local-only index that is zero-filled on restore, so it cannot be
 trusted across DR.
 
-Cartridges under a storage-native legal hold are always excluded from
+Cartridges under a cloud-native legal hold are always excluded from
 tiering, with no per-policy opt-in: a hold has no host-visible signal
 and no cross-backend transfer path, so relocating a held cartridge
 would silently drop the hold. `plan` reads each move candidate's hold
