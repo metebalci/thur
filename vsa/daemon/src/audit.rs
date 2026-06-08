@@ -16,25 +16,47 @@
 //! / [`nvme_tcp::LoginAuditSink`] adapters that forward into the
 //! shared `AuditChannel`.
 //!
-//! There's no audit-chain rate-limiter wired up yet — the failure
-//! rows write one-per-event (the per-host/per-NQN brute-force *alert*
-//! is already deduped + thresholded in `shared-alerting`), and chain
-//! floods haven't shown up in practice. When thurvsa grows more
-//! host-driven failure paths (e.g. WORM refusals, ACL violations
-//! against volume admin ops) the `AuditRateLimiter` from shared-audit
-//! drops in unchanged.
+//! Both login-failure paths are guarded by an [`AuditRateLimiter`]
+//! (60 s window, matching VTL's `scsi-ssc` data-path limiter): the
+//! first failure for a given `<op>:<peer>:<user-or-nqn>:<reason>` key
+//! emits a chain row as usual, same-key repeats inside the window are
+//! silently counted, and the daemon's flush task ([`run_audit_ratelimit_flush`])
+//! drains each expired window into a single rollup row. This bounds a
+//! CHAP / DH-HMAC-CHAP brute-force from flooding the BLAKE3-chained
+//! log with one row per attempt. Success rows and lifecycle events
+//! (`daemon.start`) bypass the limiter — same opt-in policy as VTL.
+//! The per-host/per-NQN brute-force *alert* is a separate mechanism,
+//! already deduped + thresholded in `shared-alerting` (issue #68).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use shared_audit::{
-    AuditActor, AuditChannel, AuditConfig, AuditLog, AuditMode, AuditResult, AuditWriterHandle,
-    spawn_writer,
+    AuditActor, AuditChannel, AuditConfig, AuditLog, AuditMode, AuditRateLimitDecision,
+    AuditRateLimitRollup, AuditRateLimiter, AuditResult, AuditWriterHandle, spawn_writer,
 };
 use shared_iscsi::transport::{LoginAuditEvent, LoginAuditSink};
 
 use crate::config::AuditSettings;
+
+/// Suppression window for the login-failure audit rate-limiter. 60 s
+/// to match VTL's `scsi-ssc` data-path limiter.
+pub const AUDIT_RATELIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Cadence at which [`run_audit_ratelimit_flush`] drains expired
+/// suppression windows. Well below [`AUDIT_RATELIMIT_WINDOW`] so the
+/// steady-state lag between window expiry and rollup emission is
+/// bounded.
+pub const AUDIT_RATELIMIT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Construct the shared login-failure audit rate-limiter. Cloned into
+/// both [`LoginAuditSink`] adapters and the flush task; drained at
+/// shutdown.
+pub fn new_audit_ratelimiter() -> Arc<AuditRateLimiter> {
+    Arc::new(AuditRateLimiter::new(AUDIT_RATELIMIT_WINDOW))
+}
 
 /// Resolve the on-disk audit directory. Defaults to
 /// `<data_dir>/audit/` when `audit.dir` is unset.
@@ -105,11 +127,15 @@ pub async fn boot_audit_log(dir: PathBuf, instance_id: Option<&str>) -> Result<A
 /// uniformly.
 pub struct IscsiDiskLoginAudit {
     channel: AuditChannel,
+    ratelimiter: Arc<AuditRateLimiter>,
 }
 
 impl IscsiDiskLoginAudit {
-    pub fn new(channel: AuditChannel) -> Self {
-        Self { channel }
+    pub fn new(channel: AuditChannel, ratelimiter: Arc<AuditRateLimiter>) -> Self {
+        Self {
+            channel,
+            ratelimiter,
+        }
     }
 }
 
@@ -141,7 +167,25 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
                 reason,
                 error,
             } => {
+                // Alert side runs unconditionally (independent of the
+                // audit rate-limiter): the alerting dispatcher keeps
+                // its own per-user counter across the window and fires
+                // WARN once `alerting.chap_failures_threshold` is hit.
+                if let Some(u) = user {
+                    shared_alerting::record::chap_failure(u, peer);
+                }
                 let actor = AuditActor::iscsi(initiator.map(str::to_string), peer.to_string());
+                // Rate-limit the chain row: one emission per distinct
+                // (peer, user, reason) tuple in the window, then a
+                // rollup. Caps a brute-force from flooding the chain.
+                let user_label = user.unwrap_or("-");
+                let key = format!("iscsi.chap.failure:{peer}:{user_label}:{reason}");
+                if matches!(
+                    self.ratelimiter.decide(key, "iscsi.chap.failure", &actor),
+                    AuditRateLimitDecision::Suppress
+                ) {
+                    return;
+                }
                 self.channel.try_append(
                     "iscsi.chap.failure",
                     actor,
@@ -152,13 +196,6 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
                     }),
                     AuditResult::Error(error),
                 );
-                // Alert side: per-user counter with threshold from
-                // `alerting.chap_failures_threshold`. Audit row goes
-                // out every time; the WARN alert only when the count
-                // for this user inside the dedup window crosses N.
-                if let Some(u) = user {
-                    shared_alerting::record::chap_failure(u, peer);
-                }
             }
         }
     }
@@ -174,11 +211,15 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
 /// shape iSCSI CHAP already has.
 pub struct NvmetcpLoginAudit {
     channel: AuditChannel,
+    ratelimiter: Arc<AuditRateLimiter>,
 }
 
 impl NvmetcpLoginAudit {
-    pub fn new(channel: AuditChannel) -> Self {
-        Self { channel }
+    pub fn new(channel: AuditChannel, ratelimiter: Arc<AuditRateLimiter>) -> Self {
+        Self {
+            channel,
+            ratelimiter,
+        }
     }
 }
 
@@ -207,7 +248,23 @@ impl nvme_tcp::LoginAuditSink for NvmetcpLoginAudit {
                 reason,
                 error,
             } => {
+                // Alert side runs unconditionally: the host NQN is the
+                // brute-force counter key (NVMe's equivalent of the
+                // CHAP username). The WARN alert fires only when this
+                // host's failure count inside the dedup window crosses
+                // `alerting.chap_failures_threshold`.
+                shared_alerting::record::chap_failure(host_nqn, peer);
                 let actor = AuditActor::nvme(host_nqn, peer.to_string());
+                // Rate-limit the chain row the same way the iSCSI sink
+                // does — keyed by (peer, host_nqn, reason).
+                let key = format!("nvmetcp.dhchap.failure:{peer}:{host_nqn}:{reason}");
+                if matches!(
+                    self.ratelimiter
+                        .decide(key, "nvmetcp.dhchap.failure", &actor),
+                    AuditRateLimitDecision::Suppress
+                ) {
+                    return;
+                }
                 self.channel.try_append(
                     "nvmetcp.dhchap.failure",
                     actor,
@@ -217,13 +274,50 @@ impl nvme_tcp::LoginAuditSink for NvmetcpLoginAudit {
                     }),
                     AuditResult::Error(error),
                 );
-                // Alert side: the host NQN is the brute-force counter
-                // key (NVMe's equivalent of the CHAP username). Audit
-                // row goes out every time; the WARN alert only when this
-                // host's failure count inside the dedup window crosses
-                // `alerting.chap_failures_threshold`.
-                shared_alerting::record::chap_failure(host_nqn, peer);
             }
+        }
+    }
+}
+
+/// Append one rate-limit rollup row to the audit chain. Best-effort:
+/// the original first emission and the suppression already told the
+/// host something is flooding, so a dropped rollup is non-fatal. Same
+/// shape VTL's `emit_audit_ratelimit_rollup` writes — `Error` result
+/// with the suppressed count + window so a chain reader spots it.
+pub fn emit_audit_ratelimit_rollup(channel: &AuditChannel, rollup: &AuditRateLimitRollup) {
+    let params = serde_json::json!({
+        "suppressed_count": rollup.suppressed_count,
+        "window_seconds": rollup.window_seconds,
+        "key": rollup.key,
+    });
+    let detail = format!(
+        "{} additional event(s) suppressed in {}s window",
+        rollup.suppressed_count, rollup.window_seconds
+    );
+    channel.try_append(
+        &rollup.op,
+        rollup.actor.clone(),
+        params,
+        AuditResult::Error(detail),
+    );
+}
+
+/// Periodic flush task. Drains expired suppression windows every
+/// [`AUDIT_RATELIMIT_FLUSH_INTERVAL`] and writes one rollup row per
+/// window. Runs until aborted at shutdown; the shutdown path does a
+/// final `flush_all` to drain still-open windows.
+pub async fn run_audit_ratelimit_flush(limiter: Arc<AuditRateLimiter>, channel: AuditChannel) {
+    let mut ticker = tokio::time::interval(AUDIT_RATELIMIT_FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tracing::info!(
+        "audit ratelimit: flush task started (interval={}s, window={}s)",
+        AUDIT_RATELIMIT_FLUSH_INTERVAL.as_secs(),
+        limiter.window().as_secs(),
+    );
+    loop {
+        ticker.tick().await;
+        for rollup in limiter.flush_expired() {
+            emit_audit_ratelimit_rollup(&channel, &rollup);
         }
     }
 }
@@ -287,7 +381,7 @@ mod tests {
         let boot = boot_audit_log(dir.clone(), None)
             .await
             .expect("audit log boots");
-        let sink = IscsiDiskLoginAudit::new(boot.channel.clone());
+        let sink = IscsiDiskLoginAudit::new(boot.channel.clone(), new_audit_ratelimiter());
 
         sink.record(LoginAuditEvent::ChapSuccess {
             peer: "10.0.0.1:3260",
@@ -325,7 +419,7 @@ mod tests {
         let boot = boot_audit_log(dir.clone(), None)
             .await
             .expect("audit log boots");
-        let sink = NvmetcpLoginAudit::new(boot.channel.clone());
+        let sink = NvmetcpLoginAudit::new(boot.channel.clone(), new_audit_ratelimiter());
 
         nvme_tcp::LoginAuditSink::record(
             &sink,
@@ -361,5 +455,96 @@ mod tests {
         assert!(combined.contains("\"nvme\""));
         assert!(combined.contains("uuid:good"));
         assert!(combined.contains("uuid:bad"));
+    }
+
+    /// Count chain lines for a given op, split into normal rows and
+    /// rate-limit rollup rows (the latter carry `suppressed_count`).
+    fn count_op_rows(dir: &Path, op: &str) -> (usize, usize) {
+        let (mut rows, mut rollups) = (0, 0);
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                if !line.contains(op) {
+                    continue;
+                }
+                if line.contains("suppressed_count") {
+                    rollups += 1;
+                } else {
+                    rows += 1;
+                }
+            }
+        }
+        (rows, rollups)
+    }
+
+    /// A burst of same-key CHAP failures collapses to one chain row
+    /// plus one rollup carrying `suppressed_count = N-1` — the core
+    /// brute-force-flood guarantee (issue #101).
+    #[tokio::test]
+    async fn chap_failure_burst_collapses_to_one_row_plus_rollup() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        let boot = boot_audit_log(dir.clone(), None)
+            .await
+            .expect("audit log boots");
+        let rl = new_audit_ratelimiter();
+        let sink = IscsiDiskLoginAudit::new(boot.channel.clone(), Arc::clone(&rl));
+
+        const N: u64 = 8;
+        for _ in 0..N {
+            sink.record(LoginAuditEvent::ChapFailure {
+                peer: "10.0.0.2:3260",
+                initiator: Some("iqn.bad"),
+                user: Some("mallory"),
+                reason: "secret mismatch",
+                error: "auth failed".to_string(),
+            });
+        }
+
+        // Drain the still-open window the way the shutdown path does.
+        let rollups = rl.flush_all();
+        assert_eq!(rollups.len(), 1, "one suppression window drained");
+        assert_eq!(rollups[0].op, "iscsi.chap.failure");
+        assert_eq!(rollups[0].suppressed_count, N - 1);
+        emit_audit_ratelimit_rollup(&boot.channel, &rollups[0]);
+
+        boot.writer.shutdown().await;
+
+        let (rows, rollup_rows) = count_op_rows(&dir, "iscsi.chap.failure");
+        assert_eq!(rows, 1, "all but the first same-key failure suppressed");
+        assert_eq!(rollup_rows, 1, "one rollup carries the suppressed count");
+    }
+
+    /// Distinct failure reasons key independent windows, so a second
+    /// failure mode is never masked by a flood of the first.
+    #[tokio::test]
+    async fn distinct_reasons_each_emit_a_row() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        let boot = boot_audit_log(dir.clone(), None)
+            .await
+            .expect("audit log boots");
+        let rl = new_audit_ratelimiter();
+        let sink = IscsiDiskLoginAudit::new(boot.channel.clone(), Arc::clone(&rl));
+
+        for reason in ["secret mismatch", "unknown user"] {
+            sink.record(LoginAuditEvent::ChapFailure {
+                peer: "10.0.0.2:3260",
+                initiator: Some("iqn.bad"),
+                user: Some("mallory"),
+                reason,
+                error: "auth failed".to_string(),
+            });
+        }
+        assert!(rl.flush_all().is_empty(), "no suppressions across keys");
+
+        boot.writer.shutdown().await;
+
+        let (rows, rollup_rows) = count_op_rows(&dir, "iscsi.chap.failure");
+        assert_eq!(rows, 2, "each distinct reason emits its own row");
+        assert_eq!(rollup_rows, 0, "no rollups when nothing was suppressed");
     }
 }

@@ -166,27 +166,44 @@ iSCSI path, append failures are logged and swallowed.
 A misbehaving initiator — one presenting a wrong CHAP secret or
 sending a broken PREVENT/ALLOW sequence — can generate the same
 failure event on every retry, flooding the chain with near-duplicate
-entries. A small allowlist of host-driven failure operations is
-rate-limited in `vtl/daemon/src/iscsi/protocol.rs::audit_append`:
+entries. Both products rate-limit a small allowlist of host-driven
+failure operations through the same `shared-audit` limiter; only the
+emission sites differ.
+
+**Thur VTL** wires it on the data path in
+`scsi/ssc/src/dispatch/audit.rs::{audit_append, ratelimit_key_for}`
+(the drive-LUN + SMC dispatch) and on the login path in the
+`LoginAuditSink` at `vtl/daemon/src/iscsi/server.rs`:
 
 | Op | Bucket key |
 |---|---|
 | `iscsi.chap.failure` | `(op, peer, chap_user, reason)` |
 | `iscsi.move_medium` (only when `params.refused` set) | `(op, peer, refused_reason)` |
 
+**Thur VSA** wires it in the two `LoginAuditSink` adapters at
+`vsa/daemon/src/audit.rs` (`IscsiDiskLoginAudit` /
+`NvmetcpLoginAudit`), bounding a CHAP / DH-HMAC-CHAP brute-force
+against the block target:
+
+| Op | Bucket key |
+|---|---|
+| `iscsi.chap.failure` | `(op, peer, chap_user, reason)` |
+| `nvmetcp.dhchap.failure` | `(op, peer, host_nqn, reason)` |
+
 The window is 60 seconds. The first event in a window is appended
 normally; subsequent events in that window are counted rather than
 written. When the window expires, a single rollup entry — same op,
 `result:"error"`, `params:{suppressed_count, window_seconds, key}`
-— is appended by the flush task running on a 10-second cadence. Daemon
+— is appended by a flush task running on a 10-second cadence. Daemon
 shutdown drains all in-flight windows before writing `daemon.stop`.
 
 Lifecycle and one-shot events (`cartridge.create`, `daemon.start`,
-`gc.run`, drive load/unload Ok paths, CHAP success,
+`gc.run`, drive load/unload Ok paths, CHAP / DH-HMAC-CHAP success,
 encryption set/clear, drive-compression toggle) bypass the limiter.
-The policy lives in `ratelimit_key_for(op, actor, params)` — the
-single source of truth for which operations opt in; adding a new
-flood-prone path requires only one additional match arm.
+On VTL the opt-in policy lives in `ratelimit_key_for(op, actor,
+params)` — the single source of truth for which data-path operations
+opt in; adding a new flood-prone path requires only one additional
+match arm. On VSA each sink keys its own failure arm inline.
 
 Implementation: `shared/audit/src/audit_ratelimit.rs`
 (`AuditRateLimiter`, fail-open on mutex poison so a poisoned limiter

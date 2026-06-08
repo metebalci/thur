@@ -675,10 +675,11 @@ pub struct AuthSettings {
 /// are the two transport login phases: iSCSI CHAP via
 /// `crate::audit::IscsiDiskLoginAudit` and NVMe/TCP DH-HMAC-CHAP via
 /// `crate::audit::NvmetcpLoginAudit` (each writes success / failure
-/// rows). The audit-chain `AuditRateLimiter` is not wired yet —
-/// failure rows write one-per-event; the per-user / per-NQN
-/// brute-force *alert* is already deduped + thresholded in
-/// `shared-alerting`.
+/// rows). Failure rows are bounded by an audit-chain `AuditRateLimiter`
+/// (60 s window, issue #101): a same-key login-failure burst collapses
+/// to one row plus a rollup. This is distinct from the per-user /
+/// per-NQN brute-force *alert*, which is separately deduped +
+/// thresholded in `shared-alerting`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditSettings {
     /// On by default. Disable only for development / ephemeral

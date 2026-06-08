@@ -282,9 +282,18 @@ async fn main() -> Result<()> {
     // `NoopLoginAudit`.
     let mut audit_lifecycle = None;
     let mut audit_channel_for_admin = None;
+    // Holds the login-failure rate-limiter + its flush-task handle when
+    // auditing is on. Drained at shutdown so an in-flight window's
+    // suppression count lands in the chain before exit.
+    let mut audit_ratelimit: Option<(
+        Arc<shared_audit::AuditRateLimiter>,
+        tokio::task::JoinHandle<()>,
+    )> = None;
     // Both transports get a login-audit sink off the same channel: iSCSI
     // CHAP and NVMe/TCP DH-HMAC-CHAP each emit success/failure rows and
-    // feed the shared `chap_failures` alert class (issue #68).
+    // feed the shared `chap_failures` alert class (issue #68). The
+    // failure rows are bounded by a shared `AuditRateLimiter` (issue
+    // #101) so a brute-force can't flood the BLAKE3 chain.
     let login_audit: Arc<dyn shared_iscsi::transport::LoginAuditSink>;
     let nvmetcp_login_audit: Arc<dyn nvme_tcp::LoginAuditSink>;
     if cfg.audit.enabled {
@@ -298,9 +307,21 @@ async fn main() -> Result<()> {
             writer,
         } = boot;
         tracing::info!("audit: log opened at {}", dir.display());
-        login_audit = Arc::new(IscsiDiskLoginAudit::new(channel.clone()));
-        nvmetcp_login_audit = Arc::new(NvmetcpLoginAudit::new(channel.clone()));
+        let ratelimiter = crate::audit::new_audit_ratelimiter();
+        let flush_handle = tokio::spawn(crate::audit::run_audit_ratelimit_flush(
+            Arc::clone(&ratelimiter),
+            channel.clone(),
+        ));
+        login_audit = Arc::new(IscsiDiskLoginAudit::new(
+            channel.clone(),
+            Arc::clone(&ratelimiter),
+        ));
+        nvmetcp_login_audit = Arc::new(NvmetcpLoginAudit::new(
+            channel.clone(),
+            Arc::clone(&ratelimiter),
+        ));
         audit_channel_for_admin = Some(channel.clone());
+        audit_ratelimit = Some((ratelimiter, flush_handle));
         audit_lifecycle = Some((channel, writer));
     } else {
         tracing::warn!(
@@ -1144,6 +1165,18 @@ async fn main() -> Result<()> {
     }
     if let Some(h) = reachability_ticker_handle {
         h.abort();
+    }
+
+    // Stop the rate-limit flush task and drain every still-open
+    // suppression window so an in-flight 60 s window's count lands in
+    // the chain before daemon.stop, not lost on exit.
+    if let Some((limiter, flush_handle)) = audit_ratelimit {
+        flush_handle.abort();
+        if let Some((channel, _)) = audit_lifecycle.as_ref() {
+            for rollup in limiter.flush_all() {
+                crate::audit::emit_audit_ratelimit_rollup(channel, &rollup);
+            }
+        }
     }
 
     // Drain the audit channel before exit so daemon.stop + any
