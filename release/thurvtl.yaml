@@ -39,9 +39,9 @@ library:
 #
 # "Storage backend" is the umbrella term — local-filesystem and any
 # S3-compatible object store (AWS S3, GCS, Azure Blob, AIStore,
-# MinIO, Ceph RGW, …) all live here. See /usr/share/doc/thurvtl/AUTH.md
-# (or docs/admin/AUTH.md in source) for the per-provider `auth:` block
-# schema in detail.
+# MinIO, Ceph RGW, …) all live here. See the Thur docs
+# (docs/admin/AUTH.md) at https://github.com/metebalci/thur for the
+# per-provider `auth:` block schema in detail.
 #
 # storage:
 #   compression: { algorithm: zstd, level: 3 }
@@ -91,8 +91,9 @@ library:
 # the values. Each encrypted cartridge binds to one named backend at
 # create time via `--keystore NAME`.
 #
-# See /usr/share/doc/thurvtl/AUTH.md (or docs/admin/AUTH.md in
-# source) for the per-provider `auth:` block schema in detail.
+# See the Thur docs (docs/admin/ENCRYPTION.md) at
+# https://github.com/metebalci/thur for the per-keystore `auth:` block
+# schema in detail.
 #
 # keystore:
 #   # Default backend picked when `cartridge create` omits

@@ -742,8 +742,8 @@ pub fn reject_legacy_cloud_backends_json(
          block of {config_path}, then remove {legacy}. The JSON\n\
          shape maps 1:1 to YAML — keys and field names are unchanged.\n\
          \n\
-         See /usr/share/doc/<product>/AUTH.md (or docs/admin/AUTH.md\n\
-         in source) for the YAML shape per provider.",
+         See the Thur docs (docs/admin/AUTH.md) at\n\
+         https://github.com/metebalci/thur for the YAML shape per provider.",
         legacy = legacy.display(),
         config_path = config_path.display(),
     ))
