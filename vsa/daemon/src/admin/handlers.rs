@@ -23,9 +23,8 @@
 //! backend reuses the same authenticated client.
 //!
 //! Audit: every mutation (`volume.create`, `volume.destroy`)
-//! produces an audit entry through the shared `AuditChannel` when
-//! audit is enabled. Read endpoints don't audit (would balloon the
-//! chain on every CLI poll).
+//! produces an audit entry through the shared `AuditChannel`. Read
+//! endpoints don't audit (would balloon the chain on every CLI poll).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -73,8 +72,7 @@ pub struct AdminState {
     pub audit: Option<AuditChannel>,
     /// Audit-log directory (`<data_dir>/audit` or the `audit.dir`
     /// override). The `system.audit.*` job handlers read JSONL files
-    /// from here; populated even when `audit.enabled=false` so the
-    /// verb reports a clear "audit dir not found".
+    /// from here.
     pub audit_dir: PathBuf,
     /// Long-running admin jobs registry — wired into the shared
     /// `jobs_router`. Job kinds (`system.alerting.test`, future

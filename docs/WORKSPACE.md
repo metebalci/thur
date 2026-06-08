@@ -716,8 +716,7 @@ runs discovery, builds a `ChapAuthenticator` from `iscsi.auth` if
   into the `AuditChannel` as `iscsi.chap.success` / `iscsi.chap.failure`
   — same op names VTL emits. On shutdown a `daemon.stop` entry is
   pushed before `writer.shutdown().await`.
-- `audit.enabled: false` is a dev escape hatch — runs without an audit
-  log, falls back to `NoopLoginAudit`. Default is on.
+- Auditing is unconditionally on (no `enabled` knob) — matching VTL.
 
 ### thurvsad admin socket
 

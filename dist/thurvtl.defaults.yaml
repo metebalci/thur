@@ -540,11 +540,11 @@ keystore:
 # First-party alerting (email + generic webhook).
 #
 # Off by default; flip enabled to true and list at least one sink.
-# Four event classes fire alerts: audit-log append failures, CHAP login
+# Five event classes fire alerts: audit-log append failures, CHAP login
 # failures (per-user threshold), disk-cache watermark /
-# backpressure-timeout, and cloud-backend reachability
-# (operator-invoked `system storage check`). Each class has an on/off
-# knob under `events:`.
+# backpressure-timeout, cloud-backend reachability
+# (operator-invoked `system storage check`), and orphaned storage
+# objects. Each class has an on/off knob under `events:`.
 #
 # Sinks support two types: `email` (SMTP via lettre) and `webhook`
 # (HTTP POST with a Tera-templated body — one code path covers

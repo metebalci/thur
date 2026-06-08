@@ -377,9 +377,10 @@ adapter layers between products are in
   [`docs/WEBUI.md`](docs/WEBUI.md).
 - **Alerting** — opt-in first-party email (SMTP via lettre) + generic
   webhook (HTTP POST with Tera-templated body — one path covers
-  PagerDuty, Slack, Discord, ntfy.sh, ServiceNow) sinks. Four event
+  PagerDuty, Slack, Discord, ntfy.sh, ServiceNow) sinks. Five event
   classes: backend reachability, audit-log append failure, disk-cache
-  watermark / backpressure timeout, repeated CHAP failures.
+  watermark / backpressure timeout, repeated CHAP failures, orphaned
+  storage objects (leaked after a failed `cartridge migrate` delete).
   Process-global dispatcher built from
   `alerting:` YAML at boot (mirrors `shared_telemetry::set_global`);
   producers emit via `shared_alerting::record::*`. Per-class dedup

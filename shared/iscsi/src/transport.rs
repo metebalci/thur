@@ -1858,10 +1858,11 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
 /// product wires in.
 ///
 /// `audit` is an `Arc<dyn LoginAuditSink>` so the consuming product
-/// can pick the sink at runtime (e.g. thurvsa branches on
-/// `audit.enabled` between [`NoopLoginAudit`] and its real channel
-/// adapter). Trait-object dispatch is one vcall per login event;
-/// negligible against the I/O the handler is already doing.
+/// can pick the sink at runtime (e.g. a product passes
+/// [`NoopLoginAudit`] on paths that don't audit logins and its real
+/// channel adapter elsewhere). Trait-object dispatch is one vcall per
+/// login event; negligible against the I/O the handler is already
+/// doing.
 /// Build the list of `(TargetAddress, TPGT)` payloads to emit for
 /// SendTargets, one per advertised portal. Wildcard binds
 /// (`0.0.0.0:*`, `[::]:*`) substitute the connection's actual local IP

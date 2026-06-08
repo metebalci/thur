@@ -340,7 +340,6 @@ mod tests {
     #[test]
     fn audit_dir_honors_explicit_override() {
         let settings = AuditSettings {
-            enabled: true,
             dir: Some("/var/log/thurvsa/audit".to_string()),
         };
         assert_eq!(

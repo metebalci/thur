@@ -267,10 +267,10 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
 
 | Opcode | Command | Notes |
 |-------:|---------|-------|
-| 0x07 | INITIALIZE ELEMENT STATUS | |
+| 0x07 | INITIALIZE ELEMENT STATUS | Reloads `inventory.json` |
 | 0x16 | RESERVE (6) | Accepted as no-op — VTL doesn't track reservation state, returned for backup-software compatibility |
 | 0x17 | RELEASE (6) | Accepted as no-op |
-| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | |
+| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | Accepted; no reload — element status is always live, nothing to rescan |
 | 0x56 | RESERVE (10) | Accepted as no-op |
 | 0x57 | RELEASE (10) | Accepted as no-op |
 | 0xA5 | MOVE MEDIUM | Slot ↔ slot, slot ↔ drive, slot ↔ I/E |

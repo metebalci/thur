@@ -27,6 +27,8 @@ CRITICAL_DATA_PATH_80 = [
 ]
 CRITICAL_CONTROL_PLANE_80 = [
     "shared/admin-server",   # admin Unix-socket bind, peer-cred, jobs
+    "shared/admin-auth",     # web-admin password gate (Argon2id, HTTP Basic)
+    "shared/admin-webui",    # network-facing read-only Web UI + GET API
     "shared/verify-core",    # pool / storage integrity sweep
     "shared/upload-worker",  # storage PUT + HEAD-probe primitive
     "shared/dedup-stats",    # operator-visible dedup math
@@ -35,9 +37,10 @@ PRODUCTS_30 = ["vtl/daemon", "vtl/cli", "vsa/daemon", "vsa/cli"]
 SHARED_50 = [
     "shared/admin-audit", "shared/admin-client", "shared/admin-http",
     "shared/admin-iscsi", "shared/admin-proto",
+    "shared/admin-cloud-check", "shared/admin-monitor",
     "shared/alerting", "shared/cli", "shared/cli-alerting",
     "shared/cli-iscsi", "shared/cli-system", "shared/object-store-bench",
-    "shared/health", "shared/naming",
+    "shared/disk-evict", "shared/health", "shared/naming",
     "shared/telemetry",
 ]
 
@@ -79,6 +82,32 @@ def crate_for(path, root):
     return None
 
 
+def check_every_member_mapped(root):
+    """Fail loudly if a workspace member escapes every floor tier.
+
+    Guards against the silent gap where a newly-added crate ships
+    untracked by the coverage gate. Parses `[workspace] members` from
+    the root Cargo.toml and asserts each maps into FLOOR_UNIT.
+    """
+    import re
+    cargo = os.path.join(root, "Cargo.toml")
+    try:
+        txt = open(cargo).read()
+    except OSError:
+        return  # not at the workspace root — skip the check
+    m = re.search(r"members\s*=\s*\[(.*?)\]", txt, re.S)
+    if not m:
+        return
+    members = re.findall(r'"([^"]+)"', m.group(1))
+    unmapped = [d for d in members if d not in FLOOR_UNIT]
+    if unmapped:
+        print("coverage floor map is missing workspace member(s):")
+        for d in sorted(unmapped):
+            print("  {}".format(d))
+        print("add each to a tier in scripts/coverage-report.py")
+        sys.exit(2)
+
+
 def main():
     json_path = sys.argv[1]
     extra = sys.argv[2:]
@@ -87,6 +116,7 @@ def main():
     integrated = "--integrated" in extra
     FLOOR = FLOOR_INTEGRATED if integrated else FLOOR_UNIT
     root = os.getcwd()
+    check_every_member_mapped(root)
 
     with open(json_path) as fh:
         data = json.load(fh)

@@ -13,8 +13,6 @@
 //!
 //! Routing CLI audit writes through the queue keeps the daemon as
 //! the single chain writer — no cross-process file lock required.
-//! Helpers are no-ops when `audit.enabled: false` is set in the
-//! config.
 
 use anyhow::Result;
 use core_mediachanger::{AuditActor, AuditResult, queue_pending};

@@ -679,30 +679,14 @@ pub struct AuthSettings {
 /// (60 s window, issue #101): a same-key login-failure burst collapses
 /// to one row plus a rollup. This is distinct from the per-user /
 /// per-NQN brute-force *alert*, which is separately deduped +
-/// thresholded in `shared-alerting`.
-#[derive(Debug, Clone, Deserialize)]
+/// thresholded in `shared-alerting`. Auditing is unconditionally on
+/// — a compliance signal, not an operational knob — so there is no
+/// `enabled` key (matching VTL).
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AuditSettings {
-    /// On by default. Disable only for development / ephemeral
-    /// runs — auditing is a compliance signal, not an operational
-    /// knob.
-    #[serde(default = "default_audit_enabled")]
-    pub enabled: bool,
     /// Override the audit directory. Defaults to
     /// `<data_dir>/audit/` when unset.
     pub dir: Option<String>,
-}
-
-impl Default for AuditSettings {
-    fn default() -> Self {
-        Self {
-            enabled: default_audit_enabled(),
-            dir: None,
-        }
-    }
-}
-
-fn default_audit_enabled() -> bool {
-    true
 }
 
 impl DaemonConfig {
@@ -739,9 +723,8 @@ data_dir: /var/lib/thurvsa
         );
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
         assert_eq!(cfg.data_dir, "/var/lib/thurvsa");
-        // Defaults: auth method None, audit enabled.
+        // Defaults: auth method None, audit dir unset (always on).
         assert!(!cfg.iscsi.auth.method.is_chap());
-        assert!(cfg.audit.enabled);
         assert!(cfg.audit.dir.is_none());
         // http.auth.method defaults to None — the web-admin password is
         // optional (#92), unauthenticated on a trusted network.
@@ -948,12 +931,10 @@ iscsi:
             r#"
 data_dir: /var/lib/thurvsa
 audit:
-  enabled: true
   dir: /var/log/thurvsa/audit
 "#,
         );
         let cfg = DaemonConfig::load(f.path()).expect("load ok");
-        assert!(cfg.audit.enabled);
         assert_eq!(cfg.audit.dir.as_deref(), Some("/var/log/thurvsa/audit"));
     }
 
@@ -1144,23 +1125,5 @@ nvmetcp:
             cfg.nvmetcp.dhchap_path(data_dir),
             Path::new("/etc/thurvsa/nvmetcp-dhchap.json")
         );
-    }
-
-    #[test]
-    fn audit_can_be_disabled() {
-        let f = write_config(
-            r#"
-data_dir: /var/lib/thurvsa
-storage:
-  backends:
-    devbox:
-      type: local
-      root_dir: /tmp/thurvsa-storage
-audit:
-  enabled: false
-"#,
-        );
-        let cfg = DaemonConfig::load(f.path()).expect("load ok");
-        assert!(!cfg.audit.enabled);
     }
 }

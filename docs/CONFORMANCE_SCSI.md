@@ -729,7 +729,7 @@ LTO-8) rather than by SSC-4.
 | 0x16 | RESERVE(6) | 🟩 No-op | O | |
 | 0x17 | RELEASE(6) | 🟩 No-op | O | |
 | 0x2B | POSITION TO ELEMENT | 🟩 No-op | O | Accepted; no robot motion to model. |
-| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | 🟩 Yes | O | Range-scoped reload. Reservation-gated (write-side — see 0x5F). |
+| 0x37 | INITIALIZE ELEMENT STATUS WITH RANGE | 🟩 No-op | O | Accepted; no reload — element status is always live in the virtual changer, so there is nothing to rescan. Reservation-gated (write-side — see 0x5F). |
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
 | 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Full PRIN surface on the changer LUN, keyed independently of the drives (issue #53). See SPC-4 § PERSISTENT RESERVE IN. |

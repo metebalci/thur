@@ -277,59 +277,41 @@ async fn main() -> Result<()> {
 
     // Audit log: open + spawn writer task before discovery so the
     // boot rollup ("daemon.start" + per-LUN log lines below) lands
-    // chronologically. Disabled by config knob means no log file
-    // and no LoginAuditSink — login-phase events fall through to
-    // `NoopLoginAudit`.
-    let mut audit_lifecycle = None;
-    let mut audit_channel_for_admin = None;
-    // Holds the login-failure rate-limiter + its flush-task handle when
-    // auditing is on. Drained at shutdown so an in-flight window's
-    // suppression count lands in the chain before exit.
-    let mut audit_ratelimit: Option<(
-        Arc<shared_audit::AuditRateLimiter>,
-        tokio::task::JoinHandle<()>,
-    )> = None;
+    // chronologically. Always on — there is no disable knob.
     // Both transports get a login-audit sink off the same channel: iSCSI
     // CHAP and NVMe/TCP DH-HMAC-CHAP each emit success/failure rows and
     // feed the shared `chap_failures` alert class (issue #68). The
     // failure rows are bounded by a shared `AuditRateLimiter` (issue
-    // #101) so a brute-force can't flood the BLAKE3 chain.
-    let login_audit: Arc<dyn shared_iscsi::transport::LoginAuditSink>;
-    let nvmetcp_login_audit: Arc<dyn nvme_tcp::LoginAuditSink>;
-    if cfg.audit.enabled {
-        let dir = audit_dir(&cfg.audit, &data_dir);
-        let boot = boot_audit_log(dir.clone(), Some(cfg.data_dir.as_str()))
-            .await
-            .context("open audit log")?;
-        let crate::audit::AuditBoot {
-            log: _log,
-            channel,
-            writer,
-        } = boot;
-        tracing::info!("audit: log opened at {}", dir.display());
-        let ratelimiter = crate::audit::new_audit_ratelimiter();
-        let flush_handle = tokio::spawn(crate::audit::run_audit_ratelimit_flush(
-            Arc::clone(&ratelimiter),
-            channel.clone(),
-        ));
-        login_audit = Arc::new(IscsiDiskLoginAudit::new(
-            channel.clone(),
-            Arc::clone(&ratelimiter),
-        ));
-        nvmetcp_login_audit = Arc::new(NvmetcpLoginAudit::new(
-            channel.clone(),
-            Arc::clone(&ratelimiter),
-        ));
-        audit_channel_for_admin = Some(channel.clone());
-        audit_ratelimit = Some((ratelimiter, flush_handle));
-        audit_lifecycle = Some((channel, writer));
-    } else {
-        tracing::warn!(
-            "audit.enabled=false - running without an audit log; not recommended outside dev"
-        );
-        login_audit = Arc::new(shared_iscsi::transport::NoopLoginAudit);
-        nvmetcp_login_audit = Arc::new(nvme_tcp::NoopLoginAudit);
-    };
+    // #101) so a brute-force can't flood the BLAKE3 chain. Auditing is
+    // unconditionally on — a compliance signal, not an operational knob
+    // (no `enabled` key), matching VTL.
+    let dir = audit_dir(&cfg.audit, &data_dir);
+    let boot = boot_audit_log(dir.clone(), Some(cfg.data_dir.as_str()))
+        .await
+        .context("open audit log")?;
+    let crate::audit::AuditBoot {
+        log: _log,
+        channel,
+        writer,
+    } = boot;
+    tracing::info!("audit: log opened at {}", dir.display());
+    let ratelimiter = crate::audit::new_audit_ratelimiter();
+    let flush_handle = tokio::spawn(crate::audit::run_audit_ratelimit_flush(
+        Arc::clone(&ratelimiter),
+        channel.clone(),
+    ));
+    let login_audit: Arc<dyn shared_iscsi::transport::LoginAuditSink> = Arc::new(
+        IscsiDiskLoginAudit::new(channel.clone(), Arc::clone(&ratelimiter)),
+    );
+    let nvmetcp_login_audit: Arc<dyn nvme_tcp::LoginAuditSink> = Arc::new(NvmetcpLoginAudit::new(
+        channel.clone(),
+        Arc::clone(&ratelimiter),
+    ));
+    let audit_channel_for_admin = Some(channel.clone());
+    // Drained at shutdown so an in-flight window's suppression count
+    // lands in the chain before exit.
+    let audit_ratelimit = Some((ratelimiter, flush_handle));
+    let audit_lifecycle = Some((channel, writer));
 
     // Resolve the operator's `cloud.upload.max_concurrent` once at
     // boot (auto-scale sentinel `0` -> min(16, num_cpus * 4)). The

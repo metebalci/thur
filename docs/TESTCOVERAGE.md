@@ -56,12 +56,15 @@ columns flag the tier per `scripts/coverage-report.py`.
 | Crate | Line cov | Tier | Coverage focus |
 |---|---:|---|---|
 | `shared-admin-audit` | 64% | shared | `system.audit.*` job handlers — reached via the daemon audit verbs |
-| `shared-admin-auth` | 96% | shared | Argon2id PHC hashing, password store, `AuthState`, HTTP Basic gate middleware |
+| `shared-admin-auth` | 96% | **control-plane critical** | Argon2id PHC hashing, password store, `AuthState`, HTTP Basic gate middleware |
 | `shared-admin-client` | 70% | shared | admin Unix-socket dialer, NDJSON job-stream consumer |
+| `shared-admin-cloud-check` | 44%† | shared | cloud reachability `system.cloud_check` job + periodic ticker — reached via the daemon storage-check verb |
 | `shared-admin-http` | 80% | shared | admin HTTP listener, TLS config, self-signed cert gen / regen |
 | `shared-admin-iscsi` | 81% | shared | cross-product iSCSI admin handlers — reached via both daemons |
+| `shared-admin-monitor` | 93% | shared | `system.monitor` tick loop, snapshot encoding, rate-window math |
 | `shared-admin-proto` | 95% | shared | admin-socket wire types (`JobEvent`, `JobAccepted`) round-trips |
 | `shared-admin-server` | 87% | **control-plane critical** | admin socket bind, peer-cred extractor, NDJSON job streaming |
+| `shared-admin-webui` | 80% | **control-plane critical** | static `/ui` bundle traversal guard + read-only `/api/v1` GET handlers |
 | `shared-alerting` | 73% | shared | email + webhook sinks, Tera templating, per-class dedup |
 | `shared-audit` | 88% | **critical** | BLAKE3 hash chain, append / verify / rotate, tail cursor |
 | `shared-cli` | 74% | shared | CLI UX helpers — reached via the shipped CLIs |
@@ -72,6 +75,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-object-store-bench` | 90% | shared | storage benchmark engine — driven by a `MockBackend` in-crate |
 | `shared-crypto` | 95% | **critical** | AES-256-GCM encrypt / decrypt, IV derivation |
 | `shared-dedup-stats` | 100% | **control-plane critical** | dedup exclusive / shared byte split |
+| `shared-disk-evict` | 45%† | shared | per-backend cap recompute + watermark alert — reached via both daemons' eviction workers |
 | `shared-health` | 100% | shared | `/health` liveness handler |
 | `shared-iscsi` | 87% | **critical** | iSCSI transport, CHAP auth, session + unit-attention |
 | `shared-keystore` | 85% | **critical** | six DEK keystore backends, wrap / unwrap round-trips |
@@ -80,6 +84,12 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-telemetry` | 66% | shared | OpenTelemetry instrument plumbing |
 | `shared-upload-worker` | 89% | **control-plane critical** | backend-upload PUT + HEAD-probe primitive |
 | `shared-verify-core` | 85% | **control-plane critical** | pool + storage verify sweeps — exercised via the `core-*` verify tests |
+
+† `shared-admin-cloud-check` and `shared-disk-evict` show **unit-mode**
+line coverage (`scripts/coverage.sh --crates`); their request paths fire
+mainly through the daemon job + shell suites, so the integrated run adds
+coverage not captured here. Re-measure with `scripts/coverage.sh
+--integrated`.
 
 ### `scsi/` — SCSI command sets
 
@@ -247,10 +257,17 @@ environment where the full shell suites can't run.
 
 ## Continuous integration
 
-Two GitHub Actions workflows run on every push:
+Three GitHub Actions workflows run on push to `main` (each
+path-filtered so it only fires on relevant changes):
 
 - **`ci.yml`** — `cargo fmt --check`, `cargo clippy --workspace
   --all-targets`, `cargo build --workspace --all-targets`, and
-  `cargo test --workspace` (the full per-crate suite above).
+  `cargo test --workspace` (the full per-crate suite above). Fires on
+  `**/*.rs` / `Cargo.*` / toolchain changes.
 - **`deny.yml`** — `cargo deny` for advisories, license policy, and
-  banned / duplicate dependencies.
+  banned / duplicate dependencies. Fires on `Cargo.*` / `deny.toml`
+  changes.
+- **`csi.yml`** — the CSI driver's Go subtree (`csi/`): gofmt, `go vet`,
+  staticcheck, `go test`, and Helm chart validation. Path-scoped to
+  `csi/**` + the admin-socket contract it consumes, so it never fires
+  on Rust-only changes.

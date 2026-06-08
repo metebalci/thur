@@ -11,7 +11,7 @@
 //!   ntfy.sh, ServiceNow, Jira — operators write the upstream JSON
 //!   shape inline in YAML, no per-vendor glue here.
 //!
-//! Four event classes (all fire from the daemon, all individually
+//! Five event classes (all fire from the daemon, all individually
 //! mutable via YAML on/off knobs):
 //!
 //! - `BackendReachability` — emitted from `system cloud_check` job.
@@ -21,6 +21,8 @@
 //!   backpressure timeout.
 //! - `ChapFailures` — emitted on repeated CHAP login failures from
 //!   the same user inside one dedup window.
+//! - `OrphanedObjects` — emitted from `cartridge migrate` when source
+//!   objects leak after a failed delete (VTL).
 //!
 //! Rate-limiting: re-uses [`shared_audit::AuditRateLimiter`]. Per-
 //! `(class, dedup_key)` window collapses repeats; first event in a

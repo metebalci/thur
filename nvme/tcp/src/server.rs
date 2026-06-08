@@ -140,8 +140,8 @@ pub trait LoginAuditSink: Send + Sync {
     fn record(&self, event: LoginAuditEvent<'_>);
 }
 
-/// Default no-op audit sink (tests; the in-process smoke path; any
-/// boot with `audit.enabled = false`).
+/// Default no-op audit sink (tests; the in-process smoke path;
+/// discovery controllers and other paths that don't audit logins).
 #[derive(Default, Clone, Copy)]
 pub struct NoopLoginAudit;
 

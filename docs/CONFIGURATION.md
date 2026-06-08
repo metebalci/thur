@@ -262,10 +262,12 @@ The audit section configures the append-only, BLAKE3-chained event journal
 at `<data_dir>/audit/`, which rolls daily at UTC midnight. Full design:
 [`AUDIT.md`](AUDIT.md).
 
+Auditing is unconditionally on for both products — a compliance signal,
+not an operational knob — so there is no `enabled` key.
+
 | Key | Default | Description |
 |---|---|---|
-| `audit.enabled` | `true` | **VSA only.** Disable only for ephemeral dev runs. VTL auditing is always on and has no `enabled` key. |
-| `audit.dir` | `<data_dir>/audit` | Audit directory override. |
+| `audit.dir` | `<data_dir>/audit` | Audit directory override. Both products. |
 | `audit.compress_rotated` | `true` | **VTL only.** zstd-compress rotated daily files. |
 | `audit.retention_days` | `90` | **VTL only.** Days of rotated history kept locally before pruning. Must be ≥ 40. |
 
