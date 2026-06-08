@@ -134,7 +134,8 @@ iscsi:
 #     # `nvme gen-tls-key --identity 1 --hmac 1 --subsysnqn=... --hostnqn=...`
 #     # and paste the NVMeTLSkey-... string into the identity file
 #     # under that host's NQN entry. See docs/admin/NETWORK_SECURITY.md
-#     # § NVMe/TCP TLS-PSK.
+#     # § NVMe/TCP TLS-PSK at
+#     # https://github.com/metebalci/thur.
 #     mode: "disabled"
 #     # Override the identity-file path. Default:
 #     # <data_dir>/nvmetcp-psks.json.
@@ -155,7 +156,8 @@ iscsi:
 #     # Generate a per-host secret on the initiator with
 #     # `nvme gen-dhchap-key --hostnqn=...` and register it with
 #     # `thurvsa nvmetcp dhchap add --host-nqn=... --key=DHHC-1:... --volume=...`.
-#     # See docs/admin/NETWORK_SECURITY.md § NVMe/TCP DH-HMAC-CHAP.
+#     # See docs/admin/NETWORK_SECURITY.md § NVMe/TCP DH-HMAC-CHAP
+#     # at https://github.com/metebalci/thur.
 #     mode: "none"
 #     # Override the identity-file path. Default:
 #     # <data_dir>/nvmetcp-dhchap.json.
@@ -315,8 +317,8 @@ http:
 # the "storage" naming leaves room for a future block-shaped backend
 # variant without another rename.
 #
-# See docs/admin/AUTH.md for the per-backend `auth:` block shapes
-# (S3 / GCS / Azure / local).
+# See docs/admin/AUTH.md at https://github.com/metebalci/thur for the
+# per-backend `auth:` block shapes (S3 / GCS / Azure / local).
 storage:
   # Opt out of bucket-immutability validation at startup. When true,
   # lock_state() is never called against any backend; retention_mode
@@ -410,7 +412,8 @@ storage:
 # plaintext unless created with --encrypt. Sticky for the volume's
 # lifetime. Backend configuration (KMS key ID, Vault address +
 # AppRole creds, etc.) lives under `keystore.backends:` below —
-# see docs/admin/ENCRYPTION.md § VSA keystore backends.
+# see docs/admin/ENCRYPTION.md § VSA keystore backends at
+# https://github.com/metebalci/thur.
 #
 # Per-volume DEK lifecycle verbs (all daemon-down — stop thurvsad first):
 #
@@ -436,8 +439,9 @@ keystore:
 
   # Named keystore-backend definitions. Each entry's `type:` picks
   # the provider (local | awskms | vault | azurekv | gcpkms | kmip).
-  # See docs/admin/ENCRYPTION.md § VSA keystore backends for the full
-  # per-provider `auth:` block schema (Static / Env / Profile / SP /
+  # See docs/admin/ENCRYPTION.md § VSA keystore backends at
+  # https://github.com/metebalci/thur for the full per-provider `auth:`
+  # block schema (Static / Env / Profile / SP /
   # SP-Env / SA-Key / ADC / Token / AppRole / ClientCert / ...).
   # Default: empty. Volume ops that reference a backend by name fail
   # at op time with UnknownBackend when the named entry is absent.
@@ -517,7 +521,7 @@ audit:
 #
 # Test a sink end-to-end with `thurvsa alerting test SINK_NAME`.
 # Full design + worked PagerDuty / Slack / Discord examples:
-# docs/admin/ALERTING.md.
+# docs/admin/ALERTING.md at https://github.com/metebalci/thur.
 alerting:
   # Master switch. enabled=false (default) means no alerts fire, no
   # sinks are constructed, the dispatcher is not installed. Flip to
