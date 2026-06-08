@@ -95,6 +95,15 @@ impl IscsiServer {
         })
     }
 
+    /// Stale-session sweep timeout (seconds) handed to the shared
+    /// transport's `ServerConfig`, sourced from
+    /// `iscsi.session_timeout_seconds`. Issue #96: the transport
+    /// previously hardcoded this to 300 and silently ignored any
+    /// configured value.
+    fn stale_session_timeout_secs(config: &IscsiConfig) -> u64 {
+        config.iscsi.session_timeout_seconds as u64
+    }
+
     /// Run the iSCSI server.
     ///
     /// Step 3c phase 2 lifted the connection lifecycle (PDU framing,
@@ -188,7 +197,7 @@ impl IscsiServer {
             session_manager: Arc::clone(&self.state.session_manager),
             auth: self.auth.clone(),
             audit,
-            stale_session_timeout_secs: 300,
+            stale_session_timeout_secs: Self::stale_session_timeout_secs(&self.config),
         };
 
         shared_iscsi::transport::run(server_config, transport_handler).await
@@ -265,5 +274,26 @@ impl LoginAuditSink for IscsiLibraryLoginAudit {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #96: a non-default `session_timeout_seconds` must reach
+    /// the transport's stale-session sweep, not be silently dropped in
+    /// favor of the old hardcoded 300.
+    #[test]
+    fn non_default_session_timeout_reaches_server_config() {
+        let mut config = IscsiConfig::default();
+        config.iscsi.session_timeout_seconds = 120;
+        assert_eq!(IscsiServer::stale_session_timeout_secs(&config), 120);
+    }
+
+    #[test]
+    fn default_session_timeout_is_300() {
+        let config = IscsiConfig::default();
+        assert_eq!(IscsiServer::stale_session_timeout_secs(&config), 300);
     }
 }
