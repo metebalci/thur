@@ -50,8 +50,6 @@ pub struct IscsiSettings {
     /// (IQN + ISID, default) or by IQN alone.
     #[serde(default)]
     pub reservations: shared_iscsi::transport::ReservationSettings,
-    #[serde(default = "default_max_sessions")]
-    pub max_sessions: u32,
     #[serde(default = "default_session_timeout")]
     pub session_timeout_seconds: u32,
     #[serde(default)]
@@ -85,7 +83,6 @@ impl Default for IscsiSettings {
             listen_portals: default_listen_portals(),
             target_iqn: shared_naming::TAPE_LIBRARY.iqn.to_string(),
             reservations: shared_iscsi::transport::ReservationSettings::default(),
-            max_sessions: 10,
             session_timeout_seconds: 300,
             auth: AuthSettings::default(),
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,
@@ -159,10 +156,6 @@ fn default_target_iqn() -> String {
     shared_naming::TAPE_LIBRARY.iqn.to_string()
 }
 
-fn default_max_sessions() -> u32 {
-    10
-}
-
 fn default_session_timeout() -> u32 {
     300
 }
@@ -206,7 +199,6 @@ mod tests {
             }]
         );
         assert_eq!(s.target_iqn, "iqn.2025-10.com.metebalci:thurvtl");
-        assert_eq!(s.max_sessions, 10);
         assert_eq!(s.session_timeout_seconds, 300);
         assert_eq!(
             s.drive_compression_algorithm,
@@ -255,7 +247,7 @@ mod tests {
         assert!(cfg.iscsi.is_none());
         // Accessors substitute defaults for absent blocks.
         assert_eq!(cfg.library().num_drives, 3);
-        assert_eq!(cfg.iscsi().max_sessions, 10);
+        assert_eq!(cfg.iscsi().session_timeout_seconds, 300);
     }
 
     #[test]
@@ -287,7 +279,6 @@ mod tests {
             ],
             target_iqn: "iqn.2025-10.com.example:vtl".to_string(),
             reservations: shared_iscsi::transport::ReservationSettings::default(),
-            max_sessions: 64,
             session_timeout_seconds: 120,
             auth: AuthSettings::default(),
             drive_compression_algorithm: core_mediachanger::CompressionAlgo::Lz4,
@@ -297,7 +288,6 @@ mod tests {
         let back: IscsiSettings = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(back.listen_portals, original.listen_portals);
         assert_eq!(back.target_iqn, original.target_iqn);
-        assert_eq!(back.max_sessions, original.max_sessions);
         assert_eq!(
             back.session_timeout_seconds,
             original.session_timeout_seconds
@@ -356,7 +346,7 @@ mod tests {
             iscsi: None,
         };
         let projected = cfg.to_iscsi_config();
-        assert_eq!(projected.iscsi.max_sessions, 10);
+        assert_eq!(projected.iscsi.session_timeout_seconds, 300);
         assert_eq!(projected.library.num_drives, 3);
     }
 

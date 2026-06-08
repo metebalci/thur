@@ -88,8 +88,10 @@ available via `audit.compress_rotated: true` (default).
 
 ## Retention
 
-`audit.retention_days` defaults to **90**. There is no `enabled`
-knob — audit is unconditionally on.
+Rotated audit files (`audit-YYYY-MM-DD.jsonl[.zst]`) are retained
+indefinitely — the daemon never prunes them. Cap local audit history
+out of band if you need to. There is no `enabled` knob either — audit
+is unconditionally on.
 
 ## CLI surfaces
 

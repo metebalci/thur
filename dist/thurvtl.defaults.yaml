@@ -212,8 +212,6 @@ iscsi:
     #     the cost of treating all of that host's concurrent sessions as
     #     a single registrant. Recommended for open-iscsi clusters.
     initiator_port: iqn-isid
-  # Maximum concurrent iSCSI sessions.
-  max_sessions: 10
   # Per-session inactivity timeout in seconds.
   session_timeout_seconds: 300
   # CHAP authentication. Users + mutual-CHAP target creds live in
@@ -380,9 +378,9 @@ audit:
   # zstd-compress yesterday's audit-YYYY-MM-DD.jsonl on rollover.
   # Default: true. Set false to keep rotated files grep-friendly.
   compress_rotated: true
-  # How many days of audit history the daemon keeps locally before
-  # pruning rotated files. Default: 90.
-  retention_days: 90
+  # Rotated audit files are retained indefinitely (operator-managed) —
+  # the daemon never prunes them. Prune out of band if you need to cap
+  # local audit history.
 
 # HTTP server (health, metrics, sessions, drives). Endpoints
 # (paths under http.listen):

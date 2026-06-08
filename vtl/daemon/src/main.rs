@@ -236,18 +236,10 @@ struct AuditConfig {
     /// for `grep`-friendliness.
     #[serde(default = "default_audit_compress_rotated")]
     compress_rotated: bool,
-    /// How many days of audit history the daemon keeps locally before
-    /// pruning rotated files. Default 90.
-    #[serde(default = "default_audit_retention_days")]
-    retention_days: u32,
 }
 
 fn default_audit_compress_rotated() -> bool {
     true
-}
-
-fn default_audit_retention_days() -> u32 {
-    90
 }
 
 impl Default for AuditConfig {
@@ -255,7 +247,6 @@ impl Default for AuditConfig {
         Self {
             dir: None,
             compress_rotated: default_audit_compress_rotated(),
-            retention_days: default_audit_retention_days(),
         }
     }
 }
@@ -651,8 +642,6 @@ struct IscsiConfig {
     /// (IQN + ISID, default) or by IQN alone.
     #[serde(default)]
     reservations: shared_iscsi::transport::ReservationSettings,
-    #[serde(default = "default_max_sessions")]
-    max_sessions: u32,
     #[serde(default = "default_session_timeout")]
     session_timeout_seconds: u32,
     #[serde(default)]
@@ -668,9 +657,6 @@ fn default_iscsi_listen() -> Vec<shared_iscsi::transport::Portal> {
 }
 fn default_target_iqn() -> String {
     shared_naming::TAPE_LIBRARY.iqn.to_string()
-}
-fn default_max_sessions() -> u32 {
-    10
 }
 fn default_session_timeout() -> u32 {
     300
@@ -749,7 +735,6 @@ impl Default for IscsiConfig {
             listen: default_iscsi_listen(),
             target_iqn: shared_naming::TAPE_LIBRARY.iqn.to_string(),
             reservations: shared_iscsi::transport::ReservationSettings::default(),
-            max_sessions: 10,
             session_timeout_seconds: 300,
             auth: AuthConfig::default(),
         }
@@ -1065,11 +1050,7 @@ async fn main() -> Result<()> {
         audit_cfg.compress_rotated = cfg.audit.compress_rotated;
         match core_mediachanger::AuditLog::open(audit_cfg) {
             Ok(log) => {
-                info!(
-                    "Audit log opened: dir={} retention={}d",
-                    audit_log_dir.display(),
-                    cfg.audit.retention_days
-                );
+                info!("Audit log opened: dir={}", audit_log_dir.display());
                 let log = std::sync::Arc::new(log);
                 match log.replay_pending() {
                     Ok((replayed, failed)) if replayed > 0 || failed > 0 => {
@@ -1899,7 +1880,6 @@ async fn main() -> Result<()> {
                 listen_portals: iscsi_cfg.listen.clone(),
                 target_iqn: iscsi_cfg.target_iqn.clone(),
                 reservations: iscsi_cfg.reservations.clone(),
-                max_sessions: iscsi_cfg.max_sessions,
                 session_timeout_seconds: iscsi_cfg.session_timeout_seconds,
                 auth: iscsi::config::AuthSettings {
                     method: iscsi_cfg.auth.method,
@@ -2473,7 +2453,6 @@ mod config_parse_tests {
         let cfg: Config =
             serde_yaml::from_str("data_dir: /srv/thur\n").expect("minimal config parses");
         assert_eq!(cfg.data_dir, "/srv/thur");
-        assert_eq!(cfg.audit.retention_days, default_audit_retention_days());
         assert!(cfg.audit.compress_rotated);
         // Both buffer sizes default to `auto` — the daemon resolves
         // them against /proc/meminfo at boot.
@@ -2514,7 +2493,6 @@ mod config_parse_tests {
         let iscsi = cfg.iscsi.expect("iscsi block present");
         assert_eq!(iscsi.listen, default_iscsi_listen());
         assert_eq!(iscsi.target_iqn, default_target_iqn());
-        assert_eq!(iscsi.max_sessions, default_max_sessions());
     }
 
     #[test]
@@ -2541,11 +2519,9 @@ mod config_parse_tests {
     fn config_default_helper_values() {
         assert!(default_true());
         assert!(default_audit_compress_rotated());
-        assert_eq!(default_audit_retention_days(), 90);
         assert_eq!(default_otlp_protocol(), "grpc");
         assert_eq!(default_otlp_interval_seconds(), 30);
         assert_eq!(default_session_timeout(), 300);
-        assert_eq!(default_max_sessions(), 10);
         assert_eq!(
             default_drive_compression_algorithm(),
             core_mediachanger::CompressionAlgo::Lz4

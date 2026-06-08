@@ -341,7 +341,7 @@ adapter layers between products are in
   task drains a cloneable `AuditChannel` mpsc; daemon-down CLI flows queue
   to `<audit_dir>/pending/` for replay on next start. Host-driven failure
   paths are rate-limited via `AuditRateLimiter` (60 s window).
-  `audit.retention_days` defaults to 90. Full design in
+  Rotated files are retained indefinitely (no pruner). Full design in
   [`docs/AUDIT.md`](docs/AUDIT.md); schema +
   rate-limited-rollup shape in
   [`docs/SPEC.md`](docs/SPEC.md) § Audit Log.

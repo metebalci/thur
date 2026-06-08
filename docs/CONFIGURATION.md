@@ -67,7 +67,6 @@ description — is available as `thurvtl config defaults` or
 | `iscsi.listen` | `0.0.0.0:3260` | iSCSI target listen portal(s). Accepts a single `"ip:port"` scalar, a list of bare `"ip:port"` strings, or a list of `{bind, advertise?, tpgt?}` objects — each entry binds its own listener (`bind`) and SendTargets advertises every entry as `TargetAddress=<advertise\|bind>,<tpgt>`, enabling multi-portal path redundancy without MC/S. Bare-string entries (and objects omitting `tpgt`) auto-assign sequential Target Portal Group Tags by input position (1, 2, …). Multiple portals sharing one TPGT (a group) is legal and is the prerequisite shape ALUA Target Port Groups will plug into; the same `bind` listed twice is rejected. The Login Response `TargetPortalGroupTag` echoes the arrival portal's TPGT (RFC 7143 §12.10). With no `advertise`, a wildcard `bind` (`0.0.0.0:*`, `[::]:*`) is substituted with the connection's actual local IP; set `advertise` (a full `ip:port`, emitted verbatim) when the bind isn't reachable by initiators — NAT, Docker bridge + published ports, reverse proxy, multi-homed host. A wildcard `advertise` is rejected at startup. |
 | `iscsi.target_iqn` | `iqn.2025-10.com.metebalci:thurvtl` / `:thurvsa` | Target IQN advertised to initiators. |
 | `iscsi.reservations.initiator_port` | `iqn-isid` | Which initiator-port identity SCSI-3 persistent reservations key by. `iqn-isid` (default): the full, spec-literal iSCSI port (initiator IQN + ISID) — models per-path (`mpathpersist`-style) registration; a host reclaims a reservation across a reconnect only if it reuses its ISID (Windows / VMware / session reinstatement do). `iqn`: key by IQN alone (ISID ignored) — a host reclaims across any reconnect / target restart even if its ISID changes (open-iscsi mints a fresh ISID per login), at the cost of collapsing all of a host's concurrent sessions to one registrant. NVMe/TCP is unaffected (keys by the host-stable HOSTID). See [`docs/SPEC.md`](SPEC.md) § Persistent reservations. |
-| `iscsi.max_sessions` | `10` | Max concurrent iSCSI sessions. **VTL only.** |
 | `iscsi.session_timeout_seconds` | `300` | Per-session inactivity timeout. **VTL only.** |
 | `iscsi.auth.method` | `None` | `None` (unauthenticated) or `CHAP`. |
 | `iscsi.auth.allowed_algorithms` | `[SHA3-256, SHA-256, SHA-1, MD5]` | Allowed CHAP digests, strongest first. Empty list falls back to all four. |
@@ -269,7 +268,6 @@ not an operational knob — so there is no `enabled` key.
 |---|---|---|
 | `audit.dir` | `<data_dir>/audit` | Audit directory override. Both products. |
 | `audit.compress_rotated` | `true` | **VTL only.** zstd-compress rotated daily files. |
-| `audit.retention_days` | `90` | **VTL only.** Days of rotated history kept locally before pruning. Must be ≥ 40. |
 
 ### `keystore`
 
