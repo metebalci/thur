@@ -90,7 +90,7 @@ up with the sustained host write rate. See
 | **Cartridge** (VTL) | A virtual tape — sequential-access, lives in a slot, loaded into a drive. |
 | **Volume** (VSA) | A thin-provisioned block LUN with a sparse page table. |
 | **Slot / drive / changer** (VTL) | Storage slot holds a cartridge; drive reads/writes; changer (medium changer, LUN 0) moves cartridges. |
-| **Snapshot / clone** (VSA) | Frozen point-in-time page table; a clone is a new writable LUN seeded from one. [`VSA_OPERATIONS.md`](VSA_OPERATIONS.md). |
+| **Snapshot / clone** (VSA) | Frozen point-in-time page table; a clone is a new writable LUN seeded from one. [`VOLUME.md`](VOLUME.md). |
 | **Backpressure** | Flow control that parks host writes when the cache budget fills, surfacing SCSI NOT READY on timeout. |
 | **DEK / keystore** | Data Encryption Key and the backend that wraps it, for at-rest encryption. |
 | **Admin socket** | The peer-cred-authed Unix socket the daemon-routed CLI talks to (`/run/<product>/admin.sock`). |

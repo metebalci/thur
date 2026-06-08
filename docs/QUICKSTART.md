@@ -56,10 +56,14 @@ storage:
       root_dir: /var/lib/thurvtl/storage-local
 ```
 
-To change the chassis later, edit the starter's `library:` block — the
-daemon materializes `<data_dir>/library/library.json` from it on first
-start. `thurvtl config defaults` prints the annotated reference for
-every key.
+`num_slots` / `num_drives` are not locked in — edit the starter's
+`library:` block and restart to resize the chassis. Growing always
+succeeds; shrinking succeeds only down to what's in use — the daemon
+refuses a shrink that would orphan a cartridge or a loaded drive
+(`thurvtl library bounds` shows the safe-shrink floor). The daemon
+materializes `<data_dir>/library/library.json` from this block on first
+start and reconciles it on every restart. `thurvtl config defaults`
+prints the annotated reference for every key.
 
 ### 2. Run
 
@@ -172,7 +176,7 @@ sudo mkdir -p /mnt/myvol && sudo mount /dev/sdb1 /mnt/myvol
 After creating more volumes, rescan the initiator so the host sees the
 new LUN (`iscsiadm -m session --rescan` or `nvme ns-rescan /dev/nvme0`).
 Volume operations — snapshots, clones, online resize, encryption — are
-in [`admin/VSA_OPERATIONS.md`](admin/VSA_OPERATIONS.md); host connection
+in [`admin/VOLUME.md`](admin/VOLUME.md); host connection
 detail in [`admin/CONNECTING.md`](admin/CONNECTING.md).
 
 ---

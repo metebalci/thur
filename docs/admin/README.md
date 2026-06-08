@@ -35,7 +35,7 @@ engine, dedup, backpressure) live in the
 
 - **Thur VTL:** [`CARTRIDGE.md`](CARTRIDGE.md) — cartridge lifecycle,
   WORM, legal hold, encryption.
-- **Thur VSA:** [`VSA_OPERATIONS.md`](VSA_OPERATIONS.md) — volumes,
+- **Thur VSA:** [`VOLUME.md`](VOLUME.md) — volumes,
   snapshots, clones, in-place restore, online resize, encryption.
 - [`CLI.md`](CLI.md) — the CLI surface, daemon-mode rules, and the
   long-running job protocol.

@@ -1,4 +1,4 @@
-# Thur VSA Operations
+# Volume Operations
 
 Day-to-day management of block volumes: create, resize, snapshot, clone,
 restore, encrypt, destroy. All `volume` commands are **daemon-routed** —

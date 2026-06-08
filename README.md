@@ -91,34 +91,6 @@ Thur VSA additionally provides:
   write-back page cache.
 - VAAI / NVMe data-path primitives and persistent reservations.
 
-# Getting Started
-
-Install on any supported distro (Debian/Ubuntu, RHEL/Rocky/Alma,
-SLES/openSUSE) from the apt / yum repository, then install one or both
-products:
-
-```bash
-curl -fsSL https://thur.metebalci.com/install.sh | sudo bash
-sudo apt install thurvtl thurvsa     # dnf / zypper on RPM distros
-```
-
-The packages install the daemon + CLI but **do not** auto-start the
-daemon — it needs configuration first (a `data_dir`, one
-`storage.backends:` entry, and — for VTL — a `library:` chassis block).
-
-From there, the **[Quick Start](docs/QUICKSTART.md)** walks you from
-install to a working virtual device in a few minutes, on one machine,
-with no cloud account. For everything beyond that — the full install
-matrix (GitHub Releases, containers, air-gapped, signature
-verification), configuration, connecting hosts, operations, security,
-and going to production — see the **[Admin Guide](docs/admin/)**.
-
-Verify the package signing key against the current fingerprint:
-
-```
-E1FF A6E4 4D8A F56E BD17  997C 9B4E 436A E137 3A4B
-```
-
 # Documentation
 
 All documentation lives under [`docs/`](docs/), organized into four sets
@@ -129,12 +101,11 @@ by audience — see [`docs/README.md`](docs/README.md) for the full map:
 - **[Admin Guide](docs/admin/)** — installation, configuration, storage
   backends, connecting hosts, VTL/VSA operations, security, monitoring,
   disaster recovery, troubleshooting, production-readiness.
-- **[Reference](docs/reference/)** — how it works: the wire
-  [`SPEC.md`](docs/reference/SPEC.md), SCSI / NVMe conformance, and the
-  storage / dedup / backpressure / transport internals.
+- **[Reference](docs/reference/)** — how it works: the wire spec, SCSI /
+  NVMe conformance, and the storage / dedup / backpressure / transport
+  internals.
 - **[Developer](docs/dev/)** — building from source, the test suite,
-  releasing. Repo orientation for contributors is in
-  [`CLAUDE.md`](CLAUDE.md).
+  releasing.
 
 Roadmap and open work are tracked as
 [GitHub issues](https://github.com/metebalci/thur/issues).

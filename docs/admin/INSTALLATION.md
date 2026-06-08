@@ -12,10 +12,6 @@ path, signature verification, containers, and the post-install steps.
 - **Storage:** a cloud account (AWS S3, GCS, Azure Blob), an on-prem
   S3-compatible object store (MinIO, Ceph RGW, AIStore, …), or the
   `local` filesystem backend.
-- **Building from source:** Rust 1.92+ (2024 edition) plus a C toolchain
-  (gcc/clang, pkg-config, OpenSSL headers). OpenSSL is vendored and
-  compiled in, so the release binary carries no runtime `libssl`
-  dependency.
 
 ## Package repository (recommended)
 
@@ -98,15 +94,6 @@ Each daemon runs a storage target plus an HTTP metrics server (port 9090)
 in one process. Persist systemd customizations through
 `sudo systemctl edit <unit>` so package upgrades don't clobber them.
 Configuration is in [`CONFIGURATION.md`](CONFIGURATION.md).
-
-## From source
-
-```bash
-cargo build --release        # binaries in target/release/
-```
-
-Not recommended for production. Build / test details in
-[`../dev/DEVELOPMENT.md`](../dev/DEVELOPMENT.md).
 
 ## Containers
 
