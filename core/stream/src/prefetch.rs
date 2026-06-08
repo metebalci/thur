@@ -355,4 +355,85 @@ mod tests {
         // but we can test the task tracking structure is correct
         assert_eq!(config.chunks_ahead, 2);
     }
+
+    /// Issue #97 acceptance: a read of chunk K with a configured
+    /// look-ahead of N actually pulls K+1..K+N from cloud into the local
+    /// pool in the background. Uses a real `LocalBackend` round-trip
+    /// rather than a mock so the BLAKE3-verified pool insert is exercised
+    /// end-to-end.
+    #[tokio::test]
+    async fn on_read_fans_out_look_ahead_to_pool() {
+        use shared_object_store::LocalBackend;
+        use std::time::Duration;
+
+        let pool_dir = tempfile::TempDir::new().unwrap();
+        let cloud_dir = tempfile::TempDir::new().unwrap();
+
+        let store = ChunkStore::new(pool_dir.path(), "primary").expect("pool");
+        let backend = LocalBackend::new(cloud_dir.path()).await.expect("backend");
+
+        // Two look-ahead chunks (K+1, K+2) live only in cloud. Seed the
+        // backend at exactly the key the prefetcher will request.
+        let mut planned = Vec::new();
+        for (i, fill) in [(11u64, 0x11u8), (12u64, 0x22u8)] {
+            let data = vec![fill; 4096];
+            let hash = blake3::hash(&data).to_hex().to_string();
+            let key = store.object_key_in_store(&hash);
+            backend.upload_chunk(&key, &data).await.expect("seed cloud");
+            planned.push((i, hash));
+        }
+
+        let mgr = PrefetchManager::new(
+            Arc::new(Box::new(backend) as Box<dyn ObjectStoreBackend>),
+            PrefetchConfig {
+                chunks_ahead: 2,
+                enabled: true,
+            },
+        );
+
+        // Location oracle: the two look-ahead chunks are cloud-only
+        // (cache miss), everything else absent.
+        let snapshot: HashMap<u64, ChunkLocationInfo> = planned
+            .iter()
+            .map(|(id, hash)| {
+                (
+                    *id,
+                    ChunkLocationInfo {
+                        in_local_cache: false,
+                        in_s3: true,
+                        hash: Some(hash.clone()),
+                    },
+                )
+            })
+            .collect();
+        let location_fn = move |id: u64| -> ChunkLocationInfo {
+            snapshot.get(&id).cloned().unwrap_or(ChunkLocationInfo {
+                in_local_cache: false,
+                in_s3: false,
+                hash: None,
+            })
+        };
+
+        let budget = Arc::new(PoolBudget::unbounded(pool_dir.path().to_path_buf()));
+        // Read chunk 10 -> prefetch 11, 12.
+        mgr.on_read("CART", 10, store.clone(), budget, location_fn)
+            .await;
+
+        // Let the background download tasks drain.
+        for _ in 0..200 {
+            if mgr.active_task_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mgr.active_task_count().await, 0, "prefetch tasks finished");
+
+        // Both look-ahead chunks are now resident in the local pool.
+        for (_, hash) in &planned {
+            assert!(
+                store.open_read(hash).is_ok(),
+                "prefetched chunk {hash} landed in the pool"
+            );
+        }
+    }
 }

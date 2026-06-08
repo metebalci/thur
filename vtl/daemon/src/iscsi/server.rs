@@ -32,6 +32,15 @@ use shared_iscsi::auth::parse_chap_algorithms;
 /// backend handles through this map.
 pub type ObjectStoreRegistry = Arc<TokioMutex<HashMap<String, Box<dyn ObjectStoreBackend>>>>;
 
+/// Per-backend background read-prefetch managers (issue #97). Lazily
+/// populated by the SCSI READ prefetch hook on first cache miss for a
+/// backend; cached so each manager's in-flight-task table (the
+/// `prefetch_queue_depth` source + the dedup that stops re-fetching a
+/// chunk already downloading) persists across reads. Process-lifetime,
+/// shared via the handler.
+pub type PrefetchManagerRegistry =
+    Arc<TokioMutex<HashMap<String, Arc<core_mediachanger::PrefetchManager>>>>;
+
 /// iSCSI Server
 ///
 /// Owns the protocol-specific state (target IQN, listen address,
@@ -167,6 +176,8 @@ impl IscsiServer {
                 .reservations
                 .initiator_port
                 .collapse_isid(),
+            prefetch_managers: Arc::clone(&self.state.prefetch_managers),
+            read_prefetch_chunks_ahead: self.state.read_prefetch_chunks_ahead,
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 

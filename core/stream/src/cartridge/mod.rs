@@ -1855,6 +1855,58 @@ impl Cartridge {
         })
     }
 
+    /// Snapshot the background-prefetch look-ahead window for the
+    /// daemon's out-of-band prefetch hook (issue #97). Mirrors the
+    /// snapshot `trigger_prefetch` builds from `read_block_async`, but
+    /// *returns* the data so the daemon can drive
+    /// [`PrefetchManager::on_read`] outside the drive lock — the sync
+    /// SCSI read path can't await, so the cartridge can't fire prefetch
+    /// itself.
+    ///
+    /// `current_chunk_id` is the chunk backing the next read LBA; the
+    /// window covers `current+1 ..= current+ahead`. Only sealed,
+    /// cloud-resident chunks are actionable downstream — staging chunks
+    /// (`hash == None`) are included in the snapshot with their real
+    /// location so `on_read` skips them. Returns `None` when prefetch is
+    /// disabled (`ahead == 0`) or the head sits past end-of-data (no
+    /// block at the head LBA).
+    pub fn peek_prefetch_window(&self, ahead: u32) -> Option<PrefetchWindow> {
+        if ahead == 0 {
+            return None;
+        }
+        let bi = self.try_block_at(self.runtime.active_partition, self.head_lba)?;
+        let current_chunk_id = bi.chunk_id;
+        let mut snapshot = std::collections::HashMap::with_capacity(ahead as usize);
+        let mut read_ahead_buffered_bytes = 0u64;
+        for i in 1..=ahead as u64 {
+            let id = current_chunk_id + i;
+            if let Ok(rec) = self.chunk_index.read(id) {
+                let in_local_cache =
+                    matches!(rec.location, LocationTag::LocalOnly | LocationTag::Both);
+                if in_local_cache {
+                    read_ahead_buffered_bytes = read_ahead_buffered_bytes.saturating_add(rec.size);
+                }
+                snapshot.insert(
+                    id,
+                    ChunkLocationInfo {
+                        in_local_cache,
+                        in_s3: matches!(rec.location, LocationTag::CloudOnly | LocationTag::Both),
+                        hash: rec.hash,
+                    },
+                );
+            }
+        }
+        Some(PrefetchWindow {
+            cartridge_id: self.manifest.label.clone(),
+            backend_name: self.manifest.backend.clone(),
+            current_chunk_id,
+            chunk_store: self.chunk_store.clone(),
+            pool_budget: self.pool_budget.clone(),
+            read_ahead_buffered_bytes,
+            snapshot,
+        })
+    }
+
     /// Resolve a `ChunkRec` to a readable `File` handle. Sealed chunks
     /// (`hash` is `Some`) live in the shared `ChunkStore`; the active
     /// staging chunk (`hash` is `None`) lives at `<root>/.staging/chunk-<id>.dat`.
@@ -3163,6 +3215,37 @@ pub struct NextReadChunk {
     pub chunk_store: ChunkStore,
 }
 
+/// Background read-ahead look-ahead window, snapshotted under the drive
+/// lock by [`Cartridge::peek_prefetch_window`] so the daemon can drive
+/// [`PrefetchManager::on_read`] *outside* the lock (issue #97). The SCSI
+/// read path is synchronous — `with_drive` can't `await` — so the
+/// cartridge can't fire prefetch itself the way `read_block_async` does;
+/// the daemon peeks this window, releases the lock, then runs the
+/// background fetch.
+pub struct PrefetchWindow {
+    /// Cartridge label, used as the prefetch active-task key prefix.
+    pub cartridge_id: String,
+    /// Sticky cloud backend the cartridge is bound to. Keys the daemon's
+    /// per-backend `PrefetchManager`.
+    pub backend_name: String,
+    /// Chunk backing the next read LBA. `on_read` fetches
+    /// `current_chunk_id + 1 ..= current_chunk_id + chunks_ahead`.
+    pub current_chunk_id: u64,
+    /// Clone of the cartridge's `ChunkStore` (backend + dedup-scope
+    /// namespace baked in) — where prefetched bytes land.
+    pub chunk_store: ChunkStore,
+    /// The cartridge's per-backend pool budget, so prefetched bytes are
+    /// accounted exactly like the SCSI-read refetch path accounts them.
+    pub pool_budget: Arc<PoolBudget>,
+    /// Sum of the sizes of look-ahead chunks already resident in the
+    /// local pool — the live read-prefetch buffer occupancy reported as
+    /// the `tape_read_buffer_used` gauge.
+    pub read_ahead_buffered_bytes: u64,
+    /// Per-chunk-id location info for `current+1 ..= current+ahead`,
+    /// consumed by the `on_read` `chunk_location_fn` closure.
+    pub snapshot: std::collections::HashMap<u64, ChunkLocationInfo>,
+}
+
 /// Snapshot describing one chunk to upload — re-exported from
 /// `shared_upload_worker::PendingUpload` (lifted alongside
 /// `upload_chunk_inert` so the block product can share the same
@@ -3323,5 +3406,71 @@ mod mam_attribute_tests {
         cart.write_mam_attribute(0x0801, 1, b"x".to_vec()).unwrap();
         cart.erase().unwrap();
         assert!(cart.mam_attributes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prefetch_window_tests {
+    //! Issue #97: the daemon's out-of-band prefetch hook snapshots this
+    //! window under the drive lock, then drives `PrefetchManager::on_read`
+    //! outside it. These pin the window shape; the background fan-out
+    //! itself is covered in `prefetch.rs`.
+    use super::*;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    /// Eight 4 KiB records into a Fixed(4 KiB) cartridge: each write
+    /// rolls, so consecutive blocks land in consecutive chunks (the
+    /// trailing chunk stays staging). Head is rewound to BOT.
+    fn multi_chunk_cart(tmp: &TempDir) -> Cartridge {
+        let tapes = tmp.path().join("tapes");
+        let mut cart = Cartridge::create_with_chunking(
+            &tapes,
+            "PREFETCH01",
+            ChunkingMode::Fixed { size_bytes: 4096 },
+            8,
+            "primary",
+            false,
+            DedupScope::Global,
+        )
+        .expect("create_with_chunking");
+        for _ in 0..8 {
+            cart.write_data(Bytes::from(vec![0xAB; 4096]))
+                .expect("write_data");
+        }
+        cart.locate(0).expect("locate to BOT");
+        cart
+    }
+
+    #[test]
+    fn window_covers_next_n_sealed_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let cart = multi_chunk_cart(&tmp);
+
+        let window = cart.peek_prefetch_window(2).expect("window at BOT");
+        let c = window.current_chunk_id;
+
+        // Exactly the next two chunk ids, all sealed-and-local.
+        let mut ids: Vec<u64> = window.snapshot.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![c + 1, c + 2], "look-ahead is the next 2 chunks");
+        for id in [c + 1, c + 2] {
+            let loc = &window.snapshot[&id];
+            assert!(loc.in_local_cache, "sealed chunk {id} is local");
+            assert!(loc.hash.is_some(), "sealed chunk {id} carries a hash");
+        }
+        assert!(
+            window.read_ahead_buffered_bytes > 0,
+            "two local look-ahead chunks => non-zero buffered bytes"
+        );
+        assert_eq!(window.backend_name, "primary");
+        assert_eq!(window.cartridge_id, "PREFETCH01");
+    }
+
+    #[test]
+    fn ahead_zero_disables_window() {
+        let tmp = TempDir::new().unwrap();
+        let cart = multi_chunk_cart(&tmp);
+        assert!(cart.peek_prefetch_window(0).is_none());
     }
 }

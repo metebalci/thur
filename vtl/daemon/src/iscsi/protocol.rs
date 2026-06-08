@@ -45,14 +45,14 @@ use unit_attention::UnitAttentionTracker;
 
 use anyhow::{Result, anyhow};
 use core_mediachanger::{
-    AuditChannel, AuditRateLimiter, Library, LibraryFacade, NextReadChunk, ObjectStoreConfig,
-    PoolBudget, TapeEvent,
+    AuditChannel, AuditRateLimiter, ChunkLocationInfo, Library, LibraryFacade, NextReadChunk,
+    ObjectStoreBackend, ObjectStoreConfig, PoolBudget, PrefetchConfig, PrefetchManager, TapeEvent,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-use super::server::ObjectStoreRegistry;
+use super::server::{ObjectStoreRegistry, PrefetchManagerRegistry};
 
 // Re-use shared dispatch types so the library wrapper, library-side
 // handlers, and the moved drive-LUN handlers all speak the same
@@ -162,6 +162,9 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     };
 
     if next.store_path.is_file() {
+        // The next read's chunk is already local — served without a
+        // cloud round-trip (a prefetch / earlier warm paid off).
+        shared_telemetry::record::prefetch_hit();
         return Ok(());
     }
 
@@ -212,6 +215,10 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 
     let downloaded = bytes.len() as u64;
 
+    // The next read's chunk was missing and we waited on a cloud
+    // download to serve it (a prefetch-miss).
+    shared_telemetry::record::prefetch_miss();
+
     // Persist through the pool API rather than a raw `fs::write`. This
     // (a) BLAKE3-verifies the cloud bytes against the expected hash
     // before they enter the pool (closing the bit-rot / wrong-bytes gap
@@ -260,6 +267,153 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     });
 
     Ok(())
+}
+
+/// Background read-ahead prefetch for the SCSI READ path (issue #97).
+///
+/// Where [`ensure_chunk_local_for_next_read`] pulls the *single* chunk
+/// the next read needs (blocking, for read correctness), this fans the
+/// `chunks_ahead` chunks *following* it out to the shared
+/// [`PrefetchManager`], which downloads them in the background so a
+/// sequential restore doesn't stall on cloud latency chunk-by-chunk.
+/// Best-effort: a disabled knob, a cloud-blind cartridge, an empty
+/// look-ahead, or an unreachable backend all simply no-op.
+///
+/// The manager is driven from here rather than from `Cartridge` because
+/// the SCSI read path is synchronous — `with_drive` can't `await`. We
+/// snapshot the look-ahead window under the drive lock
+/// ([`core_mediachanger::Cartridge::peek_prefetch_window`]), release it,
+/// then run `on_read` outside. One `PrefetchManager` is built per
+/// backend and cached in `prefetch_managers` so its in-flight-task table
+/// (the `prefetch_queue_depth` source, and the dedup that stops
+/// re-fetching a chunk already downloading) persists across reads.
+pub(crate) async fn prefetch_read_ahead(
+    drive_manager: &Arc<DriveManager>,
+    drive_id: usize,
+    tsih: u16,
+    backends: &ObjectStoreRegistry,
+    storage_config: &Arc<ObjectStoreConfig>,
+    prefetch_managers: &PrefetchManagerRegistry,
+    chunks_ahead: u32,
+) {
+    if chunks_ahead == 0 {
+        return;
+    }
+
+    // Snapshot the look-ahead window under the drive lock, then release
+    // it before any async I/O (same rule the blocking refetch follows:
+    // holding the sync drive Mutex across an await is forbidden).
+    let Some(window) = drive_manager
+        .with_drive(drive_id, tsih, |cart| {
+            Ok(cart.peek_prefetch_window(chunks_ahead))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+
+    // Read-prefetch buffer occupancy: bytes of the look-ahead window
+    // already warmed into the local pool ahead of the head.
+    shared_telemetry::record::tape_read_buffer_used(
+        &window.cartridge_id,
+        window.read_ahead_buffered_bytes,
+    );
+
+    // Nothing addressable to prefetch (head at end-of-data, or every
+    // look-ahead chunk is still in staging).
+    if window.snapshot.is_empty() {
+        return;
+    }
+
+    let Some(manager) = get_or_build_prefetch_manager(
+        prefetch_managers,
+        backends,
+        storage_config,
+        &window.backend_name,
+        chunks_ahead,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let snapshot = window.snapshot;
+    let location_fn = move |chunk_id: u64| -> ChunkLocationInfo {
+        snapshot
+            .get(&chunk_id)
+            .cloned()
+            .unwrap_or(ChunkLocationInfo {
+                in_local_cache: false,
+                in_s3: false,
+                hash: None,
+            })
+    };
+
+    manager
+        .on_read(
+            &window.cartridge_id,
+            window.current_chunk_id,
+            window.chunk_store,
+            window.pool_budget,
+            location_fn,
+        )
+        .await;
+
+    shared_telemetry::record::prefetch_queue_depth(manager.active_task_count().await as i64);
+}
+
+/// Resolve a backend handle from the shared registry, lazily
+/// constructing (and caching) it on first miss. Factored out of the
+/// double-checked-lock idiom the prefetch / legal-hold hooks share: the
+/// auth/network round-trip runs with no lock held so concurrent ops
+/// don't serialize behind the first init of any backend.
+async fn get_or_init_backend(
+    backends: &ObjectStoreRegistry,
+    storage_config: &Arc<ObjectStoreConfig>,
+    backend_name: &str,
+) -> Result<Box<dyn ObjectStoreBackend>> {
+    if let Some(b) = backends.lock().await.get(backend_name).cloned() {
+        return Ok(b);
+    }
+    let b = storage_config
+        .create_backend_named(backend_name)
+        .await
+        .map_err(|e| anyhow!("init backend '{}': {}", backend_name, e))?;
+    let mut reg = backends.lock().await;
+    Ok(reg.entry(backend_name.to_string()).or_insert(b).clone())
+}
+
+/// Get-or-build the per-backend [`PrefetchManager`]. Cached in
+/// `prefetch_managers` so the in-flight-task table survives across reads
+/// (dedup + queue-depth depend on it). Returns `None` if the bound
+/// backend can't be initialized — prefetch is best-effort.
+async fn get_or_build_prefetch_manager(
+    prefetch_managers: &PrefetchManagerRegistry,
+    backends: &ObjectStoreRegistry,
+    storage_config: &Arc<ObjectStoreConfig>,
+    backend_name: &str,
+    chunks_ahead: u32,
+) -> Option<Arc<PrefetchManager>> {
+    if let Some(m) = prefetch_managers.lock().await.get(backend_name).cloned() {
+        return Some(m);
+    }
+    let backend = get_or_init_backend(backends, storage_config, backend_name)
+        .await
+        .ok()?;
+    let manager = Arc::new(PrefetchManager::new(
+        Arc::new(backend),
+        PrefetchConfig {
+            enabled: true,
+            chunks_ahead,
+        },
+    ));
+    let mut reg = prefetch_managers.lock().await;
+    Some(
+        reg.entry(backend_name.to_string())
+            .or_insert(manager)
+            .clone(),
+    )
 }
 
 /// Read the cloud sentinel

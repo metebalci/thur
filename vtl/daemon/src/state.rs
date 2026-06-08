@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 
 use crate::diagnostics::DiagnosticStore;
 use crate::iscsi::drive_manager::DriveManager;
-use crate::iscsi::server::ObjectStoreRegistry;
+use crate::iscsi::server::{ObjectStoreRegistry, PrefetchManagerRegistry};
 use crate::iscsi::session::SessionManager;
 use crate::iscsi::unit_attention::UnitAttentionTracker;
 use scsi_smc::changer::ElementAddressConfig;
@@ -86,6 +86,10 @@ pub struct DaemonStateConfig {
     pub pool_budgets: HashMap<String, Arc<PoolBudget>>,
     pub ghost_lists: HashMap<String, Arc<core_mediachanger::GhostList>>,
     pub backpressure_max_wait: Duration,
+    /// How many chunks ahead of the next read the background prefetcher
+    /// pulls (issue #97). Sourced from
+    /// `memory_buffers.read_prefetch_chunks_ahead`; 0 disables prefetch.
+    pub read_prefetch_chunks_ahead: u32,
     /// Live web-admin password verifier, seeded from
     /// `<data_dir>/admin-password.json` at boot. Shared (same `Arc`)
     /// with the HTTP listener's auth middleware and hot-swapped by the
@@ -163,6 +167,13 @@ pub struct DaemonState {
     /// the HTTP listener (`HttpState.daemon_state.auth`) — one process,
     /// one handle.
     pub auth: shared_admin_auth::AuthState,
+    /// How many chunks ahead of the next read the background prefetcher
+    /// pulls (issue #97). Cloned into the iSCSI handler at server start.
+    pub read_prefetch_chunks_ahead: u32,
+    /// Per-backend background read-prefetch managers (issue #97). Lazily
+    /// populated by the READ prefetch hook; shared with the iSCSI
+    /// handler so the in-flight-task table persists across reads.
+    pub prefetch_managers: PrefetchManagerRegistry,
 }
 
 impl DaemonState {
@@ -227,6 +238,8 @@ impl DaemonState {
             pool_budgets,
             reservations,
             auth: cfg.auth,
+            read_prefetch_chunks_ahead: cfg.read_prefetch_chunks_ahead,
+            prefetch_managers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -284,6 +297,7 @@ mod tests {
             ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
             auth: shared_admin_auth::AuthState::new(None),
+            read_prefetch_chunks_ahead: 2,
         };
 
         let state = DaemonState::new(cfg);

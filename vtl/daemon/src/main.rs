@@ -1742,6 +1742,7 @@ async fn main() -> Result<()> {
         ghost_lists: ghost_lists.clone(),
         backpressure_max_wait,
         auth: auth_state,
+        read_prefetch_chunks_ahead: cfg.memory_buffers.read_prefetch_chunks_ahead,
     }));
 
     // Periodic backend-reachability ticker. Opt-in via

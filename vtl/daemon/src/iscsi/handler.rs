@@ -43,7 +43,7 @@ use tokio::sync::broadcast;
 
 use super::drive_manager::DriveManager;
 use super::protocol::{self, Pdu, ScsiResp};
-use super::server::ObjectStoreRegistry;
+use super::server::{ObjectStoreRegistry, PrefetchManagerRegistry};
 use super::unit_attention::UnitAttentionTracker;
 use crate::diagnostics::DiagnosticStore;
 use scsi_smc::changer::{ElementAddressConfig, ElementType};
@@ -87,6 +87,14 @@ pub struct IscsiLibraryHandler {
     /// collapses the ISID so reservations key by IQN alone. Sourced from
     /// `iscsi.reservations.initiator_port`; default `false`.
     pub(crate) pr_collapse_isid: bool,
+    /// Per-backend background read-prefetch managers (issue #97). Lazily
+    /// built by the READ prefetch hook; shared process-lifetime so the
+    /// in-flight-task table (queue depth + dedup) persists across reads.
+    pub(crate) prefetch_managers: PrefetchManagerRegistry,
+    /// How many chunks ahead of the next read the background prefetcher
+    /// pulls. Sourced from `memory_buffers.read_prefetch_chunks_ahead`;
+    /// 0 disables prefetch.
+    pub(crate) read_prefetch_chunks_ahead: u32,
 }
 
 impl IscsiLibraryHandler {
@@ -170,6 +178,21 @@ impl ScsiHandler for IscsiLibraryHandler {
                     e
                 );
             }
+
+            // Background N-chunk read-ahead (issue #97): fan the chunks
+            // *following* the next read out to the shared PrefetchManager
+            // so a sequential restore doesn't stall on cloud latency
+            // chunk-by-chunk. Fire-and-forget; never blocks the read.
+            protocol::prefetch_read_ahead(
+                &self.drive_manager,
+                drive_id,
+                tsih,
+                &self.cloud_backends,
+                &self.storage_config,
+                &self.prefetch_managers,
+                self.read_prefetch_chunks_ahead,
+            )
+            .await;
         }
 
         // SEND DIAGNOSTIC pre-hook: SELFTEST=1 (CDB byte 1 bit 2)

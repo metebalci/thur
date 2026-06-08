@@ -116,8 +116,8 @@ coherent area of the daemon and the files that instrument it:
 | `storage` | Per-backend request rates, latencies, error classes | `s3.rs` / `gcs.rs` / `azure.rs` / `local.rs` via `object_store_backend.rs` |
 | `chunk` | Seal rate, dedup hit rate (local + storage-side via HEAD), upload bytes | `cartridge.rs`, upload worker in daemon |
 | `iscsi` | Active sessions, per-opcode throughput, data-in/out bytes | `vtl/daemon/src/iscsi/*` |
-| `tape` | Per-cartridge memory-buffer occupancy | `memory_buffer_manager.rs` |
-| `prefetch` | Queue depth, hit/miss counts | `prefetch.rs` |
+| `tape` | Per-cartridge read-ahead + write-staging buffer occupancy | `memory_buffer_manager.rs` (write), `iscsi/protocol.rs` (read) |
+| `prefetch` | Queue depth, hit/miss counts | `iscsi/protocol.rs` (read hook), `prefetch.rs` (engine) |
 | `audit` | Append rate by entry kind, chain resets, queue drops | `audit.rs` |
 | `recovery` | Orphan-upload scan: chunks found by boot-time sweep + scan duration | `vtl/daemon/src/upload_recovery.rs` (thurvtl only) |
 | `daemon` | Process start time | `vtl/daemon/src/main.rs` |

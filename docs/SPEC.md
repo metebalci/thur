@@ -2661,6 +2661,20 @@ done. A sustained climb means host writes are outrunning backend uploads
 — the same condition `pool_backpressure_waits_total` catches once the
 pool actually fills.
 
+The `prefetch` and `tape` buffer instruments are VTL-only and driven by
+the SCSI read path (issue #97). On every tape READ the daemon first
+ensures the chunk the next read needs is local — `prefetch_hits_total`
+counts the reads that found it already resident, `prefetch_misses_total`
+the reads that had to wait on a cloud download — then fans the following
+`memory_buffers.read_prefetch_chunks_ahead` chunks out to a background
+`PrefetchManager` so a sequential restore doesn't stall chunk-by-chunk.
+`prefetch_queue_depth` is the absolute count of in-flight background
+prefetch tasks, pushed after each trigger. `tape_read_buffer_used` is the
+per-cartridge sum of look-ahead chunk bytes already warmed into the local
+pool ahead of the head; `tape_write_buffer_used` is the per-cartridge
+write-staging bytes buffered for upload but not yet dispatched, pushed by
+the `MemoryBufferManager` as chunks seal and as upload batches dispatch.
+
 ### Process-global handle
 
 The core call sites — cartridge, audit, storage, iSCSI, pool budget —

@@ -1381,6 +1381,40 @@ pub mod record {
             t.upload_set_queue_depth(n);
         }
     }
+    /// Outstanding background read-prefetch tasks (issue #97).
+    pub fn prefetch_queue_depth(n: i64) {
+        if let Some(t) = global() {
+            t.prefetch_set_queue_depth(n);
+        }
+    }
+    /// A host read found its chunk already local (served from a prefetch
+    /// / earlier warm), no cloud round-trip needed.
+    pub fn prefetch_hit() {
+        if let Some(t) = global() {
+            t.prefetch_inc_hit();
+        }
+    }
+    /// A host read found its chunk missing and had to wait on a cloud
+    /// download.
+    pub fn prefetch_miss() {
+        if let Some(t) = global() {
+            t.prefetch_inc_miss();
+        }
+    }
+    /// Per-cartridge read-prefetch buffer occupancy (bytes of look-ahead
+    /// chunks already warmed into the local pool).
+    pub fn tape_read_buffer_used(cartridge: &str, bytes: u64) {
+        if let Some(t) = global() {
+            t.tape_set_read_buffer(cartridge, bytes);
+        }
+    }
+    /// Per-cartridge write-staging buffer occupancy (bytes buffered for
+    /// upload but not yet dispatched).
+    pub fn tape_write_buffer_used(cartridge: &str, bytes: u64) {
+        if let Some(t) = global() {
+            t.tape_set_write_buffer(cartridge, bytes);
+        }
+    }
     pub fn iscsi_sessions_active(n: i64) {
         if let Some(t) = global() {
             t.iscsi_set_sessions_active(n);

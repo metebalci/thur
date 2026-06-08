@@ -74,7 +74,8 @@ pub use core_stream::cartridge::{
     AtRestCreateParams, Cartridge, CartridgeEncryptionAlgorithm, CartridgeEncryptionMeta,
     CartridgeOpenMode, CartridgeOpenOptions, ChunkUploadOutcome, ChunkingMode, DedupScope,
     MAX_PARTITIONS, ManifestBackupOutcome, NextReadChunk, PendingPartitionLayout,
-    PendingUploadPayload, generate_cartridge_uuid, lto_default_capacity_gb, upload_chunk_inert,
+    PendingUploadPayload, PrefetchWindow, generate_cartridge_uuid, lto_default_capacity_gb,
+    upload_chunk_inert,
 };
 pub use core_stream::chunk_store::ChunkStore;
 pub use shared_audit::{

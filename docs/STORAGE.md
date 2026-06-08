@@ -180,6 +180,37 @@ volatile drive state, never persisted.
 0-based LBA, filemarks (zero-length blocks), BOT/EOD, SPACE
 (records/filemarks), LOCATE (random access).
 
+## Read path — cache miss and read-ahead
+
+The SCSI READ handler runs synchronously against the loaded cartridge's
+on-disk pool, so the cloud round-trips that hide read latency live in two
+out-of-band async hooks the daemon fires *around* each tape READ (the
+sync read itself can't `await`):
+
+1. **On-demand refetch.** Before the read, the daemon peeks the chunk
+   backing the next read LBA; if its pool file is missing (cold cache, or
+   eviction pruned it mid-session) it downloads exactly that chunk from
+   the cartridge's bound backend and warms it into the pool — blocking,
+   because the read needs it now. A peek that finds the chunk already
+   local is a prefetch *hit*; a download is a *miss*
+   (`prefetch_hits_total` / `prefetch_misses_total`).
+
+2. **Background read-ahead.** Sequential restores would still stall one
+   cloud round-trip per chunk if every read waited on its own refetch, so
+   after the on-demand step the daemon fans the next
+   `memory_buffers.read_prefetch_chunks_ahead` chunks (default 2) out to a
+   per-backend `PrefetchManager`. It downloads them in the background —
+   deduping against already-in-flight fetches and never blocking the host
+   — so by the time the head reaches them they are already pool-resident.
+   0 disables read-ahead; the on-demand refetch always runs. In-flight
+   tasks are reported as `prefetch_queue_depth`, and the look-ahead bytes
+   already warmed ahead of the head as `tape_read_buffer_used`.
+
+Both hooks route through `ChunkPool::insert_verified_bytes`, so every
+cloud-fetched chunk is BLAKE3-verified against its content address before
+it enters the pool (see *Integrity layers* below) and accounted against
+the per-backend disk-cache budget.
+
 ## Integrity layers
 
 Four independent layers, each firing on its own trigger for a distinct

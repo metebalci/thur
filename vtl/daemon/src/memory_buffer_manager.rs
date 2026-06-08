@@ -294,6 +294,7 @@ impl MemoryBufferManager {
 
             // Update write buffer usage
             tape.write_buffer_usage += size;
+            shared_telemetry::record::tape_write_buffer_used(tape_id, tape.write_buffer_usage);
             *tape.chunk_bytes.entry(chunk_id).or_insert(0) += size;
             tape.head_position = lba + 1; // Advance head
 
@@ -515,6 +516,7 @@ impl MemoryBufferManager {
             }
         }
         tape.write_buffer_usage = tape.write_buffer_usage.saturating_sub(dispatched_bytes);
+        shared_telemetry::record::tape_write_buffer_used(tape_id, tape.write_buffer_usage);
         info!(
             "Dispatched upload batch for {}: {} chunks ({} bytes), write_buffer_usage now {}",
             tape_id,

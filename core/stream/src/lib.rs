@@ -31,7 +31,7 @@ pub mod tape;
 pub use cartridge::{
     Cartridge, CartridgeOpenMode, CartridgeOpenOptions, ChunkUploadOutcome, ChunkingMode,
     DedupScope, MAX_PARTITIONS, ManifestBackupOutcome, NextReadChunk, PendingPartitionLayout,
-    PendingUploadPayload, lto_default_capacity_gb, upload_chunk_inert,
+    PendingUploadPayload, PrefetchWindow, lto_default_capacity_gb, upload_chunk_inert,
 };
 pub use chunk_store::ChunkStore;
 pub use disk_cache::{DiskCacheManager, refresh_pool_budget_from_tapes};

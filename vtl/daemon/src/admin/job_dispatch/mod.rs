@@ -179,6 +179,7 @@ mod tests {
             ghost_lists: HashMap::new(),
             backpressure_max_wait: Duration::from_secs(30),
             auth: shared_admin_auth::AuthState::new(None),
+            read_prefetch_chunks_ahead: 2,
         };
         Arc::new(DaemonState::new(cfg))
     }
