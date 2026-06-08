@@ -6,11 +6,11 @@
 # commented-out so you can see they exist and what shape the value
 # takes — uncomment and fill in to use them.
 #
-# First-time setup: at minimum, set `data_dir` and one entry under
-# `cloud.backends`, then run `thurvtl library init` before
-# starting the daemon.
+# First-time setup: at minimum, set `data_dir`, the required
+# `library:` block (see below), and one entry under
+# `storage.backends:`, then start the daemon.
 #
-# Print this content from the CLI with `thurvtl config generate`.
+# Print this content from the CLI with `thurvtl config defaults`.
 # The checked-in copy at `dist/thurvtl.defaults.yaml` is
 # auto-maintained by `vtl/cli/build.rs` whenever this file changes.
 
@@ -84,15 +84,15 @@ memory_buffers:
   auto_max_gb_per_tape: 32
 
 # Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
-# applied per cloud backend. Independent of per-tape memory_buffers
+# applied per storage backend. Independent of per-tape memory_buffers
 # above. `size_gb` here is the **per-backend default**; individual
-# entries under `cloud.backends:` below may override with their own
+# entries under `storage.backends:` below may override with their own
 # `disk_cache_size_gb` field for asymmetric workloads. A chunk-seal
 # that would push a backend's pool past its cap (or take free
 # filesystem space below `disk_free_min_gb`) blocks until the upload
 # worker frees space — this is the upload-backpressure gate that
 # prevents disk-fill from turning into MEDIUM ERROR. See
-# `upload.backpressure_max_wait_seconds` under cloud for the per-seal
+# `upload.backpressure_max_wait_seconds` under a storage backend for the per-seal
 # timeout, after which the SCSI surface returns NOT READY (host backup
 # software treats as transient and retries).
 disk_cache:
@@ -105,7 +105,7 @@ disk_cache:
   #     share evenly so two `auto` backends can't combined commit
   #     100% of free space. External disk pressure shrinks the cap
   #     reactively; recovery grows it.
-  # Each cloud.backends entry uses this unless it sets its own
+  # Each storage.backends entry uses this unless it sets its own
   # `disk_cache_size_gb` (same shape).
   size_gb: auto
   # Floor (GB) applied when size_gb resolves under `auto`. Honored
@@ -151,7 +151,7 @@ disk_cache:
 # *which* algorithm and zstd level the drive uses if/when the host
 # flips DCE on. Drive-side compression cuts cross-cartridge dedup
 # ratio because block bytes change with surrounding context — for
-# best dedup, leave the host alone and rely on cloud.compression
+# best dedup, leave the host alone and rely on storage.compression
 # (post-dedup) below.
 drive:
   compression:
@@ -364,7 +364,7 @@ tiering:
 # Audit log. Append-only event journal at <data_dir>/audit/ by default,
 # rolled over daily at UTC midnight. Always on. Records administrative
 # and data-plane state changes (cartridge create/import/export,
-# library init/modify, drive load/unload/move, drive WORM/encryption
+# library reconcile, drive load/unload/move, drive WORM/encryption
 # changes, daemon start/stop, CHAP auth success/failure). Read paths
 # are NOT logged.
 #
@@ -543,7 +543,7 @@ keystore:
 # Four event classes fire alerts: audit-log append failures, CHAP login
 # failures (per-user threshold), disk-cache watermark /
 # backpressure-timeout, and cloud-backend reachability
-# (operator-invoked `system cloud_check`). Each class has an on/off
+# (operator-invoked `system storage check`). Each class has an on/off
 # knob under `events:`.
 #
 # Sinks support two types: `email` (SMTP via lettre) and `webhook`
@@ -634,8 +634,10 @@ alerting:
   #     body_template: |
   #       {"text": "[{{severity}}] {{product}} {{class}}: {{message}}"}
 
-# Library topology (slots, drives, LTO generation) is NOT in this file.
-# It is initialized once via `thurvtl library init` and persisted in
-# <data_dir>/library/library.json. Use `thurvtl library info` to view
-# and `thurvtl library modify` to change.
+# Library topology (slots, drives, LTO generation) is declared in the
+# `library:` block above and materialized into
+# <data_dir>/library/library.json on first daemon start, then
+# reconciled against the YAML on every subsequent start. Use
+# `thurvtl library info` to view and `thurvtl library bounds` for the
+# safe-shrink envelope.
 

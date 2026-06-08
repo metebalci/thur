@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Library management (init, info, modify, monitor)
+    /// Library management (info, bounds, restore, partition)
     Library {
         #[command(subcommand)]
         action: LibraryAction,
@@ -637,7 +637,7 @@ enum CartridgeAction {
         /// Cloud backend name to bind this cartridge to.
         ///
         /// Required when the config defines multiple backends in
-        /// `cloud.backends`; optional (and inferred) when only one
+        /// `storage.backends`; optional (and inferred) when only one
         /// backend is configured. The chosen name is sticky: every
         /// chunk upload, manifest backup, and refetch routes through
         /// this backend for the life of the cartridge.
@@ -729,7 +729,7 @@ enum CartridgeAction {
     Migrate {
         /// Cartridge barcode.
         barcode: String,
-        /// Target backend name (must exist under `cloud.backends:`).
+        /// Target backend name (must exist under `storage.backends:`).
         #[arg(long)]
         target_backend: String,
         /// Migration mode.
@@ -983,7 +983,7 @@ enum LibraryAction {
     Restore {
         /// Cloud backend name to restore from.
         ///
-        /// Required when `cloud.backends:` in the YAML conffile declares
+        /// Required when `storage.backends:` in the YAML conffile declares
         /// more than one backend; inferred when exactly one is configured.
         #[arg(long)]
         backend: Option<String>,

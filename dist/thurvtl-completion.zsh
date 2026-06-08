@@ -358,7 +358,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
-'--target-backend=[Target backend name (must exist under \`cloud.backends\:\`)]:TARGET_BACKEND:_default' \
+'--target-backend=[Target backend name (must exist under \`storage.backends\:\`)]:TARGET_BACKEND:_default' \
 '--mode=[Migration mode]:MODE:(move rebind)' \
 '-c+[Path to configuration file]:CONFIG:_default' \
 '--config=[Path to configuration file]:CONFIG:_default' \
@@ -2429,7 +2429,7 @@ esac
 (( $+functions[_thurvtl_commands] )) ||
 _thurvtl_commands() {
     local commands; commands=(
-'library:Library management (init, info, modify, monitor)' \
+'library:Library management (info, bounds, restore, partition)' \
 'cartridge:Cartridge management operations' \
 'changer:Changer / SMC operations (inventory, move, load, unload)' \
 'drive:Drive operations and status' \
@@ -2879,7 +2879,7 @@ _thurvtl__subcmd__drive__subcmd__status_commands() {
 (( $+functions[_thurvtl__subcmd__help_commands] )) ||
 _thurvtl__subcmd__help_commands() {
     local commands; commands=(
-'library:Library management (init, info, modify, monitor)' \
+'library:Library management (info, bounds, restore, partition)' \
 'cartridge:Cartridge management operations' \
 'changer:Changer / SMC operations (inventory, move, load, unload)' \
 'drive:Drive operations and status' \

@@ -7,7 +7,7 @@
 # takes — uncomment and fill in to use them.
 #
 # First-time setup: at minimum, set `data_dir`, uncomment a
-# `cloud.backends:` entry below, then start the daemon and create a
+# `storage.backends:` entry below, then start the daemon and create a
 # volume via `thurvsa volume create NAME --size SIZE`.
 #
 # Print this content from the CLI with `thurvsa config defaults`.
@@ -180,8 +180,8 @@ iscsi:
 #     listen: "0.0.0.0:8009"
 
 # Content-addressed chunk pool budget on disk at <data_dir>/chunks/,
-# applied per cloud backend. `size_gb` here is the **per-backend
-# default**; individual entries under `cloud.backends:` below may
+# applied per storage backend. `size_gb` here is the **per-backend
+# default**; individual entries under `storage.backends:` below may
 # override with their own `disk_cache_size_gb` field for asymmetric
 # workloads.
 # A page-seal that would push a backend's pool past its cap (or take
@@ -201,7 +201,7 @@ disk_cache:
   #     share evenly so two `auto` backends can't combined commit
   #     100% of free space. External disk pressure shrinks the cap
   #     reactively; recovery grows it.
-  # Each cloud.backends entry uses this unless it sets its own
+  # Each storage.backends entry uses this unless it sets its own
   # `disk_cache_size_gb` (same shape).
   size_gb: auto
   # Floor (GB) applied when size_gb resolves under `auto`. Honored
