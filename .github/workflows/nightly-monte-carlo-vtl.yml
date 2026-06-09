@@ -1,10 +1,11 @@
 name: nightly-monte-carlo-vtl
 
-# Seeded random-op test against a small VTL chassis (1 drive,
-# 4 cartridges, 1 IE element). Each run picks a fresh seed from
-# /dev/urandom, prints it on start, and any failure is reproducible
-# via --seed N — running nightly grows the seed corpus over time.
-# ~5 min wall-clock default (3000 ops).
+# Seeded random-op test against a small VTL chassis (3 drives,
+# 8 cartridges, 12 storage slots, 1 IE element). Each run picks a fresh
+# seed from /dev/urandom, prints it on start, and any failure is
+# reproducible via --seed N — running nightly grows the seed corpus over
+# time. Runs a 3000-op soak (--ops 3000), heavier than the 1000-op
+# script default; roughly 5-8 min wall-clock.
 
 on:
   schedule:
@@ -52,7 +53,7 @@ jobs:
       # keeping data has no downside). Daemon stays at the default info
       # log level.
       - name: run monte-carlo
-        run: ./vtl/scripts/test-monte-carlo.sh --keep-data
+        run: ./vtl/scripts/test-monte-carlo.sh --keep-data --ops 3000
 
       # Host-side mt / mtx failures report their sense data into the
       # kernel ring buffer, which outlives the test's iSCSI logout.

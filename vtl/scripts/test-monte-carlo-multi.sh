@@ -812,6 +812,43 @@ for c in d.get('cartridges', []):
             log_info "  [init $suffix $MC_OP_INDEX/$n_ops] loaded=$(for di in "${PINNED_DRIVES[@]}"; do printf 'd%s=%s ' "$di" "${DRIVE_LOADED[$di]:-<empty>}"; done)"
         fi
     done
+
+    # Final sweep: replay every cart from BOT on one pinned drive and
+    # compare every record. The in-loop read_verify is random, so late
+    # writes may never have been re-read; matches the single-initiator
+    # harness's final pass. The multi op set writes no filemarks, so
+    # RECORDS holds only R entries (mirror of op_read_verify).
+    local fdrive="${PINNED_DRIVES[0]}" fnst fc fentry fkind fidx fsize fn_total=0
+    local fexp="$TEST_DIR/scratch-$suffix.fexp" fact="$TEST_DIR/scratch-$suffix.fact"
+    for fc in "${CARTS[@]}"; do
+        [[ -z "${RECORDS[$fc]}" ]] && continue
+        ensure_loaded_local "$fc" "$fdrive" || exit 1
+        fnst=$(nst_for_drive "$fdrive")
+        mt -f "$fnst" rewind >/dev/null 2>&1 || { log_error "init $suffix final_verify: rewind failed for $fc"; exit 1; }
+        while IFS= read -r fentry; do
+            [[ -z "$fentry" ]] && continue
+            fkind="${fentry%%:*}"
+            local frest="${fentry#*:}"
+            fidx="${frest%%:*}"; fsize="${frest#*:}"
+            [[ "$fkind" == "R" ]] || continue
+            mc_content_to "$fc" "$fidx" "$fsize" "$fexp"
+            if ! dd if="$fnst" of="$fact" bs="$fsize" count=1 status=none 2>/dev/null; then
+                log_error "init $suffix final_verify: dd read failed (bc=$fc idx=$fidx size=$fsize)"
+                exit 1
+            fi
+            local fact_size; fact_size=$(stat -c%s "$fact")
+            if [[ "$fact_size" != "$fsize" ]]; then
+                log_error "init $suffix final_verify: short read on $fc idx=$fidx exp=$fsize got=$fact_size"
+                exit 1
+            fi
+            if ! cmp -s "$fexp" "$fact"; then
+                log_error "init $suffix final_verify: content mismatch on $fc idx=$fidx size=$fsize"
+                exit 1
+            fi
+            fn_total=$(( fn_total + 1 ))
+        done <<< "${RECORDS[$fc]}"
+    done
+    log_info "  [init $suffix] final verify OK ($fn_total records)"
     mc_op_stats_dump
     exit 0
 }
@@ -880,6 +917,11 @@ main() {
         log_fail "Concurrent op loop failed (A exit=$rc_a B exit=$rc_b)"
         log_info "Op log A: $TEST_DIR/ops-a.log"
         log_info "Op log B: $TEST_DIR/ops-b.log"
+        exit 1
+    fi
+
+    if ! mc_assert_daemon_healthy "${TEST_DIR}/daemon.log" "${DAEMON_PID:-}"; then
+        log_fail "Daemon health check failed (crash or panic)"
         exit 1
     fi
 

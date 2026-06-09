@@ -237,6 +237,48 @@ mc_log_op() {
     printf '\n' >> "$MC_OP_LOG"
 }
 
+# Assert the daemon is still healthy after a run. Two signals:
+#
+#   - process liveness: if a PID is passed and it isn't running, the
+#     daemon died on us (a crash the data path may not have surfaced
+#     because the next I/O simply errored out and got handled).
+#   - thread panics in the daemon log: a panicked Tokio task (eviction
+#     / upload worker, reachability ticker) can leave the data path
+#     intact yet still be a real bug — exactly the kind a long random
+#     run is meant to flush out. A panic is never legitimate, so it
+#     fails the run.
+#
+# ERROR-level log lines are *surfaced but not fatal*: this harness
+# deliberately induces ENOSPC, abrupt logout, and daemon restarts, any
+# of which the daemon may legitimately log at ERROR. We print a count +
+# sample for human review rather than flaking the suite on expected
+# noise. (Contrast test-smoke.sh, a happy-path test, which treats any
+# ERROR as failure.)
+#
+# Args: daemon_log_path [daemon_pid]. Returns 1 on a fatal signal.
+mc_assert_daemon_healthy() {
+    local log="$1" pid="${2:-}"
+    local rc=0
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+        log_error "daemon health: process (PID $pid) is not running"
+        rc=1
+    fi
+    if [[ -r "$log" ]] && grep -qE 'panicked|panic occurred' "$log"; then
+        log_error "daemon health: thread panic in $log:"
+        grep -nE 'panicked|panic occurred' "$log" | tail -10 >&2
+        rc=1
+    fi
+    if [[ -r "$log" ]]; then
+        local errs
+        errs=$(grep -cE ' ERROR ' "$log" 2>/dev/null || true)
+        if (( errs > 0 )); then
+            log_warn "daemon health: $errs ERROR line(s) in daemon log (non-fatal; induced failures log at ERROR):"
+            grep -nE ' ERROR ' "$log" | tail -5 >&2
+        fi
+    fi
+    return $rc
+}
+
 # Dump the last N op-log lines + the seed banner + per-op stats to
 # stderr. Called from the harness on any verification failure; the goal
 # is that the user can copy-paste a reproducer command line and see

@@ -634,6 +634,22 @@ run_initiator_ops() {
             log_info "  [init $suffix $MC_OP_INDEX/$n_ops] alive=${#ALIVE_PATHS[@]}"
         fi
     done
+
+    # Final sweep: re-verify every alive file end-to-end. The in-loop
+    # read_verify is random, so files written late may never have been
+    # re-read; this matches the single-initiator harness's final pass.
+    local fp fv fsize ftmp="$TEST_DIR/scratch-$suffix.final" fchecked=0
+    for fp in "${ALIVE_PATHS[@]}"; do
+        (( ${FILE_VERSIONS[$fp]:-0} > 0 )) || continue
+        fv=${FILE_VERSIONS[$fp]}; fsize=${FILE_SIZES[$fp]}
+        regen_local "$fp" "$fv" "$fsize" "$ftmp"
+        if ! cmp -s "$fp" "$ftmp"; then
+            log_error "init $suffix final_verify: content mismatch at $fp v=$fv size=$fsize"
+            exit 1
+        fi
+        fchecked=$(( fchecked + 1 ))
+    done
+    log_info "  [init $suffix] final verify OK ($fchecked files)"
     mc_op_stats_dump
     exit 0
 }
@@ -680,6 +696,11 @@ main() {
     if (( rc_a != 0 || rc_b != 0 )); then
         log_fail "Concurrent op loop failed (A=$rc_a B=$rc_b)"
         log_info "Op logs: $TEST_DIR/ops-{a,b}.log"
+        exit 1
+    fi
+
+    if ! mc_assert_daemon_healthy "${TEST_DIR}/daemon.log" "${DAEMON_PID:-}"; then
+        log_fail "Daemon health check failed (crash or panic)"
         exit 1
     fi
 

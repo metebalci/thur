@@ -292,12 +292,13 @@ check_prerequisites() {
         [mkfs.ext4]="sudo apt-get install e2fsprogs"
         [mount]="(util-linux — usually present)"
         [umount]="(util-linux — usually present)"
+        [fstrim]="(util-linux — usually present)"
         [openssl]="(usually present)"
         [curl]="sudo apt-get install curl"
         [systemctl]="(systemd — usually present)"
         [cmp]="(diffutils — usually present)"
     )
-    local tools=(mkfs.ext4 mount umount openssl curl systemctl cmp)
+    local tools=(mkfs.ext4 mount umount fstrim openssl curl systemctl cmp)
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         tools+=(iscsiadm lsscsi)
     else
@@ -987,6 +988,38 @@ finally:
     mc_log_op fdatasync_one path="$path"
 }
 
+# fstrim the chosen volume's mount. The FITRIM ioctl issues SCSI UNMAP /
+# NVMe DSM Deallocate for the filesystem's free extents — the only path
+# that reaches the SBC UNMAP / NVM Deallocate handlers under this
+# harness, since ext4 is mounted without -o discard so ordinary frees
+# never auto-trim. Content-neutral: only free space is trimmed, so the
+# file model is untouched and the post-run final_verify confirms live
+# data survived the trim storm. Logs trimmed bytes so the op stats show
+# whether the device actually advertised discard (0 bytes / unsupported
+# = no thin-provisioning VPD, still a valid exercise of the FITRIM path).
+op_fstrim() {
+    ensure_mounted || return 1
+    local root
+    root=$(pick_mount_root)
+    local out
+    if ! out=$(fstrim -v "$root" 2>&1); then
+        # Some kernels return "discard operation is not supported" when
+        # the device advertises no provisioning — treat that as a soft
+        # skip, not a failure.
+        if [[ "$out" == *"not supported"* ]]; then
+            mc_log_op fstrim root="$root" status=unsupported
+            return 0
+        fi
+        log_error "fstrim: failed on $root: $out"
+        mc_dump_failure
+        return 1
+    fi
+    # `fstrim -v` prints e.g. "/mnt: 120 MiB (125829120 bytes) trimmed".
+    local bytes
+    bytes=$(echo "$out" | grep -oE '[0-9]+ bytes' | grep -oE '[0-9]+' | head -1)
+    mc_log_op fstrim root="$root" trimmed_bytes="${bytes:-unknown}"
+}
+
 op_umount_cycle() {
     if [[ $MOUNT_UP -eq 0 ]]; then
         mc_log_op umount_cycle status=already_unmounted
@@ -1185,9 +1218,9 @@ op_write_at_offset() {
 # rmdir / rename / write_at_offset are low-rate correctness-shape ops,
 # not throughput drivers.
 OP_WEIGHTS=(
-    "17:write_new" "12:overwrite" "11:append" "16:read_verify"
+    "14:write_new" "12:overwrite" "11:append" "16:read_verify"
     "5:write_at_offset" "6:delete" "3:truncate" "3:truncate_extend"
-    "4:sync" "3:fdatasync_one"
+    "4:sync" "3:fdatasync_one" "3:fstrim"
     "3:mkdir" "2:rmdir" "3:rename"
     "6:umount_cycle" "4:transport_logout_cycle"
     "2:daemon_restart"
@@ -1211,6 +1244,7 @@ run_ops() {
             truncate_extend)          op_truncate_extend || return 1 ;;
             sync)                     op_sync || return 1 ;;
             fdatasync_one)            op_fdatasync_one || return 1 ;;
+            fstrim)                   op_fstrim || return 1 ;;
             mkdir)                    op_mkdir || return 1 ;;
             rmdir)                    op_rmdir || return 1 ;;
             rename)                   op_rename || return 1 ;;
@@ -1273,6 +1307,12 @@ main() {
 
     if ! final_verify_all; then
         log_fail "Final verification failed"
+        exit 1
+    fi
+
+    if ! mc_assert_daemon_healthy "${TEST_DIR}/daemon.log" "${DAEMON_PID:-}"; then
+        log_fail "Daemon health check failed (crash or panic)"
+        mc_dump_failure
         exit 1
     fi
 

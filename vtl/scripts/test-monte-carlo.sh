@@ -1105,6 +1105,12 @@ main() {
         exit 1
     fi
 
+    if ! mc_assert_daemon_healthy "${TEST_DIR}/daemon.log" "${DAEMON_PID:-}"; then
+        log_fail "Daemon health check failed (crash or panic)"
+        mc_dump_failure
+        exit 1
+    fi
+
     echo ""
     echo "========================================"
     log_pass "$OPS ops + final verify  (seed=$MC_SEED)"
