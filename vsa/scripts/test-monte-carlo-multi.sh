@@ -90,6 +90,11 @@ OPS=""
 VOLUME_NAMES_A=("vol-mc-a1" "vol-mc-a2")
 VOLUME_NAMES_B=("vol-mc-b1" "vol-mc-b2")
 VOLUME_SIZE_MIB=512
+# At-rest encryption embedded in the default run: one volume per
+# initiator (vol-mc-a2 / vol-mc-b2) is created --encrypt --keystore
+# local, the other plaintext, so each concurrent stream sweeps both
+# data paths under contention. No flag needed.
+ENCRYPTED_VOLUMES=("vol-mc-a2" "vol-mc-b2")
 
 # iSCSI-only identity (one iface + one CHAP user per initiator).
 INIT_IQN_A="iqn.2025-10.com.metebalci:vsa-mc-a"
@@ -247,6 +252,10 @@ storage:
     local:
       type: local
       root_dir: "$TEST_DIR/local-backend"
+keystore:
+  backends:
+    local:
+      type: local
 EOFCONFIG
 }
 
@@ -271,9 +280,14 @@ start_daemon_mc() {
 create_volumes() {
     local name
     for name in "${VOLUME_NAMES_A[@]}" "${VOLUME_NAMES_B[@]}"; do
-        log_info "Creating volume $name (${VOLUME_SIZE_MIB} MiB)..."
+        local enc_args=() enc_note=""
+        if printf '%s\n' "${ENCRYPTED_VOLUMES[@]}" | grep -qxF "$name"; then
+            enc_args=(--encrypt --keystore local)
+            enc_note=" (encrypted)"
+        fi
+        log_info "Creating volume $name (${VOLUME_SIZE_MIB} MiB)${enc_note}..."
         "$CLI_PATH" --config "$TEST_CONFIG" volume create "$name" \
-            --size "${VOLUME_SIZE_MIB}M" --backend local >/dev/null
+            --size "${VOLUME_SIZE_MIB}M" --backend local "${enc_args[@]}" >/dev/null
     done
 }
 
@@ -654,6 +668,29 @@ run_initiator_ops() {
     exit 0
 }
 
+# Post-run integrity gates against the state both concurrent streams
+# built: pool/page-table + storage consistency, the BLAKE3 audit chain,
+# and a stats dump (dedup ratio > 1 with the dup-corpus content class).
+run_integrity_gates() {
+    log_info "Integrity gates: system gc + verify + audit verify + stats..."
+    local out
+    "$CLI_PATH" --config "$TEST_CONFIG" system gc >/dev/null 2>&1 || true
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system verify 2>&1); then
+        log_error "integrity: system verify failed:"
+        echo "$out" | tail -20 >&2
+        return 1
+    fi
+    # audit verify exit codes: 0 valid, 1 break, 2 IO, 3 plain-mode.
+    "$CLI_PATH" --config "$TEST_CONFIG" system audit verify >/dev/null 2>&1
+    local arc=$?
+    if (( arc == 1 || arc == 2 )); then
+        log_error "integrity: audit chain verify failed (rc=$arc)"
+        return 1
+    fi
+    "$CLI_PATH" --config "$TEST_CONFIG" system stats 2>&1 | sed 's/^/  stats: /' || true
+    log_info "Integrity gates OK (audit verify rc=$arc)"
+}
+
 main() {
     echo "========================================"
     echo "thurvsa Monte Carlo Multi-Initiator Test"
@@ -696,6 +733,11 @@ main() {
     if (( rc_a != 0 || rc_b != 0 )); then
         log_fail "Concurrent op loop failed (A=$rc_a B=$rc_b)"
         log_info "Op logs: $TEST_DIR/ops-{a,b}.log"
+        exit 1
+    fi
+
+    if ! run_integrity_gates; then
+        log_fail "Integrity gates failed (gc/verify/audit)"
         exit 1
     fi
 

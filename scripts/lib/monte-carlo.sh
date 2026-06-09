@@ -154,27 +154,90 @@ mc_pick_size_boundary_biased() {
     esac
 }
 
-# Write `size` bytes of deterministic-but-random-looking content to
-# `out_path`. Content is keyed by `(MC_SEED, key, version)`; same key +
-# version always yields the same bytes, so callers can verify a read by
-# regenerating into a tmp file and `cmp`'ing.
+# Keyed AES-256-CTR keystream truncated to `size`. The cheapest way to
+# get high-entropy bytes from a keyed seed (~1 GB/s on any modern CPU).
+# Size-independent by construction (the key never depends on size), so
+# content(N) is always a prefix of content(M>N) — the property
+# append / truncate / truncate_extend rely on.
+_mc_keystream_to() {
+    local key_hex="$1" size="$2" out="$3"
+    openssl enc -aes-256-ctr -K "$key_hex" -iv 00000000000000000000000000000000 \
+        -in /dev/zero 2>/dev/null | head -c "$size" > "$out"
+}
+
+# blake3 (or sha256 fallback) of the piped tag, first 64 hex chars =
+# one AES-256 key.
+_mc_key64() {
+    local tag="$1" h
+    h=$(printf '%s' "$tag" | b3sum --no-names 2>/dev/null \
+        || printf '%s' "$tag" | sha256sum | awk '{print $1}')
+    echo "${h:0:64}"
+}
+
+# --- content classes (each a size-independent stream truncated to size) ---
+
+# Unique, high-entropy, incompressible. Never dedupes (key folds in
+# path/version). This is the original behavior and the bulk of writes.
+_mc_content_random() {
+    local key="$1" version="$2" size="$3" out="$4"
+    _mc_keystream_to "$(_mc_key64 "$MC_SEED|$key|$version|content")" "$size" "$out"
+}
+
+# Compressible: a keyed 512-byte tile repeated (by doubling) to >= size
+# then truncated. Period-512 so the compressor actually shrinks it;
+# unique per (key,version) so it doesn't also dedupe across files. The
+# tile is size-independent, so the prefix property still holds.
+_mc_content_compressible() {
+    local key="$1" version="$2" size="$3" out="$4"
+    local tile="$out.tile"
+    _mc_keystream_to "$(_mc_key64 "$MC_SEED|$key|$version|tile")" 512 "$tile"
+    cp "$tile" "$out"
+    local cur=512
+    while (( cur < size )); do
+        cat "$out" "$out" > "$out.dbl" && mv "$out.dbl" "$out"
+        cur=$(( cur * 2 ))
+    done
+    head -c "$size" "$out" > "$out.cut" && mv "$out.cut" "$out"
+    rm -f "$tile"
+}
+
+# Dedup-friendly: drawn from a small shared corpus keyed only by a
+# bucket (NOT the file key), so distinct files / cartridges that land on
+# the same bucket contain identical chunks that fold in the
+# content-addressed pool. High-entropy, so the win is dedup, not
+# compression. Size-independent keystream => prefix property holds.
+_mc_content_dup() {
+    local bucket="$1" size="$2" out="$3"
+    _mc_keystream_to "$(_mc_key64 "$MC_SEED|dupcorpus|$bucket")" "$size" "$out"
+}
+
+# Write `size` bytes of deterministic content to `out_path`, keyed by
+# `(MC_SEED, key, version)`. Same key + version + size always yields the
+# same bytes, so a reader verifies by regenerating into a tmp file and
+# `cmp`'ing.
 #
-# AES-256-CTR over /dev/zero is the cheapest way to get high-entropy
-# bytes from a keyed seed without needing a per-byte hash. Throughput is
-# ~1 GB/s on any modern CPU.
+# The content *class* is a deterministic function of (seed, key,
+# version) too, so the verify side reproduces byte-identical content
+# with zero model state. The mix exercises three storage-layer behaviors
+# a single all-random stream never reaches (a unique high-entropy stream
+# defeats both dedup and compression by construction):
+#   ~62% random        unique + incompressible (no dedup, no compress)
+#   ~20% compressible   the compressor measurably shrinks it
+#   ~18% dup-corpus     identical chunks fold in the dedup pool
+# All three keep the prefix property, so append / truncate are unaffected.
 mc_content_to() {
     local key="$1" version="$2" size="$3" out_path="$4"
-    local key_hex
-    key_hex=$(printf '%s|%s|%s|content' "$MC_SEED" "$key" "$version" \
-        | b3sum --no-names 2>/dev/null \
-        || printf '%s|%s|%s|content' "$MC_SEED" "$key" "$version" | sha256sum | awk '{print $1}')
-    key_hex="${key_hex:0:64}"
-    # IV is fixed at zeros — we re-key per (path, version), so reusing
-    # the IV is fine (the keystream never repeats across versions or
-    # across paths). Saves an extra RNG draw.
-    openssl enc -aes-256-ctr -K "$key_hex" -iv 00000000000000000000000000000000 \
-        -in /dev/zero 2>/dev/null \
-        | head -c "$size" > "$out_path"
+    local ch
+    ch=$(_mc_key64 "$MC_SEED|$key|$version|class")
+    local roll=$(( 16#${ch:0:2} ))           # 0..255
+    if (( roll < 158 )); then
+        _mc_content_random "$key" "$version" "$size" "$out_path"
+    elif (( roll < 210 )); then
+        _mc_content_compressible "$key" "$version" "$size" "$out_path"
+    else
+        local bucket=$(( 16#${ch:2:2} % 6 ))
+        _mc_content_dup "$bucket" "$size" "$out_path"
+    fi
 }
 
 # Per-op + per-status counter, keyed "op|status". `status` defaults to

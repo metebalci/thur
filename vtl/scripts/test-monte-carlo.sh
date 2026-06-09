@@ -107,6 +107,12 @@ TEST_PREFIX=""
 CARTS=(MC01L8 MC02L8 MC03L8 MC04L8 MC05L8 MC06L8 MC07L8 MC08L8)
 NUM_SLOTS=12
 NUM_DRIVES=3
+# At-rest encryption is embedded in the default run: half the carts are
+# created with --encrypt --keystore local (per-cartridge AES-256-GCM DEK
+# wrapped by the local keystore), the rest plaintext. The random drive /
+# cart picker sweeps both the encrypted and plaintext tape data paths
+# every run — no flag needed.
+ENCRYPTED_CARTS=(MC02L8 MC04L8 MC06L8 MC08L8)
 
 # Auth wrapper. THURVTL_TEST_AUTH=chap enables CHAP — the conffile
 # carries auth.method: CHAP, a per-run user/secret is added via
@@ -394,9 +400,14 @@ setup_chap_user() {
 create_cartridges() {
     local c
     for c in "${CARTS[@]}"; do
-        log_info "Creating cartridge $c on backend $BACKEND_NAME..."
+        local enc_args=() enc_note=""
+        if printf '%s\n' "${ENCRYPTED_CARTS[@]}" | grep -qxF "$c"; then
+            enc_args=(--encrypt --keystore local)
+            enc_note=" (encrypted)"
+        fi
+        log_info "Creating cartridge $c on backend $BACKEND_NAME${enc_note}..."
         if ! "$CLI_PATH" --config "$TEST_CONFIG" cartridge create "$c" \
-            --lto-generation 8 --backend "$BACKEND_NAME" >/dev/null 2>&1; then
+            --lto-generation 8 --backend "$BACKEND_NAME" "${enc_args[@]}" >/dev/null 2>&1; then
             log_error "cartridge create $c failed"
             tail -20 "${TEST_DIR}/daemon.log"
             exit 1
@@ -938,6 +949,20 @@ op_write_filemarks_sync() {
     mc_log_op write_filemarks_sync drive="$drive_idx" cart="$bc" n="$n"
 }
 
+# Run a real garbage-collection pass mid-stream. GC is refcount-aware,
+# so it must never collect a live chunk; the read_verify ops that follow
+# (and the post-run final_verify) confirm it didn't. Daemon-routed job —
+# runs against the admin socket regardless of iSCSI / load state.
+op_gc() {
+    local out
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system gc 2>&1); then
+        log_error "gc: system gc failed: $out"
+        mc_dump_failure
+        return 1
+    fi
+    mc_log_op gc
+}
+
 # Stop and restart the daemon. The daemon handles SIGTERM by abort()
 # rather than running its flush path, so we cleanly unload every loaded
 # cart first — that triggers MemoryBufferManager::on_cartridge_unloaded,
@@ -979,12 +1004,12 @@ op_daemon_restart() {
 # at startup enforces that. write_filemark / write_filemarks_sync are
 # rare on purpose — they're correctness-shape ops, not throughput drivers.
 OP_WEIGHTS=(
-    "29:write_record" "37:read_verify"
+    "29:write_record" "35:read_verify"
     "5:rewind"
     "10:load_cycle" "5:iscsi_logout_cycle"
     "3:import_export" "3:changer_move"
     "4:write_filemark" "2:write_filemarks_sync"
-    "2:daemon_restart"
+    "2:gc" "2:daemon_restart"
 )
 
 run_ops() {
@@ -1004,6 +1029,7 @@ run_ops() {
             changer_move)           op_changer_move || return 1 ;;
             write_filemark)         op_write_filemark || return 1 ;;
             write_filemarks_sync)   op_write_filemarks_sync || return 1 ;;
+            gc)                     op_gc || return 1 ;;
             daemon_restart)         op_daemon_restart || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
@@ -1078,6 +1104,31 @@ final_verify_all() {
     log_info "Final verify OK ($total_records records across $total_carts cartridges)"
 }
 
+# Post-run integrity gates against the state the random stream built:
+#   - system verify : chunk-pool + library + storage-backend consistency
+#                     (would flag a chunk an op_gc wrongly collected).
+#   - system audit verify : the BLAKE3 audit chain end-to-end.
+#   - system stats  : logged for visibility — with the dup-corpus content
+#                     class the cross-cartridge dedup ratio is > 1.
+run_integrity_gates() {
+    log_info "Integrity gates: system verify + audit verify + stats..."
+    local out
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system verify 2>&1); then
+        log_error "integrity: system verify failed:"
+        echo "$out" | tail -20 >&2
+        return 1
+    fi
+    # audit verify exit codes: 0 valid, 1 break, 2 IO, 3 plain-mode.
+    "$CLI_PATH" --config "$TEST_CONFIG" system audit verify >/dev/null 2>&1
+    local arc=$?
+    if (( arc == 1 || arc == 2 )); then
+        log_error "integrity: audit chain verify failed (rc=$arc)"
+        return 1
+    fi
+    "$CLI_PATH" --config "$TEST_CONFIG" system stats 2>&1 | sed 's/^/  stats: /' || true
+    log_info "Integrity gates OK (audit verify rc=$arc)"
+}
+
 main() {
     echo "========================================"
     echo "thurvtl Monte Carlo Random-Op Test"
@@ -1102,6 +1153,12 @@ main() {
 
     if ! final_verify_all; then
         log_fail "Final verification failed"
+        exit 1
+    fi
+
+    if ! run_integrity_gates; then
+        log_fail "Integrity gates failed (verify/audit)"
+        mc_dump_failure
         exit 1
     fi
 

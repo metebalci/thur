@@ -92,6 +92,10 @@ NUM_DRIVES=4
 NUM_SLOTS=8
 CARTS_A=(MC01L8 MC02L8 MC03L8)
 CARTS_B=(MC04L8 MC05L8 MC06L8)
+# At-rest encryption embedded in the default run: one cart per partition
+# (MC02L8 / MC05L8) is created --encrypt --keystore local, the rest
+# plaintext, so each concurrent stream sweeps both data paths.
+ENCRYPTED_CARTS=(MC02L8 MC05L8)
 DRIVES_A=(0 1)
 DRIVES_B=(2 3)
 SLOTS_A_START=0; SLOTS_A_END=3
@@ -273,9 +277,14 @@ setup_chap_users() {
 create_cartridges() {
     local c
     for c in "${CARTS_A[@]}" "${CARTS_B[@]}"; do
-        log_info "Creating cartridge $c..."
+        local enc_args=() enc_note=""
+        if printf '%s\n' "${ENCRYPTED_CARTS[@]}" | grep -qxF "$c"; then
+            enc_args=(--encrypt --keystore local)
+            enc_note=" (encrypted)"
+        fi
+        log_info "Creating cartridge $c${enc_note}..."
         if ! "$CLI_PATH" --config "$TEST_CONFIG" cartridge create "$c" \
-            --lto-generation 8 --backend local >/dev/null 2>&1; then
+            --lto-generation 8 --backend local "${enc_args[@]}" >/dev/null 2>&1; then
             log_error "cartridge create $c failed"
             tail -20 "${TEST_DIR}/daemon.log"
             exit 1
@@ -853,6 +862,30 @@ for c in d.get('cartridges', []):
     exit 0
 }
 
+# Post-run integrity gates against the state both concurrent streams
+# built: chunk-pool + library + storage consistency, the BLAKE3 audit
+# chain, and a stats dump (cross-cartridge dedup ratio > 1 with the
+# dup-corpus content class).
+run_integrity_gates() {
+    log_info "Integrity gates: system gc + verify + audit verify + stats..."
+    local out
+    "$CLI_PATH" --config "$TEST_CONFIG" system gc >/dev/null 2>&1 || true
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system verify 2>&1); then
+        log_error "integrity: system verify failed:"
+        echo "$out" | tail -20 >&2
+        return 1
+    fi
+    # audit verify exit codes: 0 valid, 1 break, 2 IO, 3 plain-mode.
+    "$CLI_PATH" --config "$TEST_CONFIG" system audit verify >/dev/null 2>&1
+    local arc=$?
+    if (( arc == 1 || arc == 2 )); then
+        log_error "integrity: audit chain verify failed (rc=$arc)"
+        return 1
+    fi
+    "$CLI_PATH" --config "$TEST_CONFIG" system stats 2>&1 | sed 's/^/  stats: /' || true
+    log_info "Integrity gates OK (audit verify rc=$arc)"
+}
+
 main() {
     echo "========================================"
     echo "thurvtl Monte Carlo Multi-Initiator Test"
@@ -917,6 +950,11 @@ main() {
         log_fail "Concurrent op loop failed (A exit=$rc_a B exit=$rc_b)"
         log_info "Op log A: $TEST_DIR/ops-a.log"
         log_info "Op log B: $TEST_DIR/ops-b.log"
+        exit 1
+    fi
+
+    if ! run_integrity_gates; then
+        log_fail "Integrity gates failed (gc/verify/audit)"
         exit 1
     fi
 

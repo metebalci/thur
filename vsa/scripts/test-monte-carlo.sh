@@ -124,6 +124,11 @@ NVME_DEVICE=""
 # sweeps per-volume PageCache isolation, per-volume SYNCHRONIZE CACHE
 # fencing, and multi-LUN-per-session SCSI dispatch.
 VOLUME_NAMES=("vol-mc" "vol-mc-b")
+# At-rest encryption is embedded in the default run: vol-mc-b is created
+# with --encrypt --keystore local (DEK wrapped by the local keystore),
+# vol-mc stays plaintext. The random per-op volume pick sweeps both the
+# encrypted and plaintext block data paths every run — no flag needed.
+ENCRYPTED_VOLUMES=("vol-mc-b")
 declare -a MOUNT_POINTS=()
 declare -a RW_DEVICES=()
 declare -a EXT4_MADE=()
@@ -397,6 +402,10 @@ storage:
     local:
       type: local
       root_dir: "$TEST_DIR/local-backend"
+keystore:
+  backends:
+    local:
+      type: local
 EOFCONFIG
         log_info "Backend: inline local at $TEST_DIR/local-backend"
         return 0
@@ -447,6 +456,10 @@ storage:
   backends:
     $BACKEND_NAME:
 $backend_yaml
+keystore:
+  backends:
+    local:
+      type: local
 EOFCONFIG
     log_info "Backend: $BACKEND_NAME (type=$BACKEND_TYPE, prefix=$TEST_PREFIX)"
 }
@@ -482,9 +495,18 @@ ensure_volumes() {
             log_info "Volume $name already present"
             continue
         fi
-        log_info "Creating $name (${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME)..."
-        "$CLI_PATH" --config "$TEST_CONFIG" volume create "$name" \
-            --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" >/dev/null
+        local enc_args=() enc_note=""
+        if printf '%s\n' "${ENCRYPTED_VOLUMES[@]}" | grep -qxF "$name"; then
+            enc_args=(--encrypt --keystore local)
+            enc_note=", encrypted"
+        fi
+        log_info "Creating $name (${VOLUME_SIZE_MIB} MiB, backend=$BACKEND_NAME${enc_note})..."
+        if ! "$CLI_PATH" --config "$TEST_CONFIG" volume create "$name" \
+                --size "${VOLUME_SIZE_MIB}M" --backend "$BACKEND_NAME" "${enc_args[@]}" >/dev/null; then
+            log_error "volume create $name failed"
+            tail -20 "${TEST_DIR}/daemon.log"
+            exit 1
+        fi
     done
 }
 
@@ -1020,6 +1042,20 @@ op_fstrim() {
     mc_log_op fstrim root="$root" trimmed_bytes="${bytes:-unknown}"
 }
 
+# Run a real garbage-collection pass mid-stream. GC is refcount-aware,
+# so it must never collect a live chunk; the read_verify ops that follow
+# (and the post-run final_verify) confirm it didn't. Daemon-routed job —
+# runs against the admin socket regardless of mount/transport state.
+op_gc() {
+    local out
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system gc 2>&1); then
+        log_error "gc: system gc failed: $out"
+        mc_dump_failure
+        return 1
+    fi
+    mc_log_op gc
+}
+
 op_umount_cycle() {
     if [[ $MOUNT_UP -eq 0 ]]; then
         mc_log_op umount_cycle status=already_unmounted
@@ -1218,9 +1254,9 @@ op_write_at_offset() {
 # rmdir / rename / write_at_offset are low-rate correctness-shape ops,
 # not throughput drivers.
 OP_WEIGHTS=(
-    "14:write_new" "12:overwrite" "11:append" "16:read_verify"
+    "12:write_new" "12:overwrite" "11:append" "16:read_verify"
     "5:write_at_offset" "6:delete" "3:truncate" "3:truncate_extend"
-    "4:sync" "3:fdatasync_one" "3:fstrim"
+    "4:sync" "3:fdatasync_one" "3:fstrim" "2:gc"
     "3:mkdir" "2:rmdir" "3:rename"
     "6:umount_cycle" "4:transport_logout_cycle"
     "2:daemon_restart"
@@ -1245,6 +1281,7 @@ run_ops() {
             sync)                     op_sync || return 1 ;;
             fdatasync_one)            op_fdatasync_one || return 1 ;;
             fstrim)                   op_fstrim || return 1 ;;
+            gc)                       op_gc || return 1 ;;
             mkdir)                    op_mkdir || return 1 ;;
             rmdir)                    op_rmdir || return 1 ;;
             rename)                   op_rename || return 1 ;;
@@ -1283,6 +1320,31 @@ final_verify_all() {
     log_info "Final verify OK ($checked files)"
 }
 
+# Post-run integrity gates against the state the random stream built:
+#   - system verify : pool + page-table + storage-backend consistency
+#                     (would flag a chunk an op_gc wrongly collected).
+#   - system audit verify : the BLAKE3 audit chain end-to-end.
+#   - system stats  : logged for visibility — with the dup-corpus content
+#                     class the dedup ratio is > 1, confirming dedup fired.
+run_integrity_gates() {
+    log_info "Integrity gates: system verify + audit verify + stats..."
+    local out
+    if ! out=$("$CLI_PATH" --config "$TEST_CONFIG" system verify 2>&1); then
+        log_error "integrity: system verify failed:"
+        echo "$out" | tail -20 >&2
+        return 1
+    fi
+    # audit verify exit codes: 0 valid, 1 break, 2 IO, 3 plain-mode.
+    "$CLI_PATH" --config "$TEST_CONFIG" system audit verify >/dev/null 2>&1
+    local arc=$?
+    if (( arc == 1 || arc == 2 )); then
+        log_error "integrity: audit chain verify failed (rc=$arc)"
+        return 1
+    fi
+    "$CLI_PATH" --config "$TEST_CONFIG" system stats 2>&1 | sed 's/^/  stats: /' || true
+    log_info "Integrity gates OK (audit verify rc=$arc)"
+}
+
 main() {
     echo "========================================"
     echo "thurvsa Monte Carlo Random-Op Test"
@@ -1307,6 +1369,12 @@ main() {
 
     if ! final_verify_all; then
         log_fail "Final verification failed"
+        exit 1
+    fi
+
+    if ! run_integrity_gates; then
+        log_fail "Integrity gates failed (gc/verify/audit)"
+        mc_dump_failure
         exit 1
     fi
 
