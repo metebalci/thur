@@ -2,11 +2,12 @@ name: nightly-monte-carlo-vsa
 
 # Seeded random-op test driving ext4 on two thurvsa volumes over iSCSI.
 # Each run picks a fresh seed from /dev/urandom, prints it on start,
-# and any failure is reproducible via --seed N — running nightly grows
-# the seed corpus over time. Runs a 3000-op soak (--ops 3000), heavier
-# than the 1000-op script default; roughly 5-8 min wall-clock.
-# Transport fixed to iSCSI for now; NVMe/TCP would be a second matrix
-# entry once it's stable on hosted runners.
+# and any failure is reproducible via --seed N. The job first replays
+# the regression seed corpus (vsa/scripts/seeds.txt) — seeds that ever
+# caught a bug, pinned forever — then runs a 3000-op soak (--ops 3000)
+# with a fresh seed; roughly 5-8 min wall-clock. Transport fixed to
+# iSCSI for now; NVMe/TCP would be a second matrix entry once it's
+# stable on hosted runners.
 
 on:
   schedule:
@@ -36,6 +37,18 @@ jobs:
 
       - name: build release binaries
         run: cargo build --release -p vsa-daemon -p vsa-cli
+
+      # Regression guard: replay every seed in the corpus (--quick)
+      # before the fresh random run. Seeds that ever caught a bug live
+      # in vsa/scripts/seeds.txt and are pinned here forever.
+      - name: replay seed corpus
+        run: |
+          while read -r seed _rest; do
+            case "$seed" in ''|\#*) continue ;; esac
+            echo "::group::replay seed $seed"
+            ./vsa/scripts/test-monte-carlo.sh --seed "$seed" --quick --keep-data
+            echo "::endgroup::"
+          done < vsa/scripts/seeds.txt
 
       # --keep-data so the test's cleanup trap doesn't rm -rf the tmp
       # dir before the upload step runs (CI runners are ephemeral, so

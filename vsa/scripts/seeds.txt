@@ -1,0 +1,15 @@
+# Monte Carlo regression seed corpus — thurvsa
+#
+# One seed per line (decimal, optionally followed by "# note"). Blank
+# lines and lines starting with '#' are ignored. The nightly workflow
+# (.github/workflows/nightly-monte-carlo-vsa.yml) replays every seed
+# here with --quick before drawing a fresh random seed, so a seed that
+# ever caught a bug becomes a permanent regression guard — this is the
+# mechanism behind the "grows the seed corpus over time" claim.
+#
+# To add a seed: a failed run prints "Re-run with: --seed N". Add that N
+# here with a one-line note; once the bug is fixed the replay pins the
+# fix forever. Replay it locally with:
+#   ./vsa/scripts/test-monte-carlo.sh --seed N --quick
+
+14548639705494613310  # 2026-06-09 known-good smoke; dedup 1.39x with the compressible/dup content classes + encryption + gc/verify embedded

@@ -1110,6 +1110,54 @@ op_daemon_restart() {
     mc_log_op daemon_restart
 }
 
+# Hard-kill (SIGKILL) crash + recovery. Where op_daemon_restart sends a
+# graceful SIGTERM (which lets the daemon run its shutdown path), this
+# SIGKILLs the process so no shutdown handler runs at all — exercising
+# the unclean-restart path: stale `.daemon.lock` auto-clear and the
+# volume re-discovery / pool re-derivation a crash recovery must do.
+#
+# Durability: we sync(2) first. On VSA that lands as SYNCHRONIZE CACHE,
+# a real fence that flushes every dirty PageCache page into the chunk
+# pool before we kill — so the post-crash invariant is "every synced
+# byte survives", which the in-loop read_verify and the post-run
+# final_verify then prove. (A finer un-synced-data-loss-boundary test
+# would need torn-write-tolerant model reconciliation; out of scope.)
+# The client side is torn cleanly (umount + logout while the session is
+# still alive) so only the daemon dies abruptly; the next file op
+# re-establishes via ensure_mounted -> transport_login (no re-mkfs —
+# the recovered volumes keep their ext4).
+op_crash() {
+    if [[ $MOUNT_UP -eq 1 ]]; then
+        sync || true
+        local mp
+        for mp in "${MOUNT_POINTS[@]}"; do
+            umount "$mp" 2>/dev/null || true
+        done
+        MOUNT_UP=0
+    fi
+    if [[ $TRANSPORT_UP -eq 1 ]]; then
+        if [[ "$TRANSPORT" == "iscsi" ]]; then
+            _iscsi_logout
+        else
+            _nvme_logout
+        fi
+        TRANSPORT_UP=0
+        local i
+        for (( i=0; i<${#RW_DEVICES[@]}; i++ )); do
+            RW_DEVICES[$i]=""
+        done
+    fi
+    # SIGKILL — no graceful shutdown.
+    if [[ -n "${DAEMON_PID:-}" ]]; then
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+        DAEMON_PID=""
+    fi
+    sleep 0.3
+    start_daemon
+    mc_log_op crash
+}
+
 # Create a fresh directory under a random volume's random parent (the
 # mount root, or any existing dir under it). The new dir joins
 # ALIVE_DIRS so subsequent new_path / op_mkdir picks can nest into it.
@@ -1254,12 +1302,12 @@ op_write_at_offset() {
 # rmdir / rename / write_at_offset are low-rate correctness-shape ops,
 # not throughput drivers.
 OP_WEIGHTS=(
-    "12:write_new" "12:overwrite" "11:append" "16:read_verify"
+    "10:write_new" "12:overwrite" "11:append" "16:read_verify"
     "5:write_at_offset" "6:delete" "3:truncate" "3:truncate_extend"
     "4:sync" "3:fdatasync_one" "3:fstrim" "2:gc"
     "3:mkdir" "2:rmdir" "3:rename"
     "6:umount_cycle" "4:transport_logout_cycle"
-    "2:daemon_restart"
+    "2:daemon_restart" "2:crash"
 )
 
 run_ops() {
@@ -1288,6 +1336,7 @@ run_ops() {
             umount_cycle)             op_umount_cycle || return 1 ;;
             transport_logout_cycle)   op_transport_logout_cycle || return 1 ;;
             daemon_restart)           op_daemon_restart || return 1 ;;
+            crash)                    op_crash || return 1 ;;
         esac
         if (( MC_OP_INDEX % progress_every == 0 )); then
             log_info "[$MC_OP_INDEX/$n] seed=$MC_SEED alive=${#ALIVE_PATHS[@]} dirs=${#ALIVE_DIRS[@]} mount=$MOUNT_UP $TRANSPORT=$TRANSPORT_UP"
