@@ -443,24 +443,53 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     };
     match drive_manager.with_drive(drive_id, tsih, |cart| {
         let old_lba = cart.head_lba();
-        let moved = match code {
-            0x00 => cart.space_records(count as i64),
-            0x01 => cart.space_filemarks(count as i64),
+        let (moved, hit_filemark) = match code {
+            0x00 => {
+                let r = cart.space_records(count as i64);
+                (r.moved, r.hit_filemark)
+            }
+            0x01 => (cart.space_filemarks(count as i64), false),
             0x03 => {
                 cart.space_to_eod();
-                count as i64
+                (count as i64, false)
             }
-            _ => 0,
+            _ => (0, false),
         };
-        Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))
+        Ok((
+            cart.label().to_string(),
+            old_lba,
+            cart.head_lba(),
+            moved,
+            hit_filemark,
+        ))
     }) {
-        Ok((tape_id, old_lba, new_lba, moved)) => {
+        Ok((tape_id, old_lba, new_lba, moved, hit_filemark)) => {
             let _ = event_tx.send(TapeEvent::HeadPositionChanged {
                 tape_id,
                 old_lba,
                 new_lba,
                 reason: core_mediachanger::PositionChangeReason::Space,
             });
+            // SPACE over logical blocks that runs into a filemark (SSC-4
+            // §7.5): terminate with CHECK CONDITION / NO SENSE / FILEMARK
+            // DETECTED (00/01), FM bit set, INFORMATION = requested count
+            // minus the records actually spaced. The Linux st driver needs
+            // this stop to keep its (file, block) position model in sync;
+            // walking silently past the filemark desynced it and corrupted
+            // the next write's position (issue #102). Checked before the
+            // EOD/BOP shortfall below because a filemark stop is also a
+            // short move.
+            if code == 0x00 && hit_filemark {
+                let residual = count.wrapping_sub(moved as i32) as u32;
+                let sense = scsi::sense::SenseDataBuilder::new(
+                    scsi::sense::SenseKey::NoSense,
+                    scsi::sense::ASC_FILEMARK_DETECTED,
+                )
+                .with_filemark()
+                .with_information(residual)
+                .build();
+                return Ok(ScsiResp::check_condition_with_sense(sense));
+            }
             // SPACE residual (SSC-5 §7.5). If fewer demarcations were
             // traversed than requested, terminate with CHECK CONDITION
             // and report (count − moved) in INFORMATION so the host's
@@ -528,24 +557,48 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     ]);
     match drive_manager.with_drive(drive_id, tsih, |cart| {
         let old_lba = cart.head_lba();
-        let moved = match code {
-            0x00 => cart.space_records(count),
-            0x01 => cart.space_filemarks(count),
+        let (moved, hit_filemark) = match code {
+            0x00 => {
+                let r = cart.space_records(count);
+                (r.moved, r.hit_filemark)
+            }
+            0x01 => (cart.space_filemarks(count), false),
             0x03 => {
                 cart.space_to_eod();
-                count
+                (count, false)
             }
-            _ => 0,
+            _ => (0, false),
         };
-        Ok((cart.label().to_string(), old_lba, cart.head_lba(), moved))
+        Ok((
+            cart.label().to_string(),
+            old_lba,
+            cart.head_lba(),
+            moved,
+            hit_filemark,
+        ))
     }) {
-        Ok((tape_id, old_lba, new_lba, moved)) => {
+        Ok((tape_id, old_lba, new_lba, moved, hit_filemark)) => {
             let _ = event_tx.send(TapeEvent::HeadPositionChanged {
                 tape_id,
                 old_lba,
                 new_lba,
                 reason: core_mediachanger::PositionChangeReason::Space,
             });
+            // Filemark stop while spacing over logical blocks (SSC-4 §7.5)
+            // — same FILEMARK DETECTED + residual contract as SPACE(6); see
+            // the issue #102 commentary there. Checked before the EOD/BOP
+            // shortfall below.
+            if code == 0x00 && hit_filemark {
+                let residual = (count.wrapping_sub(moved) & 0xFFFF_FFFF) as u32;
+                let sense = scsi::sense::SenseDataBuilder::new(
+                    scsi::sense::SenseKey::NoSense,
+                    scsi::sense::ASC_FILEMARK_DETECTED,
+                )
+                .with_filemark()
+                .with_information(residual)
+                .build();
+                return Ok(ScsiResp::check_condition_with_sense(sense));
+            }
             // Same residual + direction-aware sense as SPACE(6) — see
             // commentary there for the bareos / Linux-st / issue #73
             // context. Forward shortfall = EOD (Blank Check, 00/05);

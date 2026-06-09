@@ -12,7 +12,7 @@
 # coordination and per-drive concurrent SCSI dispatch. Op mix is weighted
 # to bias drive data-path ops and sample changer / iSCSI churn at low
 # rates. Tape semantics:
-# every write appends at EOD (the harness issues `mt eod` before each
+# every write appends at EOD (the harness issues `mt eom` before each
 # write so picks of `space_back` mid-test don't accidentally truncate),
 # every read_verify rewinds and replays the cartridge's known record
 # stream in order.
@@ -466,6 +466,13 @@ iscsi_login() {
     for (( di=0; di<NUM_DRIVES; di++ )); do
         DRIVE_TAPE_DEV[$di]="${tape_devs[$di]}"
         DRIVE_NST_DEV[$di]=$(echo "${tape_devs[$di]}" | sed 's|/dev/st|/dev/nst|')
+        # A regular file squatting on /dev/nstN (left by a write to a
+        # vanished node) blocks devtmpfs from creating the real device
+        # and fails every op on this drive — catch it here, by name.
+        if [[ ! -c "${DRIVE_NST_DEV[$di]}" ]]; then
+            log_error "${DRIVE_NST_DEV[$di]} is not a character device; remove the stale file and re-run"
+            return 1
+        fi
     done
     # Warm up: clear pending UA from login across changer + every drive.
     mtx -f "$CHANGER_DEVICE" status >/dev/null 2>&1 || true
@@ -672,22 +679,25 @@ ensure_loaded() {
     DRIVE_LOADED[$drive_idx]="$target_bc"
 }
 
-# Position drive $drive_idx at end-of-data so every write_record
-# appends. We use rewind+fsr(N) rather than `mt eod`: the underlying
-# filemark-on-READ bug (#25) that made `mt eod` corrupt the next write
-# has been fixed, but rewind+fsr is still the more predictable form —
-# each fsr block is a single LBA step, and the kernel/daemon agree on
-# what those LBAs are regardless of how many filemarks sit on the medium.
+# Position drive $drive_idx at end-of-data so every write_record appends.
+# `mt eom` (SPACE to EOD) reaches true end-of-data regardless of how many
+# filemarks lie behind — unlike `rewind+fsr(N)`, which no longer works now
+# that SPACE over records stops at the first filemark (SSC-4 7.5, issue
+# #102). One wrinkle: the Linux st driver writes a single filemark when a
+# device opened for writing is closed after writing DATA (but writes no
+# extra filemark after a `weof`). To keep the record stream contiguous the
+# next write has to overwrite that trailing close-filemark, so we back over
+# it — but only when the cart's last entry was a data record. A trailing
+# explicit filemark (last entry F) has no close-filemark after it and must
+# not be clobbered.
 seek_eod() {
     local drive_idx="$1"
     local bc="${DRIVE_LOADED[$drive_idx]}"
     [[ -z "$bc" ]] && return 0
     local nst="${DRIVE_NST_DEV[$drive_idx]}"
-    mt -f "$nst" rewind >/dev/null 2>&1
-    local n
-    n=$(record_count "$bc")
-    if (( n > 0 )); then
-        mt -f "$nst" fsr "$n" >/dev/null 2>&1
+    mt -f "$nst" eom >/dev/null 2>&1
+    if [[ "$(last_entry_kind "$bc")" == "R" ]]; then
+        mt -f "$nst" bsr 1 >/dev/null 2>&1 || true
     fi
 }
 
@@ -697,6 +707,14 @@ record_count() {
     local bc="$1"
     [[ -z "${RECORDS[$bc]}" ]] && { echo 0; return; }
     printf '%s' "${RECORDS[$bc]}" | grep -c '^' || true
+}
+# Kind of the last entry on a cart: "R" (data record), "F" (filemark), or
+# "" (empty cart). Drives seek_eod's close-filemark handling.
+last_entry_kind() {
+    local bc="$1" last
+    last=$(printf '%s' "${RECORDS[$bc]}" | grep -v '^$' | tail -1)
+    [[ -z "$last" ]] && { echo ""; return; }
+    echo "${last%%:*}"
 }
 
 # ---------------------------------------------------------------------------
@@ -718,8 +736,12 @@ op_write_record() {
     (( size > 4194304 )) && size=4194304
     local tmp="$TEST_DIR/scratch.rec"
     mc_content_to "$bc" "$idx" "$size" "$tmp"
-    # dd to /dev/nstN writes one record per dd invocation.
-    if ! dd if="$tmp" of="${DRIVE_NST_DEV[$drive_idx]}" bs="$size" count=1 status=none 2>/dev/null; then
+    # dd to /dev/nstN writes one record per dd invocation. conv=nocreat:
+    # if the session dropped and the kernel removed the device node, dd
+    # must fail loudly — without it, dd creates a REGULAR FILE at
+    # /dev/nstN, which then blocks devtmpfs from recreating the real
+    # node on every subsequent login (poisons all later runs).
+    if ! dd if="$tmp" of="${DRIVE_NST_DEV[$drive_idx]}" bs="$size" count=1 conv=nocreat status=none 2>/dev/null; then
         log_error "write_record: dd failed (drive=$drive_idx bc=$bc idx=$idx size=$size)"
         mc_dump_failure
         return 1
@@ -797,13 +819,56 @@ op_read_verify() {
     mc_log_op read_verify drive="$drive_idx" cart="$bc" records="$n_records" filemarks="$n_filemarks"
 }
 
-# space_fwd/space_back ops are intentionally absent. The daemon's tape
-# position logic plus the kernel /dev/nstN driver produces unpredictable
-# state when a write follows an arbitrary space sequence, surfacing as
-# read-back garbage at the "next" LBA. That's likely a real bug worth
-# its own follow-up — but Monte Carlo isn't the right test for it; the
-# scripted scsi-conformance tests catch position-management regressions
-# more pointedly. Keep this harness focused on data correctness.
+# space_fwd / space_back exercise SPACE over records (SSC-4 7.5) at a
+# random mid-medium spot. Their landing position isn't depended upon —
+# the next write seek_eod's back to true EOD and every read rewinds — but
+# a SPACE that desynced the kernel st driver's position model (the issue
+# #102 bug, where SPACE walked silently past filemarks) would corrupt the
+# *following* write, which read_verify / final_verify then catch. `mt
+# fsr`/`bsr` return EIO when they legitimately stop on a filemark; that's
+# expected, so the exit status is ignored.
+op_space_fwd() {
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    local bc="${DRIVE_LOADED[$drive_idx]}"
+    local nst="${DRIVE_NST_DEV[$drive_idx]}"
+    local n
+    n=$(record_count "$bc")
+    if (( n == 0 )); then
+        mc_log_op space_fwd drive="$drive_idx" cart="$bc" status=empty
+        return 0
+    fi
+    mt -f "$nst" rewind >/dev/null 2>&1 || true
+    local k=$(( $(mc_rng_u32 "space-fwd-k" "$n") + 1 ))
+    mt -f "$nst" fsr "$k" >/dev/null 2>&1 || true
+    mc_log_op space_fwd drive="$drive_idx" cart="$bc" k="$k"
+}
+
+op_space_back() {
+    local drive_idx
+    drive_idx=$(mc_rng_u32 "drive-pick" "$NUM_DRIVES")
+    ensure_loaded "" "$drive_idx" || return 1
+    local bc="${DRIVE_LOADED[$drive_idx]}"
+    local nst="${DRIVE_NST_DEV[$drive_idx]}"
+    local n
+    n=$(record_count "$bc")
+    if (( n == 0 )); then
+        mc_log_op space_back drive="$drive_idx" cart="$bc" status=empty
+        return 0
+    fi
+    # Land mid-stream first: from EOD the first object in the reverse
+    # direction is always a filemark (a trailing data record carries the
+    # st close-FM; a trailing weof IS one), so a bsr from `mt eom` halts
+    # immediately having crossed zero records. rewind + fsr puts the head
+    # inside the record run so the bsr genuinely crosses records.
+    mt -f "$nst" rewind >/dev/null 2>&1 || true
+    local j=$(( $(mc_rng_u32 "space-back-j" "$n") + 1 ))
+    mt -f "$nst" fsr "$j" >/dev/null 2>&1 || true
+    local k=$(( $(mc_rng_u32 "space-back-k" "$n") + 1 ))
+    mt -f "$nst" bsr "$k" >/dev/null 2>&1 || true
+    mc_log_op space_back drive="$drive_idx" cart="$bc" j="$j" k="$k"
+}
 
 op_write_filemark() {
     local drive_idx
@@ -1004,11 +1069,12 @@ op_daemon_restart() {
 # at startup enforces that. write_filemark / write_filemarks_sync are
 # rare on purpose — they're correctness-shape ops, not throughput drivers.
 OP_WEIGHTS=(
-    "29:write_record" "35:read_verify"
+    "27:write_record" "33:read_verify"
     "5:rewind"
     "10:load_cycle" "5:iscsi_logout_cycle"
     "3:import_export" "3:changer_move"
     "4:write_filemark" "2:write_filemarks_sync"
+    "2:space_fwd" "2:space_back"
     "2:gc" "2:daemon_restart"
 )
 
@@ -1029,6 +1095,8 @@ run_ops() {
             changer_move)           op_changer_move || return 1 ;;
             write_filemark)         op_write_filemark || return 1 ;;
             write_filemarks_sync)   op_write_filemarks_sync || return 1 ;;
+            space_fwd)              op_space_fwd || return 1 ;;
+            space_back)             op_space_back || return 1 ;;
             gc)                     op_gc || return 1 ;;
             daemon_restart)         op_daemon_restart || return 1 ;;
         esac

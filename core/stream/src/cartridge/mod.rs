@@ -560,6 +560,26 @@ impl From<BlockKindSerde> for BlockKind {
     }
 }
 
+/// Outcome of [`Cartridge::space_records`] — a SPACE over logical blocks
+/// (records). SSC-4 §7.5 requires the motion to halt when a filemark is
+/// encountered, which the SCSI layer reports as FILEMARK DETECTED with a
+/// residual rather than silently spacing past it. The Linux `st` driver
+/// relies on that stop to keep its (file, block) position model in sync;
+/// without it, a write following an arbitrary space across a filemark
+/// lands at a position the host didn't intend (issue #102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceRecordsResult {
+    /// Logical blocks (records) actually spaced over, signed like the
+    /// request. Filemarks are not logical blocks, so they are never
+    /// counted here.
+    pub moved: i64,
+    /// True if the motion stopped because a filemark was encountered.
+    /// Forward: the head is left on the EOP side of the filemark (just
+    /// past it). Reverse: the head is left on the BOP side (at the
+    /// filemark's LBA, matching [`Cartridge::space_filemarks`]).
+    pub hit_filemark: bool,
+}
+
 /// Directory-backed cartridge with content-addressed chunk storage and
 /// optional storage tiering.
 ///
@@ -2727,45 +2747,78 @@ impl Cartridge {
         Ok(blk)
     }
 
-    /// SPACE over a number of **records** (blocks) in the active partition,
-    /// forward (+) or backward (−). Returns the **actual** number of records
-    /// moved.
-    pub fn space_records(&mut self, delta: i64) -> i64 {
-        let cur = self.head_lba as i64;
-        let max = self.active_next_lba() as i64;
-        let mut target = cur.saturating_add(delta);
-        if target < 0 {
-            target = 0;
+    /// SPACE over a number of **records** (logical blocks) in the active
+    /// partition, forward (+) or backward (−).
+    ///
+    /// SSC-4 §7.5: spacing over logical blocks halts as soon as a filemark
+    /// is encountered. The head is left on the EOP side of the filemark
+    /// (forward) or its BOP side (reverse, head at the filemark's LBA — the
+    /// same convention [`Cartridge::space_filemarks`] uses), the filemark is
+    /// not counted as a record, and [`SpaceRecordsResult::hit_filemark`] is
+    /// set so the SCSI layer can report FILEMARK DETECTED + residual. Motion
+    /// also stops at BOP / EOD (a short move with `hit_filemark == false`).
+    pub fn space_records(&mut self, delta: i64) -> SpaceRecordsResult {
+        let part_idx = self.runtime.active_partition;
+        let max = self.active_next_lba();
+        if delta > 0 {
+            let mut moved = 0i64;
+            while moved < delta && self.head_lba < max {
+                // Spacing over the block at the head; if it is a filemark,
+                // cross it and stop on its EOP side without counting it.
+                if self
+                    .try_block_at(part_idx, self.head_lba)
+                    .is_some_and(|bi| bi.kind == BlockKindSerde::Filemark)
+                {
+                    self.head_lba += 1;
+                    return SpaceRecordsResult {
+                        moved,
+                        hit_filemark: true,
+                    };
+                }
+                self.head_lba += 1;
+                moved += 1;
+            }
+            SpaceRecordsResult {
+                moved,
+                hit_filemark: false,
+            }
+        } else {
+            let mut moved = 0i64;
+            while moved > delta && self.head_lba > 0 {
+                let prev = self.head_lba - 1;
+                // Spacing backward over the block behind the head; if it is a
+                // filemark, stop on its BOP side (head at the filemark's LBA)
+                // without counting it.
+                if self
+                    .try_block_at(part_idx, prev)
+                    .is_some_and(|bi| bi.kind == BlockKindSerde::Filemark)
+                {
+                    self.head_lba = prev;
+                    return SpaceRecordsResult {
+                        moved,
+                        hit_filemark: true,
+                    };
+                }
+                self.head_lba = prev;
+                moved -= 1;
+            }
+            SpaceRecordsResult {
+                moved,
+                hit_filemark: false,
+            }
         }
-        if target > max {
-            target = max;
-        }
-        let moved = target - cur;
-        self.head_lba = target as u64;
-        moved
     }
 
     /// SPACE over records in the active partition (async version with
     /// prefetch cancellation for large movements). Cancels prefetches if
-    /// moving more than 2 blocks (likely not sequential anymore).
-    pub async fn space_records_async(&mut self, delta: i64) -> i64 {
+    /// moving more than 2 blocks (likely not sequential anymore). Filemark
+    /// semantics match [`Cartridge::space_records`].
+    pub async fn space_records_async(&mut self, delta: i64) -> SpaceRecordsResult {
         // Cancel prefetches if moving more than 2 blocks
         if delta.abs() > 2 {
             self.cancel_prefetches().await;
         }
-
-        let cur = self.head_lba as i64;
-        let max = self.active_next_lba() as i64;
-        let mut target = cur.saturating_add(delta);
-        if target < 0 {
-            target = 0;
-        }
-        if target > max {
-            target = max;
-        }
-        let moved = target - cur;
-        self.head_lba = target as u64;
-        moved
+        self.space_records(delta)
     }
 
     /// SPACE over **filemarks** (EOFs) in the active partition, forward (+)
@@ -3408,6 +3461,126 @@ mod mam_attribute_tests {
         cart.write_mam_attribute(0x0801, 1, b"x".to_vec()).unwrap();
         cart.erase().unwrap();
         assert!(cart.mam_attributes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod space_then_write_repro {
+    //! Issue #102: SPACE over records/blocks followed by a WRITE.
+    use super::*;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    fn rec(tag: u8) -> Bytes {
+        Bytes::from(vec![tag; 4096])
+    }
+
+    fn make_cart(tmp: &TempDir) -> Cartridge {
+        let tapes = tmp.path().join("tapes");
+        Cartridge::create_with_chunking(
+            &tapes,
+            "SPACE01",
+            ChunkingMode::Fixed { size_bytes: 4096 },
+            8,
+            "primary",
+            false,
+            DedupScope::Global,
+        )
+        .expect("create_with_chunking")
+    }
+
+    #[test]
+    fn space_back_then_write_reads_back_correct_and_truncates_tail() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+
+        // Five records 0..5, distinct content.
+        for i in 0..5u8 {
+            cart.write_data(rec(0x10 + i)).expect("write");
+        }
+        assert_eq!(cart.head_lba(), 5);
+
+        // Space back 2 records: head 5 -> 3. No filemark in the span.
+        let r = cart.space_records(-2);
+        assert_eq!(r.moved, -2);
+        assert!(!r.hit_filemark);
+        assert_eq!(cart.head_lba(), 3);
+
+        // Write a new record at LBA 3.
+        cart.write_data(rec(0xEE)).expect("write after space");
+        assert_eq!(cart.head_lba(), 4);
+
+        // Read back from BOT.
+        cart.locate(0).unwrap();
+        for i in 0..3u8 {
+            let blk = cart.read_next().expect("read");
+            assert_eq!(blk.data, rec(0x10 + i), "LBA {i} should be original");
+        }
+        let blk = cart.read_next().expect("read new");
+        assert_eq!(blk.data, rec(0xEE), "LBA 3 should be the new record");
+        // LBA 4 must be EOD — the write erased everything past the head.
+        match cart.read_next() {
+            Err(SmcError::EndOfData) => {}
+            other => panic!("LBA 4 should be EOD after space+write, got {other:?}"),
+        }
+    }
+
+    /// Lay out `R R R [FM] R R` and assert SPACE over records halts on the
+    /// filemark in both directions (SSC-4 §7.5) instead of walking past it —
+    /// the root cause of issue #102's kernel-st position desync.
+    fn cart_with_midstream_filemark(tmp: &TempDir) -> Cartridge {
+        let mut cart = make_cart(tmp);
+        cart.write_data(rec(1)).unwrap(); // LBA 0
+        cart.write_data(rec(2)).unwrap(); // LBA 1
+        cart.write_data(rec(3)).unwrap(); // LBA 2
+        cart.write_filemark().unwrap(); // LBA 3 (FM)
+        cart.write_data(rec(4)).unwrap(); // LBA 4
+        cart.write_data(rec(5)).unwrap(); // LBA 5
+        cart
+    }
+
+    #[test]
+    fn forward_space_records_stops_at_filemark() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = cart_with_midstream_filemark(&tmp);
+
+        cart.locate(0).unwrap();
+        // Ask to space 5 records forward. Conformant: space R0,R1,R2 (3),
+        // hit the FM at LBA 3, stop on its EOP side (head = 4).
+        let r = cart.space_records(5);
+        assert!(r.hit_filemark, "must report the filemark stop");
+        assert_eq!(r.moved, 3, "only the 3 records before the FM are spaced");
+        assert_eq!(cart.head_lba(), 4, "head left just past the filemark");
+        // The next read is the record after the filemark, not garbage.
+        assert_eq!(cart.read_next().unwrap().data, rec(4));
+    }
+
+    #[test]
+    fn backward_space_records_stops_at_filemark() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = cart_with_midstream_filemark(&tmp);
+
+        // From EOD (head = 6) space back 5 records. Conformant: space R5,R4
+        // (2), hit the FM at LBA 3, stop on its BOP side (head = 3).
+        cart.locate(6).unwrap();
+        let r = cart.space_records(-5);
+        assert!(r.hit_filemark);
+        assert_eq!(r.moved, -2, "only the 2 records after the FM are spaced");
+        assert_eq!(cart.head_lba(), 3, "head left at the filemark's LBA");
+    }
+
+    #[test]
+    fn space_records_without_filemark_moves_full_count() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        for i in 0..6u8 {
+            cart.write_data(rec(0x20 + i)).unwrap();
+        }
+        cart.locate(1).unwrap();
+        let r = cart.space_records(3);
+        assert!(!r.hit_filemark);
+        assert_eq!(r.moved, 3);
+        assert_eq!(cart.head_lba(), 4);
     }
 }
 

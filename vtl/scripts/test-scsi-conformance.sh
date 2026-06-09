@@ -1170,6 +1170,30 @@ t_tape_status_read_position()       { mt -f "$TAPE_NST_DEVICE" status | grep -qE
 t_tape_write_filemarks()            { mt -f "$TAPE_NST_DEVICE" weof 2; }
 t_tape_space_forward_filemark()     { mt -f "$TAPE_NST_DEVICE" rewind && mt -f "$TAPE_NST_DEVICE" weof 2 && mt -f "$TAPE_NST_DEVICE" rewind && mt -f "$TAPE_NST_DEVICE" fsf 1; }
 t_tape_space_backward_filemark()    { mt -f "$TAPE_NST_DEVICE" bsf 1; }
+# SPACE(6) over records (Code 000b) must halt on a filemark (SSC-4 §7.5,
+# issue #102) instead of silently spacing past it — the divergence that
+# desynced the kernel st driver's position model and corrupted a write
+# that followed an arbitrary space. Lay out R R [FM] R entirely via
+# sg_raw on the sg device (sidesteps the st driver's close-on-write
+# filemark), LOCATE back to BOT, then SPACE forward 5 records. The drive
+# must cross only the two records before the mark, stop on it, and
+# terminate CHECK CONDITION / NO SENSE / FILEMARK DETECTED.
+t_tape_space_records_stops_at_filemark() {
+    local rec="$TEST_DIR/spc102.bin"
+    head -c 512 /dev/zero > "$rec"
+    # LOCATE(10) to LBA 0.
+    sg_raw "$TAPE_SG_DEVICE" 2b 00 00 00 00 00 00 00 00 00 || return 1
+    # WRITE(6) variable, 512 bytes (0x000200): 0a 00 00 02 00 00.
+    sg_raw --infile="$rec" --send=512 "$TAPE_SG_DEVICE" 0a 00 00 02 00 00 || return 1
+    sg_raw --infile="$rec" --send=512 "$TAPE_SG_DEVICE" 0a 00 00 02 00 00 || return 1
+    # WRITE FILEMARKS(6), one mark: 10 00 00 00 01 00.
+    sg_raw "$TAPE_SG_DEVICE" 10 00 00 00 01 00 || return 1
+    sg_raw --infile="$rec" --send=512 "$TAPE_SG_DEVICE" 0a 00 00 02 00 00 || return 1
+    sg_raw "$TAPE_SG_DEVICE" 2b 00 00 00 00 00 00 00 00 00 || return 1
+    # SPACE(6) forward 5 records (11 00 00 00 05 00) — must stop on the FM.
+    expect_check_cond "$TAPE_SG_DEVICE" "No Sense" "Filemark|Mark detected" \
+        11 00 00 00 05 00
+}
 # LOCATE(10) to LBA 0: CDB = 2b 00 00 00 00 00 00 00 00 00
 t_tape_locate10_lba0()              { sg_raw "$TAPE_SG_DEVICE" 2b 00 00 00 00 00 00 00 00 00; }
 t_tape_read_position_via_sg_raw()   { sg_raw -r 32 "$TAPE_SG_DEVICE" 34 00 00 00 00 00 00 00 00 00; }
@@ -1355,6 +1379,7 @@ main() {
     run_test "WRITE FILEMARKS (2 marks)"                      t_tape_write_filemarks
     run_test "SPACE forward filemark"                         t_tape_space_forward_filemark
     run_test "SPACE backward filemark"                        t_tape_space_backward_filemark
+    run_test "SPACE records halts on filemark (issue #102)"   t_tape_space_records_stops_at_filemark
     run_test "LOCATE(10) to LBA 0"                            t_tape_locate10_lba0
     run_test "WRITE FILEMARKS (16, 1 mark)"                   t_tape_write_filemarks_16
     run_test "SPACE (16) backward filemark"                   t_tape_space_16_backward_filemark

@@ -79,8 +79,9 @@ pub(crate) async fn run_smoke_test(cfg: &Config) -> Result<()> {
         cart.position()
     );
 
-    // SPACE records: skip over the FILEMARK to the next data ('gamma')
-    let moved_recs = cart.space_records(1);
+    // SPACE records: spacing forward over a filemark halts on it (SSC-4
+    // §7.5), leaving the head just past the FM at the next data ('gamma').
+    let moved_recs = cart.space_records(1).moved;
     let pos_after_recs = cart.position();
     let b_after = cart.read_next_verify()?; // gamma
     info!(
