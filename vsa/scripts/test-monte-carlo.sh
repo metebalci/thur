@@ -178,6 +178,19 @@ declare -a ALIVE_DIRS
 NEXT_PATH_INDEX=1
 NEXT_DIR_INDEX=1
 
+# Snapshot model (iSCSI transport only). op_snapshot freezes a volume's
+# page table and records the snapshot-time file set in SNAP_FILES[name]
+# (one "relpath|version|size|key" line each) + the source volume in
+# SNAP_SRC[name]. A later op_clone_verify clones the snapshot into a new
+# LUN, mounts it read-only, and proves every recorded file still reads
+# its snapshot-time content (copy-on-write isolation) even though the
+# live volume kept mutating in between. CLONE_MOUNT is the scratch
+# mountpoint the clone is verified through.
+declare -A SNAP_FILES
+declare -A SNAP_SRC
+declare -a SNAP_NAMES=()
+CLONE_MOUNT="${TEST_DIR}/mnt-clone"
+
 init_common_daemon_args
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -231,6 +244,9 @@ cleanup() {
     local rc=$?
     log_info "Cleaning up..."
 
+    if mountpoint -q "$CLONE_MOUNT" 2>/dev/null; then
+        umount "$CLONE_MOUNT" 2>/dev/null || true
+    fi
     local mp
     for mp in "${MOUNT_POINTS[@]}"; do
         if mountpoint -q "$mp" 2>/dev/null; then
@@ -295,15 +311,17 @@ check_prerequisites() {
         [lsscsi]="sudo apt-get install lsscsi"
         [nvme]="sudo apt-get install nvme-cli"
         [mkfs.ext4]="sudo apt-get install e2fsprogs"
+        [resize2fs]="sudo apt-get install e2fsprogs"
         [mount]="(util-linux — usually present)"
         [umount]="(util-linux — usually present)"
         [fstrim]="(util-linux — usually present)"
+        [blockdev]="(util-linux — usually present)"
         [openssl]="(usually present)"
         [curl]="sudo apt-get install curl"
         [systemctl]="(systemd — usually present)"
         [cmp]="(diffutils — usually present)"
     )
-    local tools=(mkfs.ext4 mount umount fstrim openssl curl systemctl cmp)
+    local tools=(mkfs.ext4 resize2fs mount umount fstrim blockdev openssl curl systemctl cmp)
     if [[ "$TRANSPORT" == "iscsi" ]]; then
         tools+=(iscsiadm lsscsi)
     else
@@ -1158,6 +1176,164 @@ op_crash() {
     mc_log_op crash
 }
 
+# --- snapshot / clone / resize (iSCSI transport only) -----------------
+# These exercise the VSA volume lifecycle (copy-on-write snapshots,
+# clone-into-new-LUN, online grow) under the random op stream. They are
+# gated to iSCSI because they discover the new/grown LUN through
+# /dev/disk/by-path + an `iscsiadm --rescan`; on NVMe/TCP they log a
+# skip. snapshot create is daemon-routed but kept iSCSI-only too so the
+# snapshots it leaves are always consumed (and destroyed) by a matching
+# clone_verify rather than accumulating.
+
+# Freeze a volume's page table. We sync(2) first so the frozen table
+# reflects the model (a snapshot captures the daemon's view, not the
+# client's dirty page cache). Records the snapshot-time file set so a
+# later clone_verify can prove copy-on-write isolation.
+op_snapshot() {
+    [[ "$TRANSPORT" != "iscsi" ]] && { mc_log_op snapshot status=skip_nvmetcp; return 0; }
+    ensure_mounted || return 1
+    sync || true
+    local idx name root snap
+    idx=$(mc_rng_u32 "snap-vol" "${#VOLUME_NAMES[@]}")
+    name="${VOLUME_NAMES[$idx]}"
+    root="${MOUNT_POINTS[$idx]}"
+    snap="snap-mc-$MC_OP_INDEX"
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" volume snapshot create "$name" "$snap" >/dev/null 2>&1; then
+        mc_log_op snapshot vol="$name" snap="$snap" status=create_failed
+        return 0
+    fi
+    local manifest="" p n=0
+    for p in "${ALIVE_PATHS[@]}"; do
+        (( ${FILE_VERSIONS[$p]:-0} > 0 )) || continue
+        [[ "$p" == "$root"/* ]] || continue
+        manifest+="${p#"$root"/}|${FILE_VERSIONS[$p]}|${FILE_SIZES[$p]}|${CONTENT_KEY[$p]:-$p}"$'\n'
+        n=$(( n + 1 ))
+    done
+    SNAP_FILES[$snap]="$manifest"
+    SNAP_SRC[$snap]="$name"
+    SNAP_NAMES+=("$snap")
+    mc_log_op snapshot vol="$name" snap="$snap" files="$n"
+}
+
+# Resolve + wait for a LUN's by-path device with a non-zero capacity
+# (a freshly-rescanned device node can exist before READ CAPACITY
+# reports its size). Echoes the device path or returns 1.
+clone_lun_device() {
+    local lun="$1"
+    local path="/dev/disk/by-path/ip-127.0.0.1:${ISCSI_PORT}-iscsi-${TARGET_IQN}-lun-${lun}"
+    local i sz
+    for i in {1..20}; do
+        if [[ -e "$path" ]]; then
+            sz=$(blockdev --getsize64 "$path" 2>/dev/null || echo 0)
+            [[ "${sz:-0}" -gt 0 ]] && { echo "$path"; return 0; }
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# Clone the oldest pending snapshot into a fresh LUN, mount it
+# read-only, and verify every snapshot-time file still reads its frozen
+# content (copy-on-write isolation) even though the live volume kept
+# mutating. Cleans up the clone + snapshot regardless of outcome.
+op_clone_verify() {
+    [[ "$TRANSPORT" != "iscsi" ]] && { mc_log_op clone_verify status=skip_nvmetcp; return 0; }
+    local n=${#SNAP_NAMES[@]}
+    (( n > 0 )) || { mc_log_op clone_verify status=no_snapshots; return 0; }
+    ensure_mounted || return 1
+    local pick snap src clone
+    pick=$(mc_rng_u32 "clone-pick" "$n")
+    snap="${SNAP_NAMES[$pick]}"
+    src="${SNAP_SRC[$snap]}"
+    clone="clone-mc-$MC_OP_INDEX"
+    local rc=0 lun="" dev=""
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" volume clone "$src" "$clone" --from-snapshot "$snap" >/dev/null 2>&1; then
+        mc_log_op clone_verify snap="$snap" status=clone_failed
+        # Snapshot may be unconsumable; drop it so we don't spin on it.
+        "$CLI_PATH" --config "$TEST_CONFIG" volume snapshot destroy "$src" "$snap" >/dev/null 2>&1 || true
+        _snap_forget "$snap"
+        return 0
+    fi
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    lun=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$clone" --json 2>/dev/null \
+        | grep -oE '"lun"[: ]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+    [[ -n "$lun" ]] && dev=$(clone_lun_device "$lun")
+    if [[ -z "$dev" ]]; then
+        log_error "clone_verify: clone $clone (lun=${lun:-?}) device did not appear"
+        rc=1
+    else
+        mkdir -p "$CLONE_MOUNT"
+        # The clone shares the source's ext4 UUID (which is mounted);
+        # mount by explicit device path, read-only, so the kernel never
+        # has to disambiguate by UUID.
+        if ! mount -o ro "$dev" "$CLONE_MOUNT" 2>/dev/null; then
+            log_error "clone_verify: mount $dev -> $CLONE_MOUNT failed"
+            rc=1
+        else
+            local line rel rest ver size key expect="$TEST_DIR/scratch.clone" checked=0
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                rel="${line%%|*}"; rest="${line#*|}"
+                ver="${rest%%|*}"; rest="${rest#*|}"
+                size="${rest%%|*}"; key="${rest##*|}"
+                mc_content_to "$key" "$ver" "$size" "$expect"
+                if ! cmp -s "$CLONE_MOUNT/$rel" "$expect"; then
+                    log_error "clone_verify: COW mismatch at $clone:$rel (snap=$snap v=$ver size=$size)"
+                    rc=1; break
+                fi
+                checked=$(( checked + 1 ))
+            done <<< "${SNAP_FILES[$snap]}"
+            umount "$CLONE_MOUNT" 2>/dev/null || true
+            (( rc == 0 )) && mc_log_op clone_verify snap="$snap" clone="$clone" lun="$lun" files="$checked"
+        fi
+    fi
+    # Teardown: destroy clone + snapshot, forget it, rescan to drop LUNs.
+    "$CLI_PATH" --config "$TEST_CONFIG" volume destroy "$clone" --force >/dev/null 2>&1 || true
+    "$CLI_PATH" --config "$TEST_CONFIG" volume snapshot destroy "$src" "$snap" >/dev/null 2>&1 || true
+    _snap_forget "$snap"
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    if (( rc != 0 )); then mc_dump_failure; return 1; fi
+}
+
+# Drop a snapshot name from the model.
+_snap_forget() {
+    local target="$1" new=() s
+    for s in "${SNAP_NAMES[@]}"; do [[ "$s" == "$target" ]] || new+=("$s"); done
+    SNAP_NAMES=("${new[@]}")
+    unset 'SNAP_FILES[$target]' 'SNAP_SRC[$target]'
+}
+
+# Grow a volume online: bump its logical size, rescan so the kernel
+# sees the new READ CAPACITY, then resize2fs the mounted ext4 up to it.
+# Data is non-destructive (final_verify proves the existing files
+# survive); growth is capped so a long run doesn't balloon logical size.
+op_resize() {
+    [[ "$TRANSPORT" != "iscsi" ]] && { mc_log_op resize status=skip_nvmetcp; return 0; }
+    ensure_mounted || return 1
+    local idx name dev cur new
+    idx=$(mc_rng_u32 "resize-vol" "${#VOLUME_NAMES[@]}")
+    name="${VOLUME_NAMES[$idx]}"
+    dev="${RW_DEVICES[$idx]}"
+    cur=$("$CLI_PATH" --config "$TEST_CONFIG" volume info "$name" --json 2>/dev/null \
+        | grep -oE '"size_bytes"[: ]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+    [[ -z "$cur" ]] && { mc_log_op resize vol="$name" status=no_size; return 0; }
+    local cap=$(( 4096 * 1024 * 1024 ))
+    (( cur >= cap )) && { mc_log_op resize vol="$name" status=at_cap cur="$cur"; return 0; }
+    new=$(( cur + 256 * 1024 * 1024 ))
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" volume resize "$name" --size "$new" >/dev/null 2>&1; then
+        mc_log_op resize vol="$name" status=resize_failed
+        return 0
+    fi
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 1
+    if ! resize2fs "$dev" >/dev/null 2>&1; then
+        log_error "resize: resize2fs $dev failed after grow to $new"
+        mc_dump_failure
+        return 1
+    fi
+    mc_log_op resize vol="$name" old="$cur" new="$new"
+}
+
 # Create a fresh directory under a random volume's random parent (the
 # mount root, or any existing dir under it). The new dir joins
 # ALIVE_DIRS so subsequent new_path / op_mkdir picks can nest into it.
@@ -1302,10 +1478,11 @@ op_write_at_offset() {
 # rmdir / rename / write_at_offset are low-rate correctness-shape ops,
 # not throughput drivers.
 OP_WEIGHTS=(
-    "10:write_new" "12:overwrite" "11:append" "16:read_verify"
+    "8:write_new" "10:overwrite" "9:append" "14:read_verify"
     "5:write_at_offset" "6:delete" "3:truncate" "3:truncate_extend"
     "4:sync" "3:fdatasync_one" "3:fstrim" "2:gc"
     "3:mkdir" "2:rmdir" "3:rename"
+    "3:snapshot" "3:clone_verify" "2:resize"
     "6:umount_cycle" "4:transport_logout_cycle"
     "2:daemon_restart" "2:crash"
 )
@@ -1333,6 +1510,9 @@ run_ops() {
             mkdir)                    op_mkdir || return 1 ;;
             rmdir)                    op_rmdir || return 1 ;;
             rename)                   op_rename || return 1 ;;
+            snapshot)                 op_snapshot || return 1 ;;
+            clone_verify)             op_clone_verify || return 1 ;;
+            resize)                   op_resize || return 1 ;;
             umount_cycle)             op_umount_cycle || return 1 ;;
             transport_logout_cycle)   op_transport_logout_cycle || return 1 ;;
             daemon_restart)           op_daemon_restart || return 1 ;;
