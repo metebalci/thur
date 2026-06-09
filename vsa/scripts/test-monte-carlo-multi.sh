@@ -668,6 +668,103 @@ run_initiator_ops() {
     exit 0
 }
 
+# The shared LUN's /dev/sdX for an iface = the device that appeared
+# after the grant+rescan that isn't in the initiator's file-op set.
+iface_new_device() {
+    local iface="$1"; shift
+    local d
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        [[ " $* " == *" $d "* ]] && continue
+        echo "$d"; return 0
+    done < <(resolve_initiator_devices "$iface")
+    return 1
+}
+
+# Persistent-Reservation fuzz (iSCSI only; soft-skips without sg3-utils).
+# After the concurrent file-op phase, attach a shared *raw* LUN to both
+# initiators (dynamic `iscsi users grant` + rescan — the same
+# REPORTED LUNS DATA CHANGED path the CSI driver uses) and run a seeded
+# sequence of PR rounds: A registers + reserves a random type, an
+# *unregistered* B's WRITE must come back RESERVATION CONFLICT (true for
+# every PR type when B isn't a registrant), then a coin-flip either has
+# B preempt A or A release — after which B's WRITE must succeed. The
+# dedicated test-multi-initiator.sh covers one fixed sequence; this adds
+# randomized types + preempt-vs-release ordering on top.
+run_pr_fuzz() {
+    [[ "$TRANSPORT" != "iscsi" ]] && { log_info "PR fuzz: skipped (nvmetcp — see test-nvmetcp-multi-initiator.sh)"; return 0; }
+    if ! command -v sg_persist >/dev/null 2>&1 || ! command -v sg_write_same >/dev/null 2>&1; then
+        log_warn "PR fuzz: sg3-utils (sg_persist/sg_write_same) missing — skipped"
+        return 0
+    fi
+    log_info "PR fuzz: attaching shared raw LUN to both initiators..."
+    local shared="vol-mc-shared"
+    if ! "$CLI_PATH" --config "$TEST_CONFIG" volume create "$shared" --size 64M --backend local >/dev/null 2>&1; then
+        log_error "PR fuzz: create $shared failed"; return 1
+    fi
+    "$CLI_PATH" --config "$TEST_CONFIG" iscsi users grant "$CHAP_USER_A" --volume "$shared" >/dev/null 2>&1
+    "$CLI_PATH" --config "$TEST_CONFIG" iscsi users grant "$CHAP_USER_B" --volume "$shared" >/dev/null 2>&1
+    iscsiadm -m session --rescan >/dev/null 2>&1
+    sleep 2
+    local dev_a dev_b
+    dev_a=$(iface_new_device "$IFACE_A" "${RW_DEVS_A[@]}")
+    dev_b=$(iface_new_device "$IFACE_B" "${RW_DEVS_B[@]}")
+    if [[ -z "$dev_a" || -z "$dev_b" ]]; then
+        log_error "PR fuzz: shared LUN device not found (A=${dev_a:-none} B=${dev_b:-none})"
+        return 1
+    fi
+    log_info "PR fuzz: shared dev A=$dev_a B=$dev_b"
+    local types=(1 3 5 6) rounds rc=0 r
+    rounds=$(( $(mc_rng_u32 "pr-rounds" 3) + 2 ))   # 2..4
+    for (( r=0; r<rounds; r++ )); do
+        local rtype="${types[$(mc_rng_u32 "pr-type-$r" 4)]}"
+        sg_persist --out --clear --param-rk=0xa1a1 "$dev_a" >/dev/null 2>&1 || true
+        if ! sg_persist --out --register --param-sark=0xa1a1 "$dev_a" >/dev/null 2>&1; then
+            log_error "PR fuzz: A register failed (round $r)"; rc=1; break
+        fi
+        if ! sg_persist --out --reserve --param-rk=0xa1a1 --prout-type="$rtype" "$dev_a" >/dev/null 2>&1; then
+            log_error "PR fuzz: A reserve type=$rtype failed (round $r)"; rc=1; break
+        fi
+        # Unregistered B's write must conflict under every type.
+        local out
+        out=$(sg_write_same --lba=0 --num=1 --in=/dev/zero "$dev_b" 2>&1 || true)
+        if ! echo "$out" | grep -qiE "Reservation conflict|reservation_conflict|sense.*0x18"; then
+            log_error "PR fuzz: B write NOT blocked while A holds type=$rtype (round $r)"
+            echo "$out" | head -3 | sed 's/^/    /' >&2
+            rc=1; break
+        fi
+        local flip=$(mc_rng_u32 "pr-flip-$r" 2)
+        if (( flip == 0 )); then
+            sg_persist --out --register --param-sark=0xb2b2 "$dev_b" >/dev/null 2>&1
+            if ! sg_persist --out --preempt --param-rk=0xb2b2 --param-sark=0xa1a1 --prout-type="$rtype" "$dev_b" >/dev/null 2>&1; then
+                log_error "PR fuzz: B preempt failed (round $r type=$rtype)"; rc=1; break
+            fi
+            if ! sg_write_same --lba=0 --num=1 --in=/dev/zero "$dev_b" >/dev/null 2>&1; then
+                log_error "PR fuzz: B write failed after preempt (round $r)"; rc=1; break
+            fi
+            sg_persist --out --clear --param-rk=0xb2b2 "$dev_b" >/dev/null 2>&1 || true
+        else
+            if ! sg_persist --out --release --param-rk=0xa1a1 --prout-type="$rtype" "$dev_a" >/dev/null 2>&1; then
+                log_error "PR fuzz: A release failed (round $r type=$rtype)"; rc=1; break
+            fi
+            if ! sg_write_same --lba=0 --num=1 --in=/dev/zero "$dev_b" >/dev/null 2>&1; then
+                log_error "PR fuzz: B write failed after A released (round $r)"; rc=1; break
+            fi
+            sg_persist --out --clear --param-rk=0xa1a1 "$dev_a" >/dev/null 2>&1 || true
+        fi
+        mc_log_op pr_round rtype="$rtype" resolve="$( (( flip == 0 )) && echo preempt || echo release )"
+    done
+    sg_persist --out --clear --param-rk=0xa1a1 "$dev_a" >/dev/null 2>&1 || true
+    sg_persist --out --clear --param-rk=0xb2b2 "$dev_b" >/dev/null 2>&1 || true
+    # The shared LUN is left for the cleanup trap (iSCSI logout + rm -rf)
+    # to reclaim: an in-test `volume destroy` of a volume still mapped to
+    # two live sessions can block on those sessions, and we don't need it
+    # gone mid-run. Run AFTER the integrity gates so `system verify`
+    # never sees this raw, FS-less volume.
+    if (( rc != 0 )); then return 1; fi
+    log_info "PR fuzz OK ($rounds rounds)"
+}
+
 # Post-run integrity gates against the state both concurrent streams
 # built: pool/page-table + storage consistency, the BLAKE3 audit chain,
 # and a stats dump (dedup ratio > 1 with the dup-corpus content class).
@@ -738,6 +835,11 @@ main() {
 
     if ! run_integrity_gates; then
         log_fail "Integrity gates failed (gc/verify/audit)"
+        exit 1
+    fi
+
+    if ! run_pr_fuzz; then
+        log_fail "Persistent-reservation fuzz failed"
         exit 1
     fi
 
