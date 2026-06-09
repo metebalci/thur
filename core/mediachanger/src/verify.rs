@@ -35,6 +35,7 @@ use crate::chunk_store::ChunkStore;
 use crate::errors::Result;
 use crate::object_store_backend::ObjectStoreBackend;
 use crate::object_store_config::ObjectStoreConfig;
+use core_stream::TAG_LEN;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use shared_verify_core::{LiveChunkSet, StorageEntity, VerifyTarget};
@@ -62,6 +63,12 @@ struct ManifestInfo {
     /// Partition IDs derived from manifest `partitions[]`. At least
     /// one entry; defaults to `[0]` for pre-multi-partition manifests.
     partitions: Vec<u8>,
+    /// True when the manifest carries an `encryption` stanza, i.e. the
+    /// cartridge seals at-rest-encrypted chunks. Each pool object is
+    /// then `plaintext + TAG_LEN` (the AES-256-GCM tag), so the
+    /// local-pool size check must add that overhead to the recorded
+    /// plaintext size.
+    encrypted: bool,
 }
 
 /// Per-cartridge view used by both consistency checks (does the local
@@ -462,6 +469,7 @@ fn verify_one_cartridge(
             dir,
             backend_name,
             mi.namespace.as_deref(),
+            mi.encrypted,
             &records_for_set,
             &mut r,
         );
@@ -537,11 +545,18 @@ fn read_manifest(dir: &Path, dir_name: &str, r: &mut CartridgeReport) -> Option<
         _ => vec![0u8], // legacy manifests with no `partitions` field default to a single P0
     };
 
+    // Encrypted cartridges carry an `encryption` object in the
+    // manifest (absent for plaintext carts — the field is
+    // skip_serializing_if = Option::is_none on the writer side). The
+    // pool then holds ciphertext+tag, 16 bytes longer per chunk.
+    let encrypted = v.get("encryption").map(|e| !e.is_null()).unwrap_or(false);
+
     Some(ManifestInfo {
         value: v,
         backend,
         namespace,
         partitions,
+        encrypted,
     })
 }
 
@@ -633,9 +648,15 @@ fn verify_local_pool(
     dir: &Path,
     backend_name: &str,
     namespace: Option<&str>,
+    encrypted: bool,
     records_for_set: &[(u64, String, u64, LocationTag)],
     r: &mut CartridgeReport,
 ) {
+    // chunks.idx records the plaintext chunk size; an encrypted
+    // cartridge seals each chunk as one AES-256-GCM block, so its pool
+    // object is TAG_LEN bytes longer. (The IV is derived, not stored,
+    // so the tag is the only on-disk overhead.)
+    let pool_overhead: u64 = if encrypted { TAG_LEN as u64 } else { 0 };
     let parent = dir
         .parent()
         .and_then(|p| p.parent())
@@ -654,12 +675,14 @@ fn verify_local_pool(
                 let path = store.store_path(hash);
                 match path.metadata() {
                     Ok(meta) if meta.is_file() => {
-                        if meta.len() != *size {
+                        let expected = *size + pool_overhead;
+                        if meta.len() != expected {
                             r.local_chunks_size_mismatch += 1;
                             r.errors.push(format!(
-                                "chunk {} size mismatch: chunks.idx={} pool={}",
+                                "chunk {} size mismatch: chunks.idx={} expected pool={} actual pool={}",
                                 short_hash(hash),
                                 size,
+                                expected,
                                 meta.len()
                             ));
                         }
@@ -1171,6 +1194,83 @@ mod tests {
         assert_eq!(c.chunks_idx_records, 1);
         assert_eq!(c.local_chunks_missing, 0);
         assert_eq!(c.local_chunks_size_mismatch, 0);
+    }
+
+    #[test]
+    fn encrypted_cartridge_tag_overhead_is_not_a_size_mismatch() {
+        // An encrypted cartridge seals each chunk as one AES-256-GCM
+        // block, so its pool object is TAG_LEN (16) bytes longer than
+        // the plaintext size recorded in chunks.idx. verify must add
+        // that overhead before comparing pool size — otherwise every
+        // encrypted chunk is wrongly flagged. (Regression for the bug
+        // the monte-carlo encryption coverage surfaced.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        fs::create_dir_all(dd.join("library")).unwrap();
+        fs::write(
+            dd.join("library").join("library.json"),
+            r#"{"num_storage_slots":1,"num_mail_slots":0,"num_drives":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            dd.join("library").join("inventory.json"),
+            r#"{"storage_slots":[{"slot_id":1,"barcode":"TAPE001"}],"mail_slots":[],"drives":[]}"#,
+        )
+        .unwrap();
+
+        let barcode = "TAPE001";
+        let backend = "primary";
+        let h = "c".repeat(64);
+        let plaintext = b"hello, encrypted tape";
+
+        let dir = dd.join("tapes").join(barcode);
+        fs::create_dir_all(&dir).unwrap();
+        // Manifest WITH an encryption stanza (what `cartridge create
+        // --encrypt` writes).
+        fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"label":"{barcode}","backend":"{backend}","dedup":"global","uuid":"{}","encryption":{{"algorithm":"aes_256_gcm","keystore_backend":"local"}}}}"#,
+                "00".repeat(16)
+            ),
+        )
+        .unwrap();
+        // chunks.idx records the PLAINTEXT size.
+        let cif = ChunkIndexFile::open_or_create(&dir).unwrap();
+        cif.append(&ChunkRec {
+            size: plaintext.len() as u64,
+            hash: Some(h.clone()),
+            location: LocationTag::LocalOnly,
+            uploaded: false,
+            compression: None,
+        })
+        .unwrap();
+        let bif = BlockIndexFile::open_or_create(&dir, 0).unwrap();
+        let mut rec = BlockRec::data();
+        rec.chunk_id = 0;
+        rec.offset = 0;
+        rec.len = plaintext.len() as u32;
+        rec.kind = BlockKind::Data;
+        bif.append(&rec).unwrap();
+        // Pool object is ciphertext+tag: plaintext + TAG_LEN bytes.
+        let store = ChunkStore::new(dd, backend).unwrap();
+        let path = store.store_path(&h);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut on_disk = plaintext.to_vec();
+        on_disk.extend_from_slice(&[0u8; TAG_LEN]);
+        fs::write(&path, &on_disk).unwrap();
+
+        let report = verify_local(dd, &VerifyScope::default()).unwrap();
+        let c = &report.cartridges[0];
+        assert_eq!(c.local_chunks_size_mismatch, 0, "{:#?}", report);
+        assert_eq!(report.error_count(), 0, "{:#?}", report);
+
+        // Negative control: an encrypted cart whose pool object is
+        // missing the tag (plaintext-sized) must still be flagged.
+        fs::write(&path, plaintext).unwrap();
+        let report = verify_local(dd, &VerifyScope::default()).unwrap();
+        let c = &report.cartridges[0];
+        assert_eq!(c.local_chunks_size_mismatch, 1, "{:#?}", report);
     }
 
     #[test]

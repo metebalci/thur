@@ -1688,7 +1688,7 @@ be partitioned along with them.
 
 | Bytes | Field | Notes |
 |-------|-------|-------|
-| `0..4` | `size` | u32 LE; sealed on-disk byte count. Width matches `BlockRec.offset` (u32) — a chunk can never hold more than 4 GiB |
+| `0..4` | `size` | u32 LE; **plaintext** byte count of the sealed chunk. Equals the on-disk pool-file size for unencrypted chunks; for an at-rest-encrypted cartridge the pool file is 16 B larger (the appended AES-256-GCM tag) while `size` stays the plaintext count — capacity accounting and block-index offsets are plaintext-stream invariants. `system verify` adds the tag back before comparing `size` against the pool file. Width matches `BlockRec.offset` (u32) — a chunk can never hold more than 4 GiB |
 | `4..36` | `hash` | 32-byte raw BLAKE3 of sealed chunk bytes; valid iff `hash_present` flag is set (zeroed for unsealed staging chunks) |
 | `36` | `flags` | bit 0 = `hash_present` (sealed); bit 1 = `uploaded`; bits 2-3 = `location` (0=LocalOnly, 1=StorageOnly, 2=Both); bits 4-6 = compression algo (0=none, 1=lz4, 2=zstd, 3=sldc); bit 7 reserved |
 | `37..64` | reserved | 27 B, zeroed |
