@@ -81,6 +81,21 @@ impl Cli {
             }
         )
     }
+
+    /// True for the daemon-down subset that needs `data_dir` resolved
+    /// up front: `volume key` reads / rewrites the volume manifest and
+    /// keystore sidecar under `<data_dir>`. The other daemon-down
+    /// verbs (`system regenerate-cert`, `system storage benchmark`)
+    /// parse the full YAML conffile themselves and never touch
+    /// `data_dir`.
+    fn needs_data_dir(&self) -> bool {
+        matches!(
+            self.command,
+            Commands::Volume {
+                action: VolumeAction::Key { .. }
+            }
+        )
+    }
 }
 
 fn main() -> Result<()> {
@@ -121,13 +136,13 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.get_config_path();
     let target_user = cli.target_user().to_string();
     // Strict split: daemon-down commands (`volume key`, `system
-    // regenerate-cert`, `system storage benchmark`) read the yaml —
-    // they need `data_dir` to write under (or, for benchmark, the
-    // `storage.backends:` block) and run with `sudo` on a packaged
-    // install so the 0640 conffile is readable. Every other command is
-    // daemon-routed and only talks to the admin Unix socket; it must
-    // not touch the yaml at all.
-    let data_dir = if cli.is_daemon_down() {
+    // regenerate-cert`, `system storage benchmark`) read the yaml and
+    // run with `sudo` on a packaged install so the 0640 conffile is
+    // readable. Only `volume key` needs `data_dir` resolved here; the
+    // other two parse the full YAML themselves in their command fns.
+    // Every other command is daemon-routed and only talks to the admin
+    // Unix socket; it must not touch the yaml at all.
+    let data_dir = if cli.needs_data_dir() {
         PathBuf::from(MinimalConfig::load(&config_path)?.data_dir)
     } else {
         PathBuf::new()
@@ -573,5 +588,31 @@ mod cli_parse_tests {
     fn iscsi_users_list_is_daemon_routed() {
         let cli = parse(["thurvsa", "iscsi", "users", "list"]);
         assert!(!cli.is_daemon_down());
+    }
+
+    // ---- data_dir resolution ----
+    //
+    // Of the daemon-down set, only `volume key` consumes the
+    // up-front `data_dir`; `regenerate-cert` and `benchmark` parse
+    // the full YAML themselves in their command fns.
+
+    #[test]
+    fn volume_key_needs_data_dir() {
+        let cli = parse([
+            "thurvsa", "volume", "key", "migrate", "vol0", "--to", "local",
+        ]);
+        assert!(cli.needs_data_dir());
+    }
+
+    #[test]
+    fn regenerate_cert_does_not_need_data_dir() {
+        let cli = parse(["thurvsa", "system", "regenerate-cert"]);
+        assert!(!cli.needs_data_dir());
+    }
+
+    #[test]
+    fn storage_benchmark_does_not_need_data_dir() {
+        let cli = parse(["thurvsa", "system", "storage", "benchmark"]);
+        assert!(!cli.needs_data_dir());
     }
 }
