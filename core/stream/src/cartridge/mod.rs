@@ -3271,25 +3271,31 @@ impl Cartridge {
         self.encryption = None;
     }
 
-    /// True iff the block at the head position is encrypted on the
-    /// medium. Used by SP IN Next Block Encryption Status (page 0x0200).
-    /// Returns false at EOD or for filemarks. Looks at the active
-    /// partition only — partitions have independent encryption metadata
-    /// per block.
-    pub fn next_block_is_encrypted(&self) -> bool {
-        self.try_block_at(self.runtime.active_partition, self.head_lba)
-            .map(|bi| bi.encrypted)
-            .unwrap_or(false)
-    }
-
-    /// Algorithm index of the next block to be read, or 0 if plaintext / EOD.
-    /// Today only AES-256-GCM is implemented (algorithm index 0x01).
-    pub fn next_block_algorithm_index(&self) -> u8 {
-        if self.next_block_is_encrypted() {
+    /// Encryption status of the block at the head position —
+    /// `(encrypted, algorithm_index)` — for SP IN Next Block
+    /// Encryption Status (SPSP 0x0021). `(false, 0)` at EOD or for
+    /// filemarks; today only AES-256-GCM is implemented (algorithm
+    /// index 0x01). Looks at the active partition only — partitions
+    /// have independent encryption metadata per block.
+    ///
+    /// Fallible (issue #110): a head record that fails to decode
+    /// propagates `IndexCorrupt` / `Io` instead of fabricating "not
+    /// encrypted" with GOOD status — a host keying decryption
+    /// decisions off this page must not be told the medium is fine.
+    /// The page handler maps the error to the same CHECK CONDITION
+    /// the subsequent READ would report.
+    pub fn next_block_encryption_status(&self) -> Result<(bool, u8)> {
+        let partition = self.runtime.active_partition;
+        if self.head_lba >= self.next_lba_of(partition) {
+            return Ok((false, 0)); // EOD
+        }
+        let bi = self.block_at(partition, self.head_lba)?;
+        let algorithm_index = if bi.encrypted {
             crate::encryption::ALGORITHM_INDEX_AES_256_GCM
         } else {
             0
-        }
+        };
+        Ok((bi.encrypted, algorithm_index))
     }
 
     // --- Drive-level compression (LTO Mode Page 0x0F DCE bit) ---

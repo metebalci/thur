@@ -1278,6 +1278,54 @@ fn security_protocol_in_serves_the_tape_encryption_pages() {
 }
 
 #[test]
+fn next_block_encryption_status_fails_on_corrupt_head_record() {
+    // Issue #110: SP IN protocol 0x20 / SPSP 0x0021 (Next Block
+    // Encryption Status) over a head block whose index record fails
+    // to decode must return CHECK CONDITION + MEDIUM ERROR +
+    // 0x11/0x00 — the same sense the subsequent READ reports — not a
+    // fabricated "not encrypted, algorithm 0" page with GOOD status
+    // that a host would key decryption decisions off.
+    use core_mediachanger::block_index::HEADER_SIZE;
+
+    let fx = Fixture::new();
+
+    // One data record, then rot record 0's index entry (reserved enc
+    // tag; the flag byte sits at record offset 12).
+    let payload = vec![0x5Au8; 512];
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
+    assert_eq!(
+        handlers::handle_write_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+    let idx = fx
+        .data_dir
+        .join("tapes")
+        .join("TAPE01")
+        .join("blocks-p0.idx");
+    let mut bytes = std::fs::read(&idx).expect("read index");
+    bytes[HEADER_SIZE + 12] = 2 << 1;
+    std::fs::write(&idx, &bytes).expect("write index");
+
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+
+    let mut c = cdb(0xA2);
+    c[1] = 0x20;
+    c[2..4].copy_from_slice(&0x0021u16.to_be_bytes());
+    c[6..10].copy_from_slice(&512u32.to_be_bytes());
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_security_protocol_in(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition, "SPSP 0x0021");
+    let sense = resp.sense.expect("must carry sense");
+    assert_eq!(sense[2] & 0x0f, 0x03, "sense key = MEDIUM ERROR");
+    assert_eq!(sense[12], 0x11, "ASC = UNRECOVERED READ ERROR");
+    assert_eq!(sense[13], 0x00, "ASCQ = 0x00");
+}
+
+#[test]
 fn security_protocol_out_clears_the_drive_encryption_key() {
     let fx = Fixture::new();
     // A 16-byte SET DATA ENCRYPTION page with both modes = Disable

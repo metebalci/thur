@@ -1746,16 +1746,34 @@ pub fn handle_security_protocol_in(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             }
         }
         scsi::encryption_pages::PAGE_NEXT_BLOCK_ENCRYPTION_STATUS => {
+            use core_mediachanger::errors::SmcError;
             let res = drive_manager.with_drive(drive_id, tsih, |cart| {
+                let (encrypted, algorithm_index) = cart.next_block_encryption_status()?;
                 Ok(scsi::encryption_pages::build_next_block_status_page(
                     cart.head_lba(),
-                    cart.next_block_is_encrypted(),
-                    cart.next_block_algorithm_index(),
+                    encrypted,
+                    algorithm_index,
                 ))
             });
             match res {
                 Ok(page) => page,
-                Err(_) => scsi::encryption_pages::build_next_block_status_page(0, false, 0),
+                // Empty / busy drive keeps the pre-existing all-zeros
+                // fallback page — drive-state probes answer on an
+                // empty drive.
+                Err(
+                    SmcError::NoCartridgeLoaded(_)
+                    | SmcError::DriveReserved(_)
+                    | SmcError::InvalidDrive(_),
+                ) => scsi::encryption_pages::build_next_block_status_page(0, false, 0),
+                // A head record that fails to decode must not be
+                // fabricated as "not encrypted" with GOOD status
+                // (issue #110): fail with the same sense the
+                // subsequent READ would report (MEDIUM ERROR
+                // 0x11/0x00 via error_to_sense).
+                Err(e) => {
+                    tracing::warn!("SP IN Next Block Encryption Status failed: {}", e);
+                    return Ok(ScsiResp::check_condition_for(&e));
+                }
             }
         }
         _ => {

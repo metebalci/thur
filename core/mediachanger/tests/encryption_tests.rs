@@ -115,15 +115,52 @@ fn next_block_status_reports_encryption_per_block() {
     cart.write_data(Bytes::from_static(b"cipher")).unwrap();
 
     cart.rewind();
-    assert!(!cart.next_block_is_encrypted());
-    assert_eq!(cart.next_block_algorithm_index(), 0);
+    assert_eq!(cart.next_block_encryption_status().unwrap(), (false, 0));
 
     let _ = cart.read_next().unwrap();
-    assert!(cart.next_block_is_encrypted());
     assert_eq!(
-        cart.next_block_algorithm_index(),
-        ALGORITHM_INDEX_AES_256_GCM
+        cart.next_block_encryption_status().unwrap(),
+        (true, ALGORITHM_INDEX_AES_256_GCM)
     );
+}
+
+#[test]
+fn next_block_status_errors_on_corrupt_head_record() {
+    // Issue #110: a head record that fails to decode must propagate
+    // the index fault instead of reporting "not encrypted" — the SP
+    // IN page handler turns it into CHECK CONDITION + MEDIUM ERROR.
+    use core_mediachanger::block_index::HEADER_SIZE;
+
+    let dir = create_test_dir();
+    let mut cart = create_test_cartridge(&dir, "ENC006");
+
+    cart.set_encryption_state(make_state([0x22u8; KEY_LEN]));
+    cart.write_data(Bytes::from_static(b"cipher")).unwrap();
+
+    // Flip record 0's flag byte to a reserved encryption tag so the
+    // decode fails (same fabrication as the #104/#105 tests).
+    let idx = dir
+        .path()
+        .join("tapes")
+        .join("ENC006")
+        .join("blocks-p0.idx");
+    let mut bytes = std::fs::read(&idx).expect("read index");
+    bytes[HEADER_SIZE + 12] = 2 << 1; // enc tag 2 = reserved
+    std::fs::write(&idx, &bytes).expect("write index");
+
+    cart.rewind();
+    let err = cart
+        .next_block_encryption_status()
+        .expect_err("corrupt head record must not fabricate plaintext status");
+    assert!(
+        matches!(err, SmcError::IndexCorrupt(_)),
+        "expected IndexCorrupt, got: {err:?}"
+    );
+
+    // Past EOD stays the benign (false, 0) — only the decode fault
+    // propagates.
+    cart.locate(1).unwrap();
+    assert_eq!(cart.next_block_encryption_status().unwrap(), (false, 0));
 }
 
 #[test]

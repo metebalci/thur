@@ -1106,6 +1106,13 @@ sized to include those 16 bytes. Reading an encrypted block without
 the correct key returns CHECK CONDITION + DATA PROTECT + ASC/ASCQ
 0x74/0x0C (LOGICAL UNIT ENCRYPTION KEY MISMATCH).
 
+Next Block Encryption Status (SPSP 0x0021) decodes the head block's
+index record; if the record is unreadable (corrupt index sidecar) the
+command fails with CHECK CONDITION + MEDIUM ERROR + 0x11/0x00 — the
+same sense the subsequent READ reports — rather than fabricating a
+"not encrypted" page with GOOD status (issue #110). EOD and
+no-cartridge keep the benign not-encrypted page.
+
 ### WORM cartridges
 
 WORM (Write Once Read Many) is a per-cartridge flag. It is set once,

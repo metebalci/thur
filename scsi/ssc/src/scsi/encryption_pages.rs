@@ -186,9 +186,12 @@ pub fn build_encryption_status_page(state: Option<&DriveEncryptionState>) -> Vec
     out
 }
 
-/// SP IN protocol 0x20 / SPSP 0x0200: Next Block Encryption Status.
+/// SP IN protocol 0x20 / SPSP 0x0021: Next Block Encryption Status.
 /// Tells the host whether the next block to be read is encrypted, so it
-/// can decide whether it needs a key.
+/// can decide whether it needs a key. Only called with a decodable
+/// head record (or at EOD): an unreadable record fails the command
+/// with CHECK CONDITION instead of fabricating a plaintext status
+/// (issue #110).
 pub fn build_next_block_status_page(
     next_lba: u64,
     encrypted: bool,

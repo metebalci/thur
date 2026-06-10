@@ -839,6 +839,14 @@ the supported-list SPSP returns exactly `[0x0000, 0x0001, 0x0010,
 Read of an encrypted block without the correct key →
 CHECK CONDITION + DATA PROTECT (0x07) + ASC/ASCQ 0x74/0x0C.
 
+Next Block Encryption Status (0x0021) reads the head block's index
+record. If that record fails to decode (corrupt index sidecar), the
+command fails with CHECK CONDITION + MEDIUM ERROR + 0x11/0x00 — the
+same sense the subsequent READ would report — instead of fabricating
+a "not encrypted, algorithm 0" page with GOOD status that a host
+could key decryption decisions off (issue #110). At EOD, or with no
+cartridge loaded, the page reports not-encrypted as before.
+
 ---
 
 ## Behavioral model & deliberate divergences
