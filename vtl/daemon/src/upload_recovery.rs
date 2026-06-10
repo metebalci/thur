@@ -1,27 +1,36 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! Startup scan for orphan chunks left behind by a mid-PUT daemon crash.
+//! Orphan-chunk sweeps: one at boot, then periodic (issue #107).
 //!
-//! Walks every cartridge under `<data_dir>/tapes/`, finds entries in
-//! `chunks.idx` that are sealed (`hash.is_some()`) but not uploaded
-//! (`!uploaded`), and re-queues them for upload via the existing
-//! [`UploadRequest`] mpsc. The upload worker treats a recovery
-//! request the same as a live `on_cartridge_unloaded` flush — its
-//! `pending_upload_payload` filter already skips already-uploaded
-//! and unsealed ids, so the request is naturally idempotent.
+//! Each sweep walks every cartridge under `<data_dir>/tapes/`, finds
+//! entries in `chunks.idx` that are sealed (`hash.is_some()`) but not
+//! uploaded (`!uploaded`), and re-queues them for upload via the
+//! existing [`UploadRequest`] mpsc. The upload worker treats a
+//! recovery request the same as a live `on_cartridge_unloaded` flush
+//! — its `pending_upload_payload` filter already skips
+//! already-uploaded and unsealed ids, and the worker processes
+//! requests sequentially against a fresh cartridge open, so a sweep
+//! request that races a live dispatch for the same chunk filters out
+//! instead of double-PUTting. The request is naturally idempotent.
 //!
-//! Why this exists. The upload pipeline is event-driven: a chunk seal
-//! publishes onto a broadcast bus consumed by `MemoryBufferManager`,
-//! which queues an `UploadRequest`. A daemon killed mid-PUT (or after
-//! PUT but before the `chunks.idx` pwrite flips `uploaded=true`)
-//! leaves a sealed chunk in the local pool with `uploaded=false` —
-//! the seal event has already been consumed and is not replayed on
-//! restart. Without this sweep the orphan sits there until the
-//! cartridge is reloaded into a drive.
+//! Why this exists. The upload pipeline is event-driven and
+//! fire-and-forget: a chunk seal publishes onto a broadcast bus
+//! consumed by `MemoryBufferManager`, which queues an
+//! `UploadRequest` and forgets the chunk at dispatch — PUT outcomes
+//! never feed back into the manager. Two things therefore strand a
+//! sealed chunk at `uploaded=false` with no event left to re-drive
+//! it: a daemon killed mid-PUT (the seal event was consumed and is
+//! not replayed on restart), and a PUT that fails after the
+//! backend's retry budget (issue #107). The boot sweep catches the
+//! first; the periodic sweep catches the second, so a transient
+//! backend outage heals within [`PERIODIC_SWEEP_INTERVAL`] instead
+//! of persisting until the next daemon restart. Stranded chunks are
+//! safe meanwhile — eviction skips `uploaded=false` — but the
+//! storage copy is the DR source of truth and must converge.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use core_mediachanger::chunk_index::ChunkIndexFile;
@@ -37,14 +46,78 @@ struct CartridgeOrphans {
     chunk_ids: Vec<u32>,
 }
 
+/// How often the periodic sweep re-walks `chunks.idx` after boot.
+/// Ten minutes bounds the healing latency after a transient backend
+/// outage; the scan itself is index-file preads, cheap enough that
+/// no opt-out knob is warranted.
+const PERIODIC_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// What initiated a sweep — controls audit verbosity. The boot scan
+/// always writes its start/completed audit pair (one per daemon
+/// start, as documented in SPEC.md § Audit Log); a periodic sweep
+/// writes a completed row only when it actually found and re-queued
+/// something, so the quiet steady state doesn't add ~144 no-op rows
+/// a day to the audit chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SweepTrigger {
+    Boot,
+    Periodic,
+}
+
+impl SweepTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            SweepTrigger::Boot => "boot",
+            SweepTrigger::Periodic => "periodic",
+        }
+    }
+}
+
+fn should_audit(trigger: SweepTrigger, orphans_found: usize) -> bool {
+    trigger == SweepTrigger::Boot || orphans_found > 0
+}
+
+/// Run the boot sweep immediately, then keep sweeping every
+/// [`PERIODIC_SWEEP_INTERVAL`] until the upload worker goes away
+/// (daemon shutdown). Spawned once from `main`.
+pub async fn run_orphan_sweeps(
+    data_dir: PathBuf,
+    upload_tx: mpsc::Sender<UploadRequest>,
+    audit: Option<AuditChannel>,
+) {
+    scan_and_enqueue_orphans(
+        data_dir.clone(),
+        upload_tx.clone(),
+        audit.clone(),
+        SweepTrigger::Boot,
+    )
+    .await;
+    loop {
+        tokio::time::sleep(PERIODIC_SWEEP_INTERVAL).await;
+        if upload_tx.is_closed() {
+            debug!("Orphan upload sweep: upload worker gone - stopping periodic sweeps");
+            return;
+        }
+        scan_and_enqueue_orphans(
+            data_dir.clone(),
+            upload_tx.clone(),
+            audit.clone(),
+            SweepTrigger::Periodic,
+        )
+        .await;
+    }
+}
+
 /// Scan `<data_dir>/tapes/` for cartridges with sealed-but-not-uploaded
 /// chunks and dispatch one `UploadRequest` per cartridge to the upload
-/// worker. Survives transient errors per cartridge; emits start/end
-/// audit events and a duration histogram sample.
+/// worker. Survives transient errors per cartridge; emits audit events
+/// (gated by `trigger` — see [`SweepTrigger`]) and a duration
+/// histogram sample.
 pub async fn scan_and_enqueue_orphans(
     data_dir: PathBuf,
     upload_tx: mpsc::Sender<UploadRequest>,
     audit: Option<AuditChannel>,
+    trigger: SweepTrigger,
 ) {
     let started = Instant::now();
     let tapes_root = data_dir.join("tapes");
@@ -80,22 +153,35 @@ pub async fn scan_and_enqueue_orphans(
     }
 
     let orphans_found: usize = all_orphans.iter().map(|c| c.chunk_ids.len()).sum();
+    let audit_gated = audit
+        .as_ref()
+        .filter(|_| should_audit(trigger, orphans_found));
 
-    if let Some(ref a) = audit {
+    if let Some(a) = audit_gated {
         a.try_append(
             "storage.orphan_scan_started",
             AuditActor::system(),
-            json!({ "cartridges_scanned": cartridges_scanned }),
+            json!({
+                "cartridges_scanned": cartridges_scanned,
+                "trigger": trigger.as_str(),
+            }),
             AuditResult::Ok,
         );
     }
 
     if orphans_found == 0 {
-        info!(
-            "Orphan upload scan: {} cartridges scanned, no orphans found",
-            cartridges_scanned
-        );
-        finalize(started, audit.as_ref(), orphans_found, 0);
+        if trigger == SweepTrigger::Boot {
+            info!(
+                "Orphan upload scan: {} cartridges scanned, no orphans found",
+                cartridges_scanned
+            );
+        } else {
+            debug!(
+                "Orphan upload sweep: {} cartridges scanned, no orphans found",
+                cartridges_scanned
+            );
+        }
+        finalize(started, audit_gated, trigger, orphans_found, 0);
         return;
     }
 
@@ -136,12 +222,19 @@ pub async fn scan_and_enqueue_orphans(
         orphans_requeued,
     );
 
-    finalize(started, audit.as_ref(), orphans_found, orphans_requeued);
+    finalize(
+        started,
+        audit_gated,
+        trigger,
+        orphans_found,
+        orphans_requeued,
+    );
 }
 
 fn finalize(
     started: Instant,
     audit: Option<&AuditChannel>,
+    trigger: SweepTrigger,
     orphans_found: usize,
     orphans_requeued: usize,
 ) {
@@ -155,6 +248,7 @@ fn finalize(
                 "orphans_found": orphans_found,
                 "orphans_requeued": orphans_requeued,
                 "duration_seconds": elapsed,
+                "trigger": trigger.as_str(),
             }),
             AuditResult::Ok,
         );
@@ -290,12 +384,47 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel::<UploadRequest>(16);
-        scan_and_enqueue_orphans(data_dir, tx, None).await;
+        scan_and_enqueue_orphans(data_dir, tx, None, SweepTrigger::Boot).await;
 
         let req = rx.recv().await.expect("one request from tapeA");
         assert_eq!(req.tape_id, "tapeA");
         assert_eq!(req.chunk_ids.len(), 2);
         // No more requests.
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A periodic sweep must dispatch exactly like the boot scan —
+    /// the trigger only changes audit verbosity, never coverage.
+    #[tokio::test]
+    async fn periodic_sweep_dispatches_same_as_boot() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let cart = data_dir.join("tapes").join("tapeC");
+        std::fs::create_dir_all(&cart).unwrap();
+        {
+            let idx = ChunkIndexFile::open_or_create(&cart).unwrap();
+            write_chunk(&idx, Some(&fake_hash(0x7)), false);
+        }
+
+        let (tx, mut rx) = mpsc::channel::<UploadRequest>(16);
+        scan_and_enqueue_orphans(data_dir, tx, None, SweepTrigger::Periodic).await;
+
+        let req = rx
+            .recv()
+            .await
+            .expect("periodic sweep re-queues the orphan");
+        assert_eq!(req.tape_id, "tapeC");
+        assert_eq!(req.chunk_ids.len(), 1);
+    }
+
+    /// Audit gating: boot always audits; a periodic sweep audits only
+    /// when it found something — the quiet steady state must not add
+    /// no-op rows to the audit chain.
+    #[test]
+    fn audit_gating_by_trigger_and_findings() {
+        assert!(should_audit(SweepTrigger::Boot, 0));
+        assert!(should_audit(SweepTrigger::Boot, 3));
+        assert!(!should_audit(SweepTrigger::Periodic, 0));
+        assert!(should_audit(SweepTrigger::Periodic, 3));
     }
 }

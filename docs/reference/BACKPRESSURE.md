@@ -511,6 +511,11 @@ gains or loses durability; pair flips with workload-level awareness.
 VTL has no chunk-grain SYNCHRONIZE CACHE equivalent; tape backup software's
 durability boundary is cartridge unload, handled via
 `MemoryBufferManager::on_cartridge_unloaded` draining the same upload queue.
+That drain dispatches and forgets — PUT outcomes never feed back into the
+manager — so a chunk whose PUT fails after the backend's retry budget keeps
+`uploaded=false` in `chunks.idx` and is re-queued by the periodic orphan
+sweep (every 10 minutes, plus once at boot) rather than by any host-visible
+fence. Eviction skips non-uploaded chunks in the meantime.
 
 ### Principle
 

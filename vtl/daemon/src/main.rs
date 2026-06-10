@@ -1612,25 +1612,26 @@ async fn main() -> Result<()> {
     });
     info!("MemoryBufferManager started");
 
-    // 🔸 Background scan for orphan chunks left behind by a previous
-    // daemon kill mid-PUT. Walks every cartridge's `chunks.idx`,
-    // finds sealed-but-not-uploaded entries, and re-queues them via
-    // the existing UploadRequest mpsc. The scan runs concurrently
-    // with iSCSI traffic — cartridges currently loaded into a drive
-    // have their own live-flush path; orphan re-queues touch the
-    // same `apply_chunk_upload_outcome` lock chain so concurrent
-    // mutation is safe.
+    // 🔸 Background sweeps for orphan chunks — sealed in `chunks.idx`
+    // but `uploaded=false`. The boot pass catches chunks left behind
+    // by a previous daemon kill mid-PUT; the periodic passes catch
+    // chunks whose PUT failed after the backend's retry budget, which
+    // otherwise had no re-drive until the next restart (issue #107).
+    // Each sweep re-queues via the existing UploadRequest mpsc and
+    // runs concurrently with iSCSI traffic — cartridges currently
+    // loaded into a drive have their own live-flush path; orphan
+    // re-queues touch the same `apply_chunk_upload_outcome` lock
+    // chain so concurrent mutation is safe, and the worker's
+    // sequential request loop filters out a sweep request that lost
+    // a race against a live dispatch.
     {
         let data_dir = std::path::PathBuf::from(&cfg.data_dir);
         let audit_for_recovery = audit_log.clone();
-        tokio::spawn(async move {
-            upload_recovery::scan_and_enqueue_orphans(
-                data_dir,
-                upload_tx_for_recovery,
-                audit_for_recovery,
-            )
-            .await;
-        });
+        tokio::spawn(upload_recovery::run_orphan_sweeps(
+            data_dir,
+            upload_tx_for_recovery,
+            audit_for_recovery,
+        ));
     }
 
     // 🔸 Build shared DaemonState and start iSCSI target server.

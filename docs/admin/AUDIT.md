@@ -114,9 +114,10 @@ crates, so the two applications cannot drift.
 Cartridge create/import/export, daemon-side chassis bring-up
 (`library.materialize` on first start, `library.reconcile` on
 subsequent YAML diffs, `inventory.move_medium` per auto-evacuated
-drive), load/unload/move, gc, daemon start/stop, boot-time
-orphan-upload recovery (`storage.orphan_scan_started` /
-`storage.orphan_scan_completed`). **Read paths are NOT logged.**
+drive), load/unload/move, gc, daemon start/stop, orphan-upload
+recovery sweeps (`storage.orphan_scan_started` /
+`storage.orphan_scan_completed` — the boot sweep always; a periodic
+sweep only when it found something). **Read paths are NOT logged.**
 
 ### SCSI-layer events
 

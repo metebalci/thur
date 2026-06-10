@@ -59,11 +59,13 @@ pub(crate) async fn run_event_driven_upload_worker(
     // before the failure surfaced. The outer layer is gone now —
     // `upload_chunk_inert` is invoked exactly once per dispatched
     // chunk, the inner backend retry handles short-lived errors, and
-    // any chunk that still fails surfaces immediately. The
-    // unload-flush loop in `MemoryBufferManager::on_cartridge_unloaded`
-    // is the next-level retry boundary; persistent failure also leaves
-    // the chunk's `uploaded=false` flag in `chunks.idx` for a future
-    // load to reclaim.
+    // any chunk that still fails surfaces immediately. A failed
+    // chunk keeps `uploaded=false` in `chunks.idx`; nothing in the
+    // live event flow re-drives it (the manager forgets chunks at
+    // dispatch), so the periodic orphan sweep in `upload_recovery`
+    // is the retry boundary (issue #107) — it re-queues
+    // sealed-but-not-uploaded chunks every few minutes, and the
+    // boot-time pass of the same sweep covers daemon restarts.
     info!(
         "Event-driven upload worker initialized (max_concurrent={} ({}), per-backend retry budget={})",
         max_concurrent, max_concurrent_source, upload_cfg.retry_max_attempts

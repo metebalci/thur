@@ -2466,12 +2466,20 @@ v1 — they are tracked as issue #91.
 
 ---
 
-## Boot-Time Recovery Audit Events
+## Orphan-Sweep Audit Events
+
+The orphan sweep walks `<data_dir>/tapes/` for sealed-but-not-uploaded
+chunks and re-queues them: once at boot (chunks left by a daemon kill
+mid-PUT) and every 10 minutes thereafter (chunks whose PUT failed after
+the backend's retry budget — without the periodic pass those had no
+re-drive until the next restart). The boot sweep always writes its
+event pair (one per daemon start); a periodic sweep writes events only
+when it found orphans, so the quiet steady state adds no audit rows.
 
 | Event | When | Body |
 |---|---|---|
-| `storage.orphan_scan_started` | Boot-time scan begins walking `<data_dir>/tapes/` for sealed-but-not-uploaded chunks. One entry per daemon start. | `cartridges_scanned: u64`. |
-| `storage.orphan_scan_completed` | Same scan ends. `orphans_requeued < orphans_found` indicates one or more upload-worker dispatches failed (channel closed). | `orphans_found: u64`, `orphans_requeued: u64`, `duration_seconds: f64`. |
+| `storage.orphan_scan_started` | A sweep begins walking `<data_dir>/tapes/` (boot always; periodic only when orphans were found). | `cartridges_scanned: u64`, `trigger: "boot" \| "periodic"`. |
+| `storage.orphan_scan_completed` | Same sweep ends. `orphans_requeued < orphans_found` indicates one or more upload-worker dispatches failed (channel closed). | `orphans_found: u64`, `orphans_requeued: u64`, `duration_seconds: f64`, `trigger: "boot" \| "periodic"`. |
 
 ---
 
