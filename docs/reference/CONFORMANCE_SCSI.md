@@ -9,8 +9,8 @@ independent parts:
 
 - **[Part 1: SPC-4, SAM-5, and iSCSI](#part-1-spc-4-sam-5-and-iscsi)**
   — the SCSI primary commands, the architecture model, and the
-  iSCSI / CHAP transport that both products share. The code lives in
-  `shared/iscsi/` plus the per-product SCSI dispatchers.
+  iSCSI / CHAP transport that both applications share. The code lives in
+  `shared/iscsi/` plus the per-application SCSI dispatchers.
 - **[Part 2: SSC-4 and SMC-3 (VTL)](#part-2-ssc-4-and-smc-3-vtl)** —
   VTL's sequential-access tape drives (SSC-4) and medium changer
   (SMC-3), the tape VPD / mode / log pages, the SECURITY PROTOCOL
@@ -68,10 +68,10 @@ outside the listed standard.
 - 🟥 — not implemented and the spec *does* require it (Status = No,
   Spec = M). A real conformance gap. **Hunt these.**
 
-**Per-row product annotations.** Some commands behave differently
+**Per-row application annotations.** Some commands behave differently
 depending on which surface they target. Where that is the case, the
 Notes column carries a `thurvtl tape:` or `thurvsa block:` prefix to
-split the explanation by product.
+split the explanation by application.
 
 
 ---
@@ -81,18 +81,18 @@ split the explanation by product.
 ## SPC-4 — SCSI Primary Commands (all LUNs)
 
 These are the commands SPC-4 defines for any SCSI logical unit,
-regardless of device type — the baseline every LUN both products
+regardless of device type — the baseline every LUN both applications
 expose must answer.
 
 | Opcode | Command | Status | Spec | Notes |
 |-------:|---------|--------|:----:|-------|
 | 0x00 | TEST UNIT READY | 🟩 Yes | M | Returns GOOD once UA cleared. |
 | 0x03 | REQUEST SENSE | 🟩 Yes | M | Fixed + descriptor formats. |
-| 0x12 | INQUIRY | 🟩 Yes | M | Standard page + VPD pages — see per-product VPD tables below. thurvtl tape: partition-fenced sessions get the SPC-4 "no logical unit" sentinel (peripheral qualifier 0b011, peripheral type 0x1F) when INQUIRYing a drive LUN whose drive isn't in the CHAP user's partition. Same shape thurvsa returns for unmapped volume LUNs. Lets the Linux kernel iSCSI initiator's all-LUNs post-login probe skip the LU and keep scanning the rest. |
+| 0x12 | INQUIRY | 🟩 Yes | M | Standard page + VPD pages — see per-application VPD tables below. thurvtl tape: partition-fenced sessions get the SPC-4 "no logical unit" sentinel (peripheral qualifier 0b011, peripheral type 0x1F) when INQUIRYing a drive LUN whose drive isn't in the CHAP user's partition. Same shape thurvsa returns for unmapped volume LUNs. Lets the Linux kernel iSCSI initiator's all-LUNs post-login probe skip the LU and keep scanning the rest. |
 | 0x15 | MODE SELECT(6) | 🟩 Partial | M | thurvtl tape: honors page 0x0F DCE bit and page 0x11 partition layout for behavior. Other advertised pages (0x01, 0x02, 0x10/0x00, 0x10/0x01 SPF=1, 0x1A, 0x1C) are round-tripped — bytes the host writes are stored per-drive (emulated NVRAM) and re-emitted verbatim by the next MODE SENSE under PC=Current / PC=Saved. SP=1 mirrors the bodies into `<data_dir>/library/drive_state.json` so they survive cartridge swaps and restarts. PS=1 advertised on every page header; per-page Changeable masks reflect round-tripped fields. Changer LUN 0 is read-only — every page accepted-and-ignored. thurvsa block: validate-and-accept-if-matches against the values MODE SENSE just returned (PF=1 required; SP=1 → SAVING PARAMETERS NOT SUPPORTED; every Changeable bit zero so WCE / RCD / DRA / D_SENSE can't flip). |
 | 0x16 | RESERVE(6) | 🟩 No-op | O | Accepted; reservation state not tracked. SPC-4 obsoletes RESERVE/RELEASE in favor of PERSISTENT RESERVE. |
 | 0x17 | RELEASE(6) | 🟩 No-op | O | Accepted. |
-| 0x1A | MODE SENSE(6) | 🟩 Yes | M | See per-product / per-LUN mode-page tables. |
+| 0x1A | MODE SENSE(6) | 🟩 Yes | M | See per-application / per-LUN mode-page tables. |
 | 0x1B | START STOP UNIT | 🟩 Yes | O | thurvtl tape: LOAD/UNLOAD on tape; no-op on changer. thurvsa block: accept-and-GOOD regardless of PowerCondition / LOEJ / START bits. |
 | 0x1C | RECEIVE DIAGNOSTIC RESULTS | 🟩 Partial | CC | Pages 0x00 (Supported Diagnostic Pages → `[0x00, 0x10]`) and 0x10 (Self-Test Results, SPC-4 §7.2.21 — 20 entries × 20 bytes, page-length 0x0190, most recent first). PCV=0 returns page 0x00. Other page codes return CHECK CONDITION + ILLEGAL REQUEST + INVALID FIELD IN CDB. (thurvtl only; thurvsa has no diagnostic ring buffer.) |
 | 0x1D | SEND DIAGNOSTIC | 🟩 Partial | M | thurvtl tape: default no-op probe (SELFTEST=0 + SELF-TEST CODE=0) returns GOOD without recording. SELFTEST=1 routes by LUN: LU0 runs library + inventory + storage-backend health (full `validate_object_store_backend` probe — auth + write + delete on every named entry); LU1+ re-validates the loaded cartridge's `manifest.json`, or GOOD if no cartridge loaded. Foreground/background extended self-test codes (0b001..0b110) accepted as GOOD without execution. Failures return CHECK CONDITION + HARDWARE ERROR + DIAGNOSTIC FAILURE ON COMPONENT 80h. Per-LUN history (most recent 20) queryable via RECEIVE DIAGNOSTIC RESULTS page 0x10. thurvsa block: no diagnostic surface. |
@@ -105,8 +105,8 @@ expose must answer.
 | 0x56 | RESERVE(10) | 🟩 No-op | O | |
 | 0x57 | RELEASE(10) | 🟩 No-op | O | |
 | 0x5A | MODE SENSE(10) | 🟩 Yes | O | |
-| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both products: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1) and the medium changer (LUN 0) — reservation state is keyed per-LUN, so the changer's is independent of the drives'. |
-| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both products implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). APTPL = 1 is honored (state persisted to `<data_dir>/reservations.json`, reloaded at start) and PTPL_C = 1 in REPORT CAPABILITIES; SPEC_I_PT / ALL_TG_PT still reject as INVALID FIELD IN PARAMETER LIST. A durable-write failure on a persist-eligible mutation returns CHECK CONDITION / HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44) rather than a false GOOD. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
+| 0x5E | PERSISTENT RESERVE IN | 🟩 Yes | O | Both applications: full READ KEYS / READ RESERVATION / REPORT CAPABILITIES / READ FULL STATUS surface backed by the shared `scsi_spc::reservations::ReservationManager`. thurvtl tape: on the drive LUN (LUN ≥ 1) and the medium changer (LUN 0) — reservation state is keyed per-LUN, so the changer's is independent of the drives'. |
+| 0x5F | PERSISTENT RESERVE OUT | 🟩 Partial | O | Both applications implement SAs 0x00 REGISTER, 0x01 RESERVE, 0x02 RELEASE, 0x03 CLEAR, 0x04 PREEMPT, 0x05 PREEMPT AND ABORT, 0x06 REGISTER AND IGNORE EXISTING KEY against the shared `ReservationManager`; 0x07 REGISTER AND MOVE rejected (no multi-port). APTPL = 1 is honored (state persisted to `<data_dir>/reservations.json`, reloaded at start) and PTPL_C = 1 in REPORT CAPABILITIES; SPEC_I_PT / ALL_TG_PT still reject as INVALID FIELD IN PARAMETER LIST. A durable-write failure on a persist-eligible mutation returns CHECK CONDITION / HARDWARE ERROR (INTERNAL TARGET FAILURE 0x44) rather than a false GOOD. thurvtl tape: on both the drive LUN (LUN ≥ 1, fences the medium read/write path) and the medium changer (LUN 0, fences MOVE / EXCHANGE / element-status — see SMC-3 § PERSISTENT RESERVE). |
 | 0xA0 | REPORT LUNS | 🟩 Yes | M | thurvtl tape: LUN 0 (changer) + LUN 1..N (drives). Partition-fenced sessions see only LUN 0 plus drives the bound partition owns. thurvsa block: SAM-5 single-level flat-space encoding over the live volume → LUN map. CHAP-user volume-admission–fenced sessions (`UserEntry.volumes`) see only the LUNs of their admitted volumes; INQUIRY / TUR / READ CAPACITY against non-admitted LUNs return PQ=0x3 (no LU). The admission set is resolved dynamically per command, so a `grant` / `revoke` reaches already-connected sessions (a REPORTED LUNS DATA HAS CHANGED UA prompts re-enumeration) — see § Dynamic LUN admission. |
 | 0xA2 | SECURITY PROTOCOL IN | 🟩 Partial | CC | thurvtl tape: protocol 0x00 (supported list) + 0x20 (Tape Data Encryption) only. Not implemented: TCG / OPAL (0x01–0x06), IEEE 1667 (0x40), IKEv2-SCSI (0x41), SPC-4 authentication (0xEE / 0xEF) — all return CHECK CONDITION (none apply to tape). Mandatory only on devices advertising data encryption. thurvsa block: not implemented. |
 | 0xA3 | MAINTENANCE IN | 🟩 Partial | O | See SA table below. thurvtl SPC-4 SAs not implemented: 0x05 REPORT IDENTIFYING INFORMATION plus storage-array-specific SAs (0x01–0x04, 0x06–0x08, 0x0B, 0x0E, 0x10–0x11). thurvsa block: SAs 0x0A REPORT TARGET PORT GROUPS, 0x0C REPORT SUPPORTED OPERATION CODES, 0x0D REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS — other SAs return INVALID FIELD IN CDB. |
@@ -124,8 +124,8 @@ accepted by issuing REPORT SUPPORTED OPERATION CODES (SA 0x0C).
 | SA | Name | Status | Spec | Notes |
 |---:|------|--------|:----:|-------|
 | 0x05 | REPORT IDENTIFYING INFORMATION | 🟨 No | O | Companion to MAINTENANCE OUT SA 0x06; both unimplemented. |
-| 0x0A | REPORT TARGET PORT GROUPS | 🟩 Yes | O | Both products. One TPG per distinct configured TPGT, member RTPIs assigned sequentially from 1 in portal order, all TPGs default to ACTIVE/OPTIMIZED (implicit ALUA). |
-| 0x0C | REPORT SUPPORTED OPERATION CODES | 🟩 Yes | O | Both products. thurvtl tape: one-command and all-commands forms. thurvsa: every routed CDB in ascending order; source of truth for VAAI / Hyper-V offload discovery. |
+| 0x0A | REPORT TARGET PORT GROUPS | 🟩 Yes | O | Both applications. One TPG per distinct configured TPGT, member RTPIs assigned sequentially from 1 in portal order, all TPGs default to ACTIVE/OPTIMIZED (implicit ALUA). |
+| 0x0C | REPORT SUPPORTED OPERATION CODES | 🟩 Yes | O | Both applications. thurvtl tape: one-command and all-commands forms. thurvsa: every routed CDB in ascending order; source of truth for VAAI / Hyper-V offload discovery. |
 | 0x0D | REPORT SUPPORTED TASK MGMT FUNCTIONS | 🟩 Yes | O | Advertises ABORT TASK / ABORT TASK SET / CLEAR TASK SET / LU RESET / I_T NEXUS RESET. |
 | 0x0F | REPORT TIMESTAMP | 🟩 Yes | O | thurvtl only. |
 | 0x1E | DYNAMIC RUNTIME ATTRIBUTE — read | 🟩 Yes | — | thurvtl only. Vendor-specific extension. |
@@ -145,7 +145,7 @@ Only thurvtl routes this opcode.
 ### Reservations — thurvtl tape vs thurvsa block
 
 SCSI reservations exist to keep two initiators from stepping on each
-other's I/O. Both products implement the SCSI-3 PERSISTENT RESERVE
+other's I/O. Both applications implement the SCSI-3 PERSISTENT RESERVE
 family for real, backed by one shared state machine
 (`scsi_spc::reservations::ReservationManager`) so the block and tape
 surfaces can't drift. The topologies still differ — VSA is a genuine
@@ -279,7 +279,7 @@ apply only to the tape side; their full coverage is in
 | Unit Attention model | 🟩 Yes | M | Per (I_T_L) UA queue; preempts every opcode except INQUIRY / REQUEST SENSE / REPORT LUNS. |
 | Sense data — fixed format | 🟩 Yes | M | thurvtl tape uses 0x70/0x71 fixed format. |
 | Sense data — descriptor format | 🟩 Yes | M | thurvsa block uses 0x72 descriptor format. |
-| LUN encoding — single-level / flat-space | 🟩 Yes | M | Both products. SAM-5 §4.7.4 8-byte LUN field. |
+| LUN encoding — single-level / flat-space | 🟩 Yes | M | Both applications. SAM-5 §4.7.4 8-byte LUN field. |
 
 ---
 
@@ -288,7 +288,7 @@ apply only to the tape side; their full coverage is in
 iSCSI is the transport that carries SCSI command and data PDUs over
 TCP. The whole transport — login phase, PDU framing, sequencing, and
 the CHAP exchange — lives in `shared/iscsi/` and is byte-for-byte
-identical between the two products; what differs is only the SCSI
+identical between the two applications; what differs is only the SCSI
 command set layered on top. Each daemon binds its own TCP port
 (default 3260, which an operator overrides on one of the two when
 both run co-resident) and presents its own target IQN
@@ -570,9 +570,9 @@ Three limitations are worth being explicit about:
 ## Deliberate non-conformance — shared
 
 The table below collects the departures from SPC-4 / SAM-5 / iSCSI /
-CHAP that cut across both products — places where conformance was
+CHAP that cut across both applications — places where conformance was
 knowingly traded away because the feature has no purpose in either
-daemon. Departures specific to one product are listed elsewhere: in
+daemon. Departures specific to one application are listed elsewhere: in
 Part 2 for the tape and changer, in Part 3 for the SBC-3 block
 target, and in [`CONFORMANCE_NVME.md`](CONFORMANCE_NVME.md) for the
 NVMe block transport.
@@ -581,8 +581,8 @@ NVMe block transport.
 |------|-----|
 | Task attributes (SIMPLE / ORDERED / HOQ) ignored | Commands serialized per-LU; queueing model unnecessary. |
 | ACA / CLEAR ACA absent | Same reason. |
-| Async Event Notification absent | SAM-5 Unit Attention queue plus iSCSI session teardown cover every state change either product cares about. |
-| MC/S fixed to 1 | No real-world deployment for either product. |
+| Async Event Notification absent | SAM-5 Unit Attention queue plus iSCSI session teardown cover every state change either application cares about. |
+| MC/S fixed to 1 | No real-world deployment for either application. |
 | ErrorRecoveryLevel fixed to 0 | TCP retransmit handles reliability. |
 | `READ BUFFER` / `WRITE BUFFER` stubbed (thurvtl only — thurvsa rejects) | Firmware-download surface has no analog on a software target. |
 | SPC-5 absent | Conformance target is SPC-4. |
@@ -597,7 +597,7 @@ it. The shared-iscsi transport — login, PDU framing, the R2T loop,
 and CHAP — is in [`../../shared/iscsi/src/`](../../shared/iscsi/src/),
 spread across `transport.rs`, `auth.rs`, `session.rs`, and
 `unit_attention.rs`. The SCSI dispatch that sits on top is
-per-product:
+per-application:
 
 - thurvtl tape: [`../../vtl/daemon/src/iscsi/protocol.rs`](../../vtl/daemon/src/iscsi/protocol.rs)
   (`handle_scsi_command` / `dispatch_scsi`). Per-page handlers in

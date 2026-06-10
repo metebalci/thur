@@ -7,7 +7,7 @@ or state from, and every key the daemon YAML conffile accepts.
 `vtl/cli/src/commands/defaults_reference.yaml` and
 `vsa/cli/src/commands/defaults_reference.yaml` — the source of the
 auto-generated `dist/{thurvtl,thurvsa}.defaults.yaml` and of
-`<product> config defaults`. The generated `dist/*.defaults.yaml`
+`<application> config defaults`. The generated `dist/*.defaults.yaml`
 is the machine-checked reference; **this document must be updated in
 the same commit whenever a YAML key is added or changed.**
 
@@ -15,17 +15,17 @@ the same commit whenever a YAML key is added or changed.**
 
 ## Configuration files
 
-| File | Location | Product | Format | Managed by |
+| File | Location | Application | Format | Managed by |
 |---|---|---|---|---|
 | `thurvtl.yaml` | `/etc/thurvtl/` (override: `--config PATH`) | VTL | YAML | operator (hand-edited) |
 | `thurvsa.yaml` | `/etc/thurvsa/` (override: `--config PATH`) | VSA | YAML | operator (hand-edited) |
 | `thurvtl.env` / `thurvsa.env` | `/etc/thurvtl/` / `/etc/thurvsa/` | both | `KEY=VALUE` | operator; loaded by systemd `EnvironmentFile` |
 | `library.json` | `<data_dir>/library/` | VTL | JSON | daemon (materialized from YAML `library:` block on first start, reconciled on subsequent starts) + `thurvtl library partition` for partition layout |
 | `inventory.json` | `<data_dir>/library/` | VTL | JSON | daemon + `thurvtl changer` ops |
-| `iscsi-users.json` | `<data_dir>/` | both | JSON | `<product> iscsi users` / `iscsi target` |
+| `iscsi-users.json` | `<data_dir>/` | both | JSON | `<application> iscsi users` / `iscsi target` |
 | `nvmetcp-psks.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp psks` |
 | `nvmetcp-dhchap.json` | `<data_dir>/` | VSA | JSON | `thurvsa nvmetcp dhchap` |
-| `admin-password.json` | `<data_dir>/` | both | JSON | daemon — Argon2id hash of the web-admin password (set via `<product> system set-admin-password`). Holds only the hash, never the plaintext; absent = no password configured. Enforced only when `http.auth.method: Password`, in which case absent fails the listener closed; the default `http.auth.method: None` serves the protected routes open. |
+| `admin-password.json` | `<data_dir>/` | both | JSON | daemon — Argon2id hash of the web-admin password (set via `<application> system set-admin-password`). Holds only the hash, never the plaintext; absent = no password configured. Enforced only when `http.auth.method: Password`, in which case absent fails the listener closed; the default `http.auth.method: None` serves the protected routes open. |
 | `reservations.json` | `<data_dir>/` | both | JSON | daemon — persisted SCSI/NVMe PERSISTENT RESERVE state (PTPL); written on every APTPL/CPTPL-set reservation change, reloaded at start. No CLI verb; never hand-edited (a corrupt file is ignored and the daemon starts with empty reservation state). |
 
 The YAML conffile carries install-time and tuning knobs. The JSON files
@@ -39,7 +39,7 @@ daemon's data directory, set by the `data_dir` key in the YAML.
 
 The daemon and CLI both resolve the conffile path the same way: use
 `--config PATH` if it was given on the command line, otherwise fall back
-to `/etc/<product>/<product>.yaml`. There is no working-directory
+to `/etc/<application>/<application>.yaml`. There is no working-directory
 fallback, so the path is always explicit. The only required key is
 `data_dir`; everything else has a default or is optional.
 
@@ -164,12 +164,12 @@ shapes are in [`AUTH.md`](AUTH.md).
 | Key | Default | Description |
 |---|---|---|
 | `storage.skip_retention_mode_check` | `false` | Skip bucket-immutability validation at startup / `storage check`. `retention_mode` still parses and still gates `--worm`. Use when the principal can't be granted management-plane IAM. |
-| `storage.check_interval_seconds` | `0` | Periodic backend-reachability ticker interval. `0` = off (reachability only checked on `system storage check`). When set, each daemon probes every backend on this interval (small list/write/read/delete per backend) and fires `backend_reachability` failure/recovery. Set conservatively (300+); each tick does real backend I/O. Both products. |
+| `storage.check_interval_seconds` | `0` | Periodic backend-reachability ticker interval. `0` = off (reachability only checked on `system storage check`). When set, each daemon probes every backend on this interval (small list/write/read/delete per backend) and fires `backend_reachability` failure/recovery. Set conservatively (300+); each tick does real backend I/O. Both applications. |
 | `storage.compression.algorithm` | `zstd` | Backend-tier compression (post-dedup, per-chunk on upload): `none` / `lz4` / `zstd`. S3/GCS/Azure only. |
 | `storage.compression.level` | `3` | Zstd level 1–22. Ignored for `lz4` / `none`. |
 | `storage.upload.max_concurrent` | `0` | In-flight uploads per backend. `0` = auto-scale to `min(16, parallelism × 4)`. |
 | `storage.upload.retry_max_attempts` | `10` | Retries per upload (exponential backoff 1 s → 30 s). |
-| `storage.upload.backpressure_max_wait_seconds` | `60` | Max seconds a chunk-seal blocks on the per-backend pool budget before surfacing SCSI NOT READY. Range 1–600. Present on both products. |
+| `storage.upload.backpressure_max_wait_seconds` | `60` | Max seconds a chunk-seal blocks on the per-backend pool budget before surfacing SCSI NOT READY. Range 1–600. Present on both applications. |
 | `storage.backends` | empty | Named backend map — see below. |
 
 `storage.backends` is a map whose keys — `primary`, `cold-archive`, and so
@@ -235,7 +235,7 @@ plus the read-only Web UI when enabled.
 | `http.tls.extra_sans` | `[]` | Extra SANs (DNS names or IPs) baked into the auto-generated self-signed cert, beyond the built-in hostname / `localhost` / `127.0.0.1` / `::1` set. Ignored when a CA-issued cert is supplied. Editing it takes effect on the next `system regenerate-cert`. |
 | `http.auth.method` | `None` | Whether the protected route group (`/sessions`, `/info`, `/ui`, read-only `/api/v1`) requires the shared web-admin password. `None` (default) serves them open — for an isolated / trusted network, the same posture `iscsi.auth.method` defaults to. `Password` requires the password (set via `system set-admin-password`) over HTTP Basic; no password configured then fails closed (503). `/health` + `/metrics` stay open regardless. Pair `Password` with `http.tls` so the secret isn't sent in clear. |
 | `http.webui.enabled` | `true` | Serve the read-only Web UI (issue #5): the static console at `/ui/` plus the read-only `/api/v1` GET subset, both under the same gate as `/sessions` + `/info` (open by default; see `http.auth.method`). `false` keeps only `/health` `/metrics` `/sessions` `/info`. Mutations are never exposed. |
-| `http.webui.asset_dir` | `""` | Directory to serve the `/ui` bundle from. Empty → the bundle embedded in the binary. Point it at the packaged `/usr/share/<product>/webui/` (or any directory) to restyle without a rebuild — edit the CSS custom-property tokens in `app.css`; a file missing from the directory falls back to the embedded copy. Path traversal out of the directory is rejected. |
+| `http.webui.asset_dir` | `""` | Directory to serve the `/ui` bundle from. Empty → the bundle embedded in the binary. Point it at the packaged `/usr/share/<application>/webui/` (or any directory) to restyle without a rebuild — edit the CSS custom-property tokens in `app.css`; a file missing from the directory falls back to the embedded copy. Path traversal out of the directory is rejected. |
 
 ### `telemetry`
 
@@ -261,12 +261,12 @@ The audit section configures the append-only, BLAKE3-chained event journal
 at `<data_dir>/audit/`, which rolls daily at UTC midnight. Full design:
 [`AUDIT.md`](AUDIT.md).
 
-Auditing is unconditionally on for both products — a compliance signal,
+Auditing is unconditionally on for both applications — a compliance signal,
 not an operational knob — so there is no `enabled` key.
 
 | Key | Default | Description |
 |---|---|---|
-| `audit.dir` | `<data_dir>/audit` | Audit directory override. Both products. |
+| `audit.dir` | `<data_dir>/audit` | Audit directory override. Both applications. |
 | `audit.compress_rotated` | `true` | **VTL only.** zstd-compress rotated daily files. |
 
 ### `keystore`
@@ -346,7 +346,7 @@ ignores the `volumes` field. Sessions without CHAP
 pairing admission with the auth layer mirrors NFS export-list
 behaviour.
 
-The file is managed by `<product> iscsi users
+The file is managed by `<application> iscsi users
 {add,remove,disable,enable,grant,revoke,rotate,list}` and
 `iscsi target {set,clear,show}` — see [`CLI.md`](CLI.md). `add`
 takes one or more `--volume NAME` (required for VSA); `grant` /
@@ -411,9 +411,9 @@ answers `503` with a challenge so operators can tell "unset" from
 "wrong". Once set, the hash is hot-swapped into the live verifier and
 takes effect immediately, with no restart.
 
-The password is set with `<product> system set-admin-password`
+The password is set with `<application> system set-admin-password`
 (daemon-routed — the daemon owns the file). The verb prompts twice with
-no echo, or reads the per-product environment variable
+no echo, or reads the per-application environment variable
 `THURVTL_ADMIN_PASSWORD` / `THURVSA_ADMIN_PASSWORD` for non-interactive
 provisioning; the plaintext travels over the local peer-cred admin
 socket and is hashed server-side. See [`CLI.md`](CLI.md).

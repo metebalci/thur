@@ -24,9 +24,9 @@ noisier in practice).
 
 | Class | Severity | Source | Dedup key |
 |---|---|---|---|
-| `backend_reachability` | error / info | `system.storage_check` job — operator-invoked `system storage check` (both products, shared handler in `shared-admin-storage-check`) — plus the opt-in `storage.check_interval_seconds` periodic ticker (both products) | `<backend>:<failure\|recovery>` |
+| `backend_reachability` | error / info | `system.storage_check` job — operator-invoked `system storage check` (both applications, shared handler in `shared-admin-storage-check`) — plus the opt-in `storage.check_interval_seconds` periodic ticker (both applications) | `<backend>:<failure\|recovery>` |
 | `audit_failure` | error | `shared/audit/src/audit_channel.rs` writer task on `AuditLog::append` Err (disk write / fsync / chain-state), via a function-pointer hook installed at boot (avoids the shared-alerting → shared-audit dep cycle) | `<op>` |
-| `disk_cache_backpressure` | warn / error | Watermark crossing in the per-product disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve`; VSA `lru.idx` sidecar persistently unwritable (eviction degrades to first-seen), latched once per volume in `core/block/src/uploader.rs` | `<backend>:watermark` / `<backend>:backpressure` / `<volume>:lru_index` |
+| `disk_cache_backpressure` | warn / error | Watermark crossing in the per-application disk-cache eviction worker (VTL + VSA); backpressure-timeout error construction in `shared/pool/src/budget.rs::try_reserve`; VSA `lru.idx` sidecar persistently unwritable (eviction degrades to first-seen), latched once per volume in `core/block/src/uploader.rs` | `<backend>:watermark` / `<backend>:backpressure` / `<volume>:lru_index` |
 | `chap_failures` | warn | `shared/iscsi/src/transport.rs` CHAP path, surfaced by the daemon's `LoginAuditSink` adapter (VTL `IscsiLibraryLoginAudit`, VSA `IscsiDiskLoginAudit`). Per-user counter in the dispatcher; WARN fires once the user crosses `alerting.chap_failures_threshold` (default 3) inside one window | `chap:<user>` |
 | `orphaned_objects` | warn | A best-effort storage delete left objects behind (orphaned until GC). Today: VTL `cartridge migrate` source-side delete failures, fired from `vtl/daemon/src/admin/job_dispatch/migrate.rs` when `report.source_delete_warnings` is non-empty. The `count` field carries the true total; the `keys` array is capped at 32 (`keys_truncated` records the overflow) so a large failure can't produce an unbounded sink body | `<backend>:<operation>:orphaned` |
 
@@ -45,7 +45,7 @@ The dispatcher wraps [`shared_audit::audit_ratelimit::AuditRateLimiter`]
 to collapse repeated events. Within a given `(class, dedup_key)` window,
 the first event is sent through; subsequent events are counted rather than
 dispatched. The count accumulates as
-`<product>_alerts_fired_total{outcome="suppressed"}` so operators have
+`<application>_alerts_fired_total{outcome="suppressed"}` so operators have
 visibility into how many events were absorbed.
 
 `alerting.dedup_window_seconds` (default 300) controls the window
@@ -55,7 +55,7 @@ duration. The same value resets the per-user CHAP failure counter.
 
 The dispatcher does not retry failed sink sends. When a send fails, it logs
 the sink name, the event class, and the raw error at WARN level, increments
-`<product>_alerts_fired_total{outcome="failure"}`, and drops the alert.
+`<application>_alerts_fired_total{outcome="failure"}`, and drops the alert.
 Operators can observe gaps through that counter. The dedup window already
 absorbs short network flaps, and persistent retry queues were deliberately
 deferred to a post-v1 iteration.
@@ -76,7 +76,7 @@ sinks:
     from: thurvtl@example.com
     to:
       - oncall@example.com
-    # subject_prefix: "[prod-east thurvtl]"   # default "[<product> ALERT]"
+    # subject_prefix: "[prod-east thurvtl]"   # default "[<application> ALERT]"
 ```
 
 - Body is plain-text: a fixed-format header (product, class,
@@ -185,7 +185,7 @@ parallel. One slow sink doesn't backpressure the others.
 
 ## CLI
 
-Both products mount the same verbs:
+Both applications mount the same verbs:
 
 ```
 thurvtl system alerting list                   # show sinks + dedup window
@@ -204,7 +204,7 @@ running daemon, with no daemon-down fallback.
 One counter, four labels:
 
 ```
-<product>_alerts_fired_total{class, severity, sink, outcome}
+<application>_alerts_fired_total{class, severity, sink, outcome}
   outcome ∈ {success, failure, suppressed}
 ```
 

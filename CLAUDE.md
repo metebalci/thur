@@ -9,7 +9,7 @@ for the full index.
 
 ## Project Overview
 
-Two sibling products on a shared backend chunk pool, packaged separately
+Two sibling applications on a shared backend chunk pool, packaged separately
 and co-resident on the same host:
 
 - **Thur VTL** (working name `thurvtl`) — Virtual Tape Library presenting
@@ -32,7 +32,7 @@ and co-resident on the same host:
   iSCSI or NVMe/TCP. Sparse per-volume page table backed by the same
   dedup-capable chunk pool, 4 KiB sectors, default 64 KiB page,
   thin-provisioned. iSCSI default port 3260 — co-resident installs override
-  one in YAML so the two products don't clash. IQN `iqn.2025-10.com.metebalci:thurvsa`.
+  one in YAML so the two applications don't clash. IQN `iqn.2025-10.com.metebalci:thurvsa`.
 
 Both daemons cleanly co-exist on the same host: disjoint system users
 (`thurvtl` / `thurvsa`), conffile dirs (`/etc/thurvtl/` / `/etc/thurvsa/`),
@@ -60,7 +60,7 @@ on-disk paths group by purpose.
   `shared_naming::ProductIdentity` for socket path / Host header /
   env-var override. Includes the NDJSON job-stream consumer
   (`run_job`), `ping`, error-body parsing.
-- `shared/admin-iscsi` (`shared-admin-iscsi`) — cross-product axum
+- `shared/admin-iscsi` (`shared-admin-iscsi`) — cross-application axum
   handlers for `/api/v1/iscsi/{users,target}` lifecycle verbs (add /
   remove / disable / enable / rotate / rotate-cancel / list / target
   set-clear-show). Both daemons impl the [`IscsiUsersState`] trait
@@ -72,12 +72,12 @@ on-disk paths group by purpose.
   `run_admin_server(socket_path, router)` (bind + chmod 0660 +
   SO_PEERCRED accept loop), `PeerCred` axum extractor, `JobRegistry`
   / `JobEmitter` / `JobHandle`, pre-built `jobs_router` parameterized
-  on a per-product state type that impls `HasJobs` plus a
-  product-supplied dispatch closure.
-- `shared/admin-audit` (`shared-admin-audit`) — cross-product
+  on a per-application state type that impls `HasJobs` plus a
+  application-supplied dispatch closure.
+- `shared/admin-audit` (`shared-admin-audit`) — cross-application
   `system.audit.*` job handlers (`run_tail` / `run_export` /
   `run_verify` / `run_rotate`). Both daemons route those job kinds
-  here; the only per-product input is the audit-log directory,
+  here; the only per-application input is the audit-log directory,
   passed as a plain `PathBuf`. Kept out of `shared-audit` itself so
   that low-level crate stays free of the `JobEmitter` / job-protocol
   deps.
@@ -96,13 +96,13 @@ on-disk paths group by purpose.
   (issue #5) embedded in both daemons' TCP HTTP listeners. Owns the
   static `/ui/*` bundle (no-build HTML/CSS/JS, `include_dir!` embedded
   with an optional on-disk `http.webui.asset_dir` restyle override +
-  traversal guard) and the cross-product read-only `/api/v1` GET
+  traversal guard) and the cross-application read-only `/api/v1` GET
   handlers (`monitor` snapshot, `jobs/recent`, `audit/tail`). Reuses
-  #4's `shared_admin_auth` gate directly; per-product inventory GETs
+  #4's `shared_admin_auth` gate directly; per-application inventory GETs
   stay per-daemon. Mutations are out of scope (issue #91). Design in
   [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
 - `shared/admin-storage-check` (`shared-admin-storage-check`) —
-  cross-product storage-backend reachability. `run_storage_check` is the
+  cross-application storage-backend reachability. `run_storage_check` is the
   `system.storage_check` job handler both daemons mount (CLI verb
   `system storage check`); `run_reachability_ticker` is the opt-in
   periodic ticker each daemon spawns when
@@ -110,29 +110,29 @@ on-disk paths group by purpose.
   `shared_object_store::validate_object_store_backend` and fire
   `backend_reachability` alerts. Same split rationale as
   `shared-admin-audit`.
-- `shared/admin-monitor` (`shared-admin-monitor`) — cross-product
+- `shared/admin-monitor` (`shared-admin-monitor`) — cross-application
   `system.monitor` job handler. Tick loop that emits one
   `MonitorSnapshot` (JSON-encoded in the `JobEvent::Log.message`)
   per second until the CLI subscriber drops the stream; CLI side
   keeps a ring buffer and computes 60 s / 5 m rate windows. Both
   daemons impl `MonitorState` for their AdminState (daemon name /
   version / started_at / `LiveStats` from `shared-telemetry` / pool
-  budgets / per-product VSA-or-VTL snapshot).
+  budgets / per-application VSA-or-VTL snapshot).
 - `shared/cli` (`shared-cli`) — CLI UX helpers: `emit_completion`
   ($SHELL detection + `clap_complete::generate`),
   `emit_defaults` / `emit_systemd_unit` print wrappers. Separate
   crate from `shared-admin-client` so the latter doesn't pull
   `clap` / `clap_complete`.
-- `shared/cli-iscsi` (`shared-cli-iscsi`) — cross-product CLI
+- `shared/cli-iscsi` (`shared-cli-iscsi`) — cross-application CLI
   implementations for `iscsi users` and `iscsi target` verbs.
   Daemon-routed only: the admin socket must answer (the daemon
   serializes the edit + emits an audit row); when it's down the
   verb refuses via `require_daemon` rather than mutating the file
   directly. Parameterized on `&'static ProductIdentity` so the
   admin socket discovery + daemon name in the refusal flow from the
-  per-product identity. VSA's NVMe-TCP `psks_*` verbs reuse the
+  per-application identity. VSA's NVMe-TCP `psks_*` verbs reuse the
   helpers (`parse_grace`, `resolve_password`, `require_daemon`) but
-  keep their product-specific lifecycle in
+  keep their application-specific lifecycle in
   `vsa/cli/src/credentials.rs`.
 - `shared/object-store` (`shared-object-store`) — `ObjectStoreBackend` trait + S3 / GCS /
   Azure / Local impls, retry, compression primitives.
@@ -141,12 +141,12 @@ on-disk paths group by purpose.
   length constants, and an `OsRng` re-export. Pure byte-slice surface
   consumed by `core-stream` (tape AME) and `core-block` (VSA at-rest);
   SCSI-flavored types stay in `core-stream::encryption`.
-- `shared/dedup-stats` (`shared-dedup-stats`) — cross-product dedup
+- `shared/dedup-stats` (`shared-dedup-stats`) — cross-application dedup
   math for `system stats`. A plain data boundary (no trait, no I/O):
   `compute_dedup(&[EntityScan])` buckets chunk hashes by
   `(backend, namespace)` and returns the per-entity exclusive/shared
   split + per-backend unique pool bytes. Entity enumeration
-  (cartridge `chunks.idx` vs volume `pages.idx`) stays per-product.
+  (cartridge `chunks.idx` vs volume `pages.idx`) stays per-application.
 - `shared/disk-evict` (`shared-disk-evict`) — the two genuinely
   identical halves of each daemon's disk-cache eviction worker:
   `resolve_and_apply_caps` (the `auto`-mode per-backend cap recompute
@@ -155,11 +155,11 @@ on-disk paths group by purpose.
   watermark alert, returning whether eviction is needed). The wakeup
   source (VTL: upload-completion `Notify` + backstop; VSA: interval)
   and the evict call (VTL's async storage-backup evict vs VSA's sync
-  fs-only trim) genuinely differ and stay per-product; both daemons
+  fs-only trim) genuinely differ and stay per-application; both daemons
   now offload the blocking usage walk + eviction to `spawn_blocking`.
 - `shared/iscsi` (`shared-iscsi`) — iSCSI transport, CHAP auth,
   session management, unit-attention queue, login audit sink,
-  product-agnostic `ScsiHandler` trait. `IscsiReservationSink`
+  application-agnostic `ScsiHandler` trait. `IscsiReservationSink`
   (a `scsi_spc::ReservationObserver`) maps the shared manager's neutral
   reservation changes to RESERVATIONS PREEMPTED / RELEASED UAs on the
   affected initiators' sessions (resolved via `SessionManager::tsihs_for`),
@@ -186,7 +186,7 @@ on-disk paths group by purpose.
 - `shared/audit` (`shared-audit`) — append-only BLAKE3-chained log +
   cloneable `AuditChannel` producer + rate limiter.
 - `shared/telemetry` (`shared-telemetry`) — OpenTelemetry SDK
-  plumbing, Prometheus pull + OTLP push. Per-product instrument
+  plumbing, Prometheus pull + OTLP push. Per-application instrument
   prefix (`thurvtl_*` / `thurvsa_*`) sourced from
   `shared_naming::PRODUCT.metric_prefix` at boot; `service.name`
   resource attribute carries the same distinction redundantly for
@@ -207,23 +207,23 @@ on-disk paths group by purpose.
   primitive, and the bounded-concurrency `run_upload_pipeline` that
   runs N PUTs through `buffer_unordered` with a caller-supplied
   per-completion hook (auto-hold reapply, eviction-Notify,
-  per-product "uploaded" flag flip). Tape-side glue
+  per-application "uploaded" flag flip). Tape-side glue
   (MemoryBufferManager, crash-recovery scan, cartridge open) stays
   in `vtl/daemon`; the block side will plug in a parallel set of
   glue when VSA's async-upload path lands. `core_stream::cartridge`
   re-exports the payload types under their legacy names
   (`PendingUploadPayload`, `ChunkUploadOutcome`) for call-site
   continuity.
-- `shared/verify-core` (`shared-verify-core`) — cross-product
+- `shared/verify-core` (`shared-verify-core`) — cross-application
   chunk-pool + storage-backend verification sweeps for `system
-  verify`. A product implements the `VerifyTarget` trait (its live
+  verify`. An application implements the `VerifyTarget` trait (its live
   chunk set + per-entity storage expectations); `sweep_local_pool`
   runs the local orphan scan and `sweep_storage` the bounded backend
   HEAD storm. The
   tape library/partition checks and the block page-table integrity
-  check stay per-product, as does each product's `VerifyReport`
+  check stay per-application, as does each application's `VerifyReport`
   shape; only the two pool sweeps are shared.
-- `shared/naming` (`shared-naming`) — per-product identity strings
+- `shared/naming` (`shared-naming`) — per-application identity strings
   (consumers still hardcode paths today; this is the migration
   target).
 - `scsi/ssc` (`scsi-ssc`) — drive-LUN SCSI dispatch + drive-manager
@@ -302,13 +302,13 @@ on-disk paths group by purpose.
   `core_stream::DriveTopology`.
 - `core/sbc` (`core-block`) — SBC-3 direct-access (block) device-type
   core.
-- `thurvtl/{daemon,cli,scripts,docs}` — Thur VTL product (system user
+- `thurvtl/{daemon,cli,scripts,docs}` — the Thur VTL application (system user
   `thurvtl`, IQN `iqn.2025-10.com.metebalci:thurvtl`).
-- `thurvsa/{daemon,cli,scripts,docs}` — Thur VSA product (system user
+- `thurvsa/{daemon,cli,scripts,docs}` — the Thur VSA application (system user
   `thurvsa`, IQN `iqn.2025-10.com.metebalci:thurvsa`).
 
 Per-crate API surfaces, module breakdowns, cross-crate re-exports, and the
-adapter layers between products are in
+adapter layers between the applications are in
 [`docs/dev/WORKSPACE.md`](docs/dev/WORKSPACE.md).
 
 ## Architecture (high-level)
@@ -329,7 +329,7 @@ adapter layers between products are in
   + cross-region ops (`cartridge migrate`, `cartridge archive`,
   `library restore-archive`, `library restore`) in
   [`docs/reference/SPEC.md`](docs/reference/SPEC.md).
-- **Pipelines** — both products park host writes against a per-backend
+- **Pipelines** — both applications park host writes against a per-backend
   `shared_pool::PoolBudget` and surface SCSI NOT READY (0x04/0x07) on
   timeout. Thur VTL runs an event-driven broadcast bus → bounded mpsc
   workers; chunk-seal is gated at the staging-rename boundary
@@ -354,7 +354,7 @@ adapter layers between products are in
   consume the backoff budget. A revoked credential surfaces in seconds.
 - **Telemetry** — one OTel `MeterProvider` with Prometheus pull (always
   wired at `GET /metrics`) + OTLP push (opt-in). Process-global handle;
-  CLI / unit-test callers no-op. Per-product instrument prefix
+  CLI / unit-test callers no-op. Per-application instrument prefix
   (`thurvtl_*` / `thurvsa_*`) sourced from
   `shared_naming::PRODUCT.metric_prefix`; `service.name` resource
   attribute (`thurvtl` / `thurvsa`) carries the distinction
@@ -389,7 +389,7 @@ adapter layers between products are in
   producers emit via `shared_alerting::record::*`. Per-class dedup
   window (default 300 s) wraps `AuditRateLimiter`. No retries on sink
   failure — drop, log, count via
-  `<product>_alerts_fired_total{outcome}`. Full design in
+  `<application>_alerts_fired_total{outcome}`. Full design in
   [`docs/admin/ALERTING.md`](docs/admin/ALERTING.md).
 - **Daemon lock** — `<data_dir>/.daemon.lock` PID lockfile; CLI mutating
   commands refuse if alive. Stale locks auto-clear.
@@ -427,7 +427,7 @@ thurvtld --test    # in-process smoke (cartridge/library/S3/prefetch/…)
 
 Production install paths (`.deb` / `.rpm`) and recipes are in
 [`README.md`](README.md). Storage credentials wiring (per-backend `auth:`
-blocks, default chains, the per-product `<product>.env` daemon env
+blocks, default chains, the per-application `<application>.env` daemon env
 file) in [`docs/admin/AUTH.md`](docs/admin/AUTH.md). Release-cut flow + glibc-floor
 strategy + OpenSSL vendoring in
 [`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
@@ -476,7 +476,7 @@ reference at `dist/{thurvtl,thurvsa}.defaults.yaml` — also what `config
 defaults` prints, also installed at `/usr/share/doc/{thurvtl,thurvsa}/`.
 Required key: `data_dir` (both). YAML carries install-time + tuning
 knobs only. Every config file (YAML conffiles, daemon-managed JSON,
-the `<product>.env` file) plus a key-by-key YAML reference is
+the `<application>.env` file) plus a key-by-key YAML reference is
 catalogued in
 [`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md).
 
@@ -563,7 +563,7 @@ job protocol on the same socket. Full split, admin socket discovery, sudo
 
 ## Integration Tests
 
-Two product-prefixed sets, in increasing order of prereqs / coverage:
+Two application-prefixed sets, in increasing order of prereqs / coverage:
 
 - `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
 - `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,dual-transport,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,snapshot,monte-carlo,app-postgres,app-vm}.sh`
@@ -573,7 +573,7 @@ default — debug builds are 5-10x slower, only useful when iterating on a
 failing case). Remote-backend variants
 require `THURVTL_TEST_BACKEND` / `THURVSA_TEST_BACKEND` matching a non-`local`
 entry in the conffile; refuses `retention_mode != none`.
-`test-monte-carlo.sh` (both products) runs seeded random op sequences
+`test-monte-carlo.sh` (both applications) runs seeded random op sequences
 with a boundary-biased size distribution and lazy transport/mount/load
 prereqs — VSA does file ops over ext4, VTL does tape record ops.
 Reproduce with `--seed N` (printed at start), `--quick` for ~30 s
@@ -625,7 +625,7 @@ be non-interactive). Exit 0 / 1, auto-cleanup unless `--keep-data`. What
 each script covers + sudo / prereq specifics live in headers at the top of
 each `.sh` file. Workspace dev utilities (`scripts/setup-system.sh`,
 `scripts/docker-compose.yml`, `scripts/lib/test-helpers.sh`) stay
-product-agnostic in the unprefixed top-level `scripts/` dir.
+application-agnostic in the unprefixed top-level `scripts/` dir.
 
 ## Design Docs
 
@@ -681,7 +681,7 @@ operator-facing doc map; `README.md` and `CLAUDE.md` stay at the repo root
 - Release:
   [`docs/dev/RELEASING.md`](docs/dev/RELEASING.md).
 - Roadmap: tracked as GitHub issues. Labels: `vtl` / `vsa` for
-  scope (cross-product items carry both); `bug` / `enhancement` /
+  scope (cross-application items carry both); `bug` / `enhancement` /
   `idea` / `doc` for kind. Release-blocking items use `bug`.
   [`docs/dev/LTO-9.md`](docs/dev/LTO-9.md) — what LTO-9 support would
   need, why a VTL cares less about LTO-9 than physical hardware

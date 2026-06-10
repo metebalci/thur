@@ -1,10 +1,10 @@
 # Deduplication
 
-Both products store data as chunks in a shared content-addressed pool
+Both applications store data as chunks in a shared content-addressed pool
 (`shared-pool`), so the deduplication mechanism is common across VTL
-and VSA. What differs is how each product cuts its byte stream into
+and VSA. What differs is how each application cuts its byte stream into
 chunks and what scope the deduplication spans. This document covers the
-shared mechanism first, then the per-product specifics.
+shared mechanism first, then the per-application specifics.
 
 - **[VTL](#vtl)** — sealed tape chunks, FastCDC / fixed chunking, the
   `--dedup` scope per cartridge, encryption / compression interactions.
@@ -103,8 +103,8 @@ pins it, garbage collection must take the union of every manifest, a
 corrupt block fans out to every referrer simultaneously, and a
 per-object provider primitive such as a legal hold or retention lock
 affects every unit that references it. Because these trade-offs play out
-differently for tape versus block workloads, **the two products default
-to opposite choices** — see the per-product sections below.
+differently for tape versus block workloads, **the two applications default
+to opposite choices** — see the per-application sections below.
 
 ### Refcount-aware eviction
 
@@ -137,7 +137,7 @@ anything — orphaned when a page is rewritten to new content, or when a
 unit is deleted. GC walks every manifest and page index to build the
 live set of `(backend, namespace) → {hash}`, then sweeps both pool
 layouts (and, on request, the storage backends), removing anything not in
-that live set. The command surface differs per product — see below.
+that live set. The command surface differs per application — see below.
 
 ---
 

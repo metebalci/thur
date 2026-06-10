@@ -2,13 +2,13 @@
 
 This document covers per-crate API surfaces, module breakdowns, and the
 adapter layers that connect crates to each other. Top-level orientation —
-which crates exist and why, how the two products share infrastructure — is
+which crates exist and why, how the two applications share infrastructure — is
 in [`../../CLAUDE.md`](../../CLAUDE.md) § Workspace Layout. This document is the
 deeper reference you reach for when you need to know exactly what a crate
 exports and how the pieces fit together.
 
 Crates live under `shared/`, `core/`, `scsi/`, `nvme/`, `vtl/`, and `vsa/`.
-The two product crates are `vtl-{daemon,cli}` and `vsa-{daemon,cli}` on
+The two application crates are `vtl-{daemon,cli}` and `vsa-{daemon,cli}` on
 disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 `thurvsa-{daemon,cli}`.
 
@@ -48,10 +48,10 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
     cursor)`. 300 s retention TTL, opportunistic `reap()` on POST.
   - `jobs_router<S: HasJobs, F: dispatch fn>(state, dispatch)`
     (`server.rs`): pre-built sub-router — `POST /api/v1/jobs/:kind`
-    (calls the product dispatch closure; 400 + synthetic `Done` on
+    (calls the application dispatch closure; 400 + synthetic `Done` on
     unknown kind) and `GET /api/v1/jobs/:id/events` (NDJSON streaming).
-    The `HasJobs` trait wires the registry out of product state.
-  Each daemon's `admin/mod.rs` builds a product `Router`, merges with
+    The `HasJobs` trait wires the registry out of application state.
+  Each daemon's `admin/mod.rs` builds an application `Router`, merges with
   `jobs_router(...)`, and hands it to `run_admin_server(...)`.
 - **shared-admin-http** — shared admin HTTP listener. `run_http_server`
   owns the bind / serve / TLS plumbing; each daemon builds its own
@@ -59,14 +59,14 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   a missing cert+key pair is auto-generated self-signed on first boot.
   Exposes `HttpListenerConfig`, `TlsConfig`, `regenerate_cert`,
   `CertGenerationOutcome`, `RegenerateOutcome`.
-- **shared-admin-iscsi** — cross-product axum handlers for iSCSI CHAP
+- **shared-admin-iscsi** — cross-application axum handlers for iSCSI CHAP
   user lifecycle (`add` / `remove` / `disable` / `enable` / `rotate` /
   `rotate cancel` / `list`) and the mutual-CHAP target credential
   (`target {set, clear, show}`). Both daemons mount the same routes;
   each daemon's `AdminState` implements `IscsiUsersState` to plumb
   `data_dir` plus an optional `AuditChannel`. Audit op names are pinned
   (`iscsi.users.add`, `iscsi.users.rotate.start`, `iscsi.target.set`, …)
-  so a multi-product audit chain reads uniformly across both daemons.
+  so a multi-application audit chain reads uniformly across both daemons.
 - **shared-admin-auth** — the single shared web-admin password that
   gates the network-facing HTTP listener (issue #4; the hard
   prerequisite for the Web UI, #5 / #91). Sibling of
@@ -102,7 +102,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   which reuses `AuthState` + `require_admin_password` directly.
 - **shared-admin-webui** — the read-only Web UI (issue #5) embedded in
   both daemons. Owns the static `/ui/*` bundle and the genuinely
-  cross-product read-only `/api/v1` GET handlers. Sibling of
+  cross-application read-only `/api/v1` GET handlers. Sibling of
   `shared-admin-iscsi` / `shared-admin-auth`; kept out of
   `shared-admin-http` so that crate stays transport-only.
   - `static_serve.rs` — asset resolution for `/ui`: `include_dir!`
@@ -111,7 +111,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
     `..` / absolute / empty path segments before either lookup.
   - `lib.rs` — `WebuiConfig`, the `webui_router(cfg, auth)` assembly
     (the static routes gated by #4's `require_admin_password`), and the
-    three cross-product read-only handlers: `monitor_snapshot_handler`
+    three cross-application read-only handlers: `monitor_snapshot_handler`
     (single-shot `shared_admin_monitor::build_payload`),
     `jobs_recent_handler` (`JobRegistry::list_recent` — a rolling 5-min
     window), and `audit_tail_handler` (last N of
@@ -119,17 +119,17 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
     daemons implement on their `AdminState`).
   Depends one way on `shared-admin-auth` / `shared-admin-monitor` /
   `shared-admin-server` / `shared-audit`; only the two daemons depend on
-  it. Per-product inventory GETs stay per-daemon (typed on each
-  product's `AdminState`). Design in [`WEBUI.md`](../reference/WEBUI.md).
-- **shared-admin-audit** — cross-product `system.audit.*` job handlers:
+  it. Per-application inventory GETs stay per-daemon (typed on each
+  application's `AdminState`). Design in [`WEBUI.md`](../reference/WEBUI.md).
+- **shared-admin-audit** — cross-application `system.audit.*` job handlers:
   `run_tail` / `run_export` / `run_verify` / `run_rotate`, each
   `(JobEmitter, serde_json::Value, PathBuf)`. Both daemons route those
   job kinds here from their `job_dispatch::dispatch`; the only
-  per-product input is the audit-log directory, passed as a plain
+  per-application input is the audit-log directory, passed as a plain
   `PathBuf` (no trait — the handlers need nothing else). Deliberately
   kept out of `shared-audit` so that lower-level crate stays free of
   the `JobEmitter` / job-protocol deps.
-- **shared-admin-storage-check** — cross-product storage-backend
+- **shared-admin-storage-check** — cross-application storage-backend
   reachability. `run_storage_check(JobEmitter, Arc<ObjectStoreConfig>)`
   is the `system.storage_check` job handler both daemons mount (CLI verb
   `system storage check`); `run_reachability_ticker(Arc<ObjectStoreConfig>, u64)`
@@ -143,7 +143,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   as `shared-admin-audit` / `shared-admin-monitor`.
 - **shared-health** — axum handler for `GET /health`, an
   unauthenticated liveness probe. Body is `{ status, daemon, version }`;
-  per-product topology stays on `/info`. Daemons supply `HealthMeta
+  per-application topology stays on `/info`. Daemons supply `HealthMeta
   { product: &ProductIdentity, version: &'static str }` via
   `axum::extract::FromRef`.
 - **shared-alerting** — opt-in first-party alerting. Two sinks: `email`
@@ -159,23 +159,23 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   watermark + backpressure timeout (incl. VSA `lru.idx` degradation),
   repeated CHAP failures, and orphaned objects (failed best-effort
   storage delete, e.g. `cartridge migrate` source-delete). Hosts the
-  cross-product `system.alerting.test` admin job and the
+  cross-application `system.alerting.test` admin job and the
   `/api/v1/system/alerting` handler (behind the `http` feature).
   Audit-append failures bridge in via an `AppendFailureHook` function
   pointer installed at boot — this breaks what would otherwise be a
   circular dependency between `shared-audit` and `shared-alerting`.
   Design in [`ALERTING.md`](../admin/ALERTING.md).
-- **shared-cli-alerting** — cross-product CLI for `alerting list` (GET
+- **shared-cli-alerting** — cross-application CLI for `alerting list` (GET
   `/api/v1/system/alerting`) and `alerting test <SINK> [--severity …]`
   (drives the `system.alerting.test` job). Daemon-routed only.
   Parameterized on `&'static ProductIdentity`.
-- **shared-cli-iscsi** — cross-product CLI implementations for `iscsi
+- **shared-cli-iscsi** — cross-application CLI implementations for `iscsi
   users` and `iscsi target` verbs. Daemon-routed only: the admin socket
   must answer so the daemon serializes the edit and emits an audit row;
   if the socket is down the command refuses with a "start the daemon"
   message rather than mutating the JSON file directly. Parameterized on
   `&'static ProductIdentity`.
-- **shared-cli-system** — cross-product `system <verb>` CLI commands,
+- **shared-cli-system** — cross-application `system <verb>` CLI commands,
   each generic over `ProductIdentity`. Modules: `regenerate_cert`
   (`cmd_regenerate_cert`); `daemon_health` (`cmd_daemon_health` — the
   `GET /api/v1/health` probe); `audit` (`cmd_tail` / `cmd_export` /
@@ -204,13 +204,13 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   error-mapping wrappers; `core-stream::block_index::derive_iv`
   forwards to `shared_crypto::derive_iv` and retains the tape-flavored
   `(uuid, chunk_id, offset)` signature.
-- **shared-dedup-stats** — cross-product dedup math for `system stats`.
+- **shared-dedup-stats** — cross-application dedup math for `system stats`.
   A plain data boundary: the caller reduces each scanned entity to an
   `EntityScan { label, backend, namespace, chunks: HashMap<hash,
   size> }`, and `compute_dedup(&[EntityScan])` returns
   `(Vec<EntityContribution>, Vec<BackendDedup>)` — the per-entity
   exclusive/shared split and the per-backend unique pool bytes. No
-  trait, no I/O, no serde. Entity enumeration differs per product
+  trait, no I/O, no serde. Entity enumeration differs per application
   (VTL walks each cartridge's `chunks.idx`, VSA each volume's
   `pages.idx`) and stays in each daemon's `job_dispatch::stats`.
 - **shared-disk-evict** — the two genuinely identical halves of each
@@ -239,8 +239,8 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   network path the daemon uses. Output: `[BENCH]` lines on stdout,
   `[BENCH-ERR]` on stderr without aborting sibling cells. Knobs via
   `BenchOptions`. Consumed by the `system storage benchmark` CLI verbs of
-  both products.
-- **shared-iscsi** — cross-product iSCSI primitives.
+  both applications.
+- **shared-iscsi** — cross-application iSCSI primitives.
   - `alua.rs` — ALUA topology (SPC-4 §5.16). `AluaTopology` built
     from `ServerConfig::listen_portals`: sequential per-portal
     RTPIs (1, 2, …), per-TPG `AsymmetricAccessState` (default
@@ -262,7 +262,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   - `error.rs` — `IscsiError` (`InvalidOp` / `InvalidSession` /
     `AuthFailed`; `From<IscsiError> for VtlError` lives in
     core-mediachanger).
-  - `metrics.rs` — pluggable `MetricsSink` trait; the consuming product
+  - `metrics.rs` — pluggable `MetricsSink` trait; the consuming application
     installs a forwarder so the `sessions_active` gauge lands in its
     OTel MeterProvider.
   - `transport.rs` — connection lifecycle: `Pdu` + `read_pdu` /
@@ -270,12 +270,12 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
     `handle_login_phase`, `collect_write_data` / `send_r2t` /
     `derive_r2t_ttt` (R2T loop), the per-connection FFP loop
     `serve_connection`, accept-loop `run`.
-  - `handler.rs` — the product-agnostic `ScsiHandler` trait
+  - `handler.rs` — the application-agnostic `ScsiHandler` trait
     (`dispatch(ScsiRequest) -> ScsiResponse`, `target_iqn`,
     `on_session_close`); VTL's `VtlTapeHandler` and VSA's
     `IscsiDiskScsiHandler` both impl it. Login-phase audit emits
     through the `LoginAuditSink` trait; `ServerConfig::audit` is an
-    `Arc<dyn LoginAuditSink>` so a product can branch at runtime
+    `Arc<dyn LoginAuditSink>` so an application can branch at runtime
     between its real adapter and `NoopLoginAudit`.
 - **shared-keystore** — pluggable VSA volume-DEK keystore.
   `KeyStoreBackend` trait (`generate_and_wrap` / `wrap` / `unwrap` /
@@ -302,7 +302,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `SdkMeterProvider` with two readers: Prometheus pull (always wired) +
   OTLP push (opt-in). The `Telemetry` struct carries every instrument
   handle (pool, storage, chunk, iscsi, tape, prefetch, audit, daemon).
-  Per-product instrument prefix (`thurvtl_*` / `thurvsa_*`)
+  Per-application instrument prefix (`thurvtl_*` / `thurvsa_*`)
   sourced from `shared_naming::PRODUCT.metric_prefix`; the
   `service.name` OTel resource attribute (`thurvtl` / `thurvsa`)
   carries the distinction redundantly. A process-global
@@ -318,13 +318,13 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   `run_upload_pipeline` — drives a batch through `upload_chunk_inert`
   with at most `max_concurrent` PUTs in flight (`buffer_unordered`),
   each completion firing a caller-supplied post-upload hook
-  (apply-outcome, auto-hold, eviction-Notify). Product-specific glue
+  (apply-outcome, auto-hold, eviction-Notify). Application-specific glue
   (the `mpsc` request type, crash-recovery scan, cartridge / volume
   open) stays in the daemons. `core_stream::cartridge` re-exports the
   payload types under their legacy names (`PendingUploadPayload`,
   `ChunkUploadOutcome`).
-- **shared-verify-core** — cross-product chunk-pool + storage
-  verification sweeps for `system verify`. A product implements the
+- **shared-verify-core** — cross-application chunk-pool + storage
+  verification sweeps for `system verify`. An application implements the
   `VerifyTarget` trait — `live_chunks()` (the `(backend, namespace) ->
   {hash}` map) and `storage_entities()` (per-entity storage expectations).
   `sweep_local_pool(data_dir, target)` returns one `PoolSweep` per
@@ -333,8 +333,8 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   HEAD storm against one storage backend and the `chunks/` orphan scan.
   The tape side additionally HEADs index-page objects + the manifest
   sentinel (no block analogue, stays in `core-mediachanger`); each
-  product assembles its own `VerifyReport` from the sweep results.
-- **shared-naming** — single source of truth for per-product identity
+  application assembles its own `VerifyReport` from the sweep results.
+- **shared-naming** — single source of truth for per-application identity
   strings (system user, IQN, NQN, conffile path, data dir, run dir,
   admin socket, service unit, metric prefix). `ProductIdentity` struct
   + consts `TAPE` / `TAPE_LIBRARY` / `DISK` (`TAPE_LIBRARY` =
@@ -374,7 +374,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   reservation / `PR_GENERATION`, the PROUT service-action handlers, the
   PRIN renderers, `allow_read` / `allow_write` / `drop_nexus`, and the
   `prin` / `prout` entry points returning the response-neutral
-  `PrInOutcome` / `PrOutOutcome`; both products' dispatchers are thin
+  `PrInOutcome` / `PrOutOutcome`; both applications' dispatchers are thin
   adapters over it). shared-iscsi's `sense.rs` + `handler.rs`
   request/response types and VSA's `scsi/types.rs` are thin re-export
   shells of scsi-spc.
@@ -488,7 +488,7 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   self-test ring buffer feeding page 0x10), `main.rs`. HTTP on 9090
   (`/health`, `/metrics`, `/sessions`, `/info`). `--test` runs
   in-process smoke tests and exits. Admin socket at
-  `/run/thurvtl/admin.sock` — `admin/mod.rs` builds the product router,
+  `/run/thurvtl/admin.sock` — `admin/mod.rs` builds the application router,
   merges `jobs_router` (dispatch in `admin/job_dispatch/*.rs`: gc /
   verify / stats / storage_check (routed to `shared-admin-storage-check`; CLI verb `system storage check`) / self_test / audit / archive /
   restore_archive / migrate / alerting) and the alerting route, and
@@ -624,7 +624,7 @@ against unmapped LUNs returns the SPC-4 "no LUN" pattern (peripheral
 qualifier 0b011 + type 0x1F) rather than CHECK CONDITION — initiators
 rely on this to discover the LUN map.
 
-Identity strings: vendor `THUR`, product `CIRRUS BLOCK`, revision
+Identity strings: vendor `MB`, product `THUR VSA`, revision
 `0001`; serial / device-id are the volume UUID hex.
 
 **MODE SELECT 6 / 10** (0x15 / 0x55) accepts parameter lists that
@@ -740,7 +740,7 @@ local `/info` (`{ product, listen_addresses, iqn, volume_count }`).
 When `http.webui.enabled` (default), it also serves the read-only Web UI
 (issue #5): the static `/ui/*` bundle from `shared_admin_webui::webui_router`
 plus a read-only `/api/v1` GET subset (`volumes` list / info / snapshots
-+ the cross-product `monitor` / `jobs/recent` / `audit/tail` handlers),
++ the cross-application `monitor` / `jobs/recent` / `audit/tail` handlers),
 all merged into the `require_admin_password`-gated protected group. The
 read-only API runs against the same `AdminState` the admin socket uses,
 but only GET handlers are mounted, so the TCP surface stays read-only.
@@ -768,7 +768,7 @@ mirrors `src/commands/defaults_reference.yaml` to
 
 ## Shared infrastructure summary
 
-The shared layer exists so the two products never diverge silently on
+The shared layer exists so the two applications never diverge silently on
 behaviors that have to match. `shared-object-store` carries the `ObjectStoreBackend`
 trait plus S3 / GCS / Azure / Local implementations, retry logic, and
 compression primitives. `shared-audit` carries the BLAKE3-chained audit
@@ -778,5 +778,5 @@ SDK plumbing, the Prometheus pull and OTLP push readers, and the
 `record::*` global-handle pattern. `shared-iscsi`,
 `shared-admin-*`, `shared-cli-*`, `shared-keystore`, `shared-alerting`,
 `shared-health`, `shared-object-store-bench`, and `shared-upload-worker` are
-likewise consumed by both products. The tape-side disk cache lives in
+likewise consumed by both applications. The tape-side disk cache lives in
 `core-stream`; the block-side equivalent is in `core-block`.

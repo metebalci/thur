@@ -25,7 +25,7 @@ hardware-specific feature is present.
 
 These run end-to-end against a live daemon on every change (`*/scripts/`):
 
-| Workload | Product | Transport | What it exercises |
+| Workload | Application | Transport | What it exercises |
 |---|---|---|---|
 | **Bareos 21** (director / SD / FD, SQLite catalog) | VTL | iSCSI | Real backup + restore across a 2-drive / 6-cartridge chassis, byte-for-byte restore diff. |
 | **PostgreSQL** on ext4 | VSA | iSCSI / NVMe/TCP | WAL fsync ordering, OLTP, SIGKILL crash + journal replay + TPC-B invariant. |

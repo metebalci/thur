@@ -5,7 +5,7 @@
 > SCSI / NVMe surface may change without notice or migration path.
 > Not recommended for production use.
 
-**Thur VTL** and **Thur VSA** are two sibling products presenting
+**Thur VTL** and **Thur VSA** are two sibling applications presenting
 spec-conformant storage devices to the host — a virtual tape library
 and a virtual storage appliance. Both are **thin-provisioned**
 (addressable capacity is declared, not reserved; only written data
@@ -30,7 +30,7 @@ and cartridge on a backend — are stored exactly once.
   From the host's perspective each LUN is an ordinary block device —
   VMware, Hyper-V, Linux, no proprietary agent required.
 
-Both products can live co-resident on a single host; they use disjoint
+Both applications can live co-resident on a single host; they use disjoint
 system users, data directories, conffiles, systemd unit names, and admin
 sockets. The configured storage backend (S3, GCS, Azure, or another
 S3-compatible object store) is, in all cases, the durable source of
@@ -57,7 +57,7 @@ own risk.
 
 # Features
 
-The following capabilities are shared across both products:
+The following capabilities are shared across both applications:
 
 - **Content-addressed dedup** — BLAKE3-hashed chunks stored once per
   backend pool; cross-volume / cross-cartridge.

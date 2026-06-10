@@ -276,12 +276,12 @@ every local-scope namespace, and deletes anything not in the live set.
 Orphan namespace directories are reclaimed in the same pass. `--storage`
 extends the sweep to backend chunk keys and stale index-page objects (any
 page whose index is >= `index_epoch[label].pages`). Cartridges with no
-local manifest are skipped. Both products expose `system gc` with the
+local manifest are skipped. Both applications expose `system gc` with the
 same flags.
 
 ## CHAP / PSK credential lifecycle
 
-Both products' iSCSI CHAP file (`<data_dir>/iscsi-users.json`) and
+Both applications' iSCSI CHAP file (`<data_dir>/iscsi-users.json`) and
 VSA's NVMe-TCP PSK file (`<data_dir>/nvmetcp-psks.json`) are read fresh
 on every iSCSI Login or TLS handshake. This means that operator edits
 via the CLI verbs take effect on the next new session without requiring

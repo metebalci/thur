@@ -72,11 +72,11 @@ from whether the global was installed.
 ## How instruments are named
 
 Every instrument name follows the shape `<prefix>_<subsystem>_<name>`.
-The prefix is what keeps the two products apart, so that a single
+The prefix is what keeps the two applications apart, so that a single
 shared backend can scrape both daemons without their instrument names
 colliding:
 
-| Product | Prefix | Source |
+| Application | Prefix | Source |
 |---|---|---|
 | Thur VTL (`thurvtld`) | `thurvtl_*` | `shared_naming::TAPE_LIBRARY.metric_prefix` |
 | Thur VSA (`thurvsad`) | `thurvsa_*` | `shared_naming::DISK.metric_prefix` |
@@ -97,7 +97,7 @@ exports as `pool_evictions_total_total` — so the internal name is
 
 There is also a `service.name` resource attribute (`thurvtl` or
 `thurvsa`) carried on the `target_info` series. It encodes the same
-product distinction a second time, which is intentional: dashboards
+application distinction a second time, which is intentional: dashboards
 can group by either the name prefix or the attribute. The prefix is
 the one that really has to be there, because it survives flat scrape
 concatenation — where every series lands in one namespace —
@@ -126,7 +126,7 @@ coherent area of the daemon and the files that instrument it:
 
 A handful of instruments are not very interesting on their own — they
 are designed to be divided into ratios that tell you something an
-operator actually cares about. Substitute the product prefix as needed
+operator actually cares about. Substitute the application prefix as needed
 (`thurvtl_*` for tape, `thurvsa_*` for block):
 
 - **Dedup ratio** = `thurvtl_chunk_logical_bytes_total /
@@ -163,7 +163,7 @@ so existing dashboards keep working unchanged.
 
 The point of the examples below is that each one maps to a concrete
 operator action — an alert you cannot act on is just noise. They use
-the `thurvtl_*` prefix; swap in `thurvsa_*` for the block product,
+the `thurvtl_*` prefix; swap in `thurvsa_*` for the block application,
 since the `pool`, `storage`, and `audit` instrument bodies exist on both.
 
 ```promql
@@ -186,7 +186,7 @@ rate(thurvtl_storage_permanent_errors_total[5m]) > 0
 
 You do not have to build the above from scratch. Checked-in reference
 assets live under [`dist/grafana/`](../../dist/grafana/): one Grafana
-dashboard per product (`thurvtl-dashboard.json` / `thurvsa-dashboard.json`,
+dashboard per application (`thurvtl-dashboard.json` / `thurvsa-dashboard.json`,
 each with `$datasource` / `$job` / `$backend` template variables) and a
 `alerts.yaml` of Prometheus alerting rules covering the watch-worthy
 conditions — disk cache near full, sustained backpressure, the

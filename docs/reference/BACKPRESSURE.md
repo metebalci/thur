@@ -6,7 +6,7 @@ write path is forced to abort the host's backup. This document explains how
 that mechanism works and why it is built this way.
 
 VTL and VSA share the upload pipeline end-to-end, so they share the core
-backpressure design. Two sections cover the product-specific details:
+backpressure design. Two sections cover the application-specific details:
 
 - **[VTL](#vtl)** — the tape side: chunk-seal gating against the
   SSC-4 sequential write stream.
@@ -39,10 +39,10 @@ this gate: no static size can absorb every burst against every backend condition
 ## What's shared
 
 Since the shared-upload-worker lift, the async upload pipeline is shared
-end-to-end between both products:
+end-to-end between both applications:
 
 - **`shared_pool::PoolBudget`** + per-backend cap map — the same hard cap
-  and disk-free floor apply to both products. One `PoolBudget` is
+  and disk-free floor apply to both applications. One `PoolBudget` is
   constructed per `storage.backends` entry at startup. The YAML
   `disk_cache.size_gb` is the per-backend default; individual
   `storage.backends:` entries may override it with their own
@@ -98,15 +98,15 @@ end-to-end between both products:
   scaffold). VTL drives the pipeline from
   `vtl/daemon/src/upload_worker.rs`; VSA drives a Semaphore-capped
   per-task fan-out from `vsa/daemon/src/upload_worker.rs`. Both
-  products' per-completion hooks (legal-hold reapply on VTL, sidecar
+  applications' per-completion hooks (legal-hold reapply on VTL, sidecar
   flip on VSA) plug into the same scaffold.
 
-- **`shared_pool::ChunkPool`** — same content-addressed layout on both products.
+- **`shared_pool::ChunkPool`** — same content-addressed layout on both applications.
 
 - **`core_stream` / `core_block` `DiskCacheManager`** — eviction
   filter pinned on per-item "Uploaded" state (`chunks.idx`
   `LocationTag::Both` on tape; `upload.idx` `Uploaded` byte on
-  block). Both products honor `disk_cache.recent_seal_pin_seconds`
+  block). Both applications honor `disk_cache.recent_seal_pin_seconds`
   (default `0`) to optionally pin chunks whose most recent `lru.idx`
   touch — seal or read — is inside the configured window.
 
@@ -121,7 +121,7 @@ end-to-end between both products:
   every major backup product (NetBackup, Veeam, Bacula, Commvault)
   treat 0x04/0x07 as transient and retry.
 
-The remaining divergence between the two products is confined to the cache
+The remaining divergence between the two applications is confined to the cache
 tier and is workload-driven — see [VSA § Why this shape
 (vs VTL)](#why-this-shape-vs-vtl).
 

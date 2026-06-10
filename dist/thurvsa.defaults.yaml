@@ -63,7 +63,7 @@ iscsi:
   #   - { bind: "0.0.0.0:3260", advertise: "192.168.1.50:3260" }
 
   # iSCSI target IQN advertised to initiators in the Login /
-  # SendTargets response. Defaults to the per-product identity
+  # SendTargets response. Defaults to the per-application identity
   # when unset.
   # target_iqn: "iqn.2025-10.com.metebalci:thurvsa"
 
@@ -117,7 +117,7 @@ iscsi:
 #   advertise: "192.168.1.50:4420"
 #
 #   # NVMe Subsystem NQN advertised to hosts (`nvme connect --nqn=`
-#   # must match this exactly). Defaults to the per-product identity
+#   # must match this exactly). Defaults to the per-application identity
 #   # when unset. The TLS-PSK derivation binds to this value, so
 #   # changing it rederives every per-host PSK.
 #   subnqn: "nqn.2025-10.com.metebalci:thurvsa"
@@ -551,7 +551,7 @@ alerting:
     # A best-effort storage cleanup left objects behind that should
     # have been deleted — the orphans consume backend storage until a
     # future GC sweep reclaims them. The alert class is shared across
-    # products; no VSA op fires it today (it is driven by VTL
+    # applications; no VSA op fires it today (it is driven by VTL
     # `cartridge migrate`), but the knob parses here for parity.
     orphaned_objects: true
 

@@ -36,7 +36,7 @@ logic crates (storage, SCSI/NVMe, dedup, crypto, chunk pool — these
 sit at **80-95%** in either mode). The shell suites under
 `vtl/scripts/` and `vsa/scripts/` drive the daemons through real
 SCSI/NVMe-TCP traffic; only the integrated mode captures their
-contribution to the product daemon/CLI crates, where the lift is
+contribution to the application daemon/CLI crates, where the lift is
 **+20-25 percentage points**:
 
 | Crate | Unit only | Integrated | Δ |
@@ -48,7 +48,7 @@ contribution to the product daemon/CLI crates, where the lift is
 | `shared/admin-server` | 65% | 87% | +22 |
 | `core/mediachanger` | 83% | 90% | +7 |
 
-### `shared/` — cross-product crates
+### `shared/` — cross-application crates
 
 Per-crate numbers are from the **integrated** run (unit + shell suites);
 columns flag the tier per `scripts/coverage-report.py`.
@@ -60,7 +60,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-admin-client` | 70% | shared | admin Unix-socket dialer, NDJSON job-stream consumer |
 | `shared-admin-storage-check` | 44%† | shared | storage reachability `system.storage_check` job + periodic ticker — reached via the daemon storage-check verb |
 | `shared-admin-http` | 80% | shared | admin HTTP listener, TLS config, self-signed cert gen / regen |
-| `shared-admin-iscsi` | 81% | shared | cross-product iSCSI admin handlers — reached via both daemons |
+| `shared-admin-iscsi` | 81% | shared | cross-application iSCSI admin handlers — reached via both daemons |
 | `shared-admin-monitor` | 93% | shared | `system.monitor` tick loop, snapshot encoding, rate-window math |
 | `shared-admin-proto` | 95% | shared | admin-socket wire types (`JobEvent`, `JobAccepted`) round-trips |
 | `shared-admin-server` | 87% | **control-plane critical** | admin socket bind, peer-cred extractor, NDJSON job streaming |
@@ -79,7 +79,7 @@ columns flag the tier per `scripts/coverage-report.py`.
 | `shared-health` | 100% | shared | `/health` liveness handler |
 | `shared-iscsi` | 87% | **critical** | iSCSI transport, CHAP auth, session + unit-attention |
 | `shared-keystore` | 85% | **critical** | six DEK keystore backends, wrap / unwrap round-trips |
-| `shared-naming` | 94% | shared | per-product identity strings |
+| `shared-naming` | 94% | shared | per-application identity strings |
 | `shared-pool` | 91% | **critical** | content-addressed chunk pool, insertion, GC iteration, budget |
 | `shared-telemetry` | 66% | shared | OpenTelemetry instrument plumbing |
 | `shared-upload-worker` | 89% | **control-plane critical** | backend-upload PUT + HEAD-probe primitive |
@@ -108,7 +108,7 @@ coverage not captured here. Re-measure with `scripts/coverage.sh
 | `nvme-nvm` | 92% | NVM Command Set dispatch, fused compare-and-write |
 | `nvme-tcp` | 87% | NVMe/TCP transport state machine, PDU codec, R2T flow |
 
-### `core/` — product cores
+### `core/` — application cores
 
 | Crate | Line cov | Coverage focus |
 |---|---:|---|
@@ -116,7 +116,7 @@ coverage not captured here. Re-measure with `scripts/coverage.sh
 | `core-mediachanger` | 83% | SMC-3 medium changer + library inventory + library-wide verify |
 | `core-stream` | 80% | LTO cartridge primitives: indexes, FastCDC, AES-GCM, prefetch |
 
-### Product daemons + CLIs
+### Application daemons + CLIs
 
 Both columns reproduce the integration surface from two angles: the
 unit-test-only number (`scripts/coverage.sh --crates`) is what
@@ -136,7 +136,7 @@ gets raised in lockstep.
 A crate can show coverage without owning many tests of its own:
 `shared-verify-core` has no inline tests yet is 85% covered, because
 `core-mediachanger` and `core-block`'s verify tests exercise it.
-Several thin cross-product crates (`shared-admin-audit`,
+Several thin cross-application crates (`shared-admin-audit`,
 `shared-admin-iscsi`, the `shared-cli-*` family) clear their 50%
 floor entirely on the strength of their consumers' tests — what they
 add directly to the workspace is structural glue.
@@ -154,7 +154,7 @@ reviewed-trivial paths in `scripts/coverage-exempt.txt` (pure re-export
 | Critical — data-path | `core/*`, `scsi/*`, `nvme/*`, `shared/crypto`, `shared/pool`, `shared/iscsi`, `shared/audit`, `shared/keystore`, `shared/object-store` | 80% |
 | Critical — control-plane | `shared/admin-server`, `shared/verify-core`, `shared/upload-worker`, `shared/dedup-stats` | 80% |
 | Standard — shared | all other `shared/*` crates | 50% |
-| Products | `vtl/daemon`, `vtl/cli`, `vsa/daemon`, `vsa/cli` | 30% |
+| Applications | `vtl/daemon`, `vtl/cli`, `vsa/daemon`, `vsa/cli` | 30% |
 
 The two critical tiers are split by failure mode, not by criticality
 level: **data-path** bugs corrupt or lose on-disk / backend data
@@ -162,10 +162,10 @@ silently; **control-plane** bugs cause silent operational failures
 (admin socket down, integrity check skipped, alert never fires) or
 unrecoverable backups. Both tiers carry the same 80% floor.
 
-The product daemons and CLIs carry the lower 30% floor because their
+The application daemons and CLIs carry the lower 30% floor because their
 request paths are exercised by the end-to-end shell suites, which the
 **`--crates`** mode does not capture. Running **`--integrated`**
-captures them and lifts the four product crates to 50-60%; that mode
+captures them and lifts the four application crates to 50-60%; that mode
 needs sudo for the kernel-initiator suites and takes 10-20 minutes.
 
 ### Structural sub-floor exceptions
@@ -249,7 +249,7 @@ It is a fast confidence check that the core read / write / backend paths
 work on the host — useful right after install or in a constrained
 environment where the full shell suites can't run.
 
-### Product-agnostic suites — `scripts/`
+### Application-agnostic suites — `scripts/`
 
 | Script | Covers |
 |---|---|

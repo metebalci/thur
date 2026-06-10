@@ -1,6 +1,6 @@
 # Production Readiness Checklist
 
-Work through this before putting either product in front of real data.
+Work through this before putting either application in front of real data.
 Each item links to the doc with the detail. Thur is alpha software with
 no stability guarantee — verify your backups independently regardless of
 this list.
@@ -38,8 +38,8 @@ this list.
 - [ ] **Admin HTTP listener secured** — web-admin password set and TLS
       enabled on the network-facing listener. [`NETWORK_SECURITY.md`](NETWORK_SECURITY.md).
 - [ ] **Admin socket access controlled** — only trusted operators in the
-      product group (the socket is peer-cred-authed, mode 0660).
-- [ ] **Conffile permissions** correct (root:`<product>`, daemon-readable);
+      application's group (the socket is peer-cred-authed, mode 0660).
+- [ ] **Conffile permissions** correct (root:`<application>`, daemon-readable);
       the postinst sets these on package installs.
 
 ## Observability
@@ -68,7 +68,7 @@ this list.
 - [ ] **systemd customizations via `systemctl edit`** so upgrades don't
       clobber them; daemon **not** left auto-started before it is
       configured. [`INSTALLATION.md`](INSTALLATION.md).
-- [ ] **Co-resident port/socket overrides** set if both products share a
+- [ ] **Co-resident port/socket overrides** set if both applications share a
       host (default iSCSI/HTTP ports collide).
 - [ ] **Upgrade / rollback plan** — pinned package channel, change
       reviewed (alpha: on-disk and wire formats may change without a

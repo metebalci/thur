@@ -28,7 +28,7 @@ than come up half-broken. Common causes:
   `library.json`. Grow always succeeds; a shrink that would orphan a
   cartridge or a loaded drive is refused. Run `thurvtl library bounds`
   (daemon up) to see the safe-shrink envelope, or raise the counts back.
-- **Missing required key.** `data_dir` is required for both products; VTL
+- **Missing required key.** `data_dir` is required for both applications; VTL
   also requires the `library:` block.
 
 ## A CLI command refuses
@@ -39,8 +39,8 @@ back). See [`CLI.md`](CLI.md) § daemon-mode.
 
 - **"start the daemon" / socket unreachable** — a daemon-routed command
   (most of them) needs the daemon running and the socket reachable. Check
-  `systemctl status`, and that you are in the product group (so you can
-  read `/run/<product>/admin.sock`, mode 0660) — see
+  `systemctl status`, and that you are in the application's group (so you can
+  read `/run/<application>/admin.sock`, mode 0660) — see
   [`INSTALLATION.md`](INSTALLATION.md) § group membership.
 - **"daemon is running, refusing"** — a daemon-down command (e.g.
   `library restore`, `volume key migrate`) refuses while the daemon is

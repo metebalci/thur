@@ -83,7 +83,7 @@ servers:
         default: localhost
       port:
         default: "9090"
-        description: http.listen port (default 9090 for both products).
+        description: http.listen port (default 9090 for both applications).
 
 tags:
   - name: common
@@ -118,7 +118,7 @@ paths:
       summary: Prometheus metrics
       description: >
         Unauthenticated. Prometheus text exposition format. Instrument
-        names are prefixed `thurvtl_*` / `thurvsa_*` per product.
+        names are prefixed `thurvtl_*` / `thurvsa_*` per application.
       operationId: getMetrics
       security: []
       responses:
@@ -154,7 +154,7 @@ paths:
       tags: [common]
       summary: Daemon summary
       description: >
-        Product-specific read-only summary. thurvtld returns library
+        Application-specific read-only summary. thurvtld returns library
         topology; thurvsad returns volume count + iSCSI coordinates.
       operationId: getInfo
       responses:
@@ -178,7 +178,7 @@ paths:
       description: >
         Single-shot snapshot — the same payload the streaming
         `system.monitor` job emits per tick. Pool / storage / dedup /
-        audit counters plus a product-tagged summary.
+        audit counters plus an application-tagged summary.
       operationId: getMonitorSnapshot
       responses:
         "200":
@@ -539,7 +539,7 @@ components:
           enum: [ok]
         daemon:
           type: string
-          description: Product name (thurvtl / thurvsa).
+          description: Application name (thurvtl / thurvsa).
         version:
           type: string
 

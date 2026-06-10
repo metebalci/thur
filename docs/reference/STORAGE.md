@@ -1,7 +1,7 @@
 # Storage Layout
 
-On-disk layout for both products: the shared content-addressed chunk
-pool and the per-unit directory each product keeps for a cartridge or
+On-disk layout for both applications: the shared content-addressed chunk
+pool and the per-unit directory each application keeps for a cartridge or
 volume. Byte-level record layouts for the VTL index files
 (`chunks.idx`, `blocks-p<N>.idx`, `lru.idx`, `manifest.json`) are in
 [`SPEC.md`](SPEC.md) § On-Disk Layout — this document is the
@@ -13,7 +13,7 @@ interaction picture.
 
 ## The shared chunk pool
 
-Both products store sealed chunks in a per-backend content-addressed
+Both applications store sealed chunks in a per-backend content-addressed
 pool under `<data_dir>/chunks/`:
 
 - **Global scope** — `<data_dir>/chunks/<backend>/<aa>/<bb>/<hash>.dat`
@@ -29,7 +29,7 @@ storage-backend key carries no `<backend>` segment. Pool layout, the `local` /
 `global` scope choice, refcount-aware eviction, and GC are the dedup
 mechanism — see [`DEDUP.md`](DEDUP.md).
 
-Each product splits per-unit state into a creation-frozen
+Each application splits per-unit state into a creation-frozen
 **`manifest.json`** (identity: UUID, capacity, backend binding, dedup
 scope, WORM flag — written once, never rewritten on the hot path) and
 a daemon-mutated **`runtime.json`** sidecar (counters and runtime
@@ -228,7 +228,7 @@ the response. BLAKE3 runs once per backend download via
 `ChunkPool::insert_verified_bytes`; the pool refuses bytes that don't
 match the expected content address — so plaintext-uncompressed
 cartridges (which otherwise lack any at-rest integrity check) and the
-VSA block product both get the same backend-corruption guard.
+VSA block path both get the same backend-corruption guard.
 
 GCM and codec checks fire on every block read regardless of the storage
 path. A chunk corrupted by anything other than this daemon (manual

@@ -30,7 +30,7 @@ channel:
 curl -fsSL https://thur.metebalci.com/install.sh | sudo CHANNEL=unstable bash
 ```
 
-Then install one or both products:
+Then install one or both applications:
 
 ```bash
 sudo apt install thurvtl thurvsa        # Debian/Ubuntu
@@ -48,7 +48,7 @@ E1FF A6E4 4D8A F56E BD17  997C 9B4E 436A E137 3A4B
 
 For air-gapped or offline staging, download the `.deb` / `.rpm` from
 [GitHub Releases](https://github.com/metebalci/thur/releases). Each
-release ships separate packages per product. One `.deb` covers Debian
+release ships separate packages per application. One `.deb` covers Debian
 12/13 + Ubuntu 24.04/26.04; one `.rpm` covers RHEL 9/10 + Rocky/Alma +
 SLES 15 SP6+/16 + openSUSE Leap. Only the `.deb` on Ubuntu 26.04 is
 regularly tested; other targets are best-effort.
@@ -66,16 +66,16 @@ build / signing process are in [`../dev/RELEASING.md`](../dev/RELEASING.md).
 - **Do not** auto-start the daemon — it needs configuration first.
 - Never touch `/var/lib/{thurvtl,thurvsa}/` (operator data) on uninstall.
 
-Products co-exist on one host with disjoint users, data dirs, conffiles,
+Both applications co-exist on one host with disjoint users, data dirs, conffiles,
 unit names, and admin sockets — iSCSI/HTTP ports default to the same
 number, so override one in YAML for co-residency.
 
 ## Post-install: group membership
 
 Most CLI commands are **daemon-routed** — they reach the daemon through
-its admin socket (`/run/<product>/admin.sock`, mode 0660, owned by the
-product's system user). To run them as an ordinary user, join that
-product's group (log out and back in to apply):
+its admin socket (`/run/<application>/admin.sock`, mode 0660, owned by the
+application's system user). To run them as an ordinary user, join that
+application's group (log out and back in to apply):
 
 ```bash
 sudo usermod -aG thurvtl $USER
@@ -97,7 +97,7 @@ Configuration is in [`CONFIGURATION.md`](CONFIGURATION.md).
 
 ## Containers
 
-Tagged releases publish multi-arch (amd64 + arm64) images per product,
+Tagged releases publish multi-arch (amd64 + arm64) images per application,
 each carrying both the daemon and the CLI:
 
 ```

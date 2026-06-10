@@ -3,7 +3,7 @@
 Thur VTL cartridges and Thur VSA volumes can be encrypted at rest under
 a pluggable Data Encryption Key (DEK) keystore. This document covers the
 keystore backends and the encrypt / inspect / migrate workflows for both
-products. Storage-backend credentials are in [`AUTH.md`](AUTH.md);
+applications. Storage-backend credentials are in [`AUTH.md`](AUTH.md);
 network and admin-listener security is in
 [`NETWORK_SECURITY.md`](NETWORK_SECURITY.md).
 

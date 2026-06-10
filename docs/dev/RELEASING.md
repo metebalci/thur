@@ -1,6 +1,6 @@
 # Releasing thurvtl and thurvsa
 
-Each release cut produces two `.deb`s and two `.rpm`s — one per product
+Each release cut produces two `.deb`s and two `.rpm`s — one per application
 (`thurvtl` virtual tape library, `thurvsa` virtual storage appliance) — all built from a single
 pinned-glibc container so the resulting binaries install on every
 mainstream Linux distribution. Operators install whichever halves they
@@ -74,12 +74,12 @@ release/                            # .deb / .rpm artifact sources
 ├── thurvsa.yaml                    # thurvsa minimal starter conffile
 ├── thurvsa.env                     # thurvsa daemon env file (storage credentials + ${ENV_VAR} secrets + feature flags)
 └── thurvsa/
-    └── postinst / prerm / postrm   # thurvsa .deb maintainer scripts (separate dir keeps cargo-deb's auto-discovery from confusing the two products)
+    └── postinst / prerm / postrm   # thurvsa .deb maintainer scripts (separate dir keeps cargo-deb's auto-discovery from confusing the two applications)
 (RPM scriptlets are inlined in vtl/cli/Cargo.toml and vsa/cli/Cargo.toml respectively)
 ```
 
 `Containerfile.builder` is build-time only — it produces the artifacts.
-The product ships exclusively as host packages managed by systemd; there
+The software ships exclusively as host packages managed by systemd; there
 are no runtime container images or compose recipes.
 
 The `thurvtl` `.deb` and `.rpm` install:
@@ -119,7 +119,7 @@ Debian convention; the `.rpm` places it at
 ## Daemon is not auto-enabled
 
 The postinst deliberately does NOT enable or start the daemon. Both
-products require an edited conffile before the daemon can start usefully.
+applications require an edited conffile before the daemon can start usefully.
 Auto-enabling on install would simply produce failed-unit logs on every
 fresh installation.
 
@@ -174,7 +174,7 @@ sentinel:
    --all-targets -- -D warnings` and `cargo test --workspace --release`
    as quality gates, then `cargo build --release --workspace` (both
    daemons + both CLIs in one pass). Then `cargo deb` /
-   `cargo generate-rpm` once per product (`vtl-cli`, then `vsa-cli`).
+   `cargo generate-rpm` once per application (`vtl-cli`, then `vsa-cli`).
    Clippy / test failures abort the cut before any artifact is produced.
 
 The first run takes roughly 10 minutes because rustup, cargo-deb, and
@@ -281,7 +281,7 @@ release/tag-release.sh
 ```
 
 The same tag push also triggers `container.yml`, which builds the
-per-product multi-arch (amd64 + arm64) images and publishes them to
+per-application multi-arch (amd64 + arm64) images and publishes them to
 `ghcr.io/<owner>/thurvtl` and `.../thurvsa` (a `v*-*` pre-release tag
 publishes by version only — no `latest` / `major.minor` float). It runs
 independently of the `.deb` / `.rpm` pipeline: a container-build failure

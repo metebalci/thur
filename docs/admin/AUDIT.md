@@ -49,7 +49,7 @@ sub-microsecond `try_send` — it never blocks waiting for disk I/O.
 
 When the channel is full (1024 entries in flight and the writer behind
 on disk), the excess pushes are dropped. These drops are counted as
-`<product>_audit_queue_drops_total` and warn-logged. This is a
+`<application>_audit_queue_drops_total` and warn-logged. This is a
 deliberate policy: dropping one audit entry is preferable to stalling a
 SCSI WRITE command. Shutdown guarantees that everything queued up to and
 including `daemon.stop` is flushed, via a `Shutdown(oneshot)` sentinel.
@@ -57,8 +57,8 @@ including `daemon.stop` is flushed, via a `Shutdown(oneshot)` sentinel.
 Code: `shared/audit/src/audit.rs` (chain core),
 `shared/audit/src/audit_channel.rs` (producer / writer task).
 Daemon hookup in each daemon's `main.rs`. The `system.audit.*` job
-handlers are cross-product in `shared/admin-audit`; the `system audit`
-CLI subcommand is cross-product in `shared/cli-system/src/audit.rs`.
+handlers are cross-application in `shared/admin-audit`; the `system audit`
+CLI subcommand is cross-application in `shared/cli-system/src/audit.rs`.
 The daemon-down audit-queue helper (used by `library partition *` and
 `library restore`) stays VTL-only in `vtl/cli/src/audit_helper.rs`.
 
@@ -97,7 +97,7 @@ is unconditionally on.
 
 Both `thurvtl` and `thurvsa` expose the identical `system audit` verb
 set — the CLI and the daemon-routed job handlers both live in shared
-crates, so the two products cannot drift.
+crates, so the two applications cannot drift.
 
 - `system audit tail [-f]`
 - `system audit export --format jsonl|csv [--from] [--to]`
@@ -168,7 +168,7 @@ iSCSI path, append failures are logged and swallowed.
 A misbehaving initiator — one presenting a wrong CHAP secret or
 sending a broken PREVENT/ALLOW sequence — can generate the same
 failure event on every retry, flooding the chain with near-duplicate
-entries. Both products rate-limit a small allowlist of host-driven
+entries. Both applications rate-limit a small allowlist of host-driven
 failure operations through the same `shared-audit` limiter; only the
 emission sites differ.
 

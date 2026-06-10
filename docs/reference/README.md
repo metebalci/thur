@@ -2,7 +2,7 @@
 
 How Thur works beneath the device surface — wire contracts, conformance
 tables, and storage/transport internals. Not needed to operate the
-products (that's the [Admin Guide](../admin/)); needed to understand,
+applications (that's the [Admin Guide](../admin/)); needed to understand,
 debug, or extend them.
 
 - [SPEC.md](SPEC.md) — the wire specification: SCSI opcodes, VPD / mode /

@@ -10,7 +10,7 @@ iSCSI only; Thur VSA serves iSCSI and/or NVMe/TCP depending on
 | Thur VSA (iSCSI) | `iqn.2025-10.com.metebalci:thurvsa` | 3260 |
 | Thur VSA (NVMe/TCP) | `nqn.2025-10.com.metebalci:thurvsa` | 4420 |
 
-Co-resident installs share port 3260 by default — override one product's
+Co-resident installs share port 3260 by default — override one application's
 port in YAML so they don't clash. The target advertises the connection's
 local IP in discovery, which matters for containers and NAT (see
 [Advertised address](#advertised-address)).
@@ -20,7 +20,7 @@ forget — keep [`ISCSIADM.md`](ISCSIADM.md) handy; it is the initiator-side
 cheatsheet. Authentication setup (CHAP, TLS-PSK, per-host/per-volume
 admission) is in [`NETWORK_SECURITY.md`](NETWORK_SECURITY.md).
 
-## iSCSI (both products)
+## iSCSI (both applications)
 
 ```bash
 # 1. Discover (writes node records under /etc/iscsi/nodes/)

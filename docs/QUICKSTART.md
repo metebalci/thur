@@ -6,7 +6,7 @@ see the whole loop on one machine; swap in a real object-store backend
 later from [`admin/CONFIGURATION.md`](admin/CONFIGURATION.md) and
 [`admin/AUTH.md`](admin/AUTH.md).
 
-Pick the product you want:
+Pick the application you want:
 
 - [Thur VTL](#thur-vtl-quick-start) — a virtual tape library for backup
   software.
@@ -29,7 +29,7 @@ sudo apt install thurvtl    # or thurvsa, or both; dnf/zypper on RPM distros
 
 Packages install the daemon + CLI but **do not** auto-start the daemon —
 it needs configuration first. To run the daemon-routed CLI as a normal
-user, join the product group (log out and back in afterward):
+user, join the application's group (log out and back in afterward):
 
 ```bash
 sudo usermod -aG thurvtl $USER     # and/or thurvsa

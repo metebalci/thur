@@ -85,12 +85,12 @@ empty.
 By convention the self-signed cert and key live under
 `<data_dir>/tls/{cert,key}.pem`. CA-issued certs are less constrained —
 they can live anywhere the daemon user can read. On packaged installs
-`/etc/<product>/tls/` works fine, provided the postinst sets
-`0640 root:<product>` on the key.
+`/etc/<application>/tls/` works fine, provided the postinst sets
+`0640 root:<application>` on the key.
 
 ### Regenerating the self-signed cert
 
-`<product> system regenerate-cert` overwrites the auto-generated
+`<application> system regenerate-cert` overwrites the auto-generated
 cert and key in place. It is a daemon-down command — it refuses to run
 while the admin socket answers — and the rewritten cert is only served
 after a restart. Because it re-derives the SAN list each time, it is
@@ -219,7 +219,7 @@ cheap to replace — re-mint them annually.
 
 The admin Unix socket and the admin HTTP listener authenticate
 differently because they have different things to lean on. The socket
-at `/run/<product>/admin.sock` is local-only and peer-cred-authed: the
+at `/run/<application>/admin.sock` is local-only and peer-cred-authed: the
 kernel hands the daemon the connecting process's uid/gid over
 `SO_PEERCRED`, so membership in the daemon's group is the credential and
 nothing crosses the network. The HTTP listener has none of that. It is a
@@ -249,13 +249,13 @@ one appliance.
 # Interactive — prompts twice, no echo.
 sudo -u thurvsa thurvsa system set-admin-password
 
-# Non-interactive provisioning — read from the per-product env var.
+# Non-interactive provisioning — read from the per-application env var.
 THURVSA_ADMIN_PASSWORD='...' sudo -u thurvsa thurvsa system set-admin-password
 ```
 
-`<product> system set-admin-password` is **daemon-routed**: the daemon
+`<application> system set-admin-password` is **daemon-routed**: the daemon
 owns the on-disk store, so the verb refuses if the daemon is down. It
-prompts twice with no echo, or reads the per-product env var
+prompts twice with no echo, or reads the per-application env var
 `THURVTL_ADMIN_PASSWORD` / `THURVSA_ADMIN_PASSWORD` for non-interactive
 provisioning. The plaintext travels only over the local peer-cred admin
 socket; the daemon hashes it **server-side** with Argon2id (the

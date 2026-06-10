@@ -6,7 +6,7 @@ and tooling is in [`CLAUDE.md`](../../CLAUDE.md).
 - [DEVELOPMENT.md](DEVELOPMENT.md) — build from source, run a daemon from
   the build tree, and the integration-test suites.
 - [WORKSPACE.md](WORKSPACE.md) — the crate map: each crate's API surface
-  and how the two products compose them.
+  and how the two applications compose them.
 - [TESTCOVERAGE.md](TESTCOVERAGE.md) — per-crate coverage floors and the
   end-to-end suite catalogue.
 - [RELEASING.md](RELEASING.md) — the release-cut flow, signing, and the

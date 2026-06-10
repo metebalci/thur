@@ -316,14 +316,14 @@ suffix.
 
 ### thurvsa block (SBC-3) — `iqn.2025-10.com.metebalci:thurvsa`, port 3260
 
-This is the sibling product: a virtual storage appliance that draws
+This is the sibling application: a virtual storage appliance that draws
 on the same backend chunk pool. Internally, volumes are page-grained
 with a default 64 KiB page, but to the host they advertise plain 4 KiB
 sectors over SBC-3 — the paging is invisible at the SCSI surface. The
 iSCSI target IQN is configurable via `iscsi.target_iqn`, and when the
 volume is served over NVMe/TCP (`nvmetcp` listed in `transports:`), the
 subsystem NQN is configurable via `nvmetcp.subnqn`. Both default to
-the per-product identity and are validated at startup. The two
+the per-application identity and are validated at startup. The two
 transports can bind concurrently (`transports: [iscsi, nvmetcp]`,
 issue #66): a volume is then addressable as a SCSI LUN and an NVMe
 namespace (`nsid = lun + 1`) at the same time, sharing one
@@ -377,7 +377,7 @@ COMMAND OPERATION CODE.
 
 #### Persistent reservations (shared: thurvsa block + thurvtl tape drive)
 
-Both products share one persistent-reservation state machine
+Both applications share one persistent-reservation state machine
 (`scsi_spc::reservations::ReservationManager`). The wire surface,
 state model, and PROUT / PRIN encodings below are identical on the
 thurvsa block LUNs and the thurvtl tape **drive** LUNs (LUN ≥ 1); only
@@ -1851,7 +1851,7 @@ Daemon-side: `daemon.start`, `daemon.stop`.
 
 System-side (both daemons, actor = the peer-cred CLI descriptor):
 `system.admin_password.set` — the web-admin password was set or
-changed via `<product> system set-admin-password`. The plaintext is
+changed via `<application> system set-admin-password`. The plaintext is
 hashed server-side and never persisted; `params` carry **no secret**
 (the recorded fields describe only that the set occurred, never the
 password or its hash).
@@ -2164,7 +2164,7 @@ Every emitted metric carries OTel resource attributes:
 ### Metric inventory
 
 Instrument names follow the shape `<prefix>_<subsystem>_<name>`. The
-prefix is per-product — `thurvtl` for this product, `thurvsa` for the
+prefix is per-application — `thurvtl` for this application, `thurvsa` for the
 block target — and both come from `shared_naming::PRODUCT.metric_prefix`.
 The table below gives only the suffix, so read every row as
 `thurvtl_<row>` for this daemon.
@@ -2235,7 +2235,7 @@ global-dedup pool) is surfaced via the `system monitor` job stream's
 sum or filter on `backend` keep working unchanged.
 
 `chunk_logical` / `chunk_unique` are recorded at every chunk seal by
-**both** products — the tape path
+**both** applications — the tape path
 (`core_stream::cartridge::chunking`) and the block path
 (`core_block::uploader`). `logical` rolls up every byte presented to
 the pool (pre-dedup); `unique` only the seals that actually grew the
@@ -2340,7 +2340,7 @@ The plaintext travels only over the local peer-cred admin socket; the
 daemon hashes it server-side with Argon2id, writes the PHC string to
 `admin-password.json`, and the change takes effect immediately (a
 hot-swapped in-process verifier, no restart). Driven by the
-`<product> system set-admin-password` CLI verb.
+`<application> system set-admin-password` CLI verb.
 
 Note: `/sessions` and `/info` were unauthenticated before this gate
 landed; they are now in the protected group. `/metrics` and `/health`
@@ -2386,7 +2386,7 @@ VSA (`thurvsad`):
 }
 ```
 
-The `product` field (`thurvtl` / `thurvsa`) is the Web UI's product
+The `product` field (`thurvtl` / `thurvsa`) is the Web UI's application
 discriminator — `app.js` reads it to decide whether to render the tape
 library or the storage-array view. `listen_addresses` is always a JSON
 array — single-portal installs report one entry, multi-portal installs
@@ -2416,11 +2416,11 @@ are the human-readable companion. A per-daemon test
 (`{vtl,vsa}/daemon/tests/openapi_sync.rs`) fails the build if a mounted
 TCP route is missing from that spec, so the two can't drift.
 
-Cross-product (identical handler on both daemons):
+Cross-application (identical handler on both daemons):
 
 | Method + path | Body |
 |---|---|
-| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / dedup / session / audit counters). The per-product `product` block carries VTL cartridge+drive counts or VSA volume count, and the session count is split into `iscsi_sessions` + `nvmetcp_sessions` on VSA. The `dedup` array carries per-backend lifetime `{logical_bytes, unique_bytes}` (ratio = logical/unique). The Web UI derives its throughput + dedup KPIs and the storage-backends table from this one payload's per-backend byte counters. |
+| `GET /api/v1/monitor` | One-shot monitor snapshot — the same JSON the streaming `system.monitor` job emits per tick (pool / storage / dedup / session / audit counters). The per-application `product` block carries VTL cartridge+drive counts or VSA volume count, and the session count is split into `iscsi_sessions` + `nvmetcp_sessions` on VSA. The `dedup` array carries per-backend lifetime `{logical_bytes, unique_bytes}` (ratio = logical/unique). The Web UI derives its throughput + dedup KPIs and the storage-backends table from this one payload's per-backend byte counters. |
 | `GET /api/v1/jobs/recent` | `{ "jobs": [ { id, kind, started_at, finished, exit_code? } ] }`. A rolling 5-minute window, not a persistent history — finished jobs are reaped 300 s after they end. |
 | `GET /api/v1/audit/tail?lines=N` | `{ "entries": [ … ] }` — the last `N` (default 100, clamped to 1000) entries of the BLAKE3-chained audit log. The one-shot "last N" read, not the streaming `audit tail` job. |
 

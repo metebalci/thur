@@ -337,7 +337,7 @@ the new state via Reservation Report on reconnect.
 
 ## NQN / discovery
 
-The subsystem NQN defaults to the `shared-naming` per-product identity:
+The subsystem NQN defaults to the `shared-naming` per-application identity:
 
 ```rust
 shared_naming::DISK.nqn   // "nqn.2025-10.com.metebalci:thurvsa"

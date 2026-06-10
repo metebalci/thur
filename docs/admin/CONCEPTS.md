@@ -1,12 +1,12 @@
 # Concepts
 
 The mental model an operator needs before configuring and running either
-product. It is deliberately light on internals — the deep mechanics live
+application. It is deliberately light on internals — the deep mechanics live
 in the reference set ([`../reference/STORAGE.md`](../reference/STORAGE.md),
 [`../reference/DEDUP.md`](../reference/DEDUP.md),
 [`../reference/BACKPRESSURE.md`](../reference/BACKPRESSURE.md)).
 
-## Two products, one engine
+## Two applications, one engine
 
 Thur VTL and Thur VSA are siblings on a shared backend. They diverge only
 in the device surface they present and the on-host data shape above it:
@@ -40,7 +40,7 @@ library or volume set.
 
 ## Content-addressed dedup
 
-Both products reduce cartridges/volumes to **chunks** — variable-sized
+Both applications reduce cartridges/volumes to **chunks** — variable-sized
 (VTL) or fixed-page (VSA) byte ranges — keyed by their BLAKE3 hash and
 stored once per backend pool. Identical bytes from any source — across
 every cartridge and volume on a backend — are stored a single time. There
@@ -93,5 +93,5 @@ up with the sustained host write rate. See
 | **Snapshot / clone** (VSA) | Frozen point-in-time page table; a clone is a new writable LUN seeded from one. [`VOLUME.md`](VOLUME.md). |
 | **Backpressure** | Flow control that parks host writes when the cache budget fills, surfacing SCSI NOT READY on timeout. |
 | **DEK / keystore** | Data Encryption Key and the backend that wraps it, for at-rest encryption. |
-| **Admin socket** | The peer-cred-authed Unix socket the daemon-routed CLI talks to (`/run/<product>/admin.sock`). |
+| **Admin socket** | The peer-cred-authed Unix socket the daemon-routed CLI talks to (`/run/<application>/admin.sock`). |
 | **WORM / legal hold** (VTL) | Write-once-read-many retention and backend-native immutability holds. |
