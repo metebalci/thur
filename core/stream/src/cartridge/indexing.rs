@@ -13,7 +13,8 @@
 //!
 //! Covers:
 //! - block-index lookups (`active_block_index`, `next_lba_of`,
-//!   `active_next_lba`, `block_at`, `try_block_at`, `block_at_active`)
+//!   `active_next_lba`, `block_at`, `try_block_at`, `block_run_at`,
+//!   `block_at_active`)
 //! - on-disk encoding (`encode_block_rec`)
 //! - chunk-index access (`read_chunk_rec`, `update_chunk_rec`)
 //!
@@ -60,6 +61,20 @@ impl Cartridge {
             return None;
         }
         self.block_at(partition, lba).ok()
+    }
+
+    /// Read a run of `n` block-index records starting at `lba` in one
+    /// pread — the SPACE walks' batched lookup (issue #104). The run
+    /// must not extend past the partition's `next_lba`; per-record
+    /// decode failures stay positional (the inner `Result`) so a walk
+    /// only observes corruption it actually reaches.
+    pub(super) fn block_run_at(
+        &self,
+        partition: u8,
+        lba: u64,
+        n: usize,
+    ) -> Result<Vec<Result<BlockRec>>> {
+        self.block_indexes[partition as usize].read_run(lba, n)
     }
 
     /// Read a block-index record from the active partition.

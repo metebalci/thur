@@ -1503,6 +1503,166 @@ fn space_16_filemarks_past_eod_returns_residual() {
     assert_eq!(info, 5, "INFORMATION = count − moved (=5, moved=0)");
 }
 
+/// SPACE(16) with a count whose residual exceeds the 4-byte
+/// INFORMATION field of fixed-format sense: SPC-4 §4.5.2 requires
+/// VALID=0 (no INFORMATION) instead of a truncated value (issue
+/// #104). EOD-shortfall branch: count = 2^40 records on an empty
+/// cartridge → residual 2^40 is unrepresentable.
+#[test]
+fn space_16_huge_count_eod_shortfall_clears_valid() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x91);
+    c[6] = 0x01; // count (cdb[4..12] BE) = 0x0000_0100_0000_0000 = 2^40
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("EOD shortfall carries sense");
+    assert_eq!(sense[2] & 0x0F, 0x08, "sense key BLANK_CHECK");
+    assert_eq!([sense[12], sense[13]], [0x00, 0x05], "EOD detected");
+    assert_eq!(
+        sense[0] & 0x80,
+        0x00,
+        "VALID must be 0 — residual exceeds the INFORMATION field"
+    );
+    assert_eq!(
+        [sense[3], sense[4], sense[5], sense[6]],
+        [0u8; 4],
+        "INFORMATION left zero"
+    );
+}
+
+/// Same VALID=0 rule on the filemark-halt branch: a filemark at LBA 0,
+/// then SPACE(16) records count = 2^40 halts on it with moved = 0 and
+/// residual 2^40 — FM bit set, but no INFORMATION.
+#[test]
+fn space_16_huge_count_filemark_halt_clears_valid() {
+    let fx = Fixture::new();
+
+    // One filemark, then rewind.
+    let mut c = cdb(0x10);
+    c[4] = 1;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    assert_eq!(
+        handlers::handle_write_filemarks_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+
+    let mut c = cdb(0x91);
+    c[6] = 0x01; // count = 2^40, code = records
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("filemark halt carries sense");
+    assert_eq!(sense[2] & 0x0F, 0x00, "sense key NO SENSE");
+    assert_eq!(sense[2] & 0x80, 0x80, "FM bit set");
+    assert_eq!([sense[12], sense[13]], [0x00, 0x01], "Filemark detected");
+    assert_eq!(sense[0] & 0x80, 0x00, "VALID must be 0");
+    assert_eq!([sense[3], sense[4], sense[5], sense[6]], [0u8; 4]);
+}
+
+/// And on the backward/BOP branch: count = −2^40 from BOT under-travels
+/// with residual −2^40 — NO SENSE + 00/04, VALID=0.
+#[test]
+fn space_16_huge_negative_count_bop_shortfall_clears_valid() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x91);
+    // count (cdb[4..12] BE) = -(2^40) = 0xFFFF_FF00_0000_0000
+    c[4] = 0xFF;
+    c[5] = 0xFF;
+    c[6] = 0xFF;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("BOP shortfall carries sense");
+    assert_eq!(sense[2] & 0x0F, 0x00, "sense key NO SENSE");
+    assert_eq!(
+        [sense[12], sense[13]],
+        [0x00, 0x04],
+        "Beginning-of-Partition detected"
+    );
+    assert_eq!(sense[0] & 0x80, 0x00, "VALID must be 0");
+    assert_eq!([sense[3], sense[4], sense[5], sense[6]], [0u8; 4]);
+}
+
+/// In-range SPACE(16) residuals keep VALID=1 — the §4.5.2 guard only
+/// fires when the value is unrepresentable.
+#[test]
+fn space_16_in_range_residual_keeps_valid() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x91);
+    c[11] = 9; // count = 9 records on an empty cartridge
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("EOD shortfall carries sense");
+    assert_eq!(sense[0] & 0x80, 0x80, "VALID set for in-range residual");
+    let info = u32::from_be_bytes([sense[3], sense[4], sense[5], sense[6]]);
+    assert_eq!(info, 9, "INFORMATION = count − moved");
+}
+
+/// The exact i32 boundary of the §4.5.2 gate: residual = i32::MAX (an
+/// empty cartridge moves 0, so residual = count) is the largest
+/// representable value — VALID=1; one past it flips to VALID=0.
+#[test]
+fn space_16_residual_valid_flips_exactly_past_i32() {
+    let fx = Fixture::new();
+
+    // count = 0x7FFF_FFFF → residual i32::MAX, still representable.
+    let mut c = cdb(0x91);
+    c[8] = 0x7F;
+    c[9] = 0xFF;
+    c[10] = 0xFF;
+    c[11] = 0xFF;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    let sense = resp.sense.expect("EOD shortfall carries sense");
+    assert_eq!(sense[0] & 0x80, 0x80, "VALID set at residual = i32::MAX");
+    let info = u32::from_be_bytes([sense[3], sense[4], sense[5], sense[6]]);
+    assert_eq!(info, 0x7FFF_FFFF);
+
+    // count = 0x8000_0000 → residual 2^31, one past i32::MAX → VALID=0.
+    let mut c = cdb(0x91);
+    c[8] = 0x80;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    let sense = resp.sense.expect("EOD shortfall carries sense");
+    assert_eq!(sense[0] & 0x80, 0x00, "VALID clear at residual = 2^31");
+    assert_eq!([sense[3], sense[4], sense[5], sense[6]], [0u8; 4]);
+}
+
+/// In-range *negative* residuals stay two's-complement encoded with
+/// VALID=1 (the i32 gate must not disturb the backward/BOP encoding).
+#[test]
+fn space_16_in_range_negative_residual_keeps_twos_complement() {
+    let fx = Fixture::new();
+    let mut c = cdb(0x91);
+    // count = -5 records from BOT: moved = 0, residual = -5.
+    let neg5 = (-5i64).to_be_bytes();
+    c[4..12].copy_from_slice(&neg5);
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, c);
+    let resp = handlers::handle_space_16(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    let sense = resp.sense.expect("BOP shortfall carries sense");
+    assert_eq!([sense[12], sense[13]], [0x00, 0x04], "BOP detected");
+    assert_eq!(sense[0] & 0x80, 0x80, "VALID set for in-range residual");
+    assert_eq!(
+        [sense[3], sense[4], sense[5], sense[6]],
+        [0xFF, 0xFF, 0xFF, 0xFB],
+        "INFORMATION = -5 two's complement"
+    );
+}
+
 /// SPACE(6) FILEMARKS with count=0 stays GOOD — no demarcations were
 /// requested, so no residual is owed even when nothing was crossed.
 #[test]

@@ -181,11 +181,11 @@ fn test_space_records() {
     assert_eq!(cartridge.position(), 0);
 
     // Space forward 3 records
-    cartridge.space_records(3);
+    cartridge.space_records(3).unwrap();
     assert_eq!(cartridge.position(), 3);
 
     // Space forward 2 more
-    cartridge.space_records(2);
+    cartridge.space_records(2).unwrap();
     assert_eq!(cartridge.position(), 5);
 }
 
@@ -201,14 +201,14 @@ fn test_space_filemarks() {
     cartridge.rewind();
 
     // Space forward 1 filemark (should position after first FM)
-    cartridge.space_filemarks(1);
+    cartridge.space_filemarks(1).unwrap();
 
     // Next read should be the first block of file 2
     let block = cartridge.read_next().unwrap();
     assert_eq!(block.kind, BlockKind::Data);
 
     // Space forward 1 more filemark
-    cartridge.space_filemarks(1);
+    cartridge.space_filemarks(1).unwrap();
 
     // Next read should be the first block of file 3
     let block = cartridge.read_next().unwrap();
@@ -236,20 +236,24 @@ fn test_space_backward_filemarks_adjacent_to_bop() {
     // Forward 1 filemark lands the head between the two (LBA 1) — the
     // position the kernel `st` driver sits at before `mt bsf 1`.
     cart.rewind();
-    assert_eq!(cart.space_filemarks(1), 1, "crossed FM@LBA0");
+    assert_eq!(cart.space_filemarks(1).unwrap(), 1, "crossed FM@LBA0");
     assert_eq!(cart.position(), 1, "head between the two filemarks");
 
     // Backward 2 filemarks: only FM@LBA0 lies behind, so the head
     // crosses it, hits BOP, and under-travels (moved = -1 of -2).
     assert_eq!(
-        cart.space_filemarks(-2),
+        cart.space_filemarks(-2).unwrap(),
         -1,
         "crossed one filemark before BOP",
     );
     assert_eq!(cart.position(), 0, "head parked at BOP");
 
     // A further backward space from BOP crosses nothing.
-    assert_eq!(cart.space_filemarks(-1), 0, "no filemark behind BOP");
+    assert_eq!(
+        cart.space_filemarks(-1).unwrap(),
+        0,
+        "no filemark behind BOP"
+    );
     assert_eq!(cart.position(), 0);
 }
 
@@ -357,14 +361,14 @@ fn test_rewrite_after_space_truncates_trailing_filemark() {
     let small = vec![0xAA_u8; 347_200];
     for i in 0..7u64 {
         cart.rewind();
-        cart.space_records(i as i64);
+        cart.space_records(i as i64).unwrap();
         cart.write_data(Bytes::from(small.clone())).unwrap();
         cart.write_filemark().unwrap();
     }
     assert_eq!(cart.next_lba(), 8);
 
     cart.rewind();
-    cart.space_records(7);
+    cart.space_records(7).unwrap();
     assert_eq!(cart.position(), 7);
     let big = vec![0xBB_u8; 4_194_304];
     cart.write_data(Bytes::from(big.clone())).unwrap();

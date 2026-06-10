@@ -357,6 +357,32 @@ impl BlockIndexFile {
         BlockRec::decode(&buf)
     }
 
+    /// Read `n` consecutive records starting at `lba` with a single
+    /// pread. The whole run must lie below `next_lba` — a run
+    /// extending past the end is a caller's bug, same contract as
+    /// [`Self::read`]. Batches the SPACE walks' per-record lookups
+    /// (issue #104): one 16-byte pread per record meant millions of
+    /// synchronous syscalls under the drive lock on a record-dense
+    /// tape.
+    ///
+    /// Decode failures are per-record (the inner `Result`) so a walk
+    /// that stops before reaching a corrupt record never observes it
+    /// — read-ahead must not make a batched walk fail where the
+    /// per-record walk would have stopped cleanly. Only the pread
+    /// itself failing (or a run past `next_lba`) is the outer error.
+    pub fn read_run(&self, lba: u64, n: usize) -> Result<Vec<Result<BlockRec>>> {
+        if lba + n as u64 > self.next_lba.load(Ordering::Acquire) {
+            return Err(SmcError::InvalidOp("block index read_run past next_lba"));
+        }
+        let mut buf = vec![0u8; n * RECORD_SIZE];
+        self.file
+            .read_exact_at(&mut buf, Self::record_offset(lba))?;
+        Ok(buf
+            .chunks_exact(RECORD_SIZE)
+            .map(|rec| BlockRec::decode(rec.try_into().expect("chunk is RECORD_SIZE")))
+            .collect())
+    }
+
     /// Truncate to `new_next_lba` records. Used by ERASE / FORMAT
     /// MEDIUM, and by writes that erase everything past the head.
     /// Header is preserved.
@@ -586,6 +612,72 @@ mod tests {
         bif.append(&BlockRec::data()).unwrap();
         assert!(bif.read(0).is_ok());
         assert!(bif.read(1).is_err());
+    }
+
+    #[test]
+    fn read_run_matches_per_record_reads() {
+        let tmp = TempDir::new().unwrap();
+        let bif = BlockIndexFile::open_or_create(tmp.path(), 0).unwrap();
+        for i in 0..20u64 {
+            bif.append(&BlockRec {
+                chunk_id: 1,
+                offset: (i * 64) as u32,
+                len: 64,
+                kind: if i == 7 {
+                    BlockKind::Filemark
+                } else {
+                    BlockKind::Data
+                },
+                encryption: EncryptionTag::None,
+                compression: None,
+            })
+            .unwrap();
+        }
+        let run = bif.read_run(5, 10).unwrap();
+        assert_eq!(run.len(), 10);
+        for (i, rec) in run.iter().enumerate() {
+            assert_eq!(*rec.as_ref().unwrap(), bif.read(5 + i as u64).unwrap());
+        }
+        assert!(matches!(run[2].as_ref().unwrap().kind, BlockKind::Filemark));
+        // Zero-length run is fine, even at next_lba.
+        assert!(bif.read_run(20, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_run_past_end_errors() {
+        let tmp = TempDir::new().unwrap();
+        let bif = BlockIndexFile::open_or_create(tmp.path(), 0).unwrap();
+        for _ in 0..4 {
+            bif.append(&BlockRec::data()).unwrap();
+        }
+        // A run that extends past next_lba is refused outright — no
+        // silent clamp (callers pair positions with records 1:1).
+        assert!(bif.read_run(2, 3).is_err());
+        assert!(bif.read_run(4, 1).is_err());
+        assert!(bif.read_run(2, 2).is_ok());
+    }
+
+    #[test]
+    fn read_run_reports_decode_errors_per_record() {
+        let tmp = TempDir::new().unwrap();
+        let path = BlockIndexFile::path_for(tmp.path(), 0);
+        {
+            let bif = BlockIndexFile::open_or_create(tmp.path(), 0).unwrap();
+            for _ in 0..3 {
+                bif.append(&BlockRec::data()).unwrap();
+            }
+            bif.fsync().unwrap();
+        }
+        // Corrupt record 1's flag byte with a reserved encryption tag.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_SIZE + RECORD_SIZE + 12] = 2 << FLAG_ENC_SHIFT;
+        std::fs::write(&path, &bytes).unwrap();
+        let bif = BlockIndexFile::open_or_create(tmp.path(), 0).unwrap();
+        // The corruption stays positional: only record 1's slot errors.
+        let run = bif.read_run(0, 3).unwrap();
+        assert!(run[0].is_ok());
+        assert!(matches!(run[1], Err(SmcError::InvalidOp(_))));
+        assert!(run[2].is_ok());
     }
 
     #[test]

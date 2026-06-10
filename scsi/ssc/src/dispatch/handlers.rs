@@ -445,10 +445,10 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         let old_lba = cart.head_lba();
         let (moved, hit_filemark) = match code {
             0x00 => {
-                let r = cart.space_records(count as i64);
+                let r = cart.space_records(count as i64)?;
                 (r.moved, r.hit_filemark)
             }
-            0x01 => (cart.space_filemarks(count as i64), false),
+            0x01 => (cart.space_filemarks(count as i64)?, false),
             0x03 => {
                 cart.space_to_eod();
                 (count as i64, false)
@@ -559,10 +559,10 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         let old_lba = cart.head_lba();
         let (moved, hit_filemark) = match code {
             0x00 => {
-                let r = cart.space_records(count);
+                let r = cart.space_records(count)?;
                 (r.moved, r.hit_filemark)
             }
-            0x01 => (cart.space_filemarks(count), false),
+            0x01 => (cart.space_filemarks(count)?, false),
             0x03 => {
                 cart.space_to_eod();
                 (count, false)
@@ -588,23 +588,30 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             // — same FILEMARK DETECTED + residual contract as SPACE(6); see
             // the issue #102 commentary there. Checked before the EOD/BOP
             // shortfall below.
+            //
+            // SPC-4 §4.5.2: VALID may only be set when the value fits the
+            // 4-byte INFORMATION field. The 8-byte count can produce a
+            // residual beyond i32 range — omit INFORMATION (VALID=0)
+            // rather than report a truncated value (issue #104). SPACE(6)
+            // is immune: its sign-extended 24-bit count keeps residuals
+            // in range.
             if code == 0x00 && hit_filemark {
-                let residual = (count.wrapping_sub(moved) & 0xFFFF_FFFF) as u32;
-                let sense = scsi::sense::SenseDataBuilder::new(
+                let mut sense = scsi::sense::SenseDataBuilder::new(
                     scsi::sense::SenseKey::NoSense,
                     scsi::sense::ASC_FILEMARK_DETECTED,
                 )
-                .with_filemark()
-                .with_information(residual)
-                .build();
-                return Ok(ScsiResp::check_condition_with_sense(sense));
+                .with_filemark();
+                if let Ok(residual) = i32::try_from(count - moved) {
+                    sense = sense.with_information(residual as u32);
+                }
+                return Ok(ScsiResp::check_condition_with_sense(sense.build()));
             }
             // Same residual + direction-aware sense as SPACE(6) — see
             // commentary there for the bareos / Linux-st / issue #73
             // context. Forward shortfall = EOD (Blank Check, 00/05);
-            // backward shortfall = BOP (NO SENSE, 00/04).
+            // backward shortfall = BOP (NO SENSE, 00/04). Same VALID=0
+            // rule as above when the residual exceeds the field.
             if (code == 0x00 || code == 0x01) && moved != count {
-                let residual = (count.wrapping_sub(moved) & 0xFFFF_FFFF) as u32;
                 let (key, asc) = if count < 0 {
                     (
                         scsi::sense::SenseKey::NoSense,
@@ -616,10 +623,11 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                         scsi::sense::ASC_EOD_DETECTED,
                     )
                 };
-                let sense = scsi::sense::SenseDataBuilder::new(key, asc)
-                    .with_information(residual)
-                    .build();
-                return Ok(ScsiResp::check_condition_with_sense(sense));
+                let mut sense = scsi::sense::SenseDataBuilder::new(key, asc);
+                if let Ok(residual) = i32::try_from(count - moved) {
+                    sense = sense.with_information(residual as u32);
+                }
+                return Ok(ScsiResp::check_condition_with_sense(sense.build()));
             }
             Ok(ScsiResp::good())
         }

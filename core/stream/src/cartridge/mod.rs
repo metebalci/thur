@@ -14,8 +14,9 @@ mod storage;
 mod chunking;
 
 // Block-index + chunk-index helpers (active_block_index, next_lba_of,
-// active_next_lba, block_at, try_block_at, block_at_active,
-// encode_block_rec, read_chunk_rec, update_chunk_rec) live in
+// active_next_lba, block_at, try_block_at, block_run_at,
+// block_at_active, encode_block_rec, read_chunk_rec,
+// update_chunk_rec) live in
 // cartridge/indexing.rs. Read-state-machine helpers
 // (maybe_decompress, maybe_decrypt, open_chunk_for_read) stay here
 // pending a future reading.rs extraction.
@@ -51,6 +52,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Max size of a chunk file before rolling to the next (128 MiB).
 const CHUNK_ROLL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Block-index records per pread in the SPACE walks (64 KiB per batch
+/// at 16 B per record). The walks scan per-record so the SSC-4 §7.5
+/// filemark stop lands exactly, but reading the fixed-size index one
+/// record per pread made a record-dense SPACE millions of synchronous
+/// syscalls under the drive lock (issue #104).
+const SPACE_WALK_BATCH: u64 = 4096;
 
 /// Maximum number of partitions on an LTO tape (LTO-5+ supports 2 under LTFS).
 pub const MAX_PARTITIONS: u8 = 2;
@@ -2757,55 +2765,80 @@ impl Cartridge {
     /// not counted as a record, and [`SpaceRecordsResult::hit_filemark`] is
     /// set so the SCSI layer can report FILEMARK DETECTED + residual. Motion
     /// also stops at BOP / EOD (a short move with `hit_filemark == false`).
-    pub fn space_records(&mut self, delta: i64) -> SpaceRecordsResult {
+    ///
+    /// An index-read failure (EIO or a corrupt record in
+    /// `blocks-p<N>.idx`) aborts the walk with the error instead of
+    /// classifying the unreadable block as a data record (issue #104);
+    /// the SCSI layer surfaces it as CHECK CONDITION like the data-read
+    /// path does. The error is positional — a walk that stops on a
+    /// filemark / BOP / EOD before reaching the corrupt record never
+    /// observes it — and the head is left where the walk stopped, so
+    /// positions crossed before the failure stay crossed.
+    pub fn space_records(&mut self, delta: i64) -> Result<SpaceRecordsResult> {
         let part_idx = self.runtime.active_partition;
-        let max = self.active_next_lba();
         if delta > 0 {
+            let max = self.active_next_lba();
             let mut moved = 0i64;
             while moved < delta && self.head_lba < max {
-                // Spacing over the block at the head; if it is a filemark,
-                // cross it and stop on its EOP side without counting it.
-                if self
-                    .try_block_at(part_idx, self.head_lba)
-                    .is_some_and(|bi| bi.kind == BlockKindSerde::Filemark)
-                {
+                // One pread per batch instead of one per record (issue
+                // #104); the scan stays per-record so the §7.5 filemark
+                // stop is exact.
+                let n = ((delta - moved) as u64)
+                    .min(max - self.head_lba)
+                    .min(SPACE_WALK_BATCH) as usize;
+                let recs = self.block_run_at(part_idx, self.head_lba, n)?;
+                for rec in recs {
+                    let rec = rec?;
+                    // Spacing over the block at the head; if it is a
+                    // filemark, cross it and stop on its EOP side without
+                    // counting it.
+                    if matches!(rec.kind, BlockKind::Filemark) {
+                        self.head_lba += 1;
+                        return Ok(SpaceRecordsResult {
+                            moved,
+                            hit_filemark: true,
+                        });
+                    }
                     self.head_lba += 1;
-                    return SpaceRecordsResult {
-                        moved,
-                        hit_filemark: true,
-                    };
+                    moved += 1;
                 }
-                self.head_lba += 1;
-                moved += 1;
             }
-            SpaceRecordsResult {
+            Ok(SpaceRecordsResult {
                 moved,
                 hit_filemark: false,
-            }
+            })
         } else {
             let mut moved = 0i64;
             while moved > delta && self.head_lba > 0 {
-                let prev = self.head_lba - 1;
-                // Spacing backward over the block behind the head; if it is a
-                // filemark, stop on its BOP side (head at the filemark's LBA)
-                // without counting it.
-                if self
-                    .try_block_at(part_idx, prev)
-                    .is_some_and(|bi| bi.kind == BlockKindSerde::Filemark)
-                {
+                // wrapping_sub: |delta| can be 2^63 (count = i64::MIN is
+                // legal in the 8-byte CDB), out of i64 range; the true
+                // difference always fits u64.
+                let n = (moved.wrapping_sub(delta) as u64)
+                    .min(self.head_lba)
+                    .min(SPACE_WALK_BATCH) as usize;
+                let start = self.head_lba - n as u64;
+                let recs = self.block_run_at(part_idx, start, n)?;
+                for rec in recs.into_iter().rev() {
+                    let rec = rec?;
+                    let prev = self.head_lba - 1;
+                    // Spacing backward over the block behind the head; if
+                    // it is a filemark, stop on its BOP side (head at the
+                    // filemark's LBA) without counting it.
+                    if matches!(rec.kind, BlockKind::Filemark) {
+                        self.head_lba = prev;
+                        return Ok(SpaceRecordsResult {
+                            moved,
+                            hit_filemark: true,
+                        });
+                    }
                     self.head_lba = prev;
-                    return SpaceRecordsResult {
-                        moved,
-                        hit_filemark: true,
-                    };
+                    moved -= 1;
                 }
-                self.head_lba = prev;
-                moved -= 1;
             }
-            SpaceRecordsResult {
+            Ok(SpaceRecordsResult {
                 moved,
                 hit_filemark: false,
-            }
+            })
         }
     }
 
@@ -2813,9 +2846,10 @@ impl Cartridge {
     /// prefetch cancellation for large movements). Cancels prefetches if
     /// moving more than 2 blocks (likely not sequential anymore). Filemark
     /// semantics match [`Cartridge::space_records`].
-    pub async fn space_records_async(&mut self, delta: i64) -> SpaceRecordsResult {
+    pub async fn space_records_async(&mut self, delta: i64) -> Result<SpaceRecordsResult> {
         // Cancel prefetches if moving more than 2 blocks
-        if delta.abs() > 2 {
+        // (unsigned_abs: plain abs() panics on i64::MIN in debug builds).
+        if delta.unsigned_abs() > 2 {
             self.cancel_prefetches().await;
         }
         self.space_records(delta)
@@ -2825,44 +2859,66 @@ impl Cartridge {
     /// or backward (−). Semantics: move the head to the block **after** the
     /// Nth filemark crossed (like SSC). Returns the number of filemarks
     /// actually crossed.
-    pub fn space_filemarks(&mut self, n: i64) -> i64 {
+    ///
+    /// Index-read failures abort the walk with the error instead of
+    /// classifying the unreadable block as a non-filemark (issue #104),
+    /// positional like [`Cartridge::space_records`]. One difference: this
+    /// walk tracks its position in a local and commits `head_lba` only on
+    /// success, so an error leaves the head at the starting position.
+    pub fn space_filemarks(&mut self, n: i64) -> Result<i64> {
         if n == 0 {
-            return 0;
+            return Ok(0);
         }
         let part_idx = self.runtime.active_partition;
         let mut moved = 0i64;
 
         if n > 0 {
-            // forward
+            // forward — batched preads (issue #104); every record up to
+            // part_next must be scanned, so the batch is bounded by the
+            // span, not the count.
             let mut lba = self.head_lba;
             let part_next = self.next_lba_of(part_idx);
             while lba < part_next && moved < n {
-                if let Some(bi) = self.try_block_at(part_idx, lba)
-                    && bi.kind == BlockKindSerde::Filemark
-                {
-                    moved += 1;
+                let batch = (part_next - lba).min(SPACE_WALK_BATCH) as usize;
+                let recs = self.block_run_at(part_idx, lba, batch)?;
+                for rec in recs {
+                    let rec = rec?;
+                    lba += 1;
+                    if matches!(rec.kind, BlockKind::Filemark) {
+                        moved += 1;
+                        if moved >= n {
+                            break;
+                        }
+                    }
                 }
-                lba += 1;
             }
             // position is after last crossed filemark
             self.head_lba = lba.min(part_next);
-            moved
+            Ok(moved)
         } else {
-            // backward
+            // backward — batched preads, scanned high-to-low.
             let mut lba: i64 = self.head_lba as i64 - 1; // start checking previous block
             let mut last_fm_lba: i64 = -1;
             while lba >= 0 && moved > n {
-                // n is negative, e.g. -2; we count down
-                if let Some(bi) = self.try_block_at(part_idx, lba as u64)
-                    && bi.kind == BlockKindSerde::Filemark
-                {
-                    moved -= 1; // moving "one filemark backward"
-                    last_fm_lba = lba;
+                let end = lba as u64 + 1; // exclusive
+                let batch = end.min(SPACE_WALK_BATCH) as usize;
+                let start = end - batch as u64;
+                let recs = self.block_run_at(part_idx, start, batch)?;
+                for (i, rec) in recs.into_iter().enumerate().rev() {
+                    let rec = rec?;
+                    // n is negative, e.g. -2; we count down
+                    if matches!(rec.kind, BlockKind::Filemark) {
+                        moved -= 1; // moving "one filemark backward"
+                        last_fm_lba = start as i64 + i as i64;
+                    }
+                    lba = start as i64 + i as i64 - 1;
+                    if moved <= n {
+                        break;
+                    }
                 }
-                lba -= 1;
             }
             if moved == 0 {
-                return moved;
+                return Ok(moved);
             }
             // SSC-4 §7.5: after a backward SPACE FILEMARKS, the logical
             // position is "immediately before the |count|-th filemark in
@@ -2882,7 +2938,7 @@ impl Cartridge {
                 new_head = part_next;
             }
             self.head_lba = new_head;
-            moved
+            Ok(moved)
         }
     }
 
@@ -3501,7 +3557,7 @@ mod space_then_write_repro {
         assert_eq!(cart.head_lba(), 5);
 
         // Space back 2 records: head 5 -> 3. No filemark in the span.
-        let r = cart.space_records(-2);
+        let r = cart.space_records(-2).unwrap();
         assert_eq!(r.moved, -2);
         assert!(!r.hit_filemark);
         assert_eq!(cart.head_lba(), 3);
@@ -3547,7 +3603,7 @@ mod space_then_write_repro {
         cart.locate(0).unwrap();
         // Ask to space 5 records forward. Conformant: space R0,R1,R2 (3),
         // hit the FM at LBA 3, stop on its EOP side (head = 4).
-        let r = cart.space_records(5);
+        let r = cart.space_records(5).unwrap();
         assert!(r.hit_filemark, "must report the filemark stop");
         assert_eq!(r.moved, 3, "only the 3 records before the FM are spaced");
         assert_eq!(cart.head_lba(), 4, "head left just past the filemark");
@@ -3563,7 +3619,7 @@ mod space_then_write_repro {
         // From EOD (head = 6) space back 5 records. Conformant: space R5,R4
         // (2), hit the FM at LBA 3, stop on its BOP side (head = 3).
         cart.locate(6).unwrap();
-        let r = cart.space_records(-5);
+        let r = cart.space_records(-5).unwrap();
         assert!(r.hit_filemark);
         assert_eq!(r.moved, -2, "only the 2 records after the FM are spaced");
         assert_eq!(cart.head_lba(), 3, "head left at the filemark's LBA");
@@ -3577,10 +3633,165 @@ mod space_then_write_repro {
             cart.write_data(rec(0x20 + i)).unwrap();
         }
         cart.locate(1).unwrap();
-        let r = cart.space_records(3);
+        let r = cart.space_records(3).unwrap();
         assert!(!r.hit_filemark);
         assert_eq!(r.moved, 3);
         assert_eq!(cart.head_lba(), 4);
+    }
+}
+
+#[cfg(test)]
+mod space_walk_hardening {
+    //! Issue #104: SPACE walks must surface index-read errors instead
+    //! of classifying an unreadable block as a data record, and the
+    //! batched preads must preserve the per-record walk's semantics
+    //! across batch boundaries.
+    use super::*;
+    use crate::block_index::{HEADER_SIZE, RECORD_SIZE};
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    fn make_cart(tmp: &TempDir) -> Cartridge {
+        let tapes = tmp.path().join("tapes");
+        Cartridge::create_with_chunking(
+            &tapes,
+            "SPACE04",
+            ChunkingMode::Fixed { size_bytes: 4096 },
+            8,
+            "primary",
+            false,
+            DedupScope::Global,
+        )
+        .expect("create_with_chunking")
+    }
+
+    /// Flip record `lba`'s flag byte in `blocks-p0.idx` to a reserved
+    /// encryption tag so decode fails — the closest stand-in for a
+    /// local-disk fault the walk can hit.
+    fn corrupt_index_record(tmp: &TempDir, lba: u64) {
+        let idx = tmp
+            .path()
+            .join("tapes")
+            .join("SPACE04")
+            .join("blocks-p0.idx");
+        let mut bytes = std::fs::read(&idx).expect("read index");
+        bytes[HEADER_SIZE + lba as usize * RECORD_SIZE + 12] = 2 << 1; // enc tag 2 = reserved
+        std::fs::write(&idx, &bytes).expect("write index");
+    }
+
+    /// Before #104, `try_block_at(..).ok()` made an index-read error
+    /// indistinguishable from a data record: the walk crossed it,
+    /// counted it in `moved`, and the command completed GOOD —
+    /// reintroducing the #102 desync class on the fault path.
+    #[test]
+    fn space_walks_surface_index_read_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        // R R R FM, with record 1's index entry corrupted.
+        for i in 0..3u8 {
+            cart.write_data(Bytes::from(vec![i; 64])).unwrap();
+        }
+        cart.write_filemark().unwrap();
+        corrupt_index_record(&tmp, 1);
+
+        cart.locate(0).unwrap();
+        assert!(cart.space_records(3).is_err(), "forward records walk");
+        assert_eq!(cart.head_lba(), 1, "record 0 was crossed before the fault");
+        cart.locate(0).unwrap();
+        assert!(cart.space_filemarks(1).is_err(), "forward filemarks walk");
+
+        // Backward from the FM's BOP side: record 2 crosses, record 1
+        // faults.
+        cart.locate(3).unwrap();
+        assert!(cart.space_records(-3).is_err(), "backward records walk");
+        assert_eq!(cart.head_lba(), 2, "record 2 was crossed before the fault");
+        cart.locate(3).unwrap();
+        assert!(cart.space_filemarks(-1).is_err(), "backward filemarks walk");
+    }
+
+    /// The error is positional: a walk that stops on a filemark before
+    /// reaching the corrupt record must not observe it, even though the
+    /// batched pread already covered it. `mt fsr` inside a healthy file
+    /// must keep working when the *next* file's index is damaged.
+    #[test]
+    fn space_walks_ignore_corruption_past_their_stop_point() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        // R R FM R(corrupt) — all within one batch.
+        cart.write_data(Bytes::from(vec![1u8; 64])).unwrap();
+        cart.write_data(Bytes::from(vec![2u8; 64])).unwrap();
+        cart.write_filemark().unwrap();
+        cart.write_data(Bytes::from(vec![3u8; 64])).unwrap();
+        corrupt_index_record(&tmp, 3);
+
+        // Forward records: stops cleanly on the FM at LBA 2.
+        cart.locate(0).unwrap();
+        let r = cart.space_records(10).unwrap();
+        assert!(r.hit_filemark);
+        assert_eq!(r.moved, 2);
+        assert_eq!(cart.head_lba(), 3);
+
+        // Forward filemarks: the 1st FM satisfies the count before the
+        // corrupt record is decoded.
+        cart.locate(0).unwrap();
+        assert_eq!(cart.space_filemarks(1).unwrap(), 1);
+        assert_eq!(cart.head_lba(), 3);
+
+        // Backward from EOD must fault — the corrupt record is the
+        // first block in the path of motion.
+        cart.locate(4).unwrap();
+        assert!(cart.space_records(-1).is_err());
+    }
+
+    /// Walks crossing the SPACE_WALK_BATCH pread boundary (4096
+    /// records) behave exactly like the per-record walk: filemark
+    /// stops land on the right side, counts and head position match.
+    #[test]
+    fn space_walks_cross_batch_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        // 4106 records, a filemark at LBA 4106, 40 more records:
+        // the walks must carry state across the 4096-record batch.
+        let n_before = SPACE_WALK_BATCH + 10;
+        for _ in 0..n_before {
+            cart.write_data(Bytes::from(vec![0xAB; 16])).unwrap();
+        }
+        cart.write_filemark().unwrap();
+        for _ in 0..40 {
+            cart.write_data(Bytes::from(vec![0xCD; 16])).unwrap();
+        }
+        let eod = n_before + 1 + 40;
+
+        // Forward records: stops on the FM's EOP side after a full batch.
+        cart.locate(0).unwrap();
+        let r = cart.space_records(9_999).unwrap();
+        assert!(r.hit_filemark);
+        assert_eq!(r.moved, n_before as i64);
+        assert_eq!(cart.head_lba(), n_before + 1);
+
+        // Backward records from EOD: stops on the FM's BOP side.
+        cart.locate(eod).unwrap();
+        let r = cart.space_records(-9_999).unwrap();
+        assert!(r.hit_filemark);
+        assert_eq!(r.moved, -40);
+        assert_eq!(cart.head_lba(), n_before);
+
+        // Forward records short of the FM: full count, no stop.
+        cart.locate(0).unwrap();
+        let r = cart.space_records(n_before as i64).unwrap();
+        assert!(!r.hit_filemark);
+        assert_eq!(r.moved, n_before as i64);
+        assert_eq!(cart.head_lba(), n_before);
+
+        // Forward filemarks: the only FM sits past the first batch.
+        cart.locate(0).unwrap();
+        assert_eq!(cart.space_filemarks(1).unwrap(), 1);
+        assert_eq!(cart.head_lba(), n_before + 1);
+
+        // Backward filemarks from EOD: head parks AT the filemark.
+        cart.locate(eod).unwrap();
+        assert_eq!(cart.space_filemarks(-1).unwrap(), -1);
+        assert_eq!(cart.head_lba(), n_before);
     }
 }
 
