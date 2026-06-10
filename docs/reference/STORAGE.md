@@ -253,6 +253,16 @@ index also on the SPACE walks (SPACE never decodes chunk records)
 (issue #105). Unreadable medium metadata is a medium fault, not an
 illegal request.
 
+So does a codec-detected fault on a sealed chunk: a compressed
+payload whose lz4/zstd frame fails to decode — on the warm read of a
+cached chunk, or while decoding a refetched storage object one layer
+before the BLAKE3 verify — is the same physical fault the hash check
+catches, a rotted chunk payload, and maps to the same MEDIUM ERROR +
+UNRECOVERED READ ERROR (issue #108). Codec failures on the
+write/compress side and on staging chunks (the drive's internal
+buffer, not yet on the medium) keep HARDWARE ERROR + INTERNAL TARGET
+FAILURE (0x44/0x00): there the device failed, not the medium.
+
 ---
 
 # VSA

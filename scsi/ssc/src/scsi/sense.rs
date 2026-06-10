@@ -135,6 +135,15 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
         SmcError::IndexCorrupt(_) => {
             SenseDataBuilder::new(SenseKey::MediumError, ASC_UNRECOVERED_READ_ERROR).build()
         }
+        // Codec-detected payload rot on a sealed chunk (warm read or
+        // refetch decode): the same physical fault ContentHashMismatch
+        // reports — a rotted chunk payload — caught by the lz4/zstd
+        // frame check instead of the BLAKE3 verify, so it gets the
+        // same medium-class sense, not the drive-is-broken HARDWARE
+        // ERROR the write-side CompressionError keeps (issue #108).
+        SmcError::ChunkPayloadCorrupt(_) => {
+            SenseDataBuilder::new(SenseKey::MediumError, ASC_UNRECOVERED_READ_ERROR).build()
+        }
 
         // Session/drive management errors (map to hardware error)
         SmcError::InvalidSession(_) => SenseDataBuilder::new(
@@ -398,6 +407,19 @@ mod tests {
 
         assert_eq!(sense.len(), 18);
         assert_eq!(sense[2] & 0x0F, 0x03); // MediumError, not IllegalRequest
+        assert_eq!(sense[12], 0x11); // ASC = unrecovered read error
+        assert_eq!(sense[13], 0x00); // ASCQ
+    }
+
+    #[test]
+    fn test_error_to_sense_chunk_payload_corrupt_is_medium_error() {
+        use core_mediachanger::errors::SmcError;
+
+        let error = SmcError::ChunkPayloadCorrupt("lz4 decode: invalid frame".to_string());
+        let sense = error_to_sense(&error);
+
+        assert_eq!(sense.len(), 18);
+        assert_eq!(sense[2] & 0x0F, 0x03); // MediumError, not HardwareError
         assert_eq!(sense[12], 0x11); // ASC = unrecovered read error
         assert_eq!(sense[13], 0x00); // ASCQ
     }

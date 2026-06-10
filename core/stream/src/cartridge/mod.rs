@@ -841,11 +841,22 @@ fn build_chunking_state(
 /// authenticated the ciphertext before we get here. So no
 /// uncompressed-size validation is needed — we trust the codec's
 /// decompressed output.
-fn maybe_decompress(bi: &BlockIndex, buf: Vec<u8>) -> Result<Vec<u8>> {
+///
+/// `sealed` is the read-side truth-telling seam (issue #108): a codec
+/// failure on a sealed chunk means the committed payload rotted on
+/// disk — remapped to the medium-class `ChunkPayloadCorrupt`, the
+/// same fault class the BLAKE3 verify reports on the refetch path.
+/// A staging chunk is the drive's internal buffer, not yet on the
+/// medium, so its codec failure stays `CompressionError` → HARDWARE
+/// ERROR, like the write/compress side.
+fn maybe_decompress(bi: &BlockIndex, buf: Vec<u8>, sealed: bool) -> Result<Vec<u8>> {
     let Some(algo) = bi.compression else {
         return Ok(buf);
     };
-    Ok(compression::decompress_data(algo, &buf)?)
+    compression::decompress_data(algo, &buf).map_err(|e| match (sealed, SmcError::from(e)) {
+        (true, SmcError::CompressionError(msg)) => SmcError::ChunkPayloadCorrupt(msg),
+        (_, other) => other,
+    })
 }
 
 /// Generate a fresh 16-byte cartridge UUID. Used at create time;
@@ -1840,7 +1851,7 @@ impl Cartridge {
         let buf = self.read_chunk_slice(chunk_id, &chunk, bi.offset, bi.len as usize)?;
 
         let after_decrypt = self.maybe_decrypt(&bi, buf)?;
-        let plaintext = maybe_decompress(&bi, after_decrypt)?;
+        let plaintext = maybe_decompress(&bi, after_decrypt, chunk.hash.is_some())?;
         // Lifetime read counter — plaintext bytes handed back to the
         // host, the read-side mirror of `host_bytes_written`. Filemark
         // reads returned early above, so they never count here.
@@ -2087,7 +2098,19 @@ impl Cartridge {
                     shared_telemetry::record::cache_miss_after_eviction(gl.backend(), age as f64);
                 }
             }
-            let data = backend.download_chunk(&object_key).await?;
+            // A refetched object whose storage-side compression frame
+            // fails to decode inside `download_chunk` is the same
+            // fault the BLAKE3 verify below catches — a corrupted
+            // storage object — detected one layer earlier, so it gets
+            // the same medium-class mapping (issue #108).
+            let data =
+                backend
+                    .download_chunk(&object_key)
+                    .await
+                    .map_err(|e| match SmcError::from(e) {
+                        SmcError::CompressionError(msg) => SmcError::ChunkPayloadCorrupt(msg),
+                        other => other,
+                    })?;
 
             // Hand the BLAKE3 verify + atomic tmp+rename to
             // `ChunkPool::insert_verified_bytes`. The verify catches
@@ -2154,7 +2177,7 @@ impl Cartridge {
         let buf = self.read_chunk_slice(chunk_id, &chunk, bi.offset, bi.len as usize)?;
 
         let after_decrypt = self.maybe_decrypt(&bi, buf)?;
-        let plaintext = maybe_decompress(&bi, after_decrypt)?;
+        let plaintext = maybe_decompress(&bi, after_decrypt, chunk.hash.is_some())?;
         // Lifetime read counter — see `read_block`. Filemark reads
         // returned early above and never count here.
         self.runtime.host_bytes_read = self
@@ -3797,6 +3820,111 @@ mod space_walk_hardening {
         cart.locate(eod).unwrap();
         assert_eq!(cart.space_filemarks(-1).unwrap(), -1);
         assert_eq!(cart.head_lba(), n_before);
+    }
+}
+
+#[cfg(test)]
+mod codec_payload_hardening {
+    //! Issue #108: a sealed chunk whose compressed payload rotted on
+    //! disk is a medium fault (`ChunkPayloadCorrupt` → MEDIUM ERROR),
+    //! not a drive fault — the codec frame check is just the layer
+    //! that catches what the BLAKE3 verify would have caught on the
+    //! refetch path. Staging chunks (the drive's internal buffer) and
+    //! the write/compress side keep `CompressionError` → HARDWARE
+    //! ERROR.
+    use super::*;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    fn make_compressing_cart(tmp: &TempDir, label: &str) -> Cartridge {
+        let tapes = tmp.path().join("tapes");
+        let mut cart = Cartridge::open(
+            &tapes,
+            label,
+            CartridgeOpenMode::Create {
+                backend: "primary".to_string(),
+                worm: false,
+                dedup: DedupScope::Global,
+            },
+        )
+        .expect("create cartridge");
+        cart.set_compression_state(DriveCompressionState::enabled());
+        cart
+    }
+
+    /// Corrupt the head of every file under `dir` (recursively) —
+    /// for a one-chunk cartridge that's the lz4 frame magic, so the
+    /// codec decode must fail.
+    fn corrupt_files_under(dir: &Path) -> usize {
+        let mut corrupted = 0;
+        for entry in walk(dir) {
+            let mut bytes = std::fs::read(&entry).expect("read chunk file");
+            assert!(bytes.len() >= 4, "chunk file too short: {entry:?}");
+            for b in bytes[0..4].iter_mut() {
+                *b ^= 0xFF;
+            }
+            std::fs::write(&entry, &bytes).expect("write chunk file");
+            corrupted += 1;
+        }
+        corrupted
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                files.extend(walk(&p));
+            } else {
+                files.push(p);
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn sealed_chunk_codec_failure_is_chunk_payload_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut cart = make_compressing_cart(&tmp, "CODEC01");
+            cart.write_data(Bytes::from(vec![0xAB; 2048])).unwrap();
+            cart.flush_and_seal().unwrap();
+        }
+        let n = corrupt_files_under(&tmp.path().join("chunks").join("primary"));
+        assert_eq!(n, 1, "expected exactly one sealed chunk in the pool");
+
+        let tapes = tmp.path().join("tapes");
+        let mut cart = Cartridge::open(&tapes, "CODEC01", CartridgeOpenMode::Open).unwrap();
+        cart.rewind();
+        let err = cart
+            .read_block(0)
+            .expect_err("read of a rotted sealed compressed chunk must fail");
+        assert!(
+            matches!(err, SmcError::ChunkPayloadCorrupt(_)),
+            "expected ChunkPayloadCorrupt (medium fault), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn staging_chunk_codec_failure_stays_compression_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_compressing_cart(&tmp, "CODEC02");
+        cart.write_data(Bytes::from(vec![0xCD; 2048])).unwrap();
+        // No seal: the block still lives in the staging file.
+        let n = corrupt_files_under(&tmp.path().join("tapes").join("CODEC02").join(".staging"));
+        assert_eq!(n, 1, "expected exactly one staging chunk file");
+
+        cart.rewind();
+        let err = cart
+            .read_block(0)
+            .expect_err("read of a rotted staging chunk must fail");
+        assert!(
+            matches!(err, SmcError::CompressionError(_)),
+            "staging is the drive's buffer, not the medium - got: {err:?}"
+        );
     }
 }
 

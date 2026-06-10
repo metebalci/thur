@@ -54,6 +54,20 @@ pub enum SmcError {
     #[error("index corrupt: {0}")]
     IndexCorrupt(&'static str),
 
+    /// A sealed chunk's payload failed codec decode on the read path:
+    /// the lz4/zstd frame check caught on-disk bit rot of a cached
+    /// chunk file (or of a refetched storage object, one layer before
+    /// the BLAKE3 verify). The codec-detected sibling of
+    /// `ContentHashMismatch` — the same physical fault, a rotted
+    /// chunk payload, detected by a different layer — so it maps to
+    /// the same CHECK CONDITION + MEDIUM ERROR (0x03) + ASC/ASCQ
+    /// 0x11/0x00 ("UNRECOVERED READ ERROR") at the iSCSI layer
+    /// (issue #108). Write-side codec failures keep
+    /// `CompressionError` → HARDWARE ERROR: there the codec itself
+    /// failed, not the medium.
+    #[error("chunk payload corrupt: {0}")]
+    ChunkPayloadCorrupt(String),
+
     #[error("storage error: {0}")]
     ObjectStoreError(String),
 

@@ -499,6 +499,82 @@ fn corrupt_index_record_surfaces_medium_error_on_read_space_and_verify() {
 }
 
 #[test]
+fn corrupt_sealed_compressed_chunk_surfaces_medium_error_on_read() {
+    // Issue #108, end-to-end: a sealed compressed chunk whose pool
+    // file rotted on disk fails the codec frame check on the warm
+    // read path; that must reach the host as CHECK CONDITION +
+    // MEDIUM ERROR + 0x11/0x00 — the same sense the storage-refetch
+    // path gives the identical fault via the BLAKE3 verify — not
+    // HARDWARE ERROR + 0x44/0x00, which tells the host the drive
+    // itself is broken and triggers failover instead of a per-block
+    // retire.
+    use core_mediachanger::DriveCompressionState;
+
+    let fx = Fixture::new();
+
+    // DCE on (LZ4) before the write so the block lands compressed.
+    fx.drive_manager
+        .with_drive(0, 1, |cart| {
+            cart.set_compression_state(DriveCompressionState::enabled());
+            Ok(())
+        })
+        .unwrap();
+
+    let payload = vec![0xC3u8; 4096];
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
+    assert_eq!(
+        handlers::handle_write_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+    );
+
+    // Seal so the chunk lands in the pool (the warm cache #108 is
+    // about; staging-chunk faults stay HARDWARE ERROR).
+    fx.drive_manager
+        .with_drive(0, 1, |cart| cart.flush_and_seal())
+        .unwrap();
+
+    // Rot the sealed chunk's codec frame header in the pool.
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut chunk_files = Vec::new();
+    walk(
+        &fx.data_dir.join("chunks").join("primary"),
+        &mut chunk_files,
+    );
+    assert_eq!(chunk_files.len(), 1, "expected one sealed chunk in pool");
+    let mut bytes = std::fs::read(&chunk_files[0]).expect("read chunk");
+    for b in bytes[0..4].iter_mut() {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&chunk_files[0], &bytes).expect("write chunk");
+
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, cdb(0x01));
+    handlers::handle_rewind(&mut ctx).unwrap();
+
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut ctx = fx.ctx(&mut rp, cdb(0x08));
+    let resp = handlers::handle_read_6(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition, "READ(6): status");
+    let sense = resp.sense.expect("READ(6): must carry sense");
+    assert_eq!(sense[2] & 0x0f, 0x03, "sense key = MEDIUM ERROR");
+    assert_eq!(sense[12], 0x11, "ASC = UNRECOVERED READ ERROR");
+    assert_eq!(sense[13], 0x00, "ASCQ = 0x00");
+}
+
+#[test]
 fn write_six_with_no_data_is_rejected() {
     let fx = Fixture::new();
     let mut p = pdu(); // empty data segment
