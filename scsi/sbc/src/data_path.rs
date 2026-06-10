@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use core_block::PageCache;
 use core_block::upload_index::UploadState;
-use core_block::uploader::UploaderError;
+use core_block::uploader::{FaultClass, UploaderError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::VolumeLookup;
@@ -495,7 +495,7 @@ pub(super) async fn unmap(
     for (byte_offset, len_bytes, lba, blocks) in to_clear {
         if let Err(e) = cache.unmap_bytes(byte_offset, len_bytes).await {
             tracing::warn!(error = %e, lba = lba, blocks = blocks, "UNMAP: cache clear failed");
-            return ScsiResponse::check(SenseData::WRITE_ERROR);
+            return ScsiResponse::check(map_write_error(&e));
         }
     }
     ScsiResponse::good(Vec::new())
@@ -1578,19 +1578,22 @@ fn build_failed_segment_details_response() -> Vec<u8> {
     data
 }
 
-/// Map an `UploaderError` from the WRITE pipeline into a SCSI
-/// sense. Internal validation errors that should have been caught
-/// upstream collapse to INVALID FIELD IN CDB (defensive); upload
-/// backpressure surfaces as NOT READY OPERATION IN PROGRESS so
-/// backup software retries; storage / io / hash failures collapse to
-/// MEDIUM ERROR + WRITE ERROR.
+/// Map an `UploaderError` from the WRITE pipeline into a SCSI sense
+/// via the shared [`FaultClass`] classifier (the NVMe dispatcher
+/// keys off the same one, so the two transports agree — issue #109).
+/// Validation errors that should have been caught upstream collapse
+/// to INVALID FIELD IN CDB (defensive); upload backpressure surfaces
+/// as NOT READY OPERATION IN PROGRESS so backup software retries;
+/// integrity faults (content-hash mismatch, GCM auth failure) are
+/// medium faults — MEDIUM ERROR + WRITE ERROR; local I/O / backend /
+/// lifecycle / keystore faults are target faults — HARDWARE ERROR +
+/// INTERNAL TARGET FAILURE (0x44/0x00), the same split VTL reports.
 fn map_write_error(e: &UploaderError) -> SenseData {
-    match e {
-        UploaderError::PageSizeMismatch { .. } | UploaderError::PageOutOfRange { .. } => {
-            SenseData::INVALID_FIELD_IN_CDB
-        }
-        UploaderError::Backpressured(_) => SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS,
-        _ => SenseData::WRITE_ERROR,
+    match e.fault_class() {
+        FaultClass::Validation => SenseData::INVALID_FIELD_IN_CDB,
+        FaultClass::Transient => SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS,
+        FaultClass::Integrity => SenseData::WRITE_ERROR,
+        FaultClass::Infrastructure => SenseData::INTERNAL_TARGET_FAILURE,
     }
 }
 
@@ -1601,12 +1604,11 @@ fn map_write_error(e: &UploaderError) -> SenseData {
 /// match arm is kept symmetric so a future refetch-path gate would
 /// drop in cleanly.
 fn map_read_error(e: &UploaderError) -> SenseData {
-    match e {
-        UploaderError::PageSizeMismatch { .. } | UploaderError::PageOutOfRange { .. } => {
-            SenseData::INVALID_FIELD_IN_CDB
-        }
-        UploaderError::Backpressured(_) => SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS,
-        _ => SenseData::READ_ERROR,
+    match e.fault_class() {
+        FaultClass::Validation => SenseData::INVALID_FIELD_IN_CDB,
+        FaultClass::Transient => SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS,
+        FaultClass::Integrity => SenseData::READ_ERROR,
+        FaultClass::Infrastructure => SenseData::INTERNAL_TARGET_FAILURE,
     }
 }
 
@@ -5318,5 +5320,75 @@ mod tests {
         // blocks regardless).
         let transfer = u64::from_be_bytes([d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23]]);
         assert_eq!(transfer, 0);
+    }
+
+    #[test]
+    fn uploader_errors_map_to_the_fault_class_sense_split() {
+        // Issue #109: local-infrastructure faults are HARDWARE
+        // ERROR / INTERNAL TARGET FAILURE (0x44/0x00), matching what
+        // VTL reports for the same physical fault; only integrity
+        // faults (corrupt stored payload / metadata) stay MEDIUM
+        // ERROR; backpressure stays the transient NOT READY.
+        use shared_pool::{BackpressureError, ChunkPoolError};
+        use std::io;
+
+        let eio = || UploaderError::Io(io::Error::from(io::ErrorKind::Other));
+        let hash_mismatch = || {
+            UploaderError::ChunkPool(ChunkPoolError::HashMismatch {
+                expected: "aa".into(),
+                actual: "bb".into(),
+            })
+        };
+        let backpressured = || {
+            UploaderError::Backpressured(BackpressureError {
+                pool_used_bytes: 1,
+                pool_cap_bytes: 1,
+                waited_secs: 1,
+            })
+        };
+
+        // Read side.
+        assert_eq!(map_read_error(&hash_mismatch()), SenseData::READ_ERROR);
+        assert_eq!(
+            map_read_error(&UploaderError::Decrypt("gcm auth tag mismatch")),
+            SenseData::READ_ERROR
+        );
+        assert_eq!(map_read_error(&eio()), SenseData::INTERNAL_TARGET_FAILURE);
+        assert_eq!(
+            map_read_error(&UploaderError::UploadChannelClosed),
+            SenseData::INTERNAL_TARGET_FAILURE
+        );
+        assert_eq!(
+            map_read_error(&UploaderError::MissingKey {
+                algorithm: "aes-256-gcm"
+            }),
+            SenseData::INTERNAL_TARGET_FAILURE
+        );
+        assert_eq!(
+            map_read_error(&backpressured()),
+            SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS
+        );
+        assert_eq!(
+            map_read_error(&UploaderError::PageOutOfRange {
+                page_id: 9,
+                page_size: 65536,
+                size_bytes: 65536,
+            }),
+            SenseData::INVALID_FIELD_IN_CDB
+        );
+
+        // Write side: same split, medium-error ASC differs.
+        assert_eq!(map_write_error(&hash_mismatch()), SenseData::WRITE_ERROR);
+        assert_eq!(map_write_error(&eio()), SenseData::INTERNAL_TARGET_FAILURE);
+        // The fence error (storage upload failed) is a backend fault,
+        // not medium corruption.
+        assert_eq!(
+            map_write_error(&UploaderError::UploadsFailed),
+            SenseData::INTERNAL_TARGET_FAILURE
+        );
+        assert_eq!(
+            map_write_error(&backpressured()),
+            SenseData::LU_NOT_READY_OPERATION_IN_PROGRESS
+        );
     }
 }

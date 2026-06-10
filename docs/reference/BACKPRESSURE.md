@@ -258,9 +258,11 @@ On the block side the gate sits per-page in
 `VolumeWriter::write_page_unsynced` (`core/block/src/uploader.rs`), between the
 SBC-3 / NVMe write and the backend PUT. Without it, the pool fills the
 filesystem, the next `pool.insert_bytes` hits `ENOSPC`, and the SCSI write
-returns MEDIUM ERROR. With the gate, `write_page` blocks at the per-backend
+returns HARDWARE ERROR (a local-I/O infrastructure fault, issue #109). With
+the gate, `write_page` blocks at the per-backend
 cap; if uploads cannot free space within `backpressure_max_wait_seconds`, the
-SBC-3 dispatcher returns NOT READY 0x04/0x07 — host filesystems retry, the
+SBC-3 dispatcher returns NOT READY 0x04/0x07 (the NVMe dispatcher Namespace
+Not Ready) — host filesystems retry, the
 workload pauses, and then resumes.
 
 ## Gate placement
@@ -284,7 +286,8 @@ with reality. Orphan GC reclaims the chunk later if no page references it.
 ## Backpressure deadline
 
 `disk_cache.backpressure_max_wait_seconds` (default 30). Surfaces through
-`UploaderError::Backpressured` → SBC-3 NOT READY 0x04/0x07. Tune upward only
+`UploaderError::Backpressured` → SBC-3 NOT READY 0x04/0x07 / NVMe Namespace
+Not Ready. Tune upward only
 if the eviction worker's recovery latency outruns the backend PUT-then-HEAD
 cadence.
 

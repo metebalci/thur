@@ -165,6 +165,37 @@ impl StatusField {
         }
     }
 
+    /// Media: Unrecovered Read Error (SCT=2h, SC=0x81). Returned when
+    /// a read-class command hits corrupt stored data — content-hash
+    /// mismatch on a refetched chunk, AES-GCM auth failure — the NVMe
+    /// analog of SCSI MEDIUM ERROR + UNRECOVERED READ ERROR
+    /// (0x11/0x00), so hosts triage it as a media fault rather than a
+    /// generic transfer failure (issue #109). DNR: the corruption is
+    /// permanent; re-issuing the same command fails the same way.
+    pub fn unrecovered_read_error() -> Self {
+        Self {
+            sct: StatusCodeType::MediaAndDataIntegrity,
+            sc: 0x81,
+            dnr: true,
+            ..Self::SUCCESS
+        }
+    }
+
+    /// Media: Write Fault (SCT=2h, SC=0x80). Returned when a
+    /// write-class command hits corrupt stored data (e.g. the RMW
+    /// read-half of a sub-page write decodes a corrupt chunk) — the
+    /// NVMe analog of SCSI MEDIUM ERROR + WRITE ERROR (0x0C/0x00)
+    /// (issue #109). DNR for the same reason as
+    /// [`Self::unrecovered_read_error`].
+    pub fn write_fault() -> Self {
+        Self {
+            sct: StatusCodeType::MediaAndDataIntegrity,
+            sc: 0x80,
+            dnr: true,
+            ..Self::SUCCESS
+        }
+    }
+
     /// Command-specific: Invalid Namespace or Format (e.g. NSID
     /// the target doesn't have attached).
     pub fn invalid_namespace() -> Self {
@@ -273,6 +304,22 @@ mod tests {
         assert_eq!(s.sct, StatusCodeType::Generic);
         assert_eq!(s.sc, 0x20);
         assert!(s.dnr);
+    }
+
+    #[test]
+    fn media_class_statuses_pack_sct_2h() {
+        // SC 0x81 << 1 = 0x102; SCT 2 << 9 = 0x400; DNR bit 15.
+        let r = StatusField::unrecovered_read_error();
+        assert_eq!(r.to_u16(), 0x8502);
+        assert_eq!(r.sct, StatusCodeType::MediaAndDataIntegrity);
+        assert_eq!(r.sc, 0x81);
+        assert!(r.dnr);
+        // SC 0x80 << 1 = 0x100; SCT 2 << 9 = 0x400; DNR bit 15.
+        let w = StatusField::write_fault();
+        assert_eq!(w.to_u16(), 0x8500);
+        assert_eq!(w.sct, StatusCodeType::MediaAndDataIntegrity);
+        assert_eq!(w.sc, 0x80);
+        assert!(w.dnr);
     }
 
     #[test]

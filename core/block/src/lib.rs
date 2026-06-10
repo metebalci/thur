@@ -34,12 +34,12 @@ pub use disk_cache::{DiskCacheManager, refresh_pool_budget_from_volumes};
 pub use lru_index::{LruIndexError, LruIndexFile};
 pub use page_index::{PageEntry, PageIndex, PageIndexError};
 pub use runtime_state::VolumeRuntime;
-pub use shared_pool::{DiskCacheBounds, DiskCacheSize};
+pub use shared_pool::{BackpressureError, DiskCacheBounds, DiskCacheSize};
 pub use snapshot::{SnapshotManifest, crypto_identity_referenced};
 pub use upload_index::{UploadIndexError, UploadIndexFile, UploadState};
 pub use uploader::{
-    DEFAULT_BACKPRESSURE_DEADLINE, DrainOutcome, PendingUploads, UploadTask, UploaderError,
-    VolumeWriter, WritePageOutcome,
+    DEFAULT_BACKPRESSURE_DEADLINE, DrainOutcome, FaultClass, PendingUploads, UploadTask,
+    UploaderError, VolumeWriter, WritePageOutcome,
 };
 pub use verify::{VerifyScope, VolumeVerifyReport};
 pub use volume::{DedupScope, SyncAfter, VolumeError, VolumeManifest, parse_size};

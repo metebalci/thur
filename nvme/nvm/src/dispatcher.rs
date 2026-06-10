@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
+use core_block::uploader::{FaultClass, UploaderError};
 use core_block::{PageCache, RangeError};
 use nvme_base::identify::CNS;
 use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusField};
@@ -627,7 +628,7 @@ impl NvmeNvmDispatcher {
             Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
                 tracing::warn!(error = %e, "flush failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::internal_error()))
+                NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)))
             }
         }
     }
@@ -652,7 +653,7 @@ impl NvmeNvmDispatcher {
             Ok(buf) => NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), buf),
             Err(e) => {
                 tracing::warn!(error = %e, "read failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::data_transfer_error()))
+                NvmeResponse::just(Cqe::failure(cid, 0, 0, read_failure_status(&e)))
             }
         }
     }
@@ -680,7 +681,7 @@ impl NvmeNvmDispatcher {
             Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
                 tracing::warn!(error = %e, "write failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::data_transfer_error()))
+                NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)))
             }
         }
     }
@@ -714,7 +715,7 @@ impl NvmeNvmDispatcher {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "compare read failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::data_transfer_error()))
+                NvmeResponse::just(Cqe::failure(cid, 0, 0, read_failure_status(&e)))
             }
         }
     }
@@ -749,12 +750,7 @@ impl NvmeNvmDispatcher {
             let zeros = vec![0u8; this as usize];
             if let Err(e) = cache.write_bytes(cursor, &zeros).await {
                 tracing::warn!(error = %e, "write-zeroes failed");
-                return NvmeResponse::just(Cqe::failure(
-                    cid,
-                    0,
-                    0,
-                    StatusField::data_transfer_error(),
-                ));
+                return NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)));
             }
             cursor += this;
             remaining -= this;
@@ -813,12 +809,7 @@ impl NvmeNvmDispatcher {
             };
             if let Err(e) = cache.unmap_bytes(byte_off, len).await {
                 tracing::warn!(error = %e, "dsm deallocate failed");
-                return NvmeResponse::just(Cqe::failure(
-                    cid,
-                    0,
-                    0,
-                    StatusField::data_transfer_error(),
-                ));
+                return NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)));
             }
         }
         NvmeResponse::just(Cqe::success(cid, 0, 0, 0))
@@ -840,7 +831,7 @@ impl NvmeNvmDispatcher {
             Ok(_) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
             Err(e) => {
                 tracing::warn!(error = %e, "verify failed");
-                NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::data_transfer_error()))
+                NvmeResponse::just(Cqe::failure(cid, 0, 0, read_failure_status(&e)))
             }
         }
     }
@@ -855,6 +846,35 @@ fn read_slba(sqe: &nvme_base::Sqe) -> u64 {
 /// CDW12 (NVM Command Set §3.2.2 etc).
 fn read_nlb(sqe: &nvme_base::Sqe) -> u32 {
     u32::from((sqe.cdw12 & 0xFFFF) as u16) + 1
+}
+
+/// Map an `UploaderError` from a read-class command (Read, Compare,
+/// Verify) into a CQE status via the shared `FaultClass` classifier —
+/// the same one the SCSI dispatcher keys off, so the two transports
+/// agree on the same fault (issue #109): integrity faults get the
+/// media-class status, infrastructure faults Internal Error,
+/// backpressure the retryable Namespace Not Ready.
+fn read_failure_status(e: &UploaderError) -> StatusField {
+    match e.fault_class() {
+        FaultClass::Validation => StatusField::invalid_field(),
+        FaultClass::Transient => StatusField::namespace_not_ready(),
+        FaultClass::Integrity => StatusField::unrecovered_read_error(),
+        FaultClass::Infrastructure => StatusField::internal_error(),
+    }
+}
+
+/// Write-class counterpart of [`read_failure_status`] (Write, Write
+/// Zeroes, DSM Deallocate, Flush, fused Compare+Write) — only the
+/// media-class status differs (Write Fault vs Unrecovered Read
+/// Error), mirroring the SBC mappers' WRITE ERROR / UNRECOVERED READ
+/// ERROR split.
+fn write_failure_status(e: &UploaderError) -> StatusField {
+    match e.fault_class() {
+        FaultClass::Validation => StatusField::invalid_field(),
+        FaultClass::Transient => StatusField::namespace_not_ready(),
+        FaultClass::Integrity => StatusField::write_fault(),
+        FaultClass::Infrastructure => StatusField::internal_error(),
+    }
 }
 
 /// Resolve an LBA span to `(byte_offset, byte_len)` against the
@@ -1013,8 +1033,11 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
             ),
             Err(e) => {
                 tracing::warn!(error = %e, "fused compare-and-write failed");
+                // Classify like SBC's COMPARE AND WRITE Err arm (the
+                // failing op is the read-modify half); the write CQE
+                // stays aborted-due-to-failed-fused either way.
                 (
-                    Cqe::failure(compare_cid, 0, 0, StatusField::internal_error()),
+                    Cqe::failure(compare_cid, 0, 0, read_failure_status(&e)),
                     Cqe::failure(write_cid, 0, 0, StatusField::aborted_due_to_failed_fused()),
                 )
             }
@@ -2683,5 +2706,53 @@ mod tests {
         );
         assert_eq!(cqe_c.cid, 0x61);
         assert_eq!(cqe_w.cid, 0x62);
+    }
+
+    #[test]
+    fn failure_statuses_follow_the_fault_class_split() {
+        // Issue #109: media faults get media-class statuses (SCT 2h)
+        // instead of the generic Data Transfer Error, infrastructure
+        // faults Internal Error, backpressure the retryable Namespace
+        // Not Ready — mirroring the SBC mappers exactly.
+        use core_block::BackpressureError;
+        use core_block::chunk_pool::ChunkPoolError;
+        use std::io;
+
+        let hash_mismatch = UploaderError::ChunkPool(ChunkPoolError::HashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        });
+        assert_eq!(
+            read_failure_status(&hash_mismatch),
+            StatusField::unrecovered_read_error()
+        );
+        assert_eq!(
+            write_failure_status(&hash_mismatch),
+            StatusField::write_fault()
+        );
+
+        let decrypt = UploaderError::Decrypt("gcm auth tag mismatch");
+        assert_eq!(
+            read_failure_status(&decrypt),
+            StatusField::unrecovered_read_error()
+        );
+
+        let eio = UploaderError::Io(io::Error::from(io::ErrorKind::Other));
+        assert_eq!(read_failure_status(&eio), StatusField::internal_error());
+        assert_eq!(write_failure_status(&eio), StatusField::internal_error());
+        assert_eq!(
+            write_failure_status(&UploaderError::UploadsFailed),
+            StatusField::internal_error()
+        );
+
+        let backpressured = UploaderError::Backpressured(BackpressureError {
+            pool_used_bytes: 1,
+            pool_cap_bytes: 1,
+            waited_secs: 1,
+        });
+        assert_eq!(
+            write_failure_status(&backpressured),
+            StatusField::namespace_not_ready()
+        );
     }
 }

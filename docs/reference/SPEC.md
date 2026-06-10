@@ -342,7 +342,7 @@ reservation state (see § Persistent reservations).
 | 0x28 | READ (10) | Sector-grain LBA + transfer length supported end-to-end via the per-volume `PageCache` (core-block::cache). Sub-page reads pull the affected page(s) from the cache or fall through to `VolumeWriter::read_page` (storage / pool / sparse-hole zero) and slice. Unallocated pages return zeros. Reservation-gated. |
 | 0x2A | WRITE (10) | Sector-grain via the cache: load the affected page(s), splice in host bytes at sector grain, mark dirty for asynchronous flush. Full-page writes skip the load. WORM volumes refuse with WRITE PROTECTED. Reservation-gated. |
 | 0x2F | VERIFY (10) | Per SBC-3 §5.46. CDB byte 1 bits 2-1 hold BYTCHK: 00b = no compare (read each block to surface medium errors — sparse-hole pages succeed), 01b = compare against Data-Out (Data-Out is `blocks * sector_bytes`; mismatch → CHECK CONDITION + MISCOMPARE). 10b/11b (LB protection) rejected with INVALID FIELD IN CDB. VRPROTECT (bits 7-5) must be 0. Reservation-gated as a read-side opcode. |
-| 0x35 | SYNCHRONIZE CACHE (10) | Real fence — awaits the cache's flush of every dirty page whose id falls in the requested LBA range through to storage-backend ack via `VolumeWriter::write_page`. NUMBER OF BLOCKS = 0 means "from LBA to end of medium" per SBC-3 §5.21. Out-of-range → LBA OUT OF RANGE. A page whose storage upload failed fails the fence with MEDIUM ERROR / WRITE ERROR (0x0C/0x00) after re-arming the upload for the next fence. Reservation-gated as a write-side opcode (SBC-3 §5.10). |
+| 0x35 | SYNCHRONIZE CACHE (10) | Real fence — awaits the cache's flush of every dirty page whose id falls in the requested LBA range through to storage-backend ack via `VolumeWriter::write_page`. NUMBER OF BLOCKS = 0 means "from LBA to end of medium" per SBC-3 §5.21. Out-of-range → LBA OUT OF RANGE. A page whose storage upload failed fails the fence with HARDWARE ERROR / INTERNAL TARGET FAILURE (0x44/0x00 — a backend fault, not medium corruption; issue #109) after re-arming the upload for the next fence. Reservation-gated as a write-side opcode (SBC-3 §5.10). |
 | 0x41 | WRITE SAME (10) | SBC-3 §5.49 — replicate one logical block of Data-Out across the requested LBA range. CDB byte 1: WRPROTECT (7-5) must be 0; ANCHOR (4) / PBDATA (2) / LBDATA (1) rejected. UNMAP (3) honored: when set with a zero pattern, route via `cache.unmap_bytes` (cheaper); other patterns expand the single-block payload across the range and route via `cache.write_bytes` in 16 MiB sector-aligned chunks. Data-Out length must equal one logical block. NUMBER OF BLOCKS = 0 is a no-op per §5.49.2. WORM refuses with WRITE PROTECTED. Reservation-gated. |
 | 0x42 | UNMAP | Thin-provisioning hint. Parameter list = 8-byte header + N × 16-byte UNMAP BLOCK DESCRIPTOR `{LBA u64, blocks u32, reserved 4}`. Sector-grain descriptors supported via the cache: full-page descriptors drop the cached entry and clear the page-index slot synchronously; sub-page descriptors zero the affected sectors in the cached page and mark dirty so the next flush commits the partial erase. Out-of-range → LBA OUT OF RANGE. ANCHOR=1 rejected (no separate "deallocated" state vs "never allocated"). Two-phase commit: validate every descriptor before any state mutation, so a malformed list leaves the volume untouched. WORM volumes refuse with WRITE PROTECTED. Reservation-gated as a write-side opcode. |
 | 0x4D | LOG SENSE | Page 0x00 (Supported Log Pages) only, listing just 0x00 itself — the SBC-3 / SPC-4 SAS-vintage log pages (temperature, retry counters, etc.) don't apply to a virtual block target. Other page codes / non-zero subpages → INVALID FIELD IN CDB per SPC-4 §7.2.5. |
@@ -374,6 +374,18 @@ reservation state (see § Persistent reservations).
 
 Unknown opcodes → CHECK CONDITION + ILLEGAL REQUEST + INVALID
 COMMAND OPERATION CODE.
+
+Data-path failures classify through one shared fault classifier
+(`core_block::FaultClass`; the NVMe dispatcher keys off the same one —
+issue #109): integrity faults (chunk content-hash mismatch on refetch,
+AES-GCM auth failure) are medium faults — MEDIUM ERROR + UNRECOVERED
+READ ERROR (0x11/0x00) on reads, WRITE ERROR (0x0C/0x00) on writes —
+while infrastructure faults (local pread/pwrite EIO, storage-backend
+op failure, daemon shutdown mid-command, keystore fault) are target
+faults — HARDWARE ERROR + INTERNAL TARGET FAILURE (0x44/0x00), the
+same sense thurvtl gives a pread EIO. Backpressure stays NOT READY +
+OPERATION IN PROGRESS (0x04/0x07). See § Data-path error
+classification in [`CONFORMANCE_SCSI.md`](CONFORMANCE_SCSI.md).
 
 #### Persistent reservations (shared: thurvsa block + thurvtl tape drive)
 

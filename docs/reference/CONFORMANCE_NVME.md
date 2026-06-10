@@ -77,6 +77,31 @@ are indistinguishable at the chunk level.
 | 0x15 | Reservation Release | 🟩 Yes | O | RRELA Release / Clear. A non-holder's data-path command (Read / Compare / Verify gated by `allow_read`; Write / Write Zeroes / DSM-deallocate / fused Compare+Write by `allow_write`) is rejected with `Reservation Conflict` (SCT=Generic, SC=0x83 — NVMe Base §4.6.1.2.1; the Linux nvme driver maps this to `BLK_STS_NEXUS` only when SCT=0). Flush is deliberately **not** gated (the NVM Command Set does not restrict it). |
 | — | Fused Compare + Write (0x05 FUSE=01 → 0x01 FUSE=10) | 🟩 Yes | O | Both halves accumulated by the transport (`nvme-tcp::server`), atomic compare-and-swap via `NvmeCommandHandler::handle_fused_compare_write` → `PageCache::compare_and_write_bytes`. Two CQEs per NVMe Base §4.2.6. Mismatch returns `Compare Failure` on the Compare CQE + `Aborted due to failed fused` (SC=0x0A) on the Write CQE. Against a WORM volume the pair refuses with `Namespace Is Write Protected` (Generic 0x20) on the Compare CQE + `Aborted due to failed fused` on the Write CQE. Sub-LBA CAW (single-sector VMFS heartbeat) honored end-to-end. |
 
+A failing `PageCache` call under any of these opcodes maps to its CQE
+status through the same fault classifier the SBC-3 dispatcher uses
+(`core_block::FaultClass`), so the two transports report the same
+fault the same way (issue #109):
+
+- **Integrity faults** (chunk content-hash mismatch on refetch,
+  AES-GCM auth failure) get the media-class statuses — `Unrecovered
+  Read Error` (SCT=Media, SC=0x81, DNR=1) on read-class commands
+  (Read / Compare / Verify), `Write Fault` (SCT=Media, SC=0x80,
+  DNR=1) on write-class commands (Write / Write Zeroes / DSM
+  Deallocate / Flush / fused Compare+Write) — the NVMe analog of
+  SCSI MEDIUM ERROR.
+- **Infrastructure faults** (local pread/pwrite EIO, storage-backend
+  op failure — including a Flush that found failed uploads — daemon
+  shutdown mid-command, keystore fault) return `Internal Error`
+  (Generic 0x06), the analog of SCSI HARDWARE ERROR / INTERNAL
+  TARGET FAILURE.
+- **Upload backpressure** returns `Namespace Not Ready` (Generic
+  0x82, DNR=0) so the host retries — the analog of SCSI NOT READY /
+  OPERATION IN PROGRESS.
+
+The generic `Data Transfer Error` is no longer used for data-path
+failures; it remains only for transport-level CRC32C data-digest
+mismatch (see § Header / data digests).
+
 ---
 
 ## Admin command set

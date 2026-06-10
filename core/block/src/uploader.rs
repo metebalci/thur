@@ -401,10 +401,81 @@ pub enum UploaderError {
     /// `upload.backpressure_max_wait_seconds` did not free enough
     /// headroom. Mapped at the SBC-3 layer to NOT READY +
     /// ASC/ASCQ 0x04/0x07 ("LOGICAL UNIT NOT READY, OPERATION IN
-    /// PROGRESS"); backup software (Veeam, Bareos, restic, fs
-    /// drivers) treats that as transient and retries.
+    /// PROGRESS") and at the NVMe layer to Namespace Not Ready;
+    /// backup software (Veeam, Bareos, restic, fs drivers) treats
+    /// that as transient and retries.
     #[error("{0}")]
     Backpressured(#[from] BackpressureError),
+}
+
+/// Coarse fault classification of an [`UploaderError`] for the
+/// host-facing transports. Both dispatchers — SCSI (`scsi-sbc`) and
+/// NVMe (`nvme-nvm`) — key their status mapping off this single
+/// classifier, so the two transports cannot drift on the same fault
+/// (issue #109): an integrity fault is a medium fault on both wires,
+/// an infrastructure fault is a target fault on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultClass {
+    /// Request-shape error the transport layer should have caught
+    /// upstream (defensive). SCSI: ILLEGAL REQUEST / INVALID FIELD
+    /// IN CDB. NVMe: Invalid Field in Command.
+    Validation,
+    /// Transient resource exhaustion — the host should retry. SCSI:
+    /// NOT READY / OPERATION IN PROGRESS (0x04/0x07). NVMe:
+    /// Namespace Not Ready.
+    Transient,
+    /// The stored payload or its metadata is corrupt (content-hash
+    /// mismatch on a refetched chunk, AES-GCM auth failure) — a
+    /// medium fault, mirroring VTL's `ContentHashMismatch` /
+    /// `IndexCorrupt` mapping. SCSI: MEDIUM ERROR. NVMe: media-class
+    /// status (SCT 2h).
+    Integrity,
+    /// Target infrastructure failed: local file I/O, storage-backend
+    /// op, daemon lifecycle, keystore. The device is at fault, not
+    /// the medium — mirroring VTL's `Io` / `ObjectStoreError`
+    /// mapping. SCSI: HARDWARE ERROR / INTERNAL TARGET FAILURE
+    /// (0x44/0x00). NVMe: Internal Error.
+    Infrastructure,
+}
+
+impl UploaderError {
+    /// Classify for transport status mapping. Exhaustive on purpose —
+    /// a new variant must pick its class here instead of silently
+    /// inheriting a catch-all (the failure mode issues #105/#108
+    /// fixed on the tape side).
+    pub fn fault_class(&self) -> FaultClass {
+        match self {
+            Self::PageSizeMismatch { .. }
+            | Self::PageOutOfRange { .. }
+            | Self::IncompatiblePageSize { .. }
+            | Self::ResizeNotSectorAligned { .. }
+            | Self::ResizeBelowPage { .. }
+            | Self::ResizeNoChange { .. }
+            | Self::ResizeWormForbidden
+            | Self::ResizeWouldDiscardData { .. } => FaultClass::Validation,
+
+            Self::Backpressured(_) => FaultClass::Transient,
+
+            Self::ChunkPool(ChunkPoolError::HashMismatch { .. }) | Self::Decrypt(_) => {
+                FaultClass::Integrity
+            }
+
+            Self::ChunkPool(ChunkPoolError::Io(_))
+            | Self::PageIndex(_)
+            | Self::LruIndex(_)
+            | Self::UploadIndex(_)
+            | Self::Volume(_)
+            | Self::Storage(_)
+            | Self::UploadWorker(_)
+            | Self::UploadChannelClosed
+            | Self::UploadsFailed
+            | Self::Io(_)
+            | Self::Encrypt(_)
+            | Self::MissingKey { .. }
+            | Self::KeyWrongLength { .. }
+            | Self::BadHash(_) => FaultClass::Infrastructure,
+        }
+    }
 }
 
 /// Outcome of one [`VolumeWriter::write_page`] call.
@@ -1445,6 +1516,66 @@ mod tests {
     use crate::volume::{DEFAULT_PAGE_SIZE_BYTES, DEFAULT_SECTOR_BYTES, DedupScope};
     use shared_object_store::LocalBackend;
     use tempfile::TempDir;
+
+    #[test]
+    fn fault_class_buckets_match_transport_contract() {
+        // The shared classifier both transports key off (issue #109):
+        // integrity faults are medium faults, infrastructure faults
+        // are target faults, backpressure is transient, shape errors
+        // are validation.
+        use std::io;
+
+        let cases: Vec<(UploaderError, FaultClass)> = vec![
+            (
+                UploaderError::PageSizeMismatch {
+                    len: 1,
+                    page_size: 65536,
+                },
+                FaultClass::Validation,
+            ),
+            (
+                UploaderError::PageOutOfRange {
+                    page_id: 9,
+                    page_size: 65536,
+                    size_bytes: 65536,
+                },
+                FaultClass::Validation,
+            ),
+            (
+                UploaderError::ChunkPool(ChunkPoolError::HashMismatch {
+                    expected: "aa".into(),
+                    actual: "bb".into(),
+                }),
+                FaultClass::Integrity,
+            ),
+            (
+                UploaderError::Decrypt("gcm auth tag mismatch"),
+                FaultClass::Integrity,
+            ),
+            (
+                UploaderError::Io(io::Error::from(io::ErrorKind::Other)),
+                FaultClass::Infrastructure,
+            ),
+            (
+                UploaderError::ChunkPool(ChunkPoolError::Io(io::Error::from(io::ErrorKind::Other))),
+                FaultClass::Infrastructure,
+            ),
+            (
+                UploaderError::UploadChannelClosed,
+                FaultClass::Infrastructure,
+            ),
+            (UploaderError::UploadsFailed, FaultClass::Infrastructure),
+            (
+                UploaderError::MissingKey {
+                    algorithm: "aes-256-gcm",
+                },
+                FaultClass::Infrastructure,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.fault_class(), want, "{err}");
+        }
+    }
 
     #[test]
     fn lru_touch_latch_fires_once_then_suppresses() {

@@ -478,3 +478,13 @@ an encrypted volume the per-page AES-256-GCM tag additionally catches
 at-rest tampering of the ciphertext on every page read. A verification
 failure surfaces to the host as a per-page MEDIUM ERROR — the same way
 the tape side fails a single chunk without faulting the whole device.
+
+Only those integrity faults are medium faults. A local pread/pwrite
+EIO on `pages.idx` or a cached chunk file, a storage-backend op
+failure, daemon shutdown mid-command, or a keystore fault surfaces as
+HARDWARE ERROR + INTERNAL TARGET FAILURE (0x44/0x00) over iSCSI and
+`Internal Error` over NVMe/TCP — the device is at fault, not the
+medium, the same split the tape side reports (issue #109). Both
+transports classify through one shared classifier
+(`core_block::FaultClass`), so an iSCSI host and an NVMe host see the
+same fault class for the same failure.
