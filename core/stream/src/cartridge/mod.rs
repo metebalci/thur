@@ -1834,7 +1834,7 @@ impl Cartridge {
         }
 
         let chunk_id = bi.chunk_id;
-        let chunk = self.read_chunk_rec(chunk_id)?;
+        let chunk = self.read_chunk_rec_for_block(chunk_id)?;
         self.lru_index.touch(chunk_id, now_timestamp())?;
 
         let buf = self.read_chunk_slice(chunk_id, &chunk, bi.offset, bi.len as usize)?;
@@ -1983,8 +1983,13 @@ impl Cartridge {
                     .map_err(|e| SmcError::EncryptionError(e.to_string()))?;
                 let end = (offset as usize).saturating_add(len);
                 if end > plaintext.len() {
-                    return Err(SmcError::InvalidOp(
-                        "block slice extends past decrypted chunk plaintext",
+                    // The slice bounds come from the persisted block
+                    // record, never from the CDB, and the plaintext
+                    // was just GCM-authenticated — so an
+                    // out-of-bounds slice means a corrupt offset/len
+                    // in the index record (issue #105).
+                    return Err(SmcError::IndexCorrupt(
+                        "block record slice extends past decrypted chunk plaintext",
                     ));
                 }
                 Ok(plaintext[offset as usize..end].to_vec())
@@ -2042,7 +2047,7 @@ impl Cartridge {
         }
 
         let chunk_id = bi.chunk_id;
-        let mut chunk = self.read_chunk_rec(chunk_id)?;
+        let mut chunk = self.read_chunk_rec_for_block(chunk_id)?;
 
         // Decide whether to fetch from storage. Two cases trigger a fetch:
         //   1. chunk_index says StorageOnly — the chunk was evicted from

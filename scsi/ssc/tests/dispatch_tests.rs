@@ -413,6 +413,92 @@ fn read_six_past_eod_returns_check_condition_with_blank_check_and_info() {
 }
 
 #[test]
+fn corrupt_index_record_surfaces_medium_error_on_read_space_and_verify() {
+    // Issue #105, end-to-end: a block-index record that fails to
+    // decode (reserved tag bits — on-disk corruption of
+    // blocks-p0.idx) must reach the host as CHECK CONDITION + MEDIUM
+    // ERROR + 0x11/0x00 (UNRECOVERED READ ERROR), not ILLEGAL
+    // REQUEST / INVALID COMMAND OPERATION CODE — backup software
+    // answers the latter by disabling the command instead of
+    // treating it as a per-block read failure. Pins the whole
+    // corrupt-bytes-on-disk -> handler -> sense-bytes chain that the
+    // unit tests only cover piecewise, on all three reporting paths:
+    // READ(6), the SPACE(6) record walk (issue #104), and VERIFY(6).
+    use core_mediachanger::block_index::{HEADER_SIZE, RECORD_SIZE};
+
+    let fx = Fixture::new();
+    let payload = vec![0xC3u8; 4096];
+
+    // Three data records.
+    for _ in 0..3 {
+        let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+        let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
+        assert_eq!(
+            handlers::handle_write_6(&mut ctx).unwrap().status,
+            ScsiStatus::Good,
+        );
+    }
+
+    // Flip record 1's flag byte to a reserved encryption tag (only
+    // 0..=1 decode). `fs::write` rewrites the same inode, so the
+    // cartridge's open fd sees the corruption on its next pread.
+    let idx = fx
+        .data_dir
+        .join("tapes")
+        .join("TAPE01")
+        .join("blocks-p0.idx");
+    let mut bytes = std::fs::read(&idx).expect("read index");
+    bytes[HEADER_SIZE + RECORD_SIZE + 12] = 2 << 1;
+    std::fs::write(&idx, &bytes).expect("write index");
+
+    let assert_medium_error = |resp: ScsiResp, what: &str| {
+        assert_eq!(resp.status, ScsiStatus::CheckCondition, "{what}: status");
+        let sense = resp
+            .sense
+            .unwrap_or_else(|| panic!("{what}: must carry sense"));
+        assert_eq!(sense[2] & 0x0f, 0x03, "{what}: sense key = MEDIUM ERROR");
+        assert_eq!(sense[12], 0x11, "{what}: ASC = UNRECOVERED READ ERROR");
+        assert_eq!(sense[13], 0x00, "{what}: ASCQ = 0x00");
+    };
+    let rewind = || {
+        let mut p = pdu();
+        let mut ctx = fx.ctx(&mut p, cdb(0x01));
+        handlers::handle_rewind(&mut ctx).unwrap();
+    };
+
+    // READ path: record 0 is intact and reads GOOD; record 1 faults.
+    rewind();
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut ctx = fx.ctx(&mut rp, cdb(0x08));
+    assert_eq!(
+        handlers::handle_read_6(&mut ctx).unwrap().status,
+        ScsiStatus::Good,
+        "record 0 is intact",
+    );
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut ctx = fx.ctx(&mut rp, cdb(0x08));
+    assert_medium_error(handlers::handle_read_6(&mut ctx).unwrap(), "READ(6)");
+
+    // SPACE record walk: the batched lookup hits the same corruption
+    // positionally (record 0 is crossed, record 1 terminates).
+    rewind();
+    let mut sp_cdb = cdb(0x11); // cdb[1] code 000b = records
+    sp_cdb[4] = 3; // 24-bit BE count
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, sp_cdb);
+    assert_medium_error(handlers::handle_space_6(&mut ctx).unwrap(), "SPACE(6)");
+
+    // VERIFY: the opcode whose whole job is reporting unreadable
+    // blocks truthfully.
+    rewind();
+    let mut v_cdb = cdb(0x13);
+    v_cdb[4] = 3;
+    let mut p = pdu();
+    let mut ctx = fx.ctx(&mut p, v_cdb);
+    assert_medium_error(handlers::handle_verify_6(&mut ctx).unwrap(), "VERIFY(6)");
+}
+
+#[test]
 fn write_six_with_no_data_is_rejected() {
     let fx = Fixture::new();
     let mut p = pdu(); // empty data segment

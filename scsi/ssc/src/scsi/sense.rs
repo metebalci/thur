@@ -127,6 +127,14 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
         SmcError::ContentHashMismatch { .. } => {
             SenseDataBuilder::new(SenseKey::MediumError, ASC_UNRECOVERED_READ_ERROR).build()
         }
+        // Index-sidecar record decode failure (`blocks-p<N>.idx` /
+        // `chunks.idx` corruption): same UNRECOVERED READ ERROR as
+        // ContentHashMismatch — the medium's metadata is unreadable,
+        // not the command illegal (issue #105). Both the READ data
+        // path and the SPACE walks (issue #104) route here.
+        SmcError::IndexCorrupt(_) => {
+            SenseDataBuilder::new(SenseKey::MediumError, ASC_UNRECOVERED_READ_ERROR).build()
+        }
 
         // Session/drive management errors (map to hardware error)
         SmcError::InvalidSession(_) => SenseDataBuilder::new(
@@ -379,6 +387,19 @@ mod tests {
         assert_eq!(sense[4], 0x34);
         assert_eq!(sense[5], 0x56);
         assert_eq!(sense[6], 0x78);
+    }
+
+    #[test]
+    fn test_error_to_sense_index_corrupt_is_medium_error() {
+        use core_mediachanger::errors::SmcError;
+
+        let error = SmcError::IndexCorrupt("block index record has unknown encryption tag");
+        let sense = error_to_sense(&error);
+
+        assert_eq!(sense.len(), 18);
+        assert_eq!(sense[2] & 0x0F, 0x03); // MediumError, not IllegalRequest
+        assert_eq!(sense[12], 0x11); // ASC = unrecovered read error
+        assert_eq!(sense[13], 0x00); // ASCQ
     }
 
     #[test]

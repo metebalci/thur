@@ -1105,7 +1105,11 @@ pub fn handle_verify_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {
             tracing::warn!("VERIFY(6) error: {}", e);
-            Ok(ScsiResp::check_condition())
+            // Surface the real cause — VERIFY exists to report medium
+            // faults truthfully (corrupt index record / chunk payload
+            // → MEDIUM ERROR, issue #105), not the bare
+            // check_condition() default of INVALID COMMAND.
+            Ok(ScsiResp::check_condition_for(&e))
         }
     }
 }
@@ -1139,7 +1143,8 @@ pub fn handle_verify_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {
             tracing::warn!("VERIFY(16) error: {}", e);
-            Ok(ScsiResp::check_condition())
+            // Same truthful-sense routing as VERIFY(6) (issue #105).
+            Ok(ScsiResp::check_condition_for(&e))
         }
     }
 }

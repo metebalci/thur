@@ -140,6 +140,22 @@ impl Cartridge {
         self.chunk_index.read(chunk_id)
     }
 
+    /// `read_chunk_rec` for a chunk id taken from a decoded block
+    /// record. The raw read guard reports past-`next_id` as
+    /// `InvalidOp` (a caller's bug for code-driven ids); here the id
+    /// is data-driven by the on-disk block index, so a miss is
+    /// corruption — a bit-flipped `chunk_id` or a truncated
+    /// `chunks.idx` — and is reported as `IndexCorrupt` so the host
+    /// sees MEDIUM ERROR instead of ILLEGAL REQUEST (issue #105).
+    pub(super) fn read_chunk_rec_for_block(&self, chunk_id: u64) -> Result<ChunkRec> {
+        self.read_chunk_rec(chunk_id).map_err(|e| match e {
+            SmcError::InvalidOp(_) => {
+                SmcError::IndexCorrupt("block record references a chunk id past the chunk index")
+            }
+            other => other,
+        })
+    }
+
     /// Helper: write `chunk_id`'s record back to chunk_index, also
     /// keeping the cached `cur_chunk` in sync if `chunk_id` is the
     /// active one.

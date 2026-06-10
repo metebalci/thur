@@ -245,6 +245,14 @@ NetBackup / tar / Bacula) treats this as a per-block read failure,
 logs and skips. The cartridge stays loaded and writable; only the
 specific chunk fails.
 
+An index-sidecar record that fails to decode (reserved tag bits in
+`blocks-p<N>.idx` / `chunks.idx`, i.e. on-disk corruption of the
+index file) surfaces the same way — MEDIUM ERROR + UNRECOVERED READ
+ERROR (0x11/0x00) — on the READ / VERIFY data path, and for the block
+index also on the SPACE walks (SPACE never decodes chunk records)
+(issue #105). Unreadable medium metadata is a medium fault, not an
+illegal request.
+
 ---
 
 # VSA

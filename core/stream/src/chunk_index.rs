@@ -170,10 +170,10 @@ impl ChunkRec {
         let hash_present = (f & FLAG_HASH_PRESENT) != 0;
         let uploaded = (f & FLAG_UPLOADED) != 0;
         let loc_bits = (f & FLAG_LOC_MASK) >> FLAG_LOC_SHIFT;
-        let location = LocationTag::from_u8(loc_bits).ok_or(SmcError::InvalidOp(
+        let location = LocationTag::from_u8(loc_bits).ok_or(SmcError::IndexCorrupt(
             "chunk index record has unknown location tag",
         ))?;
-        let comp = unpack_compression(f).ok_or(SmcError::InvalidOp(
+        let comp = unpack_compression(f).ok_or(SmcError::IndexCorrupt(
             "chunk index record has unknown compression tag",
         ))?;
         Ok((hash_present, uploaded, location, comp))
@@ -557,7 +557,7 @@ mod tests {
         let mut buf = [0u8; RECORD_SIZE];
         buf[36] = (4u8 << FLAG_COMP_SHIFT) | FLAG_HASH_PRESENT;
         let err = ChunkRec::decode(&buf).unwrap_err();
-        assert!(matches!(err, SmcError::InvalidOp(_)));
+        assert!(matches!(err, SmcError::IndexCorrupt(_)));
     }
 
     #[test]
@@ -565,7 +565,7 @@ mod tests {
         let mut buf = [0u8; RECORD_SIZE];
         buf[36] = 3u8 << FLAG_LOC_SHIFT; // location code 3 is reserved
         let err = ChunkRec::decode(&buf).unwrap_err();
-        assert!(matches!(err, SmcError::InvalidOp(_)));
+        assert!(matches!(err, SmcError::IndexCorrupt(_)));
     }
 
     #[test]

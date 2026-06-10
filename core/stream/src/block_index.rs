@@ -172,10 +172,10 @@ impl BlockRec {
             BlockKind::Data
         };
         let enc_bits = (f & FLAG_ENC_MASK) >> FLAG_ENC_SHIFT;
-        let enc = EncryptionTag::from_u8(enc_bits).ok_or(SmcError::InvalidOp(
+        let enc = EncryptionTag::from_u8(enc_bits).ok_or(SmcError::IndexCorrupt(
             "block index record has unknown encryption tag",
         ))?;
-        let comp = unpack_compression(f).ok_or(SmcError::InvalidOp(
+        let comp = unpack_compression(f).ok_or(SmcError::IndexCorrupt(
             "block index record has unknown compression tag",
         ))?;
         Ok((kind, enc, comp))
@@ -511,8 +511,8 @@ mod tests {
         buf[12] = 4 << FLAG_COMP_SHIFT;
         let err = BlockRec::decode(&buf).unwrap_err();
         match err {
-            SmcError::InvalidOp(_) => {}
-            other => panic!("expected InvalidOp, got {:?}", other),
+            SmcError::IndexCorrupt(_) => {}
+            other => panic!("expected IndexCorrupt, got {:?}", other),
         }
     }
 
@@ -523,8 +523,8 @@ mod tests {
         buf[12] = 2 << FLAG_ENC_SHIFT;
         let err = BlockRec::decode(&buf).unwrap_err();
         match err {
-            SmcError::InvalidOp(_) => {}
-            other => panic!("expected InvalidOp, got {:?}", other),
+            SmcError::IndexCorrupt(_) => {}
+            other => panic!("expected IndexCorrupt, got {:?}", other),
         }
     }
 
@@ -676,7 +676,7 @@ mod tests {
         // The corruption stays positional: only record 1's slot errors.
         let run = bif.read_run(0, 3).unwrap();
         assert!(run[0].is_ok());
-        assert!(matches!(run[1], Err(SmcError::InvalidOp(_))));
+        assert!(matches!(run[1], Err(SmcError::IndexCorrupt(_))));
         assert!(run[2].is_ok());
     }
 

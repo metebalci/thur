@@ -39,6 +39,21 @@ pub enum SmcError {
     #[error("content hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch { expected: String, actual: String },
 
+    /// An index-sidecar record (`blocks-p<N>.idx` / `chunks.idx`)
+    /// failed to decode: reserved encryption / compression / location
+    /// tag bits, i.e. on-disk corruption of the index file. Distinct
+    /// from `InvalidOp` (genuinely illegal requests and internal
+    /// invariants) so the SCSI layer can tell the truth: mapped at the
+    /// iSCSI layer to CHECK CONDITION + MEDIUM ERROR (0x03) + ASC/ASCQ
+    /// 0x11/0x00 ("UNRECOVERED READ ERROR") — the same sense
+    /// `ContentHashMismatch` produces for corrupt chunk payloads — so
+    /// backup software treats it as a per-block read failure (log,
+    /// skip, or fail the cartridge) rather than an unsupported command
+    /// (issue #105). Both the READ data path and the SPACE walks
+    /// (issue #104) surface it.
+    #[error("index corrupt: {0}")]
+    IndexCorrupt(&'static str),
+
     #[error("storage error: {0}")]
     ObjectStoreError(String),
 
