@@ -30,10 +30,11 @@ identically (tape and block both record logical/unique at chunk seal). Everythin
 do through it you could already do read-only through the CLI — it is a
 window onto the same state, not a new control plane.
 
-Mutations are explicitly out of scope for v1. Creating a cartridge,
+Mutations are explicitly out of scope. Creating a cartridge,
 moving a changer element, making a volume, taking a snapshot — all of
-that stays on the CLI and the peer-cred admin socket. The mutating Web
-UI is tracked separately as issue #91.
+that stays on the CLI and the peer-cred admin socket. A mutating Web
+UI was considered and rejected (issue #91, closed won't-do) — the
+console is read-only by design.
 
 ## Why embedded, not a separate daemon
 
@@ -174,9 +175,9 @@ already implements the monitor and jobs traits), and
 returns the listener to the `/health` `/metrics` `/sessions` `/info`
 posture it had before #5.
 
-## Out of scope for v1
+## Out of scope
 
-No mutations (issue #91). No single-page-app framework, Node, or
+No mutations (issue #91, closed won't-do). No single-page-app framework, Node, or
 bundler. No graphical config editor. No real-time streaming — the
 monitor snapshot is one-shot per request, the audit tail is "last N
 once", and recent-jobs is a rolling 5-minute window because finished

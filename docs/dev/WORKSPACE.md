@@ -396,9 +396,12 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   fences MOVE / EXCHANGE / element-status opcodes with RESERVATION
   CONFLICT (issue #53). Consumed by `thurvtld`.
 - **scsi-sbc** — SBC-3 block-target SCSI dispatch (every data-path
-  opcode: READ / WRITE 10/16, COMPARE AND WRITE, UNMAP, WRITE SAME,
-  SYNCHRONIZE CACHE; INQUIRY + VPD, READ CAPACITY, REPORT LUNS, MODE
-  SENSE/SELECT, PERSISTENT RESERVE IN/OUT, MAINTENANCE IN, probes).
+  opcode: READ / WRITE 10/16, VERIFY 10/16, COMPARE AND WRITE, UNMAP,
+  WRITE SAME, SYNCHRONIZE CACHE, EXTENDED COPY incl. the ODX token form
+  (POPULATE TOKEN / WRITE USING TOKEN, `TokenManager` with pool-pin
+  guards), RECEIVE COPY RESULTS; INQUIRY + VPD, READ CAPACITY, REPORT
+  LUNS, MODE SENSE/SELECT, PERSISTENT RESERVE IN/OUT, MAINTENANCE IN,
+  probes).
   `SbcScsiDispatcher` implements `shared_iscsi::ScsiHandler`; the
   daemon plugs its `VolumeRegistry` in via the `VolumeLookup` trait.
   Consumed by `thurvsad`.
@@ -410,11 +413,16 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   Controller / Namespace / Active NS list builders, Fabrics shapes
   (`ConnectData`, `FabricsType`, `extract_fctype`), `ControllerRegs`
   (CC / CSTS / VS / CAP), log-page builders (SMART, Error Info, FW
-  Slot).
+  Slot, Reservation Notification), AER completion DW0 packing, and the
+  DH-HMAC-CHAP wire shapes (`nvme_base::auth`: negotiate / challenge /
+  reply / success layouts, hash + DH-group constants).
 - **nvme-nvm** — NVM Command Set dispatch (Read / Write / Flush /
   Compare / Write Zeroes / DSM Deallocate / Verify; fused Compare+Write
   via `handle_fused_compare_write`). Admin coverage: Identify, Keep
-  Alive, Get/Set Features (Number of Queues), Get Log Page, Abort.
+  Alive, Get/Set Features (Number of Queues FID 0x07, Async Event
+  Configuration FID 0x0B, Keep Alive Timer FID 0x0F, Reservation
+  Notification Mask FID 0x82), Get Log Page (Error / SMART / FW Slot /
+  Reservation Notification LID 0x80), Abort.
   `NvmeNvmDispatcher` impls `NvmeCommandHandler`; the daemon plugs
   `VolumeRegistry` in via the `NamespaceLookup` trait. Reaches into
   `core-block::PageCache` directly. `nsid = lun + 1`.
@@ -425,9 +433,10 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
   fused Compare+Write pair tracking, C2HData SUCCESS-bit folding,
   C2HTermReq on protocol violations, per-controller CNTLID allocation at
   Connect, reservation notifications via AER (Admin 0x0C) + LID 0x80
-  parked on a shared `nvme_nvm::ControllerRegistry`. Out of scope:
-  TLS-PSK auth, CRC32C digests, multi-outstanding R2T, discovery
-  controller.
+  parked on a shared `nvme_nvm::ControllerRegistry`. TLS-PSK +
+  DH-HMAC-CHAP auth, CRC32C digests, and the single-subsystem
+  discovery controller have all shipped; out of scope:
+  multi-outstanding R2T.
 
 ## core-stream
 

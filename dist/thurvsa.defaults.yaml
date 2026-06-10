@@ -252,7 +252,7 @@ disk_cache:
   ghost_ring_size: 100000
 
 # HTTP server (health, metrics). Endpoints under http.listen:
-#   /health   - Health check (JSON; daemon, version, volume_count)
+#   /health   - Health check (JSON; status, daemon, version)
 #   /metrics  - Prometheus metrics (text format, OpenTelemetry-sourced)
 http:
   # Listen address for the HTTP server. Distinct from thurvtl's

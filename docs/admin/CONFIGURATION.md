@@ -347,9 +347,11 @@ pairing admission with the auth layer mirrors NFS export-list
 behaviour.
 
 The file is managed by `<application> iscsi users
-{add,remove,disable,enable,grant,revoke,rotate,list}` and
-`iscsi target {set,clear,show}` — see [`CLI.md`](CLI.md). `add`
-takes one or more `--volume NAME` (required for VSA); `grant` /
+{add,remove,disable,enable,rotate,list}` (plus the VSA-only `grant` /
+`revoke` volume-admission verbs) and
+`iscsi target {set,clear,show}` — see [`CLI.md`](CLI.md). VSA's `add`
+takes one or more `--volume NAME` (required; VTL's `add` takes
+`--partition` instead of `--volume`); `grant` /
 `revoke` mutate the list post-creation. The YAML conffile carries
 only `iscsi.auth.method` and `iscsi.auth.allowed_algorithms`; the
 credentials themselves live here.
@@ -362,9 +364,11 @@ and the per-host volume admission set. Each entry **must** carry a
 is on — admission is mandatory: every TLS-authenticated host is
 fenced to that subset. Identify CNS=0x02 (Active NS List), CNS=0x00
 (Namespace), and per-NSID I/O against non-admitted namespaces
-return Invalid Namespace. Plaintext mode (`nvmetcp.tls.mode:
-Disabled`) skips admission entirely and connections see every
-namespace — same shape as iSCSI no-CHAP.
+return Invalid Namespace. Both auths off (`nvmetcp.tls.mode:
+disabled` and `nvmetcp.auth.mode: none`) skips admission entirely and
+connections see every namespace — same shape as iSCSI no-CHAP; when
+DH-HMAC-CHAP is on, its `nvmetcp-dhchap.json` entries own admission
+instead, regardless of TLS state (see below).
 
 Managed by `thurvsa nvmetcp psks
 {add,remove,disable,enable,grant,revoke,rotate,list}`. The file is

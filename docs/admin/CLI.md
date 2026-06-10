@@ -8,13 +8,14 @@ orientation is in [`../../CLAUDE.md`](../../CLAUDE.md) § CLI Surface.
 ## thurvtl
 
 ```
-library    init / info / modify / monitor / self-test / restore / restore-archive / partition
+library    info / bounds / monitor / self-test / restore / restore-archive / partition
            partition list / create / modify / delete
 cartridge  create / archive / migrate / import / export / list / info / reset-stats / legal-hold / key
 changer    inventory / move / load / unload [--force]
 drive      status / self-test / reset-stats [ID|--all]
-system     gc / verify / stats / reset-stats / daemon-health
+system     gc / verify / stats / reset-stats / daemon-health / monitor
            audit {tail,export,verify,verify-offline,rotate} / storage {check,benchmark}
+           tiering {plan,run-now,status}
            regenerate-cert / set-admin-password / alerting {list,test}
 iscsi      users {add,remove,disable,enable,rotate,list} / target {set,clear,show}
 config     defaults / systemd-unit / completion
@@ -136,7 +137,7 @@ env var. The canonical path is binding for both the daemon
 the 0640 conffile.
 
 - **Daemon-down (partition layout + DR + storage benchmark + offline
-  key/cert ops):** `library restore`, `library restore-archive`,
+  key/cert ops):** `library restore`,
   `library partition {list,create,modify,delete}`,
   `cartridge key {migrate,show}`, `system storage benchmark`,
   `system regenerate-cert`.
@@ -217,10 +218,12 @@ Job kinds (`vtl/daemon/src/admin/job_dispatch/mod.rs`): `system.gc`,
 `system.verify`, `system.stats`, `system.storage_check` (CLI verb `system storage check`),
 `system.audit.{tail,export,verify,rotate}`,
 `system.{library,drive}.self_test`, `system.alerting.test`,
+`system.monitor`, `system.tiering.{plan,run}`,
 `cartridge.{migrate,archive}`, `library.restore_archive`.
 `thurvsad`'s `job_dispatch/mod.rs` mirrors the subset that applies to
-block storage: `system.{gc,stats,verify}`,
-`system.audit.{tail,export,verify,rotate}`, `system.alerting.test`.
+block storage: `system.{gc,stats,verify}`, `system.storage_check`,
+`system.audit.{tail,export,verify,rotate}`, `system.alerting.test`,
+`system.monitor`.
 
 The CLI client (`AdminClient::run_job`) renders log lines as they arrive
 and exits with the daemon's reported code. The job plumbing itself lives

@@ -5,7 +5,7 @@ under the top-level `docs/` tree, organized into four audience sets:
 `docs/QUICKSTART.md`, `docs/admin/` (operations / the Admin Guide),
 `docs/reference/` (wire spec, conformance, internals), and `docs/dev/`
 (contributor docs). This file is the orientation pass — see § Design Docs
-for the full index.
+for the key docs; `docs/README.md` is the complete index.
 
 ## Project Overview
 
@@ -45,11 +45,12 @@ Wire-level contracts in [`docs/reference/SPEC.md`](docs/reference/SPEC.md).
 ## Workspace Layout
 
 Layout C umbrella tree (shipped 2026-05-10): crates live under
-`shared/`, `core/`, `thurvtl/`, and `thurvsa/`. Design docs
-live under the top-level `docs/` tree, split into `admin/`,
-`reference/`, and `dev/` sets. Crate names are
-unchanged (`shared-pool`, `core-stream`, `thurvtld`, …) — only
-on-disk paths group by purpose.
+`shared/`, `scsi/`, `nvme/`, `core/`, `vtl/`, and `vsa/`. Design docs
+live under the top-level `docs/` tree, organized into four audience
+sets: `docs/QUICKSTART.md`, `admin/`, `reference/`, and `dev/`. Crate
+names are unchanged (`shared-pool`, `core-stream`, `vtl-daemon`, …) —
+only on-disk paths group by purpose (`thurvtld` / `thurvsad` are the
+`[[bin]]` names of the `vtl-daemon` / `vsa-daemon` crates).
 
 - `shared/admin-proto` (`shared-admin-proto`) — wire types crossing
   the admin Unix socket: `JobEvent` enum, `JobAccepted` struct.
@@ -62,8 +63,9 @@ on-disk paths group by purpose.
   (`run_job`), `ping`, error-body parsing.
 - `shared/admin-iscsi` (`shared-admin-iscsi`) — cross-application axum
   handlers for `/api/v1/iscsi/{users,target}` lifecycle verbs (add /
-  remove / disable / enable / rotate / rotate-cancel / list / target
-  set-clear-show). Both daemons impl the [`IscsiUsersState`] trait
+  remove / disable / enable / grant / revoke / rotate / rotate-cancel /
+  list / target set-clear-show; grant / revoke edit the VSA-only
+  `volumes` admission list). Both daemons impl the [`IscsiUsersState`] trait
   (`data_dir` + optional `AuditChannel`); everything else — wire
   shapes, `ApiError` type, audit op names, sweep-expired-previous
   logic — lives here so the two `iscsi-users.json` surfaces can't
@@ -81,9 +83,10 @@ on-disk paths group by purpose.
   passed as a plain `PathBuf`. Kept out of `shared-audit` itself so
   that low-level crate stays free of the `JobEmitter` / job-protocol
   deps.
-- `shared/admin-auth` (`shared-admin-auth`) — the single web-admin
-  password gating the network-facing HTTP listener (issue #4, the
-  prerequisite for the Web UI #5). Owns Argon2id PHC hashing (OWASP
+- `shared/admin-auth` (`shared-admin-auth`) — the optional single
+  web-admin password for the network-facing HTTP listener's protected
+  routes (issue #4) — enforced only under `http.auth.method: Password`;
+  the shipped default `None` serves them open. Owns Argon2id PHC hashing (OWASP
   baseline m=19456,t=2,p=1), the `<data_dir>/admin-password.json`
   store (hash only), the hot-swappable `AuthState` verifier (arc-swap,
   shared in-process between admin socket and HTTP listener), HTTP
@@ -92,6 +95,10 @@ on-disk paths group by purpose.
   Both daemons mount it today; `shared-admin-webui` reuses it. Sibling
   of `shared-admin-iscsi`; kept out of the transport-only
   `shared-admin-http`. Design in [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md).
+- `shared/admin-http` (`shared-admin-http`) — the shared TCP HTTP
+  listener: bind / serve / TLS plumbing both daemons hand their
+  per-application `axum::Router` to. Transport-only — auth lives in
+  `shared-admin-auth`, handlers per-daemon.
 - `shared/admin-webui` (`shared-admin-webui`) — the read-only Web UI
   (issue #5) embedded in both daemons' TCP HTTP listeners. Owns the
   static `/ui/*` bundle (no-build HTML/CSS/JS, `include_dir!` embedded
@@ -99,7 +106,8 @@ on-disk paths group by purpose.
   traversal guard) and the cross-application read-only `/api/v1` GET
   handlers (`monitor` snapshot, `jobs/recent`, `audit/tail`). Reuses
   #4's `shared_admin_auth` gate directly; per-application inventory GETs
-  stay per-daemon. Mutations are out of scope (issue #91). Design in
+  stay per-daemon. Mutations were rejected (issue #91, closed won't-do
+  — read-only by design). Design in
   [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
 - `shared/admin-storage-check` (`shared-admin-storage-check`) —
   cross-application storage-backend reachability. `run_storage_check` is the
@@ -130,12 +138,23 @@ on-disk paths group by purpose.
   verb refuses via `require_daemon` rather than mutating the file
   directly. Parameterized on `&'static ProductIdentity` so the
   admin socket discovery + daemon name in the refusal flow from the
-  per-application identity. VSA's NVMe-TCP `psks_*` verbs reuse the
-  helpers (`parse_grace`, `resolve_password`, `require_daemon`) but
-  keep their application-specific lifecycle in
-  `vsa/cli/src/credentials.rs`.
+  per-application identity. VSA's NVMe-TCP credential verbs — `psks_*`
+  (TLS-PSK) and `dhchap_*` (DH-HMAC-CHAP) — reuse the helpers
+  (`parse_grace`, `resolve_password`, `require_daemon`) but keep their
+  application-specific lifecycle in `vsa/cli/src/credentials.rs` (one
+  `CredSurface`-driven implementation serves both surfaces).
+- `shared/cli-system` (`shared-cli-system`) — cross-application
+  `system <verb>` CLI implementations, generic over
+  `shared_naming::ProductIdentity` so one implementation serves both
+  binaries.
+- `shared/cli-alerting` (`shared-cli-alerting`) — cross-application CLI
+  implementations for the `system alerting` verbs (daemon-routed only).
 - `shared/object-store` (`shared-object-store`) — `ObjectStoreBackend` trait + S3 / GCS /
   Azure / Local impls, retry, compression primitives.
+- `shared/object-store-bench` (`shared-object-store-bench`) — the
+  `system storage benchmark` engine: drives N parallel upload /
+  download / delete ops through the same `ObjectStoreBackend` + SDK
+  path the daemon uses, so the reported numbers are the real ceiling.
 - `shared/crypto` (`shared-crypto`) — AES-256-GCM primitives
   (`encrypt_block` / `decrypt_block`), IV derivation (`derive_iv`),
   length constants, and an `OsRng` re-export. Pure byte-slice surface
@@ -185,12 +204,20 @@ on-disk paths group by purpose.
   `thurvsa volume key migrate NAME --to NAME` (daemon-down).
 - `shared/audit` (`shared-audit`) — append-only BLAKE3-chained log +
   cloneable `AuditChannel` producer + rate limiter.
+- `shared/alerting` (`shared-alerting`) — the cross-application
+  alerting subsystem the Architecture § Alerting bullet describes:
+  process-global dispatcher, email (lettre SMTP) + Tera-templated
+  webhook sinks, per-class dedup window, `shared_alerting::record::*`
+  producer helpers.
+- `shared/health` (`shared-health`) — the unauthenticated `GET /health`
+  axum liveness handler (`{status, daemon, version}` only — per-application
+  topology stays on `/info`).
 - `shared/telemetry` (`shared-telemetry`) — OpenTelemetry SDK
   plumbing, Prometheus pull + OTLP push. Per-application instrument
-  prefix (`thurvtl_*` / `thurvsa_*`) sourced from
-  `shared_naming::PRODUCT.metric_prefix` at boot; `service.name`
-  resource attribute carries the same distinction redundantly for
-  OTLP relabeling.
+  prefix (`thurvtl_*` / `thurvsa_*`) sourced from the per-application
+  `shared_naming::ProductIdentity` (`TAPE_LIBRARY` / `DISK`)
+  `metric_prefix` at boot; `service.name` resource attribute carries
+  the same distinction redundantly for OTLP relabeling.
 - `scsi/spc` (`scsi-spc`) — SPC-4 baseline (sense, INQUIRY / VPD /
   mode / report-luns / PR primitives, canonical `ScsiRequest` /
   `ScsiResponse`). The PR `ReservationManager` owns the transport-neutral
@@ -209,8 +236,10 @@ on-disk paths group by purpose.
   per-completion hook (auto-hold reapply, eviction-Notify,
   per-application "uploaded" flag flip). Tape-side glue
   (MemoryBufferManager, crash-recovery scan, cartridge open) stays
-  in `vtl/daemon`; the block side will plug in a parallel set of
-  glue when VSA's async-upload path lands. `core_stream::cartridge`
+  in `vtl/daemon`; the block-side glue lives in
+  `vsa/daemon/src/upload_worker.rs` (per-page tasks reusing
+  `upload_chunk_inert` directly rather than the batched
+  `run_upload_pipeline`). `core_stream::cartridge`
   re-exports the payload types under their legacy names
   (`PendingUploadPayload`, `ChunkUploadOutcome`) for call-site
   continuity.
@@ -223,9 +252,11 @@ on-disk paths group by purpose.
   tape library/partition checks and the block page-table integrity
   check stay per-application, as does each application's `VerifyReport`
   shape; only the two pool sweeps are shared.
-- `shared/naming` (`shared-naming`) — per-application identity strings
-  (consumers still hardcode paths today; this is the migration
-  target).
+- `shared/naming` (`shared-naming`) — the per-application
+  `ProductIdentity` bundle (`TAPE_LIBRARY` / `DISK`: name, IQN/NQN,
+  metric prefix, conffile / data / run / admin-socket paths, system
+  user, service unit) plus vendor-level strings (`VENDOR_INQUIRY`).
+  Both daemons and CLIs source identity and default paths from here.
 - `scsi/ssc` (`scsi-ssc`) — drive-LUN SCSI dispatch + drive-manager
   primitives + tape scsi helpers (sense, log pages, MAM attributes,
   encryption pages). Consumed by `thurvtld`.
@@ -240,13 +271,16 @@ on-disk paths group by purpose.
   `SmcScsiCtx` wraps `scsi-ssc`'s `ScsiCtx` and adds the `Library`
   lock + `ElementAddressConfig` borrows. Consumed by `thurvtld`.
 - `scsi/sbc` (`scsi-sbc`) — SBC-3 block-target SCSI dispatch (every
-  data-path opcode: READ / WRITE 10/16, COMPARE AND WRITE, UNMAP,
-  WRITE SAME, SYNCHRONIZE CACHE; plus INQUIRY + VPD, READ CAPACITY,
+  data-path opcode: READ / WRITE 10/16, VERIFY 10/16, COMPARE AND
+  WRITE, UNMAP, WRITE SAME, SYNCHRONIZE CACHE, EXTENDED COPY incl. the
+  ODX token form (POPULATE TOKEN / WRITE USING TOKEN, backed by a
+  `TokenManager` with pool-pin guards), RECEIVE COPY RESULTS; plus
+  INQUIRY + VPD, READ CAPACITY,
   REPORT LUNS, MODE SENSE/SELECT, PERSISTENT RESERVE IN/OUT,
   MAINTENANCE IN, probes). `SbcScsiDispatcher` implements
   `shared_iscsi::ScsiHandler`; the daemon plugs its
   `VolumeRegistry` in via the `VolumeLookup` trait (same shape as
-  `scsi-ssc::TapeDeviceFacade`). Consumed by `thurvsad`.
+  `core_mediachanger::TapeDeviceFacade`). Consumed by `thurvsad`.
 - `nvme/base` (`nvme-base`) — NVMe Base Spec primitives: 64-byte
   SQE, 16-byte CQE with status field (SCT / SC / DNR), Admin opcode
   enum, FUSE / PSDT sub-fields, Identify Controller / Identify
@@ -254,14 +288,18 @@ on-disk paths group by purpose.
   (`ConnectData`, `FabricsType`, `extract_fctype`), controller
   register state (`ControllerRegs`: CC / CSTS / VS / CAP), log-page
   builders (SMART, Error Info, FW Slot, Reservation Notification),
-  AER completion DW0 packing. Wire-format ground floor every NVMe
+  AER completion DW0 packing, DH-HMAC-CHAP wire shapes
+  (`nvme_base::auth`: negotiate / challenge / reply / success message
+  layouts, hash + DH-group constants — crypto and the controller-side
+  state machine stay in `nvme-tcp`). Wire-format ground floor every NVMe
   command set + NVMe-oF transport consumes.
 - `nvme/nvm` (`nvme-nvm`) — NVM Command Set dispatch
   (Read / Write / Flush / Compare / Write Zeroes / DSM Deallocate /
   Verify; fused Compare+Write via `handle_fused_compare_write`).
   Admin command coverage: Identify, Keep Alive, Get/Set Features
-  (Number of Queues, Reservation Notification Mask FID 0x82), Get
-  Log Page (Error / SMART / FW Slot / Reservation Notification LID
+  (Number of Queues FID 0x07, Async Event Configuration FID 0x0B,
+  Keep Alive Timer FID 0x0F, Reservation Notification Mask FID 0x82),
+  Get Log Page (Error / SMART / FW Slot / Reservation Notification LID
   0x80), Abort. Reservation notifications are driven by the shared
   `ReservationManager` observer hook (issue #67): `AerReservationSink`
   consumes the manager's neutral pre/post diff and fans LID 0x80 + AER
@@ -286,25 +324,29 @@ on-disk paths group by purpose.
   `nvme_nvm::ControllerRegistry` (which also allocates a CNTLID per
   controller at Connect). Enabled by listing `nvmetcp` in `transports:`
   in `thurvsa.yaml` (default `[iscsi]`; list both to bind concurrently —
-  issue #66). TLS-PSK auth, CRC32C header/data digests (issue #78), and
+  issue #66). TLS-PSK auth, DH-HMAC-CHAP in-band auth (issue #59;
+  `nvmetcp.auth.mode: dhchap`, composable with TLS-PSK as
+  "dhchap+tls"), CRC32C header/data digests (issue #78), and
   a single-subsystem discovery controller have all shipped; still out of
   scope: multi-outstanding R2T — rationale in
   [`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md) § *Out of scope*.
-- `core/ssc` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
+- `core/stream` (`core-stream`) — SSC-4 / LTO tape-cartridge primitives:
   cartridge, block/chunk/lru indexes, dirty-page tracker, index-page
   backups, prefetch, FastCDC, AES-GCM encryption, disk-cache + pool
   budget, cartridge-side legal-hold sentinel, mode-page/drive-state,
   plus the `DriveTopology` trait. Consumed by
   `thurvtld` via `core-mediachanger`.
-- `core/smc` (`core-mediachanger`) — SMC-3 medium-changer + library inventory +
+- `core/mediachanger` (`core-mediachanger`) — SMC-3 medium-changer + library inventory +
   library-wide verify. Composes `core-stream`.
   `Library` (and the `LibraryFacade` lock-wrapper) impls
   `core_stream::DriveTopology`.
-- `core/sbc` (`core-block`) — SBC-3 direct-access (block) device-type
+- `core/block` (`core-block`) — SBC-3 direct-access (block) device-type
   core.
-- `thurvtl/{daemon,cli,scripts,docs}` — the Thur VTL application (system user
+- `vtl/{daemon,cli,scripts}` — the Thur VTL application (crates
+  `vtl-daemon` / `vtl-cli`, binaries `thurvtld` / `thurvtl`; system user
   `thurvtl`, IQN `iqn.2025-10.com.metebalci:thurvtl`).
-- `thurvsa/{daemon,cli,scripts,docs}` — the Thur VSA application (system user
+- `vsa/{daemon,cli,scripts}` — the Thur VSA application (crates
+  `vsa-daemon` / `vsa-cli`, binaries `thurvsad` / `thurvsa`; system user
   `thurvsa`, IQN `iqn.2025-10.com.metebalci:thurvsa`).
 
 Per-crate API surfaces, module breakdowns, cross-crate re-exports, and the
@@ -328,7 +370,9 @@ adapter layers between the applications are in
   [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md); cross-backend
   + cross-region ops (`cartridge migrate`, `cartridge archive`,
   `library restore-archive`, `library restore`) in
-  [`docs/reference/SPEC.md`](docs/reference/SPEC.md).
+  [`docs/admin/DISASTER_RECOVERY.md`](docs/admin/DISASTER_RECOVERY.md)
+  (the at-rest wire primitives they build on stay in
+  [`docs/reference/SPEC.md`](docs/reference/SPEC.md)).
 - **Pipelines** — both applications park host writes against a per-backend
   `shared_pool::PoolBudget` and surface SCSI NOT READY (0x04/0x07) on
   timeout. Thur VTL runs an event-driven broadcast bus → bounded mpsc
@@ -355,19 +399,22 @@ adapter layers between the applications are in
 - **Telemetry** — one OTel `MeterProvider` with Prometheus pull (always
   wired at `GET /metrics`) + OTLP push (opt-in). Process-global handle;
   CLI / unit-test callers no-op. Per-application instrument prefix
-  (`thurvtl_*` / `thurvsa_*`) sourced from
-  `shared_naming::PRODUCT.metric_prefix`; `service.name` resource
-  attribute (`thurvtl` / `thurvsa`) carries the distinction
+  (`thurvtl_*` / `thurvsa_*`) sourced from the per-application
+  `shared_naming::ProductIdentity::metric_prefix`; `service.name`
+  resource attribute (`thurvtl` / `thurvsa`) carries the distinction
   redundantly. Design in
   [`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md); full instrument
   table in [`docs/reference/SPEC.md`](docs/reference/SPEC.md) § Telemetry.
 - **Web-admin password** — the TCP HTTP listener splits its router into
   an OPEN group (`/health` + `/metrics`, unauthenticated for Prometheus
-  + liveness) and a PROTECTED group (everything else, gated by HTTP
-  Basic against the single shared web-admin password — realm `thur
-  admin`, fixed username `webadmin`). No password configured fails
-  closed (503 + challenge); wrong creds 401. The prerequisite for the
-  Web UI (issue #4, set via `system set-admin-password`). Design in
+  + liveness) and a PROTECTED group (everything else). Gating is opt-in
+  via `http.auth.method` (`None | Password`, default `None` — protected
+  routes served open; the network boundary is the gate). Under
+  `Password`, the group is gated by HTTP Basic against the single
+  shared web-admin password — realm `thur admin`, fixed username
+  `webadmin`; no password configured then fails closed (503 +
+  challenge), wrong creds 401. Set via `system set-admin-password`
+  (issue #4). Design in
   [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md).
 - **Web UI** — a read-only operator console (issue #5) embedded in each
   daemon's TCP HTTP listener, on by default (`http.webui.enabled`). The
@@ -376,7 +423,8 @@ adapter layers between the applications are in
   and a read-only `/api/v1` GET subset (inventory + monitor snapshot +
   recent jobs + audit tail). GET-only on TCP — every mutating verb stays
   on the peer-cred admin socket. Lives in `shared-admin-webui`; reuses
-  the #4 password gate. Mutations are issue #91. Design in
+  the #4 password gate. A mutating UI was rejected (issue #91, closed
+  won't-do) — read-only by design. Design in
   [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md).
 - **Alerting** — opt-in first-party email (SMTP via lettre) + generic
   webhook (HTTP POST with Tera-templated body — one path covers
@@ -391,8 +439,11 @@ adapter layers between the applications are in
   failure — drop, log, count via
   `<application>_alerts_fired_total{outcome}`. Full design in
   [`docs/admin/ALERTING.md`](docs/admin/ALERTING.md).
-- **Daemon lock** — `<data_dir>/.daemon.lock` PID lockfile; CLI mutating
-  commands refuse if alive. Stale locks auto-clear.
+- **Daemon lock (VTL only)** — thurvtld holds a `<data_dir>/.daemon.lock`
+  PID lockfile (`core_mediachanger::DaemonLock`); the daemon-down
+  `library restore` / `library partition {create,modify,delete}` verbs
+  refuse while it is alive. Stale locks auto-clear. thurvsad keeps no lockfile — VSA's
+  daemon-down `volume key *` verbs are safe with the daemon up.
 
 ## Quick Start
 
@@ -441,7 +492,7 @@ Eight checked-in artifacts under `dist/` are regenerated by the matching
   CLI crate's `src/cli.rs` via `clap_complete`. The same `cli.rs` the binary
   uses is `include!`d, so the scripts can never drift. Bash doesn't embed
   help text (so `///` doc edits won't dirty the bash file); zsh does.
-  Operators on shells we don't ship (fish, elvish, powershell, nushell) get
+  Operators on shells we don't ship (fish, elvish, powershell) get
   scripts on demand via `<binary> config completion <shell>`.
 - `dist/{thurvtl,thurvsa}.defaults.yaml` — mirrored byte-for-byte from each
   CLI crate's `src/commands/defaults_reference.yaml`. Edit the in-crate
@@ -512,24 +563,42 @@ re-materializes `library.json` from the YAML `library:` block.
   session = see-nothing (safe fallback). Sessions without CHAP
   (`auth.method: None`) skip admission entirely and see everything.
   VTL ignores the `volumes` field. Managed via
-  `thur{vtl,vsa} iscsi users {add,remove,disable,enable,grant,revoke,
-  rotate,list}` and `iscsi target {set,clear,show}`. Daemon re-reads
+  `thur{vtl,vsa} iscsi users {add,remove,disable,enable,rotate,list}`
+  (plus the VSA-only `grant` / `revoke` volume-admission verbs) and
+  `iscsi target {set,clear,show}`. Daemon re-reads
   on every login — no restart needed.
 - `nvmetcp-psks.json` (VSA only) — TLS-PSK host identity list + per-
   hostnqn volume admission. Each entry **must** carry a `volumes:`
   array (at least one) when TLS-PSK is on — admission is mandatory:
   `nvmetcp psks add --host-nqn ... --key ... --volume NAME [...]`,
   `nvmetcp psks grant --host-nqn ... --volume NAME [...]`,
-  `nvmetcp psks revoke --host-nqn ... --volume NAME [...]`. TLS off
-  (`nvmetcp.tls.mode: Disabled`) skips admission entirely and
-  connections see everything (mirror of iSCSI no-CHAP). Managed via
+  `nvmetcp psks revoke --host-nqn ... --volume NAME [...]`. Both auths
+  off (`nvmetcp.tls.mode: disabled` and `nvmetcp.auth.mode: none`)
+  skips admission entirely and connections see everything (mirror of
+  iSCSI no-CHAP); when DH-HMAC-CHAP is on, its `nvmetcp-dhchap.json`
+  entries own admission instead, regardless of TLS state. Managed via
   `thurvsa nvmetcp psks {add,remove,disable,enable,grant,revoke,
   rotate,list}`. Daemon re-reads on every TLS handshake — no restart
   needed.
+- `nvmetcp-dhchap.json` (VSA only) — DH-HMAC-CHAP host-secret list +
+  per-hostnqn volume admission for NVMe-TCP in-band auth
+  (`nvmetcp.auth.mode: dhchap`, composable with TLS-PSK as
+  "dhchap+tls"). Each entry **must** carry a `volumes:` array (at
+  least one) — admission is mandatory, mirror of `nvmetcp-psks.json`;
+  an optional per-host controller secret enables mutual auth. Managed
+  via `thurvsa nvmetcp dhchap {add,remove,disable,enable,grant,revoke,
+  rotate,set-ctrl-key,clear-ctrl-key,list}`. Daemon re-reads on every
+  handshake — no restart needed.
+- `reservations.json` (both daemons) — persisted PERSISTENT RESERVE
+  state (PTPL, issue #57): written on reservation changes, reloaded at
+  start so reservations survive a daemon restart. Daemon-managed only —
+  no CLI verb, never hand-edited.
 - `admin-password.json` — the single web-admin password gating the
   HTTP listener's protected routes. Holds only the Argon2id PHC hash
   (never the plaintext), mode 0640, written by the daemon (no postinst
-  entry). Absent file = no password = the gate fails closed. Set via
+  entry). Absent file = no password; under `http.auth.method: Password`
+  the gate then fails closed (503) — under the default `None` the
+  protected routes are served open regardless. Set via
   `thur{vtl,vsa} system set-admin-password` (daemon-routed; the
   plaintext is hashed server-side and never lands on disk). Hot-swapped
   on set — no restart needed.
@@ -542,31 +611,42 @@ direction.
 ## CLI Surface
 
 ```
-thurvtl      library / cartridge / changer / drive / system / config
-thurvsa      volume / config
+thurvtl      library / cartridge / changer / drive / system / iscsi / config
+thurvsa      volume / system / iscsi / nvmetcp / config
 ```
 
 `<binary> <subcommand> --help` is the source of truth for flags (clap
 drives both `--help` and the shipped completion scripts).
 
 Most CLI commands are **daemon-routed** (live; talk to the admin socket at
-`/run/{thurvtl,thurvsa}/admin.sock`, mode 0660, peer-cred-authed). Only
-partition-layout ops (`library partition *`), DR-restore (`library
-restore` / `library restore-archive`), and pure-local config commands
-are **daemon-down**. Chassis topology (`num_slots`, `num_drives`,
+`/run/{thurvtl,thurvsa}/admin.sock`, mode 0660, peer-cred-authed). The
+**daemon-down** set: VTL `library partition *`, `library restore` (DR),
+`cartridge key {migrate,show}`, `system storage benchmark`, `system
+regenerate-cert`; VSA `volume key *`, `system storage benchmark`,
+`system regenerate-cert`; plus the pure-local `config` commands on both.
+(`library restore-archive` is daemon-routed — it rides the job
+protocol.) Chassis topology (`num_slots`, `num_drives`,
 `lto_generation`) is YAML-declared and reconciled by the daemon at
-start; there's no imperative chassis-mutation verb. Long-running
-ops (`gc` / `verify` / `stats` / `storage check` / self-tests) ride a two-step
+start; there's no imperative chassis-mutation verb. Long-running and
+streaming ops (`gc` / `verify` / `stats` / `storage check` /
+`monitor` / `alerting test` / the `system audit` jobs, plus VTL's
+self-tests, `tiering plan` / `tiering run-now`, `cartridge migrate` /
+`cartridge archive`, and `library restore-archive`) ride a two-step
 job protocol on the same socket. Full split, admin socket discovery, sudo
 / privdrop behavior, and the job protocol in
 [`docs/admin/CLI.md`](docs/admin/CLI.md).
 
 ## Integration Tests
 
-Two application-prefixed sets, in increasing order of prereqs / coverage:
+Two application-prefixed sets, in increasing order of prereqs / coverage,
+plus one unprefixed cross-application test
+(`scripts/test-coresident-smoke.sh`, the VTL+VSA co-residency smoke):
 
-- `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,app-bareos,monte-carlo}.sh`
-- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,dual-transport,scsi-conformance,fs,fs-storage,fs-storage-failures,keystore,snapshot,monte-carlo,app-postgres,app-vm}.sh`
+- `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,backup-storage-failures,backup-storage-resume,crash-audit-append,crash-chunk-seal,legal-hold-lifecycle,lifecycle-cartridge-migrate,lifecycle-dr-restore,lifecycle-many-cartridges,pipeline-layers,tiering-plan-and-run,tiering-legal-hold-interaction,app-bareos,monte-carlo,monte-carlo-multi}.sh`
+- `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,dual-transport,scsi-conformance,iscsi-multi-pdu-readin,fs,fs-storage,fs-storage-failures,multi-initiator,nvmetcp-multi-initiator,multi-volume-dedup,pipeline-layers,crash-audit-append,crash-page-flush,keystore,keystore-kmip,snapshot,monte-carlo,monte-carlo-multi,app-postgres,app-vm}.sh`
+
+(the per-application `{vtl,vsa}/scripts/README.md` files catalogue what
+each script covers)
 
 Run from the repo root; flags `--debug`, `--keep-data` (release is the
 default — debug builds are 5-10x slower, only useful when iterating on a
@@ -584,7 +664,8 @@ are transport-agnostic; only the login / device-discovery /
 logout-cycle primitives branch.
 `test-app-bareos.sh` (VTL only) drives a real Bareos director/SD/FD
 in podman (built on the fly from an inline `Containerfile`, debian:12 +
-bareos-21 + SQLite catalog) against a 2-drive / 6-cartridge chassis,
+Bareos from the upstream community `current` repo + PostgreSQL
+catalog) against a 2-drive / 6-cartridge chassis,
 runs a seeded random number of small backup jobs with Bareos Max
 Concurrent Jobs = 2 so both drives engage, restores every job and diffs
 the restored tree byte-for-byte. `--seed N` reproduces; `--quick` for 4
@@ -619,13 +700,20 @@ reuse the cache.
 — `THURVSA_TEST_KEYSTORE=<name>` picks an entry from
 `private/keystore-backends.yaml` (override via `THURVSA_SOURCE_KEYSTORES`)
 and exercises wrap / unwrap / migrate against any backend type
-(`local` / `awskms` / `vault` / `azurekv` / `gcpkms`). sudo-required
+(`local` / `awskms` / `vault` / `azurekv` / `gcpkms` / `kmip`);
+`test-keystore-kmip.sh` is the zero-credential `kmip` counterpart — it
+bootstraps a local PyKMIP server (python3 venv + self-signed mTLS
+certs via `vsa/scripts/pykmip-server.py` / `pykmip-create-kek.py`).
+sudo-required
 scripts self-elevate via `exec sudo "$0" "$@"` (NOPASSWD sudoers entry to
 be non-interactive). Exit 0 / 1, auto-cleanup unless `--keep-data`. What
 each script covers + sudo / prereq specifics live in headers at the top of
-each `.sh` file. Workspace dev utilities (`scripts/setup-system.sh`,
-`scripts/docker-compose.yml`, `scripts/lib/test-helpers.sh`) stay
-application-agnostic in the unprefixed top-level `scripts/` dir.
+each `.sh` file. Workspace dev utilities and cross-application tooling
+stay in the unprefixed top-level `scripts/` dir: `setup-system.sh`,
+`docker-compose.yml`, `webui-demo.sh`, the coverage workflow
+(`coverage.sh` + `coverage-report.py` + `coverage-exempt.txt`), and
+shared helpers under `scripts/lib/` (`test-helpers.sh`,
+`monte-carlo.sh`).
 
 ## Design Docs
 
@@ -639,6 +727,7 @@ operator-facing doc map; `README.md` and `CLAUDE.md` stay at the repo root
 - Architecture deep-dives:
   [`docs/reference/STORAGE.md`](docs/reference/STORAGE.md),
   [`docs/admin/CARTRIDGE.md`](docs/admin/CARTRIDGE.md),
+  [`docs/admin/VOLUME.md`](docs/admin/VOLUME.md),
   [`docs/reference/DEDUP.md`](docs/reference/DEDUP.md),
   [`docs/reference/BACKPRESSURE.md`](docs/reference/BACKPRESSURE.md),
   [`docs/admin/AUDIT.md`](docs/admin/AUDIT.md),
@@ -646,7 +735,10 @@ operator-facing doc map; `README.md` and `CLAUDE.md` stay at the repo root
   [`docs/admin/ENCRYPTION.md`](docs/admin/ENCRYPTION.md),
   [`docs/admin/NETWORK_SECURITY.md`](docs/admin/NETWORK_SECURITY.md),
   [`docs/reference/WEBUI.md`](docs/reference/WEBUI.md),
-  [`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md).
+  [`docs/admin/TELEMETRY.md`](docs/admin/TELEMETRY.md),
+  [`docs/admin/ALERTING.md`](docs/admin/ALERTING.md),
+  [`docs/admin/DISASTER_RECOVERY.md`](docs/admin/DISASTER_RECOVERY.md),
+  [`docs/admin/CONFIGURATION.md`](docs/admin/CONFIGURATION.md).
 - Conformance:
   [`docs/reference/CONFORMANCE_SCSI.md`](docs/reference/CONFORMANCE_SCSI.md) — the whole
   SCSI surface in three parts: SPC-4 / SAM-5 / iSCSI / CHAP (shared
@@ -654,13 +746,14 @@ operator-facing doc map; `README.md` and `CLAUDE.md` stay at the repo root
   Encryption + the behavioral model and deliberate divergences from
   typical LTO hardware (VTL), and SBC-3 (VSA).
   [`docs/reference/CONFORMANCE_NVME.md`](docs/reference/CONFORMANCE_NVME.md) (NVMe
-  Base / NVM Command Set / NVMe-oF / NVMe-TCP, incl. TLS-PSK),
+  Base / NVM Command Set / NVMe-oF / NVMe-TCP, incl. TLS-PSK +
+  DH-HMAC-CHAP in-band auth),
   [`docs/reference/NVMETCP.md`](docs/reference/NVMETCP.md) (NVMe/TCP transport
   design walkthrough for VSA: crate split, opcode → PageCache
-  mapping, NQN, auth roadmap).
+  mapping, NQN / discovery, TLS-PSK + DH-HMAC-CHAP auth designs).
 - Kubernetes:
   [`docs/admin/CSI.md`](docs/admin/CSI.md) — the Thur VSA CSI driver (Go subtree
-  under `csi/`, issue #15): admin-socket client, per-volume CHAP
+  under `csi/`, issue #15): admin-socket client, per-node CHAP
   isolation, RPC→admin-call mapping, the Helm chart, and the `csi-v*`
   release cadence.
 - Wire-level reference:

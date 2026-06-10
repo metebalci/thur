@@ -3,8 +3,9 @@
 
 //! SBC-3 SCSI dispatch layer for thurvsa.
 //!
-//! Lifts the per-opcode handlers (READ / WRITE / COMPARE AND WRITE /
-//! UNMAP / WRITE SAME / SYNCHRONIZE CACHE / INQUIRY + VPD / READ
+//! Lifts the per-opcode handlers (READ / WRITE / VERIFY / COMPARE AND
+//! WRITE / UNMAP / WRITE SAME / SYNCHRONIZE CACHE / EXTENDED COPY incl.
+//! the ODX token form / RECEIVE COPY RESULTS / INQUIRY + VPD / READ
 //! CAPACITY / REPORT LUNS / MODE SENSE+SELECT / PERSISTENT
 //! RESERVE IN-OUT / MAINTENANCE IN / probes) out of `thurvsad`
 //! so the workspace family is symmetric with `scsi-ssc` (drive-LUN)
@@ -16,7 +17,7 @@
 //! - [`VolumeLookup`] — trait the daemon's `VolumeRegistry`
 //!   implements so the dispatcher can resolve LUN → `PageCache`
 //!   without depending on the daemon crate (analogous to
-//!   `scsi-ssc::TapeDeviceFacade`).
+//!   `core_mediachanger::TapeDeviceFacade`).
 //!
 //! What stays in `thurvsad`: boot wiring (config / discovery /
 //! admin socket), `VolumeRegistry` lifecycle (admin create / destroy

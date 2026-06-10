@@ -16,7 +16,7 @@ Naming follows `test-<category>-<topic>.sh`:
 | `app-<name>` | Real applications driving the storage end-to-end |
 | `crash-*` | Power-loss / SIGKILL durability invariants |
 | `keystore[-<backend>]` | Keystore backend coverage |
-| *flat* | Single-script categories (`monte-carlo`, `pipeline-layers`, `multi-initiator`, `multi-volume-dedup`) |
+| *flat* | Flat names (`monte-carlo[-multi]`, `pipeline-layers`, `multi-initiator`, `multi-volume-dedup`, `dual-transport`, `snapshot`) |
 
 ## Scripts
 
@@ -25,11 +25,13 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-smoke.sh` | HTTP health, admin socket, iSCSI INQUIRY — no kernel initiator, no data path. |
 | `test-proto-iscsi.sh` | iSCSI protocol-layer conformance (login, CmdSN/StatSN, digests) via libiscsi. |
 | `test-proto-nvmetcp.sh` | NVMe/TCP host round-trip (handshake, identify, properties, I/O, disconnect). |
+| `test-dual-transport.sh` | One volume exported over iSCSI and NVMe/TCP simultaneously (`transports: [iscsi, nvmetcp]`). |
 | `test-scsi-conformance.sh` | Per-CDB SBC-3 compliance (INQUIRY, READ/WRITE, CAW, UNMAP, persistent reservations). |
 | `test-iscsi-multi-pdu-readin.sh` | iSCSI Data-In chunking when a single READ-16 response exceeds MaxRecvDataSegmentLength. |
 | `test-fs.sh` | ext4 durability + daemon-restart persistence; transport-agnostic (`--transport iscsi\|nvmetcp`). |
 | `test-fs-storage.sh` | `test-fs` + real S3/GCS/Azure backend — upload pipeline, dedup, refetch; transport-agnostic (`--transport iscsi\|nvmetcp`). |
 | `test-fs-storage-failures.sh` | Backend failure injection (auth, timeout, throttling) via the daemon's test-mode hooks. |
+| `test-snapshot.sh` | Copy-on-write snapshot + clone lifecycle through the real iSCSI data path. |
 | `test-app-postgres.sh` | PostgreSQL OLTP + TPC-B invariant survives SIGKILL + WAL replay. |
 | `test-app-vm.sh` | Ubuntu 26.04 guest boots from a VSA volume; cloud-init fixture survives clean shutdown and crash-replay. |
 | `test-crash-audit-append.sh` | BLAKE3-chained audit log stays valid under SIGKILL mid-append. |
@@ -38,8 +40,9 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-nvmetcp-multi-initiator.sh` | NVMe/TCP reservations across two host NQNs: fencing, cross-host preempt + Reservation Notification (AER) delivery. |
 | `test-multi-volume-dedup.sh` | 20-volume fleet exercises shared-pool dedup stats + chunk-pool bookkeeping. |
 | `test-monte-carlo.sh` | Seeded random filesystem ops with boundary-biased sizes; transport-agnostic (`--transport iscsi\|nvmetcp`). |
+| `test-monte-carlo-multi.sh` | Two concurrent seeded op streams from two distinct initiators over 4 volumes on one daemon — multi-initiator sibling of `test-monte-carlo.sh`. |
 | `test-pipeline-layers.sh` | Matrix of `{dedup, encrypt, storage-zstd}` combinations — five-row layer comparison. |
-| `test-keystore.sh` | DEK wrap/unwrap/migrate against each `KeyStoreBackend` (local, awskms, vault, azurekv, gcpkms). |
+| `test-keystore.sh` | DEK wrap/unwrap/migrate against each `KeyStoreBackend` (local, awskms, vault, azurekv, gcpkms, kmip). |
 | `test-keystore-kmip.sh` | KMIP backend integration against a locally-spun PyKMIP server. |
 
 Run from the repo root. Remote-backend variants (`*-storage*`, the

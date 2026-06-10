@@ -14,9 +14,10 @@
 # Workflow:
 #   1. thurvtld up with 2 drives, ~6 cartridges, local backend.
 #   2. iSCSI login on the host; resolve /dev/sgN changer + /dev/nstN drives.
-#   3. Build a small Bareos all-in-one container (debian:12 + bareos-21 +
-#      SQLite catalog) from an inline Containerfile. Image cached after
-#      the first build; tag includes a Containerfile-content fingerprint.
+#   3. Build a small Bareos all-in-one container (debian:12 + Bareos from
+#      the upstream community 'current' repo + PostgreSQL catalog) from
+#      an inline Containerfile. Image cached after the first build; tag
+#      includes a Containerfile-content fingerprint.
 #   4. Run the container --privileged with the 3 SCSI devices mapped in.
 #   5. Generate dir/SD/FD/bconsole configs (autochanger + 2 devices, pool
 #      of N tape volumes, one FileSet per backup job).
