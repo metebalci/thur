@@ -756,13 +756,20 @@ run_pr_fuzz() {
     done
     sg_persist --out --clear --param-rk=0xa1a1 "$dev_a" >/dev/null 2>&1 || true
     sg_persist --out --clear --param-rk=0xb2b2 "$dev_b" >/dev/null 2>&1 || true
-    # The shared LUN is left for the cleanup trap (iSCSI logout + rm -rf)
-    # to reclaim: an in-test `volume destroy` of a volume still mapped to
-    # two live sessions can block on those sessions, and we don't need it
-    # gone mid-run. Run AFTER the integrity gates so `system verify`
-    # never sees this raw, FS-less volume.
     if (( rc != 0 )); then return 1; fi
-    log_info "PR fuzz OK ($rounds rounds)"
+    # Destroy the shared LUN in-test, seconds after the sg_write_same
+    # writes and with both sessions still live — the issue #103
+    # regression: destroy used to unregister the volume before its
+    # final flush, stranding the just-written page as a pending upload
+    # the worker could no longer resolve, and the admin call hung
+    # forever. The timeout turns a regression into a loud failure
+    # instead of a wedged suite. Runs AFTER the integrity gates so
+    # `system verify` never saw this raw, FS-less volume.
+    if ! timeout 30 "$CLI_PATH" --config "$TEST_CONFIG" volume destroy "$shared" --force >/dev/null 2>&1; then
+        log_error "PR fuzz: destroy $shared hung or failed right after writes (issue #103 regression)"
+        return 1
+    fi
+    log_info "PR fuzz OK ($rounds rounds; shared LUN destroyed live)"
 }
 
 # Post-run integrity gates against the state both concurrent streams

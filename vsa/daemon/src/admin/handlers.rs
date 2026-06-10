@@ -1206,7 +1206,7 @@ pub async fn destroy(
     peer: PeerCred,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let (lun, cache) = state.registry.unregister_by_name(&name).ok_or_else(|| {
+    let cache = state.registry.get_by_name(&name).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("volume '{name}' is not registered") })),
@@ -1219,6 +1219,15 @@ pub async fn destroy(
     // the request on flush errors: the chunks we couldn't upload
     // would be orphaned by the destroy anyway, so a warning is
     // truthful.
+    //
+    // The flush MUST run while the volume is still registered: the
+    // upload worker resolves each task's volume through the registry
+    // by name, so unregistering first leaves every page flushed here
+    // as a pending upload that can never complete ("unknown in
+    // registry"), and `flush_all`'s pending-upload drain then waits
+    // on it forever — a host write inside the flush-worker tick
+    // window followed by a destroy wedged the admin call (issue
+    // #103).
     if let Err(e) = cache.flush_all().await {
         warn!(
             volume = name.as_str(),
@@ -1226,6 +1235,15 @@ pub async fn destroy(
             "admin: final flush before destroy failed (may have lost host-acked writes)"
         );
     }
+
+    let Some((lun, _)) = state.registry.unregister_by_name(&name) else {
+        // A concurrent destroy of the same name won the race while we
+        // were flushing.
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("volume '{name}' is not registered") })),
+        ));
+    };
     cache.request_shutdown();
 
     // Drop the cache before removing the volume directory: the
