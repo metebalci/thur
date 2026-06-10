@@ -489,6 +489,18 @@ Implementation in `PageCache::synchronize_bytes`:
   worker tick or eviction-induced flush drains them. Host `fsync(2)` returns
   immediately. This is the ZFS `sync=disabled` equivalent.
 
+**Failed uploads fail the fence — and the fence retries them.** When the
+upload worker gives up on a page's PUT (backend outage, permanent backend
+error), it settles the page's in-flight marker as *failed* rather than
+leaving it pending. A `Storage`-tier SYNC whose range contains a failed page
+returns CHECK CONDITION (MEDIUM ERROR / WRITE ERROR) instead of either
+hanging on the dead upload or falsely reporting durability — the page stays
+`LocalOnly` in `upload.idx`. Before erroring, the fence re-enqueues the
+failed page through the worker, so the host's next `fsync(2)` retry observes
+a fresh attempt and succeeds once the backend recovers. `flush_all`
+(destroy / shutdown / snapshot) reports and re-arms the same way; a daemon
+restart's recovery scan remains the backstop.
+
 **Live-mutable, silent to the SCSI initiator.** A `volume modify --sync-after
 <MODE>` flip updates the writer's atomic and rewrites `runtime.json` so the
 next boot picks the new tier. The flip takes effect on the next SYNC;

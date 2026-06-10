@@ -38,8 +38,8 @@ pub use shared_pool::{DiskCacheBounds, DiskCacheSize};
 pub use snapshot::{SnapshotManifest, crypto_identity_referenced};
 pub use upload_index::{UploadIndexError, UploadIndexFile, UploadState};
 pub use uploader::{
-    DEFAULT_BACKPRESSURE_DEADLINE, PendingUploads, UploadTask, UploaderError, VolumeWriter,
-    WritePageOutcome,
+    DEFAULT_BACKPRESSURE_DEADLINE, DrainOutcome, PendingUploads, UploadTask, UploaderError,
+    VolumeWriter, WritePageOutcome,
 };
 pub use verify::{VerifyScope, VolumeVerifyReport};
 pub use volume::{DedupScope, SyncAfter, VolumeError, VolumeManifest, parse_size};

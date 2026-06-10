@@ -66,7 +66,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::page_index::{PageId, PageIndex};
 use crate::runtime_state::VolumeRuntime;
 use crate::upload_index::UploadState;
-use crate::uploader::{UploaderError, VolumeWriter};
+use crate::uploader::{DrainOutcome, UploaderError, VolumeWriter};
 use crate::volume::{SyncAfter, VolumeManifest};
 
 /// Default cache budget — 64 MiB. At the default 64 KiB page size
@@ -842,12 +842,23 @@ impl PageCache {
         self.flush_pages_in_range(first, last).await?;
         // Phase 2 (Storage only): drain the pending-upload tracker.
         // No-op under inline dispatch (pending tracker stays
-        // empty) and on already-drained ranges.
-        if matches!(self.writer.sync_after(), SyncAfter::Storage) {
-            self.writer
+        // empty) and on already-drained ranges. A failed upload in
+        // the range fails the fence (issue #106): report the error
+        // to the host instead of claiming durability — but re-arm
+        // the upload first, so the host's retry of the fence drives
+        // a fresh attempt and heals once the backend recovers.
+        if matches!(self.writer.sync_after(), SyncAfter::Storage)
+            && self
+                .writer
                 .pending_uploads()
                 .wait_for_range(first..=last)
-                .await;
+                .await
+                == DrainOutcome::Failed
+        {
+            self.writer
+                .retry_failed_uploads_in_range(first..=last)
+                .await?;
+            return Err(UploaderError::UploadsFailed);
         }
         Ok(())
     }
@@ -872,10 +883,23 @@ impl PageCache {
         self.flush_drain(|dirty, n| dirty.iter().take(n).copied().collect())
             .await?;
         self.persist_runtime_if_dirty()?;
-        self.writer
+        // A failed upload fails the drain (issue #106): destroy /
+        // shutdown / snapshot must hear about a page that never
+        // reached storage, not report it drained. Re-arm before
+        // erroring so a retried caller (next snapshot attempt, next
+        // fence) drives a fresh upload.
+        if self
+            .writer
             .pending_uploads()
             .wait_for_range(PageId::MIN..=PageId::MAX)
-            .await;
+            .await
+            == DrainOutcome::Failed
+        {
+            self.writer
+                .retry_failed_uploads_in_range(PageId::MIN..=PageId::MAX)
+                .await?;
+            return Err(UploaderError::UploadsFailed);
+        }
         Ok(())
     }
 
@@ -914,10 +938,20 @@ impl PageCache {
     pub async fn snapshot_pages_idx(&self, dst_pages_idx: PathBuf) -> Result<(), UploaderError> {
         self.flush_all().await?;
         let _freeze = self.inner.lock().await;
-        self.writer
+        // A flush that raced in between flush_all and the lock could
+        // itself fail its upload — a frozen index must never
+        // reference a non-uploaded chunk, so the failure aborts the
+        // snapshot (issue #106). flush_all already re-armed earlier
+        // failures; this one stays parked for the next fence.
+        if self
+            .writer
             .pending_uploads()
             .wait_for_range(PageId::MIN..=PageId::MAX)
-            .await;
+            .await
+            == DrainOutcome::Failed
+        {
+            return Err(UploaderError::UploadsFailed);
+        }
         self.writer.page_index_sync()?;
         let src = PageIndex::path_for(&VolumeManifest::dir_for(
             self.writer.data_dir(),
@@ -965,9 +999,22 @@ impl PageCache {
         &self,
         snapshot_pages_idx: PathBuf,
     ) -> Result<(), UploaderError> {
-        self.flush_all().await?;
+        // Tolerate UploadsFailed: a page whose storage PUT keeps
+        // failing belongs to the post-snapshot writes this restore
+        // discards — refusing the rollback over it would block the
+        // operator's recovery move exactly when the backend is
+        // unhappy (issue #106). Real flush errors still abort.
+        match self.flush_all().await {
+            Ok(()) | Err(UploaderError::UploadsFailed) => {}
+            Err(e) => return Err(e),
+        }
         let mut inner = self.inner.lock().await;
-        self.writer
+        // A failed drain here doesn't block the restore: the failed
+        // uploads belong to post-snapshot writes we are about to
+        // discard, so the markers are cleared along with the
+        // sidecars below instead of erroring (issue #106).
+        let _ = self
+            .writer
             .pending_uploads()
             .wait_for_range(PageId::MIN..=PageId::MAX)
             .await;
@@ -982,6 +1029,12 @@ impl PageCache {
         })
         .await
         .map_err(|e| UploaderError::Io(std::io::Error::other(e.to_string())))??;
+
+        // The in-memory failed set mirrors the upload sidecar we just
+        // reset: any surviving failure marker refers to a discarded
+        // pre-restore write and would make the next fence error and
+        // retry against the rewound page table for nothing.
+        self.writer.pending_uploads().clear_all_failed().await;
 
         drop(inner);
         Ok(())
@@ -1001,8 +1054,17 @@ impl PageCache {
             }
             // Drain dirty pages opportunistically; ignore individual
             // flush errors (logged inside `flush_one`) so a transient
-            // storage blip doesn't kill the worker.
-            let _ = self.flush_all().await;
+            // storage blip doesn't kill the worker. Deliberately NOT
+            // `flush_all`: the tick has no durability contract to
+            // report, so it skips the pending-upload drain — whose
+            // failure path re-arms failed uploads (issue #106) and
+            // would turn a backend outage into a retry storm at
+            // every tick. Failed uploads wait for a deliberate fence
+            // (SYNCHRONIZE CACHE / destroy / snapshot / shutdown).
+            let _ = self
+                .flush_drain(|dirty, n| dirty.iter().take(n).copied().collect())
+                .await;
+            let _ = self.persist_runtime_if_dirty();
         }
     }
 
@@ -1696,6 +1758,108 @@ mod tests {
         (0..len)
             .map(|i| seed.wrapping_add((i & 0xFF) as u8))
             .collect()
+    }
+
+    /// Like [`fixture_cache`] but on the async-dispatch path: the
+    /// writer hands upload tasks to the returned receiver, so the
+    /// test plays the upload worker's role.
+    async fn fixture_cache_async(
+        size_bytes: u64,
+    ) -> (
+        TempDir,
+        Arc<PageCache>,
+        Arc<VolumeWriter>,
+        tokio::sync::mpsc::Receiver<crate::uploader::UploadTask>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let backend = LocalBackend::new(&storage).await.unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(backend);
+        VolumeManifest::new(
+            "vol1".into(),
+            size_bytes,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let writer = Arc::new(
+            VolumeWriter::open(tmp.path(), "vol1", backend)
+                .unwrap()
+                .with_upload_sender(tx),
+        );
+        let cache = PageCache::new(writer.clone());
+        (tmp, cache, writer, rx)
+    }
+
+    /// Issue #106: a failed upload must fail the fence with an error
+    /// (not hang it, not report durable), re-arm the upload, and let
+    /// the host's retried fence succeed once the upload goes through.
+    #[tokio::test]
+    async fn synchronize_fails_honestly_and_heals_on_retried_fence() {
+        let (_tmp, cache, writer, mut rx) = fixture_cache_async(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0x5A, PAGE)).await.unwrap();
+
+        // Play a worker whose PUT fails: settle the task as failed.
+        let failer = tokio::spawn(async move {
+            let task = rx.recv().await.expect("fence flush hands the task over");
+            let page = u32::try_from(task.payload.item_id).unwrap();
+            task.pending.mark_failed(page).await;
+            rx
+        });
+        let err = cache.synchronize_bytes(0, PAGE as u64).await.unwrap_err();
+        assert!(
+            matches!(err, UploaderError::UploadsFailed),
+            "fence must surface the failed upload, got: {err}"
+        );
+        let mut rx = failer.await.unwrap();
+
+        // The failing fence re-armed the page. Complete the retry the
+        // way the real worker does, then the next fence drains clean.
+        let retry = rx.recv().await.expect("fence re-enqueues the failed page");
+        assert_eq!(retry.payload.item_id, 0);
+        let outcome = shared_upload_worker::UploadOutcome {
+            item_id: retry.payload.item_id,
+            object_key: retry.payload.object_key.clone(),
+            dedup_hit: false,
+            put_compression: None,
+            put_bytes: Some(1),
+        };
+        writer.apply_page_upload_outcome(&outcome).await.unwrap();
+        cache.synchronize_bytes(0, PAGE as u64).await.unwrap();
+    }
+
+    /// Issue #106: flush_all (destroy / shutdown / snapshot) must
+    /// error on a failed upload instead of waiting forever, and
+    /// re-arm it for the next attempt.
+    #[tokio::test]
+    async fn flush_all_fails_on_failed_upload_and_rearms() {
+        let (_tmp, cache, _writer, mut rx) = fixture_cache_async(4 * (1u64 << 20)).await;
+        cache.write_bytes(0, &pattern(0xA5, PAGE)).await.unwrap();
+
+        let failer = tokio::spawn(async move {
+            let task = rx.recv().await.expect("flush hands the task over");
+            let page = u32::try_from(task.payload.item_id).unwrap();
+            task.pending.mark_failed(page).await;
+            rx
+        });
+        let err = cache.flush_all().await.unwrap_err();
+        assert!(
+            matches!(err, UploaderError::UploadsFailed),
+            "flush_all must surface the failed upload, got: {err}"
+        );
+        let mut rx = failer.await.unwrap();
+        assert!(
+            rx.try_recv().is_ok(),
+            "flush_all re-arms the failed page before erroring"
+        );
     }
 
     #[tokio::test]

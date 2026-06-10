@@ -113,12 +113,17 @@ pub async fn run_upload_worker(
 /// Single-task pipeline: resolve backend + cache, run
 /// `upload_chunk_inert`, apply outcome. All errors logged and
 /// swallowed — the per-page `LocalOnly` marker stays set so the
-/// next write or boot-time scan re-enqueues.
+/// next write, fence-driven retry, or boot-time scan re-enqueues.
+/// Every failure path settles the in-flight marker via
+/// `task.pending.mark_failed` (issue #106): a waiter parked on the
+/// page (SYNCHRONIZE CACHE, flush_all) wakes with a failure verdict
+/// instead of hanging forever on an upload that already gave up.
 async fn run_one_task(
     task: UploadTask,
     backends: &Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     registry: &VolumeRegistry,
 ) {
+    let page_id = u32::try_from(task.payload.item_id).ok();
     // Share the same map AdminState holds so backends instantiated by
     // a runtime `volume create` (via admin/handlers.rs's
     // `get_or_init_backend`) are visible here. Pre-fix this was a
@@ -139,6 +144,9 @@ async fn run_one_task(
                     &task.payload.backend_name,
                     "backend_unknown",
                 );
+                if let Some(p) = page_id {
+                    task.pending.mark_failed(p).await;
+                }
                 return;
             }
         }
@@ -154,6 +162,9 @@ async fn run_one_task(
                 &task.payload.backend_name,
                 "entity_unknown",
             );
+            if let Some(p) = page_id {
+                task.pending.mark_failed(p).await;
+            }
             return;
         }
     };
@@ -165,6 +176,9 @@ async fn run_one_task(
                 "upload worker: PUT failed for volume '{}' page {} ({}): {}",
                 task.volume_name, item_id, task.payload.object_key, e
             );
+            if let Some(p) = page_id {
+                task.pending.mark_failed(p).await;
+            }
             return;
         }
     };
@@ -173,6 +187,9 @@ async fn run_one_task(
             "upload worker: apply_page_upload_outcome failed for volume '{}' page {}: {}",
             task.volume_name, item_id, e
         );
+        if let Some(p) = page_id {
+            task.pending.mark_failed(p).await;
+        }
         return;
     }
     // Fold the on-wire PUT size into the volume's backend-write
@@ -268,6 +285,7 @@ async fn enqueue_one_volume(
         };
         let task = UploadTask {
             volume_name: name.to_string(),
+            pending: writer.pending_uploads().clone(),
             payload,
         };
         writer.pending_uploads().mark_pending(page_id).await;
@@ -280,4 +298,62 @@ async fn enqueue_one_volume(
         enqueued += 1;
     }
     Ok(enqueued)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_block::{DedupScope, DrainOutcome, PendingUploads};
+    use shared_object_store::LocalBackend;
+    use shared_upload_worker::PendingUpload;
+    use tempfile::TempDir;
+
+    fn task_for(volume: &str, backend: &str, pending: &PendingUploads) -> UploadTask {
+        UploadTask {
+            volume_name: volume.to_string(),
+            pending: pending.clone(),
+            payload: PendingUpload {
+                item_id: 0,
+                hash: "00".repeat(32),
+                local_path: std::path::PathBuf::from("/nonexistent"),
+                object_key: "test/key".to_string(),
+                dedup: DedupScope::Local,
+                backend_name: backend.to_string(),
+            },
+        }
+    }
+
+    /// Issue #106: every per-task failure path must settle the
+    /// in-flight marker as failed so a waiter parked on the page
+    /// wakes with a verdict instead of hanging forever. Covers the
+    /// two resolution failures (unknown backend, unknown volume);
+    /// the PUT-failure path runs the same mark on the same tracker.
+    #[tokio::test]
+    async fn failed_resolution_settles_the_pending_marker() {
+        let registry = VolumeRegistry::new();
+        let backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+
+        // Backend unknown.
+        let pending = PendingUploads::new();
+        pending.mark_pending(0).await;
+        run_one_task(
+            task_for("ghost", "no-such-backend", &pending),
+            &backends,
+            &registry,
+        )
+        .await;
+        assert_eq!(pending.wait_for_range(0..=0).await, DrainOutcome::Failed);
+
+        // Backend resolves, volume unknown in the registry (the
+        // mid-destroy race shape from #103).
+        let tmp = TempDir::new().unwrap();
+        let local: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(tmp.path()).await.unwrap());
+        backends.lock().await.insert("local".to_string(), local);
+        let pending = PendingUploads::new();
+        pending.mark_pending(0).await;
+        run_one_task(task_for("ghost", "local", &pending), &backends, &registry).await;
+        assert_eq!(pending.wait_for_range(0..=0).await, DrainOutcome::Failed);
+    }
 }

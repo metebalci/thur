@@ -83,6 +83,12 @@ pub struct UploadTask {
     /// the right `VolumeWriter` in the daemon's volume registry so
     /// it can call `apply_page_upload_outcome` after the PUT.
     pub volume_name: String,
+    /// The owning volume's in-flight tracker. Lets the worker
+    /// [`PendingUploads::mark_failed`] on every failure path without
+    /// resolving the volume through the registry — a task whose
+    /// volume has just been unregistered (mid-destroy) can still
+    /// settle its marker instead of stranding waiters (issue #106).
+    pub pending: PendingUploads,
     /// Page-shaped upload payload (`PendingUpload::item_id` is the
     /// `page_id`).
     pub payload: PendingUpload,
@@ -90,7 +96,11 @@ pub struct UploadTask {
 
 /// In-flight upload tracker, owned by `VolumeWriter` in async mode.
 /// Counts which `page_id`s have a pending PUT and lets SYNCHRONIZE
-/// CACHE drain on the relevant range.
+/// CACHE drain on the relevant range. A failed upload moves its
+/// page to a `failed` set instead of vanishing (issue #106): the
+/// drain reports it so the fence command can return an honest error,
+/// and the failure stays sticky until a retry re-marks the page
+/// pending (or a new host write supersedes it).
 ///
 /// Single per-volume `tokio::sync::Notify` wakes every waiter on
 /// any completion; waiters re-check the set under the lock and
@@ -108,8 +118,31 @@ pub struct PendingUploads {
 
 #[derive(Debug, Default)]
 struct PendingUploadsInner {
-    pending: Mutex<HashSet<PageId>>,
+    sets: Mutex<PendingSets>,
     notify: Notify,
+}
+
+/// Both sets live under one lock so the pending → failed and
+/// failed → pending transitions are atomic: a waiter can never
+/// observe a page in neither set while its upload is unsettled.
+#[derive(Debug, Default)]
+struct PendingSets {
+    pending: HashSet<PageId>,
+    failed: HashSet<PageId>,
+}
+
+/// What [`PendingUploads::wait_for_range`] saw once the range had
+/// no pending uploads left (or as soon as a failure surfaced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum DrainOutcome {
+    /// Every upload in the range completed.
+    Clean,
+    /// At least one page in the range has a failed upload. The
+    /// caller decides whether to retry
+    /// ([`VolumeWriter::retry_failed_uploads_in_range`]) and must
+    /// not report the range storage-durable.
+    Failed,
 }
 
 /// Process-global count of pages currently pending upload, summed
@@ -136,11 +169,16 @@ impl PendingUploads {
     /// Mark `page_id`'s upload as pending. Called by
     /// [`VolumeWriter::write_page_unsynced`] right before sending
     /// the task into the worker's channel, while the page-index
-    /// hasn't yet been bumped. Returns whether this newly added the
-    /// page (a re-mark of an already-pending page is a no-op and does
-    /// not double-count the backlog gauge).
+    /// hasn't yet been bumped. Clears any earlier failure for the
+    /// page — the new attempt supersedes it. Returns whether this
+    /// newly added the page (a re-mark of an already-pending page is
+    /// a no-op and does not double-count the backlog gauge).
     pub async fn mark_pending(&self, page_id: PageId) -> bool {
-        let newly = self.inner.pending.lock().await.insert(page_id);
+        let newly = {
+            let mut s = self.inner.sets.lock().await;
+            s.failed.remove(&page_id);
+            s.pending.insert(page_id)
+        };
         if newly {
             adjust_upload_queue_depth(1);
         }
@@ -154,7 +192,11 @@ impl PendingUploads {
     /// neighbouring range still benefit. Returns whether an entry was
     /// actually cleared (only a real clear decrements the gauge).
     pub async fn mark_done(&self, page_id: PageId) -> bool {
-        let was_present = self.inner.pending.lock().await.remove(&page_id);
+        let was_present = {
+            let mut s = self.inner.sets.lock().await;
+            s.failed.remove(&page_id);
+            s.pending.remove(&page_id)
+        };
         self.inner.notify.notify_waiters();
         if was_present {
             adjust_upload_queue_depth(-1);
@@ -162,12 +204,57 @@ impl PendingUploads {
         was_present
     }
 
+    /// Mark `page_id`'s upload as failed and wake every current
+    /// waiter (issue #106). The page moves pending → failed: it no
+    /// longer counts toward the backlog gauge (nothing is in
+    /// flight), but [`Self::wait_for_range`] reports the range
+    /// [`DrainOutcome::Failed`] until a retry re-marks it pending or
+    /// a new write supersedes it. Called by the daemon's upload
+    /// worker on every per-task failure path.
+    pub async fn mark_failed(&self, page_id: PageId) {
+        let was_pending = {
+            let mut s = self.inner.sets.lock().await;
+            let was_pending = s.pending.remove(&page_id);
+            s.failed.insert(page_id);
+            was_pending
+        };
+        self.inner.notify.notify_waiters();
+        if was_pending {
+            adjust_upload_queue_depth(-1);
+        }
+    }
+
+    /// Drop `page_id` from the failed set without re-queueing —
+    /// used when the failure became moot (page deallocated since).
+    pub async fn clear_failed(&self, page_id: PageId) {
+        self.inner.sets.lock().await.failed.remove(&page_id);
+    }
+
+    /// Drop every failed marker. Used by snapshot restore, which
+    /// discards the writes the failures belonged to.
+    pub async fn clear_all_failed(&self) {
+        self.inner.sets.lock().await.failed.clear();
+    }
+
+    /// Failed page ids intersecting `range`, for the retry path.
+    pub async fn failed_in_range(&self, range: RangeInclusive<PageId>) -> Vec<PageId> {
+        let s = self.inner.sets.lock().await;
+        s.failed
+            .iter()
+            .copied()
+            .filter(|p| range.contains(p))
+            .collect()
+    }
+
     /// Block until no pending uploads remain for any `page_id` in
-    /// `range`. Returns immediately if the range is already clean.
-    /// Safe under racing completions: the `Notify` is enabled
-    /// before the pending-set check so a completion in the window
-    /// between the check and the await still wakes us.
-    pub async fn wait_for_range(&self, range: RangeInclusive<PageId>) {
+    /// `range`, reporting whether any of them failed. Returns
+    /// immediately if the range is already clean — or as soon as a
+    /// failure shows up: the range can't drain clean anymore, and
+    /// waiting out the rest only delays the error. Safe under racing
+    /// completions: the `Notify` is enabled before the set check so
+    /// a completion in the window between the check and the await
+    /// still wakes us.
+    pub async fn wait_for_range(&self, range: RangeInclusive<PageId>) -> DrainOutcome {
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
@@ -175,12 +262,18 @@ impl PendingUploads {
             // race where a completion between check and await
             // would otherwise be missed.
             notified.as_mut().enable();
-            let any_pending = {
-                let p = self.inner.pending.lock().await;
-                p.iter().any(|pid| range.contains(pid))
+            let (any_pending, any_failed) = {
+                let s = self.inner.sets.lock().await;
+                (
+                    s.pending.iter().any(|pid| range.contains(pid)),
+                    s.failed.iter().any(|pid| range.contains(pid)),
+                )
             };
+            if any_failed {
+                return DrainOutcome::Failed;
+            }
             if !any_pending {
-                return;
+                return DrainOutcome::Clean;
             }
             notified.await;
         }
@@ -189,7 +282,7 @@ impl PendingUploads {
     /// Snapshot of currently-pending page ids (for diagnostics /
     /// tests). Not used on the hot path.
     pub async fn snapshot(&self) -> HashSet<PageId> {
-        self.inner.pending.lock().await.clone()
+        self.inner.sets.lock().await.pending.clone()
     }
 }
 
@@ -221,6 +314,12 @@ pub enum UploaderError {
 
     #[error("upload-worker channel closed (daemon shutdown or worker crashed)")]
     UploadChannelClosed,
+
+    #[error(
+        "storage upload failed for one or more pages; they stay \
+         LocalOnly and the next fence retries the upload"
+    )]
+    UploadsFailed,
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -645,6 +744,46 @@ impl VolumeWriter {
         }))
     }
 
+    /// Re-enqueue every failed upload whose page falls in `range`
+    /// (issue #106). Each page moves failed → pending and goes back
+    /// through the worker channel, so the caller's next
+    /// `wait_for_range` observes the fresh attempt's outcome. A page
+    /// deallocated since the failure (UNMAP) has nothing left to
+    /// upload — its failed marker is dropped. Returns the number of
+    /// re-enqueued pages; 0 under inline dispatch (no sender means
+    /// failures already propagated synchronously, the failed set
+    /// stays empty).
+    pub async fn retry_failed_uploads_in_range(
+        &self,
+        range: RangeInclusive<PageId>,
+    ) -> Result<usize, UploaderError> {
+        let Some(sender) = &self.upload_sender else {
+            return Ok(0);
+        };
+        let mut retried = 0usize;
+        for page_id in self.pending_uploads.failed_in_range(range).await {
+            let Some(payload) = self.pending_upload_payload(page_id)? else {
+                self.pending_uploads.clear_failed(page_id).await;
+                continue;
+            };
+            self.pending_uploads.mark_pending(page_id).await;
+            let task = UploadTask {
+                volume_name: self.manifest.name.clone(),
+                pending: self.pending_uploads.clone(),
+                payload,
+            };
+            if sender.send(task).await.is_err() {
+                // Worker gone (daemon shutdown). Put the marker back
+                // so the failure stays observable; the boot-time
+                // recovery scan owns it from here.
+                self.pending_uploads.mark_failed(page_id).await;
+                return Err(UploaderError::UploadChannelClosed);
+            }
+            retried += 1;
+        }
+        Ok(retried)
+    }
+
     /// Apply a successful upload outcome to the per-volume upload
     /// sidecar: flip `LocalOnly → Uploaded` and clear the pending
     /// tracker entry so any `synchronize_bytes` waiter unblocks.
@@ -1056,6 +1195,7 @@ impl VolumeWriter {
             self.pending_uploads.mark_pending(page_id).await;
             let task = UploadTask {
                 volume_name: self.manifest.name.clone(),
+                pending: self.pending_uploads.clone(),
                 payload: payload_obj,
             };
             if sender.send(task).await.is_err() {
@@ -1346,6 +1486,42 @@ mod tests {
         assert!(p.snapshot().await.is_empty());
     }
 
+    /// Failed-set semantics (issue #106): a failed upload must wake
+    /// waiters with `Failed` instead of leaving them parked, stay
+    /// sticky for later waiters, and clear when a retry re-marks
+    /// the page pending.
+    #[tokio::test]
+    async fn pending_uploads_failure_wakes_and_sticks_until_retry() {
+        let p = PendingUploads::new();
+        let page = PageId::try_from(7u64).unwrap();
+        p.mark_pending(page).await;
+
+        // A waiter parked on the range must wake with Failed when the
+        // upload fails — this is the hang the issue is about.
+        let waiter = {
+            let p = p.clone();
+            tokio::spawn(async move { p.wait_for_range(0..=10).await })
+        };
+        p.mark_failed(page).await;
+        assert_eq!(waiter.await.unwrap(), DrainOutcome::Failed);
+
+        // Sticky: a later waiter sees the same verdict immediately;
+        // a range not covering the page stays clean.
+        assert_eq!(p.wait_for_range(0..=10).await, DrainOutcome::Failed);
+        assert_eq!(p.wait_for_range(8..=10).await, DrainOutcome::Clean);
+        assert_eq!(p.failed_in_range(0..=10).await, vec![page]);
+
+        // A retry (or a superseding host write) re-marks pending and
+        // clears the failure; success then drains clean.
+        assert!(
+            p.mark_pending(page).await,
+            "failed -> pending is a real add"
+        );
+        assert!(p.failed_in_range(0..=10).await.is_empty());
+        p.mark_done(page).await;
+        assert_eq!(p.wait_for_range(0..=10).await, DrainOutcome::Clean);
+    }
+
     /// Stand up a 4 MiB volume with the given dedup scope and a
     /// LocalBackend rooted at `<tmp>/storage`. Returns
     /// (data_dir, volume_name, backend).
@@ -1484,6 +1660,48 @@ mod tests {
              even though the worker has not run"
         );
         assert_eq!(hex::encode(recorded.unwrap()), outcome.hash_hex);
+    }
+
+    /// Fence-driven retry (issue #106): a failed page goes back
+    /// through the worker channel with a fresh payload and moves
+    /// failed -> pending; a failed page that was deallocated since
+    /// just drops its marker (nothing left to upload).
+    #[tokio::test]
+    async fn retry_failed_uploads_reenqueues_and_drops_moot_pages() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let (tx, mut rx) = mpsc::channel::<UploadTask>(8);
+        let writer = VolumeWriter::open(tmp.path(), &name, backend)
+            .unwrap()
+            .with_upload_sender(tx);
+        let bytes = page_bytes(0x5A);
+
+        writer.write_page_unsynced(3, &bytes).await.unwrap();
+        let task = rx.try_recv().expect("write hands one task to the worker");
+        let page = PageId::try_from(task.payload.item_id).unwrap();
+
+        // Simulate the worker failing the PUT, plus a stale failure
+        // for a page that has no pages.idx entry (UNMAP'd since).
+        task.pending.mark_failed(page).await;
+        writer.pending_uploads().mark_failed(9).await;
+
+        let retried = writer
+            .retry_failed_uploads_in_range(PageId::MIN..=PageId::MAX)
+            .await
+            .unwrap();
+        assert_eq!(retried, 1, "only the still-allocated page re-enqueues");
+
+        let retry = rx.try_recv().expect("retry task lands on the channel");
+        assert_eq!(retry.payload.item_id, u64::from(page));
+        assert_eq!(retry.payload.hash, task.payload.hash);
+        assert!(
+            writer
+                .pending_uploads()
+                .failed_in_range(PageId::MIN..=PageId::MAX)
+                .await
+                .is_empty(),
+            "both markers settle: page 3 back to pending, page 9 dropped as moot"
+        );
+        assert!(writer.pending_uploads().snapshot().await.contains(&page));
     }
 
     #[tokio::test]
