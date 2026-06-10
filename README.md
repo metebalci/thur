@@ -5,6 +5,13 @@
 > SCSI / NVMe surface may change without notice or migration path.
 > Not recommended for production use.
 
+> **Built with an AI coding agent.** All code, tests, and documentation
+> in this repository are written by Claude Code — development started
+> on Claude Opus 4.7, continued on Opus 4.8, and currently runs on
+> Claude Fable 5 — with design direction and review by a human
+> maintainer. Commit `Co-Authored-By` trailers record which model wrote
+> a change.
+
 **Thur VTL** and **Thur VSA** are two sibling applications presenting
 spec-conformant storage devices to the host — a virtual tape library
 and a virtual storage appliance. Both are **thin-provisioned**
