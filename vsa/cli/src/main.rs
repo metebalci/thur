@@ -52,12 +52,16 @@ impl Cli {
             .unwrap_or(shared_naming::DISK.system_user)
     }
 
-    /// True for commands that write under `data_dir` directly while
-    /// the daemon is down. Under `sudo`, those files would otherwise
-    /// be owned by root and unreadable by the daemon. Only `volume
-    /// key` rewrites on-disk state offline; the rest of the CLI
-    /// surface (`volume create` / `list` / `info`, `iscsi`,
-    /// `nvmetcp`) is daemon-routed and never privdrops.
+    /// True for commands that read `thurvsa.yaml` / write under
+    /// `data_dir` directly while the daemon is down. Under `sudo`
+    /// those files would otherwise be owned by root and unreadable by
+    /// the daemon, so we privdrop to the daemon's system user first.
+    /// The set: `volume key` (rewrites the manifest + keystore sidecar
+    /// offline), `system regenerate-cert` (rewrites the cert/key in
+    /// place), and `system storage benchmark` (parses the YAML and
+    /// drives the backend SDKs directly). The rest of the CLI surface
+    /// (`volume create` / `list` / `info`, `iscsi`, `nvmetcp`) is
+    /// daemon-routed and never privdrops.
     fn is_daemon_down(&self) -> bool {
         matches!(
             self.command,
@@ -65,6 +69,15 @@ impl Cli {
                 action: VolumeAction::Key { .. }
             } | Commands::System {
                 action: SystemAction::RegenerateCert
+            }
+            // `system storage benchmark` reads the YAML
+            // `storage.backends:` block directly and contacts the
+            // backend SDKs — no admin socket round-trip. Lets operators
+            // validate a backend pre-daemon-start.
+            | Commands::System {
+                action: SystemAction::Storage {
+                    action: StorageAction::Benchmark { .. }
+                }
             }
         )
     }
@@ -108,11 +121,12 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.get_config_path();
     let target_user = cli.target_user().to_string();
     // Strict split: daemon-down commands (`volume key`, `system
-    // regenerate-cert`) read the yaml — they need `data_dir` to
-    // write under and run with `sudo` on a packaged install so the
-    // 0640 conffile is readable. Every other command is daemon-routed
-    // and only talks to the admin Unix socket; it must not touch the
-    // yaml at all.
+    // regenerate-cert`, `system storage benchmark`) read the yaml —
+    // they need `data_dir` to write under (or, for benchmark, the
+    // `storage.backends:` block) and run with `sudo` on a packaged
+    // install so the 0640 conffile is readable. Every other command is
+    // daemon-routed and only talks to the admin Unix socket; it must
+    // not touch the yaml at all.
     let data_dir = if cli.is_daemon_down() {
         PathBuf::from(MinimalConfig::load(&config_path)?.data_dir)
     } else {
@@ -491,5 +505,73 @@ async fn run(cli: Cli) -> Result<()> {
         },
         // Config dispatched above before runtime construction.
         Commands::Config { .. } => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Helper: parse an argv array into a `Cli`. `Cli` doesn't derive
+    /// `Debug`, so `Result::expect` isn't available; go through
+    /// `Result::ok()` + `Option::expect`, which has no `Debug` bound.
+    #[allow(clippy::ok_expect)]
+    fn parse<const N: usize>(args: [&str; N]) -> Cli {
+        Cli::try_parse_from(args).ok().expect("argv must parse")
+    }
+
+    // ---- daemon-down classification ----
+    //
+    // Guards the daemon-mode split: these verbs read the yaml / write
+    // under `data_dir` offline and must privdrop under sudo, so they
+    // have to test true. `system storage benchmark` in particular
+    // parses `storage.backends:` directly — regression cover for #111,
+    // where it was misclassified as daemon-routed (no privdrop).
+
+    #[test]
+    fn volume_key_is_daemon_down() {
+        let cli = parse([
+            "thurvsa", "volume", "key", "migrate", "vol0", "--to", "local",
+        ]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn regenerate_cert_is_daemon_down() {
+        let cli = parse(["thurvsa", "system", "regenerate-cert"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn storage_benchmark_is_daemon_down() {
+        let cli = parse(["thurvsa", "system", "storage", "benchmark"]);
+        assert!(cli.is_daemon_down());
+    }
+
+    #[test]
+    fn storage_check_is_daemon_routed() {
+        // `storage check` talks to the admin socket — daemon-routed,
+        // unlike its `benchmark` sibling.
+        let cli = parse(["thurvsa", "system", "storage", "check"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    #[test]
+    fn volume_list_is_daemon_routed() {
+        let cli = parse(["thurvsa", "volume", "list"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    #[test]
+    fn system_gc_is_daemon_routed() {
+        let cli = parse(["thurvsa", "system", "gc"]);
+        assert!(!cli.is_daemon_down());
+    }
+
+    #[test]
+    fn iscsi_users_list_is_daemon_routed() {
+        let cli = parse(["thurvsa", "iscsi", "users", "list"]);
+        assert!(!cli.is_daemon_down());
     }
 }
