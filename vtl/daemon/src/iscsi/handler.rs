@@ -212,14 +212,24 @@ impl ScsiHandler for IscsiLibraryHandler {
             .await;
         }
 
-        // MOVE MEDIUM (LUN 0, 0xA5) load-to-drive detection: capture
-        // the destination drive_id pre-call so the legal-hold
-        // sentinel HEAD post-call can run. src must be Storage or
-        // ImportExport, dst must be DataTransfer.
+        // Load-to-drive detection for the legal-hold post-hook: capture
+        // the destination drive_id pre-call so the legal-hold sentinel
+        // HEAD post-call can stamp the volatile `legal_held` flag.
+        //
+        // SMC-3 CDB layout for both MOVE MEDIUM (0xA5) and EXCHANGE
+        // MEDIUM (0xA6): bytes 2-3 are the MEDIUM TRANSPORT (picker)
+        // address, bytes 4-5 the SOURCE, bytes 6-7 the (first)
+        // DESTINATION. The previous reading took src from bytes 2-3
+        // (the transport) and dst from 4-5 (the real source), so a
+        // normal slot->drive load never matched the Storage->DataTransfer
+        // arm and legal hold was never stamped — a silent compliance
+        // bypass (issue #142). For EXCHANGE the cartridge that ends up in
+        // the first destination is the source, so the same dst slot
+        // (bytes 6-7) is the drive being loaded.
         let move_medium_loaded_drive: Option<usize> =
-            if pdu_lun == 0 && cdb_opcode == 0xA5 && req.cdb.len() >= 6 {
-                let cdb_src = u16::from_be_bytes([req.cdb[2], req.cdb[3]]);
-                let cdb_dst = u16::from_be_bytes([req.cdb[4], req.cdb[5]]);
+            if pdu_lun == 0 && (cdb_opcode == 0xA5 || cdb_opcode == 0xA6) && req.cdb.len() >= 8 {
+                let cdb_src = u16::from_be_bytes([req.cdb[4], req.cdb[5]]);
+                let cdb_dst = u16::from_be_bytes([req.cdb[6], req.cdb[7]]);
                 let src_t = self.element_config.element_type_from_address(cdb_src);
                 let dst_t = self.element_config.element_type_from_address(cdb_dst);
                 match (src_t, dst_t) {

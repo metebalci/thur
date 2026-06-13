@@ -1162,6 +1162,69 @@ mod tests {
         assert!(library.drives().iter().all(|d| !d.occupied));
     }
 
+    /// Issue #120: a MOVE / LOAD to an occupied destination must fail
+    /// with the cartridge still in its source element, not vanish from
+    /// inventory.
+    #[test]
+    fn failed_move_to_occupied_destination_leaves_source_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let lib_root = temp_dir.path().join("library");
+        let tapes_root = temp_dir.path().join("tapes");
+        let mut library =
+            Library::initialize(&lib_root, &tapes_root, 5, 0, 2, 8, None, 0, 1001, 101, 1).unwrap();
+        let src_id = library.add_or_create_tape("TAPEAAAL8", "primary").unwrap();
+        let dst_id = library.add_or_create_tape("TAPEBBBL8", "primary").unwrap();
+        assert_ne!(src_id, dst_id);
+
+        // Move onto an occupied destination slot — must fail.
+        assert!(
+            library.move_cartridge(src_id, dst_id).is_err(),
+            "move to occupied destination must fail"
+        );
+        let src = library
+            .storage_slots()
+            .iter()
+            .find(|s| s.id == src_id)
+            .unwrap();
+        assert!(src.occupied, "source slot still occupied after failed move");
+        assert_eq!(
+            src.barcode.as_deref(),
+            Some("TAPEAAAL8"),
+            "source barcode intact after failed move"
+        );
+    }
+
+    /// Issue #120: a LOAD to a drive that already holds a cartridge must
+    /// leave the second tape in its storage slot.
+    #[test]
+    fn failed_load_to_occupied_drive_leaves_source_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let lib_root = temp_dir.path().join("library");
+        let tapes_root = temp_dir.path().join("tapes");
+        let mut library =
+            Library::initialize(&lib_root, &tapes_root, 5, 0, 2, 8, None, 0, 1001, 101, 1).unwrap();
+        let first = library.add_or_create_tape("TAPEAAAL8", "primary").unwrap();
+        let second = library.add_or_create_tape("TAPEBBBL8", "primary").unwrap();
+        let drive_id = library.drives()[0].id;
+
+        library.load_to_drive(first, drive_id).unwrap();
+        // Drive is now occupied; loading the second tape must fail.
+        assert!(
+            library.load_to_drive(second, drive_id).is_err(),
+            "load into occupied drive must fail"
+        );
+        let src = library
+            .storage_slots()
+            .iter()
+            .find(|s| s.id == second)
+            .unwrap();
+        assert!(
+            src.occupied,
+            "second tape's slot still occupied after failed load"
+        );
+        assert_eq!(src.barcode.as_deref(), Some("TAPEBBBL8"));
+    }
+
     #[test]
     fn test_library_reopen() {
         let temp_dir = TempDir::new().unwrap();

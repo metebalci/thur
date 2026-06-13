@@ -758,6 +758,34 @@ pub async fn changer_load(
                     drive_num: req.drive as u8,
                 });
             }
+            // Stamp the volatile legal-hold flag on the freshly-loaded
+            // drive so host writes return WRITE PROTECTED for a cartridge
+            // under legal hold — the admin-load counterpart of the iSCSI
+            // MOVE MEDIUM post-hook (issue #142).
+            if barcode.is_some()
+                && let Ok(Some((bc, backend_name))) = state
+                    .daemon
+                    .drive_manager
+                    .get_loaded_cartridge_info(req.drive as usize)
+            {
+                let held = crate::iscsi::protocol::read_legal_hold_at_load(
+                    &state.daemon.storage_backends,
+                    &state.daemon.storage_config,
+                    &backend_name,
+                    &bc,
+                )
+                .await;
+                if let Err(e) = state
+                    .daemon
+                    .drive_manager
+                    .set_legal_held(req.drive as usize, held)
+                {
+                    error!(
+                        "admin changer load: legal-hold stamp failed for drive {}: {}",
+                        req.drive, e
+                    );
+                }
+            }
             // Only the destination drive's cartridge changed.
             raise_medium_may_have_changed(&state.daemon, &[req.drive]);
             audit_append(

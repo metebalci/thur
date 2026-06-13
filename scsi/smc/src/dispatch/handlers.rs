@@ -466,6 +466,35 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let first_dest_type = element_config.element_type_from_address(first_dest_address);
     let second_dest_type = element_config.element_type_from_address(second_dest_address);
 
+    // Refuse drive-involving EXCHANGE MEDIUM. This handler performs the
+    // swap as two bare inventory moves and — unlike MOVE MEDIUM — does
+    // not mirror drive loads/unloads into drive_manager, check
+    // PREVENT/ALLOW, or emit load/unload events. A drive-involving
+    // exchange would leave the data path bound to the wrong Cartridge,
+    // silently corrupting backup data (issue #133). Real backup software
+    // uses MOVE MEDIUM (load/unload) for drives; EXCHANGE swaps storage /
+    // mail cartridges, which stay supported.
+    if [source_type, first_dest_type, second_dest_type]
+        .iter()
+        .any(|t| matches!(t, Some(changer::ElementType::DataTransfer)))
+    {
+        tracing::warn!(
+            "EXCHANGE MEDIUM refused: drive-involving exchange unsupported (src={} dst1={} dst2={})",
+            source_address,
+            first_dest_address,
+            second_dest_address
+        );
+        let sense = SenseDataBuilder::new(
+            SenseKey::IllegalRequest,
+            AdditionalSenseCode {
+                asc: 0x24,
+                ascq: 0x00,
+            },
+        )
+        .build();
+        return Ok(ScsiResp::check_condition_with_sense(sense));
+    }
+
     tracing::info!(
         "EXCHANGE MEDIUM: transport={}, src={}, dst1={}, dst2={}",
         transport_address,

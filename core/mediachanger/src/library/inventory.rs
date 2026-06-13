@@ -73,27 +73,36 @@ impl Library {
     /// Load a cartridge from a storage slot into a drive.
     /// The cartridge is moved from the storage slot to the drive slot.
     pub fn load_to_drive(&mut self, storage_slot_id: u32, drive_id: u32) -> Result<()> {
-        // Get cartridge info from storage slot
+        // Read the source barcode WITHOUT mutating, then validate the
+        // destination (incl. the drive-id lookup) before touching either
+        // element. A destination-full / bad-drive-id error must leave the
+        // cartridge in its source slot — clearing the source first dropped
+        // the barcode on the floor and made the cartridge vanish from
+        // inventory (issue #120).
         let barcode = {
             let s = self.storage_slot_mut(storage_slot_id)?;
             if !s.occupied {
                 return Err(SmcError::InvalidOp("storage slot empty"));
             }
-            let barcode = s
-                .barcode
+            s.barcode
                 .clone()
-                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?;
-            s.occupied = false;
-            s.barcode = None;
-            barcode
+                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?
         };
-
-        // Load into drive slot
         {
             let d = self.drive_slot_mut(drive_id)?;
             if d.occupied {
                 return Err(SmcError::InvalidOp("drive already has cartridge"));
             }
+        }
+
+        // Both endpoints validated — now mutate.
+        {
+            let s = self.storage_slot_mut(storage_slot_id)?;
+            s.occupied = false;
+            s.barcode = None;
+        }
+        {
+            let d = self.drive_slot_mut(drive_id)?;
             d.occupied = true;
             d.barcode = Some(barcode);
             d.home_slot = Some(storage_slot_id as u16);
@@ -104,28 +113,31 @@ impl Library {
 
     /// Unload a cartridge from a drive back to a storage slot.
     pub fn unload_from_drive(&mut self, drive_id: u32, storage_slot_id: u32) -> Result<()> {
-        // Get cartridge info from drive
+        // Validate both endpoints before mutating either (issue #120).
         let barcode = {
             let d = self.drive_slot_mut(drive_id)?;
             if !d.occupied {
                 return Err(SmcError::InvalidOp("drive has no cartridge"));
             }
-            let barcode = d
-                .barcode
+            d.barcode
                 .clone()
-                .ok_or(SmcError::InvalidOp("drive occupied but barcode missing"))?;
-            d.occupied = false;
-            d.barcode = None;
-            d.home_slot = None;
-            barcode
+                .ok_or(SmcError::InvalidOp("drive occupied but barcode missing"))?
         };
-
-        // Put back into storage slot
         {
             let s = self.storage_slot_mut(storage_slot_id)?;
             if s.occupied {
                 return Err(SmcError::InvalidOp("storage slot occupied"));
             }
+        }
+
+        {
+            let d = self.drive_slot_mut(drive_id)?;
+            d.occupied = false;
+            d.barcode = None;
+            d.home_slot = None;
+        }
+        {
+            let s = self.storage_slot_mut(storage_slot_id)?;
             s.occupied = true;
             s.barcode = Some(barcode);
         }
@@ -142,27 +154,30 @@ impl Library {
             ));
         }
 
-        // Get cartridge info from source slot
+        // Validate both endpoints before mutating either (issue #120).
         let barcode = {
             let s = self.storage_slot_mut(from_slot_id)?;
             if !s.occupied {
                 return Err(SmcError::InvalidOp("source slot empty"));
             }
-            let barcode = s
-                .barcode
+            s.barcode
                 .clone()
-                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?;
-            s.occupied = false;
-            s.barcode = None;
-            barcode
+                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?
         };
-
-        // Move to destination slot
         {
             let s = self.storage_slot_mut(to_slot_id)?;
             if s.occupied {
                 return Err(SmcError::InvalidOp("destination slot occupied"));
             }
+        }
+
+        {
+            let s = self.storage_slot_mut(from_slot_id)?;
+            s.occupied = false;
+            s.barcode = None;
+        }
+        {
+            let s = self.storage_slot_mut(to_slot_id)?;
             s.occupied = true;
             s.barcode = Some(barcode);
         }
@@ -172,27 +187,30 @@ impl Library {
 
     /// Export a cartridge from a storage slot to a mail slot.
     pub fn export_to_mail(&mut self, storage_slot_id: u32, mail_slot_id: u32) -> Result<()> {
-        // Get cartridge info from storage slot
+        // Validate both endpoints before mutating either (issue #120).
         let barcode = {
             let s = self.storage_slot_mut(storage_slot_id)?;
             if !s.occupied {
                 return Err(SmcError::InvalidOp("storage slot empty"));
             }
-            let barcode = s
-                .barcode
+            s.barcode
                 .clone()
-                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?;
-            s.occupied = false;
-            s.barcode = None;
-            barcode
+                .ok_or(SmcError::InvalidOp("slot occupied but barcode missing"))?
         };
-
-        // Put into mail slot
         {
             let m = self.mail_slot_mut(mail_slot_id)?;
             if m.occupied {
                 return Err(SmcError::InvalidOp("mail slot occupied"));
             }
+        }
+
+        {
+            let s = self.storage_slot_mut(storage_slot_id)?;
+            s.occupied = false;
+            s.barcode = None;
+        }
+        {
+            let m = self.mail_slot_mut(mail_slot_id)?;
             m.occupied = true;
             m.barcode = Some(barcode);
         }
@@ -202,26 +220,30 @@ impl Library {
 
     /// Import a cartridge from a mail slot to a storage slot.
     pub fn import_from_mail(&mut self, mail_slot_id: u32, storage_slot_id: u32) -> Result<()> {
-        // Get cartridge info from mail slot
+        // Validate both endpoints before mutating either (issue #120).
         let barcode = {
             let m = self.mail_slot_mut(mail_slot_id)?;
             if !m.occupied {
                 return Err(SmcError::InvalidOp("mail slot empty"));
             }
-            let barcode = m.barcode.clone().ok_or(SmcError::InvalidOp(
+            m.barcode.clone().ok_or(SmcError::InvalidOp(
                 "mail slot occupied but barcode missing",
-            ))?;
-            m.occupied = false;
-            m.barcode = None;
-            barcode
+            ))?
         };
-
-        // Put into storage slot
         {
             let s = self.storage_slot_mut(storage_slot_id)?;
             if s.occupied {
                 return Err(SmcError::InvalidOp("storage slot occupied"));
             }
+        }
+
+        {
+            let m = self.mail_slot_mut(mail_slot_id)?;
+            m.occupied = false;
+            m.barcode = None;
+        }
+        {
+            let s = self.storage_slot_mut(storage_slot_id)?;
             s.occupied = true;
             s.barcode = Some(barcode);
         }
