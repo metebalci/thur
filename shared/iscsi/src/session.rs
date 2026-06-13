@@ -99,12 +99,37 @@ impl SessionManager {
 
     /// Create a new session with the given ISID
     pub fn create_session(&self, isid: [u8; 6]) -> u16 {
+        // Lock `sessions` before `next_tsih` (consistent ordering;
+        // `next_tsih` is locked nowhere else) so we can verify the minted
+        // TSIH is not already live. The single wrapping counter would,
+        // after 65535 logins, wrap onto a value a long-lived session
+        // still occupies and overwrite it — collapsing two sessions onto
+        // one Connection (cid is always 0) and mis-routing reservation /
+        // UA fan-out keyed by TSIH (issue #169). Advance past any live
+        // TSIH (and 0).
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session manager mutex poisoned");
         let mut next_tsih = self
             .next_tsih
             .lock()
             .expect("session manager mutex poisoned");
-        let tsih = *next_tsih;
-        *next_tsih = next_tsih.wrapping_add(1);
+        let mut tsih = *next_tsih;
+        // Bounded scan: at most the whole 16-bit space. 65535 concurrent
+        // live sessions is far beyond any real deployment; if somehow
+        // every slot is taken we fall through and reuse `tsih` rather
+        // than hang.
+        for _ in 0..=u16::MAX {
+            if tsih != 0 && !sessions.contains_key(&tsih) {
+                break;
+            }
+            tsih = tsih.wrapping_add(1);
+            if tsih == 0 {
+                tsih = 1;
+            }
+        }
+        *next_tsih = tsih.wrapping_add(1);
         if *next_tsih == 0 {
             *next_tsih = 1; // Skip 0 (reserved)
         }
@@ -121,10 +146,6 @@ impl SessionManager {
             authenticated_user: None,
         };
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .expect("session manager mutex poisoned");
         sessions.insert(tsih, session);
         let active = sessions.len() as i64;
         drop(sessions);
@@ -486,10 +507,27 @@ impl SessionManager {
         let now = Instant::now();
 
         sessions.retain(|tsih, session| {
+            // Never idle-reap a session that still has a live connection.
+            // `last_activity` is only refreshed when a PDU is dequeued in
+            // the FFP loop, so an initiator with a mounted-but-idle LUN
+            // that sends no proactive NOP-Out keepalives (e.g. the
+            // Windows MSFT initiator), or a connection mid-way through one
+            // long dispatch / slow R2T burst, looks "idle" while its TCP
+            // connection is perfectly alive. Reaping it deletes the
+            // shared session state out from under the running
+            // serve_connection task, whose next check_cmdsn then fails
+            // with InvalidSession and tears the connection down mid-IO
+            // without running SessionGuard cleanup (issue #170). The
+            // connection's own SessionGuard removes the session when the
+            // socket actually closes; the idle sweep only reclaims
+            // orphaned session state with no connection left.
+            if !session.connections.is_empty() {
+                return true;
+            }
             let idle_secs = now.duration_since(session.last_activity).as_secs();
             if idle_secs > timeout_seconds {
                 warn!(
-                    "Removing stale session TSIH={} (idle for {}s)",
+                    "Removing stale session TSIH={} (idle for {}s, no live connection)",
                     tsih, idle_secs
                 );
                 false
@@ -582,6 +620,45 @@ mod tests {
         mgr.add_connection(tsih2, 0, 131072).unwrap();
 
         assert_eq!(mgr.connection_count(), 2);
+    }
+
+    /// Issue #169: when the TSIH counter wraps back onto a value a live
+    /// session still occupies, create_session must skip it rather than
+    /// overwrite the live session.
+    #[test]
+    fn create_session_skips_live_tsih_on_wrap() {
+        let mgr = SessionManager::new();
+        let t1 = mgr.create_session([1, 1, 1, 1, 1, 1]);
+        // Force the counter to wrap back onto the live t1.
+        *mgr.next_tsih.lock().unwrap() = t1;
+        let t2 = mgr.create_session([2, 2, 2, 2, 2, 2]);
+        assert_ne!(t2, t1, "must not reuse a live TSIH");
+        let live = mgr.active_tsihs();
+        assert!(live.contains(&t1) && live.contains(&t2));
+        assert_eq!(mgr.session_count(), 2, "neither session was overwritten");
+    }
+
+    /// Issue #170: the idle sweeper must never reap a session that still
+    /// has a live connection (the running serve_connection task), even
+    /// if it has been quiet past the timeout — only orphaned
+    /// connectionless session state is reclaimed.
+    #[test]
+    fn stale_sweep_spares_live_connection_reaps_orphan() {
+        use std::time::Duration;
+        let mgr = SessionManager::new();
+        let live = mgr.create_session([1, 0, 0, 0, 0, 1]);
+        mgr.add_connection(live, 0, 131072).unwrap();
+        let orphan = mgr.create_session([2, 0, 0, 0, 0, 2]); // no connection
+        {
+            let mut s = mgr.sessions.lock().unwrap();
+            let old = Instant::now() - Duration::from_secs(10_000);
+            s.get_mut(&live).unwrap().last_activity = old;
+            s.get_mut(&orphan).unwrap().last_activity = old;
+        }
+        mgr.cleanup_stale_sessions(300);
+        let alive = mgr.active_tsihs();
+        assert!(alive.contains(&live), "live-connection session must survive");
+        assert!(!alive.contains(&orphan), "idle orphan must be reaped");
     }
 
     #[test]

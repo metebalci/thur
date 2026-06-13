@@ -596,11 +596,16 @@ fn raise_medium_may_have_changed(state: &DaemonState, drive_ids: &[u32]) {
     if drive_ids.is_empty() {
         return;
     }
+    // Live session list, not the UA-map keys: a host that has never
+    // received a UA must still be told the medium changed (issue #175).
+    let tsihs = state.session_manager.active_tsihs();
     for drive_id in drive_ids {
         let drive_lun = (*drive_id as u8) + 1;
-        state
-            .ua_tracker
-            .add_ua_all_sessions(drive_lun, UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED);
+        state.ua_tracker.add_ua_all_sessions(
+            &tsihs,
+            drive_lun,
+            UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED,
+        );
     }
 }
 

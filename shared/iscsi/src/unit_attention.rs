@@ -122,21 +122,18 @@ impl UnitAttentionTracker {
         );
     }
 
-    /// Add a Unit Attention for all sessions on a specific LUN
-    /// (e.g., when media is loaded into a drive, all connected initiators should know)
-    pub fn add_ua_all_sessions(&self, lun: u8, code: UnitAttentionCode) {
+    /// Add a Unit Attention for every live session on a specific LUN
+    /// (e.g. when media is loaded into a drive, all connected initiators
+    /// should be told). `tsihs` MUST be the SessionManager's live
+    /// session list (`SessionManager::active_tsihs`): deriving "all
+    /// sessions" from the keys already in `pending_ua` (the old
+    /// behaviour) silently skipped any session that had never received a
+    /// prior UA, so a freshly-connected host never saw the medium change
+    /// — the stale-head/stale-filemark hazard the changer path exists to
+    /// prevent (issue #175).
+    pub fn add_ua_all_sessions(&self, tsihs: &[u16], lun: u8, code: UnitAttentionCode) {
         let mut pending = self.pending_ua.lock().expect("UA tracker mutex poisoned");
-
-        // Find all unique TSIHs
-        let sessions: Vec<u16> = pending
-            .keys()
-            .map(|(tsih, _)| *tsih)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Add UA for each session on this LUN
-        for tsih in sessions {
+        for &tsih in tsihs {
             pending.entry((tsih, lun)).or_default().push(code);
             debug!(
                 "Added Unit Attention (all sessions) for TSIH={} LUN={}: ASC=0x{:02x} ASCQ=0x{:02x}",
@@ -145,8 +142,11 @@ impl UnitAttentionTracker {
         }
 
         info!(
-            "Added Unit Attention for all sessions on LUN {}: ASC=0x{:02x} ASCQ=0x{:02x}",
-            lun, code.asc, code.ascq
+            "Added Unit Attention for {} session(s) on LUN {}: ASC=0x{:02x} ASCQ=0x{:02x}",
+            tsihs.len(),
+            lun,
+            code.asc,
+            code.ascq
         );
     }
 
@@ -228,6 +228,24 @@ mod tests {
 
         // Should be cleared now
         assert!(!tracker.has_pending_ua(1, 1));
+    }
+
+    /// Issue #175: add_ua_all_sessions queues the UA for every TSIH in
+    /// the supplied live-session list, including sessions that have
+    /// never received a prior UA (no pre-existing pending_ua key).
+    #[test]
+    fn add_ua_all_sessions_reaches_sessions_with_no_prior_ua() {
+        let tracker = UnitAttentionTracker::new();
+        // Session 7 has a prior UA on a different LUN; sessions 8 and 9
+        // have none at all.
+        tracker.add_ua(7, 0, UnitAttentionCode::POWER_ON_RESET);
+        tracker.add_ua_all_sessions(&[7, 8, 9], 1, UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED);
+        for tsih in [7u16, 8, 9] {
+            assert!(
+                tracker.has_pending_ua(tsih, 1),
+                "TSIH {tsih} must receive the medium-change UA"
+            );
+        }
     }
 
     #[test]

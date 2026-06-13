@@ -496,8 +496,21 @@ async fn write_segment<W: AsyncWrite + Unpin>(sock: &mut W, data: &[u8]) -> Resu
 pub async fn write_pdu<W: AsyncWrite + Unpin>(sock: &mut W, p: &mut Pdu) -> Result<()> {
     let data_len = p.data.len();
     frame_pdu_header(p, data_len);
-    sock.write_all(&p.bhs).await?;
-    write_segment(sock, &p.data).await
+    // Coalesce BHS + (small) data segment + pad into a single write so a
+    // control PDU (NOP-In / R2T / SCSI Response / Reject) goes out as one
+    // segment rather than 2-3 separate sub-MSS writes (issue #174). The
+    // bulk Data-In path (`write_pdu_with_data`) keeps its zero-copy
+    // separate writes — coalescing there would reintroduce a per-chunk
+    // copy of up to MaxRecvDataSegmentLength bytes, and TCP_NODELAY
+    // already removes the latency penalty.
+    let pad = (4 - (data_len % 4)) % 4;
+    let mut buf = Vec::with_capacity(48 + data_len + pad);
+    buf.extend_from_slice(&p.bhs);
+    buf.extend_from_slice(&p.data);
+    buf.extend_from_slice(&[0u8; 3][..pad]);
+    sock.write_all(&buf).await?;
+    sock.flush().await?;
+    Ok(())
 }
 
 /// Write a PDU whose data segment is supplied as a borrowed slice
@@ -609,17 +622,20 @@ async fn send_r2t<W: AsyncWrite + Unpin>(
 /// write half). This decoupling lets the reader continue to demux
 /// other in-flight Cmd / NopOut / Data-Out PDUs on the same TCP
 /// stream concurrently with the R2T waiter — see `serve_connection`.
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_write_data<W: AsyncWrite + Unpin>(
     sock: &mut W,
     cmd: &mut Pdu,
     edtl: u32,
+    max_burst_length: u32,
+    first_burst_length: u32,
     session_manager: &Arc<SessionManager>,
     tsih: u16,
     cid: u16,
     data_out_rx: &mut tokio::sync::mpsc::Receiver<Pdu>,
 ) -> Result<()> {
     // Phase 1: drain unsolicited Data-Out, if any.
-    if !cmd.final_bit && (cmd.data.len() as u32) < FIRST_BURST_LENGTH.min(edtl) {
+    if !cmd.final_bit && (cmd.data.len() as u32) < first_burst_length.min(edtl) {
         loop {
             let dout = recv_data_out_or_timeout(data_out_rx, cmd.itt).await?;
             // Reader pre-filters opcode 0x05 + matching ITT before
@@ -663,11 +679,11 @@ pub async fn collect_write_data<W: AsyncWrite + Unpin>(
                     edtl
                 ));
             }
-            if new_total as u32 > FIRST_BURST_LENGTH {
+            if new_total as u32 > first_burst_length {
                 return Err(anyhow!(
                     "unsolicited burst {} exceeds FirstBurstLength {}",
                     new_total,
-                    FIRST_BURST_LENGTH
+                    first_burst_length
                 ));
             }
             cmd.data.extend_from_slice(&dout.data);
@@ -682,7 +698,7 @@ pub async fn collect_write_data<W: AsyncWrite + Unpin>(
     while (cmd.data.len() as u32) < edtl {
         let already = cmd.data.len() as u32;
         let remaining = edtl - already;
-        let ddtl = MAX_BURST_LENGTH.min(remaining);
+        let ddtl = max_burst_length.min(remaining);
         let ttt = derive_r2t_ttt(cmd.itt, r2tsn);
 
         send_r2t(
@@ -818,6 +834,14 @@ pub struct LoginOutcome {
     /// this many bytes each, with DataSN / BufferOffset / F / S bits
     /// stamped per spec.
     pub peer_max_recv_data_segment_length: u32,
+    /// Negotiated `MaxBurstLength` (min of target / initiator offers).
+    /// Bounds the R2T DESIRED DATA TRANSFER LENGTH in the FFP loop so a
+    /// solicited burst never exceeds what the initiator agreed to
+    /// (issue #171).
+    pub negotiated_max_burst_length: u32,
+    /// Negotiated `FirstBurstLength` (min of offers, capped at the
+    /// negotiated MaxBurstLength). Bounds the unsolicited Data-Out burst.
+    pub negotiated_first_burst_length: u32,
 }
 
 /// CHAP state carried across login PDUs. Lives inside the login state
@@ -991,6 +1015,37 @@ fn negotiate_chap_security_stage(
 /// Build the operational-parameter response keys for one login PDU.
 /// Mirrors what the initiator offered (digests, markers, time2*),
 /// pinning each at the safest target-side value.
+/// Apply RFC 7143 §12 operational-parameter negotiation to `negotiated`
+/// (seeded with the target's offers) from the initiator's `req_keys`:
+/// MaxBurstLength / FirstBurstLength take the min, ImmediateData the AND,
+/// InitialR2T the OR. Out-of-range numeric burst values (RFC range
+/// 512..=2^24-1) are ignored. FirstBurstLength is finally capped at the
+/// negotiated MaxBurstLength. Issue #171.
+fn negotiate_session_params(negotiated: &mut SessionParams, req_keys: &HashMap<String, String>) {
+    if let Some(parsed) = req_keys
+        .get("MaxBurstLength")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|p| (512..=0x00FF_FFFF).contains(p))
+    {
+        negotiated.max_burst_length = negotiated.max_burst_length.min(parsed);
+    }
+    if let Some(parsed) = req_keys
+        .get("FirstBurstLength")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|p| (512..=0x00FF_FFFF).contains(p))
+    {
+        negotiated.first_burst_length = negotiated.first_burst_length.min(parsed);
+    }
+    if let Some(v) = req_keys.get("ImmediateData") {
+        negotiated.immediate_data = negotiated.immediate_data && v.eq_ignore_ascii_case("Yes");
+    }
+    if let Some(v) = req_keys.get("InitialR2T") {
+        negotiated.initial_r2t = negotiated.initial_r2t || v.eq_ignore_ascii_case("Yes");
+    }
+    // FirstBurstLength must not exceed MaxBurstLength (RFC 7143).
+    negotiated.first_burst_length = negotiated.first_burst_length.min(negotiated.max_burst_length);
+}
+
 fn append_opneg_response_keys(
     req_keys: &HashMap<String, String>,
     params: &SessionParams,
@@ -1087,7 +1142,14 @@ pub async fn handle_login_phase(
     tpgt: u16,
 ) -> Result<LoginOutcome> {
     let mut current_stage = STAGE_SECURITY;
-    let params = SessionParams::default();
+    // Negotiated session parameters, seeded with the target's offers and
+    // narrowed toward the initiator's during opneg (RFC 7143: min for
+    // burst lengths, AND for ImmediateData, OR for InitialR2T). Echoing
+    // the target's own values unconditionally (the old bug) could
+    // promise a MaxBurstLength larger than the initiator proposed and
+    // then solicit an R2T exceeding it — a protocol error that strict
+    // initiators drop the connection over (issue #171).
+    let mut negotiated = SessionParams::default();
     let mut isid = [0u8; 6];
     let mut is_discovery = false;
     let mut tsih: u16 = 0;
@@ -1161,6 +1223,13 @@ pub async fn handle_login_phase(
             peer_max_recv_data_segment_length = parsed;
         }
 
+        // RFC 7143 §12 negotiation of the burst/immediate keys (min /
+        // AND / OR against the initiator's proposal), narrowing the
+        // target's offers so the response — and the R2T DDTL bound
+        // threaded via LoginOutcome to collect_write_data — never exceeds
+        // what the initiator agreed to (issue #171).
+        negotiate_session_params(&mut negotiated, &req_keys);
+
         if current_stage == STAGE_SECURITY {
             is_discovery = req_keys
                 .get("SessionType")
@@ -1217,7 +1286,7 @@ pub async fn handle_login_phase(
         }
 
         if negotiate_opneg {
-            append_opneg_response_keys(&req_keys, &params, is_discovery, tpgt, &mut resp_keys);
+            append_opneg_response_keys(&req_keys, &negotiated, is_discovery, tpgt, &mut resp_keys);
         }
 
         let resp_csg = req_csg;
@@ -1236,7 +1305,7 @@ pub async fn handle_login_phase(
             } else {
                 tsih = session_manager.create_session(isid);
                 session_manager
-                    .add_connection(tsih, cid, params.max_recv_data_segment_length)
+                    .add_connection(tsih, cid, negotiated.max_recv_data_segment_length)
                     .map_err(|e| anyhow!("Failed to add connection: {}", e))?;
             }
             resp.bhs[14..16].copy_from_slice(&tsih.to_be_bytes());
@@ -1294,6 +1363,8 @@ pub async fn handle_login_phase(
                 authenticated_volumes: chap.authenticated_volumes,
                 authenticated_user: chap.authenticated_user,
                 peer_max_recv_data_segment_length,
+                negotiated_max_burst_length: negotiated.max_burst_length,
+                negotiated_first_burst_length: negotiated.first_burst_length,
             });
         }
 
@@ -1498,6 +1569,8 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         authenticated_volumes,
         authenticated_user,
         peer_max_recv_data_segment_length,
+        negotiated_max_burst_length,
+        negotiated_first_burst_length,
         ..
     } = outcome;
 
@@ -1676,6 +1749,16 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     tracing::warn!(
                         "SCSI Command on discovery session from {peer} — protocol violation"
                     );
+                    // The reader pre-registered an ITT-keyed Data-Out
+                    // route for any W-bit SCSI Command before it knew the
+                    // session type. Drop it here too, or a discovery
+                    // session streaming W-bit commands with distinct ITTs
+                    // would leak one route-map entry each — unbounded
+                    // per-connection memory growth, reachable
+                    // unauthenticated (issue #172).
+                    if data_out_rx.is_some() {
+                        drop_route(pdu.itt);
+                    }
                     let mut rej = build_reject(0xFFFFFFFF, 0x04);
                     stamp_and_write!(rej, &pdu);
                     continue;
@@ -1711,8 +1794,18 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                         )
                     })?;
                     let outcome =
-                        collect_write_data(sock, &mut pdu, edtl, &session_manager, tsih, cid, rx)
-                            .await;
+                        collect_write_data(
+                            sock,
+                            &mut pdu,
+                            edtl,
+                            negotiated_max_burst_length,
+                            negotiated_first_burst_length,
+                            &session_manager,
+                            tsih,
+                            cid,
+                            rx,
+                        )
+                        .await;
                     drop_route(pdu.itt);
                     outcome?;
                 } else if w_bit {
@@ -2150,6 +2243,16 @@ where
         match listener.accept().await {
             Ok((stream, addr)) => {
                 info!("New connection from {} (TPGT={})", addr, tpgt);
+                // Disable Nagle: iSCSI writes a PDU as a small BHS plus a
+                // sub-MSS data/pad tail, and Nagle holds that tail until
+                // the prior segment is ACKed — against an initiator using
+                // delayed-ACK that adds up to ~40 ms per round trip on
+                // queue-depth-1 workloads (database fsync, tape
+                // filemark/sync). Every mainstream iSCSI target sets
+                // TCP_NODELAY at accept (issue #174).
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("set_nodelay failed for {}: {} (latency may suffer)", addr, e);
+                }
                 let handler = Arc::clone(&handler);
                 let session_manager = Arc::clone(&session_manager);
                 let auth = auth.clone();
@@ -2490,6 +2593,42 @@ mod tests {
         assert_eq!(parsed.get("Empty"), Some(&String::new()));
     }
 
+    /// Issue #171: operational-parameter negotiation takes the min of
+    /// the burst lengths, AND of ImmediateData, OR of InitialR2T — never
+    /// echoes the target's own offer unconditionally.
+    #[test]
+    fn negotiate_session_params_applies_min_and_or() {
+        let mut p = SessionParams::default();
+        // Target defaults: MaxBurst 16 MiB, FirstBurst = MAX_RECV, both
+        // ImmediateData/InitialR2T at the SessionParams default.
+        let init_default_immediate = p.immediate_data;
+        let mut req = HashMap::new();
+        req.insert("MaxBurstLength".to_string(), "4194304".to_string()); // 4 MiB
+        req.insert("FirstBurstLength".to_string(), "65536".to_string());
+        req.insert("ImmediateData".to_string(), "No".to_string());
+        req.insert("InitialR2T".to_string(), "Yes".to_string());
+        negotiate_session_params(&mut p, &req);
+        assert_eq!(p.max_burst_length, 4 * 1024 * 1024, "MaxBurstLength = min");
+        assert_eq!(p.first_burst_length, 65536, "FirstBurstLength = min");
+        assert!(!p.immediate_data, "ImmediateData = AND (No wins)");
+        assert!(p.initial_r2t, "InitialR2T = OR (Yes wins)");
+        let _ = init_default_immediate;
+    }
+
+    /// Issue #171: an out-of-range or absent burst value leaves the
+    /// target's default; FirstBurstLength is capped at MaxBurstLength.
+    #[test]
+    fn negotiate_session_params_ignores_garbage_and_caps_first_burst() {
+        let mut p = SessionParams::default();
+        let mut req = HashMap::new();
+        req.insert("MaxBurstLength".to_string(), "256".to_string()); // < 512, ignored
+        req.insert("FirstBurstLength".to_string(), "999999999".to_string()); // > 2^24-1, ignored
+        negotiate_session_params(&mut p, &req);
+        assert_eq!(p.max_burst_length, MAX_BURST_LENGTH, "garbage MaxBurst ignored");
+        // FirstBurst default capped at MaxBurst (both unchanged here).
+        assert!(p.first_burst_length <= p.max_burst_length);
+    }
+
     #[test]
     fn next_exp_cmdsn_wraps_at_u32_max() {
         let mut pdu = build_empty_pdu(0x01, false, false);
@@ -2764,7 +2903,7 @@ mod tests {
         drop(tx);
 
         let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, edtl, &mgr, tsih, cid, &mut rx)
+        collect_write_data(&mut sink, &mut cmd, edtl, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap();
         assert_eq!(cmd.data, [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -2793,7 +2932,7 @@ mod tests {
         drop(tx);
 
         let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, edtl, &mgr, tsih, cid, &mut rx)
+        collect_write_data(&mut sink, &mut cmd, edtl, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap();
         assert_eq!(cmd.data, [0xDE, 0xAD, 0xBE, 0xEF]);
@@ -2816,7 +2955,7 @@ mod tests {
         tx.send(wrong).await.unwrap();
         drop(tx);
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("expected unsolicited Data-Out"));
@@ -2833,7 +2972,7 @@ mod tests {
             .unwrap();
         drop(tx);
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("ITT mismatch"));
@@ -2851,7 +2990,7 @@ mod tests {
             .unwrap();
         drop(tx);
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("non-default TTT"));
@@ -2869,7 +3008,7 @@ mod tests {
             .unwrap();
         drop(tx);
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("BufferOffset"));
@@ -2887,7 +3026,7 @@ mod tests {
             .unwrap();
         drop(tx);
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 4, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 4, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("overruns EDTL"));
@@ -2901,7 +3040,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
         drop(tx); // reader "closed" before any Data-Out arrived
         let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, &mgr, tsih, cid, &mut rx)
+        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("PDU reader closed"));
@@ -2917,7 +3056,7 @@ mod tests {
         cmd.data = vec![1, 2, 3, 4];
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
         let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, 4, &mgr, tsih, cid, &mut rx)
+        collect_write_data(&mut sink, &mut cmd, 4, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
             .await
             .unwrap();
         assert_eq!(cmd.data, [1, 2, 3, 4]);
