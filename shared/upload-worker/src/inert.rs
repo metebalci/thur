@@ -59,6 +59,7 @@ pub async fn upload_chunk_inert(
             );
             return Ok(UploadOutcome {
                 item_id: payload.item_id,
+                hash: payload.hash.clone(),
                 object_key,
                 dedup_hit: true,
                 put_compression: None,
@@ -91,6 +92,7 @@ pub async fn upload_chunk_inert(
 
     Ok(UploadOutcome {
         item_id: payload.item_id,
+        hash: payload.hash.clone(),
         object_key,
         dedup_hit: false,
         put_compression: applied_algo,

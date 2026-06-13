@@ -1595,7 +1595,7 @@ pub struct ResizeVolumeRequest {
 /// The cache is populated at boot from `discovery.rs`; this helper
 /// exists so admin-side creates against a never-before-used backend
 /// pay the SDK construction cost exactly once.
-async fn get_or_init_backend(
+pub(crate) async fn get_or_init_backend(
     state: &AdminState,
     name: &str,
 ) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {

@@ -671,6 +671,7 @@ impl PageCache {
         }
         let mut cursor = byte_offset;
         let mut remaining = len;
+        let mut cleared_any_page = false;
         while remaining > 0 {
             let page_id = self.page_id_for_offset(cursor)?;
             let off_in_page = (cursor % self.page_size) as usize;
@@ -678,12 +679,22 @@ impl PageCache {
             let chunk = chunk_u64 as usize;
             if off_in_page == 0 && chunk == self.page_size as usize {
                 self.unmap_full_page(page_id).await?;
+                cleared_any_page = true;
             } else {
                 let zeros = vec![0u8; chunk];
                 self.modify_page(page_id, off_in_page, &zeros).await?;
             }
             cursor += chunk_u64;
             remaining -= chunk_u64;
+        }
+        // One batched fdatasync for the whole command rather than one per
+        // cleared page. A host fstrim / blkdiscard can cover the entire
+        // volume; the per-page fsync that used to live in `clear` turned
+        // that into 16 384 fdatasyncs/GiB, stalling the command past the
+        // host timeout (issue #112). The pwrites above already landed in
+        // the OS page cache via clear_unsynced.
+        if cleared_any_page {
+            self.writer.page_index().sync()?;
         }
         // UNMAP zeros count as host-written bytes. The host told us
         // "these LBAs are now zero" — that's still a write from the
@@ -1266,14 +1277,16 @@ impl PageCache {
 
     /// UNMAP a full page: drop any cached entry (clean or dirty —
     /// the host explicitly told us to forget it) and clear the
-    /// underlying page-index slot synchronously. Storage chunks linger
-    /// until `system gc` reclaims them.
+    /// underlying page-index slot. The clear is left *unsynced*; the
+    /// caller ([`Self::unmap_bytes`]) issues one batched `fdatasync` for
+    /// the whole command (issue #112). Storage chunks linger until
+    /// `system gc` reclaims them.
     async fn unmap_full_page(&self, page_id: PageId) -> Result<(), UploaderError> {
         {
             let mut inner = self.inner.lock().await;
             inner.drop_entry(page_id);
         }
-        self.writer.page_index().clear(page_id)?;
+        self.writer.page_index().clear_unsynced(page_id)?;
         Ok(())
     }
 
@@ -1827,6 +1840,7 @@ mod tests {
         assert_eq!(retry.payload.item_id, 0);
         let outcome = shared_upload_worker::UploadOutcome {
             item_id: retry.payload.item_id,
+            hash: retry.payload.hash.clone(),
             object_key: retry.payload.object_key.clone(),
             dedup_hit: false,
             put_compression: None,

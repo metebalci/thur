@@ -60,6 +60,11 @@ pub struct UploadOutcome {
     /// Echoed from [`PendingUpload::item_id`] so the caller can
     /// match outcomes back to index records without a side map.
     pub item_id: u64,
+    /// Echoed from [`PendingUpload::hash`] (BLAKE3 hex of the uploaded
+    /// chunk's content). Lets the caller confirm the index record it is
+    /// about to flip still references *this* chunk and wasn't superseded
+    /// by a re-write between enqueue and completion (issue #113).
+    pub hash: String,
     /// Echoed from [`PendingUpload::object_key`].
     pub object_key: String,
     /// True iff cross-namespace dedup fired (storage HEAD hit under

@@ -355,10 +355,23 @@ impl PageIndex {
     /// afterward return `None`. The pool-side chunk that used to
     /// back the page is left for GC to sweep.
     pub fn clear(&self, page_id: PageId) -> Result<(), PageIndexError> {
+        self.clear_unsynced(page_id)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Drop the mapping for `page_id` *without* the trailing
+    /// `sync_data` — the unsynced counterpart of [`Self::clear`],
+    /// mirroring [`Self::set_unsynced`]. Durability requires a later
+    /// [`Self::sync`]. A multi-page UNMAP (a host `fstrim` /
+    /// `blkdiscard` can legally cover the whole volume) clears each
+    /// covered page this way and pays one `fdatasync` per command
+    /// instead of one per page — 16 384 fdatasyncs/GiB collapses to one
+    /// (issue #112).
+    pub fn clear_unsynced(&self, page_id: PageId) -> Result<(), PageIndexError> {
         let offset = HEADER_SIZE + u64::from(page_id) * RECORD_SIZE;
         let zero = [0u8; RECORD_SIZE as usize];
         self.file.write_at(&zero, offset)?;
-        self.file.sync_data()?;
         Ok(())
     }
 
@@ -787,6 +800,26 @@ mod tests {
 
         idx.clear(7).unwrap();
         assert_eq!(idx.get(7).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_unsynced_then_sync_drops_mappings() {
+        // The batched-UNMAP path (issue #112): clear several pages
+        // without per-page fdatasync, then one trailing sync. The
+        // mappings must read back as vacant.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(FILENAME);
+        let idx = PageIndex::create(&path, fixture_uuid(), 65_536).unwrap();
+        for p in 0..5u32 {
+            idx.set(p, &fixture_hash(p as u8)).unwrap();
+        }
+        for p in 0..5u32 {
+            idx.clear_unsynced(p).unwrap();
+        }
+        idx.sync().unwrap();
+        for p in 0..5u32 {
+            assert_eq!(idx.get(p).unwrap(), None, "page {p} should be cleared");
+        }
     }
 
     #[test]

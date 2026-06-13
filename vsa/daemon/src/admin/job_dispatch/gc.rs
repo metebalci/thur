@@ -28,7 +28,6 @@ use core_block::{ChunkPool, PageIndex, SnapshotManifest, VolumeManifest};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_audit::{AuditActor, AuditResult};
-use shared_object_store::ObjectStoreConfig;
 use shared_pool::PoolBudget;
 use tracing::warn;
 
@@ -47,6 +46,15 @@ pub struct GcParams {
 /// `Local`-scope volumes.
 type LiveSet = HashMap<(String, Option<String>), HashSet<String>>;
 
+/// `(backend, namespace)` buckets whose live set could not be read in
+/// full (a page-index open/iteration error on a volume or snapshot we
+/// *could* identify). Deletion is disabled for these buckets so a
+/// transient read error can't be misread as orphanhood — issue #145.
+/// Errors where the bucket itself can't be identified (manifest load
+/// failure) abort the whole GC instead, since we can't tell which bucket
+/// to protect.
+type PoisonSet = HashSet<(String, Option<String>)>;
+
 pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState) {
     let params: GcParams = match serde_json::from_value(body) {
         Ok(p) => p,
@@ -63,11 +71,11 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
     // Phase 1 — collect the live set. Page-index iteration is sync
     // pread; run it on the blocking pool.
     let dd_for_collect = data_dir.clone();
-    let live: Result<LiveSet, anyhow::Error> =
+    let collected: Result<(LiveSet, PoisonSet), anyhow::Error> =
         tokio::task::spawn_blocking(move || collect_live_hashes(&dd_for_collect))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("collect panicked: {}", e)));
-    let live = match live {
+    let (live, poisoned) = match collected {
         Ok(l) => l,
         Err(e) => {
             emitter
@@ -76,6 +84,17 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
             return;
         }
     };
+
+    if !poisoned.is_empty() {
+        emitter
+            .info(format!(
+                "WARNING: {} pool(s) had an unreadable live set; deletion is DISABLED for them \
+                 this run (orphans there are retained, not reclaimed).",
+                poisoned.len()
+            ))
+            .await;
+        emitter.info("").await;
+    }
 
     let total_live: usize = live.values().map(|s| s.len()).sum();
     let backend_count: HashSet<&String> = live.keys().map(|(b, _)| b).collect();
@@ -108,8 +127,9 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
         let dd = data_dir.clone();
         let dry = params.dry_run;
         let budget = state.pool_budgets.get(backend_name).cloned();
+        let poisoned_clone = poisoned.clone();
         let lines_with_freed = tokio::task::spawn_blocking(move || {
-            run_local_gc(&dd, &bn, &live_clone, dry, budget.as_deref())
+            run_local_gc(&dd, &bn, &live_clone, &poisoned_clone, dry, budget.as_deref())
         })
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("local gc panicked: {}", e)));
@@ -135,9 +155,10 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
         if params.storage
             && let Err(e) = run_storage_gc(
                 &emitter,
-                &state.storage,
+                &state,
                 backend_name,
                 &live,
+                &poisoned,
                 params.dry_run,
             )
             .await
@@ -209,19 +230,24 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState
 /// parent's and any clones' into one bucket. The union is a `HashSet`,
 /// so a chunk shared across family members is counted once and only
 /// reclaimed when no member references it.
-fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
+fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<(LiveSet, PoisonSet)> {
     let mut out: LiveSet = HashMap::new();
+    let mut poisoned: PoisonSet = HashSet::new();
     for name in VolumeManifest::list(data_dir)? {
-        let manifest = match VolumeManifest::load(data_dir, &name) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "gc: skipping volume '{}' - manifest load failed: {}",
-                    name, e
-                );
-                continue;
-            }
-        };
+        // A manifest we can't load means we can't identify the volume's
+        // (backend, namespace) bucket — and run_local_gc would otherwise
+        // treat its on-disk namespace dir as a fully-orphan destroyed
+        // volume and delete every chunk. We can't protect a bucket we
+        // can't name, so abort the whole GC rather than risk it (#145).
+        let manifest = VolumeManifest::load(data_dir, &name).map_err(|e| {
+            anyhow::anyhow!(
+                "gc aborted: volume '{}' manifest load failed ({}); refusing to GC with an \
+                 incomplete live set",
+                name,
+                e
+            )
+        })?;
+        let key = (manifest.backend.clone(), manifest.pool_namespace());
         let vol_dir = VolumeManifest::dir_for(data_dir, &name);
         let page_index = match PageIndex::open(
             &PageIndex::path_for(&vol_dir),
@@ -230,23 +256,29 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
         ) {
             Ok(p) => p,
             Err(e) => {
+                // Bucket is known: protect it instead of dropping it.
                 warn!(
-                    "gc: skipping volume '{}' - pages.idx open failed: {}",
+                    "gc: volume '{}' pages.idx open failed ({}); disabling deletion for its pool",
                     name, e
                 );
+                poisoned.insert(key.clone());
+                out.entry(key).or_default();
                 continue;
             }
         };
-        let bucket = out
-            .entry((manifest.backend.clone(), manifest.pool_namespace()))
-            .or_default();
+        let bucket = out.entry(key.clone()).or_default();
         for record in page_index.iter() {
             match record {
                 Ok((_page_id, hash)) => {
                     bucket.insert(hex::encode(hash));
                 }
                 Err(e) => {
-                    warn!("gc: volume '{}' - pages.idx iteration failed: {}", name, e);
+                    warn!(
+                        "gc: volume '{}' pages.idx iteration failed ({}); disabling deletion \
+                         for its pool",
+                        name, e
+                    );
+                    poisoned.insert(key);
                     break;
                 }
             }
@@ -257,16 +289,16 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
     // keyed on the snapshot's family namespace so it unions with its
     // parent/clones.
     for (parent, snap) in SnapshotManifest::list_all(data_dir)? {
-        let manifest = match SnapshotManifest::load(data_dir, &parent, &snap) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "gc: skipping snapshot '{}/{}' - manifest load failed: {}",
-                    parent, snap, e
-                );
-                continue;
-            }
-        };
+        let manifest = SnapshotManifest::load(data_dir, &parent, &snap).map_err(|e| {
+            anyhow::anyhow!(
+                "gc aborted: snapshot '{}/{}' manifest load failed ({}); refusing to GC with an \
+                 incomplete live set",
+                parent,
+                snap,
+                e
+            )
+        })?;
+        let key = (manifest.backend.clone(), manifest.pool_namespace());
         let idx_path = SnapshotManifest::page_index_path(data_dir, &parent, &snap);
         let page_index = match PageIndex::open(
             &idx_path,
@@ -276,15 +308,16 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
             Ok(p) => p,
             Err(e) => {
                 warn!(
-                    "gc: skipping snapshot '{}/{}' - pages.idx open failed: {}",
+                    "gc: snapshot '{}/{}' pages.idx open failed ({}); disabling deletion for its \
+                     pool",
                     parent, snap, e
                 );
+                poisoned.insert(key.clone());
+                out.entry(key).or_default();
                 continue;
             }
         };
-        let bucket = out
-            .entry((manifest.backend.clone(), manifest.pool_namespace()))
-            .or_default();
+        let bucket = out.entry(key.clone()).or_default();
         for record in page_index.iter() {
             match record {
                 Ok((_page_id, hash)) => {
@@ -292,21 +325,24 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<LiveSet> {
                 }
                 Err(e) => {
                     warn!(
-                        "gc: snapshot '{}/{}' - pages.idx iteration failed: {}",
+                        "gc: snapshot '{}/{}' pages.idx iteration failed ({}); disabling deletion \
+                         for its pool",
                         parent, snap, e
                     );
+                    poisoned.insert(key);
                     break;
                 }
             }
         }
     }
-    Ok(out)
+    Ok((out, poisoned))
 }
 
 fn run_local_gc(
     data_dir: &Path,
     backend_name: &str,
     live: &LiveSet,
+    poisoned: &PoisonSet,
     dry_run: bool,
     budget: Option<&PoolBudget>,
 ) -> anyhow::Result<(Vec<String>, u64)> {
@@ -314,20 +350,25 @@ fn run_local_gc(
     let mut bytes_freed = 0u64;
     let empty: HashSet<String> = HashSet::new();
 
-    // Shared (Global-scope) pool.
-    let shared_live = live
-        .get(&(backend_name.to_string(), None))
-        .unwrap_or(&empty);
-    let shared_pool = ChunkPool::new(data_dir, backend_name)?;
-    bytes_freed = bytes_freed.saturating_add(sweep_one_pool(
-        &shared_pool,
-        shared_live,
-        dry_run,
-        "shared pool",
-        None,
-        budget,
-        &mut lines,
-    )?);
+    // Shared (Global-scope) pool. Skip entirely if its live set was
+    // incomplete this run (#145).
+    if poisoned.contains(&(backend_name.to_string(), None)) {
+        lines.push("  shared pool: skipped (live set unreadable this run)".to_string());
+    } else {
+        let shared_live = live
+            .get(&(backend_name.to_string(), None))
+            .unwrap_or(&empty);
+        let shared_pool = ChunkPool::new(data_dir, backend_name)?;
+        bytes_freed = bytes_freed.saturating_add(sweep_one_pool(
+            &shared_pool,
+            shared_live,
+            dry_run,
+            "shared pool",
+            None,
+            budget,
+            &mut lines,
+        )?);
+    }
 
     // Local-scope per-volume namespaces: every namespace named in the
     // live set, plus any orphan namespace dir still on disk whose
@@ -362,6 +403,16 @@ fn run_local_gc(
     }
 
     for (ns, ns_live) in namespaces {
+        // Skip namespaces whose live set was incomplete this run (#145):
+        // an unreadable index must not let the sweep mistake the volume's
+        // chunks for orphans.
+        if poisoned.contains(&(backend_name.to_string(), Some(ns.clone()))) {
+            lines.push(format!(
+                "  namespace '{}': skipped (live set unreadable this run)",
+                ns
+            ));
+            continue;
+        }
         let ns_pool = ChunkPool::new_namespaced(data_dir, backend_name, &ns)?;
         let context = format!("namespace '{}'", ns);
         bytes_freed = bytes_freed.saturating_add(sweep_one_pool(
@@ -469,12 +520,20 @@ fn remove_empty_pool_dir(pool_dir: &Path) -> std::io::Result<()> {
 
 async fn run_storage_gc(
     emitter: &JobEmitter,
-    cfg: &ObjectStoreConfig,
+    state: &AdminState,
     backend_name: &str,
     live: &LiveSet,
+    poisoned: &PoisonSet,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let backend = cfg.create_backend_named(backend_name).await?;
+    // Use the daemon's cached backend instance, not a fresh one: every
+    // backend is wrapped in CachingObjectStoreBackend, and delete_object
+    // only invalidates the instance it runs on. Deleting through a
+    // private instance would leave the long-lived instance (used by the
+    // upload worker / read refetch) still asserting the key is present —
+    // a later identical-content write would then skip its PUT and lose
+    // data (#146).
+    let backend = crate::admin::handlers::get_or_init_backend(state, backend_name).await?;
     let keys = backend.list_objects("chunks/").await?;
     let mut orphans = 0usize;
     let mut total = 0usize;
@@ -492,6 +551,11 @@ async fn run_storage_gc(
             None => continue,
         };
         total += 1;
+        // Never delete from a bucket whose live set was incomplete this
+        // run (#145).
+        if poisoned.contains(&(backend_name.to_string(), parsed.namespace.clone())) {
+            continue;
+        }
         let live_set = live_for_backend
             .get(&parsed.namespace.as_deref())
             .copied()
@@ -637,14 +701,16 @@ mod tests {
             pages.set(0, &orphan_bytes).unwrap();
             pages.set(0, &live_bytes).unwrap();
 
-            let live = collect_live_hashes(data_dir).unwrap();
+            let (live, poisoned) = collect_live_hashes(data_dir).unwrap();
+            assert!(poisoned.is_empty());
             assert_eq!(
                 live.get(&("primary".to_string(), Some(ns.clone()))),
                 Some(&HashSet::from([live_hash.clone()])),
                 "only the chunk still mapped into pages.idx is live"
             );
 
-            let (_lines, freed) = run_local_gc(data_dir, "primary", &live, dry_run, None).unwrap();
+            let (_lines, freed) =
+                run_local_gc(data_dir, "primary", &live, &poisoned, dry_run, None).unwrap();
 
             if dry_run {
                 assert_eq!(freed, 0, "dry-run frees nothing");
@@ -693,8 +759,8 @@ mod tests {
             budget.force_reserve(2048, Some(&ns));
             assert_eq!(budget.current_bytes(), 4096 + 2048);
 
-            let live = collect_live_hashes(data_dir).unwrap();
-            run_local_gc(data_dir, "primary", &live, dry_run, Some(&budget)).unwrap();
+            let (live, poisoned) = collect_live_hashes(data_dir).unwrap();
+            run_local_gc(data_dir, "primary", &live, &poisoned, dry_run, Some(&budget)).unwrap();
 
             if dry_run {
                 assert_eq!(
@@ -710,6 +776,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A poisoned `(backend, namespace)` bucket must not be swept even
+    /// though its live set looks empty — the protective half of #145.
+    #[test]
+    fn poisoned_namespace_is_not_swept() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary");
+        let ns = manifest.pool_namespace().unwrap();
+
+        let pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        let (h, _) = pool.insert_bytes(&[0x33; 4096]).unwrap();
+
+        // Empty live set (as if the index couldn't be read) but the
+        // bucket is poisoned: the sweep must protect it.
+        let live = LiveSet::new();
+        let mut poisoned = PoisonSet::new();
+        poisoned.insert(("primary".to_string(), Some(ns.clone())));
+
+        let (_lines, freed) =
+            run_local_gc(data_dir, "primary", &live, &poisoned, false, None).unwrap();
+        assert_eq!(freed, 0, "poisoned namespace must free nothing");
+        assert!(pool.exists(&h), "poisoned namespace chunk must survive GC");
+    }
+
+    /// An unreadable volume manifest must abort the whole GC (we can't
+    /// identify the bucket to protect), not silently shrink the live set
+    /// and delete the volume's chunks — the abort half of #145.
+    #[test]
+    fn collect_aborts_on_unreadable_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        make_volume(data_dir, "vol-a", "primary");
+        // Corrupt the manifest so load() fails.
+        let manifest_path = VolumeManifest::path_for(data_dir, "vol-a");
+        fs::write(&manifest_path, b"{ this is not valid manifest json").unwrap();
+
+        let res = collect_live_hashes(data_dir);
+        assert!(
+            res.is_err(),
+            "an unreadable manifest must abort GC rather than drop the volume from the live set"
+        );
     }
 
     /// Take a snapshot the way the daemon does: copy the live pages.idx
@@ -758,7 +867,7 @@ mod tests {
         pages.set(0, &new_bytes).unwrap();
 
         // Live set holds BOTH — the snapshot keeps the old hash alive.
-        let live = collect_live_hashes(data_dir).unwrap();
+        let (live, _poisoned) = collect_live_hashes(data_dir).unwrap();
         let bucket = live
             .get(&("primary".to_string(), Some(ns.clone())))
             .expect("namespace bucket present");
@@ -769,15 +878,16 @@ mod tests {
         assert!(bucket.contains(&new_hash), "parent's current chunk is live");
 
         // GC while the snapshot exists: nothing reclaimed.
-        run_local_gc(data_dir, "primary", &live, false, None).unwrap();
+        run_local_gc(data_dir, "primary", &live, &PoisonSet::new(), false, None).unwrap();
         assert!(pool.exists(&old_hash), "snapshot-held chunk survives GC");
         assert!(pool.exists(&new_hash));
 
         // Destroy the snapshot, re-collect, GC again: old chunk is now a
         // true orphan and gets reclaimed; the parent's chunk stays.
         fs::remove_dir_all(SnapshotManifest::dir_for(data_dir, "vol-a", "snap1")).unwrap();
-        let live = collect_live_hashes(data_dir).unwrap();
-        let (_lines, freed) = run_local_gc(data_dir, "primary", &live, false, None).unwrap();
+        let (live, poisoned) = collect_live_hashes(data_dir).unwrap();
+        let (_lines, freed) =
+            run_local_gc(data_dir, "primary", &live, &poisoned, false, None).unwrap();
         assert_eq!(freed, 4096, "the orphaned old chunk is reclaimed");
         assert!(
             !pool.exists(&old_hash),

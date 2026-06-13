@@ -861,6 +861,16 @@ impl VolumeWriter {
     /// Called by the daemon's upload worker after each successful
     /// PUT. The inline write path (no upload sender) calls this
     /// from `write_page_unsynced` itself before returning.
+    ///
+    /// **Supersession guard (issue #113):** the flip only fires when
+    /// the page's current `pages.idx` hash still equals the chunk this
+    /// PUT uploaded. A re-write between enqueue and completion rebinds
+    /// the page to a newer, still-local chunk; flipping `Uploaded` then
+    /// would falsely report the newer bytes durable (fooling SYNCHRONIZE
+    /// CACHE) and let eviction delete the newer chunk before its own PUT
+    /// lands — permanent data loss. When superseded, leave the page
+    /// `LocalOnly` and keep the pending marker: the newer chunk's own
+    /// upload task is the one that clears it.
     pub async fn apply_page_upload_outcome(
         &self,
         outcome: &UploadOutcome,
@@ -876,6 +886,18 @@ impl VolumeWriter {
                 return Ok(());
             }
         };
+        // Does the page still reference the chunk this outcome uploaded?
+        let current_hash = self.page_index.get(page_id)?.map(hex::encode);
+        if current_hash.as_deref() != Some(outcome.hash.as_str()) {
+            tracing::debug!(
+                "apply_page_upload_outcome: page {} was superseded (uploaded {}.., now {:?}); \
+                 leaving LocalOnly + pending for the newer chunk's upload",
+                u64::from(page_id),
+                &outcome.hash[..8.min(outcome.hash.len())],
+                current_hash.as_deref().map(|h| &h[..8.min(h.len())]),
+            );
+            return Ok(());
+        }
         self.upload_index.set(page_id, UploadState::Uploaded)?;
         self.pending_uploads.mark_done(page_id).await;
         Ok(())
@@ -1159,13 +1181,29 @@ impl VolumeWriter {
         // Mirrors `core_stream::cartridge::chunking::seal_current_chunk`.
         let reserved_bytes = payload.len() as u64;
         let namespace = self.manifest.pool_namespace();
-        self.pool_budget.try_reserve(
-            reserved_bytes,
-            namespace.as_deref(),
-            self.backpressure_deadline,
-        )?;
+        // Async backpressure wait: the block write path runs directly on
+        // tokio workers, so the sync condvar park would freeze the whole
+        // runtime under sustained backpressure (issue #114 / #123).
+        self.pool_budget
+            .try_reserve_async(
+                reserved_bytes,
+                namespace.as_deref(),
+                self.backpressure_deadline,
+            )
+            .await?;
 
-        let insert_result = self.pool.insert_bytes(payload);
+        // Offload the chunk seal (BLAKE3 hash + tempfile write + fsync) to
+        // the blocking pool. Running it inline on a tokio worker parks the
+        // worker for the whole kernel flush; under concurrent writes that
+        // starves every other async task on the runtime — admin socket,
+        // /health, accept loops, I/O to other volumes (issue #114).
+        let pool = self.pool.clone();
+        let payload_owned = payload.to_vec();
+        let insert_result = tokio::task::spawn_blocking(move || pool.insert_bytes(&payload_owned))
+            .await
+            .map_err(|e| {
+                UploaderError::Io(std::io::Error::other(format!("seal task join: {e}")))
+            })?;
         let (hash_hex, was_new) = match insert_result {
             Ok(v) => v,
             Err(e) => {
@@ -1424,7 +1462,18 @@ impl VolumeWriter {
             // made. `force_reserve`, not `try_reserve`: a host READ must
             // never block on backpressure — the bytes already left the
             // backend and the page must be served.
-            let was_new = self.pool.insert_verified_bytes(&hash_hex, &bytes)?;
+            // Offload the verify + tempfile-write + fsync to the blocking
+            // pool — running it inline on a tokio worker parks the worker
+            // for the kernel flush and starves the runtime (issue #114).
+            // `bytes` moves in and back out so we don't clone the page.
+            let pool = self.pool.clone();
+            let hh = hash_hex.clone();
+            let (was_new, bytes) = tokio::task::spawn_blocking(move || {
+                let was_new = pool.insert_verified_bytes(&hh, &bytes)?;
+                Ok::<_, ChunkPoolError>((was_new, bytes))
+            })
+            .await
+            .map_err(|e| UploaderError::Io(std::io::Error::other(format!("refetch task join: {e}"))))??;
             if was_new {
                 self.pool_budget
                     .force_reserve(storage_bytes, self.manifest.pool_namespace().as_deref());
@@ -1711,6 +1760,58 @@ mod tests {
         assert!(writer.pool().exists(&outcome.hash_hex));
         let object_key = writer.pool().object_key(&outcome.hash_hex);
         assert!(backend.chunk_exists(&object_key).await.unwrap());
+    }
+
+    /// Issue #113: an upload outcome for a chunk the page no longer
+    /// references (a re-write superseded it between enqueue and
+    /// completion) must NOT flip the page to Uploaded or clear its
+    /// pending marker. Otherwise the newer, still-local chunk is
+    /// reported durable (fooling SYNCHRONIZE CACHE) and becomes eligible
+    /// for eviction before its own PUT lands.
+    #[tokio::test]
+    async fn superseded_upload_outcome_is_ignored() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend.clone()).unwrap();
+
+        // Seal chunk A at page 0, then re-write page 0 with chunk B so
+        // pages.idx[0] references B.
+        let a = writer.write_page(0, &page_bytes(0xAA)).await.unwrap();
+        let b = writer.write_page(0, &page_bytes(0xBB)).await.unwrap();
+        assert_ne!(a.hash_hex, b.hash_hex);
+
+        // Pretend the page is mid-upload again (LocalOnly), then a STALE
+        // Task_A completion for chunk A lands.
+        writer.upload_index().set(0, UploadState::LocalOnly).unwrap();
+        let stale = UploadOutcome {
+            item_id: 0,
+            hash: a.hash_hex.clone(),
+            object_key: writer.pool().object_key(&a.hash_hex),
+            dedup_hit: false,
+            put_compression: None,
+            put_bytes: Some(1),
+        };
+        writer.apply_page_upload_outcome(&stale).await.unwrap();
+        assert_eq!(
+            writer.upload_index().read(0).unwrap(),
+            UploadState::LocalOnly,
+            "a superseded outcome must not mark the page Uploaded"
+        );
+
+        // The current chunk's outcome DOES flip it.
+        let current = UploadOutcome {
+            item_id: 0,
+            hash: b.hash_hex.clone(),
+            object_key: writer.pool().object_key(&b.hash_hex),
+            dedup_hit: false,
+            put_compression: None,
+            put_bytes: Some(1),
+        };
+        writer.apply_page_upload_outcome(&current).await.unwrap();
+        assert_eq!(
+            writer.upload_index().read(0).unwrap(),
+            UploadState::Uploaded,
+            "the current chunk's outcome marks the page Uploaded"
+        );
     }
 
     /// Read-miss budget accounting (#49): a cache-miss refetch must
