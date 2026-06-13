@@ -270,6 +270,21 @@ impl ChunkPool {
             .join(format!("{hash_hex}.dat"))
     }
 
+    /// Best-effort modification time of the pool file for `hash_hex`, in
+    /// unix seconds. `None` if the file is absent or its mtime can't be
+    /// read. Used by GC's recent-seal grace window: a chunk sealed during
+    /// the sweep (after the live-set snapshot) has a fresh mtime, so GC
+    /// can skip it instead of deleting a still-referenced chunk whose
+    /// reference it hasn't observed yet (issue #141).
+    pub fn chunk_mtime_secs(&self, hash_hex: &str) -> Option<u64> {
+        let meta = fs::metadata(self.store_path(hash_hex)).ok()?;
+        meta.modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
     /// Storage key for a chunk in this pool — honours the pool's own
     /// namespace (under `Local` dedup the namespace segment is
     /// preserved so sibling-volume chunks don't collide in a shared

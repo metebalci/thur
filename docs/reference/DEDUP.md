@@ -460,6 +460,17 @@ without touching anything; `--storage` extends the sweep to the storage
 backend's `chunks/` objects. The verb mirrors VTL's `thurvtl system gc` —
 daemon-routed, runs alongside live traffic, audited as `gc.run`.
 
+Because GC runs concurrently with host writes, it never deletes a chunk
+(or its storage object) whose pool file was sealed within a **recent-seal
+grace window** (1 hour). A chunk sealed after GC snapshotted the live set
+would otherwise look like an orphan even though an in-flight write
+references it; deleting it would lose host-acked data before its upload
+completes. A genuine orphan simply ages past the window and is reclaimed
+on the next run. A read error while building the live set disables
+deletion for the affected `(backend, namespace)` pool that run, and an
+unreadable volume manifest aborts the whole GC rather than risk deleting a
+healthy volume's chunks.
+
 ## Snapshots + clones
 
 Snapshots and clones (issue #13) share chunks rather than copying them,

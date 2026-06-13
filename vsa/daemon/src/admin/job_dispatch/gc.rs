@@ -55,6 +55,20 @@ type LiveSet = HashMap<(String, Option<String>), HashSet<String>>;
 /// to protect.
 type PoisonSet = HashSet<(String, Option<String>)>;
 
+/// Recent-seal grace window for GC (issue #141): never delete a pool
+/// chunk (or its storage object) sealed within this many seconds, since
+/// it may be referenced by an in-flight write that landed after the
+/// live-set snapshot. Generous so a chunk sealed during the whole GC
+/// pass is protected; a genuine orphan is reclaimed on a later run.
+const GC_RECENT_SEAL_GRACE_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: AdminState) {
     let params: GcParams = match serde_json::from_value(body) {
         Ok(p) => p,
@@ -447,6 +461,7 @@ fn sweep_one_pool(
     let mut bytes_freed = 0u64;
     let ns_label = namespace.unwrap_or("(shared)");
 
+    let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
     for (hash, size) in chunks {
         if live.contains(&hash) {
             continue;
@@ -454,6 +469,22 @@ fn sweep_one_pool(
         if pool.is_pinned(&hash) {
             lines.push(format!(
                 "  skipped orphan chunk {}.. ({} bytes, {}) - pinned by outstanding ROD token",
+                &hash[..hash.len().min(8)],
+                size,
+                ns_label,
+            ));
+            continue;
+        }
+        // Recent-seal grace window (issue #141): a chunk sealed after the
+        // phase-1 live-set snapshot looks like an orphan but is referenced
+        // by an in-flight WRITE GC hasn't observed; deleting it loses
+        // host-acked data before its upload completes. A genuine orphan
+        // ages past the window and is reclaimed on a later run.
+        if let Some(mtime) = pool.chunk_mtime_secs(&hash)
+            && mtime >= recent_cutoff
+        {
+            lines.push(format!(
+                "  skipped recent chunk {}.. ({} bytes, {}) - sealed within grace window",
                 &hash[..hash.len().min(8)],
                 size,
                 ns_label,
@@ -537,6 +568,7 @@ async fn run_storage_gc(
     let keys = backend.list_objects("chunks/").await?;
     let mut orphans = 0usize;
     let mut total = 0usize;
+    let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
 
     let empty: HashSet<String> = HashSet::new();
     let live_for_backend: HashMap<Option<&str>, &HashSet<String>> = live
@@ -563,8 +595,31 @@ async fn run_storage_gc(
         if live_set.contains(&parsed.hash) {
             continue;
         }
-        orphans += 1;
         let ns_label = parsed.namespace.as_deref().unwrap_or("(shared)");
+        // Recent-seal grace (issue #141): a chunk uploaded after the
+        // live-set snapshot looks orphaned but is referenced by a write
+        // GC hasn't observed. Its local pool file was sealed just as
+        // recently, so skip the storage delete when the local file is
+        // present and within the grace window — protecting the DR copy.
+        let local_pool = match parsed.namespace.as_deref() {
+            Some(ns) => ChunkPool::new_namespaced(&state.data_dir, backend_name, ns),
+            None => ChunkPool::new(&state.data_dir, backend_name),
+        };
+        if let Ok(pool) = local_pool
+            && let Some(mtime) = pool.chunk_mtime_secs(&parsed.hash)
+            && mtime >= recent_cutoff
+        {
+            emitter
+                .info(format!(
+                    "  skipped recent storage object {} (hash {}.., {}) - sealed within grace window",
+                    key,
+                    &parsed.hash[..parsed.hash.len().min(8)],
+                    ns_label,
+                ))
+                .await;
+            continue;
+        }
+        orphans += 1;
         if dry_run {
             emitter
                 .info(format!(
@@ -671,6 +726,30 @@ mod tests {
         .unwrap()
     }
 
+    /// Age every pool chunk file under `data_dir/chunks` past the GC
+    /// recent-seal grace window so the deletion-path tests aren't masked
+    /// by it (issue #141 grace skips freshly-sealed chunks). Production
+    /// keeps the grace; this only backdates mtimes for the test.
+    fn backdate_chunks(data_dir: &Path) {
+        fn walk(dir: &Path) {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p);
+                    } else if p.extension().is_some_and(|x| x == "dat")
+                        && let Ok(f) = fs::OpenOptions::new().write(true).open(&p)
+                    {
+                        let old =
+                            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+                        let _ = f.set_modified(old);
+                    }
+                }
+            }
+        }
+        walk(&data_dir.join("chunks"));
+    }
+
     /// Seal two chunks under a Local volume's namespace but map only
     /// one into `pages.idx` (overwrite page 0 to orphan the first).
     /// A non-dry-run sweep removes the orphan and keeps the live
@@ -709,6 +788,7 @@ mod tests {
                 "only the chunk still mapped into pages.idx is live"
             );
 
+            backdate_chunks(data_dir);
             let (_lines, freed) =
                 run_local_gc(data_dir, "primary", &live, &poisoned, dry_run, None).unwrap();
 
@@ -760,6 +840,7 @@ mod tests {
             assert_eq!(budget.current_bytes(), 4096 + 2048);
 
             let (live, poisoned) = collect_live_hashes(data_dir).unwrap();
+            backdate_chunks(data_dir);
             run_local_gc(data_dir, "primary", &live, &poisoned, dry_run, Some(&budget)).unwrap();
 
             if dry_run {
@@ -776,6 +857,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #141: a chunk sealed within the grace window (i.e. possibly
+    /// referenced by an in-flight write not yet in the live set) must NOT
+    /// be deleted even though it's absent from the live set.
+    #[test]
+    fn recent_orphan_chunk_survives_grace_window() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let manifest = make_volume(data_dir, "vol-a", "primary");
+        let ns = manifest.pool_namespace().unwrap();
+        let pool = ChunkPool::new_namespaced(data_dir, "primary", &ns).unwrap();
+        // A just-sealed chunk referenced by nothing in the (empty) live
+        // set — but its mtime is now, inside the grace window.
+        let (hash, _) = pool.insert_bytes(&[0x44; 4096]).unwrap();
+
+        let live = LiveSet::new();
+        let (_lines, freed) =
+            run_local_gc(data_dir, "primary", &live, &PoisonSet::new(), false, None).unwrap();
+        assert_eq!(freed, 0, "recently-sealed chunk must not be reclaimed");
+        assert!(
+            pool.exists(&hash),
+            "recently-sealed chunk survives the grace window"
+        );
     }
 
     /// A poisoned `(backend, namespace)` bucket must not be swept even
@@ -886,6 +991,7 @@ mod tests {
         // true orphan and gets reclaimed; the parent's chunk stays.
         fs::remove_dir_all(SnapshotManifest::dir_for(data_dir, "vol-a", "snap1")).unwrap();
         let (live, poisoned) = collect_live_hashes(data_dir).unwrap();
+        backdate_chunks(data_dir);
         let (_lines, freed) =
             run_local_gc(data_dir, "primary", &live, &poisoned, false, None).unwrap();
         assert_eq!(freed, 4096, "the orphaned old chunk is reclaimed");
