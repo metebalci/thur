@@ -10,7 +10,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
-use core_mediachanger::{Cartridge, CartridgeEncryptionAlgorithm, CartridgeEncryptionMeta};
+use core_mediachanger::{
+    Cartridge, CartridgeEncryptionAlgorithm, CartridgeEncryptionMeta, check_daemon_not_running,
+};
 use shared_keystore::KeystoreYamlConfig;
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
@@ -32,6 +34,13 @@ pub async fn cmd_key_migrate(
     to: &str,
     purge_local: bool,
 ) -> Result<()> {
+    // Refuse while the daemon is up: thurvtld caches plaintext DEKs at
+    // boot and periodically re-uploads its in-memory manifest to the DR
+    // sentinel, so an out-of-band manifest rewrite here would race that
+    // cache and could leave the DR copy pointing at a purged wrap target
+    // — unrecoverable encrypted data (issue #143). Mirrors the sibling
+    // daemon-down `library` verbs.
+    check_daemon_not_running(data_dir)?;
     let tapes_root = data_dir.join("tapes");
     let (uuid, current_meta) =
         Cartridge::read_manifest_identity(&tapes_root, barcode).map_err(|e| {

@@ -1475,6 +1475,21 @@ mod tests {
         ];
         library.set_partitions(parts.clone()).unwrap();
 
+        // The on-disk schema must stay v2 (declared/minted split): the
+        // daemon's open_or_materialize hard-refuses a v1 flat file, so a
+        // flat rewrite would brick the daemon (issue #121).
+        let raw = std::fs::read_to_string(lib_root.join("library.json")).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            disk.get("version").and_then(|x| x.as_u64()),
+            Some(2),
+            "set_partitions must persist the v2 schema"
+        );
+        assert!(
+            disk.get("minted").is_some(),
+            "v2 minted stanza must be preserved"
+        );
+
         // Reopen and verify persistence.
         let reloaded = Library::open(&lib_root, &tapes_root).unwrap();
         assert_eq!(reloaded.partitions().len(), 2);

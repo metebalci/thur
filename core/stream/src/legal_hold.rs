@@ -52,22 +52,12 @@ use std::sync::Arc;
 #[derive(Debug, Deserialize)]
 struct ManifestSlice {
     label: String,
-    #[serde(default)]
-    chunks: Vec<ManifestChunkSlice>,
     /// Sticky dedup scope (see `Cartridge`/`Manifest`). Under `Local`
     /// the chunk + manifest storage keys are namespaced under the
     /// cartridge barcode — so legal-hold key enumeration must match.
+    /// Sealed chunk hashes come from `chunks.idx`, not the manifest.
     #[serde(default)]
     dedup: crate::cartridge::DedupScope,
-}
-
-#[derive(Debug, Deserialize)]
-struct ManifestChunkSlice {
-    /// `Some(hex)` once the chunk has been sealed into the pool. `None`
-    /// means the chunk is still in `.staging/` and was never uploaded —
-    /// nothing to hold storage-side.
-    #[serde(default)]
-    hash: Option<String>,
 }
 
 /// Result of one provider call (set or get) for a single key.
@@ -124,7 +114,8 @@ pub async fn collect_cartridge_keys(
 ) -> Result<CartridgeKeys> {
     use crate::chunk_store::ChunkStore;
 
-    let manifest_path = tapes_dir.join(&barcode).join("manifest.json");
+    let cart_root = tapes_dir.join(&barcode);
+    let manifest_path = cart_root.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path).map_err(SmcError::Io)?;
     let m: ManifestSlice = serde_json::from_str(&raw).map_err(SmcError::SerdeJson)?;
     if m.label != barcode {
@@ -132,15 +123,20 @@ pub async fn collect_cartridge_keys(
     }
 
     let cartridge_namespace: Option<&str> = m.dedup.namespace(&m.label);
-    let mut others: Vec<String> = m
-        .chunks
-        .iter()
-        .filter_map(|c| {
-            c.hash
-                .as_ref()
-                .map(|h| ChunkStore::object_key_for(cartridge_namespace, h))
-        })
-        .collect();
+    // Enumerate sealed chunk hashes from `chunks.idx`, NOT the manifest:
+    // per-chunk records moved out of manifest.json into the chunk index,
+    // so the manifest carries no chunk hashes. Reading them from the
+    // (absent) manifest field left every tape DATA object unprotected by
+    // legal hold (issue #119). Mirrors `cartridge_migrate`'s walk.
+    let chunk_idx = crate::chunk_index::ChunkIndexFile::open_or_create(&cart_root)?;
+    let mut others: Vec<String> = Vec::new();
+    for entry in chunk_idx.iter() {
+        let (_id, rec) = entry?;
+        if let Some(hash) = rec.hash {
+            others.push(ChunkStore::object_key_for(cartridge_namespace, &hash));
+        }
+    }
+    drop(chunk_idx);
 
     // Manifest backups: list the cartridge's manifests/<label>/ prefix
     // on the bound backend. This covers `manifest-latest.json` plus
@@ -454,9 +450,20 @@ mod tests {
         let hash = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         std::fs::write(
             cart_dir.join("manifest.json"),
-            format!(r#"{{"label":"TAPE01","chunks":[{{"hash":"{hash}"}}]}}"#),
+            r#"{"label":"TAPE01"}"#,
         )
         .expect("write manifest");
+        // Sealed chunk lives in chunks.idx, not the manifest (issue #119).
+        let idx = crate::chunk_index::ChunkIndexFile::open_or_create(&cart_dir).expect("chunk idx");
+        idx.append(&crate::chunk_index::ChunkRec {
+            size: 4096,
+            hash: Some(hash.to_string()),
+            location: crate::chunk_index::LocationTag::LocalOnly,
+            uploaded: true,
+            compression: None,
+        })
+        .expect("append sealed chunk");
+        drop(idx);
 
         let sentinel = manifest_latest_sentinel_key("TAPE01");
         let versioned = "manifests/TAPE01/manifest-20260101T000000Z.json".to_string();

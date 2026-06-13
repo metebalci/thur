@@ -704,6 +704,22 @@ fn persist_v2(
     Ok(())
 }
 
+/// Persist ONLY `library.json` in the on-disk v2 schema from the current
+/// in-memory topology (which `Library::open` populated with the minted
+/// `chassis_serial` + element bases via `topology_from_disk`). Used by
+/// daemon-down partition mutations so they don't rewrite the file in the
+/// in-memory v1 flat shape — which the daemon's `open_or_materialize`
+/// then hard-refuses at next start, bricking it (issue #121).
+pub(super) fn persist_library_topology_v2(
+    lib_root: &Path,
+    topology: &LibraryTopology,
+) -> Result<()> {
+    let disk = disk_from_topology(topology);
+    let lib_path = lib_root.join("library.json");
+    Library::write_locked_pub(&lib_path, &serde_json::to_string_pretty(&disk)?)?;
+    Ok(())
+}
+
 // ---------- Library-side bridge methods ----------
 //
 // Reconcile is a child module of `library`, but we keep the

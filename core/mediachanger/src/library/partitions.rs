@@ -85,8 +85,13 @@ impl Library {
         )?;
         self.topology.partitions = partitions;
 
-        let lib_path = self.root.join("library.json");
-        Self::write_locked(&lib_path, &serde_json::to_string_pretty(&self.topology)?)?;
+        // Persist through the v2 writer, NOT a flat dump of the in-memory
+        // topology: the daemon materializes library.json in the v2
+        // declared/minted schema and refuses to start against a v1 flat
+        // file, so a flat rewrite here would brick the daemon (issue
+        // #121). `disk_from_topology` re-emits the minted stanza the
+        // in-memory topology carries.
+        super::reconcile::persist_library_topology_v2(&self.root, &self.topology)?;
         Ok(())
     }
 }

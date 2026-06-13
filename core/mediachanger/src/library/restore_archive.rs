@@ -162,8 +162,23 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         .await
         .map_err(storage_err)?;
     let dedup_local = manifest_is_local_dedup(&original_manifest)?;
+    // A rename mints a fresh manifest UUID. For an encrypted cartridge
+    // that is fatal: the keystore unwrap binds the manifest UUID as AAD
+    // and every per-chunk IV derives from it, so a new UUID makes both
+    // the DEK unwrap and AES-GCM tag verification fail on every chunk —
+    // restore-archive would report success but produce an unreadable
+    // cartridge (issue #122). Refuse the rename; restore under the
+    // original barcode preserves the UUID and stays decryptable.
+    let is_rename = opts.as_barcode.is_some_and(|b| b != opts.barcode);
+    if is_rename && manifest_is_encrypted(&original_manifest)? {
+        return Err(SmcError::InvalidOp(
+            "cannot rename an encrypted cartridge on restore-archive: the manifest UUID binds the \
+             keystore wrap context and per-chunk IVs, so a fresh UUID would make every chunk \
+             undecryptable. Restore under the original barcode (omit --as-barcode).",
+        ));
+    }
     let rewritten_manifest =
-        rewrite_manifest_for_local(&original_manifest, local_barcode, opts.backend_name)?;
+        rewrite_manifest_for_local(&original_manifest, local_barcode, opts.backend_name, is_rename)?;
     // Runtime fields the restored cartridge can't inherit: the
     // index-backup epoch (gets repopulated on the next manifest
     // backup pass) and the pending partition layout (a stale stage
@@ -347,6 +362,7 @@ fn rewrite_manifest_for_local(
     archive_manifest: &str,
     new_label: &str,
     new_backend: &str,
+    mint_new_uuid: bool,
 ) -> Result<String> {
     let mut v: serde_json::Value = serde_json::from_str(archive_manifest)?;
     let obj = v.as_object_mut().ok_or(SmcError::InvalidOp(
@@ -360,14 +376,26 @@ fn rewrite_manifest_for_local(
         "backend".to_string(),
         serde_json::Value::String(new_backend.to_string()),
     );
-    // Fresh UUID, hex-encoded (the cartridge layer's uuid_serde
-    // expects either 32-hex string or 16-byte array; the JSON form
-    // the manifest serializes is a 32-hex string).
-    obj.insert(
-        "uuid".to_string(),
-        serde_json::Value::String(generate_uuid_hex()),
-    );
+    // Mint a fresh UUID only on a true rename. Restoring under the
+    // original barcode preserves the UUID so the keystore wrap context
+    // and per-chunk IVs still resolve — minting unconditionally broke
+    // every encrypted restore (issue #122). The encrypted-rename case is
+    // refused by the caller before reaching here. Hex-encoded (the
+    // cartridge layer's uuid_serde accepts a 32-hex string).
+    if mint_new_uuid {
+        obj.insert(
+            "uuid".to_string(),
+            serde_json::Value::String(generate_uuid_hex()),
+        );
+    }
     Ok(serde_json::to_string(&v)?)
+}
+
+/// True iff the archive manifest carries a non-null `encryption` stanza
+/// (appliance-side at-rest encryption was on for this cartridge).
+fn manifest_is_encrypted(manifest_json: &str) -> Result<bool> {
+    let v: serde_json::Value = serde_json::from_str(manifest_json)?;
+    Ok(v.get("encryption").is_some_and(|e| !e.is_null()))
 }
 
 /// Strip runtime fields the restored cartridge can't inherit:
@@ -424,4 +452,50 @@ fn open_local_pool(
         ChunkStore::new(&parent, backend)?
     };
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_preserves_uuid_when_not_renaming() {
+        // Issue #122: restoring under the original barcode must keep the
+        // manifest UUID so an encrypted cartridge stays decryptable.
+        let original = r#"{"label":"OLD","backend":"old","uuid":"00112233445566778899aabbccddeeff"}"#;
+        let out = rewrite_manifest_for_local(original, "OLD", "primary", false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.get("uuid").and_then(|u| u.as_str()),
+            Some("00112233445566778899aabbccddeeff"),
+            "UUID must be preserved when not renaming"
+        );
+        assert_eq!(v.get("label").and_then(|l| l.as_str()), Some("OLD"));
+        assert_eq!(v.get("backend").and_then(|b| b.as_str()), Some("primary"));
+    }
+
+    #[test]
+    fn rewrite_mints_fresh_uuid_on_rename() {
+        let original = r#"{"label":"OLD","backend":"old","uuid":"00112233445566778899aabbccddeeff"}"#;
+        let out = rewrite_manifest_for_local(original, "NEW", "primary", true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let uuid = v.get("uuid").and_then(|u| u.as_str()).unwrap();
+        assert_ne!(
+            uuid, "00112233445566778899aabbccddeeff",
+            "rename must mint a fresh UUID"
+        );
+        assert_eq!(uuid.len(), 32);
+    }
+
+    #[test]
+    fn manifest_is_encrypted_detects_stanza() {
+        assert!(!manifest_is_encrypted(r#"{"label":"X"}"#).unwrap());
+        assert!(!manifest_is_encrypted(r#"{"label":"X","encryption":null}"#).unwrap());
+        assert!(
+            manifest_is_encrypted(
+                r#"{"label":"X","encryption":{"algorithm":"aes-256-gcm","wrapped_dek":"zz"}}"#
+            )
+            .unwrap()
+        );
+    }
 }

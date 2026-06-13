@@ -185,6 +185,15 @@ async fn main() -> Result<()> {
 
     if cli.is_daemon_down() {
         Cli::print_header(&config_path, &data_dir);
+        // Daemon-down writes ride under sudo; drop privs to the daemon's
+        // system user up front so every file the verb creates is owned
+        // correctly. Previously only `library restore` dropped, so
+        // `cartridge key migrate`, `system regenerate-cert`, and
+        // `library partition *` under sudo left root-owned keys / TLS
+        // certs / audit-pending dirs that broke the daemon at next start
+        // (issue #144). Daemon-routed commands keep root's peer-cred so
+        // the daemon can authorize them.
+        shared_cli::privdrop::drop_to_user_if_root(&target_user)?;
     } else {
         Cli::print_runtime_header();
     }
@@ -380,7 +389,8 @@ async fn main() -> Result<()> {
                 dry_run,
                 allow_existing,
             } => {
-                shared_cli::privdrop::drop_to_user_if_root(&target_user)?;
+                // privdrop already happened up front for all daemon-down
+                // verbs (see main()'s is_daemon_down block, issue #144).
                 let exit_code = commands::library::cmd_restore(
                     &data_dir,
                     &config_path,
