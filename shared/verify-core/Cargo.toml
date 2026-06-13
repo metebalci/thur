@@ -22,3 +22,4 @@ shared-pool = { path = "../pool" }
 shared-object-store = { path = "../object-store" }
 
 futures = "0.3"
+hex = "0.4"

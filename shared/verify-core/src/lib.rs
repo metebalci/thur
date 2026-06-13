@@ -267,7 +267,14 @@ pub async fn sweep_storage(
         .collect();
 
     let mut per_entity: Vec<EntityStorageResult> = Vec::new();
-    let mut expected: HashSet<String> = HashSet::new();
+    // Expected chunks, keyed per-namespace by the raw 32-byte digest
+    // rather than the full ~79-char object-key String. At the pool's
+    // documented ~60 M-chunk scale a HashSet<String> of keys is ~7 GB;
+    // the per-namespace [u8;32] form is ~4x smaller and keeps namespace
+    // precision (issue #167). The listing below is still the backend's
+    // full Vec<String> — paged/streaming listing is a trait-wide change
+    // tracked separately.
+    let mut expected: HashMap<Option<String>, HashSet<[u8; 32]>> = HashMap::new();
 
     for ent in &entities {
         let jobs: Vec<(String, String)> = ent
@@ -280,8 +287,11 @@ pub async fn sweep_storage(
                 )
             })
             .collect();
-        for (key, _) in &jobs {
-            expected.insert(key.clone());
+        let ns_set = expected.entry(ent.namespace.clone()).or_default();
+        for (_, hash) in &jobs {
+            if let Some(d) = hex_to_digest(hash) {
+                ns_set.insert(d);
+            }
         }
 
         let results: Vec<_> =
@@ -323,7 +333,18 @@ pub async fn sweep_storage(
         Ok(keys) => {
             for key in keys {
                 sweep.chunk_objects += 1;
-                if !expected.contains(&key) {
+                // Parse `chunks/[ns/]<s1>/<s2>/<hash>.dat` into
+                // (namespace, digest) and check the matching namespace's
+                // expected set. An unparseable key (or one whose hash
+                // isn't expected) is an orphan — same as the old
+                // full-key membership test.
+                let is_expected = match parse_chunk_key(&key) {
+                    Some((ns, digest)) => expected
+                        .get(&ns)
+                        .is_some_and(|set| set.contains(&digest)),
+                    None => false,
+                };
+                if !is_expected {
                     sweep.chunk_orphans += 1;
                 }
             }
@@ -331,4 +352,61 @@ pub async fn sweep_storage(
         Err(e) => sweep.list_error = Some(e.to_string()),
     }
     sweep
+}
+
+/// Decode a 64-char BLAKE3 hex string into the raw 32-byte digest.
+fn hex_to_digest(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out).ok()?;
+    Some(out)
+}
+
+/// Parse a pool object key `chunks/[<ns>/]<s1>/<s2>/<hash>.dat` into its
+/// `(namespace, digest)`. Returns `None` if the key doesn't match the
+/// expected shape (treated as an orphan by the caller).
+fn parse_chunk_key(key: &str) -> Option<(Option<String>, [u8; 32])> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let (ns, file) = match parts.as_slice() {
+        ["chunks", s1, s2, file] if s1.len() == 2 && s2.len() == 2 => (None, *file),
+        ["chunks", ns, s1, s2, file] if s1.len() == 2 && s2.len() == 2 => {
+            (Some((*ns).to_string()), *file)
+        }
+        _ => return None,
+    };
+    let hash = file.strip_suffix(".dat")?;
+    let digest = hex_to_digest(hash)?;
+    Some((ns, digest))
+}
+
+#[cfg(test)]
+mod parse_key_tests {
+    //! Issue #167: the storage orphan sweep parses each listed key into
+    //! (namespace, digest) and checks the matching namespace's expected
+    //! [u8;32] set instead of comparing full ~79-char key Strings.
+    use super::{ChunkPool, hex_to_digest, parse_chunk_key};
+
+    #[test]
+    fn parse_roundtrips_object_key_for() {
+        let hash = "ab".repeat(32); // 64 hex chars
+        let digest = hex_to_digest(&hash).unwrap();
+
+        // No namespace.
+        let key = ChunkPool::object_key_for(None, &hash);
+        assert_eq!(parse_chunk_key(&key), Some((None, digest)));
+
+        // With namespace.
+        let key = ChunkPool::object_key_for(Some("vol-42"), &hash);
+        assert_eq!(
+            parse_chunk_key(&key),
+            Some((Some("vol-42".to_string()), digest))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_malformed_keys() {
+        assert!(parse_chunk_key("chunks/ab/cd/nothex.dat").is_none());
+        assert!(parse_chunk_key("chunks/ab/cd/deadbeef").is_none()); // no .dat
+        assert!(parse_chunk_key("other/ab/cd/x.dat").is_none()); // wrong root
+        assert!(parse_chunk_key("chunks/toolong/cd/x.dat").is_none()); // shard not 2 chars
+    }
 }

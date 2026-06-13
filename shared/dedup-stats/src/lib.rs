@@ -18,7 +18,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// One scanned entity — a VTL cartridge or a VSA volume — reduced to
 /// the inputs the dedup math needs.
@@ -74,8 +74,14 @@ pub struct BackendDedup {
 /// `BackendDedup`s come back sorted by backend name.
 pub fn compute_dedup(scans: &[EntityScan]) -> (Vec<EntityContribution>, Vec<BackendDedup>) {
     type BucketKey = (String, Option<String>);
-    // hash -> (max observed size, set of owning entity labels)
-    type Bucket = HashMap<String, (u64, HashSet<String>)>;
+    // hash -> (max observed size, owner count). Only the owner COUNT is
+    // ever read (`owners == 1` => exclusive), and each EntityScan's
+    // `chunks` is a HashMap so an entity contributes a given hash at most
+    // once — a plain counter is an exact replacement for the previous
+    // `HashSet<String>` of labels, which cost ~250+ B/chunk (≈15 GB of
+    // `system stats` job RAM at the ~60 M-chunk documented scale) for a
+    // value never inspected (issue #168).
+    type Bucket = HashMap<String, (u64, u32)>;
 
     let mut buckets: HashMap<BucketKey, Bucket> = HashMap::new();
     for scan in scans {
@@ -83,9 +89,9 @@ pub fn compute_dedup(scans: &[EntityScan]) -> (Vec<EntityContribution>, Vec<Back
             .entry((scan.backend.clone(), scan.namespace.clone()))
             .or_default();
         for (h, &sz) in &scan.chunks {
-            let entry = bucket.entry(h.clone()).or_insert((sz, HashSet::new()));
+            let entry = bucket.entry(h.clone()).or_insert((sz, 0));
             entry.0 = entry.0.max(sz);
-            entry.1.insert(scan.label.clone());
+            entry.1 += 1;
         }
     }
 
@@ -99,7 +105,7 @@ pub fn compute_dedup(scans: &[EntityScan]) -> (Vec<EntityContribution>, Vec<Back
             let mut exclusive = 0u64;
             for (h, &sz) in &scan.chunks {
                 unique = unique.saturating_add(sz);
-                let owners = bucket.get(h).map(|(_, set)| set.len()).unwrap_or(1);
+                let owners = bucket.get(h).map(|(_, count)| *count).unwrap_or(1);
                 if owners == 1 {
                     exclusive = exclusive.saturating_add(sz);
                 }

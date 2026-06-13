@@ -370,7 +370,17 @@ impl ChunkPool {
             f.sync_all()?;
         }
         match fs::rename(&tmp, &dst) {
-            Ok(()) => Ok((hash_hex, true)),
+            Ok(()) => {
+                // fsync the shard directory so the rename's directory
+                // entry is durable: the tempfile data is fsynced above,
+                // but without this a power loss can revert the rename
+                // and leave no chunk file — while the index files that
+                // reference this hash ARE fsynced at seal time, so the
+                // recovered index would point at a vanished chunk
+                // (issue #166). One fsync per sealed chunk, not per IO.
+                sync_pool_dir(&dst);
+                Ok((hash_hex, true))
+            }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e.into())
@@ -433,7 +443,12 @@ impl ChunkPool {
             f.sync_all()?;
         }
         match fs::rename(&tmp, &dst) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Durably link the new chunk into its shard directory
+                // before returning (issue #166) — see `insert_bytes`.
+                sync_pool_dir(&dst);
+                Ok(true)
+            }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e.into())
