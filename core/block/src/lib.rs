@@ -13,6 +13,7 @@
 //! unchanged.
 
 pub mod cache;
+pub mod caw_locks;
 pub mod chunk_pool;
 pub mod disk_cache;
 pub mod lru_index;
@@ -25,6 +26,7 @@ pub mod verify;
 pub mod volume;
 
 pub use cache::{DEFAULT_CACHE_BUDGET_BYTES, PageCache, RangeError, rebind_is_sound};
+pub use caw_locks::CawLocks;
 pub use chunk_pool::{ChunkPool, ChunkPoolError};
 // `DiskCacheSize` / `DiskCacheBounds` live in `shared-pool` so the
 // YAML default and the per-entry `storage.backends:` override can't

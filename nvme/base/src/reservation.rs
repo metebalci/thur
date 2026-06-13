@@ -43,8 +43,13 @@ pub const CPTPL_NO_CHANGE: u8 = 0b00;
 pub const CPTPL_CLEAR: u8 = 0b10;
 pub const CPTPL_PERSIST: u8 = 0b11;
 
-/// Reservation Status Data Structure header length (both forms).
+/// Reservation Status Data Structure header length, short form (EDS=0):
+/// bytes 0..23, registered-controller entries start at byte 24.
 pub const STATUS_HEADER_LEN: usize = 24;
+/// Reservation Status Data Structure header length, extended form
+/// (EDS=1): NVMe Base 1.4 §6.13 reserves bytes 24..63, so extended
+/// entries start at byte 64 (issue #129).
+pub const STATUS_HEADER_EXT_LEN: usize = 64;
 /// Registered Controller Data Structure length (EDS = 0).
 pub const REG_CTLR_LEN: usize = 24;
 /// Registered Controller Extended Data Structure length (EDS = 1).
@@ -171,26 +176,37 @@ pub fn reservation_status(
     ptpls: bool,
 ) -> Vec<u8> {
     let entry_len = if eds { REG_CTLR_EXT_LEN } else { REG_CTLR_LEN };
-    let mut out = vec![0u8; STATUS_HEADER_LEN + entries.len() * entry_len];
+    let header_len = if eds {
+        STATUS_HEADER_EXT_LEN
+    } else {
+        STATUS_HEADER_LEN
+    };
+    let mut out = vec![0u8; header_len + entries.len() * entry_len];
     out[0..4].copy_from_slice(&generation.to_le_bytes());
     out[4] = rtype_nvme;
     out[5..7].copy_from_slice(&(entries.len() as u16).to_le_bytes()); // REGCTL
     // bytes 7..9 reserved; byte 9 PTPLS = current Persist Through Power
-    // Loss State for the namespace (issue #57); bytes 10..24 reserved.
+    // Loss State for the namespace (issue #57); the rest of the header
+    // (bytes 10..24 short, 10..64 extended) is reserved.
     out[9] = u8::from(ptpls);
     for (i, e) in entries.iter().enumerate() {
-        let base = STATUS_HEADER_LEN + i * entry_len;
+        let base = header_len + i * entry_len;
         let entry = &mut out[base..base + entry_len];
+        // Registered Controller (Extended) Data Structure, NVMe Base 1.4
+        // §6.13: CNTLID 0..2, RCSTS at 2, bytes 3..8 reserved. The
+        // earlier layout shifted HOSTID/RKEY 3 bytes left into the
+        // reserved region, so the Linux PR API decoded garbled keys and
+        // host ids (issue #129).
         entry[0..2].copy_from_slice(&e.cntlid.to_le_bytes());
         entry[2] = u8::from(e.holds_reservation); // RCSTS bit 0
         if eds {
-            // Extended: RKEY at 5..13, full 128-bit HOSTID at 13..29.
-            entry[5..13].copy_from_slice(&e.rkey.to_le_bytes());
-            entry[13..29].copy_from_slice(&e.hostid);
+            // Extended: RKEY at 8..16, full 128-bit HOSTID at 16..32.
+            entry[8..16].copy_from_slice(&e.rkey.to_le_bytes());
+            entry[16..32].copy_from_slice(&e.hostid);
         } else {
-            // Short: low 64 bits of HOSTID at 5..13, RKEY at 13..21.
-            entry[5..13].copy_from_slice(&e.hostid[0..8]);
-            entry[13..21].copy_from_slice(&e.rkey.to_le_bytes());
+            // Short: low 64 bits of HOSTID at 8..16, RKEY at 16..24.
+            entry[8..16].copy_from_slice(&e.hostid[0..8]);
+            entry[16..24].copy_from_slice(&e.rkey.to_le_bytes());
         }
     }
     out
@@ -259,12 +275,14 @@ mod tests {
         assert_eq!(buf[4], 1); // RTYPE
         assert_eq!(&buf[5..7], &1u16.to_le_bytes()); // REGCTL
         assert_eq!(buf[9], 0); // PTPLS = 0 (ptpls arg false)
-        // Entry
+        // Entry — spec offsets (NVMe Base 1.4 §6.13): RCSTS at 2, bytes
+        // 3..8 reserved, HOSTID at 8..16, RKEY at 16..24 (issue #129).
         let e = &buf[STATUS_HEADER_LEN..];
         assert_eq!(&e[0..2], &1u16.to_le_bytes()); // CNTLID
         assert_eq!(e[2], 1); // RCSTS holds-reservation
-        assert_eq!(&e[5..13], &hostid[0..8]); // HOSTID low 64
-        assert_eq!(&e[13..21], &0xDEAD_BEEFu64.to_le_bytes()); // RKEY
+        assert_eq!(&e[3..8], &[0u8; 5]); // reserved
+        assert_eq!(&e[8..16], &hostid[0..8]); // HOSTID low 64
+        assert_eq!(&e[16..24], &0xDEAD_BEEFu64.to_le_bytes()); // RKEY
     }
 
     #[test]
@@ -276,15 +294,18 @@ mod tests {
             hostid,
             rkey: 0x1234_5678,
         }];
-        // ptpls=true here: PTPLS (byte 9) must reflect it.
+        // ptpls=true here: PTPLS (byte 9) must reflect it. Extended form
+        // uses the 64-byte header (issue #129).
         let buf = reservation_status(3, 2, &entries, true, true);
-        assert_eq!(buf.len(), STATUS_HEADER_LEN + REG_CTLR_EXT_LEN);
+        assert_eq!(buf.len(), STATUS_HEADER_EXT_LEN + REG_CTLR_EXT_LEN);
         assert_eq!(buf[9], 1); // PTPLS = 1
-        let e = &buf[STATUS_HEADER_LEN..];
+        // Extended entries start at byte 64, not 24.
+        let e = &buf[STATUS_HEADER_EXT_LEN..];
         assert_eq!(&e[0..2], &1u16.to_le_bytes()); // CNTLID
         assert_eq!(e[2], 0); // not holder
-        assert_eq!(&e[5..13], &0x1234_5678u64.to_le_bytes()); // RKEY first
-        assert_eq!(&e[13..29], &hostid); // full 128-bit HOSTID
+        assert_eq!(&e[3..8], &[0u8; 5]); // reserved
+        assert_eq!(&e[8..16], &0x1234_5678u64.to_le_bytes()); // RKEY at 8..16
+        assert_eq!(&e[16..32], &hostid); // full 128-bit HOSTID at 16..32
     }
 
     #[test]
@@ -292,5 +313,11 @@ mod tests {
         let buf = reservation_status(0, 0, &[], false, false);
         assert_eq!(buf.len(), STATUS_HEADER_LEN);
         assert_eq!(&buf[5..7], &0u16.to_le_bytes());
+    }
+
+    #[test]
+    fn status_extended_empty_uses_64_byte_header() {
+        let buf = reservation_status(0, 0, &[], true, false);
+        assert_eq!(buf.len(), STATUS_HEADER_EXT_LEN);
     }
 }

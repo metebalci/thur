@@ -180,6 +180,16 @@ impl SbcScsiDispatcher {
         self
     }
 
+    /// Inject a shared per-LUN CAW lock registry so COMPARE AND WRITE
+    /// over iSCSI serializes against fused Compare+Write over NVMe/TCP on
+    /// the same volume under a dual-transport export (issue #128). The
+    /// daemon hands the *same* `Arc<CawLocks>` to the NVMe dispatcher.
+    /// Without this the dispatcher keeps its own per-instance registry.
+    pub fn with_caw_locks(mut self, caw_locks: Arc<CawLocks>) -> Self {
+        self.caw_locks = caw_locks;
+        self
+    }
+
     #[allow(dead_code)] // surfaced for tests / future admin reservations endpoint
     pub fn reservations(&self) -> &ReservationManager {
         &self.reservations

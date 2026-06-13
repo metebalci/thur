@@ -1168,14 +1168,18 @@ where
                                 IoCommand {
                                     sqe: compare_sqe,
                                     data_out: Some(&compare_data),
-                                    data_in_max: u32::MAX,
+                                    // Cap at MDTS so the dispatcher's
+                                    // transfer-length check rejects an
+                                    // oversized NLB instead of allocating
+                                    // up to 256 MiB (issue #127).
+                                    data_in_max: MAX_TRANSFER_BYTES,
                                     session_volumes: admission_slice,
                                     host_id: Some(host_id),
                                 },
                                 IoCommand {
                                     sqe,
                                     data_out: Some(&write_data),
-                                    data_in_max: u32::MAX,
+                                    data_in_max: MAX_TRANSFER_BYTES,
                                     session_volumes: admission_slice,
                                     host_id: Some(host_id),
                                 },
@@ -1538,7 +1542,11 @@ async fn handle_command(
             .handle_io(IoCommand {
                 sqe,
                 data_out,
-                data_in_max: u32::MAX,
+                // Cap at MDTS so the dispatcher rejects an oversized NLB
+                // read (NLB drives the read length, not the SGL the MDTS
+                // reader-check inspects) instead of allocating up to
+                // 256 MiB from a single small capsule (issue #127).
+                data_in_max: MAX_TRANSFER_BYTES,
                 session_volumes: admission_slice,
                 host_id: Some(host_id),
             })

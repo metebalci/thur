@@ -488,6 +488,11 @@ async fn main() -> Result<()> {
         Arc::new(registry::VolumeUuidResolver::new(Arc::clone(&registry))),
     ));
 
+    // One per-LUN CAW lock registry shared by the SBC and NVMe
+    // dispatchers so COMPARE AND WRITE / fused Compare+Write against the
+    // same volume serialize across a dual-transport export (issue #128).
+    let caw_locks = Arc::new(core_block::CawLocks::new());
+
     // Per-volume write-back flush workers. Each cache wakes on its
     // own dirty notification + a periodic tick; the workers exit
     // when `request_shutdown` is called below. JoinHandles get
@@ -611,7 +616,8 @@ async fn main() -> Result<()> {
                         collapse_isid,
                         Some(Arc::clone(&ua_tracker)),
                     )
-                    .with_admission(Arc::clone(&admission_view)),
+                    .with_admission(Arc::clone(&admission_view))
+                    .with_caw_locks(Arc::clone(&caw_locks)),
                 );
                 // Proactive reservation-change notification (issue #67): a
                 // reservation preempted/released over iSCSI or NVMe raises
@@ -723,7 +729,7 @@ async fn main() -> Result<()> {
                     THURVSA_VERSION_STR.to_string(),
                     Arc::clone(&aer_hub),
                     Arc::clone(&reservations),
-                ));
+                ).with_caw_locks(Arc::clone(&caw_locks)));
                 tracing::info!(
                     "thurvsad: NVMe NVM dispatcher ready ({} NSID(s))",
                     volumes.len()

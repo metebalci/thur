@@ -604,17 +604,19 @@ Release always validate CRKEY (1.2.1 IEKEY model, RESCAP bit 7 = 0).
 Acquire from an unregistered host returns Reservation Conflict.
 
 The Reservation Report returns the **Reservation Status Data
-Structure**: a 24-byte header (GEN u32 LE at 0..4, RTYPE at 4, REGCTL
-u16 LE at 5..7, PTPLS at 9 = the namespace's current Persist Through
-Power Loss state) followed by one registered-controller
-entry per registrant HOSTID. The short form (EDS = 0, 24 bytes each)
-carries CNTLID (0..2), RCSTS bit 0 = holds-reservation (2), the low 64
-bits of HOSTID (5..13), and RKEY (13..21). The extended form
-(EDS = 1, 64 bytes each) carries CNTLID (0..2), RCSTS (2), RKEY
-(5..13), and the full 128-bit HOSTID (13..29). CNTLID is the
-registrant's representative live controller (its lowest assigned
-CNTLID), or `0` if the host has a persisted registration but no live
-controller — the fencing identity is the HOSTID.
+Structure** (byte-exact to NVMe Base 1.4 §6.13). The header carries GEN
+u32 LE at 0..4, RTYPE at 4, REGCTL u16 LE at 5..7, and PTPLS at 9 (the
+namespace's current Persist Through Power Loss state); registered-
+controller entries follow. The short form (EDS = 0) uses a 24-byte
+header (entries at byte 24) with 24-byte entries: CNTLID (0..2), RCSTS
+bit 0 = holds-reservation (2), bytes 3..8 reserved, the low 64 bits of
+HOSTID (8..16), and RKEY (16..24). The extended form (EDS = 1) uses a
+64-byte header (bytes 24..63 reserved, entries at byte 64) with 64-byte
+entries: CNTLID (0..2), RCSTS (2), bytes 3..8 reserved, RKEY (8..16),
+and the full 128-bit HOSTID (16..32). CNTLID is the registrant's
+representative live controller (its lowest assigned CNTLID), or `0` if
+the host has a persisted registration but no live controller — the
+fencing identity is the HOSTID.
 
 Enforcement gate: a non-holder's data-path command returns NVMe status
 **Reservation Conflict** (SCT = Command-Specific, SC = 0x83). The read

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use async_trait::async_trait;
 
 use core_block::uploader::{FaultClass, UploaderError};
-use core_block::{PageCache, RangeError};
+use core_block::{CawLocks, PageCache, RangeError};
 use nvme_base::identify::CNS;
 use nvme_base::{AdminOpcode, Cqe, IdentifyController, IdentifyNamespace, StatusField};
 use scsi_spc::reservations::{RegistrantId, ReservationManager};
@@ -125,6 +125,12 @@ pub struct NvmeNvmDispatcher {
     /// an AER parked on a controller's admin connection. Built once at
     /// boot alongside the dispatcher.
     aer: Arc<ControllerRegistry>,
+    /// Per-LUN COMPARE AND WRITE / fused Compare+Write serialization.
+    /// Defaults to a per-dispatcher registry; the daemon injects the
+    /// *same* `Arc` it gives the SBC dispatcher so a fused CAW over NVMe
+    /// serializes against a COMPARE AND WRITE over iSCSI on the same
+    /// volume (issue #128).
+    caw_locks: Arc<CawLocks>,
 }
 
 impl NvmeNvmDispatcher {
@@ -152,7 +158,17 @@ impl NvmeNvmDispatcher {
             kato_ms: AtomicU32::new(0),
             reservations,
             aer,
+            caw_locks: Arc::new(CawLocks::new()),
         }
+    }
+
+    /// Inject a shared per-LUN CAW lock registry so fused Compare+Write
+    /// over NVMe serializes against COMPARE AND WRITE over iSCSI on the
+    /// same volume under a dual-transport export (issue #128). The daemon
+    /// hands the *same* `Arc<CawLocks>` to the SBC dispatcher.
+    pub fn with_caw_locks(mut self, caw_locks: Arc<CawLocks>) -> Self {
+        self.caw_locks = caw_locks;
+        self
     }
 
     async fn dispatch_io(&self, cmd: IoCommand<'_>) -> NvmeResponse {
@@ -1022,6 +1038,15 @@ impl NvmeCommandHandler for NvmeNvmDispatcher {
                 );
             }
         };
+        // Serialize the read-compare-write window per LUN. The primitive
+        // is NOT internally atomic, so two concurrent fused CAWs (two I/O
+        // queues, or pipelined) could both pass the compare and both
+        // commit — split-brain on the cluster-coordination LBA (issue
+        // #128). The shared registry also serializes against COMPARE AND
+        // WRITE arriving over iSCSI on the same volume.
+        let lun = crate::reservations::nsid_to_lun(compare.sqe.nsid);
+        let caw_lock = self.caw_locks.lock_for(lun);
+        let _caw_guard = caw_lock.lock().await;
         match cache.compare_and_write_bytes(byte_off, expected, new).await {
             Ok(true) => (
                 Cqe::success(compare_cid, 0, 0, 0),
@@ -1535,6 +1560,93 @@ mod tests {
             })
             .await;
         assert_eq!(resp.cqe.status, StatusField::invalid_namespace());
+    }
+
+    /// Issue #128: two concurrent fused Compare+Write commands against
+    /// the same namespace, both expecting the current value, must
+    /// serialize so exactly ONE wins (the loser sees the value the winner
+    /// wrote and its compare fails). Without the per-LUN CAW lock both
+    /// could pass the compare and both commit — split-brain.
+    #[tokio::test]
+    async fn concurrent_fused_caw_yields_exactly_one_winner() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        // Seed LBA 0..16 with a known pattern.
+        let original: Vec<u8> = (0..(64 * 1024)).map(|i| (i & 0xFF) as u8).collect();
+        let mut wsqe = vec![0u8; nvme_base::SQE_SIZE];
+        wsqe[0] = NvmOpcode::Write as u8;
+        wsqe[2] = 0x40;
+        wsqe[4] = 0x01;
+        wsqe[48..52].copy_from_slice(&15u32.to_le_bytes());
+        let wsqe = nvme_base::Sqe::parse(&wsqe).unwrap();
+        disp.handle_io(IoCommand {
+            sqe: wsqe,
+            data_out: Some(&original),
+            data_in_max: 0,
+            session_volumes: None,
+            host_id: None,
+        })
+        .await;
+
+        let new_a = vec![0xAAu8; 64 * 1024];
+        let new_b = vec![0xBBu8; 64 * 1024];
+        let mk = |ccid: u8, wcid: u8| -> (nvme_base::Sqe, nvme_base::Sqe) {
+            let mut c = vec![0u8; nvme_base::SQE_SIZE];
+            c[0] = NvmOpcode::Compare as u8;
+            c[1] = 0b0000_0001; // FUSE = First
+            c[2] = ccid;
+            c[4] = 0x01;
+            c[48..52].copy_from_slice(&15u32.to_le_bytes());
+            let mut w = vec![0u8; nvme_base::SQE_SIZE];
+            w[0] = NvmOpcode::Write as u8;
+            w[1] = 0b0000_0010; // FUSE = Second
+            w[2] = wcid;
+            w[4] = 0x01;
+            w[48..52].copy_from_slice(&15u32.to_le_bytes());
+            (
+                nvme_base::Sqe::parse(&c).unwrap(),
+                nvme_base::Sqe::parse(&w).unwrap(),
+            )
+        };
+        let (c1, w1) = mk(0x11, 0x12);
+        let (c2, w2) = mk(0x21, 0x22);
+        let fut1 = disp.handle_fused_compare_write(
+            IoCommand {
+                sqe: c1,
+                data_out: Some(&original),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            },
+            IoCommand {
+                sqe: w1,
+                data_out: Some(&new_a),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            },
+        );
+        let fut2 = disp.handle_fused_compare_write(
+            IoCommand {
+                sqe: c2,
+                data_out: Some(&original),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            },
+            IoCommand {
+                sqe: w2,
+                data_out: Some(&new_b),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            },
+        );
+        let ((cc1, _), (cc2, _)) = tokio::join!(fut1, fut2);
+        let wins = [cc1.status, cc2.status]
+            .iter()
+            .filter(|s| **s == StatusField::SUCCESS)
+            .count();
+        assert_eq!(wins, 1, "exactly one fused CAW may win (test-and-set)");
     }
 
     /// Generic NVM I/O SQE: opcode at byte 0, CID at 2, NSID = 1 at
@@ -2199,8 +2311,9 @@ mod tests {
             "real CNTLID, not static 1"
         );
         assert_eq!(entry[2], 1, "holder bit set");
-        assert_eq!(&entry[5..13], &host[0..8], "HOSTID low 64");
-        assert_eq!(&entry[13..21], &0xCAFEu64.to_le_bytes(), "RKEY");
+        // Spec offsets (issue #129): HOSTID at 8..16, RKEY at 16..24.
+        assert_eq!(&entry[8..16], &host[0..8], "HOSTID low 64");
+        assert_eq!(&entry[16..24], &0xCAFEu64.to_le_bytes(), "RKEY");
     }
 
     /// A registrant whose host has no live controller (registered, then
@@ -2230,7 +2343,7 @@ mod tests {
             &0u16.to_le_bytes(),
             "CNTLID 0 = no live controller"
         );
-        assert_eq!(&entry[5..13], &host[0..8], "HOSTID still present");
+        assert_eq!(&entry[8..16], &host[0..8], "HOSTID still present");
     }
 
     /// Cross-host fencing: host A holds Write Exclusive; host B is

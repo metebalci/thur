@@ -26,13 +26,11 @@
 //! synchronously clears the page-index slot; the storage-side chunk
 //! lingers in the per-backend pool until `system gc` reclaims it.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use core_block::PageCache;
 use core_block::upload_index::UploadState;
 use core_block::uploader::{FaultClass, UploaderError};
-use tokio::sync::Mutex as AsyncMutex;
 
 use super::VolumeLookup;
 use super::inquiry::naa_locally_assigned;
@@ -42,29 +40,12 @@ use super::odx::{
 use super::reservations::{Nexus, ReservationManager};
 use super::types::{ScsiRequest, ScsiResponse, SenseData};
 
-/// Per-LUN async mutex registry. COMPARE AND WRITE holds the lock
-/// for the LUN it targets across the read+compare+write window so
-/// two concurrent CAWs against the same LUN are serialized. The
-/// inner sync mutex is held for one BTreeMap lookup; the
-/// `Arc<AsyncMutex>` is what callers actually `.lock().await` on.
-#[derive(Default)]
-pub struct CawLocks {
-    inner: StdMutex<BTreeMap<u64, Arc<AsyncMutex<()>>>>,
-}
-
-impl CawLocks {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Look up (and lazily create) the per-LUN lock. Cheap — one
-    /// BTreeMap lookup per CAW; the lock entries linger for the
-    /// daemon's lifetime, which is fine at thurvsa's LUN counts.
-    pub fn lock_for(&self, lun: u64) -> Arc<AsyncMutex<()>> {
-        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.entry(lun).or_default().clone()
-    }
-}
+// `CawLocks` moved to `core-block` so the SBC (iSCSI) and NVM
+// (NVMe/TCP) dispatchers can share one instance and serialize
+// COMPARE AND WRITE / fused Compare+Write against the same volume
+// across transports (issue #128). Re-exported here so existing
+// `crate::data_path::CawLocks` call sites are unchanged.
+pub use core_block::CawLocks;
 
 /// Decoded LBA + transfer length, normalized to u64. Both READ and
 /// WRITE 10/16 share this shape — only the CDB byte layout differs.
