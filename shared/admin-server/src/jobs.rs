@@ -31,7 +31,7 @@ use serde::Serialize;
 use shared_admin_proto::JobEvent;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
@@ -50,6 +50,26 @@ struct JobInner {
     /// Streamers observe this *after* draining the event log so they
     /// always emit `Done` as the last line.
     finished: AtomicBool,
+    /// Count of live streaming subscribers (a CLI connected to
+    /// `GET /jobs/{id}/events`). Incremented on connect, decremented when
+    /// the stream drops. An infinite job worker stops once this is 0 so
+    /// an abandoned `system monitor` / `audit tail -f` doesn't loop
+    /// forever (issue #140).
+    subscribers: AtomicUsize,
+    /// Set once any subscriber has ever connected. Lets an infinite
+    /// worker distinguish "subscriber connected then left" (stop now)
+    /// from "subscriber hasn't connected yet" (wait out the connect
+    /// grace — POST and the follow-up GET are separate requests).
+    ever_subscribed: AtomicBool,
+    /// Optional ring cap on the retained event log (`0` = unbounded).
+    /// Infinite jobs (monitor, audit tail --follow) opt in via
+    /// [`JobEmitter::set_event_cap`] so a long-lived subscriber can't
+    /// grow the log without bound; finite jobs keep the full transcript
+    /// for replay.
+    max_events: AtomicUsize,
+    /// Count of events dropped off the front of the ring, so streamer
+    /// cursors (which are absolute event indices) can be remapped.
+    dropped: AtomicUsize,
 }
 
 impl JobInner {
@@ -60,6 +80,10 @@ impl JobInner {
             events: Mutex::new(Vec::new()),
             notify: Notify::new(),
             finished: AtomicBool::new(false),
+            subscribers: AtomicUsize::new(0),
+            ever_subscribed: AtomicBool::new(false),
+            max_events: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
         })
     }
 }
@@ -82,11 +106,47 @@ impl JobEmitter {
         {
             let mut v = self.inner.events.lock().await;
             v.push(ev);
+            // Ring cap for infinite jobs: drop the oldest events once
+            // over the cap so the log doesn't grow without bound while a
+            // subscriber stays connected (issue #140). `dropped` keeps
+            // absolute cursors valid. `0` = unbounded (finite jobs keep
+            // the full transcript for replay).
+            let cap = self.inner.max_events.load(Ordering::Relaxed);
+            if cap > 0 && v.len() > cap {
+                let excess = v.len() - cap;
+                v.drain(0..excess);
+                self.inner.dropped.fetch_add(excess, Ordering::Relaxed);
+            }
         }
         if terminal {
             self.inner.finished.store(true, Ordering::Release);
         }
         self.inner.notify.notify_waiters();
+    }
+
+    /// Cap the retained event log to the last `n` events (a ring).
+    /// Infinite job loops (monitor / audit tail --follow) call this once
+    /// at start; finite jobs leave it unbounded for full replay.
+    pub fn set_event_cap(&self, n: usize) {
+        self.inner.max_events.store(n, Ordering::Relaxed);
+    }
+
+    /// True when an infinite job worker should stop: no streaming
+    /// subscriber is currently connected, and either one was here and
+    /// left, or the `connect_grace` since job creation has elapsed with
+    /// none ever connecting (the POST that spawned the worker and the
+    /// follow-up GET that subscribes are separate requests). Lets
+    /// `system monitor` / `audit tail -f` workers self-terminate on
+    /// disconnect instead of leaking forever (issue #140).
+    pub fn should_stop_infinite(&self, connect_grace: Duration) -> bool {
+        if self.inner.subscribers.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        if self.inner.ever_subscribed.load(Ordering::Acquire) {
+            return true;
+        }
+        let age = Utc::now().timestamp_millis() - self.inner.started_at.timestamp_millis();
+        age > connect_grace.as_millis() as i64
     }
 
     /// Convenience: emit an info log line.
@@ -136,8 +196,16 @@ impl JobHandle {
 
             let (drained, finished) = {
                 let v = self.inner.events.lock().await;
-                let new = v[*cursor..].to_vec();
-                *cursor = v.len();
+                // `*cursor` is an ABSOLUTE event index; `dropped` events
+                // have been trimmed off the ring's front, so v[0] is at
+                // absolute index `dropped`. A cursor behind the ring skips
+                // the trimmed events (fine for live monitor — stale
+                // snapshots). `max=0` jobs never drop, so this is a no-op
+                // for them.
+                let dropped = self.inner.dropped.load(Ordering::Relaxed);
+                let local = cursor.saturating_sub(dropped).min(v.len());
+                let new = v[local..].to_vec();
+                *cursor = dropped + v.len();
                 (new, self.inner.finished.load(Ordering::Acquire))
             };
 
@@ -154,6 +222,33 @@ impl JobHandle {
 
     pub fn is_finished(&self) -> bool {
         self.inner.finished.load(Ordering::Acquire)
+    }
+
+    /// Register a live streaming subscriber. The returned guard
+    /// decrements the count when dropped (CLI disconnect or stream
+    /// completion), so an infinite job worker can detect that the last
+    /// subscriber left and stop (issue #140). The streaming handler holds
+    /// this for the lifetime of the NDJSON response.
+    pub fn subscribe(&self) -> SubscriberGuard {
+        self.inner.subscribers.fetch_add(1, Ordering::Release);
+        self.inner.ever_subscribed.store(true, Ordering::Release);
+        SubscriberGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// RAII guard counting one live NDJSON subscriber. Drops decrement the
+/// per-job subscriber count.
+pub struct SubscriberGuard {
+    inner: Arc<JobInner>,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.inner.subscribers.fetch_sub(1, Ordering::Release);
+        // Wake any parked streamers; harmless for the worker (it polls).
+        self.inner.notify.notify_waiters();
     }
 }
 
@@ -472,6 +567,46 @@ mod tests {
         let mut cursor = 0;
         let history = handle.next_events(&mut cursor).await;
         assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn infinite_job_stops_when_last_subscriber_drops() {
+        // Issue #140: an infinite worker stops once the last streaming
+        // subscriber disconnects, instead of looping forever.
+        let reg = JobRegistry::new();
+        let (id, _s, emitter) = reg.create("system.monitor").await;
+        let handle = reg.get(&id).await.unwrap();
+        // No subscriber yet, but a generous connect grace → keep going
+        // (the follow-up GET hasn't arrived).
+        assert!(!emitter.should_stop_infinite(Duration::from_secs(60)));
+        let guard = handle.subscribe();
+        assert!(!emitter.should_stop_infinite(Duration::from_secs(60)));
+        drop(guard);
+        // Connected then left → stop now, regardless of grace.
+        assert!(emitter.should_stop_infinite(Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn event_cap_rings_and_remaps_cursors() {
+        // Issue #140: a capped (infinite) job's log is a ring; absolute
+        // cursors remap across dropped events so a fresh subscriber still
+        // gets the latest window.
+        let reg = JobRegistry::new();
+        let (id, _s, emitter) = reg.create("system.monitor").await;
+        emitter.set_event_cap(3);
+        for i in 0..5 {
+            emitter.info(format!("e{i}")).await;
+        }
+        let handle = reg.get(&id).await.unwrap();
+        let mut cursor = 0;
+        let got = handle.next_events(&mut cursor).await;
+        assert_eq!(got.len(), 3, "ring keeps only the last 3 events");
+        assert_eq!(cursor, 5, "cursor is absolute (2 dropped + 3 held)");
+        // A further emit drops one more; the same cursor sees only the new one.
+        emitter.info("e5").await;
+        let got2 = handle.next_events(&mut cursor).await;
+        assert_eq!(got2.len(), 1, "only the newly-appended event");
+        assert_eq!(cursor, 6);
     }
 
     #[tokio::test]

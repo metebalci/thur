@@ -168,10 +168,26 @@ pub struct AuditEntry {
     pub entries_total: u64,
 }
 
-/// Tick loop. Runs until the subscriber drops the stream — the
-/// `JobRegistry` reaper handles cancellation; we never emit `Done`.
+/// Grace after job creation for the CLI's follow-up `GET .../events` to
+/// connect before the worker concludes nobody is listening (the POST that
+/// spawns the worker and the GET that subscribes are separate requests).
+const MONITOR_CONNECT_GRACE: Duration = Duration::from_secs(10);
+/// Ring cap on the retained snapshot log: 15 minutes of 1 Hz snapshots.
+/// Old snapshots are stale for a live view, so trimming them bounds
+/// daemon heap on a long-lived `system monitor` session (issue #140).
+const MONITOR_EVENT_CAP: usize = 900;
+
+/// Tick loop. Emits one snapshot/second while a subscriber is connected,
+/// and stops (emitting a terminal `Done`) once the last subscriber drops
+/// — so an abandoned `system monitor` neither leaks the 1 Hz task nor
+/// grows the event log forever (issue #140).
 pub async fn run_monitor<S: MonitorState>(emitter: JobEmitter, _body: serde_json::Value, state: S) {
+    emitter.set_event_cap(MONITOR_EVENT_CAP);
     loop {
+        if emitter.should_stop_infinite(MONITOR_CONNECT_GRACE) {
+            emitter.emit(JobEvent::done(0)).await;
+            return;
+        }
         let payload = build_payload(&state);
         let json = match serde_json::to_string(&payload) {
             Ok(s) => s,

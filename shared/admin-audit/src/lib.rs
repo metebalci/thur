@@ -56,6 +56,13 @@ pub struct RotateParams {
     pub accept_break: bool,
 }
 
+/// Grace after job creation for the CLI's follow-up `GET .../events` to
+/// connect before the follow loop concludes nobody is listening.
+const TAIL_CONNECT_GRACE: Duration = Duration::from_secs(10);
+/// Ring cap on the retained follow-mode event log: bounds daemon heap on
+/// a long-lived `audit tail -f` session (issue #140).
+const TAIL_EVENT_CAP: usize = 10_000;
+
 pub async fn run_tail(emitter: JobEmitter, body: serde_json::Value, dir: PathBuf) {
     let params: TailParams = match serde_json::from_value(body) {
         Ok(p) => p,
@@ -121,7 +128,17 @@ pub async fn run_tail(emitter: JobEmitter, body: serde_json::Value, dir: PathBuf
             .await;
         return;
     }
+    // Cap the retained log + self-terminate when the subscriber drops,
+    // so an abandoned `audit tail -f` neither leaks the poll task nor
+    // grows the event log forever (issue #140). The 500 ms poll cadence
+    // means a connected subscriber refreshes its poll well within the
+    // grace; an idle window past it means the operator disconnected.
+    emitter.set_event_cap(TAIL_EVENT_CAP);
     loop {
+        if emitter.should_stop_infinite(TAIL_CONNECT_GRACE) {
+            emitter.emit(JobEvent::done(0)).await;
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let appended = match tail_step(&mut cursor, &dir) {
             Ok(e) => e,

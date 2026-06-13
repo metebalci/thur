@@ -27,7 +27,7 @@ pub mod jobs;
 pub mod peer;
 pub mod server;
 
-pub use jobs::{JobEmitter, JobHandle, JobRegistry, JobSummary};
+pub use jobs::{JobEmitter, JobHandle, JobRegistry, JobSummary, SubscriberGuard};
 pub use peer::PeerCred;
 pub use server::{HasJobs, jobs_router, run_admin_server};
 

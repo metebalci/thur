@@ -257,6 +257,10 @@ where
     // keeps the loop readable; the cursor + Notify dance lives in
     // JobHandle::next_events.
     let stream = async_stream::stream! {
+        // Count this live subscriber for the job's lifetime; the guard
+        // decrements on stream drop (CLI disconnect) so an infinite job
+        // worker can self-terminate when no one is listening (issue #140).
+        let _sub_guard = handle.subscribe();
         let mut cursor = 0usize;
         loop {
             let evs = handle.next_events(&mut cursor).await;
