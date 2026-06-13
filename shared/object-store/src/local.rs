@@ -19,7 +19,82 @@ use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
+
+/// Monotonic suffix source for staging temp files. Combined with the
+/// process id it makes every staged write target a unique path, so two
+/// concurrent writers of the same content-addressed key never clobber
+/// each other's in-flight temp file.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique sibling temp path for an atomic write into `final_path`.
+/// Kept in the same directory so the follow-up `rename(2)` stays on one
+/// filesystem (rename across mounts is not atomic).
+fn temp_path_for(final_path: &Path) -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let mut name = final_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp.{pid}.{n}"));
+    final_path.with_file_name(name)
+}
+
+/// Best-effort fsync of a file's parent directory so a preceding
+/// `rename(2)` is durable across power loss. A failure here can't tear
+/// the object (the rename already landed), so we swallow it.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Atomically materialize `data` at `final_path`: write to a sibling temp
+/// file, fsync it, `rename(2)` into place, then fsync the parent dir. A
+/// crash or power loss can leave a stray `.tmp.*` file but never a torn
+/// object at the final key — the property dedup / recovery probes rely on
+/// (a present key must be a complete object).
+fn atomic_write_bytes(final_path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = temp_path_for(final_path);
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, final_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_parent_dir(final_path);
+    Ok(())
+}
+
+/// Atomic counterpart of `fs::copy`: copy `src` to a sibling temp of
+/// `final_path`, fsync, `rename(2)` into place, fsync the parent dir.
+/// Returns the copied byte count.
+fn atomic_copy(src: &Path, final_path: &Path) -> std::io::Result<u64> {
+    let tmp = temp_path_for(final_path);
+    if let Err(e) = fs::copy(src, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    {
+        let f = fs::File::open(&tmp)?;
+        f.sync_all()?;
+    }
+    let size = fs::metadata(&tmp)?.len();
+    if let Err(e) = fs::rename(&tmp, final_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_parent_dir(final_path);
+    Ok(size)
+}
 
 /// Env var that drives test-only failure injection on the LocalBackend.
 ///
@@ -265,11 +340,19 @@ impl ObjectStoreBackend for LocalBackend {
                     fs::create_dir_all(parent)?;
                 }
 
-                // Up to 128 MiB per chunk on the LocalBackend path. Sync
-                // `fs::write` would park a tokio worker for the full kernel
-                // flush; `tokio::fs::write` runs the syscall on the blocking
-                // pool.
-                tokio::fs::write(&path, data).await?;
+                // Up to 128 MiB per chunk on the LocalBackend path. Write
+                // to a sibling temp, fsync, and rename(2) into place so a
+                // crash mid-write can never leave a torn object at the
+                // final key (which dedup / recovery would trust as a
+                // complete upload). The write+fsync+rename is real
+                // blocking work, so run it on the blocking pool.
+                let data_owned = data.to_vec();
+                let dst = path.clone();
+                tokio::task::spawn_blocking(move || atomic_write_bytes(&dst, &data_owned))
+                    .await
+                    .map_err(|e| {
+                        crate::ObjectStoreError::Other(format!("spawn_blocking join: {e}"))
+                    })??;
 
                 let size = data.len() as u64;
                 debug!("Local backend uploaded chunk: {} ({} bytes)", key, size);
@@ -297,12 +380,13 @@ impl ObjectStoreBackend for LocalBackend {
 
                 // Up to 128 MiB on the chunk path. (`fs::copy` is a real
                 // pread/pwrite loop, not a clone(2) reflink — the TODO
-                // above tracks that.) Run on the blocking pool.
+                // above tracks that.) Copy to a sibling temp, fsync, and
+                // rename(2) into place so a crash mid-copy never leaves a
+                // torn object at the final key. Run on the blocking pool.
                 let src = file_path.to_path_buf();
                 let dst = dest_path.clone();
                 let size = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-                    fs::copy(&src, &dst)?;
-                    Ok(fs::metadata(&dst)?.len())
+                    atomic_copy(&src, &dst)
                 })
                 .await
                 .map_err(|e| {
@@ -369,8 +453,11 @@ impl ObjectStoreBackend for LocalBackend {
                     fs::create_dir_all(parent)?;
                 }
 
-                // Write manifest JSON
-                fs::write(&path, json)?;
+                // Write manifest JSON atomically (temp + fsync + rename)
+                // so a crash mid-write can't leave a truncated manifest at
+                // the final key. Manifests are small, so the fsync stays
+                // inline rather than on the blocking pool.
+                atomic_write_bytes(&path, json.as_bytes())?;
 
                 debug!("Local backend uploaded manifest: {}", key);
 
@@ -856,6 +943,121 @@ mod tests {
             .await
             .expect_err("missing manifest must error");
         assert!(matches!(err, ObjectStoreError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn upload_leaves_no_temp_files_and_content_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let data = vec![0xABu8; 4096];
+        backend
+            .upload_chunk("chunks/AT/obj-1.dat", &data)
+            .await
+            .unwrap();
+        let manifest = r#"{"v":1}"#;
+        backend
+            .upload_manifest("manifests/AT/m.json", manifest)
+            .await
+            .unwrap();
+
+        // Final keys hold the exact bytes.
+        assert_eq!(
+            backend.download_chunk("chunks/AT/obj-1.dat").await.unwrap(),
+            data
+        );
+        assert_eq!(
+            backend
+                .download_manifest("manifests/AT/m.json")
+                .await
+                .unwrap(),
+            manifest
+        );
+
+        // No staging temp files survived the atomic rename.
+        let leftovers = leftover_temp_files(temp_dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "stray temp files after upload: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_of_same_key_leave_no_temp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let data = vec![0x5Au8; 8192];
+        // Two writers racing on the identical content-addressed key:
+        // unique temp suffixes mean neither tears the other's temp file,
+        // and the final object is complete regardless of who renamed last.
+        let a = {
+            let b = backend.clone();
+            let d = data.clone();
+            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", &d).await })
+        };
+        let c = {
+            let b = backend.clone();
+            let d = data.clone();
+            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", &d).await })
+        };
+        a.await.unwrap().unwrap();
+        c.await.unwrap().unwrap();
+
+        assert_eq!(
+            backend.download_chunk("chunks/RACE/obj.dat").await.unwrap(),
+            data
+        );
+        let leftovers = leftover_temp_files(temp_dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "stray temp files after concurrent upload: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zerocopy_upload_leaves_no_temp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_path = src_dir.path().join("chunk.bin");
+        let payload = vec![0x11u8; 2048];
+        tokio::fs::write(&src_path, &payload).await.unwrap();
+        backend
+            .upload_chunk_zerocopy("chunks/ZCAT/obj.dat", &src_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.download_chunk("chunks/ZCAT/obj.dat").await.unwrap(),
+            payload
+        );
+        let leftovers = leftover_temp_files(temp_dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "stray temp files after zerocopy upload: {leftovers:?}"
+        );
+    }
+
+    /// Recursively collect any `.tmp.*` staging files under `root`.
+    fn leftover_temp_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains(".tmp."))
+                        .unwrap_or(false)
+                    {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        walk(root, &mut out);
+        out
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ use futures::future::{BoxFuture, Shared};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What we know about a single storage key.
@@ -73,6 +74,15 @@ pub struct CachingObjectStoreBackend {
     inner: Arc<dyn ObjectStoreBackend>,
     name: String,
     known: Arc<Mutex<HashMap<String, StorageState>>>,
+    /// Monotonic invalidation epoch, bumped by every op that removes a
+    /// cache fact (`delete_object`, `upload_versioned`). A HEAD or PUT
+    /// snapshots the epoch before it touches the backend and only
+    /// installs its result if the epoch is unchanged at completion. This
+    /// closes the TOCTOU where a stale completion would resurrect a
+    /// concurrently-deleted object in the cache (issue #134) — which
+    /// would later let a content-addressed re-write skip its PUT, losing
+    /// data against the authoritative backend.
+    epoch: Arc<AtomicU64>,
 }
 
 // `StorageState::InFlight` carries a `Shared<BoxFuture>` which is not
@@ -97,6 +107,7 @@ impl CachingObjectStoreBackend {
             inner: Arc::from(inner),
             name: name.into(),
             known: Arc::new(Mutex::new(HashMap::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -181,8 +192,12 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
 
         // Re-check under the lock — a concurrent caller may have raced
         // ahead and installed their own singleflight (or even
-        // completed it) while we were building ours.
-        let waiter = {
+        // completed it) while we were building ours. The creator captures
+        // the invalidation epoch at install time; only the creator
+        // installs the terminal `Uploaded`, gated on that epoch (joiners
+        // just return the shared result), so a delete that races our PUT
+        // can't be overwritten by a stale completion.
+        let (waiter, install_epoch) = {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
                 Some(StorageState::Uploaded {
@@ -191,26 +206,44 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                     algo,
                 }) => return Ok((*uncompressed, *compressed, *algo)),
                 Some(StorageState::Probed) => return Ok((data.len() as u64, None, None)),
-                Some(StorageState::InFlight(existing)) => existing.clone(),
+                Some(StorageState::InFlight(existing)) => (existing.clone(), None),
                 None => {
+                    let epoch = self.epoch.load(Ordering::SeqCst);
                     map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
-                    shared
+                    (shared, Some(epoch))
                 }
             }
         };
 
         let result = waiter.await;
+
+        // Joiners don't install — the creator's gated install is the single
+        // authority for the terminal cache fact.
+        let Some(install_epoch) = install_epoch else {
+            return match result {
+                Ok(outcome) => Ok((outcome.uncompressed, outcome.compressed, outcome.algo)),
+                Err(arc_err) => Err(ObjectStoreError::Other(arc_err.to_string())),
+            };
+        };
+
         let mut map = self.known.lock().expect("cache mutex poisoned");
         match result {
             Ok(outcome) => {
-                map.insert(
-                    key.to_string(),
-                    StorageState::Uploaded {
-                        uncompressed: outcome.uncompressed,
-                        compressed: outcome.compressed,
-                        algo: outcome.algo,
-                    },
-                );
+                // Only memoize if no invalidating op (delete / versioned
+                // write) raced our PUT. Otherwise drop our InFlight so the
+                // next caller re-checks the authoritative backend.
+                if self.epoch.load(Ordering::SeqCst) == install_epoch {
+                    map.insert(
+                        key.to_string(),
+                        StorageState::Uploaded {
+                            uncompressed: outcome.uncompressed,
+                            compressed: outcome.compressed,
+                            algo: outcome.algo,
+                        },
+                    );
+                } else if matches!(map.get(key), Some(StorageState::InFlight(_))) {
+                    map.remove(key);
+                }
                 Ok((outcome.uncompressed, outcome.compressed, outcome.algo))
             }
             Err(arc_err) => {
@@ -283,31 +316,44 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
         > = upload_fut.boxed().shared();
 
-        let waiter = {
+        let (waiter, install_epoch) = {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
                 Some(StorageState::Uploaded { uncompressed, .. }) => return Ok(*uncompressed),
-                Some(StorageState::InFlight(existing)) => existing.clone(),
+                Some(StorageState::InFlight(existing)) => (existing.clone(), None),
                 // For Probed (no size known) and None: install the singleflight.
                 _ => {
+                    let epoch = self.epoch.load(Ordering::SeqCst);
                     map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
-                    shared
+                    (shared, Some(epoch))
                 }
             }
         };
 
         let result = waiter.await;
+
+        let Some(install_epoch) = install_epoch else {
+            return match result {
+                Ok(outcome) => Ok(outcome.uncompressed),
+                Err(arc_err) => Err(ObjectStoreError::Other(arc_err.to_string())),
+            };
+        };
+
         let mut map = self.known.lock().expect("cache mutex poisoned");
         match result {
             Ok(outcome) => {
-                map.insert(
-                    key.to_string(),
-                    StorageState::Uploaded {
-                        uncompressed: outcome.uncompressed,
-                        compressed: outcome.compressed,
-                        algo: outcome.algo,
-                    },
-                );
+                if self.epoch.load(Ordering::SeqCst) == install_epoch {
+                    map.insert(
+                        key.to_string(),
+                        StorageState::Uploaded {
+                            uncompressed: outcome.uncompressed,
+                            compressed: outcome.compressed,
+                            algo: outcome.algo,
+                        },
+                    );
+                } else if matches!(map.get(key), Some(StorageState::InFlight(_))) {
+                    map.remove(key);
+                }
                 Ok(outcome.uncompressed)
             }
             Err(arc_err) => {
@@ -342,6 +388,9 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         // next download_chunk's.
         let result = self.inner.upload_versioned(key, data).await;
         let mut map = self.known.lock().expect("cache mutex poisoned");
+        // Bump the epoch under the lock so an upload_chunk completion that
+        // snapshotted before this write can't reinstall a stale fact.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         map.remove(key);
         result
     }
@@ -384,11 +433,17 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         }
         // Miss, or coalesced singleflight failed: real HEAD. Negative
         // results are NOT cached (a co-resident process could upload
-        // between our HEAD and the next caller's check).
+        // between our HEAD and the next caller's check). Snapshot the
+        // invalidation epoch before the HEAD; if a delete races our probe
+        // we must not cache the (now stale) positive result, or a later
+        // content-addressed write would skip its PUT and lose data.
+        let probe_epoch = self.epoch.load(Ordering::SeqCst);
         let exists = self.inner.chunk_exists(key).await?;
         if exists {
             let mut map = self.known.lock().expect("cache mutex poisoned");
-            map.entry(key.to_string()).or_insert(StorageState::Probed);
+            if self.epoch.load(Ordering::SeqCst) == probe_epoch {
+                map.entry(key.to_string()).or_insert(StorageState::Probed);
+            }
         }
         Ok(exists)
     }
@@ -423,6 +478,12 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
     async fn delete_object(&self, key: &str) -> Result<()> {
         self.inner.delete_object(key).await?;
         let mut map = self.known.lock().expect("cache mutex poisoned");
+        // Bump the epoch under the lock so any HEAD/PUT that snapshotted
+        // before this delete can't reinstall the now-deleted object as
+        // present (issue #134). Whether our remove or a racing completion
+        // wins the lock, the epoch mismatch makes the stale install a
+        // no-op, leaving the cache to re-probe the backend.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         map.remove(key);
         Ok(())
     }
@@ -455,6 +516,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             inner: Arc::clone(&self.inner),
             name: self.name.clone(),
             known: Arc::clone(&self.known),
+            epoch: Arc::clone(&self.epoch),
         })
     }
 }
@@ -480,6 +542,7 @@ mod tests {
         fail_next_upload: AtomicBool,
         head_returns: AtomicBool,
         upload_delay_ms: AtomicU64,
+        head_delay_ms: AtomicU64,
         list_keys: Mutex<Vec<String>>,
     }
 
@@ -547,6 +610,10 @@ mod tests {
         }
 
         async fn chunk_exists(&self, _key: &str) -> Result<bool> {
+            let delay = self.c.head_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             self.c.heads.fetch_add(1, Ordering::SeqCst);
             Ok(self.c.head_returns.load(Ordering::SeqCst))
         }
@@ -725,6 +792,72 @@ mod tests {
             c.heads.load(Ordering::SeqCst),
             1,
             "second HEAD should be a cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_racing_positive_head_is_not_cached() {
+        // Reproduces issue #134: a HEAD reaches the backend while the
+        // object still exists; a concurrent delete removes it; the stale
+        // positive HEAD must NOT install a Probed entry (which would later
+        // let a content-addressed write skip its PUT and lose data).
+        let (mock, c) = MockBackend::new();
+        c.head_returns.store(true, Ordering::SeqCst);
+        c.head_delay_ms.store(40, Ordering::SeqCst);
+        let cache = Arc::new(wrap(mock));
+
+        let probe = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.chunk_exists("k").await })
+        };
+        // Let the HEAD start (and block in its 40 ms sleep), then delete.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.delete_object("k").await.unwrap();
+
+        assert!(probe.await.unwrap().unwrap(), "HEAD observed the object");
+        assert_eq!(c.heads.load(Ordering::SeqCst), 1);
+
+        // The stale positive must not have been cached: a follow-up
+        // chunk_exists fires a fresh HEAD rather than returning a cached
+        // Probed.
+        c.head_returns.store(false, Ordering::SeqCst);
+        c.head_delay_ms.store(0, Ordering::SeqCst);
+        assert!(!cache.chunk_exists("k").await.unwrap());
+        assert_eq!(
+            c.heads.load(Ordering::SeqCst),
+            2,
+            "delete-racing HEAD must not have cached a Probed entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_racing_upload_completion_is_not_cached() {
+        // Reproduces the upload-side half of #134: a PUT is in flight when
+        // a delete removes the key; the PUT completion must NOT install a
+        // stale Uploaded entry, or the next upload of the same content
+        // would be skipped.
+        let (mock, c) = MockBackend::new();
+        c.upload_delay_ms.store(40, Ordering::SeqCst);
+        let cache = Arc::new(wrap(mock));
+
+        let put = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.upload_chunk("k", b"hello").await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache.delete_object("k").await.unwrap();
+
+        put.await.unwrap().unwrap();
+        assert_eq!(c.puts.load(Ordering::SeqCst), 1);
+
+        // The racing delete must have prevented the Uploaded install, so a
+        // follow-up upload of the same content fires a real PUT.
+        c.upload_delay_ms.store(0, Ordering::SeqCst);
+        cache.upload_chunk("k", b"hello").await.unwrap();
+        assert_eq!(
+            c.puts.load(Ordering::SeqCst),
+            2,
+            "delete-racing PUT completion must not have cached Uploaded"
         );
     }
 

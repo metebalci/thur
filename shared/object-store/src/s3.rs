@@ -812,14 +812,26 @@ impl S3Backend {
         let full_prefix = self.full_key(key_prefix);
         debug!("Listing objects in S3 with prefix: {}", full_prefix);
 
-        let resp = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&full_prefix)
-            .send()
-            .await
-            .map_err(|e| {
+        // ListObjectsV2 caps a single response at 1000 keys and signals
+        // more via is_truncated + next_continuation_token. Loop until the
+        // listing is exhausted — a single request silently truncates large
+        // pools (DR restore, verify sweeps, GC orphan scans all list
+        // prefixes that easily exceed 1000 objects). Mirrors the GCS/Azure
+        // backends, which already paginate.
+        let mut keys: Vec<String> = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full_prefix);
+            if let Some(token) = continuation_token.as_ref() {
+                req = req.continuation_token(token.clone());
+            }
+
+            let resp = req.send().await.map_err(|e| {
                 let detail = describe_sdk_error("list_objects", &e);
                 ObjectStoreError::classified(
                     classify_s3_sdk_error(&e),
@@ -830,10 +842,7 @@ impl S3Backend {
                 )
             })?;
 
-        let keys: Vec<String> = resp
-            .contents()
-            .iter()
-            .filter_map(|obj| {
+            keys.extend(resp.contents().iter().filter_map(|obj| {
                 obj.key().map(|k| {
                     // Strip the bucket prefix to return relative keys
                     if !self.prefix.is_empty() && k.starts_with(&self.prefix) {
@@ -842,8 +851,18 @@ impl S3Backend {
                         k.to_string()
                     }
                 })
-            })
-            .collect();
+            }));
+
+            if resp.is_truncated().unwrap_or(false) {
+                match resp.next_continuation_token() {
+                    Some(token) => continuation_token = Some(token.to_string()),
+                    // Truncated but no token: nothing more we can fetch.
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
 
         debug!("Found {} objects with prefix {}", keys.len(), full_prefix);
         Ok(keys)
@@ -1627,6 +1646,62 @@ mod tests {
         assert_eq!(
             keys,
             vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_list_objects_paginates_past_first_page() {
+        // Issue #136: a truncated first page must be followed via
+        // next_continuation_token. First GET (no continuation-token)
+        // returns IsTruncated=true + a token; the second GET (carrying
+        // that token) returns the rest with IsTruncated=false.
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let page1 = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Name>test-bucket</Name><Prefix>tapes/</Prefix><KeyCount>1</KeyCount>\
+            <MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated>\
+            <NextContinuationToken>TOKEN1</NextContinuationToken>\
+            <Contents><Key>tapes/chunks/a.dat</Key><Size>1</Size>\
+            <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+            <ETag>\"e\"</ETag><StorageClass>STANDARD</StorageClass></Contents>\
+            </ListBucketResult>";
+        let page2 = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Name>test-bucket</Name><Prefix>tapes/</Prefix><KeyCount>1</KeyCount>\
+            <MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated>\
+            <Contents><Key>tapes/chunks/b.dat</Key><Size>2</Size>\
+            <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+            <ETag>\"e\"</ETag><StorageClass>STANDARD</StorageClass></Contents>\
+            </ListBucketResult>";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param_is_missing("continuation-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(page1),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("continuation-token", "TOKEN1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/xml")
+                    .set_body_string(page2),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server).await;
+        let mut keys = backend.list_objects("chunks/").await.expect("list");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["chunks/a.dat".to_string(), "chunks/b.dat".to_string()],
+            "both pages must be returned"
         );
     }
 
