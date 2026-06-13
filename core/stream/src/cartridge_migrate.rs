@@ -224,7 +224,14 @@ async fn verify_worm_target_lock(target: &dyn ObjectStoreBackend, is_worm: bool)
 /// Once the manifest flip commits, source-side delete failures
 /// degrade to warnings: the migration succeeds and the orphans clean
 /// up on the next GC sweep.
+/// Bounded backend concurrency for the per-chunk copy / verify / delete
+/// storms. A 12 TB LTO-8 cartridge is ~1.5M chunks at the 8 MiB FastCDC
+/// average; one round trip at a time would run for days (issue #158).
+/// Matches the legal-hold per-key storm.
+const MIGRATE_CONCURRENCY: usize = 16;
+
 pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
+    use futures::stream::{self, StreamExt};
     let cart_root = opts.tapes_dir.join(opts.barcode);
     let manifest_path = cart_root.join("manifest.json");
     if !manifest_path.is_file() {
@@ -318,29 +325,53 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                 opts.source_name,
                 opts.target_name
             ));
-            for (i, (hash, key)) in chunk_hashes.iter().zip(chunk_keys.iter()).enumerate() {
-                let exists_on_target = opts.target.chunk_exists(key).await.map_err(storage_err)?;
-                if !exists_on_target {
-                    let bytes = opts.source.download_chunk(key).await.map_err(storage_err)?;
+            // Bounded-concurrency copy: each chunk independently HEADs
+            // the target, then GET+verify+PUT only on a miss. Results are
+            // folded into `report` after the storm drains; the first
+            // error (hash mismatch / backend fault) wins.
+            let source = opts.source;
+            let target = opts.target;
+            // Owned (hash, key) pairs per task — moving them in sidesteps
+            // the higher-ranked-lifetime trap of `map`-ing borrowed refs
+            // into async blocks. The clone is negligible next to a
+            // backend round trip.
+            let copy_pairs: Vec<(String, String)> = chunk_hashes
+                .iter()
+                .cloned()
+                .zip(chunk_keys.iter().cloned())
+                .collect();
+            let copy_outcomes: Vec<Result<(bool, u64)>> = stream::iter(copy_pairs)
+                .map(|(hash, key)| async move {
+                    if target.chunk_exists(&key).await.map_err(storage_err)? {
+                        return Ok((false, 0u64));
+                    }
+                    let bytes = source.download_chunk(&key).await.map_err(storage_err)?;
                     let actual = blake3_hex(&bytes);
-                    if &actual != hash {
+                    if actual != hash {
                         return Err(SmcError::ContentHashMismatch {
-                            expected: hash.clone(),
+                            expected: hash,
                             actual,
                         });
                     }
                     let size = bytes.len() as u64;
-                    opts.target
-                        .upload_chunk(key, &bytes)
-                        .await
-                        .map_err(storage_err)?;
+                    target.upload_chunk(&key, &bytes).await.map_err(storage_err)?;
+                    Ok((true, size))
+                })
+                .buffer_unordered(MIGRATE_CONCURRENCY)
+                .collect()
+                .await;
+            for outcome in copy_outcomes {
+                let (copied, size) = outcome?;
+                if copied {
                     report.chunks_copied += 1;
                     report.bytes_copied += size;
                 }
-                if (i + 1).is_multiple_of(64) {
-                    log(&format!("copied {}/{} chunks", i + 1, chunk_hashes.len()));
-                }
             }
+            log(&format!(
+                "copied {} new chunks ({} already on target)",
+                report.chunks_copied,
+                chunk_hashes.len() as u64 - report.chunks_copied
+            ));
 
             // Phase 2: copy manifest backups. Source carries
             //   manifests/<barcode>/manifest-latest.json
@@ -391,17 +422,30 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
             } else {
                 "deleting source manifest backups (chunks shared under Global dedup; leave for GC)"
             });
-            let delete_keys: Vec<&String> = if delete_chunks {
-                chunk_keys.iter().chain(manifest_keys.iter()).collect()
+            let delete_keys: Vec<String> = if delete_chunks {
+                chunk_keys
+                    .iter()
+                    .chain(manifest_keys.iter())
+                    .cloned()
+                    .collect()
             } else {
-                manifest_keys.iter().collect()
+                manifest_keys.clone()
             };
-            for key in delete_keys {
-                match opts.source.delete_object(key).await {
+            let source = opts.source;
+            let delete_outcomes: Vec<std::result::Result<(), String>> = stream::iter(delete_keys)
+                .map(|key| async move {
+                    source
+                        .delete_object(&key)
+                        .await
+                        .map_err(|e| format!("{}: {}", key, e))
+                })
+                .buffer_unordered(MIGRATE_CONCURRENCY)
+                .collect()
+                .await;
+            for outcome in delete_outcomes {
+                match outcome {
                     Ok(()) => report.source_objects_deleted += 1,
-                    Err(e) => report
-                        .source_delete_warnings
-                        .push(format!("{}: {}", key, e)),
+                    Err(w) => report.source_delete_warnings.push(w),
                 }
             }
         }
@@ -412,16 +456,27 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                     chunk_hashes.len(),
                     opts.target_name
                 ));
+                // Bounded-concurrency HEAD storm; collect existence per
+                // key, then tally. (One HEAD at a time over ~1.5M chunks
+                // is ~21 h of pure latency for a full LTO-8 — issue #158.)
+                let target = opts.target;
+                let verify_keys: Vec<String> = chunk_keys.clone();
+                let verify_outcomes: Vec<Result<(String, bool)>> = stream::iter(verify_keys)
+                    .map(|key| async move {
+                        let exists = target.chunk_exists(&key).await.map_err(storage_err)?;
+                        Ok((key, exists))
+                    })
+                    .buffer_unordered(MIGRATE_CONCURRENCY)
+                    .collect()
+                    .await;
                 let mut missing: Vec<String> = Vec::new();
-                for key in &chunk_keys {
-                    if opts.target.chunk_exists(key).await.map_err(storage_err)? {
+                for outcome in verify_outcomes {
+                    let (key, exists) = outcome?;
+                    if exists {
                         report.chunks_verified += 1;
-                    } else {
-                        missing.push(key.clone());
-                        if missing.len() >= 16 {
-                            // Cap the list; report.failures clamps too.
-                            break;
-                        }
+                    } else if missing.len() < 16 {
+                        // Cap the reported list; report.failures clamps too.
+                        missing.push(key);
                     }
                 }
                 if missing.is_empty() {

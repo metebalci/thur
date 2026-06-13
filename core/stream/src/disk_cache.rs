@@ -251,7 +251,11 @@ impl DiskCacheManager {
 
     /// Evict LRU chunks until cache usage is under limit
     /// Returns the number of bytes freed
-    pub async fn evict_lru_chunks(
+    // Not `async`: the body is entirely blocking std::fs I/O (manifest
+    // parses, chunks.idx scans, cartridge opens, record flips) with no
+    // `.await`. The daemon offloads the whole pass to `spawn_blocking`
+    // (issue #160) so a multi-second rescan can't pin a tokio worker.
+    pub fn evict_lru_chunks(
         &mut self,
         storage_backend: Option<&dyn ObjectStoreBackend>,
     ) -> Result<u64> {

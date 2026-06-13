@@ -168,7 +168,10 @@ thurvtl cartridge migrate <BARCODE> --target-backend <NAME>
 2. **Copy chunks.** Issue a HEAD on the target first — this is what
    makes a retry idempotent — and if the chunk is missing,
    `source.download_chunk(key)`, then BLAKE3-verify, then
-   `target.upload_chunk(key, bytes)`.
+   `target.upload_chunk(key, bytes)`. The per-chunk copy runs with
+   bounded concurrency (16 in flight), as do the rebind-verify HEAD
+   pass and the source-delete pass — a full LTO-8 cartridge is ~1.5M
+   chunks, so a one-round-trip-at-a-time loop would take days.
 3. **Copy manifest backups.** Every key under `manifests/<barcode>/`
    on the source is copied across: JSON keys via `upload_manifest` /
    `download_manifest`, binary index pages via `upload_chunk` /

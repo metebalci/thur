@@ -265,9 +265,22 @@ impl IscsiUsersFile {
             IscsiError::InvalidConfig(format!("failed to serialize iscsi-users.json: {e}"))
         })?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(|e| {
-            IscsiError::InvalidConfig(format!("I/O error writing iscsi-users.json: {e}"))
-        })?;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| {
+                IscsiError::InvalidConfig(format!("I/O error writing iscsi-users.json: {e}"))
+            })?;
+            f.write_all(body.as_bytes()).map_err(|e| {
+                IscsiError::InvalidConfig(format!("I/O error writing iscsi-users.json: {e}"))
+            })?;
+            // fsync the data before the rename: otherwise a power loss
+            // can leave a zero-length / torn iscsi-users.json, and
+            // `load` errors fatally on that — losing every CHAP
+            // credential at next boot (issue #157).
+            f.sync_all().map_err(|e| {
+                IscsiError::InvalidConfig(format!("fsync failed on iscsi-users.json: {e}"))
+            })?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -278,6 +291,11 @@ impl IscsiUsersFile {
         std::fs::rename(&tmp, path).map_err(|e| {
             IscsiError::InvalidConfig(format!("rename failed on iscsi-users.json: {e}"))
         })?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 

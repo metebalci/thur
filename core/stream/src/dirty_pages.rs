@@ -220,9 +220,21 @@ impl DirtyPageTracker {
         if inner.bits.len() > needed_words {
             inner.bits.truncate(needed_words);
         }
-        // Clear bits past new_page_count within the trailing word.
+        // Clear bits past new_page_count within the trailing word — but
+        // only when that word really IS the last word of the new bound
+        // (`bits.len() == needed_words`). If the in-memory bitmap is
+        // SHORTER than needed_words — which happens when an unclean
+        // shutdown left a stale, smaller sidecar on disk that
+        // `open_or_create` loaded against a since-grown index — the
+        // partial-word mask would land on an *earlier* word and clear
+        // in-bounds dirty bits for pages strictly below new_page_count.
+        // Those lost marks silently skip the next index upload, leaving
+        // the storage copy of the index permanently stale (a cold-bucket
+        // DR restore then stitches records pointing at wrong chunks —
+        // issue #159). When the bitmap is shorter, every set bit is
+        // already in-bounds, so there is nothing to clear.
         let bits_used = (new_page_count as usize) % 64;
-        if bits_used != 0 && !inner.bits.is_empty() {
+        if bits_used != 0 && inner.bits.len() == needed_words {
             let last = inner
                 .bits
                 .last_mut()
@@ -425,6 +437,30 @@ mod tests {
         t.truncate_to_pages(3);
         let s = t.snapshot();
         assert_eq!(s.pages, vec![2]); // boundary page (3-1)
+    }
+
+    /// Issue #159: when the in-memory bitmap is SHORTER than the word
+    /// count the new page count needs (a stale, smaller sidecar loaded
+    /// against a since-grown index), the partial-word mask must not run
+    /// — it would land on an earlier word and clear in-bounds dirty
+    /// bits. Here pages 30..=49 live in word 0 (bits.len() == 1), and
+    /// truncate_to_pages(90) needs 2 words; the buggy mask
+    /// `(1<<(90%64))-1` over word 0 would clear bits 26..63, wiping all
+    /// of 30..=49.
+    #[test]
+    fn truncate_to_pages_shorter_bitmap_keeps_in_bounds_bits() {
+        let tmp = TempDir::new().unwrap();
+        let t = DirtyPageTracker::open_or_create(&idx(&tmp)).unwrap();
+        // Mark pages 30..=49 — all within word 0, so bits.len() == 1.
+        t.mark_range(30 * PAGE_SIZE as u64, 20 * PAGE_SIZE as u64);
+        assert_eq!(t.snapshot().pages, (30..=49).collect::<Vec<_>>());
+        // New page count 90 needs 2 words; the bitmap only has 1.
+        t.truncate_to_pages(90);
+        assert_eq!(
+            t.snapshot().pages,
+            (30..=49).collect::<Vec<_>>(),
+            "in-bounds dirty bits below new_page_count must survive"
+        );
     }
 
     #[test]

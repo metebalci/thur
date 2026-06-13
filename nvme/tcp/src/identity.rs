@@ -144,14 +144,28 @@ fn load_json_or_default<T: DeserializeOwned + Default>(
 fn save_json_atomic_0640<T: Serialize>(path: &Path, value: &T) -> Result<(), IdentityFileError> {
     let body = serde_json::to_string_pretty(value).map_err(IdentityFileError::Parse)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).map_err(IdentityFileError::Io)?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp).map_err(IdentityFileError::Io)?;
+        f.write_all(body.as_bytes()).map_err(IdentityFileError::Io)?;
+        // fsync the data before the rename so a power loss can't leave a
+        // zero-length / torn credential file that `load` then rejects,
+        // dropping every TLS-PSK / DH-CHAP host secret (issue #157).
+        f.sync_all().map_err(IdentityFileError::Io)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
             .map_err(IdentityFileError::Io)?;
     }
-    std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)
+    std::fs::rename(&tmp, path).map_err(IdentityFileError::Io)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 impl NvmetcpPsksFile {

@@ -2249,7 +2249,27 @@ async fn run_disk_cache_eviction_worker(
                 }
             };
 
-            match cm.evict_lru_chunks(storage_backend.as_deref()).await {
+            // Offload the whole eviction pass to a blocking thread: it is
+            // pure blocking fs work (manifest parses, full chunks.idx
+            // scans, cartridge opens) that can run for seconds at scale,
+            // and awaiting it directly would pin a tokio worker (issue
+            // #160). Hand `cm` + the storage backend in and back out,
+            // mirroring the usage-walk offload above.
+            // `cm` is dropped at the end of this iteration (the `for mut
+            // cm in managers` loop rebinds it next pass), so the handle
+            // returned from the closure is intentionally discarded.
+            let evict_res = match tokio::task::spawn_blocking(move || {
+                cm.evict_lru_chunks(storage_backend.as_deref())
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Cache eviction task for backend '{}' panicked: {e}", backend);
+                    continue;
+                }
+            };
+            match evict_res {
                 Ok(freed) if freed > 0 => {
                     info!(
                         "Cache eviction freed {} bytes from backend '{}'",

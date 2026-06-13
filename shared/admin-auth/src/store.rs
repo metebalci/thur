@@ -48,7 +48,17 @@ impl AdminPasswordFile {
         let body = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serializing admin-password.json: {e}"))?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        {
+            use std::io::Write as _;
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+            f.write_all(body.as_bytes())
+                .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+            // fsync data before rename so a power loss can't leave a
+            // torn admin-password.json (issue #157).
+            f.sync_all()
+                .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -56,6 +66,11 @@ impl AdminPasswordFile {
                 .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
         }
         std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }

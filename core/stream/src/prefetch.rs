@@ -294,7 +294,7 @@ async fn download_chunk_to_store(
     backend: &dyn ObjectStoreBackend,
     hash: &str,
     chunk_store: &ChunkStore,
-    pool_budget: &PoolBudget,
+    pool_budget: &Arc<PoolBudget>,
 ) -> Result<usize> {
     let object_key = chunk_store.object_key_in_store(hash);
     let data = backend.download_chunk(&object_key).await?;
@@ -302,27 +302,35 @@ async fn download_chunk_to_store(
 
     // Prefetch grows the local pool — account it against the per-backend
     // budget so `current_bytes()` stays equal to on-disk pool bytes (the
-    // eviction worker reads the budget instead of rescanning). Persist
-    // FIRST, then reserve only when the insert actually wrote the file
-    // (`was_new`): a chunk already warmed by a racing read-miss/prefetch
-    // reports `was_new == false` and is not double-counted, and a failed
-    // persist returns via `?` with no reservation made. `force_reserve`,
-    // not `try_reserve`: prefetch is speculative I/O and must never block
-    // on backpressure.
+    // eviction worker reads the budget instead of rescanning). The insert
+    // and the matching `force_reserve` MUST be atomic with respect to
+    // task cancellation: the prefetch task is abortable (`cancel_all` on
+    // every LOCATE / REWIND / SPACE>2), and `spawn_blocking` closures are
+    // NOT cancellable — they run to completion. If the reserve sat after
+    // the `.await` (the abort point), an abort landing while parked there
+    // would still let the blocking insert write the chunk to the pool but
+    // skip the reservation, so the per-backend budget would undercount
+    // on-disk bytes forever and erode the disk-cache cap (issue #161).
+    // Doing both inside one closure makes the pair all-or-nothing.
+    // `was_new` gates the reserve: a chunk already warmed by a racing
+    // read-miss reports `false` and must not be double-counted.
+    // `force_reserve`, not `try_reserve`: prefetch is speculative I/O and
+    // must never block on backpressure.
     let store = chunk_store.clone();
     let hash_owned = hash.to_string();
-    let was_new =
-        tokio::task::spawn_blocking(move || store.insert_verified_bytes(&hash_owned, &data))
-            .await
-            .map_err(|e| {
-                crate::errors::SmcError::Io(std::io::Error::other(format!(
-                    "prefetch insert join: {e}"
-                )))
-            })
-            .and_then(|inner| inner.map_err(Into::into))?;
-    if was_new {
-        pool_budget.force_reserve(size as u64, chunk_store.namespace());
-    }
+    let budget = pool_budget.clone();
+    let data_len = size as u64;
+    tokio::task::spawn_blocking(move || {
+        let was_new = store.insert_verified_bytes(&hash_owned, &data)?;
+        if was_new {
+            budget.force_reserve(data_len, store.namespace());
+        }
+        Ok::<(), crate::errors::SmcError>(())
+    })
+    .await
+    .map_err(|e| {
+        crate::errors::SmcError::Io(std::io::Error::other(format!("prefetch insert join: {e}")))
+    })??;
 
     debug!(
         "Wrote prefetched chunk to pool: {} ({} bytes)",

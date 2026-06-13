@@ -38,7 +38,8 @@ use crate::errors::{Result, SmcError};
 use core_stream::DriveTopology;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Per-product abstraction over "what tape device am I serving SCSI for?".
@@ -846,11 +847,30 @@ impl Library {
 
         lock_file.lock_exclusive()?;
 
-        // Write to temporary file
-        fs::write(&tmp_path, content)?;
+        // Write to temporary file, fsync the DATA before the rename, then
+        // fsync the parent directory. Skipping the data fsync lets the
+        // rename's directory entry become durable before the file's data
+        // pages, so a power loss can leave a zero-length or partial
+        // library.json / inventory.json (XFS / btrfs / ext4
+        // noauto_da_alloc). A torn library.json is catastrophic: the
+        // documented recovery (remove library/ + re-materialize) mints a
+        // NEW chassis_serial and element bases that are immutable
+        // forever, orphaning backup-software catalogs. inventory.json is
+        // rewritten on every MOVE MEDIUM, so the window recurs constantly
+        // (issue #157).
+        {
+            let mut f = File::create(&tmp_path)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
 
         // Atomic rename (replaces target file)
         fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
 
         // Lock automatically released on drop
         Ok(())

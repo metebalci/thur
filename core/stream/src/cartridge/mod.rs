@@ -744,6 +744,17 @@ pub struct Cartridge {
     /// trailing staging chunk out from under the drive-side primary
     /// handle that owns it (issue #28).
     is_view_handle: bool,
+    /// Most-recently-decrypted sealed chunk: `(chunk_id, plaintext)`.
+    /// At-rest reads decrypt the WHOLE chunk (up to 32 MiB CDC / 128 MiB
+    /// fixed) to slice one block out, so a sequential restore would
+    /// re-read + re-GCM-decrypt the same chunk once per block — up to
+    /// ~512x read+decrypt amplification (issue #155). Tape reads are
+    /// sequential, so caching just the last decrypted chunk turns that
+    /// back into one decrypt per chunk. Sealed chunks are immutable, so
+    /// the (id, plaintext) pairing never needs invalidation; the
+    /// unsealed staging chunk takes the plaintext branch and is never
+    /// cached here.
+    last_decrypted_chunk: Option<(u64, Arc<Vec<u8>>)>,
     /// Per-backend ghost list of recently-evicted chunk hashes. When
     /// set, the cache-miss path consults it before each backend GET
     /// and records the eviction age (now - evicted_at) into the
@@ -1228,6 +1239,7 @@ impl Cartridge {
             early_warning_reported: false,
             at_rest_dek,
             is_view_handle: false,
+            last_decrypted_chunk: None,
             ghost_list: None,
         };
         // Write manifest.json first (identity), then runtime.json. Both
@@ -1270,8 +1282,13 @@ impl Cartridge {
             ));
         }
         let partition_count = runtime.partitions.len();
-        let (cur_chunk_id, cur_chunk, cur_file) =
-            Self::resume_or_create_active(&root, partition_count, &chunk_index, &lru_index)?;
+        let (cur_chunk_id, cur_chunk, cur_file) = Self::resume_or_create_active(
+            &root,
+            partition_count,
+            &chunk_index,
+            &lru_index,
+            view_only,
+        )?;
         // Bring lru.idx in lockstep with chunks.idx: cold-start restore
         // (where chunks.idx came from storage and lru.idx is freshly
         // empty) needs zero-fill up to next_id.
@@ -1306,6 +1323,7 @@ impl Cartridge {
             early_warning_reported: false,
             at_rest_dek,
             is_view_handle: view_only,
+            last_decrypted_chunk: None,
             ghost_list: None,
         })
     }
@@ -1413,16 +1431,24 @@ impl Cartridge {
         // refuses with a clear error and the next open path can
         // re-restore.
         let tmp = manifest_path.with_extension("json.tmp");
-        let mut f = File::create(&tmp)?;
-        f.write_all(manifest_json.as_bytes())?;
-        f.flush()?;
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(manifest_json.as_bytes())?;
+            // fsync data before rename (issue #157).
+            f.sync_all()?;
+        }
         fs::rename(tmp, &manifest_path)?;
         let runtime_path = Runtime::path_for(root);
         let tmp = runtime_path.with_extension("json.tmp");
-        let mut f = File::create(&tmp)?;
-        f.write_all(runtime_json.as_bytes())?;
-        f.flush()?;
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(runtime_json.as_bytes())?;
+            f.sync_all()?;
+        }
         fs::rename(tmp, &runtime_path)?;
+        if let Ok(dir) = File::open(root) {
+            let _ = dir.sync_all();
+        }
         tracing::info!("Restored manifest + runtime from storage to local files");
         let m: Manifest = serde_json::from_str(&manifest_json)?;
         let r: Runtime = serde_json::from_str(&runtime_json)?;
@@ -1449,6 +1475,7 @@ impl Cartridge {
         partition_count: usize,
         chunk_index: &ChunkIndexFile,
         lru_index: &LruIndexFile,
+        view_only: bool,
     ) -> Result<(u64, ChunkRec, File)> {
         let last_id = chunk_index
             .next_id()
@@ -1460,21 +1487,40 @@ impl Cartridge {
             // reconcile its size with the block-index files.
             let true_size = Self::recovered_chunk_size(root, partition_count, last_id)?;
             let staging = staging_path(root, last_id);
-            // Truncate any trailing torn-write bytes so the staging
-            // file contains exactly the bytes the block-index records
-            // say it does.
-            let cur_len = std::fs::metadata(&staging).map(|md| md.len()).unwrap_or(0);
-            if cur_len > true_size {
-                let f = OpenOptions::new().write(true).open(&staging)?;
-                f.set_len(true_size)?;
+            // The truncate + chunk-index overwrite below are crash
+            // recovery, valid ONLY on the owning primary open. A
+            // view-only handle (the upload worker, eviction) can open
+            // while a drive-side primary is mid-write: `write_data`
+            // appends the staging bytes BEFORE the block-index record,
+            // so there is a per-WRITE window where the file is longer
+            // than `true_size`. Running the reconcile then would
+            // `set_len` the primary's just-written block back out of the
+            // file — the primary's O_APPEND fd then writes the next
+            // block at the shortened EOF while its in-memory size still
+            // counts the lost bytes, desyncing every subsequent block's
+            // recorded offset — and `chunk_index.overwrite` would
+            // violate ChunkIndexFile's single-writer invariant (issue
+            // #154). Skip both on view-only opens.
+            if !view_only {
+                // Truncate any trailing torn-write bytes so the staging
+                // file contains exactly the bytes the block-index
+                // records say it does.
+                let cur_len = std::fs::metadata(&staging).map(|md| md.len()).unwrap_or(0);
+                if cur_len > true_size {
+                    let f = OpenOptions::new().write(true).open(&staging)?;
+                    f.set_len(true_size)?;
+                }
             }
             let f = open_staging_for_append(&staging)?;
-            // Sync the size into the in-memory chunk and persist it
-            // back to chunk_index so subsequent reads see the
-            // reconciled size.
+            // Sync the size into the in-memory chunk (this handle's view
+            // only). The owning primary also persists it back to
+            // chunk_index so future opens see the reconciled size; a
+            // view handle must not write the shared index.
             let mut last = last;
             last.size = true_size;
-            chunk_index.overwrite(last_id, &last)?;
+            if !view_only {
+                chunk_index.overwrite(last_id, &last)?;
+            }
             return Ok((last_id, last, f));
         }
         // All chunks sealed — create a fresh staging chunk for future writes.
@@ -1585,10 +1631,20 @@ impl Cartridge {
     pub fn persist_identity(&mut self) -> Result<()> {
         let tmp = self.root.join("manifest.json.tmp");
         let finalp = self.root.join("manifest.json");
-        let mut f = std::io::BufWriter::with_capacity(64 * 1024, File::create(&tmp)?);
-        serde_json::to_writer(&mut f, &self.manifest)?;
-        f.flush()?;
+        {
+            let mut f = std::io::BufWriter::with_capacity(64 * 1024, File::create(&tmp)?);
+            serde_json::to_writer(&mut f, &self.manifest)?;
+            f.flush()?;
+            // fsync the data before the rename so a power loss can't
+            // leave a zero-length / torn manifest.json (issue #157).
+            f.into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
+        }
         fs::rename(tmp, finalp)?;
+        if let Ok(dir) = File::open(&self.root) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -2059,21 +2115,33 @@ impl Cartridge {
     /// falls back to the original seek-into-File path with no extra
     /// allocation.
     fn read_chunk_slice(
-        &self,
+        &mut self,
         chunk_id: u64,
         chunk: &ChunkRec,
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
         match (self.at_rest_dek, chunk.hash.as_deref()) {
-            // Sealed and encrypted: decrypt the whole chunk, slice.
+            // Sealed and encrypted: decrypt the whole chunk, slice. A
+            // one-entry cache of the last decrypted chunk turns a
+            // sequential restore's per-block re-decrypt of the same
+            // chunk into one decrypt per chunk (issue #155); sealed
+            // chunks are immutable so a cache hit needs no validation.
             (Some(dek), Some(_)) => {
-                let mut f = self.open_chunk_for_read(chunk_id, chunk)?;
-                let mut ciphertext = Vec::with_capacity(chunk.size as usize + 16);
-                f.read_to_end(&mut ciphertext)?;
-                let iv = derive_iv(&self.manifest.uuid, chunk_id, 0);
-                let plaintext = shared_crypto::decrypt_block(&dek, &iv, &ciphertext)
-                    .map_err(|e| SmcError::EncryptionError(e.to_string()))?;
+                let plaintext = match &self.last_decrypted_chunk {
+                    Some((cached_id, pt)) if *cached_id == chunk_id => Arc::clone(pt),
+                    _ => {
+                        let mut f = self.open_chunk_for_read(chunk_id, chunk)?;
+                        let mut ciphertext = Vec::with_capacity(chunk.size as usize + 16);
+                        f.read_to_end(&mut ciphertext)?;
+                        let iv = derive_iv(&self.manifest.uuid, chunk_id, 0);
+                        let pt = shared_crypto::decrypt_block(&dek, &iv, &ciphertext)
+                            .map_err(|e| SmcError::EncryptionError(e.to_string()))?;
+                        let pt = Arc::new(pt);
+                        self.last_decrypted_chunk = Some((chunk_id, Arc::clone(&pt)));
+                        pt
+                    }
+                };
                 let end = (offset as usize).saturating_add(len);
                 if end > plaintext.len() {
                     // The slice bounds come from the persisted block
@@ -2347,10 +2415,19 @@ impl Cartridge {
         };
         m.encryption = new_meta;
         let tmp = cart_root.join("manifest.json.tmp");
-        let mut f = std::io::BufWriter::with_capacity(64 * 1024, File::create(&tmp)?);
-        serde_json::to_writer(&mut f, &m)?;
-        f.flush()?;
-        fs::rename(tmp, manifest_path)?;
+        {
+            let mut f = std::io::BufWriter::with_capacity(64 * 1024, File::create(&tmp)?);
+            serde_json::to_writer(&mut f, &m)?;
+            f.flush()?;
+            // fsync data before rename (issue #157).
+            f.into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
+        }
+        fs::rename(tmp, &manifest_path)?;
+        if let Ok(dir) = File::open(&cart_root) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
     /// Whether the cartridge's volatile legal-hold flag is on. Snapshot
@@ -3027,11 +3104,23 @@ impl Cartridge {
                     }
                 }
             }
-            if moved == 0 {
+            // If the walk reached BOP before crossing the requested
+            // number of filemarks (`moved > n`, since both are <= 0 and
+            // `moved` never reached `n`), the medium terminated motion at
+            // beginning-of-partition. SSC-4 §7.5 requires the head to be
+            // AT BOP then, and the SCSI layer reports CHECK CONDITION /
+            // NO SENSE / 00-04 (BOP detected) with a residual, telling
+            // the host its position is file 0 / block 0. Leaving the head
+            // mid-tape — at the last crossed filemark, or unchanged when
+            // none were crossed (the old `moved == 0` early return) —
+            // desyncs that model and hands the next READ the wrong record
+            // (issue #156). Snap to BOP.
+            if moved > n {
+                self.head_lba = 0;
                 return Ok(moved);
             }
-            // SSC-4 §7.5: after a backward SPACE FILEMARKS, the logical
-            // position is "immediately before the |count|-th filemark in
+            // Exact count reached (`moved == n`): SSC-4 §7.5 positions the
+            // logical head "immediately before the |count|-th filemark in
             // the direction of motion" — i.e. AT the filemark itself, not
             // the block beyond it. Putting head_lba at the FM means a
             // subsequent forward SPACE FILEMARKS 1 re-crosses the same
@@ -3708,6 +3797,73 @@ mod space_then_write_repro {
         );
     }
 
+    /// Issue #154: a view-only open (upload worker / eviction) must NOT
+    /// run the crash-recovery reconcile — truncating the staging file or
+    /// overwriting the chunk_index record. Those steps are valid only on
+    /// the owning primary open; a view handle landing in the per-WRITE
+    /// window where the staging file is longer than the block-index says
+    /// would chop the primary's just-written bytes out from under its
+    /// live O_APPEND fd. A subsequent primary open still reconciles.
+    #[test]
+    fn view_only_open_does_not_truncate_live_staging() {
+        let tmp = TempDir::new().unwrap();
+        let tapes = tmp.path().join("tapes");
+        let root = tapes.join("SPACE01");
+        {
+            let mut primary = make_cart(&tmp);
+            // 100 < 4096 fixed chunk size, so chunk 0 stays the unsealed
+            // trailing staging chunk.
+            primary.write_data(Bytes::from(vec![0x7Eu8; 100])).unwrap();
+            // Leave it unsealed on disk (mimic a live primary mid-write):
+            // skip Drop's flush_and_seal.
+            std::mem::forget(primary);
+        }
+        // Mimic the mid-WRITE window: staging bytes appended before the
+        // block-index record, so the file is longer than the recorded
+        // chunk size.
+        let staging = staging_path(&root, 0);
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&staging)
+                .unwrap();
+            f.write_all(&[0xFFu8; 50]).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&staging).unwrap().len(), 150);
+
+        // View-only open must leave the staging file untouched.
+        let view = Cartridge::open_with(
+            &tapes,
+            "SPACE01",
+            CartridgeOpenMode::Open,
+            CartridgeOpenOptions::new().with_view_only(),
+        )
+        .unwrap();
+        assert!(view.is_view_handle);
+        assert_eq!(
+            std::fs::metadata(&staging).unwrap().len(),
+            150,
+            "view-only open must not truncate the live staging file"
+        );
+        std::mem::forget(view);
+
+        // A primary (owning) open DOES reconcile: truncate to 100.
+        let primary = Cartridge::open_with(
+            &tapes,
+            "SPACE01",
+            CartridgeOpenMode::Open,
+            CartridgeOpenOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&staging).unwrap().len(),
+            100,
+            "primary open reconciles the torn-write tail"
+        );
+        std::mem::forget(primary);
+    }
+
     /// Issue #116: under an ALLOW OVERWRITE barrier a mid-span write must
     /// overwrite the record at the head in place (LTFS index rewrite), not
     /// append at EOD leaving the head's old block readable and the
@@ -4031,6 +4187,46 @@ mod space_walk_hardening {
         assert_eq!(cart.space_filemarks(-1).unwrap(), -1);
         assert_eq!(cart.head_lba(), n_before);
     }
+
+    /// Issue #156: a backward SPACE FILEMARKS that exhausts the tape
+    /// before crossing the requested count must leave the head at BOP
+    /// (LBA 0) — matching the 00/04 BOP sense the SCSI layer reports to
+    /// the host. Leaving it at the last crossed filemark desyncs the
+    /// host's file/block position model.
+    #[test]
+    fn backward_space_filemarks_short_of_count_parks_at_bop() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        // R R R FM R R R — exactly one filemark, at LBA 3.
+        for _ in 0..3 {
+            cart.write_data(Bytes::from(vec![0xAB; 16])).unwrap();
+        }
+        cart.write_filemark().unwrap();
+        for _ in 0..3 {
+            cart.write_data(Bytes::from(vec![0xCD; 16])).unwrap();
+        }
+        // From LBA 6, ask for 2 filemarks backward — only 1 exists.
+        cart.locate(6).unwrap();
+        let moved = cart.space_filemarks(-2).unwrap();
+        assert_eq!(moved, -1, "crossed the only filemark");
+        assert_eq!(cart.head_lba(), 0, "terminating at BOP parks head at LBA 0");
+    }
+
+    /// Issue #156: backward SPACE FILEMARKS over a tape with no
+    /// filemarks at all walks to BOP and parks there, rather than
+    /// leaving the head at its original mid-tape position.
+    #[test]
+    fn backward_space_filemarks_no_filemark_parks_at_bop() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        for _ in 0..3 {
+            cart.write_data(Bytes::from(vec![0xAB; 16])).unwrap();
+        }
+        cart.locate(2).unwrap();
+        let moved = cart.space_filemarks(-1).unwrap();
+        assert_eq!(moved, 0, "no filemark crossed");
+        assert_eq!(cart.head_lba(), 0, "head snaps to BOP");
+    }
 }
 
 #[cfg(test)]
@@ -4201,5 +4397,63 @@ mod prefetch_window_tests {
         let tmp = TempDir::new().unwrap();
         let cart = multi_chunk_cart(&tmp);
         assert!(cart.peek_prefetch_window(0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod at_rest_decrypt_cache {
+    //! Issue #155: at-rest encrypted reads decrypt the WHOLE chunk to
+    //! slice one block out. A one-entry cache of the last decrypted
+    //! chunk turns a sequential restore's per-block re-decrypt into one
+    //! decrypt per chunk; this verifies the cached path returns
+    //! identical bytes and that the cache is populated.
+    use super::*;
+    use bytes::Bytes;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sequential_reads_in_one_chunk_hit_the_decrypt_cache() {
+        let tmp = TempDir::new().unwrap();
+        let tapes = tmp.path().join("tapes");
+        let at_rest = AtRestCreateParams {
+            uuid: [7u8; 16],
+            meta: CartridgeEncryptionMeta {
+                algorithm: CartridgeEncryptionAlgorithm::Aes256Gcm,
+                keystore_backend: "local".into(),
+                wrapped_dek: None,
+            },
+            plain_dek: [0x42u8; shared_crypto::KEY_LEN],
+        };
+        let mut cart = Cartridge::create_with_chunking_and_at_rest(
+            &tapes,
+            "ENC01",
+            ChunkingMode::Fixed { size_bytes: 4096 },
+            8,
+            "primary",
+            false,
+            DedupScope::Global,
+            Some(at_rest),
+        )
+        .expect("create at-rest cartridge");
+
+        // Two 2 KiB records fill chunk 0 (4 KiB) and roll it; seal.
+        let a = vec![0xA1u8; 2048];
+        let b = vec![0xB2u8; 2048];
+        cart.write_data(Bytes::from(a.clone())).unwrap(); // LBA 0
+        cart.write_data(Bytes::from(b.clone())).unwrap(); // LBA 1 (rolls chunk 0)
+        cart.flush_and_seal().unwrap();
+
+        // First read decrypts chunk 0 and caches it.
+        let b0 = cart.read_block(0).unwrap();
+        assert_eq!(b0.data.as_ref(), &a[..]);
+        assert!(
+            matches!(cart.last_decrypted_chunk, Some((0, _))),
+            "first at-rest read must populate the decrypt cache"
+        );
+
+        // Second read of the same chunk is a cache hit and must return
+        // identical plaintext.
+        let b1 = cart.read_block(1).unwrap();
+        assert_eq!(b1.data.as_ref(), &b[..]);
     }
 }

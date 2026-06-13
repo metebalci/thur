@@ -179,8 +179,15 @@ impl Runtime {
         }
     }
 
-    /// Atomic write: tmp + fsync + rename, matching the manifest
-    /// persistence pattern in `Cartridge::persist_runtime`.
+    /// Atomic write: tmp + fsync + rename + parent-dir fsync, matching
+    /// the persistence pattern in `scsi_spc::reservations`. The tempfile
+    /// data MUST be fsync'd before the rename: otherwise the rename's
+    /// directory update can become durable before the new file's data
+    /// pages, leaving a zero-length or torn `runtime.json` on power loss
+    /// (XFS / btrfs / ext4 noauto_da_alloc). `Runtime::load` hard-errors
+    /// on a torn file, which would make the cartridge unopenable — and
+    /// this runs at every LOCATE / MODE SELECT / manifest-backup
+    /// boundary (issue #157).
     pub fn persist(&self, root: &Path) -> Result<()> {
         let tmp = root.join("runtime.json.tmp");
         let finalp = root.join(Self::FILENAME);
@@ -188,8 +195,14 @@ impl Runtime {
             let mut f = std::io::BufWriter::with_capacity(64 * 1024, File::create(&tmp)?);
             serde_json::to_writer(&mut f, self)?;
             f.flush()?;
+            f.into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
         }
         fs::rename(tmp, finalp)?;
+        if let Ok(dir) = File::open(root) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
