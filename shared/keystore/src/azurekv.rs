@@ -59,6 +59,14 @@ struct WrappedEnvelope {
     v: u8,
     uuid: String,
     ct: String,
+    /// KV key VERSION the ciphertext was wrapped under (the `kid`'s
+    /// trailing segment). KV RSA ciphertext carries no key metadata, so
+    /// unwrap MUST target this exact version — a KEK rotation moves
+    /// "latest" and would otherwise strand every existing blob (issue
+    /// #137). Absent on pre-fix v1 envelopes; those fall back to the
+    /// configured version on unwrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kv: Option<String>,
 }
 
 /// Azure Key Vault-backed keystore. The DEK never appears on the Thur
@@ -136,11 +144,18 @@ impl AzureKvBackend {
     /// Build the JSON envelope that binds the wrapped ciphertext to
     /// `wrap_context`. Crate-internal so the unit tests can
     /// hand-craft envelopes for the context-mismatch check.
-    pub(crate) fn build_envelope(wrap_context: &[u8; 16], ct: &[u8]) -> Vec<u8> {
+    pub(crate) fn build_envelope(
+        wrap_context: &[u8; 16],
+        ct: &[u8],
+        key_version: Option<&str>,
+    ) -> Vec<u8> {
         let envelope = WrappedEnvelope {
             v: ENVELOPE_VERSION,
             uuid: hex::encode(wrap_context),
             ct: B64.encode(ct),
+            kv: key_version
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string()),
         };
         // `serde_json::to_vec` only fails on a `Serializer` IO error;
         // a `Vec<u8>` sink can't fail. Fall back to an empty buffer if
@@ -162,11 +177,12 @@ impl AzureKvBackend {
     }
 
     /// Parse an envelope and verify it was bound to `wrap_context`.
-    /// Returns the inner ciphertext bytes (the raw KV wrap output).
+    /// Returns `(ciphertext, key_version)` — `key_version` is the KV
+    /// version the blob was wrapped under (`None` on a pre-fix envelope).
     pub(crate) fn parse_envelope(
         wrap_context: &[u8; 16],
         wrapped: &[u8],
-    ) -> Result<Vec<u8>, KeyStoreError> {
+    ) -> Result<(Vec<u8>, Option<String>), KeyStoreError> {
         let envelope: WrappedEnvelope = serde_json::from_slice(wrapped).map_err(|e| {
             KeyStoreError::Other(format!(
                 "azurekv: wrapped_dek does not parse as a v1 JSON envelope: {e}"
@@ -186,8 +202,10 @@ impl AzureKvBackend {
                 envelope.uuid, expected
             )));
         }
-        B64.decode(envelope.ct.as_bytes())
-            .map_err(|e| KeyStoreError::Other(format!("azurekv: envelope ct base64 decode: {e}")))
+        let ct = B64.decode(envelope.ct.as_bytes()).map_err(|e| {
+            KeyStoreError::Other(format!("azurekv: envelope ct base64 decode: {e}"))
+        })?;
+        Ok((ct, envelope.kv))
     }
 }
 
@@ -221,7 +239,7 @@ impl KeyStoreBackend for AzureKvBackend {
         wrap_context: &[u8; 16],
         plaintext: &SecretBytes,
     ) -> Result<Vec<u8>, KeyStoreError> {
-        let ct = self
+        let (ct, resolved_version) = self
             .api
             .wrap_key(
                 &self.key_name,
@@ -229,7 +247,18 @@ impl KeyStoreBackend for AzureKvBackend {
                 plaintext.as_bytes().to_vec(),
             )
             .await?;
-        Ok(Self::build_envelope(wrap_context, &ct))
+        // Record the version KV actually used so unwrap survives a later
+        // KEK rotation (issue #137). Fall back to the configured version
+        // if the response carried no `kid`.
+        let version = resolved_version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .or(if self.key_version.is_empty() {
+                None
+            } else {
+                Some(self.key_version.as_str())
+            });
+        Ok(Self::build_envelope(wrap_context, &ct, version))
     }
 
     async fn unwrap(
@@ -237,10 +266,16 @@ impl KeyStoreBackend for AzureKvBackend {
         wrap_context: &[u8; 16],
         wrapped: &[u8],
     ) -> Result<SecretBytes, KeyStoreError> {
-        let ct = Self::parse_envelope(wrap_context, wrapped)?;
+        let (ct, env_version) = Self::parse_envelope(wrap_context, wrapped)?;
+        // Unwrap against the version the blob was wrapped under, NOT the
+        // statically-configured version — a KEK rotation moves "latest"
+        // and the configured value would point at the wrong private key
+        // (issue #137). Pre-fix envelopes (no recorded version) fall back
+        // to the configured version, preserving the old behavior.
+        let version = env_version.as_deref().unwrap_or(&self.key_version);
         let plain = self
             .api
-            .unwrap_key(&self.key_name, &self.key_version, ct)
+            .unwrap_key(&self.key_name, version, ct)
             .await?;
         if plain.len() != DEK_LEN {
             return Err(KeyStoreError::Other(format!(
@@ -294,18 +329,36 @@ mod tests {
     fn envelope_round_trips_with_correct_uuid() {
         let uuid = fixture_uuid();
         let ct = b"\x01\x02\x03kv-wrapped-blob";
-        let env = AzureKvBackend::build_envelope(&uuid, ct);
-        let back = AzureKvBackend::parse_envelope(&uuid, &env).expect("round-trip");
+        let env = AzureKvBackend::build_envelope(&uuid, ct, Some("v7"));
+        let (back, version) = AzureKvBackend::parse_envelope(&uuid, &env).expect("round-trip");
         assert_eq!(back, ct);
+        assert_eq!(version.as_deref(), Some("v7"), "key version round-trips");
     }
 
     #[test]
     fn envelope_carries_volume_uuid_hex() {
         let uuid = fixture_uuid();
-        let env = AzureKvBackend::build_envelope(&uuid, b"x");
+        let env = AzureKvBackend::build_envelope(&uuid, b"x", None);
         let parsed: WrappedEnvelope = serde_json::from_slice(&env).expect("parse");
         assert_eq!(parsed.v, ENVELOPE_VERSION);
         assert_eq!(parsed.uuid, "ab".repeat(16));
+        assert_eq!(parsed.kv, None);
+    }
+
+    #[test]
+    fn pre_fix_envelope_without_version_parses() {
+        // A v1 envelope written before issue #137 (no `kv` field) must
+        // still parse, with version None (unwrap falls back to config).
+        let uuid = fixture_uuid();
+        let legacy = serde_json::json!({
+            "v": ENVELOPE_VERSION,
+            "uuid": hex::encode(uuid),
+            "ct": B64.encode(b"legacy"),
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let (ct, version) = AzureKvBackend::parse_envelope(&uuid, &bytes).expect("parse legacy");
+        assert_eq!(ct, b"legacy");
+        assert_eq!(version, None);
     }
 
     #[test]
@@ -318,7 +371,7 @@ mod tests {
         // ops itself).
         let uuid_a = [0x01u8; 16];
         let uuid_b = [0x02u8; 16];
-        let env = AzureKvBackend::build_envelope(&uuid_a, b"x");
+        let env = AzureKvBackend::build_envelope(&uuid_a, b"x", None);
         let err = AzureKvBackend::parse_envelope(&uuid_b, &env).expect_err("must reject");
         match err {
             KeyStoreError::Authz(_) => {}
@@ -332,6 +385,7 @@ mod tests {
             v: ENVELOPE_VERSION + 1,
             uuid: hex::encode(fixture_uuid()),
             ct: B64.encode(b"x"),
+            kv: None,
         })
         .expect("encode bad-version envelope");
         let err = AzureKvBackend::parse_envelope(&fixture_uuid(), &bad).expect_err("must reject");
@@ -350,6 +404,7 @@ mod tests {
             v: ENVELOPE_VERSION,
             uuid: hex::encode(fixture_uuid()),
             ct: "!!!not base64!!!".into(),
+            kv: None,
         })
         .expect("encode");
         let err = AzureKvBackend::parse_envelope(&fixture_uuid(), &bad).expect_err("must reject");
@@ -413,6 +468,8 @@ mod tests {
     #[derive(Default, Debug)]
     struct MockAzureKvApi {
         wrap_outcomes: Mutex<Vec<Result<Vec<u8>, KeyStoreError>>>,
+        /// Version `wrap_key` reports back (the resolved `kid` segment).
+        wrap_version: Mutex<Option<String>>,
         unwrap_outcomes: Mutex<Vec<Result<Vec<u8>, KeyStoreError>>>,
         get_outcomes: Mutex<Vec<Result<(), KeyStoreError>>>,
 
@@ -444,14 +501,16 @@ mod tests {
             key_name: &str,
             key_version: &str,
             plaintext: Vec<u8>,
-        ) -> Result<Vec<u8>, KeyStoreError> {
+        ) -> Result<(Vec<u8>, Option<String>), KeyStoreError> {
             self.wrap_calls.fetch_add(1, Ordering::SeqCst);
             self.captured_wrap.lock().expect("cap").push((
                 key_name.to_string(),
                 key_version.to_string(),
                 plaintext,
             ));
-            Self::pop_or(&self.wrap_outcomes, || Ok(b"kv-ciphertext".to_vec()))
+            let ct = Self::pop_or(&self.wrap_outcomes, || Ok(b"kv-ciphertext".to_vec()))?;
+            let version = self.wrap_version.lock().map(|g| g.clone()).unwrap_or(None);
+            Ok((ct, version))
         }
         async fn unwrap_key(
             &self,
@@ -544,13 +603,36 @@ mod tests {
         let plain = SecretBytes::new([0x33u8; DEK_LEN]);
         let envelope = b.wrap(&ctx, &plain).await.expect("wrap");
         // Envelope decodes back to the canned KV ciphertext.
-        let inner = AzureKvBackend::parse_envelope(&ctx, &envelope).expect("parse");
+        let (inner, _version) = AzureKvBackend::parse_envelope(&ctx, &envelope).expect("parse");
         assert_eq!(inner, b"kv-ciphertext");
         let captured = api.captured_wrap.lock().expect("cap").clone();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, FIXTURE_KEY);
         assert_eq!(captured[0].1, "");
         assert_eq!(captured[0].2, vec![0x33u8; DEK_LEN]);
+    }
+
+    #[tokio::test]
+    async fn unwrap_targets_wrapped_version_not_config() {
+        // #137: the version KV used at wrap time is recorded in the
+        // envelope; unwrap must target THAT version, not the configured
+        // "latest" — otherwise a KEK rotation strands the ciphertext.
+        let api = Arc::new(MockAzureKvApi::default());
+        *api.wrap_version.lock().unwrap() = Some("v-wrapped".to_string());
+        {
+            let mut g = api.unwrap_outcomes.lock().expect("queue");
+            g.push(Ok(vec![0x66u8; DEK_LEN]));
+        }
+        let b = backend_latest(api.clone()); // configured version = "" (latest)
+        let ctx = fixture_uuid();
+        let plain = SecretBytes::new([0x33u8; DEK_LEN]);
+        let envelope = b.wrap(&ctx, &plain).await.expect("wrap");
+        b.unwrap(&ctx, &envelope).await.expect("unwrap");
+        let captured = api.captured_unwrap.lock().expect("cap").clone();
+        assert_eq!(
+            captured[0].1, "v-wrapped",
+            "unwrap must target the version recorded at wrap, not the configured latest"
+        );
     }
 
     #[tokio::test]
@@ -563,7 +645,7 @@ mod tests {
         }
         let b = backend_latest(api.clone());
         let ctx = fixture_uuid();
-        let envelope = AzureKvBackend::build_envelope(&ctx, b"opaque-kv-ciphertext");
+        let envelope = AzureKvBackend::build_envelope(&ctx, b"opaque-kv-ciphertext", None);
         let plain = b.unwrap(&ctx, &envelope).await.expect("unwrap");
         assert_eq!(plain.as_bytes(), &[0x55u8; DEK_LEN][..]);
         let captured = api.captured_unwrap.lock().expect("cap").clone();
@@ -577,7 +659,7 @@ mod tests {
         // be caught locally.
         let api = Arc::new(MockAzureKvApi::default());
         let b = backend_latest(api.clone());
-        let envelope = AzureKvBackend::build_envelope(&[0x01u8; 16], b"ct");
+        let envelope = AzureKvBackend::build_envelope(&[0x01u8; 16], b"ct", None);
         let err = b
             .unwrap(&[0x02u8; 16], &envelope)
             .await
@@ -595,7 +677,7 @@ mod tests {
         }
         let b = backend_latest(api);
         let ctx = fixture_uuid();
-        let envelope = AzureKvBackend::build_envelope(&ctx, b"ct");
+        let envelope = AzureKvBackend::build_envelope(&ctx, b"ct", None);
         let err = b.unwrap(&ctx, &envelope).await.expect_err("must reject");
         assert!(matches!(err, KeyStoreError::Other(_)));
     }
@@ -626,7 +708,7 @@ mod tests {
             .expect("gen+wrap");
         assert_eq!(plain.as_bytes().len(), DEK_LEN);
         // Wrapped is a JSON envelope; can be parsed back with the same ctx.
-        let inner = AzureKvBackend::parse_envelope(&ctx, &wrapped).expect("parse");
+        let (inner, _version) = AzureKvBackend::parse_envelope(&ctx, &wrapped).expect("parse");
         assert_eq!(inner, b"kv-ciphertext");
         assert_eq!(api.wrap_calls.load(Ordering::SeqCst), 1);
     }

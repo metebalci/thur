@@ -41,12 +41,17 @@ const RSA_OAEP_256: EncryptionAlgorithm = EncryptionAlgorithm::RsaOaep256;
 /// `azure_security_keyvault_keys` SDK.
 #[async_trait]
 pub(crate) trait AzureKvApi: Send + Sync + std::fmt::Debug {
+    /// Wrap `plaintext` and return `(ciphertext, resolved_version)`.
+    /// `resolved_version` is the version segment of the `kid` the vault
+    /// actually used (KV resolves an empty/`latest` request to a concrete
+    /// version); the caller persists it so a later KEK rotation can't
+    /// strand the ciphertext against the wrong private key (issue #137).
     async fn wrap_key(
         &self,
         key_name: &str,
         key_version: &str,
         plaintext: Vec<u8>,
-    ) -> Result<Vec<u8>, KeyStoreError>;
+    ) -> Result<(Vec<u8>, Option<String>), KeyStoreError>;
     async fn unwrap_key(
         &self,
         key_name: &str,
@@ -125,7 +130,7 @@ impl AzureKvApi for RealAzureKvApi {
         key_name: &str,
         key_version: &str,
         plaintext: Vec<u8>,
-    ) -> Result<Vec<u8>, KeyStoreError> {
+    ) -> Result<(Vec<u8>, Option<String>), KeyStoreError> {
         let params = KeyOperationParameters {
             algorithm: Some(RSA_OAEP_256),
             value: Some(plaintext),
@@ -142,9 +147,20 @@ impl AzureKvApi for RealAzureKvApi {
         let result = response
             .into_model()
             .map_err(|e| classify_azure_kv_err("azurekv.wrapKey parse", e))?;
-        result.result.ok_or_else(|| {
+        // The `kid` is the full versioned key URL
+        // (https://vault/keys/<name>/<version>); keep its trailing
+        // version segment so unwrap can target this exact key version
+        // even after a KEK rotation moved "latest" (issue #137).
+        let version = result
+            .kid
+            .as_deref()
+            .and_then(|kid| kid.rsplit('/').next())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        let ct = result.result.ok_or_else(|| {
             KeyStoreError::Other("azurekv.wrapKey returned no `result` field".into())
-        })
+        })?;
+        Ok((ct, version))
     }
 
     async fn unwrap_key(

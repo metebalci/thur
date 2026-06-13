@@ -705,6 +705,32 @@ pub async fn cmd_key_migrate(
         .await
         .map_err(|e| anyhow!("wrap via new backend '{to}': {e}"))?;
 
+    // Verify the new backend can UNWRAP the blob it just produced BEFORE
+    // overwriting the manifest — for a remote source the manifest's
+    // wrapped_dek is the only persisted copy of the DEK ciphertext, and
+    // wrap (Encrypt) / unwrap (Decrypt) are separately permissioned on
+    // every remote backend. A token that can encrypt but not decrypt
+    // would let wrap succeed and leave the DEK permanently unrecoverable
+    // once the old blob is gone (issue #147). Abort here keeps the
+    // existing binding intact.
+    let verify_dek = new_backend
+        .unwrap(&manifest.dek_uuid(), &wrapped_out)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "verify-unwrap via new backend '{to}' failed: {e}. Migration NOT applied; the \
+                 existing DEK binding is unchanged. The new backend must grant BOTH wrap and \
+                 unwrap (e.g. KMS Encrypt+Decrypt, Vault transit encrypt+decrypt, KV \
+                 wrapKey+unwrapKey)."
+            )
+        })?;
+    if verify_dek.as_bytes() != plain_dek.as_bytes() {
+        bail!(
+            "verify failed: new backend '{to}' unwrapped a DEK that does not match the \
+             original. Migration NOT applied; the existing DEK binding is unchanged."
+        );
+    }
+
     // Build the updated manifest. For backends that own their
     // sidecar (just `local` today) the wrapped blob is empty and
     // wrapped_dek stays `None`; for everything else we base64 it

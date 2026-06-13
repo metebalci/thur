@@ -305,15 +305,26 @@ Key Vault ciphertext in an explicit envelope before persisting
 `wrapped_dek`:
 
 ```json
-{ "v": 1, "uuid": "<volume_uuid_hex>", "ct": "<base64-of-kv-output>" }
+{ "v": 1, "uuid": "<volume_uuid_hex>", "ct": "<base64-of-kv-output>", "kv": "<key-version>" }
 ```
 
 Here `uuid` is the lowercase-hex volume UUID. On unwrap the daemon
 parses the envelope and refuses with `KeyStoreError::Authz` if `uuid`
 does not match the call's `volume_uuid`. This envelope is itself
 stored inside the manifest's base64-encoded `wrapped_dek`, so the
-on-disk shape is base64-of-JSON-containing-base64. The whole scheme
-costs roughly 80 extra bytes per manifest.
+on-disk shape is base64-of-JSON-containing-base64.
+
+`kv` is the **KEK version** the ciphertext was wrapped under — the
+trailing segment of the `kid` Key Vault returns from `wrapKey`. RSA
+ciphertext carries no key metadata, so unwrap must target the exact
+version that produced it; the daemon passes `kv` to `unwrapKey` rather
+than the statically-configured (possibly `latest`) version. Without
+this, a KEK rotation — including Azure KV's auto-rotation — would move
+`latest` to a new version and make every existing wrapped DEK
+un-unwrappable. The field is optional: envelopes written before this
+behavior shipped have no `kv` and fall back to the configured version
+on unwrap (the pre-rotation default). The whole scheme costs roughly
+80–100 extra bytes per manifest.
 
 #### KMIP-specific envelope (`kmip`)
 
