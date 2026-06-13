@@ -781,7 +781,7 @@ pub(super) async fn extended_copy(
     match sa {
         0x00 => extended_copy_lid1(req, registry, nexus, reservations).await,
         0x01 => extended_copy_lid4(req, registry, nexus, reservations).await,
-        0x10 => populate_token(req, registry, nexus, tokens).await,
+        0x10 => populate_token(req, registry, nexus, reservations, tokens).await,
         0x11 => write_using_token(req, registry, nexus, reservations, tokens).await,
         0x12 => cancel_rod_token(req, tokens),
         _ => ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB),
@@ -1072,12 +1072,19 @@ fn resolve_targets_and_plan(
     // means a malformed segment N never half-commits a successful
     // segment N-1.
     for seg in &planned {
-        let (_src_lun, src_cache) = &targets[seg.src_idx];
+        let (src_lun, src_cache) = &targets[seg.src_idx];
         let (dst_lun, dst_cache) = &targets[seg.dst_idx];
         if dst_cache.manifest().worm {
             return Err(ExtendedCopyParseError::Sense(SenseData::WRITE_PROTECTED));
         }
         if !reservations.allow_write(*dst_lun, nexus) {
+            return Err(ExtendedCopyParseError::ReservationConflict);
+        }
+        // Honor a read reservation on the SOURCE too: a non-holder must
+        // not copy a reserved LU's data to another LUN via XCOPY
+        // (issue #183) — the copy manager respects the source's
+        // reservation exactly as a plain READ would.
+        if !reservations.allow_read(*src_lun, nexus) {
             return Err(ExtendedCopyParseError::ReservationConflict);
         }
         let src_sz = Sizing::from(src_cache.as_ref());
@@ -1699,16 +1706,23 @@ async fn populate_token(
     req: &ScsiRequest<'_>,
     registry: &Arc<dyn VolumeLookup>,
     nexus: Nexus,
+    reservations: &ReservationManager,
     tokens: &Arc<TokenManager>,
 ) -> ScsiResponse {
     // POPULATE TOKEN's source is the LUN the CDB was sent to. No
     // CSCD target descriptors.
-    let _ = nexus;
     // Per-CHAP-user admission: refuse to snapshot a LUN this session
     // isn't admitted to, so a tenant can't POPULATE TOKEN against a
     // victim's volume to pin + later recrypt its pages (issue #131).
     if !lun_admitted(registry, req.session_volumes, req.lun) {
         return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED);
+    }
+    // Honor a persistent reservation on the SOURCE: the ODX copy
+    // manager must respect a read reservation just like a plain READ
+    // would, or a non-holder could siphon a reserved LU's data into a
+    // ROD token (issue #183).
+    if !reservations.allow_read(req.lun, &nexus) {
+        return ScsiResponse::reservation_conflict();
     }
     let src_cache = match registry.get(req.lun) {
         Some(c) => c,
@@ -4585,6 +4599,59 @@ mod tests {
         let mut out = [0u8; ROD_TOKEN_LEN];
         out.copy_from_slice(&body[40..40 + ROD_TOKEN_LEN]);
         out
+    }
+
+    /// Issue #183: POPULATE TOKEN must honor a persistent reservation on
+    /// the SOURCE LUN — a non-holder can't siphon a reserved LU's data
+    /// into a ROD token.
+    #[tokio::test]
+    async fn populate_token_refuses_when_source_reserved_by_other() {
+        let (_tmp, src, _dst) = fresh_two_volumes_global("src_vol", "dst_vol").await;
+        src.write_bytes(0, &page_pattern(0x10)).await.unwrap();
+        src.flush_all().await.unwrap();
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src.clone());
+            Arc::new(r)
+        };
+        // A different initiator holds Exclusive Access on LUN 0.
+        let mgr = ReservationManager::new();
+        let holder = Nexus::iscsi(Some("iqn.test:holder".into()), [9u8; 6]);
+        let mut p_reg = vec![0u8; 24];
+        p_reg[8..16].copy_from_slice(&0xBEEFu64.to_be_bytes()); // SARK = new key
+        mgr.prout(0, 0x06, 0, 0, &p_reg, 24, &holder, true); // REGISTER
+        let mut p_res = vec![0u8; 24];
+        p_res[0..8].copy_from_slice(&0xBEEFu64.to_be_bytes()); // RESERVATION KEY
+        mgr.prout(0, 0x01, 0, 0x03, &p_res, 24, &holder, true); // RESERVE EX_AC
+
+        // POPULATE TOKEN by the default (non-holder) nexus → conflict.
+        let pt_params = populate_token_param_list(&[(0, SECTORS_PER_PAGE as u32)]);
+        let pt_cdb = odx_cdb(0x83, 0x10, 0xAAAA, pt_params.len() as u32);
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &pt_cdb,
+                data_out: &pt_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                initiator_isid: [0u8; 6],
+                cid: 0,
+                peer: "",
+                session_partition: None,
+                session_volumes: None,
+            },
+            &registry,
+            test_nexus(),
+            &mgr,
+            &test_tokens(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            scsi_spc::ScsiStatus::ReservationConflict,
+            "non-holder POPULATE TOKEN of a reserved source must be refused"
+        );
     }
 
     #[tokio::test]

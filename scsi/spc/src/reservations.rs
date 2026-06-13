@@ -934,7 +934,17 @@ fn render_read_reservation(state: Option<&LunState>) -> Vec<u8> {
         return header(state.generation, 0).to_vec();
     };
     let mut out = header(state.generation, 16).to_vec();
-    out.extend_from_slice(&r.key.to_be_bytes());
+    // SPC-4 6.13.3.2: the RESERVATION KEY is zero for All-Registrants
+    // reservation types — the reservation is held collectively, not by
+    // one key. Emitting the creating registrant's key makes spec-correct
+    // hosts (sg_persist, fencing agents) treat it as key-held and target
+    // the wrong key in PREEMPT/failover (issue #182/#79).
+    let report_key = if r.r#type.is_all_registrants() {
+        0u64
+    } else {
+        r.key
+    };
+    out.extend_from_slice(&report_key.to_be_bytes());
     out.extend_from_slice(&[0u8; 4]); // obsolete (scope-specific addr)
     out.push(0); // reserved
     out.push(r.r#type.as_u8()); // SCOPE (LU_SCOPE = 0) | TYPE
@@ -1114,7 +1124,15 @@ fn prout_reserve(state: &mut LunState, nexus: &Nexus, rk: u64, type_byte: u8) ->
         return PrOutOutcome::InvalidFieldInCdb;
     };
     if let Some(existing) = &state.reservation {
-        if existing.r#type == r#type && existing.holder == *nexus {
+        // SPC-4 5.12.6.3: a holder re-issuing RESERVE with the same
+        // SCOPE/TYPE gets GOOD, no change. For All-Registrants types
+        // (5.12.10) every registered I_T nexus is a holder, so a
+        // co-registrant's idempotent RESERVE of the same type must also
+        // succeed rather than RESERVATION CONFLICT (issue #182/#80) —
+        // mirrors the release path's AR holder check.
+        let is_holder = existing.holder == *nexus
+            || (existing.r#type.is_all_registrants() && state.is_registered(nexus));
+        if existing.r#type == r#type && is_holder {
             return PrOutOutcome::Good; // idempotent
         }
         return PrOutOutcome::ReservationConflict;
@@ -1192,6 +1210,35 @@ fn prout_preempt(
     let Some(r#type) = ReservationType::from_u8(type_byte) else {
         return PrOutOutcome::InvalidFieldInCdb;
     };
+    // SPC-4 5.12.11.2: PREEMPT with SARK=0 identifies an All-Registrants
+    // reservation. If one is held, remove every registration except the
+    // preemptor's and install the new reservation under TYPE — this is
+    // the spec-defined cluster-failover takeover. If SARK=0 and the held
+    // reservation is NOT all-registrants (or none is held), it's INVALID
+    // FIELD IN PARAMETER LIST, not RESERVATION CONFLICT (issue #182/#81).
+    if sark == 0 {
+        return match &state.reservation {
+            Some(r) if r.r#type.is_all_registrants() => {
+                let to_drop: Vec<RegistrantId> = state
+                    .registrations
+                    .iter()
+                    .filter(|(id, _)| **id != *nexus)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for k in &to_drop {
+                    state.registrations.remove(k);
+                }
+                state.reservation = Some(ReservationState {
+                    holder: nexus.clone(),
+                    key: rk,
+                    r#type,
+                });
+                state.bump_generation();
+                PrOutOutcome::Good
+            }
+            _ => PrOutOutcome::InvalidFieldInParameterList,
+        };
+    }
     // Drop every registration whose key matches SARK *except* the
     // calling nexus (the preemptor remains registered).
     let to_drop: Vec<RegistrantId> = state
@@ -1497,6 +1544,71 @@ mod tests {
         assert_eq!(body.len(), 16);
         assert_eq!(&body[4..8], &8u32.to_be_bytes());
         assert_eq!(&body[8..16], &0xDEADBEEFu64.to_be_bytes());
+    }
+
+    /// Issue #182/#79: READ RESERVATION reports a zero key for an
+    /// All-Registrants reservation (held collectively, not key-held).
+    #[test]
+    fn read_reservation_zeroes_key_for_all_registrants() {
+        let mgr = ReservationManager::new();
+        let a = nexus(1, "iqn.test:a");
+        register(&mgr, &a, 0xAAAA);
+        reserve(&mgr, &a, 0xAAAA, 0x07); // WR_EX_AR
+        let body = match mgr.prin(0, 0x01, true) {
+            PrInOutcome::Good(b) => b,
+            other => panic!("expected Good, got {other:?}"),
+        };
+        assert_eq!(body.len(), 24, "header(8) + 16-byte descriptor");
+        assert_eq!(
+            &body[8..16],
+            &0u64.to_be_bytes(),
+            "All-Registrants reservation key must be reported as zero"
+        );
+    }
+
+    /// Issue #182/#80: a co-registrant re-issuing RESERVE of the same
+    /// All-Registrants type gets GOOD (idempotent), not CONFLICT.
+    #[test]
+    fn co_registrant_reserve_all_registrants_is_idempotent() {
+        let mgr = ReservationManager::new();
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        register(&mgr, &a, 0xAAAA);
+        register(&mgr, &b, 0xBBBB);
+        reserve(&mgr, &a, 0xAAAA, 0x07); // a creates WR_EX_AR
+        let out = mgr.prout(0, 0x01, 0, 0x07, &params(0xBBBB, 0, false), 24, &b, true);
+        assert_eq!(out, PrOutOutcome::Good, "co-registrant RESERVE must be idempotent");
+    }
+
+    /// Issue #182/#81: PREEMPT with SARK=0 against an All-Registrants
+    /// reservation takes it over (drops other registrants); against a
+    /// non-AR reservation it is INVALID FIELD IN PARAMETER LIST.
+    #[test]
+    fn preempt_sark_zero_takes_over_all_registrants() {
+        let mgr = ReservationManager::new();
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        register(&mgr, &a, 0xAAAA);
+        register(&mgr, &b, 0xBBBB);
+        reserve(&mgr, &a, 0xAAAA, 0x07); // WR_EX_AR
+        let out = mgr.prout(0, 0x04, 0, 0x07, &params(0xBBBB, 0, false), 24, &b, true);
+        assert_eq!(out, PrOutOutcome::Good, "SARK=0 must take over an AR reservation");
+        // a's registration was dropped; only b's key remains.
+        let body = read_keys(&mgr);
+        assert_eq!(&body[4..8], &8u32.to_be_bytes(), "exactly one key remains");
+        assert_eq!(&body[8..16], &0xBBBBu64.to_be_bytes());
+    }
+
+    #[test]
+    fn preempt_sark_zero_on_non_ar_is_invalid_param() {
+        let mgr = ReservationManager::new();
+        let a = nexus(1, "iqn.test:a");
+        let b = nexus(2, "iqn.test:b");
+        register(&mgr, &a, 0xAAAA);
+        register(&mgr, &b, 0xBBBB);
+        reserve(&mgr, &a, 0xAAAA, 0x01); // WR_EX (not all-registrants)
+        let out = mgr.prout(0, 0x04, 0, 0x01, &params(0xBBBB, 0, false), 24, &b, true);
+        assert_eq!(out, PrOutOutcome::InvalidFieldInParameterList);
     }
 
     #[test]
