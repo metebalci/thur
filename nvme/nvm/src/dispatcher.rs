@@ -748,28 +748,43 @@ impl NvmeNvmDispatcher {
             Ok(v) => v,
             Err(resp) => return resp,
         };
-        // VSA's write path dedups identical pages, so a zero buffer
-        // collapses to the canonical zero-chunk reference. unmap is
-        // a possible optimization but core-block doesn't yet expose
-        // a hint that distinguishes deallocate vs zero-fill semantics,
-        // and zero-write preserves the read-back contract NVMe writes
-        // expect (all zeros, not "unallocated").
-        //
-        // Cap the in-memory zero buffer at ~16 MiB and iterate so a
-        // multi-GB Write Zeroes doesn't allocate one massive block —
-        // same chunking as SBC's WRITE SAME.
+        // DEAC (CDW12 bit 25): the host asked to *deallocate* rather than
+        // physically zero-fill. core-block's `unmap_bytes` preserves the
+        // read-back contract (unallocated pages read as zero), so honor
+        // it via the fast index-only path — ~N index updates instead of
+        // pushing up to 256 MiB of zeros through the RMW/hash/dedup/flush
+        // pipeline (issue #179; the SBC twin does this for WRITE
+        // SAME+UNMAP). Linux sets DEAC for fallocate(ZERO_RANGE) /
+        // blkdiscard -z / filesystem zeroing. Skip on WORM (unmap mutates
+        // the medium) so WORM behavior matches the zero-write path below.
+        let deac = (sqe.cdw12 & (1 << 25)) != 0;
+        if deac && !cache.manifest().worm {
+            return match cache.unmap_bytes(byte_off, len_bytes).await {
+                Ok(()) => NvmeResponse::just(Cqe::success(cid, 0, 0, 0)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "write-zeroes deallocate failed");
+                    NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)))
+                }
+            };
+        }
+
+        // Explicit zero-fill. Cap the in-memory zero buffer at ~16 MiB
+        // and reuse it across iterations (hoisted out of the loop) so a
+        // multi-GB Write Zeroes neither allocates one massive block nor a
+        // fresh 16 MiB buffer per page-cohort — same chunking as SBC's
+        // WRITE SAME.
         const TARGET_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+        let zeros = vec![0u8; len_bytes.min(TARGET_CHUNK_BYTES) as usize];
         let mut remaining = len_bytes;
         let mut cursor = byte_off;
         while remaining > 0 {
-            let this = remaining.min(TARGET_CHUNK_BYTES);
-            let zeros = vec![0u8; this as usize];
-            if let Err(e) = cache.write_bytes(cursor, &zeros).await {
+            let this = remaining.min(TARGET_CHUNK_BYTES) as usize;
+            if let Err(e) = cache.write_bytes(cursor, &zeros[..this]).await {
                 tracing::warn!(error = %e, "write-zeroes failed");
                 return NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)));
             }
-            cursor += this;
-            remaining -= this;
+            cursor += this as u64;
+            remaining -= this as u64;
         }
         NvmeResponse::just(Cqe::success(cid, 0, 0, 0))
     }
@@ -1197,6 +1212,91 @@ mod tests {
         b[44..48].copy_from_slice(&((slba >> 32) as u32).to_le_bytes());
         b[48..52].copy_from_slice(&u32::from(nlb_zero_based).to_le_bytes());
         nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    fn sqe_write_zeroes(slba: u64, nlb_zero_based: u16, deac: bool) -> nvme_base::Sqe {
+        let mut b = vec![0u8; nvme_base::SQE_SIZE];
+        b[0] = NvmOpcode::WriteZeroes as u8;
+        b[2] = 0x03;
+        b[4] = 0x01;
+        b[40..44].copy_from_slice(&((slba & 0xFFFF_FFFF) as u32).to_le_bytes());
+        b[44..48].copy_from_slice(&((slba >> 32) as u32).to_le_bytes());
+        let mut cdw12 = u32::from(nlb_zero_based);
+        if deac {
+            cdw12 |= 1 << 25; // DEAC
+        }
+        b[48..52].copy_from_slice(&cdw12.to_le_bytes());
+        nvme_base::Sqe::parse(&b).unwrap()
+    }
+
+    /// Issue #179: Write Zeroes with the DEAC bit deallocates (fast
+    /// index-only path) and the range still reads back zero.
+    #[tokio::test]
+    async fn write_zeroes_deac_deallocates_and_reads_back_zero() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let payload: Vec<u8> = vec![0xAB; 64 * 1024];
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_write(0, 15),
+                data_out: Some(&payload),
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS, "seed write failed");
+
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_write_zeroes(0, 15, true),
+                data_out: None,
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS, "write-zeroes DEAC failed");
+
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_read(0, 15),
+                data_out: None,
+                data_in_max: 64 * 1024,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        assert!(
+            resp.data_in.iter().all(|&b| b == 0),
+            "deallocated range must read back zero"
+        );
+    }
+
+    /// Issue #179: Write Zeroes without DEAC zero-fills (read-back zero).
+    #[tokio::test]
+    async fn write_zeroes_without_deac_zero_fills() {
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_write_zeroes(0, 15, false),
+                data_out: None,
+                data_in_max: 0,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        let resp = disp
+            .handle_io(IoCommand {
+                sqe: sqe_read(0, 15),
+                data_out: None,
+                data_in_max: 64 * 1024,
+                session_volumes: None,
+                host_id: None,
+            })
+            .await;
+        assert!(resp.data_in.iter().all(|&b| b == 0));
     }
 
     #[tokio::test]

@@ -251,7 +251,7 @@ Transport behavior:
   back (one per CID — NVMe Base §4.2.6) and are written in order.
 - Any non-fused or fabrics CapsuleCmd arriving while a fused-first
   is pending aborts the orphan with
-  `aborted_due_to_missing_fused` (SC=0x0B, Generic, DNR=1) before
+  `aborted_due_to_missing_fused` (SC=0x0A, Generic, DNR=1) before
   processing the new command.
 
 `NvmeNvmDispatcher::handle_fused_compare_write` routes through
@@ -260,7 +260,7 @@ Transport behavior:
 | Outcome              | Compare CQE                                  | Write CQE                                          |
 | -------------------- | -------------------------------------------- | -------------------------------------------------- |
 | Compare matches      | Success                                      | Success                                            |
-| Compare mismatches   | `compare_failure` (SCT=Media, SC=0x85, DNR=1)| `aborted_due_to_failed_fused` (SC=0x0A, Generic)   |
+| Compare mismatches   | `compare_failure` (SCT=Media, SC=0x85, DNR=1)| `aborted_due_to_failed_fused` (SC=0x09, Generic)   |
 | Internal error       | `internal_error` (SC=0x06)                   | `aborted_due_to_failed_fused`                      |
 
 ## NVM Command Set opcode mapping
@@ -271,7 +271,7 @@ Transport behavior:
 | Write                     | 0x01 | `PageCache::write_bytes(slba * lba, data_out)`           |
 | Read                      | 0x02 | `PageCache::read_bytes(slba * lba, nlb * lba)`           |
 | Compare                   | 0x05 | `read_bytes` + dispatcher-side byte equality             |
-| Write Zeroes              | 0x08 | `write_bytes(... &vec![0; nlb * lba])`                   |
+| Write Zeroes              | 0x08 | DEAC set → `unmap_bytes`; else `write_bytes(&vec![0;…])` |
 | Dataset Management (AD=1) | 0x09 | per-range `PageCache::unmap_bytes(off, len)`             |
 | Verify                    | 0x0C | `read_bytes` (payload discarded)                         |
 | Compare + Write fused     | 0x05 + 0x01 with FUSE bits | `PageCache::compare_and_write_bytes(...)` |

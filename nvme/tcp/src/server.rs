@@ -347,12 +347,22 @@ mod fes {
     pub const INVALID_PDU_HEADER_TYPE: u16 = 0x07;
 }
 
-/// Max concurrent in-flight commands per connection. Tracked as the
-/// size of the per-connection `CommandTable` (R2T-needing writes are
-/// the only commands that consume the table). Comfortable headroom
-/// under `CAP.MQES=1024`; if a host queues more, the 257th gets a
-/// `Namespace Not Ready` CQE instead of a spawned task.
+/// Max concurrent in-flight commands per connection. Comfortable
+/// headroom under `CAP.MQES=1024`; a host that pipelines more gets a
+/// `Namespace Not Ready` CQE instead of a spawned task. Enforced for
+/// EVERY data-path command (not just R2T-needing writes) via a
+/// per-connection semaphore so a flood of pipelined reads — each
+/// buffering up to `MAX_TRANSFER_BYTES` of response data in a blocked
+/// task — can't grow memory without bound (issue #178).
 const INFLIGHT_CAP: usize = 256;
+
+/// Max outstanding Async Event Requests a connection may hold parked.
+/// Each parked AER costs a oneshot channel + a blocked delivery task; a
+/// host streaming AER capsules would otherwise grow daemon memory
+/// without bound (issue #177). Generous relative to any real host's
+/// outstanding-AER count; the excess completes with SC 0x05 (Async
+/// Event Request Limit Exceeded).
+const AER_LIMIT: usize = 8;
 
 /// Per-command H2CData routing channel depth. With
 /// `ADVERTISED_MAXH2CDATA=128 KiB` and the host's MAXR2T effectively
@@ -442,6 +452,24 @@ where
         anyhow::bail!(
             "first PDU was {:?}, expected ICReq",
             icreq_pdu.header.pdu_type
+        );
+    }
+    // Guard the slice: RawPdu::read_async only checks HLEN/PLEN framing,
+    // so a host can send an 8-byte ICReq (PLEN=8) whose body is empty.
+    // Slicing `[..PAYLOAD_LEN]` would then panic and tear down the
+    // pre-auth connection task on crafted input (issue #176). Emit the
+    // same INVALID_PDU_HEADER_FIELD term-req the length error would.
+    if icreq_pdu.body.len() < pdu::ICReq::PAYLOAD_LEN {
+        write_term_req(
+            &mut stream,
+            fes::INVALID_PDU_HEADER_FIELD,
+            pdu::DigestCfg::NONE,
+        )
+        .await?;
+        anyhow::bail!(
+            "ICReq body too short: {} < {}",
+            icreq_pdu.body.len(),
+            pdu::ICReq::PAYLOAD_LEN
         );
     }
     let icreq = pdu::ICReq::read_from(&icreq_pdu.body[..pdu::ICReq::PAYLOAD_LEN])?;
@@ -752,6 +780,11 @@ where
     let (read_half, write_half) = tokio::io::split(stream);
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundPdu>(OUTBOUND_CAPACITY);
     let commands: CommandTable = Arc::new(Mutex::new(HashMap::new()));
+    // Global per-connection in-flight gate covering every spawned
+    // data-path command (issue #178), and outstanding-AER counter
+    // bounding parked Async Event Requests (issue #177).
+    let inflight = Arc::new(tokio::sync::Semaphore::new(INFLIGHT_CAP));
+    let aer_outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let mut writer = tokio::spawn(writer_task(write_half, outbound_rx, peer, qid, dgst));
     let mut reader = tokio::spawn(reader_task(
@@ -763,6 +796,8 @@ where
         Arc::clone(&aer),
         conn_token,
         Arc::clone(&commands),
+        Arc::clone(&inflight),
+        Arc::clone(&aer_outstanding),
         outbound_tx,
         qid,
         admission_volumes.map(Arc::new),
@@ -832,6 +867,8 @@ async fn reader_task<R>(
     aer: Arc<ControllerRegistry>,
     conn_token: ConnToken,
     commands: CommandTable,
+    inflight: Arc<tokio::sync::Semaphore>,
+    aer_outstanding: Arc<std::sync::atomic::AtomicUsize>,
     outbound: mpsc::Sender<OutboundPdu>,
     qid: u16,
     admission_volumes: Option<Arc<Vec<String>>>,
@@ -1054,10 +1091,30 @@ where
                             })
                             .await;
                     }
+                    use std::sync::atomic::Ordering;
+                    // Bound outstanding AERs (issue #177): excess completes
+                    // with SC 0x05 rather than parking a oneshot + blocking
+                    // a task per capsule without limit.
+                    if aer_outstanding.load(Ordering::Acquire) >= AER_LIMIT {
+                        let _ = outbound
+                            .send(OutboundPdu::CommandResponse {
+                                cqe: Cqe::failure(
+                                    sqe.cid,
+                                    0,
+                                    0,
+                                    StatusField::async_event_limit_exceeded(),
+                                ),
+                                data_in: Vec::new(),
+                            })
+                            .await;
+                        continue;
+                    }
+                    aer_outstanding.fetch_add(1, Ordering::AcqRel);
                     let (tx, rx) = oneshot::channel();
                     aer.park(conn_token, tx);
                     let outbound_clone = outbound.clone();
                     let cid = sqe.cid;
+                    let aer_outstanding_clone = Arc::clone(&aer_outstanding);
                     tokio::spawn(async move {
                         if let Ok(completion) = rx.await {
                             let _ = outbound_clone
@@ -1067,6 +1124,9 @@ where
                                 })
                                 .await;
                         }
+                        // Slot freed whether the AER delivered or the
+                        // connection tore down (sender dropped).
+                        aer_outstanding_clone.fetch_sub(1, Ordering::AcqRel);
                     });
                     continue;
                 }
@@ -1218,9 +1278,29 @@ where
                         .await;
                 }
 
-                // Decide R2T need; only R2T-needing commands consume
-                // a slot in the per-connection inflight table. Over
-                // cap → Namespace Not Ready, without spawning a task.
+                // Global in-flight gate (issue #178): EVERY spawned
+                // data-path command holds a permit for its lifetime, not
+                // just R2T-needing writes — otherwise a flood of
+                // pipelined reads (each buffering up to MAX_TRANSFER_BYTES
+                // of response data in a blocked task) grows memory without
+                // bound. Over cap → Namespace Not Ready, no task spawned.
+                let permit = match Arc::clone(&inflight).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let cqe =
+                            Cqe::failure(sqe.cid, 0, 0, StatusField::namespace_not_ready());
+                        let _ = outbound
+                            .send(OutboundPdu::CommandResponse {
+                                cqe,
+                                data_in: Vec::new(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+
+                // Decide R2T need; R2T-needing commands also consume a
+                // slot in the per-connection h2c routing table.
                 let needs_r2t = direction == DataDirection::HostToController && sgl_len > icd_len;
                 let h2c_rx = if needs_r2t {
                     let mut map = commands.lock().await;
@@ -1245,21 +1325,27 @@ where
                 let outbound_clone = outbound.clone();
                 let commands_clone = Arc::clone(&commands);
                 let admission_clone = admission_volumes.clone();
-                tokio::spawn(handle_command(
-                    sqe,
-                    icd_owned,
-                    sgl_len,
-                    qid,
-                    h2c_rx,
-                    handler_clone,
-                    outbound_clone,
-                    commands_clone,
-                    peer,
-                    local_addr,
-                    admission_clone,
-                    host_id,
-                    cntlid,
-                ));
+                tokio::spawn(async move {
+                    // Hold the in-flight permit for the command's whole
+                    // lifetime; it releases when this task ends (#178).
+                    let _permit = permit;
+                    handle_command(
+                        sqe,
+                        icd_owned,
+                        sgl_len,
+                        qid,
+                        h2c_rx,
+                        handler_clone,
+                        outbound_clone,
+                        commands_clone,
+                        peer,
+                        local_addr,
+                        admission_clone,
+                        host_id,
+                        cntlid,
+                    )
+                    .await
+                });
             }
             other => {
                 tracing::warn!(

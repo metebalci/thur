@@ -207,13 +207,30 @@ impl StatusField {
         }
     }
 
+    /// Generic: Asynchronous Event Request Limit Exceeded (SC 0x05).
+    /// Returned when a host submits more concurrent Async Event Requests
+    /// than the controller will hold outstanding, instead of parking the
+    /// excess unboundedly (issue #177).
+    pub fn async_event_limit_exceeded() -> Self {
+        Self {
+            sct: StatusCodeType::Generic,
+            sc: 0x05,
+            dnr: true,
+            ..Self::SUCCESS
+        }
+    }
+
     /// Generic: Aborted due to failed fused command. Returned on
     /// the second half of a fused operation when the first half
     /// failed (NVMe Base §4.2.6).
     pub fn aborted_due_to_failed_fused() -> Self {
         Self {
             sct: StatusCodeType::Generic,
-            sc: 0x0A,
+            // NVMe Base Generic SC 0x09 = Aborted due to Failed Fused
+            // Command. The old value 0x0A is Missing-Fused, and 0x0B is
+            // Invalid Namespace or Format — both mis-decode on the host
+            // (issue #180).
+            sc: 0x09,
             dnr: true,
             ..Self::SUCCESS
         }
@@ -225,7 +242,9 @@ impl StatusField {
     pub fn aborted_due_to_missing_fused() -> Self {
         Self {
             sct: StatusCodeType::Generic,
-            sc: 0x0B,
+            // NVMe Base Generic SC 0x0A = Aborted due to Missing Fused
+            // Command (0x0B is Invalid Namespace or Format) (issue #180).
+            sc: 0x0A,
             dnr: true,
             ..Self::SUCCESS
         }
@@ -278,6 +297,33 @@ mod tests {
     #[test]
     fn success_is_zero() {
         assert_eq!(StatusField::SUCCESS.to_u16(), 0);
+    }
+
+    /// Issue #180: fused-abort status codes must be Generic SC 0x09
+    /// (failed) / 0x0A (missing), not the off-by-one 0x0A / 0x0B (the
+    /// latter being Invalid Namespace or Format).
+    #[test]
+    fn fused_abort_status_codes_are_spec_correct() {
+        let failed = StatusField::aborted_due_to_failed_fused();
+        assert_eq!(failed.sct, StatusCodeType::Generic);
+        assert_eq!(failed.sc, 0x09, "failed-fused = Generic SC 0x09");
+
+        let missing = StatusField::aborted_due_to_missing_fused();
+        assert_eq!(missing.sct, StatusCodeType::Generic);
+        assert_eq!(missing.sc, 0x0A, "missing-fused = Generic SC 0x0A");
+
+        // Neither must collide with Invalid Namespace or Format (0x0B).
+        assert_ne!(failed.sc, 0x0B);
+        assert_ne!(missing.sc, 0x0B);
+    }
+
+    /// Issue #177: the AER-limit status is Generic SC 0x05.
+    #[test]
+    fn async_event_limit_status_is_generic_0x05() {
+        let s = StatusField::async_event_limit_exceeded();
+        assert_eq!(s.sct, StatusCodeType::Generic);
+        assert_eq!(s.sc, 0x05);
+        assert!(s.dnr);
     }
 
     #[test]
