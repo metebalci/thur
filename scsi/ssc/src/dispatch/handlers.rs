@@ -652,12 +652,19 @@ pub fn handle_write_filemarks_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         tracing::warn!("WRITE FILEMARKS(6) refused by drive write-mode: {}", e);
         return Ok(ScsiResp::check_condition_for(&e));
     }
-    let count = ((cdb[2] as u32) << 16) | ((cdb[3] as u32) << 8) | (cdb[4] as u32);
+    let count = (((cdb[2] as u32) << 16) | ((cdb[3] as u32) << 8) | (cdb[4] as u32)) as u64;
+    if count > MAX_FILEMARKS_PER_COMMAND {
+        tracing::warn!(
+            "WRITE FILEMARKS(6) count {} exceeds cap {}; refusing",
+            count,
+            MAX_FILEMARKS_PER_COMMAND
+        );
+        return Ok(ScsiResp::check_condition_for(
+            &core_mediachanger::errors::SmcError::InvalidField,
+        ));
+    }
     match drive_manager.with_drive(drive_id, tsih, |cart| {
-        for _ in 0..count {
-            cart.write_filemark()?;
-        }
-        Ok(())
+        cart.write_filemarks(count).map(|_| ())
     }) {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {
@@ -666,6 +673,14 @@ pub fn handle_write_filemarks_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         }
     }
 }
+
+/// Per-command WRITE FILEMARKS count ceiling. Real backup software writes
+/// 0-2 filemarks per command; the filemark count comes straight from the
+/// untrusted CDB (up to 2^32-1), and each filemark appends a zero-byte
+/// index record under the drive mutex. Without a cap a single command can
+/// wedge a drive and grow the block index until the disk fills (issue
+/// #132). 64 Ki is far beyond any legitimate use.
+const MAX_FILEMARKS_PER_COMMAND: u64 = 65_536;
 
 pub fn handle_write_filemarks_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
     let cdb = ctx.cdb;
@@ -688,11 +703,18 @@ pub fn handle_write_filemarks_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         return Ok(ScsiResp::check_condition_for(&e));
     }
     let count = u32::from_be_bytes([cdb[12], cdb[13], cdb[14], cdb[15]]) as u64;
+    if count > MAX_FILEMARKS_PER_COMMAND {
+        tracing::warn!(
+            "WRITE FILEMARKS(16) count {} exceeds cap {}; refusing",
+            count,
+            MAX_FILEMARKS_PER_COMMAND
+        );
+        return Ok(ScsiResp::check_condition_for(
+            &core_mediachanger::errors::SmcError::InvalidField,
+        ));
+    }
     match drive_manager.with_drive(drive_id, tsih, |cart| {
-        for _ in 0..count {
-            cart.write_filemark()?;
-        }
-        Ok(())
+        cart.write_filemarks(count).map(|_| ())
     }) {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {

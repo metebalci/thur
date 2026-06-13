@@ -1707,8 +1707,26 @@ impl Cartridge {
             encrypted,
             applied_compression,
         )?;
-        let lba = self.block_indexes[part_idx].append(&rec)?;
-        self.head_lba = lba + 1;
+        // ALLOW OVERWRITE (CDB 0x82): when the barrier suppressed the
+        // truncate and the head is inside the existing partition span,
+        // rewrite the record in place instead of appending at EOD.
+        // Appending would strand the host's bytes at next_lba and leave a
+        // stale block readable at head_lba — silent stale data + a
+        // position teleport on READ POSITION (issue #116). This is the
+        // LTFS index-rewrite flow `BlockIndexFile::overwrite` exists for.
+        // The data bytes are already in the current chunk; the overwrite
+        // just rebinds head_lba to them.
+        let next_lba = self.block_indexes[part_idx].next_lba();
+        let lba = if self.head_lba < next_lba {
+            let lba = self.head_lba;
+            self.block_indexes[part_idx].overwrite(lba, &rec)?;
+            self.head_lba = lba + 1;
+            lba
+        } else {
+            let lba = self.block_indexes[part_idx].append(&rec)?;
+            self.head_lba = lba + 1;
+            lba
+        };
 
         self.lru_index.touch(self.cur_chunk_id, now_timestamp())?;
         if self.storage_backend.is_some() {
@@ -1806,6 +1824,56 @@ impl Cartridge {
             return Err(SmcError::EarlyWarning);
         }
         Ok(lba)
+    }
+
+    /// Write `count` consecutive filemarks with a single trailing fsync of
+    /// the block + chunk indexes, instead of the double-fsync-per-mark of
+    /// looping [`Self::write_filemark`]. The WRITE FILEMARKS handler caps
+    /// `count` to a sane bound before calling this, so the loop is bounded
+    /// (issue #132). Returns the LBA of the last filemark written (the
+    /// current head when `count == 0`).
+    pub fn write_filemarks(&mut self, count: u64) -> Result<u64> {
+        if count == 0 {
+            // SSC count-0 is a buffer flush: fsync the indexes, no record.
+            let part_idx = self.runtime.active_partition as usize;
+            self.block_indexes[part_idx].fsync()?;
+            self.chunk_index.fsync()?;
+            return Ok(self.head_lba);
+        }
+        self.require_writable(true)?;
+        if let Some(effective) = self.effective_capacity_bytes()
+            && self.used_capacity_bytes() >= effective
+        {
+            return Err(SmcError::EndOfMedium);
+        }
+        // Only the first mark can land mid-span; truncate once up front
+        // (matches per-mark `write_filemark`, which truncates each time but
+        // only the first truncation has any effect once head reaches EOD).
+        self.truncate_from_head()?;
+        let part_idx = self.runtime.active_partition as usize;
+        let mut last_lba = self.head_lba;
+        for _ in 0..count {
+            let rec = Self::encode_block_rec(
+                self.cur_chunk_id,
+                self.cur_chunk.size,
+                0,
+                BlockKindSerde::Filemark,
+                false,
+                None,
+            )?;
+            let lba = self.block_indexes[part_idx].append(&rec)?;
+            self.head_lba = lba + 1;
+            last_lba = lba;
+        }
+        // One fsync for the whole batch (issue #132): filemarks are
+        // application boundaries, so durability is owed once the command
+        // completes, not once per mark.
+        self.block_indexes[part_idx].fsync()?;
+        self.chunk_index.fsync()?;
+        if self.maybe_raise_early_warning() {
+            return Err(SmcError::EarlyWarning);
+        }
+        Ok(last_lba)
     }
 
     /// Truncate the active partition at the current head position. Used by
@@ -3638,6 +3706,81 @@ mod space_then_write_repro {
             after.hash, sealed.hash,
             "view persist_runtime must not erase the sealed chunk hash"
         );
+    }
+
+    /// Issue #116: under an ALLOW OVERWRITE barrier a mid-span write must
+    /// overwrite the record at the head in place (LTFS index rewrite), not
+    /// append at EOD leaving the head's old block readable and the
+    /// position desynced.
+    #[test]
+    fn allow_overwrite_barrier_overwrites_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        let part = cart.runtime.active_partition as usize;
+
+        cart.write_data(rec(0x10)).unwrap(); // LBA 0
+        cart.write_data(rec(0x11)).unwrap(); // LBA 1
+        cart.write_data(rec(0x12)).unwrap(); // LBA 2
+        assert_eq!(cart.block_indexes[part].next_lba(), 3);
+
+        // Barrier at LBA 1; locate to 1 (head >= barrier => no truncate).
+        cart.set_allow_overwrite(0, 1).unwrap();
+        cart.locate(1).unwrap();
+        assert_eq!(cart.head_lba(), 1);
+
+        // Overwrite-in-place: head 1 < next_lba 3.
+        cart.write_data(rec(0xEE)).unwrap();
+        assert_eq!(cart.head_lba(), 2, "head advances by one, not to EOD");
+        assert_eq!(
+            cart.block_indexes[part].next_lba(),
+            3,
+            "no record appended — the span length is unchanged"
+        );
+
+        // Read back: LBA 1 is the new record; LBA 2 survived (not truncated).
+        cart.locate(0).unwrap();
+        assert_eq!(cart.read_next().unwrap().data, rec(0x10));
+        assert_eq!(
+            cart.read_next().unwrap().data,
+            rec(0xEE),
+            "LBA 1 reads back the overwritten record, not the stale one"
+        );
+        assert_eq!(
+            cart.read_next().unwrap().data,
+            rec(0x12),
+            "LBA 2 survived the barrier-suppressed write"
+        );
+        match cart.read_next() {
+            Err(SmcError::EndOfData) => {}
+            other => panic!("expected EOD after LBA 2, got {other:?}"),
+        }
+    }
+
+    /// Issue #132: write_filemarks writes exactly `count` filemarks with a
+    /// single trailing fsync (no per-mark double-fsync) and count 0 is a
+    /// no-op flush.
+    #[test]
+    fn write_filemarks_batches_count() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        let part = cart.runtime.active_partition as usize;
+
+        cart.write_data(rec(0x01)).unwrap(); // LBA 0
+        let next_before = cart.block_indexes[part].next_lba();
+        cart.write_filemarks(3).unwrap();
+        assert_eq!(
+            cart.block_indexes[part].next_lba(),
+            next_before + 3,
+            "three filemark records appended"
+        );
+        assert_eq!(cart.head_lba(), next_before + 3);
+
+        // Count 0 is a flush no-op — head unchanged, no record added.
+        let head = cart.head_lba();
+        let next = cart.block_indexes[part].next_lba();
+        cart.write_filemarks(0).unwrap();
+        assert_eq!(cart.head_lba(), head);
+        assert_eq!(cart.block_indexes[part].next_lba(), next);
     }
 
     #[test]
