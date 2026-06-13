@@ -16,7 +16,9 @@
 //! - Optional compression support (zstd/lz4)
 //! - Error handling and logging
 
-use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
+use crate::compression::{
+    CompressionAlgo, CompressionConfig, compress_data_async, decompress_data_async,
+};
 use crate::gcs_api::{GcsApi, RealGcsApi, build_credentials};
 use crate::object_store_backend::ObjectStoreBackend;
 use crate::{ObjectStoreError, Result};
@@ -181,7 +183,9 @@ impl ObjectStoreBackend for GcsBackend {
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {
-                    let compressed = compress_data(algo, data, self.compression_config.level)?;
+                    let compressed =
+                        compress_data_async(algo, data.to_vec(), self.compression_config.level)
+                            .await?;
                     let comp_size = compressed.len() as u64;
                     debug!(
                         "Compressed chunk ({}) from {} bytes to {} bytes (ratio: {:.2}%)",
@@ -281,8 +285,8 @@ impl ObjectStoreBackend for GcsBackend {
             // per-cartridge / per-volume manifest stays the authoritative
             // record; this metadata read mirrors the S3 backend (issue #10).
             let data = match metadata.get("compression").map(String::as_str) {
-                Some("zstd") => decompress_data(CompressionAlgo::Zstd, &buf)?,
-                Some("lz4") => decompress_data(CompressionAlgo::Lz4, &buf)?,
+                Some("zstd") => decompress_data_async(CompressionAlgo::Zstd, buf).await?,
+                Some("lz4") => decompress_data_async(CompressionAlgo::Lz4, buf).await?,
                 Some("none") | None => buf,
                 Some(other) => {
                     return Err(ObjectStoreError::Other(format!(
@@ -835,7 +839,8 @@ mod tests {
         // the backend decompresses off the object's `compression`
         // metadata, not its own config (here: compression disabled).
         let payload = vec![0u8; 1024];
-        let compressed = compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
+        let compressed =
+            crate::compression::compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.read_outcomes.lock().expect("queue");
@@ -858,7 +863,8 @@ mod tests {
         // lz4 and restarts. The per-object marker, not the live config,
         // governs decompression.
         let payload = b"the quick brown fox jumped over the lazy dog".repeat(8);
-        let compressed = compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
+        let compressed =
+            crate::compression::compress_data(CompressionAlgo::Zstd, &payload, 3).expect("compress");
         let api = Arc::new(MockGcsApi::default());
         {
             let mut g = api.read_outcomes.lock().expect("queue");

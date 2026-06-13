@@ -119,7 +119,12 @@ pub async fn run_from_config_path(
     backends: Vec<String>,
     opts: BenchOptions,
 ) -> Result<(), BenchError> {
-    let cfg = load_storage_config(config_path)?;
+    let mut cfg = load_storage_config(config_path)?;
+    // Force compression off so the benchmark measures raw transport, not
+    // local codec throughput. The conffile default is zstd-3, which would
+    // CPU-bound an incompressible-random run and under-report the link
+    // ceiling — contradicting the doc claim above (issue #195).
+    cfg.disable_compression();
 
     let backend_names: Vec<String> = if backends.is_empty() {
         cfg.backend_names()

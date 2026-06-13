@@ -17,7 +17,9 @@
 //! Storage-account shared-key auth is no longer supported by the new
 //! SDK; SAS or AAD remain.
 
-use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
+use crate::compression::{
+    CompressionAlgo, CompressionConfig, compress_data_async, decompress_data_async,
+};
 use crate::object_store_backend::ObjectStoreBackend;
 use crate::object_store_config::{FailureKind, ResolvedAzureAuth, http_status_to_failure_kind};
 use crate::{ObjectStoreError, Result};
@@ -418,7 +420,9 @@ impl ObjectStoreBackend for AzureBackend {
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {
-                    let compressed = compress_data(algo, data, self.compression_config.level)?;
+                    let compressed =
+                        compress_data_async(algo, data.to_vec(), self.compression_config.level)
+                            .await?;
                     let comp_size = compressed.len() as u64;
                     debug!(
                         "Compressed chunk ({}) from {} bytes to {} bytes (ratio: {:.2}%)",
@@ -576,11 +580,11 @@ impl ObjectStoreBackend for AzureBackend {
                 let data = match compression_type.as_deref() {
                     Some("zstd") => {
                         debug!("Decompressing chunk (zstd)");
-                        decompress_data(CompressionAlgo::Zstd, &buffer)?
+                        decompress_data_async(CompressionAlgo::Zstd, buffer).await?
                     }
                     Some("lz4") => {
                         debug!("Decompressing chunk (lz4)");
-                        decompress_data(CompressionAlgo::Lz4, &buffer)?
+                        decompress_data_async(CompressionAlgo::Lz4, buffer).await?
                     }
                     Some("none") | None => buffer,
                     Some(other) => {

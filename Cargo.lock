@@ -4781,6 +4781,7 @@ dependencies = [
  "google-cloud-gax",
  "google-cloud-storage",
  "google-cloud-wkt",
+ "lru",
  "lz4_flex",
  "openssl",
  "rand 0.9.4",

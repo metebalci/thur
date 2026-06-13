@@ -31,11 +31,19 @@ use crate::object_store_backend::LockState;
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Upper bound on memoized presence/upload facts. ~150–200 B per entry,
+/// so ~40–50 MB worst case — enough to coalesce any realistic hot working
+/// set while keeping daemon RSS bounded regardless of pool size. LRU
+/// eviction of a terminal (Probed / Uploaded) fact is harmless: the next
+/// caller re-HEADs or re-PUTs (content-addressed, idempotent). See
+/// issue #192.
+const DEFAULT_KNOWN_CAPACITY: usize = 262_144;
 
 /// What we know about a single storage key.
 enum StorageState {
@@ -73,7 +81,13 @@ struct UploadOutcome {
 pub struct CachingObjectStoreBackend {
     inner: Arc<dyn ObjectStoreBackend>,
     name: String,
-    known: Arc<Mutex<HashMap<String, StorageState>>>,
+    /// Bounded LRU of presence/upload facts (issue #192). An `InFlight`
+    /// entry may in principle be evicted under cap pressure while its PUT
+    /// is still running; that only costs a rare duplicate (idempotent,
+    /// content-addressed) PUT — every completion install/remove below is
+    /// already gated on the entry still being `InFlight`, so a missing
+    /// entry is a safe no-op.
+    known: Arc<Mutex<LruCache<String, StorageState>>>,
     /// Monotonic invalidation epoch, bumped by every op that removes a
     /// cache fact (`delete_object`, `upload_versioned`). A HEAD or PUT
     /// snapshots the epoch before it touches the backend and only
@@ -103,10 +117,21 @@ impl CachingObjectStoreBackend {
     /// [`Self::warmup_prefix`] from the daemon at boot to seed
     /// `Probed` entries from a LIST.
     pub fn new(inner: Box<dyn ObjectStoreBackend>, name: impl Into<String>) -> Self {
+        Self::with_capacity(inner, name, DEFAULT_KNOWN_CAPACITY)
+    }
+
+    /// As [`Self::new`] but with an explicit fact-cache capacity. Used by
+    /// tests to drive LRU eviction with a tiny bound.
+    fn with_capacity(
+        inner: Box<dyn ObjectStoreBackend>,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity >= 1");
         Self {
             inner: Arc::from(inner),
             name: name.into(),
-            known: Arc::new(Mutex::new(HashMap::new())),
+            known: Arc::new(Mutex::new(LruCache::new(cap))),
             epoch: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -139,7 +164,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Miss,
         }
         let action = {
-            let map = self.known.lock().expect("cache mutex poisoned");
+            let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
                 Some(StorageState::Uploaded {
                     uncompressed,
@@ -209,7 +234,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 Some(StorageState::InFlight(existing)) => (existing.clone(), None),
                 None => {
                     let epoch = self.epoch.load(Ordering::SeqCst);
-                    map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
+                    map.put(key.to_string(), StorageState::InFlight(shared.clone()));
                     (shared, Some(epoch))
                 }
             }
@@ -233,7 +258,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 // write) raced our PUT. Otherwise drop our InFlight so the
                 // next caller re-checks the authoritative backend.
                 if self.epoch.load(Ordering::SeqCst) == install_epoch {
-                    map.insert(
+                    map.put(
                         key.to_string(),
                         StorageState::Uploaded {
                             uncompressed: outcome.uncompressed,
@@ -242,7 +267,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                         },
                     );
                 } else if matches!(map.get(key), Some(StorageState::InFlight(_))) {
-                    map.remove(key);
+                    map.pop(key);
                 }
                 Ok((outcome.uncompressed, outcome.compressed, outcome.algo))
             }
@@ -252,7 +277,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 // by another caller has already overwritten it with
                 // `Uploaded`, leave that alone.
                 if matches!(map.get(key), Some(StorageState::InFlight(_))) {
-                    map.remove(key);
+                    map.pop(key);
                 }
                 Err(ObjectStoreError::Other(arc_err.to_string()))
             }
@@ -274,7 +299,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Miss,
         }
         let action = {
-            let map = self.known.lock().expect("cache mutex poisoned");
+            let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
                 Some(StorageState::Uploaded { uncompressed, .. }) => {
                     Action::ReturnSize(*uncompressed)
@@ -324,7 +349,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                 // For Probed (no size known) and None: install the singleflight.
                 _ => {
                     let epoch = self.epoch.load(Ordering::SeqCst);
-                    map.insert(key.to_string(), StorageState::InFlight(shared.clone()));
+                    map.put(key.to_string(), StorageState::InFlight(shared.clone()));
                     (shared, Some(epoch))
                 }
             }
@@ -343,7 +368,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         match result {
             Ok(outcome) => {
                 if self.epoch.load(Ordering::SeqCst) == install_epoch {
-                    map.insert(
+                    map.put(
                         key.to_string(),
                         StorageState::Uploaded {
                             uncompressed: outcome.uncompressed,
@@ -352,13 +377,13 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                         },
                     );
                 } else if matches!(map.get(key), Some(StorageState::InFlight(_))) {
-                    map.remove(key);
+                    map.pop(key);
                 }
                 Ok(outcome.uncompressed)
             }
             Err(arc_err) => {
                 if matches!(map.get(key), Some(StorageState::InFlight(_))) {
-                    map.remove(key);
+                    map.pop(key);
                 }
                 Err(ObjectStoreError::Other(arc_err.to_string()))
             }
@@ -391,7 +416,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         // Bump the epoch under the lock so an upload_chunk completion that
         // snapshotted before this write can't reinstall a stale fact.
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        map.remove(key);
+        map.pop(key);
         result
     }
 
@@ -410,7 +435,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Miss,
         }
         let action = {
-            let map = self.known.lock().expect("cache mutex poisoned");
+            let mut map = self.known.lock().expect("cache mutex poisoned");
             match map.get(key) {
                 Some(StorageState::Probed | StorageState::Uploaded { .. }) => HeadAction::Hit,
                 Some(StorageState::InFlight(fut)) => HeadAction::Await(fut.clone()),
@@ -441,8 +466,11 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let exists = self.inner.chunk_exists(key).await?;
         if exists {
             let mut map = self.known.lock().expect("cache mutex poisoned");
-            if self.epoch.load(Ordering::SeqCst) == probe_epoch {
-                map.entry(key.to_string()).or_insert(StorageState::Probed);
+            // Don't overwrite an existing InFlight / Uploaded fact; only
+            // seed Probed into a vacant slot. `peek` avoids promoting on
+            // the no-op branch.
+            if self.epoch.load(Ordering::SeqCst) == probe_epoch && map.peek(key).is_none() {
+                map.put(key.to_string(), StorageState::Probed);
             }
         }
         Ok(exists)
@@ -463,8 +491,12 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             for k in keys {
-                if let Entry::Vacant(slot) = map.entry(k) {
-                    slot.insert(StorageState::Probed);
+                // Seed only vacant slots — never overwrite InFlight /
+                // Uploaded. The LRU bound means a bucket larger than the
+                // cap keeps only the most recently seeded keys; the rest
+                // are HEAD'd on demand (issue #192).
+                if map.peek(&k).is_none() {
+                    map.put(k, StorageState::Probed);
                     seeded += 1;
                 }
             }
@@ -484,7 +516,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         // wins the lock, the epoch mismatch makes the stale install a
         // no-op, leaving the cache to re-probe the backend.
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        map.remove(key);
+        map.pop(key);
         Ok(())
     }
 
@@ -696,6 +728,28 @@ mod tests {
         let second = cache.upload_chunk("k", b"hello").await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 1, "second call is cache hit");
         assert_eq!(first, second, "cached tuple matches first PUT");
+    }
+
+    #[tokio::test]
+    async fn known_map_is_bounded_and_evicts_lru() {
+        // Issue #192: the fact cache must not grow without bound. With a
+        // 2-entry cap, inserting a third key evicts the least-recently-used
+        // one; re-touching the evicted key misses and re-PUTs, while the
+        // still-cached key stays a hit.
+        let (mock, c) = MockBackend::new();
+        let cache = CachingObjectStoreBackend::with_capacity(Box::new(mock), "test", 2);
+        cache.upload_chunk("k1", b"a").await.unwrap();
+        cache.upload_chunk("k2", b"b").await.unwrap();
+        cache.upload_chunk("k3", b"c").await.unwrap(); // evicts k1 (LRU)
+        assert_eq!(c.puts.load(Ordering::SeqCst), 3);
+
+        // k3 is still cached — a re-upload coalesces to a hit, no new PUT.
+        cache.upload_chunk("k3", b"c").await.unwrap();
+        assert_eq!(c.puts.load(Ordering::SeqCst), 3, "k3 still cached");
+
+        // k1 was evicted — its re-upload misses and PUTs again.
+        cache.upload_chunk("k1", b"a").await.unwrap();
+        assert_eq!(c.puts.load(Ordering::SeqCst), 4, "evicted k1 re-uploads");
     }
 
     #[tokio::test]

@@ -245,6 +245,31 @@ pub fn decompress_data(algo: CompressionAlgo, data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Async wrapper around [`compress_data`] that runs the CPU-bound codec
+/// on a blocking-pool thread. Chunks are 1–128 MiB; zstd/lz4 of one chunk
+/// blocks for tens to hundreds of ms, so calling the sync variant
+/// directly inside an `async fn` stalls a tokio worker and adds latency
+/// spikes to the iSCSI/NVMe command processing sharing the runtime
+/// (issue #194). `data` is moved onto the blocking thread.
+pub async fn compress_data_async(
+    algo: CompressionAlgo,
+    data: Vec<u8>,
+    level: i32,
+) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || compress_data(algo, &data, level))
+        .await
+        .map_err(|e| ObjectStoreError::Compression(format!("compress task join: {}", e)))?
+}
+
+/// Async wrapper around [`decompress_data`] — see [`compress_data_async`]
+/// for the rationale (issue #194). `data` is moved onto the blocking
+/// thread.
+pub async fn decompress_data_async(algo: CompressionAlgo, data: Vec<u8>) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || decompress_data(algo, &data))
+        .await
+        .map_err(|e| ObjectStoreError::Compression(format!("decompress task join: {}", e)))?
+}
+
 /// Tiny helper so the `compress_data` LZ4 arm reads top-down without a
 /// `let`-then-`Ok(...)` dance. Local to this file — not a general utility.
 trait Pipe: Sized {

@@ -38,6 +38,11 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # Decorrelated-jitter backoff for the retry loop.
 rand = "0.9"
 
+# Bounded LRU for the caching wrapper's presence/upload fact map, so it
+# can't grow one permanent entry per chunk key ever seen (issue #192).
+# Already in the tree transitively (aws-smithy-runtime) — same version.
+lru = "0.16"
+
 # DiskCacheSize is reused on the per-entry `disk_cache_size_gb`
 # override under `storage.backends:` (same shape as the YAML default —
 # the two parsers can't drift).

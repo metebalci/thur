@@ -8,7 +8,9 @@
 //! - AWS credential handling (env vars, IAM, shared credentials)
 //! - Error handling and logging
 
-use crate::compression::{CompressionAlgo, CompressionConfig, compress_data, decompress_data};
+use crate::compression::{
+    CompressionAlgo, CompressionConfig, compress_data_async, decompress_data_async,
+};
 use crate::object_store_backend::ObjectStoreBackend;
 use crate::object_store_config::ResolvedS3Auth;
 use crate::{ObjectStoreError, Result};
@@ -338,7 +340,9 @@ impl S3Backend {
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {
-                    let compressed = compress_data(algo, data, self.compression_config.level)?;
+                    let compressed =
+                        compress_data_async(algo, data.to_vec(), self.compression_config.level)
+                            .await?;
                     let comp_size = compressed.len() as u64;
                     debug!(
                         "Compressed chunk ({}) from {} bytes to {} bytes (ratio: {:.2}%)",
@@ -557,11 +561,11 @@ impl S3Backend {
                 let data = match compression_type.as_deref() {
                     Some("zstd") => {
                         debug!("Decompressing chunk (zstd)");
-                        decompress_data(CompressionAlgo::Zstd, &compressed_data)?
+                        decompress_data_async(CompressionAlgo::Zstd, compressed_data).await?
                     }
                     Some("lz4") => {
                         debug!("Decompressing chunk (lz4)");
-                        decompress_data(CompressionAlgo::Lz4, &compressed_data)?
+                        decompress_data_async(CompressionAlgo::Lz4, compressed_data).await?
                     }
                     Some("none") | None => {
                         debug!("No decompression needed");

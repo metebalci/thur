@@ -269,14 +269,17 @@ impl GcsApi for RealGcsApi {
         // CRITICAL: the FieldMask must scope the patch to
         // `event_based_hold`; without it, the SDK's PATCH wipes every
         // other field on the object.
+        // The update RPC addresses the object by the resource's `bucket`
+        // + `name`. `name` here is a bare key ("manifests/T1/..."), not a
+        // fully-qualified resource, so the bucket MUST be set explicitly
+        // (as every sibling get/list/delete call does) — without it the
+        // PATCH cannot resolve the object and fails server-side, breaking
+        // every GCS legal-hold set/release (issue #193).
         let resource = Object::default()
+            .set_bucket(Self::bucket_resource(bucket))
             .set_name(key.to_string())
             .set_event_based_hold(held);
         let mask = FieldMask::default().set_paths(["event_based_hold"]);
-        // The update RPC infers the bucket from `resource.name` only if
-        // the name is fully qualified; we pass `set_bucket` explicitly
-        // for parity with the get/list/delete calls above.
-        let _ = bucket;
         self.control
             .update_object()
             .set_object(resource)

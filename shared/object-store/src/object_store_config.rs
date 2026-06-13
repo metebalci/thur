@@ -708,6 +708,15 @@ impl ObjectStoreConfig {
         }
     }
 
+    /// Force storage-side compression off. The storage benchmark calls
+    /// this so its reported throughput measures raw transport, not local
+    /// zstd/lz4 codec speed — otherwise an incompressible-random run is
+    /// CPU-bound on the codec and under-reports the link ceiling
+    /// (issue #195).
+    pub fn disable_compression(&mut self) {
+        self.compression.algorithm = CompressionAlgoYaml::None;
+    }
+
     /// Operator-declared retention mode for the named backend. Local
     /// backends always report `None` (the filesystem has no
     /// immutability concept).

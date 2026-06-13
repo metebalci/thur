@@ -36,7 +36,7 @@ pub use azure::AzureBackend;
 pub use caching::CachingObjectStoreBackend;
 pub use compression::{
     COMPRESSION_ALGORITHM_DEFAULT, CompressionAlgo, CompressionConfig, DriveCompressionState,
-    ZSTD_DEFAULT_LEVEL, compress_data, decompress_data,
+    ZSTD_DEFAULT_LEVEL, compress_data, compress_data_async, decompress_data, decompress_data_async,
 };
 pub use dedup::DedupScope;
 pub use error::{ObjectStoreError, Result};
