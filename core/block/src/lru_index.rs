@@ -161,6 +161,32 @@ impl LruIndexFile {
         Ok(u64::from_le_bytes(buf))
     }
 
+    /// Read every timestamp in one sequential pass. Returns a vector
+    /// indexed by `page_id` (`vec[page_id]` = last-touched ts; absent
+    /// trailing pages read as `0` = oldest). The eviction worker's
+    /// whole-volume walk uses this instead of one 8-byte random
+    /// `pread` per allocated page — turning O(pages) syscalls into one
+    /// sequential read per volume (issue #152). A torn trailing record
+    /// (file length not a record multiple) is ignored.
+    pub fn read_all(&self) -> Result<Vec<u64>, LruIndexError> {
+        let len = self.file.metadata()?.len();
+        if len <= HEADER_SIZE {
+            return Ok(Vec::new());
+        }
+        let body_len = (len - HEADER_SIZE) as usize;
+        let mut body = vec![0u8; body_len];
+        self.file.read_exact_at(&mut body, HEADER_SIZE)?;
+        let count = body_len / RECORD_SIZE as usize;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * RECORD_SIZE as usize;
+            let mut buf = [0u8; RECORD_SIZE as usize];
+            buf.copy_from_slice(&body[start..start + RECORD_SIZE as usize]);
+            out.push(u64::from_le_bytes(buf));
+        }
+        Ok(out)
+    }
+
     /// Force file contents to disk. Called at write-page boundaries
     /// alongside `pages.idx::sync`.
     pub fn sync(&self) -> Result<(), LruIndexError> {
@@ -219,6 +245,34 @@ mod tests {
         // Sparse: any page id is legal; never-touched ⇒ 0.
         assert_eq!(lru.read(0).unwrap(), 0);
         assert_eq!(lru.read(99_999).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_all_returns_every_record_indexed_by_page_id() {
+        let tmp = TempDir::new().unwrap();
+        let lru = LruIndexFile::open_or_create(tmp.path()).unwrap();
+        lru.touch(0, 100).unwrap();
+        lru.touch(2, 300).unwrap();
+        lru.touch(5, 600).unwrap();
+        let all = lru.read_all().unwrap();
+        // File extends to the highest touched page; intermediate holes
+        // read as 0 (oldest), matching per-page `read`.
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0], 100);
+        assert_eq!(all[1], 0);
+        assert_eq!(all[2], 300);
+        assert_eq!(all[5], 600);
+        // Bulk read agrees with the per-page random `pread` it replaces.
+        for (pid, &ts) in all.iter().enumerate() {
+            assert_eq!(lru.read(pid as PageId).unwrap(), ts);
+        }
+    }
+
+    #[test]
+    fn read_all_on_empty_file_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let lru = LruIndexFile::open_or_create(tmp.path()).unwrap();
+        assert!(lru.read_all().unwrap().is_empty());
     }
 
     #[test]

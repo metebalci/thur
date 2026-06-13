@@ -271,6 +271,17 @@ pub enum VolumeError {
     #[error("volume size must be at least one page ({0} B)")]
     SizeBelowPage(u32),
 
+    #[error(
+        "volume size ({size_bytes} B at {page_size_bytes} B pages) addresses page \
+         ids beyond the {max_pages}-page limit; the block layer uses a 32-bit page \
+         id, so the tail would be unaddressable (writes fail, fences skip it)"
+    )]
+    SizeExceedsAddressable {
+        size_bytes: u64,
+        page_size_bytes: u32,
+        max_pages: u64,
+    },
+
     #[error("size string '{0}' could not be parsed: {1}")]
     InvalidSize(String, &'static str),
 
@@ -527,6 +538,13 @@ impl VolumeManifest {
                 sector_bytes,
             });
         }
+        if !last_page_id_fits(size_bytes, page_size_bytes) {
+            return Err(VolumeError::SizeExceedsAddressable {
+                size_bytes,
+                page_size_bytes,
+                max_pages: u64::from(u32::MAX) + 1,
+            });
+        }
         Ok(Self {
             schema_version: VOLUME_SCHEMA_VERSION,
             name,
@@ -728,6 +746,21 @@ pub fn validate_name(name: &str) -> Result<(), VolumeError> {
         ));
     }
     Ok(())
+}
+
+/// Does the volume's last byte map to an addressable `PageId`? The
+/// block layer addresses pages with a 32-bit [`crate::page_index::PageId`];
+/// a volume whose last byte lands on a page id past `u32::MAX` has an
+/// unaddressable tail — writes there fail with `PageOutOfRange`, and a
+/// whole-device SYNCHRONIZE CACHE would silently skip it (issue #151).
+/// Shared by `VolumeManifest::new` (create) and `VolumeWriter::set_size`
+/// (resize) so neither path can mint an over-sized volume.
+pub(crate) fn last_page_id_fits(size_bytes: u64, page_size_bytes: u32) -> bool {
+    if page_size_bytes == 0 {
+        return false;
+    }
+    let last_page = size_bytes.saturating_sub(1) / u64::from(page_size_bytes);
+    last_page <= u64::from(u32::MAX)
 }
 
 fn validate_page_size(page_size_bytes: u32, sector_bytes: u32) -> Result<(), VolumeError> {
@@ -1003,6 +1036,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, VolumeError::SizeNotSectorAligned { .. }));
+    }
+
+    #[test]
+    fn rejects_size_beyond_addressable_page_space() {
+        // One page past the 32-bit page-id limit at the default page
+        // size: the tail would be unaddressable (issue #151).
+        let ps = u64::from(DEFAULT_PAGE_SIZE_BYTES);
+        let too_big = (u64::from(u32::MAX) + 2) * ps;
+        let err = VolumeManifest::new(
+            "vol1".into(),
+            too_big,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, VolumeError::SizeExceedsAddressable { .. }));
+    }
+
+    #[test]
+    fn accepts_max_addressable_size() {
+        // Exactly `2^32` pages: the last byte maps to page id
+        // `u32::MAX`, which fits — the boundary must be allowed.
+        let ps = u64::from(DEFAULT_PAGE_SIZE_BYTES);
+        let max_ok = (u64::from(u32::MAX) + 1) * ps;
+        assert!(last_page_id_fits(max_ok, DEFAULT_PAGE_SIZE_BYTES));
+        assert!(!last_page_id_fits(max_ok + ps, DEFAULT_PAGE_SIZE_BYTES));
+        VolumeManifest::new(
+            "vol1".into(),
+            max_ok,
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .expect("the max-addressable size must be accepted");
     }
 
     #[test]

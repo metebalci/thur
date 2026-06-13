@@ -285,11 +285,15 @@ impl DiskCacheManager {
         let mut chunks = self.scan_chunks()?;
         let (touches, uploaded) = self.collect_lru_touches_and_upload_state()?;
         for c in chunks.iter_mut() {
+            // The walk keys by the raw 32-byte hash; decode the
+            // chunk's hex name once (cheap — chunk count, not page
+            // count). A malformed name (shouldn't happen) leaves the
+            // defaults below.
+            let key = hex_to_blake3(&c.hash);
             // Per-namespace lookup: Global chunks have None key,
             // Local-scope chunks key by their owning volume.
-            c.last_accessed = touches
-                .get(&c.namespace)
-                .and_then(|m| m.get(&c.hash))
+            c.last_accessed = key
+                .and_then(|k| touches.get(&c.namespace).and_then(|m| m.get(&k)))
                 .copied()
                 .unwrap_or(0);
             // Default uploaded = true when no record exists: a
@@ -297,9 +301,8 @@ impl DiskCacheManager {
             // upload.idx entry) was synchronously uploaded under
             // the old write path, so dropping it from the pool is
             // safe — `read_page` will refetch from storage on miss.
-            c.uploaded = uploaded
-                .get(&c.namespace)
-                .and_then(|m| m.get(&c.hash))
+            c.uploaded = key
+                .and_then(|k| uploaded.get(&c.namespace).and_then(|m| m.get(&k)))
                 .copied()
                 .unwrap_or(true);
         }
@@ -489,13 +492,18 @@ impl DiskCacheManager {
         &self,
     ) -> Result<
         (
-            HashMap<Option<String>, HashMap<String, u64>>,
-            HashMap<Option<String>, HashMap<String, bool>>,
+            HashMap<Option<String>, HashMap<[u8; 32], u64>>,
+            HashMap<Option<String>, HashMap<[u8; 32], bool>>,
         ),
         ChunkPoolError,
     > {
-        let mut touches: HashMap<Option<String>, HashMap<String, u64>> = HashMap::new();
-        let mut uploaded: HashMap<Option<String>, HashMap<String, bool>> = HashMap::new();
+        // Keyed by the raw 32-byte BLAKE3 hash, not its 64-char hex
+        // form: `pages.idx` already yields the bytes, so hex-encoding
+        // per page allocated a transient `String` per allocated page
+        // (10^8+ at documented scale) and inflated each map entry from
+        // 32 inline bytes to a heap `String` (issue #152).
+        let mut touches: HashMap<Option<String>, HashMap<[u8; 32], u64>> = HashMap::new();
+        let mut uploaded: HashMap<Option<String>, HashMap<[u8; 32], bool>> = HashMap::new();
         let volumes_dir = self.data_dir.join(VolumeManifest::VOLUMES_SUBDIR);
         if !volumes_dir.is_dir() {
             return Ok((touches, uploaded));
@@ -568,6 +576,29 @@ impl DiskCacheManager {
                     None
                 }
             };
+            // One sequential read of each sidecar per volume instead of
+            // a random `pread` per allocated page (issue #152). `lru.idx`
+            // is a best-effort recency hint: a read failure degrades to
+            // "all pages oldest", never pinning. `upload.idx` is a
+            // safety gate: a read failure pins the whole volume for this
+            // pass, exactly like the open failure handled above.
+            let lru_ts: Vec<u64> = lru_index.read_all().unwrap_or_default();
+            let upload_states: Vec<u8> = if sidecar_unreadable {
+                Vec::new()
+            } else {
+                match upload_idx.as_ref().map(UploadIndexFile::read_all) {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => {
+                        warn!(
+                            "LRU walk: read upload.idx for '{}' failed: {} (pinning this volume's chunks against eviction for this pass)",
+                            name, e
+                        );
+                        sidecar_unreadable = true;
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            };
             let namespace_key: Option<String> = manifest.pool_namespace();
             let bucket_t = touches.entry(namespace_key.clone()).or_default();
             let bucket_u = uploaded.entry(namespace_key).or_default();
@@ -579,25 +610,24 @@ impl DiskCacheManager {
                         break;
                     }
                 };
-                let ts = lru_index.read(page_id).unwrap_or(0);
+                let ts = lru_ts.get(page_id as usize).copied().unwrap_or(0);
                 let is_uploaded = if sidecar_unreadable {
-                    // Whole-file open failed above — can't verify
-                    // upload state for any page; pin conservatively.
+                    // Sidecar unreadable — can't verify upload state for
+                    // any page; pin conservatively.
                     false
                 } else {
-                    match upload_idx.as_ref().map(|u| u.read(page_id)) {
-                        Some(Ok(UploadState::Uploaded)) | None => true,
-                        Some(Ok(UploadState::LocalOnly)) => false,
-                        // Read error on a single record: assume
-                        // Uploaded so a transient IO blip doesn't
-                        // freeze the cache. The eviction worker is
-                        // periodic; the next pass re-reads.
-                        Some(Err(_)) => true,
+                    // A page id past the sidecar's length reads as
+                    // Uploaded (legacy default, matching
+                    // `UploadIndexFile::read`); an in-range byte decodes
+                    // via `UploadState::from_byte`, where unknown bytes
+                    // also fall back to Uploaded.
+                    match upload_states.get(page_id as usize) {
+                        None => true,
+                        Some(&b) => UploadState::from_byte(b) == UploadState::Uploaded,
                     }
                 };
-                let hash_hex = hex::encode(hash);
                 bucket_t
-                    .entry(hash_hex.clone())
+                    .entry(hash)
                     .and_modify(|cur| {
                         if ts > *cur {
                             *cur = ts;
@@ -607,7 +637,7 @@ impl DiskCacheManager {
                 // AND across every reference: a single LocalOnly
                 // page pins the chunk against eviction.
                 bucket_u
-                    .entry(hash_hex)
+                    .entry(hash)
                     .and_modify(|cur| *cur &= is_uploaded)
                     .or_insert(is_uploaded);
             }

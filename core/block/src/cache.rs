@@ -1105,8 +1105,21 @@ impl PageCache {
         let first = byte_offset / self.page_size;
         let last_byte = byte_offset.checked_add(len - 1)?;
         let last = last_byte / self.page_size;
+        // The first page beyond the addressable `PageId` (`u32`) space
+        // can never have been written (writes there fail with
+        // `PageOutOfRange`), so there is genuinely nothing to flush —
+        // a no-op is correct.
         let first_u32 = u32::try_from(first).ok()?;
-        let last_u32 = u32::try_from(last).ok()?;
+        // Clamp the *last* page to the highest addressable id rather
+        // than no-opping the whole fence on overflow (issue #151): a
+        // whole-device SYNCHRONIZE CACHE (LBA 0 / count 0) on a volume
+        // larger than `2^32` pages must still flush every page it
+        // actually wrote, not silently report durable without flushing
+        // anything. Volumes are refused at create/resize time if their
+        // last byte maps past `PageId::MAX` (see `VolumeManifest::new`
+        // / `VolumeWriter::set_size`), so in practice this clamp is a
+        // belt-and-suspenders guard for any range arithmetic.
+        let last_u32 = u32::try_from(last).unwrap_or(PageId::MAX);
         Some((first_u32, last_u32))
     }
 
@@ -1771,6 +1784,28 @@ mod tests {
         (0..len)
             .map(|i| seed.wrapping_add((i & 0xFF) as u8))
             .collect()
+    }
+
+    /// Issue #151: a whole-device range whose last page would overflow
+    /// the 32-bit `PageId` must clamp to the highest addressable page,
+    /// not no-op the fence. (Volumes are refused at create time if they
+    /// reach this far, but the arithmetic must still be safe.)
+    #[tokio::test]
+    async fn page_range_for_bytes_clamps_overflowing_last_page() {
+        let (_tmp, cache, _w) = fixture_cache(4 * (1u64 << 20)).await;
+        let ps = cache.page_size;
+        // A length whose last byte maps past page id u32::MAX.
+        let huge_len = (u64::from(u32::MAX) + 5) * ps;
+        let (first, last) = cache
+            .page_range_for_bytes(0, huge_len)
+            .expect("an in-range start must not no-op the fence");
+        assert_eq!(first, 0);
+        assert_eq!(last, PageId::MAX, "last page clamps to the addressable max");
+
+        // A start already past the addressable space: nothing written
+        // there, so a no-op is correct.
+        let past = (u64::from(u32::MAX) + 5) * ps;
+        assert!(cache.page_range_for_bytes(past, 1).is_none());
     }
 
     /// Like [`fixture_cache`] but on the async-dispatch path: the

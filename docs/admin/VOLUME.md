@@ -24,6 +24,13 @@ only written data consumes backend storage (after dedup + compression).
 `--backend` is resolved daemon-side — omit it when exactly one
 `storage.backends:` entry exists. 4 KiB sectors, default 64 KiB page.
 
+The block layer addresses pages with a 32-bit page id, so a volume may
+span at most `2^32` pages: 256 TiB at the default 64 KiB page, 16 TiB at
+a 4 KiB page. `volume create` / `volume resize` refuse a size whose last
+byte would land past that ceiling rather than mint an unaddressable tail
+(writes there would fail and a whole-device flush would skip it). Pick a
+larger page size if you need more addressable capacity.
+
 After `create`, rescan the host (`iscsiadm -m session --rescan` /
 `nvme ns-rescan`) to see the new LUN; under CHAP / TLS-PSK also grant
 admission first (see [Admission](#admission-chap--tls-psk)).

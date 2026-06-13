@@ -374,6 +374,12 @@ pub enum UploaderError {
     #[error("resize target {size_bytes} B is smaller than one {page_size} B page")]
     ResizeBelowPage { size_bytes: u64, page_size: u32 },
 
+    #[error(
+        "resize target {size_bytes} B at {page_size} B pages addresses page ids \
+         beyond the 32-bit page-id limit; the tail would be unaddressable"
+    )]
+    ResizeExceedsAddressable { size_bytes: u64, page_size: u32 },
+
     #[error("resize target {size_bytes} B equals the current size; nothing to do")]
     ResizeNoChange { size_bytes: u64 },
 
@@ -450,6 +456,7 @@ impl UploaderError {
             | Self::IncompatiblePageSize { .. }
             | Self::ResizeNotSectorAligned { .. }
             | Self::ResizeBelowPage { .. }
+            | Self::ResizeExceedsAddressable { .. }
             | Self::ResizeNoChange { .. }
             | Self::ResizeWormForbidden
             | Self::ResizeWouldDiscardData { .. } => FaultClass::Validation,
@@ -999,6 +1006,16 @@ impl VolumeWriter {
                 page_size: self.manifest.page_size_bytes,
             });
         }
+        // Refuse a grow whose tail would land past the 32-bit page-id
+        // space — an unaddressable region whose whole-device fence would
+        // silently no-op (issue #151). Mirrors the create-time guard in
+        // `VolumeManifest::new`.
+        if !crate::volume::last_page_id_fits(new_size, self.manifest.page_size_bytes) {
+            return Err(UploaderError::ResizeExceedsAddressable {
+                size_bytes: new_size,
+                page_size: self.manifest.page_size_bytes,
+            });
+        }
         let current = self.size_bytes();
         if new_size == current {
             return Err(UploaderError::ResizeNoChange {
@@ -1113,7 +1130,10 @@ impl VolumeWriter {
         bytes: &[u8],
     ) -> Result<WritePageOutcome, UploaderError> {
         let outcome = self.write_page_unsynced(page_id, bytes).await?;
-        self.page_index.sync()?;
+        // `page_index_sync` fsyncs the upload sidecar then `pages.idx`,
+        // so the strict path also forces the now-unsynced `LocalOnly`
+        // flag to disk (issue #153).
+        self.page_index_sync()?;
         Ok(outcome)
     }
 
@@ -1286,8 +1306,15 @@ impl VolumeWriter {
         // Flag the sidecar as LocalOnly *before* the hand-off so a
         // crash between here and the worker's completion leaves a
         // recoverable record (the boot-time recovery scan finds it
-        // and re-enqueues).
-        self.upload_index.set(page_id, UploadState::LocalOnly)?;
+        // and re-enqueues). Use the *unsynced* write on the hot path:
+        // the batched flush drain pays one `UploadIndexFile::sync` per
+        // cohort in `page_index_sync` (ordered before the `pages.idx`
+        // fsync), instead of an `fdatasync` per 64 KiB page that would
+        // cap a serial flush stream at ~128 MB/s regardless of backend
+        // speed (issue #153). The crash-ordering requirement —
+        // `LocalOnly` durable before the `pages.idx` hash — still holds
+        // because `page_index_sync` fsyncs the sidecar first.
+        self.upload_index.set_unsynced(page_id, UploadState::LocalOnly)?;
 
         // The async-vs-inline branch: with a sender, hand off and
         // return — the worker drives `upload_chunk_inert` and calls
@@ -1365,7 +1392,17 @@ impl VolumeWriter {
 
     /// Flush every prior [`Self::write_page_unsynced`] to disk.
     /// Returns once `fdatasync(2)` on the page index has completed.
+    ///
+    /// Fsyncs the upload sidecar *first*, then `pages.idx`. The hot
+    /// write path now marks `upload.idx[page] = LocalOnly` with an
+    /// unsynced pwrite (issue #153); the crash-ordering contract is
+    /// that the `LocalOnly` flag is durable before the `pages.idx`
+    /// hash a SYNCHRONIZE CACHE waiter can observe, so a power loss can
+    /// never leave a hash pointing at a chunk the recovery scan won't
+    /// re-enqueue. One `fdatasync` per cohort on each sidecar, not per
+    /// page.
     pub fn page_index_sync(&self) -> Result<(), UploaderError> {
+        self.upload_index.sync()?;
         self.page_index.sync()?;
         Ok(())
     }
@@ -2070,6 +2107,46 @@ mod tests {
         let reopened = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
         assert_eq!(reopened.size_bytes(), 8 * (1u64 << 20));
         assert_eq!(reopened.last_page_id(), 127);
+    }
+
+    #[tokio::test]
+    async fn set_size_rejects_grow_beyond_addressable_page_space() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let writer = VolumeWriter::open(tmp.path(), &name, backend).unwrap();
+        // One page past the 32-bit page-id limit at the volume's page
+        // size — the grown tail would be unaddressable (issue #151).
+        let ps = u64::from(writer.manifest().page_size_bytes);
+        let too_big = (u64::from(u32::MAX) + 2) * ps;
+        assert!(matches!(
+            writer.set_size(too_big).unwrap_err(),
+            UploaderError::ResizeExceedsAddressable { .. }
+        ));
+    }
+
+    /// Issue #153: the async flush path marks `upload.idx` LocalOnly
+    /// with an unsynced pwrite (the value is still recorded), and
+    /// `page_index_sync` — which now fsyncs the sidecar before
+    /// `pages.idx` — leaves it intact.
+    #[tokio::test]
+    async fn write_page_unsynced_marks_localonly_then_survives_index_sync() {
+        let (tmp, name, backend) = fixture(DedupScope::Local).await;
+        let (tx, _rx) = mpsc::channel::<UploadTask>(8);
+        let writer = VolumeWriter::open(tmp.path(), &name, backend)
+            .unwrap()
+            .with_upload_sender(tx);
+        let bytes = page_bytes(0x5A);
+        writer.write_page_unsynced(3, &bytes).await.unwrap();
+        assert_eq!(
+            writer.upload_index().read(3).unwrap(),
+            UploadState::LocalOnly,
+            "async write must record the page LocalOnly for the recovery scan"
+        );
+        writer.page_index_sync().unwrap();
+        assert_eq!(
+            writer.upload_index().read(3).unwrap(),
+            UploadState::LocalOnly,
+            "the cohort sync must not disturb the recorded state"
+        );
     }
 
     #[tokio::test]

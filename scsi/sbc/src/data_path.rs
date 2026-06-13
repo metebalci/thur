@@ -218,11 +218,23 @@ pub(super) async fn read(
         Err(s) => return ScsiResponse::check(s),
     };
 
-    let mut out = match cache.read_bytes(byte_offset, want_bytes).await {
+    // Bound the per-command working buffer by the declared transfer
+    // length. Anything past `data_in_max` is truncated off the wire
+    // below anyway, so reading it would only over-allocate and pull
+    // extra pages through cache+storage. Without this cap a crafted
+    // READ(16) carrying a huge NUMBER OF BLOCKS against a large thin
+    // volume drives a single multi-GB/TB `Vec` allocation, which aborts
+    // the daemon (allocation failure is an abort, not a catchable
+    // panic) and takes down every volume for every initiator (issue
+    // #150).
+    let want = want_bytes.min(req.data_in_max);
+    let mut out = match cache.read_bytes(byte_offset, want).await {
         Ok(v) => v,
         Err(e) => return ScsiResponse::check(map_read_error(&e)),
     };
 
+    // `want` already bounds `out` to `data_in_max`; this stays as a
+    // defensive net should the cache ever over-return.
     if out.len() > req.data_in_max {
         out.truncate(req.data_in_max);
     }
@@ -2536,6 +2548,33 @@ mod tests {
         assert!(r.sense.is_none());
         assert_eq!(r.data_in.len(), 256);
         assert_eq!(&r.data_in[..], &payload[..256]);
+    }
+
+    /// Issue #150: a READ(16) carrying a huge NUMBER OF BLOCKS against
+    /// a large thin volume must not allocate the full declared transfer
+    /// length up-front (which aborts the process on a multi-GB request)
+    /// — the working buffer is bounded by `data_in_max`. Before the fix
+    /// this attempted a ~64 GiB `Vec` and crashed the daemon.
+    #[tokio::test]
+    async fn read_caps_working_buffer_against_huge_thin_volume() {
+        let tmp = TempDir::new().unwrap();
+        // 64 GiB thin volume — instant to create, never allocated.
+        let size = 64 * (1u64 << 30);
+        let cache = fixture_cache(tmp.path(), size, false).await;
+        let total_blocks = (size / SECTOR as u64) as u32;
+        let cdb = read16_cdb(0, total_blocks);
+        let r = read(
+            &req(&cdb, &[], 256),
+            Some(cache.as_ref()),
+            test_nexus(),
+            &test_mgr(),
+        )
+        .await;
+        assert!(r.sense.is_none());
+        // Only `data_in_max` bytes are read/returned, not the 64 GiB the
+        // CDB nominally requested.
+        assert_eq!(r.data_in.len(), 256);
+        assert!(r.data_in.iter().all(|&b| b == 0), "unallocated reads zero");
     }
 
     #[tokio::test]

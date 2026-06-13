@@ -226,6 +226,24 @@ impl UploadIndexFile {
         Ok(UploadState::from_byte(buf[0]))
     }
 
+    /// Read every record in one sequential pass. Returns a vector
+    /// indexed by `page_id` (`vec[page_id]` = the raw state byte);
+    /// trailing pages past the file length are absent and the caller
+    /// treats them as `Uploaded` (the legacy default, matching
+    /// [`Self::read`]). The eviction worker's whole-volume walk uses
+    /// this instead of one 1-byte random `pread` per allocated page
+    /// (issue #152).
+    pub fn read_all(&self) -> Result<Vec<u8>, UploadIndexError> {
+        let len = self.file.metadata()?.len();
+        if len <= HEADER_SIZE {
+            return Ok(Vec::new());
+        }
+        let body_len = (len - HEADER_SIZE) as usize;
+        let mut body = vec![0u8; body_len];
+        self.file.read_exact_at(&mut body, HEADER_SIZE)?;
+        Ok(body)
+    }
+
     /// Force file contents to disk.
     pub fn sync(&self) -> Result<(), UploadIndexError> {
         self.file.sync_data()?;
@@ -419,6 +437,29 @@ mod tests {
         let u = UploadIndexFile::open_or_create(tmp.path()).unwrap();
         let items: Vec<_> = u.iter().unwrap().collect::<Result<_, _>>().unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn read_all_returns_body_indexed_by_page_id() {
+        let tmp = TempDir::new().unwrap();
+        let u = UploadIndexFile::open_or_create(tmp.path()).unwrap();
+        u.set(0, UploadState::Uploaded).unwrap();
+        u.set(3, UploadState::LocalOnly).unwrap();
+        let body = u.read_all().unwrap();
+        // File extends through the highest-set page; the bulk read
+        // agrees byte-for-byte with the per-page `read` it replaces.
+        assert_eq!(body.len(), 4);
+        for (pid, &b) in body.iter().enumerate() {
+            assert_eq!(UploadState::from_byte(b), u.read(pid as PageId).unwrap());
+        }
+        assert_eq!(UploadState::from_byte(body[3]), UploadState::LocalOnly);
+    }
+
+    #[test]
+    fn read_all_on_empty_file_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let u = UploadIndexFile::open_or_create(tmp.path()).unwrap();
+        assert!(u.read_all().unwrap().is_empty());
     }
 
     #[test]
