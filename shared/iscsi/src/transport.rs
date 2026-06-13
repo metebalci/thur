@@ -70,6 +70,17 @@ pub const MAX_BURST_LENGTH: u32 = 16 * 1024 * 1024;
 /// no follow-on unsolicited Data-Out PDUs needed.
 pub const FIRST_BURST_LENGTH: u32 = MAX_RECV_DATA_SEGMENT_LENGTH;
 
+/// Hard ceiling on a single SCSI Command's Expected Data Transfer
+/// Length (the WRITE buffer one command can grow). The EDTL comes
+/// verbatim from the untrusted Command BHS (a full u32 → 4 GiB); with
+/// the shipped `iscsi.auth.method: None` default any network peer could
+/// stream toward 4 GiB per connection and OOM the daemon (issue #125).
+/// 128 MiB is far above any realistic host I/O (OSes cap a single SCSI
+/// transfer well below this) while bounding per-connection memory. A
+/// command over the cap is refused with CHECK CONDITION (INVALID FIELD
+/// IN CDB) before any Data-Out is solicited.
+pub const MAX_WRITE_EDTL: u32 = 128 * 1024 * 1024;
+
 /// One advertised iSCSI portal: a TCP bind address paired with the
 /// Target Portal Group Tag the daemon reports for it. Each portal binds
 /// its own [`TcpListener`]; SendTargets emits one
@@ -610,12 +621,7 @@ pub async fn collect_write_data<W: AsyncWrite + Unpin>(
     // Phase 1: drain unsolicited Data-Out, if any.
     if !cmd.final_bit && (cmd.data.len() as u32) < FIRST_BURST_LENGTH.min(edtl) {
         loop {
-            let dout = data_out_rx.recv().await.ok_or_else(|| {
-                anyhow!(
-                    "PDU reader closed while awaiting unsolicited Data-Out for ITT=0x{:08x}",
-                    cmd.itt
-                )
-            })?;
+            let dout = recv_data_out_or_timeout(data_out_rx, cmd.itt).await?;
             // Reader pre-filters opcode 0x05 + matching ITT before
             // routing here, so the opcode/ITT checks below are
             // defense-in-depth.
@@ -694,13 +700,7 @@ pub async fn collect_write_data<W: AsyncWrite + Unpin>(
 
         let burst_end = already + ddtl;
         loop {
-            let dout = data_out_rx.recv().await.ok_or_else(|| {
-                anyhow!(
-                    "PDU reader closed while awaiting solicited Data-Out for ITT=0x{:08x} TTT=0x{:08x}",
-                    cmd.itt,
-                    ttt
-                )
-            })?;
+            let dout = recv_data_out_or_timeout(data_out_rx, cmd.itt).await?;
             if (dout.opcode & 0x3F) != 0x05 {
                 return Err(anyhow!(
                     "expected solicited Data-Out for ITT=0x{:08x} TTT=0x{:08x}, got opcode 0x{:02x}",
@@ -1337,13 +1337,50 @@ struct RoutedPdu {
 }
 
 /// Bounded depth of the per-ITT Data-Out channel. One unsolicited
-/// burst is bounded by `FIRST_BURST_LENGTH` and one R2T-solicited
-/// burst by `MAX_BURST_LENGTH`; at the 128 KiB segment cap, the
-/// largest legal burst is ~128 PDUs (16 MiB / 128 KiB). 32 buffered
-/// is enough headroom that the reader rarely backpressures; the
-/// reader awaits on `send().await` when full so back-pressure
-/// naturally throttles the wire.
-const DATA_OUT_CHANNEL_DEPTH: usize = 32;
+/// Per-ITT Data-Out channel depth. A queued (not-yet-collected) WRITE's
+/// unsolicited burst is bounded by `FIRST_BURST_LENGTH` (128 KiB); with
+/// small Data-Out PDUs that is many PDUs, and if the channel fills before
+/// the dispatch loop starts collecting, the reader blocks here and wedges
+/// the connection (issue #126). Sized to hold a full first-burst of
+/// ~512-byte PDUs (128 KiB / 512 B = 256); the recv timeout in
+/// `collect_write_data` backstops any tinier-PDU pathological flood.
+const DATA_OUT_CHANNEL_DEPTH: usize = 256;
+
+/// Main (non-Data-Out) PDU channel depth. The reader forwards every
+/// command / immediate PDU here and awaits when full; meanwhile a WRITE's
+/// `collect_write_data` only drains its per-ITT channel, not this one. If
+/// this fills while a WRITE is collecting, the reader blocks and can no
+/// longer route that WRITE's Data-Out — deadlock (issue #126). Sized to
+/// the advertised CmdSN window (max outstanding commands) plus headroom
+/// for immediate PDUs (NOP-Out / TMF) that don't consume CmdSN, so the
+/// reader never blocks here under spec-compliant queue depth.
+const MAIN_CHANNEL_DEPTH: usize = ADVERTISED_CMDSN_WINDOW as usize + 64;
+
+/// Backstop timeout awaiting a Data-Out PDU during a WRITE collect. A
+/// well-behaved initiator sends solicited Data-Out within milliseconds of
+/// an R2T; a multi-second gap means the connection is wedged or the peer
+/// is dead. Bounds any residual `collect_write_data` hang (issue #126)
+/// into a connection reset rather than an indefinite stall.
+const DATA_OUT_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Await the next routed Data-Out PDU with a timeout backstop.
+async fn recv_data_out_or_timeout(
+    rx: &mut tokio::sync::mpsc::Receiver<Pdu>,
+    itt: u32,
+) -> Result<Pdu> {
+    match tokio::time::timeout(DATA_OUT_RECV_TIMEOUT, rx.recv()).await {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err(anyhow!(
+            "PDU reader closed while awaiting Data-Out for ITT=0x{:08x}",
+            itt
+        )),
+        Err(_) => Err(anyhow!(
+            "timed out after {:?} awaiting Data-Out for ITT=0x{:08x} (connection wedged)",
+            DATA_OUT_RECV_TIMEOUT,
+            itt
+        )),
+    }
+}
 
 /// Per-connection PDU reader. Owns the read half of the TCP stream
 /// and runs as a spawned task. Demuxes inbound PDUs by ITT:
@@ -1486,7 +1523,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
     let routes: Arc<std::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Pdu>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (main_tx, mut main_rx) =
-        tokio::sync::mpsc::channel::<Result<RoutedPdu>>(DATA_OUT_CHANNEL_DEPTH);
+        tokio::sync::mpsc::channel::<Result<RoutedPdu>>(MAIN_CHANNEL_DEPTH);
     let reader_task = tokio::spawn(pdu_reader(read_half, main_tx, Arc::clone(&routes)));
     // Abort the reader task on any exit path so the OwnedReadHalf is
     // dropped promptly (Drop closes the TCP read side).
@@ -1651,7 +1688,22 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                 // (success or error).
                 let edtl = pdu_expected_xfer_len(&pdu);
                 let w_bit = (pdu.bhs[1] & 0x20) != 0;
-                if w_bit && edtl as usize > pdu.data.len() {
+                // #125: reject an oversized WRITE EDTL before soliciting
+                // any Data-Out, so an initiator can't grow the
+                // per-connection buffer toward 4 GiB and OOM the daemon
+                // (reachable unauthenticated under the no-auth default).
+                // We never send R2T for it, so the initiator stops after
+                // its (FirstBurst-bounded) unsolicited data already read.
+                let edtl_over_cap = w_bit && edtl > MAX_WRITE_EDTL;
+                if edtl_over_cap {
+                    if data_out_rx.is_some() {
+                        drop_route(pdu.itt);
+                    }
+                    error!(
+                        "WRITE EDTL {} from {} exceeds cap {} — rejecting (CHECK CONDITION)",
+                        edtl, peer, MAX_WRITE_EDTL
+                    );
+                } else if w_bit && edtl as usize > pdu.data.len() {
                     let rx = data_out_rx.as_mut().ok_or_else(|| {
                         anyhow!(
                             "reader did not register Data-Out route for ITT=0x{:08x}",
@@ -1709,7 +1761,17 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     session_volumes,
                 };
 
-                let resp = handler.dispatch(req).await;
+                let resp = if edtl_over_cap {
+                    // INVALID FIELD IN CDB (0x05/0x24) — the transfer
+                    // length the host asked for is unsupported (#125).
+                    crate::handler::ScsiResponse::check(scsi_spc::sense::SenseData::new(
+                        scsi_spc::sense::SenseKey::IllegalRequest,
+                        0x24,
+                        0x00,
+                    ))
+                } else {
+                    handler.dispatch(req).await
+                };
 
                 let exp_cmdsn = next_exp_cmdsn(&pdu);
                 let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
@@ -2215,6 +2277,43 @@ mod tests {
     #[test]
     fn max_burst_length_at_least_max_block() {
         const _: () = assert!(MAX_BURST_LENGTH >= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn write_edtl_cap_is_bounded_well_below_u32_max() {
+        // #125: a sane ceiling far below the 4 GiB an untrusted EDTL
+        // could request, but generous vs real host I/O.
+        const _: () = assert!(MAX_WRITE_EDTL < u32::MAX);
+        const _: () = assert!(MAX_WRITE_EDTL >= MAX_BURST_LENGTH);
+    }
+
+    #[test]
+    fn main_channel_exceeds_cmdsn_window() {
+        // #126: the main PDU channel must hold the full advertised CmdSN
+        // window plus headroom so the reader never blocks on it while a
+        // WRITE collect drains only its per-ITT channel.
+        const _: () = assert!(MAIN_CHANNEL_DEPTH > ADVERTISED_CMDSN_WINDOW as usize);
+        // Per-ITT depth covers a full first burst of small Data-Out PDUs.
+        const _: () = assert!(DATA_OUT_CHANNEL_DEPTH >= 256);
+    }
+
+    #[tokio::test]
+    async fn recv_data_out_errors_on_closed_channel() {
+        // Reader gone (connection dropped) → clean error, not a hang.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(1);
+        drop(tx);
+        let err = recv_data_out_or_timeout(&mut rx, 0x1).await.unwrap_err();
+        assert!(err.to_string().contains("reader closed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recv_data_out_times_out_when_wedged() {
+        // #126 backstop: a Data-Out that never arrives (reader wedged)
+        // must time out rather than hang forever. Paused clock fires the
+        // 60s timeout instantly.
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(1);
+        let err = recv_data_out_or_timeout(&mut rx, 0xABCD).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"));
     }
 
     #[test]

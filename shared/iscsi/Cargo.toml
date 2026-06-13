@@ -48,3 +48,6 @@ default = []
 http = ["dep:axum"]
 
 [dev-dependencies]
+# `test-util` enables tokio's paused clock so the 60s Data-Out recv
+# timeout can be exercised instantly in unit tests.
+tokio = { version = "1", features = ["test-util", "macros", "rt", "sync", "time"] }
