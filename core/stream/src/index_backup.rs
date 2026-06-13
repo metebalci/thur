@@ -108,11 +108,21 @@ pub async fn upload_one_index(
     let file = std::fs::File::open(file_ref.path)?;
     let total_pages = file_ref.file_size.div_ceil(PAGE_SIZE as u64) as u32;
     let mut uploaded_keys: Vec<String> = Vec::new();
+    // Pages this pass handled (uploaded or dropped-past-EOF) and may
+    // clear. We clear against a freshly-reloaded on-disk tracker at the
+    // end rather than the in-memory `file_ref.tracker`: the upload worker
+    // runs on a *view* handle whose tracker is a stale open-time snapshot,
+    // so persisting it would clobber dirty bits the owning primary handle
+    // marked after the view opened, dropping them from the next backup
+    // pass (issue #117). We re-read the current on-disk dirty set and
+    // clear only the pages we handled, preserving the primary's marks.
+    let mut handled_pages: Vec<u32> = Vec::new();
     for page in &snapshot.pages {
         if (*page as u64) * PAGE_SIZE as u64 >= file_ref.file_size {
             // Page sits past EOF — happens after a truncate where the
             // boundary page is the only mark. Drop it.
             file_ref.tracker.clear_pages(&[*page]);
+            handled_pages.push(*page);
             continue;
         }
         let off = (*page as u64) * PAGE_SIZE as u64;
@@ -126,12 +136,18 @@ pub async fn upload_one_index(
         // meta-cache wrapper's once-and-done memoization.
         backend.upload_versioned(&key, &buf).await?;
         uploaded_keys.push(key);
-        // Clear immediately so a mid-pass crash doesn't re-upload
-        // pages that already landed.
+        // Clear from the in-memory tracker immediately so a mid-pass crash
+        // doesn't re-upload pages that already landed.
         file_ref.tracker.clear_pages(&[*page]);
+        handled_pages.push(*page);
     }
-    let epoch = file_ref.tracker.bump_epoch();
-    file_ref.tracker.persist()?;
+    // Persist against the current on-disk dirty set so the owning
+    // primary's post-open marks survive (issue #117): re-read the sidecar,
+    // clear only the pages we handled, bump the epoch, and persist that.
+    let on_disk = DirtyPageTracker::open_or_create(file_ref.path)?;
+    on_disk.clear_pages(&handled_pages);
+    let epoch = on_disk.bump_epoch();
+    on_disk.persist()?;
     Ok((
         IndexEpoch {
             pages: total_pages,

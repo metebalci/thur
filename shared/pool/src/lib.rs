@@ -131,6 +131,18 @@ fn unique_tmp_path(dst: &Path) -> PathBuf {
     dst.with_extension(format!("dat.{}.{n}.tmp", std::process::id()))
 }
 
+/// Best-effort fsync of a file's parent directory so a preceding
+/// `rename(2)` into the pool is durable across power loss (issue #115).
+/// A failure can't tear the chunk (the rename already landed), so it is
+/// swallowed.
+fn sync_pool_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
 /// Copy `src` into the content-addressed `dst` honoring the "tempfile +
 /// atomic rename" contract: copy to a sibling temp of `dst`, fsync, then
 /// rename(2) into place; clean up the temp on any error. Used by
@@ -429,13 +441,20 @@ impl ChunkPool {
             fs::create_dir_all(parent)?;
         }
         match fs::rename(src, &dst) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // fsync the pool shard dir so the rename is durable across
+                // power loss (issue #115) — the caller fsynced the staging
+                // file's contents before handing it to us.
+                sync_pool_dir(&dst);
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
                 // Cross-device staging: rename(2) can't move across
                 // filesystems. Copy via a fsync'd tempfile + atomic
                 // rename (not straight onto `dst`) so a torn copy can't
                 // be sealed as authoritative — issue #124.
                 copy_into_pool_atomic(src, &dst)?;
+                sync_pool_dir(&dst);
                 fs::remove_file(src)?;
                 Ok(())
             }

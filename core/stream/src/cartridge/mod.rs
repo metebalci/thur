@@ -1553,6 +1553,20 @@ impl Cartridge {
     /// chunk is flushed at the same cadence so a crash before the
     /// next chunk-roll has up-to-date metadata.
     pub fn persist_runtime(&mut self) -> Result<()> {
+        // View handles (the upload worker's `backup_manifest_to_storage`,
+        // GC) must never write the shared chunk index or runtime sidecar:
+        // the primary drive handle owns the trailing staging chunk and the
+        // runtime counters. A view's `overwrite(cur_chunk_id, ..)` rewrites
+        // the slot with its stale open-time snapshot — erasing the hash of
+        // a chunk the primary sealed mid-pass, making every block in it
+        // permanently unreadable — and its `runtime.persist` regresses the
+        // primary's host_bytes / MAM / partition counters (issue #117). The
+        // owning primary persists this state at its own boundaries; the
+        // storage manifest bundle the view just wrote already carries the
+        // fresh index_epoch, so DR is unaffected.
+        if self.is_view_handle {
+            return Ok(());
+        }
         // Sync the active staging chunk's running size into chunk_index
         // so a crash before the next chunk-roll has up-to-date metadata.
         // Block-index records are the authoritative recovery source for
@@ -3577,6 +3591,53 @@ mod space_then_write_repro {
             DedupScope::Global,
         )
         .expect("create_with_chunking")
+    }
+
+    /// Issue #117: a view handle's `persist_runtime` must be a no-op. A
+    /// view (the upload worker, GC) holds a stale open-time snapshot of
+    /// the trailing chunk; the buggy path overwrote the chunk_index slot
+    /// with it, erasing the hash of a chunk the owning primary sealed
+    /// mid-pass and making every block in it permanently unreadable.
+    #[test]
+    fn view_handle_persist_runtime_does_not_clobber_sealed_chunk() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut primary = make_cart(&tmp);
+            for i in 0..3u8 {
+                primary.write_data(rec(0x10 + i)).unwrap();
+            }
+            primary.flush_and_seal().unwrap();
+        }
+        let tapes = tmp.path().join("tapes");
+        let mut view = Cartridge::open_with(
+            &tapes,
+            "SPACE01",
+            CartridgeOpenMode::Open,
+            CartridgeOpenOptions::new().with_view_only(),
+        )
+        .unwrap();
+        assert!(view.is_view_handle);
+
+        // Chunk 0 is sealed with a content hash on disk.
+        let sealed = view.chunk_index.read(0).unwrap();
+        assert!(
+            sealed.hash.is_some(),
+            "precondition: chunk 0 is sealed with a hash"
+        );
+
+        // Point the view's stale cur_chunk at the sealed slot with no
+        // hash — exactly what a view that opened before a mid-pass seal
+        // holds. The buggy persist_runtime would overwrite slot 0 with
+        // this, erasing the hash.
+        view.cur_chunk_id = 0;
+        view.cur_chunk.hash = None;
+        view.persist_runtime().unwrap();
+
+        let after = view.chunk_index.read(0).unwrap();
+        assert_eq!(
+            after.hash, sealed.hash,
+            "view persist_runtime must not erase the sealed chunk hash"
+        );
     }
 
     #[test]

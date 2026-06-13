@@ -20,7 +20,6 @@
 //! ...) that only a same-module child test mod can see.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 
 use crate::block_index::derive_iv;
@@ -125,10 +124,17 @@ impl Cartridge {
                 .try_reserve(staged_bytes, namespace, self.backpressure_deadline)?;
         }
 
-        // Make sure all bytes hit disk before the rename. The hash
-        // itself comes from the streaming hasher we updated per-block
-        // in `write_data` — we do not re-read the chunk to hash it.
-        if let Err(e) = self.cur_file.flush() {
+        // Make sure all bytes hit disk before the rename. `File::flush`
+        // is a stdlib no-op for a raw `File`, so a crash within the
+        // kernel writeback window after UNLOAD could leave a torn pool
+        // chunk under a durably-recorded hash — permanent loss of
+        // acknowledged data (issue #115). `sync_data` forces the bytes
+        // out. The at-rest branch below rewrites the staging file with
+        // ciphertext and fsyncs that instead, so only sync the plaintext
+        // here when there is no at-rest DEK.
+        if self.at_rest_dek.is_none()
+            && let Err(e) = self.cur_file.sync_data()
+        {
             self.pool_budget.release(staged_bytes, namespace);
             return Err(e.into());
         }
@@ -178,6 +184,21 @@ impl Cartridge {
                 self.pool_budget.release(staged_bytes, namespace);
                 SmcError::from(e)
             })?;
+            // fsync the rewritten ciphertext before insert_from_path
+            // renames it into the pool — same durability guarantee as the
+            // plaintext path (issue #115).
+            match std::fs::File::open(&staging) {
+                Ok(f) => {
+                    if let Err(e) = f.sync_all() {
+                        self.pool_budget.release(staged_bytes, namespace);
+                        return Err(SmcError::from(e));
+                    }
+                }
+                Err(e) => {
+                    self.pool_budget.release(staged_bytes, namespace);
+                    return Err(SmcError::from(e));
+                }
+            }
             ct_hash
         } else {
             let h = hex::encode(self.cur_chunk_hasher.finalize().as_bytes());

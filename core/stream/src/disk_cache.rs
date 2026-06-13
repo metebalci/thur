@@ -352,21 +352,25 @@ impl DiskCacheManager {
                 break;
             }
             let chunks = by_label.remove(&label).unwrap_or_default();
-            // Open the cartridge once for this label.
-            let cartridge = if let Some(backend) = storage_backend {
-                Cartridge::open_with_storage(
-                    &tapes_root,
-                    &label,
-                    crate::cartridge::CartridgeOpenMode::Open,
-                    Some(backend.clone_box()),
-                )
-            } else {
-                Cartridge::open(
-                    &tapes_root,
-                    &label,
-                    crate::cartridge::CartridgeOpenMode::Open,
-                )
-            };
+            // Open the cartridge once for this label, as a VIEW handle.
+            // The eviction worker runs exactly when a loaded cartridge is
+            // being written (upload-completion notify under cache
+            // pressure), and a non-view secondary handle's Drop runs
+            // flush_and_seal + runtime.persist: for the trailing staging
+            // chunk it unlinks / force-renames the file out from under the
+            // primary drive handle's open fd, surfacing as a post-write
+            // ENOENT / HARDWARE ERROR on the active backup stream (issue
+            // #118). `mark_chunk_evicted` works fine through a view handle.
+            let mut opts = crate::cartridge::CartridgeOpenOptions::new().with_view_only();
+            if let Some(backend) = storage_backend {
+                opts = opts.with_storage(Some(backend.clone_box()));
+            }
+            let cartridge = Cartridge::open_with(
+                &tapes_root,
+                &label,
+                crate::cartridge::CartridgeOpenMode::Open,
+                opts,
+            );
             let mut cartridge = match cartridge {
                 Ok(c) => c,
                 Err(e) => {
