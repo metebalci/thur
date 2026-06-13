@@ -73,6 +73,14 @@ const PROTO_MINOR: i32 = 4;
 /// peer from steering us into an OOM via a forged length header.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
+/// Wall-clock cap on a single KMIP RPC (connect + TLS handshake +
+/// request write + response read). A sub-1 KiB Encrypt/Decrypt exchange
+/// completes in milliseconds; this bound stops a black-holed or
+/// deadlocked HSM from hanging daemon-start volume discovery, the
+/// `volume create` admin job, and the daemon-down key-migrate CLI forever
+/// (issue #196).
+const KMIP_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Serialize, Deserialize)]
 struct WrappedEnvelope {
     v: u8,
@@ -304,6 +312,20 @@ impl KmipBackend {
     /// design — wrap/unwrap is rare (volume create + daemon boot),
     /// pooling would be premature.
     async fn rpc(&self, req_bytes: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
+        // Bound the entire exchange so a stalled endpoint can't hang the
+        // caller indefinitely (issue #196).
+        tokio::time::timeout(KMIP_RPC_TIMEOUT, self.rpc_inner(req_bytes))
+            .await
+            .map_err(|_| {
+                KeyStoreError::Timeout(format!(
+                    "kmip: no response from '{}' within {}s",
+                    self.endpoint,
+                    KMIP_RPC_TIMEOUT.as_secs()
+                ))
+            })?
+    }
+
+    async fn rpc_inner(&self, req_bytes: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
         let tcp = TcpStream::connect(&self.endpoint).await.map_err(|e| {
             KeyStoreError::Network(format!("kmip: tcp connect '{}': {e}", self.endpoint))
         })?;

@@ -191,13 +191,23 @@ the same chain as the S3 backend.
 This backend uses Vault's Transit secrets engine.
 
 ```bash
-vault secrets enable transit                          # one-time per cluster
-vault write -f transit/keys/thurvsa-volumes           # one key per logical KEK
+vault secrets enable transit                                    # one-time per cluster
+vault write -f transit/keys/thurvsa-volumes derived=true        # one key per logical KEK
 ```
 
-The backend expects the default key type, `aes256-gcm96`. The token or
-AppRole the daemon authenticates with needs the `update` capability on
-`transit/encrypt/thurvsa-volumes` and `transit/decrypt/thurvsa-volumes`.
+The backend expects the default key type, `aes256-gcm96`, created with
+**`derived=true`**. Derivation is what makes Transit honor the per-volume
+`context` the backend sends on every encrypt/decrypt: a non-derived key
+silently *ignores* `context`, so a wrapped DEK from one volume would
+unwrap under another volume's context. The backend also wraps each DEK in
+a local context-binding envelope as a second line of defense, but the
+derived key is the cryptographic guarantee (issue #198).
+
+The token or AppRole the daemon authenticates with needs the `update`
+capability on `transit/encrypt/thurvsa-volumes` and
+`transit/decrypt/thurvsa-volumes`, plus `read` on
+`transit/keys/thurvsa-volumes` so `system storage check` can verify the
+key is derived (without it the check warns instead of confirming).
 
 #### `azurekv`
 

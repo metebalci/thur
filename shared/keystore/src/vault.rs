@@ -309,15 +309,15 @@ impl KeyStoreBackend for VaultBackend {
     ) -> Result<(SecretBytes, Vec<u8>), KeyStoreError> {
         match source {
             DekSource::Backend => {
-                let (plain, wrapped) = self.datakey_call(wrap_context).await?;
-                Ok((SecretBytes::new(plain), wrapped))
+                let (plain, ct) = self.datakey_call(wrap_context).await?;
+                Ok((SecretBytes::new(plain), build_vault_envelope(wrap_context, &ct)?))
             }
             DekSource::Daemon => {
                 use shared_crypto::{OsRng, RngCore};
                 let mut plain = [0u8; DEK_LEN];
                 OsRng.fill_bytes(&mut plain);
-                let wrapped = self.encrypt_call(wrap_context, &plain).await?;
-                Ok((SecretBytes::new(plain), wrapped))
+                let ct = self.encrypt_call(wrap_context, &plain).await?;
+                Ok((SecretBytes::new(plain), build_vault_envelope(wrap_context, &ct)?))
             }
         }
     }
@@ -327,7 +327,8 @@ impl KeyStoreBackend for VaultBackend {
         wrap_context: &[u8; 16],
         plaintext: &SecretBytes,
     ) -> Result<Vec<u8>, KeyStoreError> {
-        self.encrypt_call(wrap_context, plaintext.as_bytes()).await
+        let ct = self.encrypt_call(wrap_context, plaintext.as_bytes()).await?;
+        build_vault_envelope(wrap_context, &ct)
     }
 
     async fn unwrap(
@@ -335,7 +336,11 @@ impl KeyStoreBackend for VaultBackend {
         wrap_context: &[u8; 16],
         wrapped: &[u8],
     ) -> Result<SecretBytes, KeyStoreError> {
-        let bytes = self.decrypt_call(wrap_context, wrapped).await?;
+        // Verify the local wrap-context binding before asking Vault to
+        // decrypt — a DEK bound to a different volume is refused here
+        // even on a non-derived Transit key (issue #198).
+        let ct = parse_vault_envelope(wrap_context, wrapped)?;
+        let bytes = self.decrypt_call(wrap_context, ct.as_bytes()).await?;
         Ok(SecretBytes::new(bytes))
     }
 
@@ -390,15 +395,62 @@ impl KeyStoreBackend for VaultBackend {
         // routed through the active node (Vault transparently
         // forwards). 501/503 are fatal.
         match status.as_u16() {
-            200 | 429 | 472 | 473 => Ok(()),
-            501 => Err(KeyStoreError::Other("vault: not initialized".into())),
-            503 => Err(KeyStoreError::Other("vault: sealed".into())),
-            _ => Err(classify_vault_status(
-                "sys.health",
+            200 | 429 | 472 | 473 => {}
+            501 => return Err(KeyStoreError::Other("vault: not initialized".into())),
+            503 => return Err(KeyStoreError::Other("vault: sealed".into())),
+            _ => {
+                return Err(classify_vault_status(
+                    "sys.health",
+                    status,
+                    read_body(resp).await,
+                ));
+            }
+        }
+
+        // Verify the Transit key is derived. A non-derived key silently
+        // ignores the per-volume `context`, so wrap-context binding would
+        // rest on the local envelope alone; refuse here so misprovisioning
+        // surfaces (issue #198). If the daemon's policy can't read the key
+        // metadata, warn instead of failing — the binding still holds via
+        // the envelope and a correctly-provisioned derived key.
+        let key_path = format!("{}/keys/{}", self.inner.transit_mount, self.inner.transit_key);
+        let headers = self.auth_headers().await;
+        let resp = self
+            .inner
+            .client
+            .get(self.url(&key_path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_err("transit.read_key", e))?;
+        let status = resp.status();
+        if status.is_success() {
+            let parsed: VaultDataResponse<TransitKeyInfo> = resp
+                .json()
+                .await
+                .map_err(|e| KeyStoreError::Other(format!("transit.read_key parse: {e}")))?;
+            if !parsed.data.derived {
+                return Err(KeyStoreError::Other(format!(
+                    "vault: Transit key '{}' is not derived (derived=false); the per-volume \
+                     wrap-context binding requires `vault write -f {}/keys/{} derived=true` — \
+                     a non-derived key silently ignores the context field (issue #198)",
+                    self.inner.transit_key, self.inner.transit_mount, self.inner.transit_key
+                )));
+            }
+        } else if status.as_u16() == 403 {
+            warn!(
+                "vault: cannot read {}/keys/{} to verify derived=true (policy lacks read); \
+                 ensure the key was created with derived=true",
+                self.inner.transit_mount, self.inner.transit_key
+            );
+        } else {
+            return Err(classify_vault_status(
+                "transit.read_key",
                 status,
                 read_body(resp).await,
-            )),
+            ));
         }
+        Ok(())
     }
 
     fn clone_box(&self) -> Box<dyn KeyStoreBackend> {
@@ -407,7 +459,16 @@ impl KeyStoreBackend for VaultBackend {
 }
 
 fn build_http_client(tls_skip_verify: bool) -> Result<Client, KeyStoreError> {
-    let mut builder = Client::builder().user_agent("thurvsa-keystore/0.1");
+    let mut builder = Client::builder()
+        .user_agent("thurvsa-keystore/0.1")
+        // reqwest has no default request or connect timeout, so a
+        // black-holed Vault (silent packet drop, half-open connection,
+        // a server that accepts TCP but never responds) would make every
+        // Transit call pend forever — hanging daemon-start volume
+        // discovery and the `volume create` job with no error or log
+        // (issue #196). Bound both.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30));
     if tls_skip_verify {
         warn!("vault: tls_skip_verify=true (development only - TLS cert validation disabled)");
         builder = builder.danger_accept_invalid_certs(true);
@@ -520,6 +581,74 @@ struct VaultDataResponse<T> {
     data: T,
 }
 
+/// Transit key metadata (subset) — read by [`VaultBackend::health_check`]
+/// to verify the key is derived (issue #198).
+#[derive(Debug, Deserialize)]
+struct TransitKeyInfo {
+    #[serde(default)]
+    derived: bool,
+}
+
+/// Envelope version for the local wrap-context binding (issue #198).
+const VAULT_ENVELOPE_VERSION: u8 = 1;
+
+/// JSON envelope binding the Transit ciphertext to its `wrap_context`,
+/// mirroring `azurekv` / `kmip`. Vault Transit's `context` field only
+/// binds when the key is *derived* (`derived=true`); a non-derived key
+/// silently ignores it, so without this local check a `wrapped_dek`
+/// lifted from one volume's manifest would unwrap under another volume's
+/// context. The embedded `uuid` (hex of `wrap_context`) is verified on
+/// unwrap (issue #198). `ct` is the Transit `vault:v1:…` ciphertext
+/// string verbatim.
+#[derive(Debug, Serialize, Deserialize)]
+struct VaultEnvelope {
+    v: u8,
+    uuid: String,
+    ct: String,
+}
+
+/// Build the envelope around a Transit ciphertext string.
+fn build_vault_envelope(wrap_context: &[u8; 16], vault_ct: &[u8]) -> Result<Vec<u8>, KeyStoreError> {
+    let ct = std::str::from_utf8(vault_ct)
+        .map_err(|e| {
+            KeyStoreError::Other(format!(
+                "vault: Transit ciphertext is not UTF-8 ({e}) — expected 'vault:v1:…'"
+            ))
+        })?
+        .to_string();
+    let env = VaultEnvelope {
+        v: VAULT_ENVELOPE_VERSION,
+        uuid: hex::encode(wrap_context),
+        ct,
+    };
+    serde_json::to_vec(&env)
+        .map_err(|e| KeyStoreError::Other(format!("vault: envelope encode: {e}")))
+}
+
+/// Parse an envelope and verify it was bound to `wrap_context`; returns
+/// the inner Transit ciphertext string on success.
+fn parse_vault_envelope(wrap_context: &[u8; 16], wrapped: &[u8]) -> Result<String, KeyStoreError> {
+    let env: VaultEnvelope = serde_json::from_slice(wrapped).map_err(|e| {
+        KeyStoreError::Other(format!(
+            "vault: wrapped_dek does not parse as a v1 JSON envelope: {e}"
+        ))
+    })?;
+    if env.v != VAULT_ENVELOPE_VERSION {
+        return Err(KeyStoreError::Other(format!(
+            "vault: envelope version {} not understood (expected {})",
+            env.v, VAULT_ENVELOPE_VERSION
+        )));
+    }
+    let expected = hex::encode(wrap_context);
+    if env.uuid != expected {
+        return Err(KeyStoreError::Authz(format!(
+            "vault: envelope wrap_context mismatch (envelope='{}', call='{}'); refusing to unwrap a DEK bound to a different volume",
+            env.uuid, expected
+        )));
+    }
+    Ok(env.ct)
+}
+
 #[derive(Debug, Serialize)]
 struct AppRoleLoginRequest<'a> {
     role_id: &'a str,
@@ -619,7 +748,10 @@ mod tests {
             .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
             .await
             .unwrap();
-        assert_eq!(wrapped, b"vault:v1:DEADBEEF");
+        // wrap now returns a wrap-context-binding envelope (issue #198);
+        // the Transit ciphertext is recoverable by parsing it back.
+        let ct = parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap();
+        assert_eq!(ct, "vault:v1:DEADBEEF");
     }
 
     #[tokio::test]
@@ -646,11 +778,33 @@ mod tests {
         .await
         .unwrap();
 
-        let plain = backend
-            .unwrap(&fixture_uuid(), b"vault:v1:DEADBEEF")
-            .await
-            .unwrap();
+        let envelope = build_vault_envelope(&fixture_uuid(), b"vault:v1:DEADBEEF").unwrap();
+        let plain = backend.unwrap(&fixture_uuid(), &envelope).await.unwrap();
         assert_eq!(plain.as_bytes(), &fixture_key());
+    }
+
+    #[tokio::test]
+    async fn unwrap_refuses_wrong_wrap_context() {
+        // Issue #198: a DEK envelope bound to volume A must not unwrap
+        // under volume B's context — refused locally before any Vault
+        // call, so the binding holds even on a non-derived Transit key.
+        let server = MockServer::start().await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        let envelope = build_vault_envelope(&[0xAAu8; 16], b"vault:v1:DEADBEEF").unwrap();
+        let err = backend
+            .unwrap(&[0xBBu8; 16], &envelope)
+            .await
+            .expect_err("context mismatch must be refused");
+        assert_eq!(err.kind(), KeyStoreFailureKind::Authz);
     }
 
     #[tokio::test]
@@ -698,6 +852,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(429))
             .mount(&server)
             .await;
+        // health_check also verifies the Transit key is derived (#198).
+        Mock::given(method("GET"))
+            .and(path("/v1/transit/keys/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "derived": true }
+            })))
+            .mount(&server)
+            .await;
         let backend = VaultBackend::new(
             server.uri(),
             "transit".into(),
@@ -709,6 +871,40 @@ mod tests {
         .await
         .unwrap();
         backend.health_check().await.expect("standby still healthy");
+    }
+
+    #[tokio::test]
+    async fn health_check_refuses_non_derived_key() {
+        // Issue #198: a non-derived Transit key silently ignores the
+        // per-volume context, so health_check must refuse it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/transit/keys/thurvsa-volumes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "derived": false }
+            })))
+            .mount(&server)
+            .await;
+        let backend = VaultBackend::new(
+            server.uri(),
+            "transit".into(),
+            "thurvsa-volumes".into(),
+            None,
+            false,
+            ResolvedVaultAuth::Token("s.devroot".into()),
+        )
+        .await
+        .unwrap();
+        let err = backend
+            .health_check()
+            .await
+            .expect_err("non-derived key must be refused");
+        assert!(format!("{err}").contains("derived"));
     }
 
     #[tokio::test]
@@ -792,7 +988,10 @@ mod tests {
             .await
             .expect("datakey");
         assert_eq!(plain.as_bytes(), &fixture_key());
-        assert_eq!(wrapped, b"vault:v1:DATAKEY");
+        assert_eq!(
+            parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap(),
+            "vault:v1:DATAKEY"
+        );
     }
 
     #[tokio::test]
@@ -811,7 +1010,10 @@ mod tests {
             .await
             .expect("encrypt path");
         assert_eq!(plain.as_bytes().len(), DEK_LEN);
-        assert_eq!(wrapped, b"vault:v1:DAEMONKEY");
+        assert_eq!(
+            parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap(),
+            "vault:v1:DAEMONKEY"
+        );
     }
 
     #[tokio::test]
@@ -825,8 +1027,9 @@ mod tests {
             .mount(&server)
             .await;
         let backend = token_backend(&server).await;
+        let wrapped = build_vault_envelope(&fixture_uuid(), b"vault:v1:X").unwrap();
         let err = backend
-            .unwrap(&fixture_uuid(), b"vault:v1:X")
+            .unwrap(&fixture_uuid(), &wrapped)
             .await
             .expect_err("short plaintext");
         match err {
@@ -836,17 +1039,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unwrap_rejects_non_utf8_blob() {
+    async fn unwrap_rejects_malformed_envelope() {
         let server = MockServer::start().await;
         let backend = token_backend(&server).await;
-        // 0xFF is not valid UTF-8: the decrypt path rejects before any
-        // network call.
+        // A non-envelope blob is rejected before any network call: unwrap
+        // parses the wrap-context envelope first (issue #198).
         let err = backend
             .unwrap(&fixture_uuid(), &[0xFF, 0xFE])
             .await
-            .expect_err("non-utf8 blob");
+            .expect_err("malformed envelope");
         match err {
-            KeyStoreError::Other(msg) => assert!(msg.contains("not UTF-8")),
+            KeyStoreError::Other(msg) => assert!(msg.contains("envelope")),
             other => panic!("expected Other, got {other:?}"),
         }
     }
@@ -921,7 +1124,10 @@ mod tests {
             .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
             .await
             .expect("wrap with approle token");
-        assert_eq!(wrapped, b"vault:v1:APPROLE");
+        assert_eq!(
+            parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap(),
+            "vault:v1:APPROLE"
+        );
     }
 
     #[tokio::test]
@@ -996,7 +1202,10 @@ mod tests {
             .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
             .await
             .expect("retry after refresh");
-        assert_eq!(wrapped, b"vault:v1:RETRIED");
+        assert_eq!(
+            parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap(),
+            "vault:v1:RETRIED"
+        );
     }
 
     #[tokio::test]
@@ -1060,6 +1269,9 @@ mod tests {
             .wrap(&fixture_uuid(), &SecretBytes::new(fixture_key()))
             .await
             .expect("wrap with namespace");
-        assert_eq!(wrapped, b"vault:v1:NS");
+        assert_eq!(
+            parse_vault_envelope(&fixture_uuid(), &wrapped).unwrap(),
+            "vault:v1:NS"
+        );
     }
 }

@@ -96,6 +96,13 @@ impl LocalBackend {
             )));
         }
         let tmp = dir.join(format!("{}.key.tmp", hex::encode(wrap_context)));
+        // A crash between temp-create and rename leaves a stale .tmp at
+        // this deterministic name; without clearing it, every later
+        // wrap/import for the same context fails AlreadyExists under
+        // create_new. Remove it first (best-effort) so create_new still
+        // detects a genuine concurrent writer but recovers from crash
+        // leftovers (issue #197).
+        let _ = fs::remove_file(&tmp);
         {
             let mut f = fs::OpenOptions::new()
                 .write(true)
@@ -119,6 +126,15 @@ impl LocalBackend {
             f.sync_all()?;
         }
         fs::rename(&tmp, &final_path)?;
+        // The rename's directory entry is not durable until the directory
+        // itself is fsynced. For the local backend the sidecar is the
+        // ONLY copy of the DEK, so a power loss in the journal-commit
+        // window after `volume create` returned could otherwise leave the
+        // key — and every byte the initiator already wrote — permanently
+        // unreadable (issue #197).
+        if let Ok(dir_handle) = fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
         Ok(final_path)
     }
 

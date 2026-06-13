@@ -80,8 +80,11 @@ pub enum CryptoError {
 /// Returns ciphertext concatenated with the 16-byte authentication
 /// tag (the standard AES-GCM "ciphertext || tag" form).
 ///
-/// IV reuse with the same key is a confidentiality break in
-/// AES-GCM — callers must guarantee uniqueness via the derivation.
+/// IV reuse with the same key is a confidentiality break in AES-GCM.
+/// [`derive_iv`] makes the IV *probabilistically* unique, not injective
+/// (see its doc); per NIST SP 800-38D §8.3 keep invocations under one key
+/// below 2^32, i.e. rotate the DEK well before ~256 TiB of distinct
+/// seals.
 pub fn encrypt_block(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if key.len() != KEY_LEN {
         return Err(CryptoError::Input(format!(
@@ -131,9 +134,21 @@ pub fn decrypt_block(
 ///
 /// Folds `uuid || counter_a || counter_b` through BLAKE3 and truncates
 /// to 12 bytes. Domain separation comes from the per-cartridge /
-/// per-volume `uuid`; uniqueness within that namespace is the caller's
-/// responsibility — they pick `counter_a` and `counter_b` so that no
-/// two writes under the same key ever share the pair.
+/// per-volume `uuid`; callers pick `counter_a` / `counter_b` so that no
+/// two writes under the same key share the pair.
+///
+/// **Uniqueness is probabilistic, not guaranteed (issue #199).** The
+/// truncating hash is not injective: distinct tuples collide in the
+/// 96-bit output with birthday probability ~N²/2⁹⁷ after N seals, so the
+/// derivation cannot by itself enforce the "no IV reuse" invariant. In
+/// particular the block (SBC) caller draws `iv_salt` at random, which
+/// puts it under NIST SP 800-38D §8.3's 2³² random-IV-invocations-per-key
+/// bound — ~256 TiB written to one encrypted volume under a never-rotated
+/// DEK. Nothing here tracks or enforces that count; operators must rotate
+/// the DEK before approaching it. Making the nonce injective (a
+/// deterministic counter IV, or per-key derivation with a packed counter)
+/// is a format-affecting change tracked separately — do not rely on this
+/// function for a hard uniqueness guarantee.
 ///
 /// Typical callers:
 /// - **Tape (SSC):** `derive_iv(uuid, chunk_id, offset)`. `chunk_id` is
