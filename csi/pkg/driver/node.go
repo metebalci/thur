@@ -23,6 +23,7 @@ import (
 // faked in tests).
 type attacher interface {
 	Attach(ctx context.Context, c iscsi.Connector) (string, error)
+	DeleteDevice(ctx context.Context, c iscsi.Connector) error
 	Rescan(ctx context.Context, c iscsi.Connector) (string, error)
 	Detach(ctx context.Context, iqn, portal string) error
 }
@@ -193,6 +194,13 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	// node's CHAP user on ControllerUnpublishVolume; a surviving session
 	// drops the now-unadmitted LUN on its next rescan.
 	_ = os.Remove(s.connPath(req.GetVolumeId()))
+	// Delete this LUN's kernel device so it can't linger and be handed to
+	// a later volume that reuses the same LUN number (issue #149). The
+	// session stays up for the node's other volumes; iscsiadm -R never
+	// removes a dropped LUN, so we must do it explicitly here.
+	if err := s.attacher.DeleteDevice(ctx, conn); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete stale device: %v", err)
+	}
 	last, err := s.isLastConnector()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "scan node state: %v", err)
@@ -284,6 +292,7 @@ func connectorFromPublishContext(pc map[string]string) (iscsi.Connector, error) 
 		Lun:        uint32(lun),
 		ChapUser:   pc[PublishCtxChapUser],
 		ChapSecret: pc[PublishCtxChapSecret],
+		Serial:     pc[PublishCtxSerial],
 	}
 	if c.TargetIQN == "" || c.Portal == "" {
 		return c, fmt.Errorf("publish context missing iqn or portal")

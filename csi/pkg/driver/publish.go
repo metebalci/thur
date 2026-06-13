@@ -23,6 +23,11 @@ const (
 	PublishCtxLUN        = "lun"
 	PublishCtxChapUser   = "chapUser"
 	PublishCtxChapSecret = "chapSecret"
+	// PublishCtxSerial carries the volume's SCSI Unit Serial Number (the
+	// volume UUID) so the node can verify the resolved device is this
+	// volume's, not a stale device from a deleted volume that reused the
+	// same LUN (issue #149).
+	PublishCtxSerial = "serial"
 )
 
 // volumeContextTargetPortal is the volume-context key carrying the StorageClass
@@ -43,6 +48,12 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if !isSupportedAccessMode(vc.GetAccessMode().GetMode()) {
 		return nil, status.Error(codes.InvalidArgument, "unsupported access mode (single-node only)")
 	}
+
+	// Serialize all publish/unpublish for this node so the shared CHAP
+	// user + secret can't be raced by a concurrent op on another volume
+	// of the same node (issue #148).
+	unlock := s.lockNode(req.GetNodeId())
+	defer unlock()
 
 	vol := req.GetVolumeId()
 	v, err := s.vsa.GetVolumeByName(ctx, vol)
@@ -85,6 +96,7 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			PublishCtxLUN:        strconv.FormatUint(v.Lun, 10),
 			PublishCtxChapUser:   creds.username,
 			PublishCtxChapSecret: creds.secret,
+			PublishCtxSerial:     v.UUID,
 		},
 	}, nil
 }
@@ -96,6 +108,10 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if req.GetNodeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id is required")
 	}
+	// Serialize against concurrent publish/unpublish on the same node
+	// (issue #148) — see ControllerPublishVolume.
+	unlock := s.lockNode(req.GetNodeId())
+	defer unlock()
 	lastVolume, err := s.dropChapVolume(ctx, req.GetNodeId(), req.GetVolumeId())
 	if err != nil {
 		return nil, err

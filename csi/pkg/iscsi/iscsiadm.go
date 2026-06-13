@@ -9,6 +9,7 @@ package iscsi
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,8 +18,9 @@ import (
 )
 
 const (
-	iscsiadm  = "iscsiadm"
-	devByPath = "/dev/disk/by-path"
+	iscsiadm   = "iscsiadm"
+	devByPath  = "/dev/disk/by-path"
+	sysfsBlock = "/sys/block"
 
 	defaultPort     = "3260"
 	deviceWaitTotal = 30 * time.Second
@@ -34,6 +36,14 @@ type Connector struct {
 	Lun        uint32 `json:"lun"`
 	ChapUser   string `json:"chapUser"`
 	ChapSecret string `json:"chapSecret"`
+	// Serial is the expected SCSI Unit Serial Number of the volume
+	// (VSA reports the volume UUID hex in VPD 0x80). When set, Attach
+	// verifies the resolved by-path device actually carries it before
+	// returning — LUN numbers are reused smallest-gap-first, so without
+	// this check a stale device from a deleted volume that held the same
+	// LUN could be handed to a new volume (cross-volume corruption,
+	// issue #149). Empty disables the check (older PublishContexts).
+	Serial string `json:"serial,omitempty"`
 }
 
 // Attacher issues iscsiadm against an exec.Interface. resolve maps a Connector
@@ -46,6 +56,10 @@ type Attacher struct {
 	exec    exec.Interface
 	cmd     []string
 	resolve func(ctx context.Context, c Connector) (string, error)
+	// verifyIdentity confirms a resolved device carries the expected
+	// volume serial (issue #149). Real sysfs reader in production,
+	// overridden in tests (no /sys there).
+	verifyIdentity func(ctx context.Context, dev, expectedSerial string) error
 }
 
 // NewAttacher builds an Attacher over e. base is the iscsiadm invocation
@@ -53,6 +67,7 @@ type Attacher struct {
 func NewAttacher(e exec.Interface, base []string) *Attacher {
 	a := &Attacher{exec: e, cmd: base}
 	a.resolve = a.waitForDevice
+	a.verifyIdentity = defaultVerifyIdentity
 	return a
 }
 
@@ -102,7 +117,38 @@ func (a *Attacher) Attach(ctx context.Context, c Connector) (string, error) {
 			return "", fmt.Errorf("iscsi rescan %s: %s: %w", c.TargetIQN, strings.TrimSpace(out), err)
 		}
 	}
-	return a.resolve(ctx, c)
+	dev, err := a.resolve(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	// Verify the resolved device is actually THIS volume's, not a stale
+	// device left from a deleted volume that held the same (reused) LUN
+	// (issue #149). Skipped when the controller supplied no serial.
+	if c.Serial != "" && a.verifyIdentity != nil {
+		if err := a.verifyIdentity(ctx, dev, c.Serial); err != nil {
+			return "", err
+		}
+	}
+	return dev, nil
+}
+
+// DeleteDevice removes the kernel SCSI device backing this connector's
+// LUN. A node keeps its single iSCSI session up while any volume remains
+// staged, and `iscsiadm -R` only discovers new LUNs — it never deletes a
+// dropped one. So at unstage we must explicitly delete the device, else
+// it lingers and a later volume reusing the same LUN resolves the stale
+// node (issue #149). Best-effort: a missing device is success.
+func (a *Attacher) DeleteDevice(_ context.Context, c Connector) error {
+	c.Portal = normalizePortal(c.Portal)
+	real, err := filepath.EvalSymlinks(c.devicePath())
+	if err != nil {
+		return nil // already gone
+	}
+	p := filepath.Join(sysfsBlock, filepath.Base(real), "device", "delete")
+	if err := os.WriteFile(p, []byte("1"), 0o200); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete stale device %s: %w", real, err)
+	}
+	return nil
 }
 
 // Rescan re-scans the target's sessions so the kernel observes a grown LUN,
@@ -182,4 +228,56 @@ func normalizePortal(p string) string {
 
 func tolerable(out string) bool {
 	return strings.Contains(out, "No matching") || strings.Contains(out, "not found")
+}
+
+// defaultVerifyIdentity forces a per-device revalidate (so capacity /
+// page-cache / identity reflect the current LUN, not a stale one) and
+// compares the device's SCSI Unit Serial Number against the expected
+// volume serial (issue #149).
+func defaultVerifyIdentity(_ context.Context, dev, expected string) error {
+	base := filepath.Base(dev)
+	// Force the kernel to re-read the device (capacity + VPD). Best-effort
+	// — a failure here just means we read whatever sysfs already has.
+	_ = os.WriteFile(filepath.Join(sysfsBlock, base, "device", "rescan"), []byte("1"), 0o200)
+	got, err := readUnitSerialPg80(base)
+	if err != nil {
+		return fmt.Errorf("read device identity for %s: %w", dev, err)
+	}
+	if !serialMatches(got, expected) {
+		return fmt.Errorf(
+			"device %s serial %q does not match expected volume serial %q "+
+				"(stale LUN device from a deleted volume?)",
+			dev, got, expected)
+	}
+	return nil
+}
+
+// readUnitSerialPg80 reads the device's VPD page 0x80 (Unit Serial
+// Number) from sysfs and returns the ASCII serial. The 4-byte page
+// header (peripheral qualifier/type, page code, reserved, page length)
+// precedes the serial bytes.
+func readUnitSerialPg80(base string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(sysfsBlock, base, "device", "vpd_pg80"))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < 4 {
+		return "", fmt.Errorf("vpd_pg80 too short (%d bytes)", len(raw))
+	}
+	end := 4 + int(raw[3])
+	if end > len(raw) {
+		end = len(raw)
+	}
+	return strings.TrimSpace(string(raw[4:end])), nil
+}
+
+// serialMatches compares two SCSI serials after normalizing (lowercase,
+// strip dashes) — VSA reports the volume UUID hex; the controller may
+// carry it dashed or cased differently. A non-empty match is required.
+func serialMatches(got, want string) bool {
+	n := func(s string) string {
+		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "-", ""))
+	}
+	gn, wn := n(got), n(want)
+	return wn != "" && gn == wn
 }

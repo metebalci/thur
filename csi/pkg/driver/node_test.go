@@ -21,11 +21,17 @@ type fakeAttacher struct {
 	attached  []iscsi.Connector
 	rescanned []iscsi.Connector
 	detached  [][2]string
+	deleted   []iscsi.Connector
 }
 
 func (f *fakeAttacher) Attach(_ context.Context, c iscsi.Connector) (string, error) {
 	f.attached = append(f.attached, c)
 	return f.device, nil
+}
+
+func (f *fakeAttacher) DeleteDevice(_ context.Context, c iscsi.Connector) error {
+	f.deleted = append(f.deleted, c)
+	return nil
 }
 
 func (f *fakeAttacher) Rescan(_ context.Context, c iscsi.Connector) (string, error) {
@@ -254,6 +260,11 @@ func TestNodeUnstageDetachesOnlyOnLastVolume(t *testing.T) {
 	if len(fa.detached) != 0 {
 		t.Fatalf("detach must not run while another volume is staged: %+v", fa.detached)
 	}
+	// But the LUN's device IS deleted even without logout, so a later
+	// volume reusing the LUN can't resolve the stale device (issue #149).
+	if len(fa.deleted) != 1 {
+		t.Fatalf("the unstaged volume's device must be deleted: %+v", fa.deleted)
+	}
 	if _, err := os.Stat(ns.connPath("pvc-a")); !os.IsNotExist(err) {
 		t.Errorf("pvc-a connector not removed: %v", err)
 	}
@@ -264,6 +275,9 @@ func TestNodeUnstageDetachesOnlyOnLastVolume(t *testing.T) {
 	}
 	if len(fa.detached) != 1 {
 		t.Fatalf("detach must run on the last volume: %+v", fa.detached)
+	}
+	if len(fa.deleted) != 2 {
+		t.Fatalf("both volumes' devices must be deleted: %+v", fa.deleted)
 	}
 }
 

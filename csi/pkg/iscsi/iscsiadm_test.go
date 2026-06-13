@@ -75,6 +75,51 @@ func TestAttachIssuesExpectedCommands(t *testing.T) {
 	wantCmd(t, *calls, 5, "iscsiadm -m node -T "+iqn+" -p "+p+" -R")
 }
 
+func TestAttachVerifiesDeviceIdentity(t *testing.T) {
+	// Matching serial → attach succeeds.
+	fe, _ := recExec(6)
+	a := &Attacher{
+		exec:           fe,
+		resolve:        func(_ context.Context, _ Connector) (string, error) { return "/dev/sdx", nil },
+		verifyIdentity: func(_ context.Context, _, expected string) error {
+			if !serialMatches("00112233", expected) {
+				return fmt.Errorf("mismatch")
+			}
+			return nil
+		},
+	}
+	if _, err := a.Attach(context.Background(), Connector{
+		TargetIQN: "iqn.x", Portal: "10.0.0.5", ChapUser: "u", ChapSecret: "s", Serial: "00112233",
+	}); err != nil {
+		t.Fatalf("matching identity should attach: %v", err)
+	}
+
+	// Mismatching serial (stale LUN device) → attach must fail (issue #149).
+	fe2, _ := recExec(6)
+	a2 := &Attacher{
+		exec:           fe2,
+		resolve:        func(_ context.Context, _ Connector) (string, error) { return "/dev/sdx", nil },
+		verifyIdentity: func(_ context.Context, _, _ string) error { return fmt.Errorf("stale device") },
+	}
+	if _, err := a2.Attach(context.Background(), Connector{
+		TargetIQN: "iqn.x", Portal: "10.0.0.5", ChapUser: "u", ChapSecret: "s", Serial: "deadbeef",
+	}); err == nil {
+		t.Fatal("mismatched device identity must fail the attach")
+	}
+}
+
+func TestSerialMatchesNormalizes(t *testing.T) {
+	if !serialMatches("ABCD-1234", "abcd1234") {
+		t.Error("serial compare must normalize case and dashes")
+	}
+	if serialMatches("aaaa", "bbbb") {
+		t.Error("different serials must not match")
+	}
+	if serialMatches("", "") {
+		t.Error("empty serial must never match")
+	}
+}
+
 func TestAttachToleratesExistingSession(t *testing.T) {
 	fe := &testingexec.FakeExec{}
 	for i := 0; i < 4; i++ {

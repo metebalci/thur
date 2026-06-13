@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -24,6 +25,21 @@ type controllerServer struct {
 	driver *Driver
 	vsa    *vsa.Client
 	chap   chapStore
+	// Per-node serialization of publish/unpublish. The external-attacher
+	// serializes per VOLUME, not per node, so two volumes on the same node
+	// can publish/unpublish concurrently and race the node's shared CHAP
+	// user + secret (issue #148). Holding this across the whole
+	// ensure+AddUser/Grant and revoke+RemoveUser+chap.remove sequence
+	// makes those steps atomic per node. The zero sync.Map is ready to use.
+	nodeLocks sync.Map // nodeID -> *sync.Mutex
+}
+
+// lockNode acquires the per-node mutex and returns its unlock func.
+func (s *controllerServer) lockNode(nodeID string) func() {
+	m, _ := s.nodeLocks.LoadOrStore(nodeID, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *controllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {

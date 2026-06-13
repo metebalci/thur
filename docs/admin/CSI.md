@@ -112,6 +112,14 @@ admitted to every volume that node mounts:
 - `DeleteVolume` does **not** touch CHAP users — they belong to the node, not
   the volume, and may admit other volumes. `ControllerUnpublishVolume` owns the
   user's lifecycle.
+- The node's CHAP user + Secret are **shared across all that node's volumes**,
+  but the external-attacher serializes only per *volume*, so the controller
+  holds a **per-node mutex** spanning the whole
+  `ensure + AddUser/Grant` (publish) and `revoke + RemoveUser + chap.remove`
+  (unpublish) sequence. Without it, a publish of one volume could interleave
+  with the unpublish of another on the same node, deleting+recreating the user
+  out from under the Secret store and silently desyncing the node's CHAP
+  password (issue #148).
 
 Because a node's volumes are admitted incrementally to one already-connected
 session, the daemon's per-CHAP-user admission is **dynamic**: a `grant` reaches
@@ -170,7 +178,14 @@ LUN granted to the node's CHAP user *after* the session came up: `--login` is a
 no-op on an existing session, and the daemon re-reads admission dynamically, so
 the rescan makes the just-admitted LUN appear. The device is resolved from the
 `/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<lun>` symlink, which udev
-creates a moment after the rescan, with a bounded poll. The volume is then
+creates a moment after the rescan, with a bounded poll. Because the daemon
+reuses LUN numbers smallest-gap-first, the resolved device is then **verified
+against the volume's identity**: the `PublishContext` carries the volume's SCSI
+Unit Serial Number (the volume UUID, VPD 0x80), and the node forces a per-device
+revalidate and compares it against `/sys/block/<dev>/device/vpd_pg80` before
+returning. A mismatch (a stale device from a deleted volume that held the same
+LUN) fails the stage rather than handing the new volume the wrong block device —
+which could otherwise corrupt across volumes (issue #149). The volume is then
 formatted and mounted to the staging path via `mount-utils` `SafeFormatAndMount`.
 
 `iscsiadm` and the host `iscsid` must be the same open-iscsi version, and the
@@ -183,8 +198,11 @@ to `--node-state-dir/<volid>.json` at stage time and read back at unstage. Since
 every volume on a node shares the one session, unstage drops this volume's
 connector file and logs out **only when it was the last** one (no `.json`
 connector files remain) — logging out earlier would tear every other volume's
-LUN off the node. A surviving session drops the now-revoked LUN on its next
-rescan. `NodeExpandVolume` reads the connector the same way to rescan the
+LUN off the node. Unstage also **deletes this LUN's kernel device**
+(`/sys/block/<dev>/device/delete`) even when it does not log out, since
+`iscsiadm -R` only discovers new LUNs and never removes a dropped one — a
+lingering stale device is what the identity check above defends against
+(issue #149). `NodeExpandVolume` reads the connector the same way to rescan the
 session before growing the filesystem.
 
 Raw-block volumes skip the stage-time format/mount; the device file is
