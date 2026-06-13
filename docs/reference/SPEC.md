@@ -228,7 +228,10 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
   destination drive on load) — never on uninvolved drives, since the
   UA preempts the host's next command on that LUN and a host that
   ignores the resulting CHECK CONDITION would never reset the
-  daemon-side head position.
+  daemon-side head position. On those affected LUN(s) the UA is queued
+  for **every live initiator's session**, not just the one that issued
+  the changer command — a second host sharing the drive must also be
+  told the medium changed before its next read/write (issue #190).
 - **Error → sense mapping.** When a handler returns a `Thur VTLError`,
   it is routed through `error_to_sense`. The point is to give the host
   a sense code that actually describes what went wrong — WORM,
@@ -274,10 +277,10 @@ of `handle_scsi_command`, before per-opcode dispatch ever runs:
 | 0x56 | RESERVE (10) | Accepted as no-op |
 | 0x57 | RELEASE (10) | Accepted as no-op |
 | 0xA5 | MOVE MEDIUM | Slot ↔ slot, slot ↔ drive, slot ↔ I/E |
-| 0xA6 | EXCHANGE MEDIUM | Composed from two MOVE MEDIUMs |
+| 0xA6 | EXCHANGE MEDIUM | Atomic storage/IE swap (single persist); supports the canonical `dst2 == src` swap; drive elements refused |
 | 0xB5 | REQUEST VOLUME ELEMENT ADDRESS | Stub (returns 8-byte empty header) |
 | 0xB6 | SEND VOLUME TAG | Accepted as no-op |
-| 0xB8 | READ ELEMENT STATUS | All four element types; honors VOLTAG / DVCID / Mixed bits |
+| 0xB8 | READ ELEMENT STATUS | All four element types; honors VOLTAG / DVCID / Mixed bits, the starting element address (as a floor) and the element-count cap |
 
 #### READ ELEMENT STATUS descriptor extensions
 
@@ -286,7 +289,10 @@ host requests them, the following extensions are appended in a fixed
 order:
 
 - **VOLTAG** (CDB byte 1 bit 4): adds a 36-byte volume-tag block (32-byte
-  barcode space-padded + 4 reserved).
+  barcode space-padded + 4 reserved). When VOLTAG is requested the
+  element-status page header byte 1 sets **PVOLTAG** (bit 7) so
+  SMC-conforming parsers (`mtx`, Bareos, NetBackup, Veeam) gate barcode
+  extraction on the bit and actually read the tags.
 - **DVCID** (CDB byte 6 bit 0): on Data Transfer descriptors only. Adds
   a 38-byte block — 4-byte SMC-3 descriptor header + 34-byte ASCII
   identifier (8-byte vendor `MB`, 16-byte product `Ultrium <gen>-SCSI`,

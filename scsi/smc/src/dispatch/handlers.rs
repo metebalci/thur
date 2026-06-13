@@ -12,11 +12,12 @@ use anyhow::{Result, anyhow};
 use core_mediachanger::{AuditResult, TapeEvent};
 use scsi_ssc::dispatch::{ScsiResp, ScsiStatus, audit_append, limit_len};
 use scsi_ssc::scsi::sense::{
-    ASC_MEDIUM_REMOVAL_PREVENTED, AdditionalSenseCode, SenseDataBuilder, SenseKey,
+    ASC_MEDIUM_REMOVAL_PREVENTED, AdditionalSenseCode, SenseDataBuilder, SenseKey, error_to_sense,
 };
 use shared_iscsi::unit_attention;
 
 use crate::changer;
+use core_mediachanger::ExchangeSlot;
 use crate::dispatch::types::SmcScsiCtx;
 
 pub fn handle_initialize_element_status(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
@@ -144,7 +145,6 @@ pub fn handle_read_element_status(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> 
 pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let cdb = ctx.cdb;
     let lun = ctx.lun;
-    let tsih = ctx.tsih;
     let drive_manager = ctx.drive_manager;
     let library = ctx.library;
     let ua_tracker = ctx.ua_tracker;
@@ -154,6 +154,7 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let audit_ratelimiter = ctx.audit_ratelimiter;
     let actor = ctx.audit_actor();
     let session_partition = ctx.session_partition;
+    let session_manager = ctx.session_manager;
 
     if lun != 0 {
         return Ok(ScsiResp::check_condition());
@@ -295,7 +296,14 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         return Ok(ScsiResp::check_condition_with_sense(sense));
     }
 
-    match changer::handle_move_medium(
+    // Perform the in-memory inventory move under the lock; everything
+    // after this — drive_manager mirroring, events, UA, audit — runs
+    // with the Library mutex released (issue #188). load_cartridge /
+    // unload_cartridge open cartridge indexes and persist drive state,
+    // none of which needs the Library lock; holding it across that work
+    // serialized every changer / identity / partition-fence command on
+    // all sessions behind one slow cartridge open.
+    if let Err(e) = changer::handle_move_medium(
         &mut lib,
         element_config,
         transport_address,
@@ -303,125 +311,197 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         destination_address,
         invert,
     ) {
-        Ok(_) => {
-            // Mirror the load/unload into drive_manager AND emit
-            // CartridgeLoaded/Unloaded events.
-            if let (Some(src), Some(dst)) = (source_type, dest_type) {
-                use changer::ElementType;
-                match (src, dst) {
-                    (ElementType::Storage, ElementType::DataTransfer) => {
-                        if let Some(drive_id) =
-                            element_config.address_to_drive_id(destination_address)
-                            && let Some(drive_info) = lib.get_drive(drive_id)
-                            && let Some(ref barcode) = drive_info.barcode
-                        {
-                            if let Err(e) = drive_manager.load_cartridge(drive_id as usize, barcode)
-                            {
-                                tracing::error!(
-                                    "drive_manager.load_cartridge failed for drive {}: {}",
-                                    drive_id,
-                                    e
-                                );
-                            }
-                            let _ = event_tx.send(TapeEvent::CartridgeLoaded {
-                                tape_id: barcode.to_string(),
-                                drive_num: drive_id as u8,
-                            });
-                        }
-                    }
-                    (ElementType::DataTransfer, ElementType::Storage) => {
-                        if let Some(drive_id) = element_config.address_to_drive_id(source_address) {
-                            if let Err(e) = drive_manager.unload_cartridge(drive_id as usize) {
-                                tracing::warn!(
-                                    "drive_manager.unload_cartridge for drive {}: {}",
-                                    drive_id,
-                                    e
-                                );
-                            }
-                            let tape_id = unload_source_barcode
-                                .clone()
-                                .unwrap_or_else(|| format!("DRIVE{}", drive_id));
-                            let _ = event_tx.send(TapeEvent::CartridgeUnloaded {
-                                tape_id,
-                                drive_num: drive_id as u8,
-                            });
-                        }
-                    }
-                    _ => {}
+        drop(lib);
+        tracing::warn!("MOVE MEDIUM error: {}", e);
+        audit_append(
+            audit_log,
+            audit_ratelimiter,
+            "iscsi.move_medium",
+            actor,
+            serde_json::json!({
+                "action": action_label,
+                "transport": transport_address,
+                "src": source_address,
+                "dst": destination_address,
+                "invert": invert,
+            }),
+            AuditResult::Error(e.to_string()),
+        );
+        return Ok(ScsiResp::check_condition());
+    }
+
+    // The inventory move succeeded and is persisted. Capture the
+    // drive-side mirror work (and the rollback target) while still
+    // holding the lock, then drop it before any drive I/O.
+    enum Mirror {
+        Load {
+            drive_id: u32,
+            barcode: String,
+            src_storage: u32,
+        },
+        Unload {
+            drive_id: u32,
+        },
+        None,
+    }
+    let mirror = match (source_type, dest_type) {
+        (
+            Some(changer::ElementType::Storage),
+            Some(changer::ElementType::DataTransfer),
+        ) => match (
+            element_config.address_to_drive_id(destination_address),
+            element_config.address_to_storage_id(source_address),
+        ) {
+            (Some(drive_id), Some(src_storage)) => {
+                match lib.get_drive(drive_id).and_then(|d| d.barcode.clone()) {
+                    Some(barcode) => Mirror::Load {
+                        drive_id,
+                        barcode,
+                        src_storage,
+                    },
+                    None => Mirror::None,
                 }
             }
+            _ => Mirror::None,
+        },
+        (
+            Some(changer::ElementType::DataTransfer),
+            Some(changer::ElementType::Storage),
+        ) => match element_config.address_to_drive_id(source_address) {
+            Some(drive_id) => Mirror::Unload { drive_id },
+            None => Mirror::None,
+        },
+        _ => Mirror::None,
+    };
+    drop(lib); // issue #188: release the Library mutex before drive I/O
 
-            // MEDIUM MAY HAVE CHANGED is delivered only to the drive
-            // LUN(s) whose cartridge actually changed: the source
-            // drive on an unload, the destination drive on a load.
-            // Earlier code broadcast the UA across every drive LUN,
-            // which preempted unrelated drives' next command — when
-            // the host's positioning sequence (e.g. `mt rewind 2>&1`)
-            // ignored that CHECK CONDITION, the drive's daemon-side
-            // head_lba never got reset, and a follow-up SPACE BLOCKS
-            // landed at the wrong LBA, leaving stale filemarks in
-            // the block index (issue #37).
-            let ua = ua_tracker;
-            let mut affected_drives: Vec<u32> = Vec::new();
-            if matches!(source_type, Some(changer::ElementType::DataTransfer))
-                && let Some(id) = element_config.address_to_drive_id(source_address)
-            {
-                affected_drives.push(id);
+    // Drive LUN(s) whose cartridge actually changed — the UA targets.
+    let mut affected_drives: Vec<u32> = Vec::new();
+    if matches!(source_type, Some(changer::ElementType::DataTransfer))
+        && let Some(id) = element_config.address_to_drive_id(source_address)
+    {
+        affected_drives.push(id);
+    }
+    if matches!(dest_type, Some(changer::ElementType::DataTransfer))
+        && let Some(id) = element_config.address_to_drive_id(destination_address)
+        && !affected_drives.contains(&id)
+    {
+        affected_drives.push(id);
+    }
+
+    match mirror {
+        Mirror::Load {
+            drive_id,
+            barcode,
+            src_storage,
+        } => {
+            if let Err(e) = drive_manager.load_cartridge(drive_id as usize, &barcode) {
+                // issue #189: the drive-side load failed (e.g. keystore
+                // unreachable so no cached DEK, corrupt manifest, LTO
+                // generation mismatch). Roll the inventory move back so
+                // library state doesn't claim the drive is loaded when it
+                // isn't, then fail the command with sense reflecting the
+                // real cause — rather than returning GOOD over a
+                // persistent library/drive desync and a false audit row.
+                tracing::error!(
+                    "drive_manager.load_cartridge failed for drive {}: {} - rolling back inventory move",
+                    drive_id,
+                    e
+                );
+                {
+                    let mut lib = library
+                        .lock()
+                        .map_err(|_| anyhow!("library mutex poisoned"))?;
+                    if let Err(re) = lib.unload_from_drive(drive_id, src_storage) {
+                        tracing::error!(
+                            "MOVE MEDIUM rollback (unload_from_drive drive {} -> slot {}) failed: {}",
+                            drive_id,
+                            src_storage,
+                            re
+                        );
+                    }
+                }
+                audit_append(
+                    audit_log,
+                    audit_ratelimiter,
+                    "iscsi.move_medium",
+                    actor,
+                    serde_json::json!({
+                        "action": action_label,
+                        "transport": transport_address,
+                        "src": source_address,
+                        "dst": destination_address,
+                        "invert": invert,
+                        "refused": "drive_load_failed",
+                        "error": e.to_string(),
+                    }),
+                    AuditResult::Error(e.to_string()),
+                );
+                return Ok(ScsiResp::check_condition_with_sense(error_to_sense(&e)));
             }
-            if matches!(dest_type, Some(changer::ElementType::DataTransfer))
-                && let Some(id) = element_config.address_to_drive_id(destination_address)
-                && !affected_drives.contains(&id)
-            {
-                affected_drives.push(id);
-            }
-            for drive_id in &affected_drives {
-                let drive_lun = (*drive_id as u8) + 1;
-                ua.add_ua(
-                    tsih,
-                    drive_lun,
-                    unit_attention::UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED,
+            let _ = event_tx.send(TapeEvent::CartridgeLoaded {
+                tape_id: barcode,
+                drive_num: drive_id as u8,
+            });
+        }
+        Mirror::Unload { drive_id } => {
+            if let Err(e) = drive_manager.unload_cartridge(drive_id as usize) {
+                tracing::warn!(
+                    "drive_manager.unload_cartridge for drive {}: {}",
+                    drive_id,
+                    e
                 );
             }
-            tracing::info!(
-                "MOVE MEDIUM completed, generated UA for drives {:?}",
-                affected_drives
-            );
-            audit_append(
-                audit_log,
-                audit_ratelimiter,
-                "iscsi.move_medium",
-                actor,
-                serde_json::json!({
-                    "action": action_label,
-                    "transport": transport_address,
-                    "src": source_address,
-                    "dst": destination_address,
-                    "invert": invert,
-                    "barcode": unload_source_barcode,
-                }),
-                AuditResult::Ok,
-            );
-            Ok(ScsiResp::good())
+            let tape_id = unload_source_barcode
+                .clone()
+                .unwrap_or_else(|| format!("DRIVE{}", drive_id));
+            let _ = event_tx.send(TapeEvent::CartridgeUnloaded {
+                tape_id,
+                drive_num: drive_id as u8,
+            });
         }
-        Err(e) => {
-            tracing::warn!("MOVE MEDIUM error: {}", e);
-            audit_append(
-                audit_log,
-                audit_ratelimiter,
-                "iscsi.move_medium",
-                actor,
-                serde_json::json!({
-                    "action": action_label,
-                    "transport": transport_address,
-                    "src": source_address,
-                    "dst": destination_address,
-                    "invert": invert,
-                }),
-                AuditResult::Error(e.to_string()),
+        Mirror::None => {}
+    }
+
+    // MEDIUM MAY HAVE CHANGED on the changed drive LUN(s) — for EVERY
+    // live initiator, not just the session that issued the changer
+    // command. add_ua is keyed per (tsih, lun), so a per-issuer add
+    // silently skips other initiators sharing the drive: host B,
+    // mid-read against the now-swapped medium, would never receive the
+    // CHECK CONDITION and would read/write the wrong cartridge at a
+    // stale position (issue #190). Mirrors the admin-socket changer-move
+    // path's add_ua_all_sessions.
+    if !affected_drives.is_empty() {
+        let tsihs = session_manager.active_tsihs();
+        for drive_id in &affected_drives {
+            let drive_lun = (*drive_id as u8) + 1;
+            ua_tracker.add_ua_all_sessions(
+                &tsihs,
+                drive_lun,
+                unit_attention::UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED,
             );
-            Ok(ScsiResp::check_condition())
         }
     }
+    tracing::info!(
+        "MOVE MEDIUM completed, generated UA for drives {:?}",
+        affected_drives
+    );
+    audit_append(
+        audit_log,
+        audit_ratelimiter,
+        "iscsi.move_medium",
+        actor,
+        serde_json::json!({
+            "action": action_label,
+            "transport": transport_address,
+            "src": source_address,
+            "dst": destination_address,
+            "invert": invert,
+            "barcode": unload_source_barcode,
+        }),
+        AuditResult::Ok,
+    );
+    Ok(ScsiResp::good())
 }
 
 pub fn handle_send_volume_tag(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
@@ -444,15 +524,17 @@ pub fn handle_send_volume_tag(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
 pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let cdb = ctx.cdb;
     let lun = ctx.lun;
-    let tsih = ctx.tsih;
     let library = ctx.library;
-    let ua_tracker = ctx.ua_tracker;
     let element_config = ctx.element_config;
     let session_partition = ctx.session_partition;
 
-    // EXCHANGE MEDIUM (SMC) — atomic swap. Composed from two MOVE MEDIUM
-    // operations executed in the order that doesn't require a temp slot:
-    // first move dest1 -> dest2 to free up dest1, then move src -> dest1.
+    // EXCHANGE MEDIUM (SMC): the medium at src moves to dst1, and the
+    // medium that was at dst1 moves to dst2. Performed as one atomic
+    // Library inventory transaction (issue #191) — the prior
+    // two-MOVE composition rejected the canonical swap (dst2 == src,
+    // which `mtx exchange A B` issues) because dst2 was still occupied
+    // when the first move ran, and left half-applied durable state when
+    // the second move failed after the first had already persisted.
     if lun != 0 {
         return Ok(ScsiResp::check_condition());
     }
@@ -460,20 +542,19 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     let source_address = u16::from_be_bytes([cdb[4], cdb[5]]);
     let first_dest_address = u16::from_be_bytes([cdb[6], cdb[7]]);
     let second_dest_address = u16::from_be_bytes([cdb[8], cdb[9]]);
-    let invert1 = (cdb[10] & 0x01) != 0;
-    let invert2 = (cdb[10] & 0x02) != 0;
     let source_type = element_config.element_type_from_address(source_address);
     let first_dest_type = element_config.element_type_from_address(first_dest_address);
     let second_dest_type = element_config.element_type_from_address(second_dest_address);
 
-    // Refuse drive-involving EXCHANGE MEDIUM. This handler performs the
-    // swap as two bare inventory moves and — unlike MOVE MEDIUM — does
-    // not mirror drive loads/unloads into drive_manager, check
-    // PREVENT/ALLOW, or emit load/unload events. A drive-involving
-    // exchange would leave the data path bound to the wrong Cartridge,
-    // silently corrupting backup data (issue #133). Real backup software
-    // uses MOVE MEDIUM (load/unload) for drives; EXCHANGE swaps storage /
-    // mail cartridges, which stay supported.
+    // Refuse drive-involving EXCHANGE MEDIUM. This handler swaps bare
+    // inventory entries and — unlike MOVE MEDIUM — does not mirror drive
+    // loads/unloads into drive_manager, check PREVENT/ALLOW, or emit
+    // load/unload events. A drive-involving exchange would leave the data
+    // path bound to the wrong Cartridge, silently corrupting backup data
+    // (issue #133). Real backup software uses MOVE MEDIUM (load/unload)
+    // for drives; EXCHANGE swaps storage / mail cartridges, which stay
+    // supported. Because no drive can participate, no drive LUN changes
+    // medium here and no MEDIUM MAY HAVE CHANGED UA is raised.
     if [source_type, first_dest_type, second_dest_type]
         .iter()
         .any(|t| matches!(t, Some(changer::ElementType::DataTransfer)))
@@ -548,56 +629,48 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
             return Ok(ScsiResp::check_condition_with_sense(sense));
         }
     }
-    // Step 1: dst1 -> dst2 (frees up dst1)
-    if let Err(e) = changer::handle_move_medium(
-        &mut lib,
-        element_config,
-        transport_address,
-        first_dest_address,
-        second_dest_address,
-        invert2,
-    ) {
-        tracing::warn!("EXCHANGE MEDIUM step 1 (dst1->dst2): {}", e);
-        return Ok(ScsiResp::check_condition());
-    }
-    // Step 2: src -> dst1
-    if let Err(e) = changer::handle_move_medium(
-        &mut lib,
-        element_config,
-        transport_address,
-        source_address,
-        first_dest_address,
-        invert1,
-    ) {
-        tracing::warn!("EXCHANGE MEDIUM step 2 (src->dst1): {}", e);
-        return Ok(ScsiResp::check_condition());
-    }
-    // EXCHANGE MEDIUM moves three cartridges across three elements;
-    // raise MEDIUM MAY HAVE CHANGED only on the drive LUN(s) that
-    // participated in the swap. Broadcasting across every drive LUN
-    // races the host's positioning sequence on unrelated drives (see
-    // handle_move_medium for the full rationale + issue #37).
-    let ua = ua_tracker;
-    let mut affected_drives: Vec<u32> = Vec::new();
-    for (addr, kind) in [
-        (source_address, source_type),
-        (first_dest_address, first_dest_type),
-        (second_dest_address, second_dest_type),
-    ] {
-        if matches!(kind, Some(changer::ElementType::DataTransfer))
-            && let Some(id) = element_config.address_to_drive_id(addr)
-            && !affected_drives.contains(&id)
-        {
-            affected_drives.push(id);
+    // Resolve the three elements to storage/mail inventory references.
+    // Drive elements are refused above; a medium-transport (robot) or
+    // unknown address can't take part in an exchange.
+    let to_exchange_slot = |addr: u16, kind: Option<changer::ElementType>| -> Option<ExchangeSlot> {
+        match kind {
+            Some(changer::ElementType::Storage) => {
+                element_config.address_to_storage_id(addr).map(ExchangeSlot::Storage)
+            }
+            Some(changer::ElementType::ImportExport) => {
+                element_config.address_to_mail_id(addr).map(ExchangeSlot::Mail)
+            }
+            _ => None,
         }
-    }
-    for drive_id in &affected_drives {
-        let drive_lun = (*drive_id as u8) + 1;
-        ua.add_ua(
-            tsih,
-            drive_lun,
-            unit_attention::UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED,
-        );
+    };
+    let (src_slot, dst1_slot, dst2_slot) = match (
+        to_exchange_slot(source_address, source_type),
+        to_exchange_slot(first_dest_address, first_dest_type),
+        to_exchange_slot(second_dest_address, second_dest_type),
+    ) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => {
+            tracing::warn!(
+                "EXCHANGE MEDIUM refused: non-storage/mail element (src={} dst1={} dst2={})",
+                source_address,
+                first_dest_address,
+                second_dest_address
+            );
+            let sense = SenseDataBuilder::new(
+                SenseKey::IllegalRequest,
+                AdditionalSenseCode {
+                    asc: 0x21,
+                    ascq: 0x01,
+                },
+            )
+            .build();
+            return Ok(ScsiResp::check_condition_with_sense(sense));
+        }
+    };
+
+    if let Err(e) = lib.exchange_medium(src_slot, dst1_slot, dst2_slot) {
+        tracing::warn!("EXCHANGE MEDIUM: {}", e);
+        return Ok(ScsiResp::check_condition_with_sense(error_to_sense(&e)));
     }
     Ok(ScsiResp::good())
 }

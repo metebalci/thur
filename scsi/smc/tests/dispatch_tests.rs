@@ -20,6 +20,7 @@ use scsi_ssc::diagnostics::DiagnosticStore;
 use scsi_ssc::dispatch::{Pdu, ScsiCtx, ScsiResp, ScsiStatus};
 use scsi_ssc::drive_manager::DriveManager;
 use shared_audit::AuditRateLimiter;
+use shared_iscsi::session::SessionManager;
 use shared_iscsi::unit_attention::{UnitAttentionCode, UnitAttentionTracker};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -47,6 +48,7 @@ struct Fixture {
     data_dir: PathBuf,
     audit_log: Option<AuditChannel>,
     reservations: Arc<scsi_spc::reservations::ReservationManager>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl Fixture {
@@ -90,6 +92,7 @@ impl Fixture {
             data_dir: tmp.path().to_path_buf(),
             audit_log: None,
             reservations: Arc::new(scsi_spc::reservations::ReservationManager::new()),
+            session_manager: Arc::new(SessionManager::new()),
             library,
             _tmp: tmp,
         }
@@ -128,6 +131,7 @@ impl Fixture {
             inner,
             library: &self.library,
             element_config: &self.element_config,
+            session_manager: &self.session_manager,
         }
     }
 
@@ -384,15 +388,17 @@ fn exchange_medium_with_empty_slots_is_refused() {
 
 #[test]
 fn move_medium_raises_ua_only_on_affected_drives() {
-    // Regression for issue #37: MEDIUM MAY HAVE CHANGED must be
-    // queued only on the drive LUN(s) whose cartridge actually
-    // changed. Broadcasting across every drive LUN (the prior
-    // "conservative" behavior) preempted the host's next command
-    // on unrelated drives — when the host's positioning sequence
-    // ignored the resulting CHECK CONDITION, the daemon-side
-    // head_lba never reset and follow-up writes landed at the
-    // wrong LBA.
+    // Regression for issues #37 and #190. #37: MEDIUM MAY HAVE CHANGED
+    // must be queued only on the drive LUN(s) whose cartridge actually
+    // changed (broadcasting across every drive LUN preempted the host's
+    // next command on unrelated drives). #190: the UA must reach EVERY
+    // live initiator's session on the affected drive LUN, not just the
+    // session that issued the changer command — otherwise another host
+    // mid-read against the swapped medium never sees the CHECK CONDITION.
     let fx = Fixture::new(8, 2, 2);
+    // Two live initiators sharing the library.
+    let t1 = fx.session_manager.create_session([1, 0, 0, 0, 0, 0]);
+    let t2 = fx.session_manager.create_session([2, 0, 0, 0, 0, 0]);
     let slot_id = {
         let mut lib = fx.library.lock().unwrap();
         lib.add_or_create_tape("TAPE01", "primary").unwrap()
@@ -409,19 +415,22 @@ fn move_medium_raises_ua_only_on_affected_drives() {
     );
 
     let ua = &fx.ua;
-    // Drive 0 (LUN 1) is the destination — it gained a cartridge.
-    let drive_0_ua = ua.check_and_pop_ua(1, 1);
-    assert_eq!(drive_0_ua, Some(UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED));
-    // Drive 1 (LUN 2) is uninvolved — it must NOT receive the UA.
-    // The bug was that every drive LUN got the UA regardless.
-    assert!(
-        ua.check_and_pop_ua(1, 2).is_none(),
-        "uninvolved drive 1 (LUN 2) must not receive MEDIUM MAY HAVE CHANGED",
+    // Drive 0 (LUN 1) is the destination — it gained a cartridge, so
+    // BOTH sessions receive the UA (issue #190).
+    assert_eq!(
+        ua.check_and_pop_ua(t1, 1),
+        Some(UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED),
     );
-    // The changer LUN (0) is not a drive — UA tracking only applies
-    // to drive LUNs, but check anyway that we didn't accidentally
-    // queue one.
-    assert!(ua.check_and_pop_ua(1, 0).is_none());
+    assert_eq!(
+        ua.check_and_pop_ua(t2, 1),
+        Some(UnitAttentionCode::MEDIUM_MAY_HAVE_CHANGED),
+        "every live session must see the medium change, not just the issuer",
+    );
+    // Drive 1 (LUN 2) is uninvolved — no session receives the UA (#37).
+    assert!(ua.check_and_pop_ua(t1, 2).is_none());
+    assert!(ua.check_and_pop_ua(t2, 2).is_none());
+    // The changer LUN (0) is not a drive — none queued.
+    assert!(ua.check_and_pop_ua(t1, 0).is_none());
 }
 
 #[test]
@@ -481,6 +490,82 @@ fn exchange_medium_swaps_two_cartridges() {
     let mut ctx = fx.ctx(&mut pdu, c, 0);
     let resp = handlers::handle_exchange_medium(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::Good);
+}
+
+#[test]
+fn exchange_medium_canonical_swap_dst2_equals_src() {
+    // Issue #191: `mtx exchange A B` issues src=A, dst1=B, dst2=A — the
+    // canonical two-element swap. The prior two-MOVE composition refused
+    // it because dst2 (== src) was still occupied when step 1 ran. The
+    // atomic exchange must accept it and swap the two cartridges.
+    let fx = Fixture::default();
+    let (a, b) = {
+        let mut lib = fx.library.lock().unwrap();
+        let a = lib.add_or_create_tape("TAPE_A", "primary").unwrap();
+        let b = lib.add_or_create_tape("TAPE_B", "primary").unwrap();
+        (a, b)
+    };
+    let mut c = cdb(0xA6);
+    c[4..6].copy_from_slice(&(STORAGE_BASE + a as u16).to_be_bytes()); // src = A
+    c[6..8].copy_from_slice(&(STORAGE_BASE + b as u16).to_be_bytes()); // dst1 = B
+    c[8..10].copy_from_slice(&(STORAGE_BASE + a as u16).to_be_bytes()); // dst2 = A (== src)
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx(&mut pdu, c, 0);
+    let resp = handlers::handle_exchange_medium(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::Good);
+
+    let lib = fx.library.lock().unwrap();
+    assert_eq!(
+        lib.storage_slots()[a as usize].barcode.as_deref(),
+        Some("TAPE_B"),
+    );
+    assert_eq!(
+        lib.storage_slots()[b as usize].barcode.as_deref(),
+        Some("TAPE_A"),
+    );
+}
+
+#[test]
+fn move_medium_load_failure_rolls_back_inventory() {
+    // Issue #189: when the drive-side cartridge load fails after the
+    // library inventory move has persisted, the move must roll back
+    // (source slot restored, drive left empty) and the command must
+    // return CHECK CONDITION — not GOOD over a persistent library/drive
+    // desync. No spurious MEDIUM MAY HAVE CHANGED UA is raised.
+    let fx = Fixture::new(8, 2, 2);
+    let t1 = fx.session_manager.create_session([1, 0, 0, 0, 0, 0]);
+    let slot_id = {
+        let mut lib = fx.library.lock().unwrap();
+        lib.add_or_create_tape("TAPE01", "primary").unwrap()
+    };
+    // Force the drive-side load to fail: remove the cartridge directory
+    // so read_manifest_identity returns CartridgeNotFound. The inventory
+    // still records the barcode in the slot.
+    std::fs::remove_dir_all(fx._tmp.path().join("tapes").join("TAPE01")).unwrap();
+
+    let mut c = cdb(0xA5);
+    c[4..6].copy_from_slice(&(STORAGE_BASE + slot_id as u16).to_be_bytes());
+    c[6..8].copy_from_slice(&DRIVE_BASE.to_be_bytes());
+    let mut pdu = blank_pdu();
+    let mut ctx = fx.ctx(&mut pdu, c, 0);
+    let resp = handlers::handle_move_medium(&mut ctx).unwrap();
+    assert_eq!(resp.status, ScsiStatus::CheckCondition);
+    assert!(resp.sense.is_some(), "must carry sense reflecting the cause");
+
+    let lib = fx.library.lock().unwrap();
+    assert!(
+        lib.storage_slots()[slot_id as usize].occupied,
+        "source slot must be restored on rollback",
+    );
+    assert!(
+        !lib.drives()[0].occupied,
+        "drive must not be left loaded after a failed load",
+    );
+    drop(lib);
+    assert!(
+        fx.ua.check_and_pop_ua(t1, 1).is_none(),
+        "no medium-changed UA on a failed load",
+    );
 }
 
 #[test]

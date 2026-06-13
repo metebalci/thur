@@ -95,6 +95,10 @@ pub struct IscsiLibraryHandler {
     /// pulls. Sourced from `memory_buffers.read_prefetch_chunks_ahead`;
     /// 0 disables prefetch.
     pub(crate) read_prefetch_chunks_ahead: u32,
+    /// Live iSCSI session registry. Threaded into the SCSI dispatcher so
+    /// MOVE / EXCHANGE MEDIUM can raise MEDIUM MAY HAVE CHANGED on every
+    /// initiator's drive LUN, not just the issuing session (issue #190).
+    pub(crate) session_manager: Arc<shared_iscsi::session::SessionManager>,
 }
 
 impl IscsiLibraryHandler {
@@ -263,6 +267,7 @@ impl ScsiHandler for IscsiLibraryHandler {
         let diag = Arc::clone(&self.diagnostic_store);
         let alua = Arc::clone(&self.alua);
         let resv = Arc::clone(&self.reservations);
+        let smgr = Arc::clone(&self.session_manager);
         let mut pdu = Pdu::synth(req.cdb, req.lun, req.data_in_max, req.data_out);
 
         let resp_result: Result<ScsiResp> = tokio::task::spawn_blocking(move || {
@@ -284,6 +289,7 @@ impl ScsiHandler for IscsiLibraryHandler {
                 diag,
                 Some(alua),
                 resv,
+                smgr,
             )
         })
         .await

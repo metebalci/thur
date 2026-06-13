@@ -178,6 +178,7 @@ impl IscsiServer {
                 .collapse_isid(),
             prefetch_managers: Arc::clone(&self.state.prefetch_managers),
             read_prefetch_chunks_ahead: self.state.read_prefetch_chunks_ahead,
+            session_manager: Arc::clone(&self.state.session_manager),
         });
         let transport_handler: Arc<dyn shared_iscsi::ScsiHandler> = handler;
 

@@ -15,6 +15,17 @@ use crate::errors::{Result, SmcError};
 
 use super::{Library, LoadedCartridge};
 
+/// A storage or import/export element addressed by its in-type id, used
+/// by [`Library::exchange_medium`] so the SMC EXCHANGE MEDIUM handler can
+/// express a three-element swap without knowing the inventory internals.
+/// Data-transfer (drive) elements are intentionally excluded — the SMC
+/// dispatcher refuses drive-involving exchanges (issue #133).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeSlot {
+    Storage(u32),
+    Mail(u32),
+}
+
 impl Library {
     /// Add an existing or new cartridge to the first free cartridge slot.
     /// If the tape directory doesn't exist yet, it will be created as an
@@ -251,6 +262,103 @@ impl Library {
         self.persist()
     }
 
+    /// Read the barcode of an exchange element, requiring it to be
+    /// occupied. Helper for [`Self::exchange_medium`].
+    fn exchange_slot_barcode(&mut self, slot: ExchangeSlot) -> Result<String> {
+        let (occupied, barcode) = match slot {
+            ExchangeSlot::Storage(id) => {
+                let s = self.storage_slot_mut(id)?;
+                (s.occupied, s.barcode.clone())
+            }
+            ExchangeSlot::Mail(id) => {
+                let m = self.mail_slot_mut(id)?;
+                (m.occupied, m.barcode.clone())
+            }
+        };
+        if !occupied {
+            return Err(SmcError::InvalidOp("exchange element empty"));
+        }
+        barcode.ok_or(SmcError::InvalidOp(
+            "exchange element occupied but barcode missing",
+        ))
+    }
+
+    /// Whether an exchange element currently holds a cartridge. Helper
+    /// for [`Self::exchange_medium`].
+    fn exchange_slot_occupied(&mut self, slot: ExchangeSlot) -> Result<bool> {
+        Ok(match slot {
+            ExchangeSlot::Storage(id) => self.storage_slot_mut(id)?.occupied,
+            ExchangeSlot::Mail(id) => self.mail_slot_mut(id)?.occupied,
+        })
+    }
+
+    /// Set (or clear, with `None`) the cartridge in an exchange element.
+    /// Helper for [`Self::exchange_medium`].
+    fn exchange_slot_assign(&mut self, slot: ExchangeSlot, barcode: Option<String>) -> Result<()> {
+        match slot {
+            ExchangeSlot::Storage(id) => {
+                let s = self.storage_slot_mut(id)?;
+                s.occupied = barcode.is_some();
+                s.barcode = barcode;
+            }
+            ExchangeSlot::Mail(id) => {
+                let m = self.mail_slot_mut(id)?;
+                m.occupied = barcode.is_some();
+                m.barcode = barcode;
+            }
+        }
+        Ok(())
+    }
+
+    /// SMC EXCHANGE MEDIUM as a single atomic inventory transaction: the
+    /// medium at `src` moves to `dst1`, and the medium that was at `dst1`
+    /// moves to `dst2`. Performed as a read-then-write over the in-memory
+    /// inventory with a single `persist()`, so a refusal leaves the
+    /// inventory untouched and there is no half-applied durable state
+    /// (issue #191).
+    ///
+    /// `dst2 == src` is the canonical two-element swap (`mtx exchange A B`
+    /// issues src=A, dst1=B, dst2=A): the source slot is vacated by this
+    /// same exchange, so reusing it as the second destination is valid.
+    pub fn exchange_medium(
+        &mut self,
+        src: ExchangeSlot,
+        dst1: ExchangeSlot,
+        dst2: ExchangeSlot,
+    ) -> Result<()> {
+        if src == dst1 {
+            return Err(SmcError::InvalidOp(
+                "exchange source and first destination must differ",
+            ));
+        }
+        if dst1 == dst2 {
+            return Err(SmcError::InvalidOp(
+                "exchange first and second destination must differ",
+            ));
+        }
+
+        // Snapshot the two media that move (both must be present).
+        let src_barcode = self.exchange_slot_barcode(src)?;
+        let dst1_barcode = self.exchange_slot_barcode(dst1)?;
+
+        // The second destination must be free unless it is the source
+        // slot itself, which this exchange vacates.
+        if dst2 != src && self.exchange_slot_occupied(dst2)? {
+            return Err(SmcError::InvalidOp("exchange second destination occupied"));
+        }
+
+        // Apply from the snapshot. The write targets are distinct
+        // (src != dst1, dst1 != dst2, and the only permitted dst2
+        // collision is dst2 == src), so write order is immaterial.
+        if dst2 != src {
+            self.exchange_slot_assign(src, None)?;
+        }
+        self.exchange_slot_assign(dst1, Some(src_barcode))?;
+        self.exchange_slot_assign(dst2, Some(dst1_barcode))?;
+
+        self.persist()
+    }
+
     /// Load a cartridge from a slot (backward compatibility - for old API).
     /// Returns a LoadedCartridge; the slot becomes empty until you `unload()` it back.
     pub fn load(&mut self, slot_id: u32) -> Result<LoadedCartridge> {
@@ -292,5 +400,109 @@ impl Library {
             s.barcode = Some(loaded.barcode);
         }
         self.persist()
+    }
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn lib_with_slots(slots: u32) -> (TempDir, Library) {
+        let temp_dir = TempDir::new().unwrap();
+        let library = Library::initialize(
+            &temp_dir.path().join("library"),
+            &temp_dir.path().join("tapes"),
+            slots,
+            0,
+            2,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .unwrap();
+        (temp_dir, library)
+    }
+
+    fn barcode_at(lib: &Library, id: u32) -> Option<String> {
+        lib.storage_slots()[id as usize].barcode.clone()
+    }
+
+    #[test]
+    fn exchange_canonical_swap_dst2_equals_src() {
+        // mtx exchange A B issues src=A, dst1=B, dst2=A — the canonical
+        // two-element swap that the prior two-move composition refused.
+        let (_t, mut lib) = lib_with_slots(8);
+        lib.add_or_create_tape("TAPE001", "primary").unwrap(); // slot 0
+        lib.add_or_create_tape("TAPE002", "primary").unwrap(); // slot 1
+
+        lib.exchange_medium(
+            ExchangeSlot::Storage(0),
+            ExchangeSlot::Storage(1),
+            ExchangeSlot::Storage(0),
+        )
+        .unwrap();
+
+        assert_eq!(barcode_at(&lib, 0).as_deref(), Some("TAPE002"));
+        assert_eq!(barcode_at(&lib, 1).as_deref(), Some("TAPE001"));
+    }
+
+    #[test]
+    fn exchange_three_distinct_elements() {
+        // src -> dst1, dst1's medium -> empty dst2, src left empty.
+        let (_t, mut lib) = lib_with_slots(8);
+        lib.add_or_create_tape("TAPE001", "primary").unwrap(); // slot 0
+        lib.add_or_create_tape("TAPE002", "primary").unwrap(); // slot 1
+
+        lib.exchange_medium(
+            ExchangeSlot::Storage(0),
+            ExchangeSlot::Storage(1),
+            ExchangeSlot::Storage(2),
+        )
+        .unwrap();
+
+        assert!(!lib.storage_slots()[0].occupied, "source must be empty");
+        assert_eq!(barcode_at(&lib, 1).as_deref(), Some("TAPE001"));
+        assert_eq!(barcode_at(&lib, 2).as_deref(), Some("TAPE002"));
+    }
+
+    #[test]
+    fn exchange_refuses_occupied_second_destination_without_state_change() {
+        let (_t, mut lib) = lib_with_slots(8);
+        lib.add_or_create_tape("TAPE001", "primary").unwrap(); // slot 0
+        lib.add_or_create_tape("TAPE002", "primary").unwrap(); // slot 1
+        lib.add_or_create_tape("TAPE003", "primary").unwrap(); // slot 2
+
+        let err = lib
+            .exchange_medium(
+                ExchangeSlot::Storage(0),
+                ExchangeSlot::Storage(1),
+                ExchangeSlot::Storage(2),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SmcError::InvalidOp(_)));
+        // No half-applied state: all three slots keep their tapes.
+        assert_eq!(barcode_at(&lib, 0).as_deref(), Some("TAPE001"));
+        assert_eq!(barcode_at(&lib, 1).as_deref(), Some("TAPE002"));
+        assert_eq!(barcode_at(&lib, 2).as_deref(), Some("TAPE003"));
+    }
+
+    #[test]
+    fn exchange_refuses_empty_source() {
+        let (_t, mut lib) = lib_with_slots(8);
+        lib.add_or_create_tape("TAPE002", "primary").unwrap(); // slot 0
+        // src = slot 1 (empty), dst1 = slot 0.
+        let err = lib
+            .exchange_medium(
+                ExchangeSlot::Storage(1),
+                ExchangeSlot::Storage(0),
+                ExchangeSlot::Storage(1),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SmcError::InvalidOp(_)));
+        assert_eq!(barcode_at(&lib, 0).as_deref(), Some("TAPE002"));
     }
 }

@@ -314,6 +314,30 @@ fn descriptor_length(et: ElementType, opts: &ReadElementStatusOpts) -> u16 {
     len
 }
 
+/// Resolve a READ ELEMENT STATUS starting element address to the first
+/// in-type element id for a single element type. SMC-3 treats the
+/// starting element address as a floor: an address below the type's
+/// range starts at the first element (id 0); an address inside the
+/// range maps to its offset; an address at or beyond the end of the
+/// range matches no element of this type and returns `None` (the caller
+/// emits an empty page for a typed request, or skips the type for a
+/// type-0 request). Replaces the prior `.unwrap_or(0)`, which wrapped an
+/// out-of-range start back to element 0 and re-returned the whole
+/// inventory under a header echoing the requested start (issue #186).
+fn resolve_start_id(start_address: u16, type_start: u16, type_count: u16) -> Option<u16> {
+    if type_count == 0 {
+        return None;
+    }
+    let type_end = type_start.saturating_add(type_count); // exclusive
+    if start_address < type_start {
+        Some(0)
+    } else if start_address < type_end {
+        Some(start_address - type_start)
+    } else {
+        None
+    }
+}
+
 /// READ ELEMENT STATUS (0xB8)
 /// Returns the status of library elements (slots, mail slots, drives).
 /// When `partition_filter` is `Some(name)` only elements that belong
@@ -349,69 +373,110 @@ pub fn handle_read_element_status(
 
     match element_type {
         ElementType::AllElements => {
-            append_storage_elements(
-                &mut response,
-                library,
-                config,
-                0,
-                config.storage_count,
-                opts,
-                partition_filter,
-            );
-            append_import_export_elements(
-                &mut response,
-                library,
-                config,
-                0,
-                config.import_export_count,
-                opts,
-                partition_filter,
-            );
-            append_data_transfer_elements(
-                &mut response,
-                library,
-                config,
-                0,
-                config.data_transfer_count,
-                opts,
-                partition_filter,
-            );
+            // SMC-3 type-0: walk Storage, Import/Export and Data Transfer
+            // in ascending type-code order, beginning at the supplied
+            // element address and returning at most `count` descriptors
+            // total. count 0 keeps the historical type-0 "return
+            // everything" behaviour (no limit). Types whose elements all
+            // sort below the starting address are skipped entirely, and
+            // building stops once the budget is exhausted (issue #185).
+            let mut budget: u32 = if count == 0 { u32::MAX } else { count as u32 };
+            if budget > 0
+                && let Some(sid) =
+                    resolve_start_id(start_address, config.storage_start, config.storage_count)
+            {
+                append_storage_elements(
+                    &mut response,
+                    library,
+                    config,
+                    Some(sid),
+                    &mut budget,
+                    opts,
+                    partition_filter,
+                );
+            }
+            if budget > 0
+                && let Some(sid) = resolve_start_id(
+                    start_address,
+                    config.import_export_start,
+                    config.import_export_count,
+                )
+            {
+                append_import_export_elements(
+                    &mut response,
+                    library,
+                    config,
+                    Some(sid),
+                    &mut budget,
+                    opts,
+                    partition_filter,
+                );
+            }
+            if budget > 0
+                && let Some(sid) = resolve_start_id(
+                    start_address,
+                    config.data_transfer_start,
+                    config.data_transfer_count,
+                )
+            {
+                append_data_transfer_elements(
+                    &mut response,
+                    library,
+                    config,
+                    Some(sid),
+                    &mut budget,
+                    opts,
+                    partition_filter,
+                );
+            }
         }
         ElementType::MediumTransport => {
             append_transport_element(&mut response, config, opts);
         }
         ElementType::Storage => {
-            let start_id = config.address_to_storage_id(start_address).unwrap_or(0);
+            let mut budget: u32 = count as u32;
+            let start_id =
+                resolve_start_id(start_address, config.storage_start, config.storage_count);
             append_storage_elements(
                 &mut response,
                 library,
                 config,
-                start_id as u16,
-                count,
+                start_id,
+                &mut budget,
                 opts,
                 partition_filter,
             );
         }
         ElementType::ImportExport => {
-            let start_id = config.address_to_mail_id(start_address).unwrap_or(0);
+            let mut budget: u32 = count as u32;
+            let start_id = resolve_start_id(
+                start_address,
+                config.import_export_start,
+                config.import_export_count,
+            );
             append_import_export_elements(
                 &mut response,
                 library,
                 config,
-                start_id as u16,
-                count,
+                start_id,
+                &mut budget,
                 opts,
                 partition_filter,
             );
         }
         ElementType::DataTransfer => {
-            let start_id = config.address_to_drive_id(start_address).unwrap_or(0);
+            let mut budget: u32 = count as u32;
+            let start_id = resolve_start_id(
+                start_address,
+                config.data_transfer_start,
+                config.data_transfer_count,
+            );
             append_data_transfer_elements(
                 &mut response,
                 library,
                 config,
-                start_id as u16,
-                count,
+                start_id,
+                &mut budget,
                 opts,
                 partition_filter,
             );
@@ -435,7 +500,10 @@ fn append_transport_element(
 
     // Element type page header (8 bytes)
     response.push(0x01); // Element type code: Medium Transport
-    response.push(0x00);
+    // Byte 1: PVOLTAG(7) | AVOLTAG(6). Set PVOLTAG whenever the
+    // descriptors carry primary volume tag fields so SMC-conforming
+    // parsers actually read them (issue #187).
+    response.push(if opts.voltag { 0x80 } else { 0x00 });
     response.extend_from_slice(&descriptor_len.to_be_bytes());
     response.push(0x00);
     response.push(0x00);
@@ -462,15 +530,17 @@ fn append_storage_elements(
     response: &mut Vec<u8>,
     library: &Library,
     config: &ElementAddressConfig,
-    start_id: u16,
-    count: u16,
+    start_id: Option<u16>,
+    budget: &mut u32,
     opts: &ReadElementStatusOpts,
     partition_filter: Option<&str>,
 ) {
     let descriptor_len = descriptor_length(ElementType::Storage, opts);
 
     response.push(0x02); // Element type code: Storage
-    response.push(0x00);
+    // Byte 1: PVOLTAG(7) | AVOLTAG(6) — set PVOLTAG when voltag fields
+    // are present so conforming parsers read the barcodes (issue #187).
+    response.push(if opts.voltag { 0x80 } else { 0x00 });
     response.extend_from_slice(&descriptor_len.to_be_bytes());
     response.push(0x00);
 
@@ -478,15 +548,22 @@ fn append_storage_elements(
     response.extend_from_slice(&[0x00, 0x00, 0x00]);
 
     let descriptors_start = response.len();
-    let slots = library.storage_slots();
-    for i in start_id..start_id.saturating_add(count).min(slots.len() as u16) {
-        if let Some(slot) = slots.get(i as usize) {
+    // `start_id == None` (start address at/beyond the type range, issue
+    // #186) emits the page header with zero descriptors — the SMC
+    // end-of-inventory signal.
+    if let Some(start_id) = start_id {
+        let slots = library.storage_slots();
+        let mut i = start_id as usize;
+        while i < slots.len() && *budget > 0 {
+            let slot = &slots[i];
+            i += 1;
             if let Some(part) = partition_filter
                 && library.partition_for_storage_slot(slot.id) != Some(part)
             {
                 continue;
             }
             append_storage_descriptor(response, config, slot, opts);
+            *budget -= 1;
         }
     }
 
@@ -539,15 +616,16 @@ fn append_import_export_elements(
     response: &mut Vec<u8>,
     library: &Library,
     config: &ElementAddressConfig,
-    start_id: u16,
-    count: u16,
+    start_id: Option<u16>,
+    budget: &mut u32,
     opts: &ReadElementStatusOpts,
     partition_filter: Option<&str>,
 ) {
     let descriptor_len = descriptor_length(ElementType::ImportExport, opts);
 
     response.push(0x03); // Element type code: Import/Export
-    response.push(0x00);
+    // Byte 1: PVOLTAG(7) | AVOLTAG(6) — issue #187.
+    response.push(if opts.voltag { 0x80 } else { 0x00 });
     response.extend_from_slice(&descriptor_len.to_be_bytes());
     response.push(0x00);
 
@@ -555,15 +633,19 @@ fn append_import_export_elements(
     response.extend_from_slice(&[0x00, 0x00, 0x00]);
 
     let descriptors_start = response.len();
-    let mail_slots = library.mail_slots();
-    for i in start_id..start_id.saturating_add(count).min(mail_slots.len() as u16) {
-        if let Some(slot) = mail_slots.get(i as usize) {
+    if let Some(start_id) = start_id {
+        let mail_slots = library.mail_slots();
+        let mut i = start_id as usize;
+        while i < mail_slots.len() && *budget > 0 {
+            let slot = &mail_slots[i];
+            i += 1;
             if let Some(part) = partition_filter
                 && library.partition_for_mail_slot(slot.id) != Some(part)
             {
                 continue;
             }
             append_import_export_descriptor(response, config, slot, opts);
+            *budget -= 1;
         }
     }
 
@@ -619,15 +701,16 @@ fn append_data_transfer_elements(
     response: &mut Vec<u8>,
     library: &Library,
     config: &ElementAddressConfig,
-    start_id: u16,
-    count: u16,
+    start_id: Option<u16>,
+    budget: &mut u32,
     opts: &ReadElementStatusOpts,
     partition_filter: Option<&str>,
 ) {
     let descriptor_len = descriptor_length(ElementType::DataTransfer, opts);
 
     response.push(0x04); // Element type code: Data Transfer
-    response.push(0x00);
+    // Byte 1: PVOLTAG(7) | AVOLTAG(6) — issue #187.
+    response.push(if opts.voltag { 0x80 } else { 0x00 });
     response.extend_from_slice(&descriptor_len.to_be_bytes());
     response.push(0x00);
 
@@ -635,15 +718,19 @@ fn append_data_transfer_elements(
     response.extend_from_slice(&[0x00, 0x00, 0x00]);
 
     let descriptors_start = response.len();
-    let drives = library.drives();
-    for i in start_id..start_id.saturating_add(count).min(drives.len() as u16) {
-        if let Some(drive) = drives.get(i as usize) {
+    if let Some(start_id) = start_id {
+        let drives = library.drives();
+        let mut i = start_id as usize;
+        while i < drives.len() && *budget > 0 {
+            let drive = &drives[i];
+            i += 1;
             if let Some(part) = partition_filter
                 && library.partition_for_drive(drive.id) != Some(part)
             {
                 continue;
             }
             append_data_transfer_descriptor(response, config, drive, opts);
+            *budget -= 1;
         }
     }
 
@@ -1220,6 +1307,162 @@ mod tests {
         let per_page_bytes_filtered =
             u32::from_be_bytes([0, filtered[8 + 5], filtered[8 + 6], filtered[8 + 7]]);
         assert_eq!(per_page_bytes_filtered, 12 * 20);
+    }
+
+    /// Build a temp-backed library with `slots` storage slots and
+    /// `drives` drives for READ ELEMENT STATUS tests.
+    fn test_library(slots: u32, drives: u32) -> (tempfile::TempDir, Library) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let library = Library::initialize(
+            &temp_dir.path().join("library"),
+            &temp_dir.path().join("tapes"),
+            slots,
+            0,
+            drives,
+            8,
+            None,
+            0,
+            1001,
+            101,
+            1,
+        )
+        .unwrap();
+        (temp_dir, library)
+    }
+
+    fn plain_opts() -> ReadElementStatusOpts {
+        ReadElementStatusOpts {
+            voltag: false,
+            dvcid: false,
+            mixed: false,
+            lto_generation: 8,
+        }
+    }
+
+    /// Per-type page byte count lives at offsets [13..16] (the type page
+    /// header sits 8 bytes into the response).
+    fn first_page_byte_count(resp: &[u8]) -> u32 {
+        u32::from_be_bytes([0, resp[8 + 5], resp[8 + 6], resp[8 + 7]])
+    }
+
+    #[test]
+    fn read_element_status_start_above_range_is_empty() {
+        // #186: a typed Storage request whose start address sits at/past
+        // the end of the storage range reports zero descriptors (end of
+        // inventory), instead of wrapping to element 0 and re-listing
+        // the whole inventory under a header echoing the requested start.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        // storage range is 1001..1009; 1009 is one past the end.
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 1009, 8, &opts, None)
+                .unwrap();
+        assert_eq!(
+            first_page_byte_count(&resp),
+            0,
+            "out-of-range start must yield zero descriptors"
+        );
+        // Outer header still echoes the requested start address.
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 1009);
+    }
+
+    #[test]
+    fn read_element_status_start_below_range_lists_from_zero() {
+        // #186: an address below the type range is a floor of id 0 —
+        // list from the first slot (lenient behaviour, preserved).
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 0, 8, &opts, None)
+                .unwrap();
+        assert_eq!(first_page_byte_count(&resp), 12 * 8);
+    }
+
+    #[test]
+    fn read_element_status_in_range_start_offsets() {
+        // #186: an in-range start lists from that offset only.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        // 1004 == storage id 3, so slots 3..8 (5 slots) remain.
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 1004, 8, &opts, None)
+                .unwrap();
+        assert_eq!(first_page_byte_count(&resp), 12 * 5);
+    }
+
+    #[test]
+    fn read_element_status_count_caps_descriptors() {
+        // #185: count limits the number of descriptors returned.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 1001, 3, &opts, None)
+                .unwrap();
+        assert_eq!(first_page_byte_count(&resp), 12 * 3);
+    }
+
+    #[test]
+    fn read_element_status_all_elements_honors_start_floor() {
+        // #185: type-0 with a start address inside the storage range
+        // excludes the lower-addressed drives (addr 1,2 < 1001) — the
+        // starting element address is a floor across every type.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        let resp = handle_read_element_status(
+            &library,
+            &cfg,
+            ElementType::AllElements,
+            1001,
+            0,
+            &opts,
+            None,
+        )
+        .unwrap();
+        // Outer header (8) + one storage page (8 + 8*12 = 104). The
+        // data-transfer page (addresses below the floor) is omitted.
+        assert_eq!(resp.len(), 8 + 104);
+        assert_eq!(resp[8], 0x02, "only the storage page should appear");
+    }
+
+    #[test]
+    fn read_element_status_all_elements_start_zero_includes_drives() {
+        // #185: type-0 start=0 keeps the historical full sweep — storage
+        // (floor 0) plus the data-transfer page.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let opts = plain_opts();
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::AllElements, 0, 0, &opts, None)
+                .unwrap();
+        // Outer header (8) + storage page (104) + data-transfer page
+        // (8 + 2*12 = 32). I/E count is 0 so no I/E page is emitted.
+        assert_eq!(resp.len(), 8 + 104 + 32);
+    }
+
+    #[test]
+    fn read_element_status_pvoltag_bit_set_with_voltag() {
+        // #187: page-header byte 1 carries PVOLTAG (0x80) when the volume
+        // tag fields are present, so conforming parsers read barcodes.
+        let (_t, library) = test_library(8, 2);
+        let cfg = ElementAddressConfig::new(0, 1001, 8, 101, 0, 1, 2);
+        let mut opts = plain_opts();
+        opts.voltag = true;
+        let resp =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 1001, 8, &opts, None)
+                .unwrap();
+        // storage page header byte 1 is at response offset 9.
+        assert_eq!(resp[9] & 0x80, 0x80, "PVOLTAG must be set with voltag");
+
+        opts.voltag = false;
+        let resp_no =
+            handle_read_element_status(&library, &cfg, ElementType::Storage, 1001, 8, &opts, None)
+                .unwrap();
+        assert_eq!(resp_no[9] & 0x80, 0x00, "PVOLTAG clear without voltag");
     }
 
     #[test]

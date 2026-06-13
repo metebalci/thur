@@ -91,8 +91,9 @@ pub use daemon_lock::{DaemonLock, check_daemon_not_running, is_daemon_running};
 pub use events::{PositionChangeReason, TapeEvent};
 pub use legal_hold::find_drive_for_loaded_cartridge;
 pub use library::{
-    DriveInfo, LEGACY_CHASSIS_SERIAL, Library, LibraryFacade, LibraryPartition, LoadedCartridge,
-    MAX_CHASSIS_SERIAL_LEN, MAX_DRIVE_MFG_SERIAL_LEN, MailSlotInfo, SlotInfo, SlotRange,
+    DriveInfo, ExchangeSlot, LEGACY_CHASSIS_SERIAL, Library, LibraryFacade, LibraryPartition,
+    LoadedCartridge, MAX_CHASSIS_SERIAL_LEN, MAX_DRIVE_MFG_SERIAL_LEN, MailSlotInfo, SlotInfo,
+    SlotRange,
     TapeDeviceFacade, default_firmware_for_lto, generate_chassis_serial, generate_drive_mfg_serial,
     partition_serial_suffix, validate_chassis_serial, validate_firmware, validate_partitions,
 };

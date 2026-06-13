@@ -501,6 +501,7 @@ pub(crate) fn handle_scsi_command(
     diagnostic_store: Arc<DiagnosticStore>,
     alua: Option<Arc<shared_iscsi::alua::AluaTopology>>,
     reservations: Arc<scsi_spc::reservations::ReservationManager>,
+    session_manager: Arc<shared_iscsi::session::SessionManager>,
 ) -> Result<ScsiResp> {
     // CDB lives in BHS bytes [32..48]; copy it to a local so handlers
     // don't have to re-slice pdu.bhs every time.
@@ -598,6 +599,7 @@ pub(crate) fn handle_scsi_command(
         inner,
         library: &library,
         element_config: &element_config,
+        session_manager: &session_manager,
     };
 
     dispatch_scsi(&mut ctx)

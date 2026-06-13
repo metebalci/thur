@@ -16,6 +16,7 @@
 
 use core_mediachanger::Library;
 use scsi_ssc::dispatch::ScsiCtx;
+use shared_iscsi::session::SessionManager;
 use std::sync::{Arc, Mutex};
 
 use crate::changer::ElementAddressConfig;
@@ -24,6 +25,10 @@ pub struct SmcScsiCtx<'a> {
     pub inner: ScsiCtx<'a>,
     pub library: &'a Arc<Mutex<Library>>,
     pub element_config: &'a ElementAddressConfig,
+    /// Live iSCSI session registry, used by MOVE / EXCHANGE MEDIUM to
+    /// raise MEDIUM MAY HAVE CHANGED on every initiator's drive LUN —
+    /// not just the session that issued the changer command (issue #190).
+    pub session_manager: &'a Arc<SessionManager>,
 }
 
 impl<'a> std::ops::Deref for SmcScsiCtx<'a> {

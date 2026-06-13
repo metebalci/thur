@@ -6,6 +6,7 @@
 // load/unload, remove_from_slot) live in library/inventory.rs to
 // keep this file scoped to library bring-up + accessors.
 mod inventory;
+pub use inventory::ExchangeSlot;
 
 // Partition lookup/replace verbs and the `resize` slot-renumbering
 // state machine (with the three private fan-out helpers
