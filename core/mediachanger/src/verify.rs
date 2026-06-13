@@ -47,7 +47,21 @@ use std::path::Path;
 /// hashed chunk in chunks.idx. Used by [`verify_local_pool`] for the
 /// presence/size walk and stashed verbatim into
 /// [`CartridgeChunkSet::records`] for the later storage sweep.
-type CartChunkRec = (u64, String, u64, LocationTag);
+/// The hash is the raw 32-byte BLAKE3 digest, not its 64-char hex
+/// string: this set is retained for the whole verify run (including
+/// the later storage sweep), so storing `[u8; 32]` inline instead of a
+/// heap `String` cuts the retained footprint from ~90-120 B/chunk to
+/// 32 B/chunk — gigabytes on a large library (issue #164). The
+/// String-consuming boundaries (`live_chunks` / `storage_entities` /
+/// `verify_local_pool`) hex-encode transiently.
+type CartChunkRec = (u64, [u8; 32], u64, LocationTag);
+
+/// Decode a 64-char BLAKE3 hex string into the raw 32-byte digest.
+fn hex_to_digest(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out).ok()?;
+    Some(out)
+}
 
 /// Manifest-derived working values [`verify_one_cartridge`] needs
 /// after [`read_manifest`] has populated the per-cartridge report.
@@ -107,7 +121,7 @@ impl VerifyTarget for TapeVerifyTarget<'_> {
                 .entry((c.backend.clone(), c.namespace.clone()))
                 .or_default();
             for (_, h, _, _) in &c.records {
-                bucket.insert(h.clone());
+                bucket.insert(hex::encode(h));
             }
         }
         out
@@ -128,7 +142,7 @@ impl VerifyTarget for TapeVerifyTarget<'_> {
                     .filter(|(_, _, _, loc)| {
                         matches!(loc, LocationTag::StorageOnly | LocationTag::Both)
                     })
-                    .map(|(_, h, _, _)| h.clone())
+                    .map(|(_, h, _, _)| hex::encode(h))
                     .collect(),
             })
             .collect()
@@ -229,6 +243,16 @@ pub struct PartitionReport {
     pub chunk_id_oob: u64,
     /// Records whose offset+len exceeds the recorded chunk size.
     pub offset_oob: u64,
+    /// Set when an *existing* blocks-p<N>.idx failed to open (corrupt
+    /// header / truncated). The caller promotes this to a hard error —
+    /// a present-but-unreadable index is exactly the corruption verify
+    /// exists to catch (issue #165).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_error: Option<String>,
+    /// Records that failed to decode (structurally bad). Promoted to a
+    /// hard error by the caller (issue #165).
+    #[serde(default)]
+    pub record_read_errors: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -591,9 +615,12 @@ fn read_chunks_index(
     r.chunks_idx_records = n;
     let mut chunk_sizes: Vec<Option<u64>> = vec![None; n as usize];
     let mut records_for_set: Vec<CartChunkRec> = Vec::new();
-    for id in 0..n {
-        match cif.read(id) {
-            Ok(rec) => {
+    // Batched iteration (64 KiB / 1024 records per read) instead of one
+    // pread per record — ~12K reads vs 50M syscalls on a large library
+    // (issue #164).
+    for item in cif.iter() {
+        match item {
+            Ok((id, rec)) => {
                 chunk_sizes[id as usize] = Some(rec.size);
                 if let ChunkRec {
                     hash: Some(h),
@@ -603,12 +630,17 @@ fn read_chunks_index(
                 } = &rec
                 {
                     r.chunks_with_hash += 1;
-                    records_for_set.push((id, h.clone(), *size, *location));
+                    match hex_to_digest(h) {
+                        Some(d) => records_for_set.push((id, d, *size, *location)),
+                        None => r
+                            .errors
+                            .push(format!("chunks.idx record {id} has a malformed hash")),
+                    }
                 }
             }
             Err(e) => r
                 .errors
-                .push(format!("chunks.idx record {} read failed: {}", id, e)),
+                .push(format!("chunks.idx record read failed: {e}")),
         }
     }
     Some((n, chunk_sizes, records_for_set))
@@ -627,7 +659,15 @@ fn verify_block_indexes(
 ) {
     for partition in partitions {
         let pr = verify_one_partition(dir, *partition, chunks_next_id, chunk_sizes);
-        if pr.records == 0 && !BlockIndexFile::path_for(dir, *partition).is_file() {
+        if let Some(open_err) = &pr.open_error {
+            // Present-but-unreadable index: a hard error, not a warning.
+            r.errors.push(open_err.clone());
+        } else if pr.record_read_errors > 0 {
+            r.errors.push(format!(
+                "blocks-p{}.idx has {} undecodable record(s)",
+                partition, pr.record_read_errors
+            ));
+        } else if pr.records == 0 && !BlockIndexFile::path_for(dir, *partition).is_file() {
             // Partition listed in manifest but no blocks file. For an
             // unwritten LTFS-formatted partition this is normal (it's
             // created on first write); flag it as a warning rather
@@ -649,7 +689,7 @@ fn verify_local_pool(
     backend_name: &str,
     namespace: Option<&str>,
     encrypted: bool,
-    records_for_set: &[(u64, String, u64, LocationTag)],
+    records_for_set: &[CartChunkRec],
     r: &mut CartridgeReport,
 ) {
     // chunks.idx records the plaintext chunk size; an encrypted
@@ -672,7 +712,8 @@ fn verify_local_pool(
                 if !need_local {
                     continue;
                 }
-                let path = store.store_path(hash);
+                let hash_hex = hex::encode(hash);
+                let path = store.store_path(&hash_hex);
                 match path.metadata() {
                     Ok(meta) if meta.is_file() => {
                         let expected = *size + pool_overhead;
@@ -680,7 +721,7 @@ fn verify_local_pool(
                             r.local_chunks_size_mismatch += 1;
                             r.errors.push(format!(
                                 "chunk {} size mismatch: chunks.idx={} expected pool={} actual pool={}",
-                                short_hash(hash),
+                                short_hash(&hash_hex),
                                 size,
                                 expected,
                                 meta.len()
@@ -691,7 +732,7 @@ fn verify_local_pool(
                         r.local_chunks_missing += 1;
                         r.errors.push(format!(
                             "chunk {} missing from local pool ({})",
-                            short_hash(hash),
+                            short_hash(&hash_hex),
                             location_str(*location)
                         ));
                     }
@@ -774,12 +815,14 @@ fn verify_one_partition(
     }
     let bif = match BlockIndexFile::open_or_create(dir, partition) {
         Ok(f) => f,
-        Err(_) => {
-            // Header validation failed — caller (verify_one_cartridge)
-            // doesn't see the error directly because partition reports
-            // are attached individually; surface this through the
-            // caller by setting records=0. We defer the structured
-            // error to the caller.
+        Err(e) => {
+            // The file EXISTS (checked above) but its header failed to
+            // validate — corrupt magic/version or a truncated header.
+            // Record it so the caller can raise a hard error; returning
+            // a clean records=0 report would let `system verify` exit 0
+            // on a cartridge whose every host READ will fail (issue
+            // #165).
+            p.open_error = Some(format!("blocks-p{partition}.idx open failed: {e}"));
             return p;
         }
     };
@@ -788,7 +831,12 @@ fn verify_one_partition(
     for lba in 0..n {
         let rec = match bif.read(lba) {
             Ok(r) => r,
-            Err(_) => continue, // structurally bad record — count it via offset_oob? leave as silent for now
+            Err(_) => {
+                // Structurally bad record — count it; the caller raises
+                // a hard error (issue #165).
+                p.record_read_errors += 1;
+                continue;
+            }
         };
         match rec.kind {
             crate::tape::BlockKind::Filemark => p.filemarks += 1,
@@ -1194,6 +1242,52 @@ mod tests {
         assert_eq!(c.chunks_idx_records, 1);
         assert_eq!(c.local_chunks_missing, 0);
         assert_eq!(c.local_chunks_size_mismatch, 0);
+    }
+
+    /// Issue #165: an existing-but-corrupt blocks-p<N>.idx (clobbered
+    /// header) must be reported as an error, not silently passed. Before
+    /// the fix verify returned a clean records=0 partition report and
+    /// exited 0 while every host READ of that partition would fail.
+    #[test]
+    fn corrupt_block_index_is_reported_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        fs::create_dir_all(dd.join("library")).unwrap();
+        fs::write(
+            dd.join("library").join("library.json"),
+            r#"{"num_storage_slots":1,"num_mail_slots":0,"num_drives":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            dd.join("library").join("inventory.json"),
+            r#"{"storage_slots":[{"slot_id":1,"barcode":"TAPE001"}],"mail_slots":[],"drives":[{"drive_id":0,"barcode":null}]}"#,
+        )
+        .unwrap();
+        let h = "a".repeat(64);
+        make_cart(dd, "TAPE001", "primary", "global", &h, b"hello");
+
+        // Clobber the block-index header magic/version so an EXISTING
+        // file fails to open.
+        let bpath = BlockIndexFile::path_for(&dd.join("tapes").join("TAPE001"), 0);
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new().write(true).open(&bpath).unwrap();
+            f.write_all(&[0xFFu8; 8]).unwrap();
+        }
+
+        let report = verify_local(dd, &VerifyScope::default()).unwrap();
+        assert!(
+            report.error_count() > 0,
+            "corrupt block index must be an error: {report:#?}"
+        );
+        let c = &report.cartridges[0];
+        assert!(
+            c.errors
+                .iter()
+                .any(|e| e.contains("blocks-p0.idx") && e.contains("open failed")),
+            "errors: {:?}",
+            c.errors
+        );
     }
 
     #[test]

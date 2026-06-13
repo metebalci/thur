@@ -420,6 +420,29 @@ pub fn diff_against_declared(
                     ));
                     continue;
                 }
+                // Two loaded drives can legitimately share a home_slot
+                // (load A from slot 5, move B into 5, load B into another
+                // drive). This diff checks PRE-evacuation occupancy, so
+                // without tracking already-planned destinations the
+                // second evacuation would overwrite the first's slot
+                // record and silently drop a cartridge from inventory
+                // (issue #162). Refuse the collision.
+                if let Some(prev) = plan
+                    .drive_evacuations
+                    .iter()
+                    .find(|e| e.origin_slot == home)
+                {
+                    blockers.push(format!(
+                        "cannot shrink num_drives from {} to {}: drive {} holds {} whose origin slot {} is also the evacuation target of {}",
+                        cur.num_drives,
+                        declared.num_drives,
+                        drive.id,
+                        barcode,
+                        home,
+                        prev.barcode,
+                    ));
+                    continue;
+                }
                 plan.drive_evacuations.push(DriveEvacuation {
                     drive_id: drive.id,
                     barcode,
@@ -541,6 +564,12 @@ pub fn compute_bounds(library: &Library) -> BoundsReport {
     // origin slot in range and unoccupied.
     let mut min_drives = cur.num_drives;
     let mut min_drives_reason: Option<String> = None;
+    // Home slots already claimed by a higher (already-removable) drive's
+    // evacuation. Two loaded drives can share a home_slot, and the diff
+    // checks PRE-evacuation occupancy, so a shrink past such a collision
+    // is not actually safe (issue #162) — stop the safe-shrink envelope
+    // at the first colliding drive.
+    let mut planned_dests: Vec<u32> = Vec::new();
     for d in (0..cur.num_drives).rev() {
         let drive = match library.drives().iter().find(|x| x.id == d) {
             Some(d) => d,
@@ -571,6 +600,14 @@ pub fn compute_bounds(library: &Library) -> BoundsReport {
             ));
             break;
         }
+        if planned_dests.contains(&home) {
+            min_drives_reason = Some(format!(
+                "drive {} holds {} whose origin slot {} is also another evacuated drive's target",
+                d, barcode, home,
+            ));
+            break;
+        }
+        planned_dests.push(home);
         min_drives = d;
     }
     // Floor at 1 — chassis must keep at least one drive.
@@ -841,6 +878,17 @@ impl Library {
             .ok_or_else(|| {
                 SmcError::LibraryConfig(format!("evacuate: origin slot {} not found", origin_slot,))
             })?;
+        // Last-line defense against the shared-home_slot collision the
+        // diff now rejects (issue #162): never silently overwrite an
+        // occupied slot — that would drop the resident cartridge from
+        // every element.
+        if slot.occupied {
+            return Err(SmcError::LibraryConfig(format!(
+                "evacuate: origin slot {} already occupied by {} — refusing to overwrite",
+                origin_slot,
+                slot.barcode.clone().unwrap_or_else(|| "<unknown>".into()),
+            )));
+        }
         slot.occupied = true;
         slot.barcode = Some(barcode.to_string());
         Ok(())
@@ -1014,6 +1062,54 @@ mod tests {
         assert!(msg.contains("drive 2"));
         assert!(msg.contains("LOADED1L8"));
         assert!(msg.contains("BLOCKER1L8"));
+    }
+
+    /// Issue #162: two loaded drives can record the SAME home_slot
+    /// (load A from slot 5, move B into 5, load B into another drive).
+    /// Shrinking off both drives would evacuate both to slot 5; the
+    /// second write would overwrite the first cartridge's slot record
+    /// and drop it from inventory. The diff must refuse.
+    #[test]
+    fn diff_shrink_drives_shared_home_slot_refuses() {
+        let dir = tempdir().unwrap();
+        let lib_root = dir.path().join("library");
+        let tapes_dir = dir.path().join("tapes");
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 3, 8)).unwrap();
+        for id in [1u32, 2u32] {
+            let drive = lib.inventory.drives.iter_mut().find(|d| d.id == id).unwrap();
+            drive.occupied = true;
+            drive.barcode = Some(format!("SHARED{id}L8"));
+            drive.home_slot = Some(5);
+        }
+        let err = diff_against_declared(&lib, &declared(8, 1, 8))
+            .expect_err("two drives evacuating to the same slot must refuse");
+        let msg = format!("{err}");
+        assert!(msg.contains("evacuation target"), "got: {msg}");
+    }
+
+    /// Issue #162: the inventory mutation itself must never silently
+    /// overwrite an occupied destination slot — the last-line defense
+    /// behind the diff guard above.
+    #[test]
+    fn evacuate_into_occupied_slot_errors() {
+        let dir = tempdir().unwrap();
+        let lib_root = dir.path().join("library");
+        let tapes_dir = dir.path().join("tapes");
+        let (mut lib, _) = open_or_materialize(&lib_root, &tapes_dir, &declared(8, 2, 8)).unwrap();
+        {
+            let s = lib
+                .inventory
+                .storage_slots
+                .iter_mut()
+                .find(|s| s.id == 2)
+                .unwrap();
+            s.occupied = true;
+            s.barcode = Some("RESIDENTL8".into());
+        }
+        let err = lib
+            .evacuate_drive_to_origin(0, 2, "LOADEDL8")
+            .expect_err("evacuating into an occupied slot must error");
+        assert!(format!("{err}").contains("already occupied"));
     }
 
     #[test]

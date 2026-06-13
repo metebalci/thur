@@ -390,7 +390,10 @@ thurvtl library restore-archive
    prefix — into the new cartridge directory.
 5. **Download chunks.** Walk the local `chunks.idx`, and for each
    sealed entry, download the chunk from the archive prefix and
-   `ChunkPool::insert_verified_bytes` it into the local pool. Each
+   `ChunkPool::insert_verified_bytes` it into the local pool. The GETs
+   run with bounded concurrency (16 in flight) rather than one object at
+   a time — a 1M-chunk cartridge is otherwise hours of pure request
+   latency. Each
    `chunks.idx` record is rewritten to `LocationTag::LocalOnly,
    uploaded=false`, so that the daemon's orphan-upload sweep will
    eventually mirror each chunk into the backend's *regular*

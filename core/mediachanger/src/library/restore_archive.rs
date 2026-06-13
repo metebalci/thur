@@ -259,34 +259,49 @@ pub async fn run_restore_archive(opts: RestoreArchiveOptions<'_>) -> Result<Rest
         dedup_local,
     )?;
     let total = chunk_idx.next_id();
-    let mut downloaded = 0u64;
-    let mut bytes = 0u64;
+    // Build the download worklist (chunks that carry a hash). Archive
+    // chunk key shape matches `cartridge_archive`'s `archive_chunk_key`.
+    let mut worklist: Vec<(u64, String, String)> = Vec::new();
     for id in 0..total {
-        let mut rec = chunk_idx.read(id)?;
-        let Some(hash) = rec.hash.clone() else {
-            continue;
-        };
-        // Archive chunk key shape (matches cartridge_archive's
-        // `archive_chunk_key`).
-        let s1 = if hash.len() >= 2 { &hash[..2] } else { "00" };
-        let s2 = if hash.len() >= 4 { &hash[2..4] } else { "00" };
-        let key = format!("{}chunks/{}/{}/{}.dat", archive_prefix, s1, s2, hash);
-        let chunk_bytes = opts
-            .backend
-            .download_chunk(&key)
-            .await
-            .map_err(storage_err)?;
-        pool.insert_verified_bytes(&hash, &chunk_bytes)?;
-        downloaded += 1;
-        bytes += chunk_bytes.len() as u64;
-
-        rec.location = LocationTag::LocalOnly;
-        rec.uploaded = false;
-        chunk_idx.overwrite(id, &rec)?;
-        if downloaded.is_multiple_of(64) {
-            log(&format!("downloaded {}/{} chunks", downloaded, total));
+        let rec = chunk_idx.read(id)?;
+        if let Some(hash) = rec.hash {
+            let s1 = if hash.len() >= 2 { &hash[..2] } else { "00" };
+            let s2 = if hash.len() >= 4 { &hash[2..4] } else { "00" };
+            let key = format!("{}chunks/{}/{}/{}.dat", archive_prefix, s1, s2, hash);
+            worklist.push((id, hash, key));
         }
     }
+    // Fan the GETs out with bounded concurrency instead of one object in
+    // flight at a time — a 1M-chunk cartridge is 8-22 h of pure request
+    // latency serially (issue #163). The pool insert + per-record
+    // chunks.idx rewrite are local and cheap; they run as each download
+    // lands (buffer_unordered polls on one task, so they serialize
+    // safely against each other).
+    use futures::stream::{self, StreamExt};
+    let backend = opts.backend;
+    let pool_ref = &pool;
+    let idx_ref = &chunk_idx;
+    let outcomes: Vec<Result<u64>> = stream::iter(worklist)
+        .map(|(id, hash, key)| async move {
+            let chunk_bytes = backend.download_chunk(&key).await.map_err(storage_err)?;
+            let len = chunk_bytes.len() as u64;
+            pool_ref.insert_verified_bytes(&hash, &chunk_bytes)?;
+            let mut rec = idx_ref.read(id)?;
+            rec.location = LocationTag::LocalOnly;
+            rec.uploaded = false;
+            idx_ref.overwrite(id, &rec)?;
+            Ok(len)
+        })
+        .buffer_unordered(shared_verify_core::STORAGE_VERIFY_CONCURRENCY)
+        .collect()
+        .await;
+    let mut downloaded = 0u64;
+    let mut bytes = 0u64;
+    for o in outcomes {
+        bytes += o?;
+        downloaded += 1;
+    }
+    log(&format!("downloaded {downloaded}/{total} chunks"));
     chunk_idx.fsync()?;
     report.chunks_total = total;
     report.chunks_downloaded = downloaded;
