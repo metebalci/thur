@@ -58,8 +58,25 @@ pub async fn require_admin_password(
         return challenge(StatusCode::UNAUTHORIZED, "authentication required");
     };
 
-    let user_ok = user.as_bytes().ct_eq(WEBADMIN_USER.as_bytes()).into();
-    let pass_ok = verify_phc(&phc, pass.as_bytes());
+    let user_ok: bool = user.as_bytes().ct_eq(WEBADMIN_USER.as_bytes()).into();
+    // Skip the ~tens-of-ms / 19 MiB Argon2id verify when these exact
+    // credentials already verified against the current PHC (the Web UI
+    // re-sends them every poll). On a miss, run the verify on a blocking
+    // thread so it never stalls the iSCSI/NVMe data path sharing this
+    // runtime, nor amplifies a bogus-credential DoS (issue #208).
+    let pass_ok = if auth.verified_matches(pass.as_bytes()) {
+        true
+    } else {
+        let phc_owned = phc.to_string();
+        let pass_owned = pass.as_bytes().to_vec();
+        let verified = tokio::task::spawn_blocking(move || verify_phc(&phc_owned, &pass_owned))
+            .await
+            .unwrap_or(false);
+        if verified {
+            auth.remember_verified(pass.as_bytes());
+        }
+        verified
+    };
     if user_ok && pass_ok {
         req.extensions_mut()
             .insert(AuditActor::rest(WEBADMIN_USER, peer.to_string()));

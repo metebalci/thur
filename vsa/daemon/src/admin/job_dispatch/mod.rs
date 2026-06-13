@@ -18,6 +18,9 @@ pub mod gc;
 pub mod stats;
 pub mod verify;
 
+use std::future::Future;
+use std::pin::Pin;
+
 use shared_admin_server::JobEmitter;
 
 use crate::admin::handlers::AdminState;
@@ -26,76 +29,58 @@ use crate::admin::handlers::AdminState;
 /// parsed inside each kind module. Returns `Err(reason)` on an
 /// unknown kind so the HTTP handler can return 400 before any job is
 /// registered.
+///
+/// Every worker runs under [`JobEmitter::spawn_supervised`] so a panic
+/// or early return without a terminal event still drives the job to a
+/// terminal state, instead of hanging the CLI stream forever and leaking
+/// the job past reap (issue #206).
 pub fn dispatch(
     kind: &str,
     body: serde_json::Value,
     emitter: JobEmitter,
     state: AdminState,
 ) -> Result<(), String> {
-    match kind {
-        "system.alerting.test" => {
-            tokio::spawn(alerting::run_test(emitter, body, state));
-            Ok(())
-        }
+    let supervisor = emitter.clone();
+    let worker: Pin<Box<dyn Future<Output = ()> + Send>> = match kind {
+        "system.alerting.test" => Box::pin(alerting::run_test(emitter, body, state)),
         "system.storage_check" => {
             // Same shared handler VTL mounts; the per-product input is
             // just the parsed storage config.
             let _ = body;
-            tokio::spawn(shared_admin_storage_check::run_storage_check(
+            Box::pin(shared_admin_storage_check::run_storage_check(
                 emitter,
                 std::sync::Arc::clone(&state.storage),
-            ));
-            Ok(())
+            ))
         }
-        "system.gc" => {
-            tokio::spawn(gc::run(emitter, body, state));
-            Ok(())
-        }
-        "system.stats" => {
-            tokio::spawn(stats::run(emitter, body, state));
-            Ok(())
-        }
-        "system.verify" => {
-            tokio::spawn(verify::run(emitter, body, state));
-            Ok(())
-        }
-        "system.audit.tail" => {
-            tokio::spawn(shared_admin_audit::run_tail(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-            Ok(())
-        }
-        "system.audit.export" => {
-            tokio::spawn(shared_admin_audit::run_export(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-            Ok(())
-        }
-        "system.audit.verify" => {
-            tokio::spawn(shared_admin_audit::run_verify(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-            Ok(())
-        }
-        "system.audit.rotate" => {
-            tokio::spawn(shared_admin_audit::run_rotate(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-            Ok(())
-        }
+        "system.gc" => Box::pin(gc::run(emitter, body, state)),
+        "system.stats" => Box::pin(stats::run(emitter, body, state)),
+        "system.verify" => Box::pin(verify::run(emitter, body, state)),
+        "system.audit.tail" => Box::pin(shared_admin_audit::run_tail(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.export" => Box::pin(shared_admin_audit::run_export(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.verify" => Box::pin(shared_admin_audit::run_verify(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.rotate" => Box::pin(shared_admin_audit::run_rotate(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
         "system.monitor" => {
             // AdminState already impls `MonitorState`; spawn directly.
-            tokio::spawn(shared_admin_monitor::run_monitor(emitter, body, state));
-            Ok(())
+            Box::pin(shared_admin_monitor::run_monitor(emitter, body, state))
         }
-        other => Err(format!("unknown job kind: {}", other)),
-    }
+        other => return Err(format!("unknown job kind: {}", other)),
+    };
+    supervisor.spawn_supervised(worker);
+    Ok(())
 }

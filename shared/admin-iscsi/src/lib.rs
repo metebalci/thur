@@ -125,6 +125,18 @@ pub struct TargetShowResponse {
     pub password_set: bool,
 }
 
+/// Serializes every iscsi-users.json read-modify-write within the
+/// process. The admin server spawns one task per connection, so two
+/// concurrent mutating requests would otherwise both `load_users` the
+/// same snapshot and the second `save_users` (atomic rename) would
+/// silently clobber the first — e.g. two CSI per-volume `grant` calls
+/// for the same node racing, dropping one admission with both requests
+/// returning 200 (issue #207). One daemon owns one users file, so a
+/// single process-global lock is sufficient; admin mutations are
+/// infrequent so the coarse granularity is harmless. Mutating handlers
+/// take this guard before `load_users` and hold it past `save_users`.
+static USERS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ---------- iSCSI user handlers ----------
 
 pub async fn list<S: IscsiUsersState>(
@@ -157,6 +169,7 @@ pub async fn add<S: IscsiUsersState>(
     validate_username(&body.username)?;
     validate_password(&body.password)?;
 
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
 
@@ -203,6 +216,7 @@ pub async fn remove<S: IscsiUsersState>(
     peer: PeerCred,
     Json(body): Json<NameOnlyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let before = file.users.len();
@@ -244,6 +258,7 @@ async fn toggle_disabled<S: IscsiUsersState>(
     name: String,
     disabled: bool,
 ) -> Result<StatusCode, ApiError> {
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let user = file
@@ -279,6 +294,7 @@ pub async fn rotate<S: IscsiUsersState>(
         ));
     }
 
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let user = file
@@ -331,6 +347,7 @@ pub async fn grant<S: IscsiUsersState>(
     if body.volumes.is_empty() {
         return Err(ApiError::bad_request("at least one --volume required"));
     }
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let user = file
@@ -381,6 +398,7 @@ pub async fn revoke<S: IscsiUsersState>(
     if body.volumes.is_empty() {
         return Err(ApiError::bad_request("at least one --volume required"));
     }
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let user = file
@@ -437,6 +455,7 @@ pub async fn rotate_cancel<S: IscsiUsersState>(
     peer: PeerCred,
     Json(body): Json<NameOnlyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     let swept = sweep_expired_previous(&mut file);
     let user = file
@@ -486,6 +505,7 @@ pub async fn target_set<S: IscsiUsersState>(
             "password must be at least 12 bytes (RFC 3720 §11.1.4)",
         ));
     }
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     file.target_username = Some(body.username.clone());
     file.target_password = Some(body.password);
@@ -503,6 +523,7 @@ pub async fn target_clear<S: IscsiUsersState>(
     State(state): State<S>,
     peer: PeerCred,
 ) -> Result<StatusCode, ApiError> {
+    let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
     file.target_username = None;
     file.target_password = None;

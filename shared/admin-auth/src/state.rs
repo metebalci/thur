@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use subtle::ConstantTimeEq;
 
 use crate::store::AdminPasswordFile;
 
@@ -41,6 +42,12 @@ pub enum AuthMethod {
 pub struct AuthState {
     inner: Arc<ArcSwapOption<String>>,
     method: AuthMethod,
+    /// blake3 digest of the last password that verified against the
+    /// current PHC. The middleware checks this first so repeated requests
+    /// with the same credentials (the Web UI re-sends Basic creds every
+    /// 1 s) skip the ~tens-of-ms / 19 MiB Argon2id verify (issue #208).
+    /// Cleared by [`Self::store`] on a password change.
+    verified: Arc<ArcSwapOption<[u8; 32]>>,
 }
 
 impl AuthState {
@@ -51,6 +58,7 @@ impl AuthState {
         Self {
             inner: Arc::new(ArcSwapOption::from(phc.map(Arc::new))),
             method: AuthMethod::Password,
+            verified: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -58,6 +66,23 @@ impl AuthState {
     pub fn with_method(mut self, method: AuthMethod) -> Self {
         self.method = method;
         self
+    }
+
+    /// True if `candidate` matches the last password that successfully
+    /// verified against the current PHC (constant-time). A hit lets the
+    /// caller skip the Argon2id verify (issue #208).
+    pub fn verified_matches(&self, candidate: &[u8]) -> bool {
+        match self.verified.load_full() {
+            Some(d) => blake3::hash(candidate).as_bytes().ct_eq(&d[..]).into(),
+            None => false,
+        }
+    }
+
+    /// Record `candidate` as the last-good password so subsequent
+    /// requests with the same credentials skip the Argon2id verify.
+    pub fn remember_verified(&self, candidate: &[u8]) {
+        self.verified
+            .store(Some(Arc::new(*blake3::hash(candidate).as_bytes())));
     }
 
     /// The configured auth method.
@@ -84,9 +109,12 @@ impl AuthState {
     }
 
     /// Hot-swap the live PHC. Called by the setter after a successful
-    /// write so the change takes effect without a daemon restart.
+    /// write so the change takes effect without a daemon restart. Clears
+    /// the verify cache so a stale last-good digest can't admit the old
+    /// password after a change (issue #208).
     pub fn store(&self, phc: Option<String>) {
         self.inner.store(phc.map(Arc::new));
+        self.verified.store(None);
     }
 }
 
@@ -139,6 +167,23 @@ mod tests {
         assert_eq!(
             s.current().as_deref().map(String::as_str),
             Some("$argon2id$v=19$seeded")
+        );
+    }
+
+    #[test]
+    fn verify_cache_hits_then_store_clears_it() {
+        // Issue #208: a remembered password matches (constant-time), and
+        // a password change (store) invalidates the cache so the old
+        // password no longer hits.
+        let s = AuthState::new(Some("phc".to_string()));
+        assert!(!s.verified_matches(b"secret"), "cold cache misses");
+        s.remember_verified(b"secret");
+        assert!(s.verified_matches(b"secret"), "remembered password hits");
+        assert!(!s.verified_matches(b"other"), "a different password misses");
+        s.store(Some("phc2".to_string()));
+        assert!(
+            !s.verified_matches(b"secret"),
+            "password change must clear the verify cache"
         );
     }
 

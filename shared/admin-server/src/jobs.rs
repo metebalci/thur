@@ -162,6 +162,32 @@ impl JobEmitter {
     pub async fn error(&self, message: impl Into<String>) {
         self.emit(JobEvent::error(message)).await;
     }
+
+    /// Spawn `fut` as this job's worker under supervision: if it panics,
+    /// is cancelled, or returns without ever emitting a terminal event,
+    /// a `Done(exit=70)` is synthesized so the job always reaches a
+    /// terminal state. Without this a panicking worker leaves `finished`
+    /// false forever — the CLI's event stream parks indefinitely and the
+    /// job plus its event log leaks past `reap` (issue #206). Use this in
+    /// place of a bare `tokio::spawn(worker(...))` in dispatch.
+    pub fn spawn_supervised<F>(self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let worker = tokio::spawn(fut);
+        tokio::spawn(async move {
+            let outcome = worker.await;
+            if self.inner.finished.load(Ordering::Acquire) {
+                return;
+            }
+            let detail = match outcome {
+                Ok(()) => "job worker exited without emitting a terminal event".to_string(),
+                Err(e) if e.is_panic() => "job worker panicked".to_string(),
+                Err(_) => "job worker was cancelled before completion".to_string(),
+            };
+            self.emit(JobEvent::done_with_error(70, detail)).await;
+        });
+    }
 }
 
 /// Read-only handle for streaming subscribers. Wraps the same
@@ -368,6 +394,81 @@ impl Default for JobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn supervised_panicking_worker_reaches_terminal_state() {
+        // Issue #206: a worker that panics without emitting a terminal
+        // event must still drive the job to Done(error) so the CLI stream
+        // ends and reap can collect it — not park forever.
+        let reg = JobRegistry::new();
+        let (id, _s, emitter) = reg.create("test.panics").await;
+        emitter.clone().spawn_supervised(async move {
+            panic!("boom");
+        });
+        let handle = reg.get(&id).await.unwrap();
+        let mut cursor = 0;
+        // The supervisor synthesizes the terminal event; the stream must
+        // yield it rather than block.
+        let mut saw_done = false;
+        for _ in 0..50 {
+            let evs = handle.next_events(&mut cursor).await;
+            if evs.iter().any(|e| e.is_terminal()) {
+                saw_done = true;
+                break;
+            }
+            if evs.is_empty() {
+                break;
+            }
+        }
+        assert!(saw_done, "panicking worker must reach a terminal event");
+        assert!(handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_without_terminal_event_is_finalized() {
+        // A worker that returns normally but forgets to emit a terminal
+        // event must still be finalized (issue #206).
+        let reg = JobRegistry::new();
+        let (id, _s, emitter) = reg.create("test.forgets").await;
+        emitter.clone().spawn_supervised(async move {
+            // emits a log but never a Done
+            emitter.info("did some work").await;
+        });
+        let handle = reg.get(&id).await.unwrap();
+        let mut cursor = 0;
+        let mut saw_done = false;
+        for _ in 0..50 {
+            let evs = handle.next_events(&mut cursor).await;
+            if evs.iter().any(|e| e.is_terminal()) {
+                saw_done = true;
+                break;
+            }
+            if evs.is_empty() && handle.is_finished() {
+                break;
+            }
+        }
+        assert!(saw_done, "a worker that forgets its Done is finalized");
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_that_emits_done_is_not_double_finalized() {
+        // A well-behaved worker's own terminal event must be the only one;
+        // the supervisor must not append a second Done.
+        let reg = JobRegistry::new();
+        let (id, _s, emitter) = reg.create("test.clean").await;
+        emitter.clone().spawn_supervised(async move {
+            emitter.emit(JobEvent::done(0)).await;
+        });
+        // Let the supervisor task observe completion.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let handle = reg.get(&id).await.unwrap();
+        let mut cursor = 0;
+        let evs = handle.next_events(&mut cursor).await;
+        let terminal_count = evs.iter().filter(|e| e.is_terminal()).count();
+        assert_eq!(terminal_count, 1, "exactly one terminal event");
+    }
 
     #[tokio::test]
     async fn emit_then_stream_replays_history() {

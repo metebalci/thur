@@ -25,9 +25,12 @@ axum = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `sync` for the process-global Mutex serializing iscsi-users.json
+# read-modify-write (issue #207).
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # Tempdir for the on-disk iscsi-users.json round-trip tests.
 tempfile = "3"
 # Multi-thread runtime + macros to drive the axum handlers in tests.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }

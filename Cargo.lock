@@ -4425,6 +4425,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64",
+ "blake3",
  "chrono",
  "password-hash",
  "serde",

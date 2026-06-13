@@ -32,6 +32,12 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 base64 = "0.22"
 subtle = "2"
 arc-swap = "1"
+# `rt` for spawn_blocking — moves the Argon2id verify off the async
+# runtime (issue #208).
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Digest of the last-good password for the verify cache (#208). blake3
+# is already the workspace's single hash (audit chain) — no new version.
+blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -23,9 +23,14 @@ use shared_admin_proto::JobEvent;
 use shared_naming::ProductIdentity;
 
 const WINDOW_60S: usize = 60;
-/// Ring-buffer capacity — 5 minutes' worth of 1 Hz ticks, which is the
-/// widest window the screen needs (audit events over 5 m).
-const RING_CAP: usize = 300;
+const WINDOW_5M: usize = 300;
+/// Ring-buffer capacity. The widest window the screen needs is the 5 m
+/// (300 s) audit delta; at ~1 Hz ticks a 300-entry ring spans only 299
+/// inter-tick seconds, so a 300 s baseline never reliably resolves and
+/// the audit line flaps between the windowed delta and the since-boot
+/// cumulative. Size past the widest window + a margin so the baseline
+/// always resolves once history fills (issue #209).
+const RING_CAP: usize = 360;
 
 pub async fn cmd_monitor(product: &'static ProductIdentity) -> Result<u8> {
     let client = AdminClient::auto_discover(product);
@@ -173,8 +178,16 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
     }
     out.push('\n');
 
-    // Audit line — 5 minutes of cumulative entries.
-    let baseline_5m = baseline_at_least(history, 300);
+    // Audit line — events over the last 5 minutes (delta against the
+    // snapshot ≥300 s old). Annotate while the ring doesn't yet cover the
+    // window, so the cumulative-since-boot fallback isn't mistaken for a
+    // 5 m count (issue #209).
+    let baseline_5m = baseline_at_least(history, WINDOW_5M);
+    let audit_note = if baseline_5m.is_none() {
+        format!(" ({}/{}s of history)", history_secs, WINDOW_5M)
+    } else {
+        String::new()
+    };
     let audit_delta = match baseline_5m {
         Some(base) => current
             .audit
@@ -182,7 +195,7 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
             .saturating_sub(base.audit.entries_total),
         None => current.audit.entries_total, // pre-window: show cumulative
     };
-    out.push_str(&format!("Audit (last 5m): {} events\n", audit_delta));
+    out.push_str(&format!("Audit (last 5m){}: {} events\n", audit_note, audit_delta));
 
     out
 }
@@ -193,8 +206,14 @@ fn render(history: &VecDeque<MonitorSnapshot>) -> String {
 /// header annotates "(N/Ms of history)".
 fn baseline_at_least(history: &VecDeque<MonitorSnapshot>, secs: usize) -> Option<&MonitorSnapshot> {
     let latest_ts = history.back()?.ts_unix;
+    // Search newest-first so the baseline is the MOST RECENT snapshot at
+    // least `secs` old. Searching oldest-first returned the oldest entry
+    // in the ring once history exceeded the window, widening a 60 s
+    // window to the whole ~300 s buffer and overstating rates up to ~5x
+    // (issue #209).
     history
         .iter()
+        .rev()
         .find(|s| latest_ts - s.ts_unix >= secs as i64)
 }
 
@@ -319,18 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn baseline_picks_first_old_enough_entry() {
+    fn baseline_picks_newest_old_enough_entry() {
         let mut h: VecDeque<MonitorSnapshot> = VecDeque::new();
         for ts in 0..120i64 {
             h.push_back(snap(ts, ts as u64));
         }
-        // Latest ts=119; baseline for 60s window is the first snapshot
-        // where 119 - ts >= 60, i.e. ts<=59.
+        // Latest ts=119; the 60 s baseline must be the NEWEST snapshot at
+        // least 60 s old (ts=59), not the oldest in the ring (ts=0).
+        // Picking the oldest would widen the "60s" window to ~120 s and
+        // overstate the displayed rate (issue #209).
         let base = baseline_at_least(&h, 60).unwrap();
-        assert!(base.ts_unix <= 59);
-        // Newer than the oldest possible — i.e. the search finds the
-        // *first* old-enough entry (FIFO order).
-        assert_eq!(base.ts_unix, 0);
+        assert_eq!(base.ts_unix, 59);
     }
 
     #[test]

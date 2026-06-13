@@ -22,6 +22,8 @@ pub mod stats;
 pub mod tiering;
 pub mod verify;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::state::DaemonState;
@@ -31,83 +33,59 @@ use shared_admin_server::JobEmitter;
 /// parsed inside each kind module so the input type can vary.
 /// Returns `Err(reason)` on a bad/unknown kind so the HTTP handler
 /// can return 400 before any job is registered.
+///
+/// Every worker runs under [`JobEmitter::spawn_supervised`] so a panic
+/// or early return without a terminal event still drives the job to a
+/// terminal state, instead of hanging the CLI stream forever and leaking
+/// the job past reap (issue #206).
 pub fn dispatch(
     kind: &str,
     body: serde_json::Value,
     emitter: JobEmitter,
     state: Arc<DaemonState>,
 ) -> Result<(), String> {
-    match kind {
+    let supervisor = emitter.clone();
+    let worker: Pin<Box<dyn Future<Output = ()> + Send>> = match kind {
         "system.storage_check" => {
             // Handler lifted to the shared crate so VSA mounts the same
             // job; the per-product input is just the storage config.
             let _ = body;
-            tokio::spawn(shared_admin_storage_check::run_storage_check(
+            Box::pin(shared_admin_storage_check::run_storage_check(
                 emitter,
                 Arc::clone(&state.storage_config),
-            ));
+            ))
         }
-        "system.verify" => {
-            tokio::spawn(verify::run(emitter, body, state));
-        }
-        "system.stats" => {
-            tokio::spawn(stats::run(emitter, body, state));
-        }
-        "system.gc" => {
-            tokio::spawn(gc::run(emitter, body, state));
-        }
-        "system.tiering.plan" => {
-            tokio::spawn(tiering::run(emitter, body, state));
-        }
-        "system.tiering.run" => {
-            tokio::spawn(tiering::run_apply(emitter, body, state));
-        }
-        "system.audit.tail" => {
-            tokio::spawn(shared_admin_audit::run_tail(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-        }
-        "system.audit.export" => {
-            tokio::spawn(shared_admin_audit::run_export(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-        }
-        "system.audit.verify" => {
-            tokio::spawn(shared_admin_audit::run_verify(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-        }
-        "system.audit.rotate" => {
-            tokio::spawn(shared_admin_audit::run_rotate(
-                emitter,
-                body,
-                state.audit_dir.clone(),
-            ));
-        }
-        "system.alerting.test" => {
-            tokio::spawn(alerting::run(emitter, body, state));
-        }
-        "system.library.self_test" => {
-            tokio::spawn(self_test::run_library(emitter, body, state));
-        }
-        "system.drive.self_test" => {
-            tokio::spawn(self_test::run_drive(emitter, body, state));
-        }
-        "cartridge.migrate" => {
-            tokio::spawn(migrate::run(emitter, body, state));
-        }
-        "cartridge.archive" => {
-            tokio::spawn(archive::run(emitter, body, state));
-        }
-        "library.restore_archive" => {
-            tokio::spawn(restore_archive::run(emitter, body, state));
-        }
+        "system.verify" => Box::pin(verify::run(emitter, body, state)),
+        "system.stats" => Box::pin(stats::run(emitter, body, state)),
+        "system.gc" => Box::pin(gc::run(emitter, body, state)),
+        "system.tiering.plan" => Box::pin(tiering::run(emitter, body, state)),
+        "system.tiering.run" => Box::pin(tiering::run_apply(emitter, body, state)),
+        "system.audit.tail" => Box::pin(shared_admin_audit::run_tail(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.export" => Box::pin(shared_admin_audit::run_export(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.verify" => Box::pin(shared_admin_audit::run_verify(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.audit.rotate" => Box::pin(shared_admin_audit::run_rotate(
+            emitter,
+            body,
+            state.audit_dir.clone(),
+        )),
+        "system.alerting.test" => Box::pin(alerting::run(emitter, body, state)),
+        "system.library.self_test" => Box::pin(self_test::run_library(emitter, body, state)),
+        "system.drive.self_test" => Box::pin(self_test::run_drive(emitter, body, state)),
+        "cartridge.migrate" => Box::pin(migrate::run(emitter, body, state)),
+        "cartridge.archive" => Box::pin(archive::run(emitter, body, state)),
+        "library.restore_archive" => Box::pin(restore_archive::run(emitter, body, state)),
         "system.monitor" => {
             // The shared handler is generic over a `MonitorState` impl;
             // `AdminState` (which wraps the same `Arc<DaemonState>` we
@@ -115,14 +93,11 @@ pub fn dispatch(
             // it here keeps `shared-admin-monitor` from depending on
             // VTL's daemon crate.
             let admin_state = crate::admin::handlers::AdminState { daemon: state };
-            tokio::spawn(shared_admin_monitor::run_monitor(
-                emitter,
-                body,
-                admin_state,
-            ));
+            Box::pin(shared_admin_monitor::run_monitor(emitter, body, admin_state))
         }
         other => return Err(format!("unknown job kind: {}", other)),
-    }
+    };
+    supervisor.spawn_supervised(worker);
     Ok(())
 }
 

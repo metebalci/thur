@@ -17,7 +17,7 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.7"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 serde = { version = "1", features = ["derive"] }
