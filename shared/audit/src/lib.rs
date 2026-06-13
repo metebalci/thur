@@ -31,7 +31,8 @@ pub mod audit_ratelimit;
 pub use audit::{
     AuditActor, AuditConfig, AuditEntry, AuditError, AuditLog, AuditMode, AuditResult,
     AuditTailCursor, CHAIN_STATE_FILE, GENESIS_PREV_HASH, PENDING_AUDIT_DIR, PendingAuditEntry,
-    VerifyReport, compute_entry_hash, queue_pending, read_entries, tail_step, verify_chain,
+    VerifyReport, compute_entry_hash, queue_pending, read_entries, read_entries_tail, tail_step,
+    verify_chain,
 };
 pub use audit_channel::{
     AUDIT_CHANNEL_CAPACITY, AppendFailureHook, AuditChannel, AuditWriterHandle,

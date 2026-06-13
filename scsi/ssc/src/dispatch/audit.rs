@@ -28,10 +28,17 @@ pub fn audit_append(
     params: serde_json::Value,
     result: AuditResult,
 ) {
-    if let Some(key) = ratelimit_key_for(op, &actor, &params)
-        && matches!(rl.decide(key, op, &actor), AuditRateLimitDecision::Suppress)
-    {
-        return;
+    if let Some(key) = ratelimit_key_for(op, &actor, &params) {
+        let (decision, displaced) = rl.decide(key, op, &actor);
+        // A window that expired mid-flood hands back the prior window's
+        // suppressed count here so it isn't lost before the flush task
+        // runs (issue #202); emit it alongside this event.
+        if let (Some(chan), Some(rollup)) = (audit_log.as_ref(), displaced) {
+            chan.append_rollup(&rollup);
+        }
+        if matches!(decision, AuditRateLimitDecision::Suppress) {
+            return;
+        }
     }
     if let Some(chan) = audit_log.as_ref() {
         chan.try_append(op, actor, params, result);

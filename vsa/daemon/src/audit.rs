@@ -180,10 +180,12 @@ impl LoginAuditSink for IscsiDiskLoginAudit {
                 // rollup. Caps a brute-force from flooding the chain.
                 let user_label = user.unwrap_or("-");
                 let key = format!("iscsi.chap.failure:{peer}:{user_label}:{reason}");
-                if matches!(
-                    self.ratelimiter.decide(key, "iscsi.chap.failure", &actor),
-                    AuditRateLimitDecision::Suppress
-                ) {
+                let (decision, displaced) =
+                    self.ratelimiter.decide(key, "iscsi.chap.failure", &actor);
+                if let Some(rollup) = displaced {
+                    self.channel.append_rollup(&rollup);
+                }
+                if matches!(decision, AuditRateLimitDecision::Suppress) {
                     return;
                 }
                 self.channel.try_append(
@@ -258,11 +260,12 @@ impl nvme_tcp::LoginAuditSink for NvmetcpLoginAudit {
                 // Rate-limit the chain row the same way the iSCSI sink
                 // does — keyed by (peer, host_nqn, reason).
                 let key = format!("nvmetcp.dhchap.failure:{peer}:{host_nqn}:{reason}");
-                if matches!(
-                    self.ratelimiter
-                        .decide(key, "nvmetcp.dhchap.failure", &actor),
-                    AuditRateLimitDecision::Suppress
-                ) {
+                let (decision, displaced) =
+                    self.ratelimiter.decide(key, "nvmetcp.dhchap.failure", &actor);
+                if let Some(rollup) = displaced {
+                    self.channel.append_rollup(&rollup);
+                }
+                if matches!(decision, AuditRateLimitDecision::Suppress) {
                     return;
                 }
                 self.channel.try_append(

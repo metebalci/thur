@@ -200,16 +200,32 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let inner = Arc::clone(&self.inner);
         let key_owned = key.to_string();
         let data_owned = data.to_vec();
+        let name = self.name.clone();
         let upload_fut = async move {
-            inner
-                .upload_chunk(&key_owned, &data_owned)
-                .await
-                .map(|(uncompressed, compressed, algo)| UploadOutcome {
-                    uncompressed,
-                    compressed,
-                    algo,
-                })
-                .map_err(Arc::new)
+            // Record one storage PUT per actual backend call (the
+            // singleflight runs the inner upload once; joiners await the
+            // shared future and don't double-count) — issue #204.
+            let started = std::time::Instant::now();
+            let res = inner.upload_chunk(&key_owned, &data_owned).await;
+            let secs = started.elapsed().as_secs_f64();
+            match &res {
+                Ok((unc, comp, _)) => shared_telemetry::record::storage_request(
+                    &name,
+                    "put",
+                    "ok",
+                    comp.unwrap_or(*unc),
+                    secs,
+                ),
+                Err(_) => {
+                    shared_telemetry::record::storage_request(&name, "put", "error", 0, secs)
+                }
+            }
+            res.map(|(uncompressed, compressed, algo)| UploadOutcome {
+                uncompressed,
+                compressed,
+                algo,
+            })
+            .map_err(Arc::new)
         };
         let shared: Shared<
             BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
@@ -326,16 +342,25 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         let inner = Arc::clone(&self.inner);
         let key_owned = key.to_string();
         let path_owned = file_path.to_path_buf();
+        let name = self.name.clone();
         let upload_fut = async move {
-            inner
-                .upload_chunk_zerocopy(&key_owned, &path_owned)
-                .await
-                .map(|size| UploadOutcome {
-                    uncompressed: size,
-                    compressed: None,
-                    algo: None,
-                })
-                .map_err(Arc::new)
+            let started = std::time::Instant::now();
+            let res = inner.upload_chunk_zerocopy(&key_owned, &path_owned).await;
+            let secs = started.elapsed().as_secs_f64();
+            match &res {
+                Ok(size) => {
+                    shared_telemetry::record::storage_request(&name, "put", "ok", *size, secs)
+                }
+                Err(_) => {
+                    shared_telemetry::record::storage_request(&name, "put", "error", 0, secs)
+                }
+            }
+            res.map(|size| UploadOutcome {
+                uncompressed: size,
+                compressed: None,
+                algo: None,
+            })
+            .map_err(Arc::new)
         };
         let shared: Shared<
             BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
@@ -391,7 +416,18 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
     }
 
     async fn download_chunk(&self, key: &str) -> Result<Vec<u8>> {
-        self.inner.download_chunk(key).await
+        // Every download is a real backend GET (no read caching) — record
+        // it (issue #204).
+        let started = std::time::Instant::now();
+        let res = self.inner.download_chunk(key).await;
+        let secs = started.elapsed().as_secs_f64();
+        match &res {
+            Ok(d) => {
+                shared_telemetry::record::storage_request(&self.name, "get", "ok", d.len() as u64, secs)
+            }
+            Err(_) => shared_telemetry::record::storage_request(&self.name, "get", "error", 0, secs),
+        }
+        res
     }
 
     async fn download_chunks_parallel(&self, keys: &[String]) -> Result<Vec<Vec<u8>>> {
@@ -463,7 +499,14 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         // we must not cache the (now stale) positive result, or a later
         // content-addressed write would skip its PUT and lose data.
         let probe_epoch = self.epoch.load(Ordering::SeqCst);
-        let exists = self.inner.chunk_exists(key).await?;
+        // This path is a real backend HEAD (cache hits returned above) —
+        // record it (issue #204).
+        let started = std::time::Instant::now();
+        let head = self.inner.chunk_exists(key).await;
+        let secs = started.elapsed().as_secs_f64();
+        let outcome = if head.is_ok() { "ok" } else { "error" };
+        shared_telemetry::record::storage_request(&self.name, "head", outcome, 0, secs);
+        let exists = head?;
         if exists {
             let mut map = self.known.lock().expect("cache mutex poisoned");
             // Don't overwrite an existing InFlight / Uploaded fact; only
@@ -508,7 +551,12 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
-        self.inner.delete_object(key).await?;
+        let started = std::time::Instant::now();
+        let res = self.inner.delete_object(key).await;
+        let secs = started.elapsed().as_secs_f64();
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        shared_telemetry::record::storage_request(&self.name, "delete", outcome, 0, secs);
+        res?;
         let mut map = self.known.lock().expect("cache mutex poisoned");
         // Bump the epoch under the lock so any HEAD/PUT that snapshotted
         // before this delete can't reinstall the now-deleted object as

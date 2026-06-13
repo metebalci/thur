@@ -78,9 +78,19 @@ impl AuditRateLimiter {
     /// [`Decision::Emit`]; further calls within the window return
     /// [`Decision::Suppress`] until [`flush_expired`] drains the
     /// window.
-    pub fn decide(&self, key: String, op: &str, actor: &AuditActor) -> Decision {
+    ///
+    /// The second element is a *displaced* rollup: when a fresh event
+    /// arrives after the window expired but before the flush task drained
+    /// it, the prior window's suppressed count would otherwise be reset
+    /// to zero and lost. Under a steady flood — exactly when the rollup
+    /// matters most — the next event almost always beats the 10 s flush
+    /// tick, so that loss is the common case, not flush-task starvation
+    /// (issue #202). The caller MUST emit this rollup (via
+    /// [`AuditChannel::append_rollup`](crate::AuditChannel::append_rollup))
+    /// in addition to acting on the [`Decision`].
+    pub fn decide(&self, key: String, op: &str, actor: &AuditActor) -> (Decision, Option<Rollup>) {
         let Ok(mut map) = self.inner.lock() else {
-            return Decision::Emit;
+            return (Decision::Emit, None);
         };
         let now = Instant::now();
         match map.get_mut(&key) {
@@ -94,24 +104,29 @@ impl AuditRateLimiter {
                         actor: actor.clone(),
                     },
                 );
-                Decision::Emit
+                (Decision::Emit, None)
             }
             Some(w) if now.duration_since(w.first_seen) >= self.window => {
                 // Window expired but the flush task hasn't run yet.
-                // Drop the prior counter (no rollup emitted from this
-                // path — that's the flusher's job) and treat this
-                // event as the start of a new window. With a flush
-                // cadence shorter than the window this branch only
-                // fires under flush-task starvation.
+                // Capture the prior window's suppressed count as a
+                // displaced rollup so it isn't lost when we re-arm the
+                // window for this event (issue #202).
+                let displaced = (w.suppressed > 0).then(|| Rollup {
+                    op: w.op.clone(),
+                    actor: w.actor.clone(),
+                    key: key.clone(),
+                    suppressed_count: w.suppressed,
+                    window_seconds: self.window.as_secs(),
+                });
                 w.first_seen = now;
                 w.suppressed = 0;
                 w.op = op.to_string();
                 w.actor = actor.clone();
-                Decision::Emit
+                (Decision::Emit, displaced)
             }
             Some(w) => {
                 w.suppressed = w.suppressed.saturating_add(1);
-                Decision::Suppress
+                (Decision::Suppress, None)
             }
         }
     }
@@ -172,7 +187,7 @@ mod tests {
     fn first_event_emits() {
         let rl = AuditRateLimiter::new(Duration::from_secs(60));
         assert_eq!(
-            rl.decide("k".into(), "iscsi.chap.failure", &actor()),
+            rl.decide("k".into(), "iscsi.chap.failure", &actor()).0,
             Decision::Emit
         );
     }
@@ -182,7 +197,7 @@ mod tests {
         let rl = AuditRateLimiter::new(Duration::from_secs(60));
         let _ = rl.decide("k".into(), "iscsi.chap.failure", &actor());
         assert_eq!(
-            rl.decide("k".into(), "iscsi.chap.failure", &actor()),
+            rl.decide("k".into(), "iscsi.chap.failure", &actor()).0,
             Decision::Suppress
         );
     }
@@ -190,8 +205,29 @@ mod tests {
     #[test]
     fn different_keys_are_independent() {
         let rl = AuditRateLimiter::new(Duration::from_secs(60));
-        assert_eq!(rl.decide("a".into(), "op", &actor()), Decision::Emit);
-        assert_eq!(rl.decide("b".into(), "op", &actor()), Decision::Emit);
+        assert_eq!(rl.decide("a".into(), "op", &actor()).0, Decision::Emit);
+        assert_eq!(rl.decide("b".into(), "op", &actor()).0, Decision::Emit);
+    }
+
+    #[test]
+    fn expired_window_with_suppressions_returns_displaced_rollup() {
+        // Issue #202: a fresh event arriving after window expiry but
+        // before flush must carry the prior window's suppressed count out
+        // as a displaced rollup, not silently zero it.
+        let rl = AuditRateLimiter::new(Duration::from_millis(20));
+        let _ = rl.decide("k".into(), "op", &actor()); // emit, opens window
+        for _ in 0..4 {
+            let _ = rl.decide("k".into(), "op", &actor()); // suppressed x4
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        let (decision, rollup) = rl.decide("k".into(), "op", &actor());
+        assert_eq!(decision, Decision::Emit);
+        let rollup = rollup.expect("displaced rollup must be returned");
+        assert_eq!(rollup.suppressed_count, 4);
+        assert_eq!(rollup.key, "k");
+        // The flusher must not re-emit it (count was moved out).
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(rl.flush_expired().is_empty());
     }
 
     #[test]
@@ -240,7 +276,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         // Flush task hasn't run yet — but `decide` past the window
         // boundary should emit again, not silently suppress.
-        assert_eq!(rl.decide("k".into(), "op", &actor()), Decision::Emit);
+        assert_eq!(rl.decide("k".into(), "op", &actor()).0, Decision::Emit);
     }
 
     #[test]

@@ -668,7 +668,18 @@ impl AuditLog {
         // to a logged warning so the append path can persist its
         // chain-state advance and the operator can re-run compression
         // out-of-band (or the next rollover does it).
+        // Skip an already-compressed file: chain.state can legitimately
+        // point at the `.jsonl.zst` (an ENOSPC or crash between
+        // rollover-compress and the new day's first chain-state write
+        // leaves last_file resolving to the `.zst`). Re-compressing it
+        // would produce `audit-…jsonl.zst.zst`, which list_audit_files /
+        // parse_date no longer match — hiding that day from verify /
+        // export / tail and breaking the chain (issue #200).
+        let already_compressed = old_file
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"));
         if self.config.compress_rotated
+            && !already_compressed
             && old_file.exists()
             && let Err(e) = compress_file_zstd(&old_file)
         {
@@ -1127,6 +1138,35 @@ pub fn read_entries(
     Ok(out)
 }
 
+/// Read the most recent `n` entries without parsing the whole chain.
+///
+/// Iterates audit files newest-first and stops as soon as `n` entries are
+/// gathered — today's file alone almost always suffices. The previous
+/// `read_entries(dir, None, None)` then keep-last-N pattern read,
+/// zstd-decompressed and JSON-parsed every retained file from genesis on
+/// every tail request, an O(total chain) cost on an endpoint that is
+/// unauthenticated by default (issue #201).
+pub fn read_entries_tail(dir: &Path, n: usize) -> Result<Vec<AuditEntry>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut files = list_audit_files(dir)?;
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest date first
+    let mut collected: Vec<AuditEntry> = Vec::new();
+    for (_date, path) in files {
+        // Read this (older than what we have) file and prepend it so the
+        // final order stays oldest -> newest.
+        let mut es = read_all_entries(&path)?;
+        es.append(&mut collected);
+        collected = es;
+        if collected.len() >= n {
+            break;
+        }
+    }
+    let start = collected.len().saturating_sub(n);
+    Ok(collected.split_off(start))
+}
+
 /// Streaming tail cursor for `audit tail --follow`. Tracks today's
 /// active audit file and a byte offset so each poll only reads bytes
 /// appended since the last call — instead of re-parsing every JSONL
@@ -1248,6 +1288,16 @@ pub fn compute_entry_hash(entry: &AuditEntry) -> String {
 }
 
 fn compress_file_zstd(file: &Path) -> Result<()> {
+    // Refuse to re-compress an already-compressed file: `*.jsonl.zst` ->
+    // `*.jsonl.zst.zst` would silently drop that day from the listed,
+    // verifiable chain (issue #200). Defense in depth behind the
+    // rollover skip.
+    if file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+    {
+        return Ok(());
+    }
     let raw = fs::read(file)?;
     let compressed = zstd::encode_all(&raw[..], 3).map_err(|e| AuditError::Zstd(e.to_string()))?;
     let zpath = PathBuf::from(format!("{}.zst", file.display()));
@@ -1437,6 +1487,27 @@ mod tests {
             listed[0].1.to_string_lossy().ends_with(".zst"),
             "the .zst variant is preferred"
         );
+    }
+
+    #[test]
+    fn compress_refuses_already_compressed_file() {
+        // Issue #200: compressing an already-`.zst` file must be a no-op,
+        // never producing `*.jsonl.zst.zst` (which list_audit_files /
+        // parse_date can't match — hiding the day and breaking the chain).
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().date_naive();
+        let jsonl = tmp.path().join(filename_for(today));
+        fs::write(&jsonl, b"{\"seq\":1}\n").unwrap();
+        compress_file_zstd(&jsonl).unwrap();
+        let zst = tmp.path().join(format!("{}.zst", filename_for(today)));
+        assert!(zst.exists());
+        // Re-compressing the .zst is a no-op.
+        compress_file_zstd(&zst).unwrap();
+        let double = tmp.path().join(format!("{}.zst.zst", filename_for(today)));
+        assert!(!double.exists(), "must not produce a .zst.zst");
+        assert!(zst.exists(), ".zst left intact");
+        let listed = list_audit_files(tmp.path()).unwrap();
+        assert_eq!(listed.len(), 1, "the day is still listed");
     }
 
     #[test]

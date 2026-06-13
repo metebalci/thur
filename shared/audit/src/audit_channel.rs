@@ -117,6 +117,29 @@ impl AuditChannel {
             }
         }
     }
+
+    /// Append one rate-limiter rollup entry, formatted identically
+    /// wherever a [`Rollup`](crate::audit_ratelimit::Rollup) is emitted —
+    /// the periodic flush task, daemon shutdown drain, and the inline
+    /// emission `decide` returns when a window expires mid-flood
+    /// (issue #202). Best-effort, like [`Self::try_append`].
+    pub fn append_rollup(&self, rollup: &crate::audit_ratelimit::Rollup) {
+        let params = serde_json::json!({
+            "suppressed_count": rollup.suppressed_count,
+            "window_seconds": rollup.window_seconds,
+            "key": rollup.key,
+        });
+        let detail = format!(
+            "{} additional event(s) suppressed in {}s window",
+            rollup.suppressed_count, rollup.window_seconds
+        );
+        self.try_append(
+            &rollup.op,
+            rollup.actor.clone(),
+            params,
+            AuditResult::Error(detail),
+        );
+    }
 }
 
 /// Shutdown handle for the writer task. Held by the daemon's main

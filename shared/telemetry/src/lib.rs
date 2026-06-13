@@ -571,14 +571,17 @@ impl Telemetry {
     /// flushed through `VolumeWriter::write_page` before drop —
     /// pathological-pressure tail; if this counter grows non-trivially
     /// relative to host writes the cache budget is undersized).
-    pub fn cache_inc_eviction(&self, volume: &str, outcome: &str) {
-        self.inner.cache_evictions_total.add(
-            1,
-            &[
-                KeyValue::new("volume", volume.to_string()),
-                KeyValue::new("outcome", outcome.to_string()),
-            ],
-        );
+    pub fn cache_inc_eviction(&self, _volume: &str, outcome: &str) {
+        // Label by outcome only, not per-volume: a per-volume label is
+        // unbounded over the deployment's life (every volume ever opened
+        // leaves a permanent series, and >2000 distinct volumes overflow
+        // the OTel SDK cardinality cap into a meaningless overflow
+        // series). Aggregate eviction rate by outcome is the bounded,
+        // dashboard-useful signal (issue #205). `_volume` is retained in
+        // the signature for call-site clarity.
+        self.inner
+            .cache_evictions_total
+            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
     }
 
     /// Record a cache miss whose chunk had been recently evicted from
@@ -814,16 +817,20 @@ impl Telemetry {
     }
 
     /// Per-cartridge memory-buffer fill (write side).
-    pub fn tape_set_write_buffer(&self, cartridge: &str, bytes: u64) {
-        self.inner
-            .tape_write_buffer_used_bytes
-            .record(bytes, &[KeyValue::new("cartridge", cartridge.to_string())]);
+    /// Library-wide write-buffer usage. Records the aggregate total
+    /// across all loaded cartridges with no per-cartridge label: a
+    /// per-cartridge gauge is unbounded (every cartridge ever loaded
+    /// leaves a permanent stale-valued series, and >2000 distinct
+    /// cartridges overflow the OTel SDK cardinality cap), so the caller
+    /// passes the running total instead (issue #205).
+    pub fn tape_set_write_buffer(&self, total_bytes: u64) {
+        self.inner.tape_write_buffer_used_bytes.record(total_bytes, &[]);
     }
 
-    pub fn tape_set_read_buffer(&self, cartridge: &str, bytes: u64) {
-        self.inner
-            .tape_read_buffer_used_bytes
-            .record(bytes, &[KeyValue::new("cartridge", cartridge.to_string())]);
+    /// Library-wide read-buffer usage. Aggregate, no per-cartridge label
+    /// (issue #205).
+    pub fn tape_set_read_buffer(&self, total_bytes: u64) {
+        self.inner.tape_read_buffer_used_bytes.record(total_bytes, &[]);
     }
 
     pub fn prefetch_set_queue_depth(&self, n: i64) {
@@ -1404,18 +1411,20 @@ pub mod record {
             t.prefetch_inc_miss();
         }
     }
-    /// Per-cartridge read-prefetch buffer occupancy (bytes of look-ahead
-    /// chunks already warmed into the local pool).
-    pub fn tape_read_buffer_used(cartridge: &str, bytes: u64) {
+    /// Library-wide read-prefetch buffer occupancy (aggregate bytes of
+    /// look-ahead chunks warmed into the local pool across all
+    /// cartridges) — issue #205.
+    pub fn tape_read_buffer_used(total_bytes: u64) {
         if let Some(t) = global() {
-            t.tape_set_read_buffer(cartridge, bytes);
+            t.tape_set_read_buffer(total_bytes);
         }
     }
-    /// Per-cartridge write-staging buffer occupancy (bytes buffered for
-    /// upload but not yet dispatched).
-    pub fn tape_write_buffer_used(cartridge: &str, bytes: u64) {
+    /// Library-wide write-staging buffer occupancy (aggregate bytes
+    /// buffered for upload but not yet dispatched across all cartridges)
+    /// — issue #205.
+    pub fn tape_write_buffer_used(total_bytes: u64) {
         if let Some(t) = global() {
-            t.tape_set_write_buffer(cartridge, bytes);
+            t.tape_set_write_buffer(total_bytes);
         }
     }
     pub fn iscsi_sessions_active(n: i64) {

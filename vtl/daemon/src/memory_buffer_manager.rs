@@ -114,6 +114,12 @@ pub struct MemoryBufferManager {
     event_rx: broadcast::Receiver<TapeEvent>,
     /// Per-tape buffer state
     tapes: HashMap<String, TapeBufferState>,
+    /// Running sum of `write_buffer_usage` across all tapes. Reported as
+    /// the library-wide `tape_write_buffer_used` gauge instead of one
+    /// series per cartridge, which is unbounded over the library's life
+    /// and overflows the OTel cardinality cap past ~2000 cartridges
+    /// (issue #205).
+    total_write_buffer_usage: u64,
     /// Default write buffer limit per tape
     write_buffer_limit: u64,
     /// Default read buffer limit per tape
@@ -145,6 +151,7 @@ impl MemoryBufferManager {
         Self {
             event_rx,
             tapes: HashMap::new(),
+            total_write_buffer_usage: 0,
             write_buffer_limit,
             read_buffer_limit,
             upload_tx,
@@ -272,14 +279,20 @@ impl MemoryBufferManager {
         // upload pipeline owns chunk durability via `chunks.idx`.
         // Leaving them populated would carry stale accounting into the
         // next load.
-        if let Some(tape) = self.tapes.get_mut(tape_id) {
+        let cleared = if let Some(tape) = self.tapes.get_mut(tape_id) {
+            let cleared = tape.write_buffer_usage;
             tape.write_buffer_usage = 0;
             tape.pending_uploads.clear();
             tape.chunk_bytes.clear();
             tape.read_buffer_usage = 0;
             tape.prefetched_chunks.clear();
             tape.last_read_chunk = None;
-        }
+            cleared
+        } else {
+            0
+        };
+        self.total_write_buffer_usage = self.total_write_buffer_usage.saturating_sub(cleared);
+        shared_telemetry::record::tape_write_buffer_used(self.total_write_buffer_usage);
         self.publish_upload_queue_depth();
     }
 
@@ -294,7 +307,6 @@ impl MemoryBufferManager {
 
             // Update write buffer usage
             tape.write_buffer_usage += size;
-            shared_telemetry::record::tape_write_buffer_used(tape_id, tape.write_buffer_usage);
             *tape.chunk_bytes.entry(chunk_id).or_insert(0) += size;
             tape.head_position = lba + 1; // Advance head
 
@@ -316,6 +328,8 @@ impl MemoryBufferManager {
                 None
             }
         };
+        self.total_write_buffer_usage += size;
+        shared_telemetry::record::tape_write_buffer_used(self.total_write_buffer_usage);
         self.publish_upload_queue_depth();
 
         if let Some((usage, limit, pending)) = warn_payload {
@@ -505,24 +519,31 @@ impl MemoryBufferManager {
     /// the per-tape write-buffer accounting by its byte total. Called
     /// only after the request was accepted by the upload worker.
     fn commit_upload_dispatch(&mut self, tape_id: &str, chunk_ids: &[u32]) {
-        let Some(tape) = self.tapes.get_mut(tape_id) else {
-            return;
-        };
-        let mut dispatched_bytes: u64 = 0;
-        for cid in chunk_ids {
-            tape.pending_uploads.remove(cid);
-            if let Some(b) = tape.chunk_bytes.remove(cid) {
-                dispatched_bytes = dispatched_bytes.saturating_add(b);
+        let (dispatched_bytes, decrease, new_usage) = {
+            let Some(tape) = self.tapes.get_mut(tape_id) else {
+                return;
+            };
+            let mut dispatched_bytes: u64 = 0;
+            for cid in chunk_ids {
+                tape.pending_uploads.remove(cid);
+                if let Some(b) = tape.chunk_bytes.remove(cid) {
+                    dispatched_bytes = dispatched_bytes.saturating_add(b);
+                }
             }
-        }
-        tape.write_buffer_usage = tape.write_buffer_usage.saturating_sub(dispatched_bytes);
-        shared_telemetry::record::tape_write_buffer_used(tape_id, tape.write_buffer_usage);
+            let before = tape.write_buffer_usage;
+            tape.write_buffer_usage = before.saturating_sub(dispatched_bytes);
+            // The library-wide total must move by the actual decrease,
+            // which `saturating_sub` may clamp below `dispatched_bytes`.
+            (dispatched_bytes, before - tape.write_buffer_usage, tape.write_buffer_usage)
+        };
+        self.total_write_buffer_usage = self.total_write_buffer_usage.saturating_sub(decrease);
+        shared_telemetry::record::tape_write_buffer_used(self.total_write_buffer_usage);
         info!(
-            "Dispatched upload batch for {}: {} chunks ({} bytes), write_buffer_usage now {}",
+            "Dispatched upload batch for {}: {} chunks ({} bytes), per-tape write_buffer_usage now {}",
             tape_id,
             chunk_ids.len(),
             dispatched_bytes,
-            tape.write_buffer_usage,
+            new_usage,
         );
         self.publish_upload_queue_depth();
     }

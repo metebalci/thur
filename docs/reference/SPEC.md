@@ -2213,7 +2213,7 @@ usual `_bucket` / `_sum` / `_count` series.
 | pool | `pool_evictions_total` | Counter<u64> | — | `backend` |
 | pool | `pool_backpressure_waits_total` | Counter<u64> | — | `backend` |
 | pool | `pool_backpressure_wait` | Histogram<f64> | s | `backend` |
-| cache | `cache_evictions_total` | Counter<u64> | — | `volume`, `outcome` (VSA only) |
+| cache | `cache_evictions_total` | Counter<u64> | — | `outcome` (VSA only; labelled by outcome only — a per-volume label is unbounded over the deployment's life and overflows the OTel cardinality cap) |
 | cache | `cache_miss_after_eviction_seconds` | Histogram<f64> | s | `backend` (explicit log-uniform buckets: 1, 2, 4, 8, 16, 32, 64, 128, 256, +Inf) |
 | scsi_xcopy | `scsi_xcopy_total` | Counter<u64> | — | `outcome` ∈ {`success`,`reject`,`error`} (VSA only) |
 | scsi_xcopy | `scsi_xcopy_copied_bytes_total` | Counter<u64> | By | `path` ∈ {`fast`,`slow`} (VSA only) |
@@ -2221,8 +2221,8 @@ usual `_bucket` / `_sum` / `_count` series.
 | storage | `storage_requests_total` | Counter<u64> | — | `backend`, `op`, `outcome` |
 | storage | `storage_request` | Histogram<f64> | s | `backend`, `op`, `outcome` |
 | storage | `storage_transferred` | Counter<u64> | By | `backend`, `op`, `outcome` |
-| storage | `storage_retries_total` | Counter<u64> | — | `backend`, `class` |
-| storage | `storage_permanent_errors_total` | Counter<u64> | — | `backend`, `class` |
+| storage | `storage_retries_total` | Counter<u64> | — | `backend`, `class` (reserved — instrument exists but not yet wired; the retry loop lacks the per-backend name) |
+| storage | `storage_permanent_errors_total` | Counter<u64> | — | `backend`, `class` (reserved — not yet wired, same reason) |
 | chunk | `chunk_seals_total` | Counter<u64> | — | `backend`, `scope` |
 | chunk | `chunk_dedup_hits_total` | Counter<u64> | — | `backend`, `scope` |
 | chunk | `chunk_logical` | Counter<u64> | By | `backend`, `scope` |
@@ -2236,12 +2236,12 @@ usual `_bucket` / `_sum` / `_count` series.
 | chunk | `chunk_upload_stranded_total` | Counter<u64> | — | `backend`, `reason` |
 | upload | `upload_queue_depth` | Gauge<i64> | — | — |
 | iscsi | `iscsi_sessions_active` | Gauge<i64> | — | — |
-| iscsi | `iscsi_commands_total` | Counter<u64> | — | `opcode`, `outcome` |
-| iscsi | `iscsi_command` | Histogram<f64> | s | `opcode`, `outcome` |
-| iscsi | `iscsi_data_in` | Counter<u64> | By | — |
-| iscsi | `iscsi_data_out` | Counter<u64> | By | — |
-| tape | `tape_write_buffer_used` | Gauge<u64> | By | `cartridge` |
-| tape | `tape_read_buffer_used` | Gauge<u64> | By | `cartridge` |
+| iscsi | `iscsi_commands_total` | Counter<u64> | — | `opcode`, `outcome` (reserved — instrument exists but not yet wired in the command loop) |
+| iscsi | `iscsi_command` | Histogram<f64> | s | `opcode`, `outcome` (reserved — not yet wired) |
+| iscsi | `iscsi_data_in` | Counter<u64> | By | — (reserved — not yet wired) |
+| iscsi | `iscsi_data_out` | Counter<u64> | By | — (reserved — not yet wired) |
+| tape | `tape_write_buffer_used` | Gauge<u64> | By | — (library-wide aggregate; no per-cartridge label — cardinality bound, issue #205) |
+| tape | `tape_read_buffer_used` | Gauge<u64> | By | — (library-wide aggregate; no per-cartridge label) |
 | prefetch | `prefetch_queue_depth` | Gauge<i64> | — | — |
 | prefetch | `prefetch_hits_total` | Counter<u64> | — | — |
 | prefetch | `prefetch_misses_total` | Counter<u64> | — | — |
@@ -2295,10 +2295,14 @@ the reads that had to wait on a storage download — then fans the following
 `PrefetchManager` so a sequential restore doesn't stall chunk-by-chunk.
 `prefetch_queue_depth` is the absolute count of in-flight background
 prefetch tasks, pushed after each trigger. `tape_read_buffer_used` is the
-per-cartridge sum of look-ahead chunk bytes already warmed into the local
-pool ahead of the head; `tape_write_buffer_used` is the per-cartridge
-write-staging bytes buffered for upload but not yet dispatched, pushed by
-the `MemoryBufferManager` as chunks seal and as upload batches dispatch.
+look-ahead chunk bytes already warmed into the local pool ahead of the
+head; `tape_write_buffer_used` is the write-staging bytes buffered for
+upload but not yet dispatched, pushed by the `MemoryBufferManager` as
+chunks seal and as upload batches dispatch. Both are library-wide
+aggregates with no per-cartridge label — a per-cartridge label is
+unbounded over the library's life and overflows the OTel SDK's
+2000-attribute-set cardinality cap on a many-cartridge chassis
+(issue #205).
 
 ### Process-global handle
 

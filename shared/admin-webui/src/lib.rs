@@ -116,10 +116,11 @@ fn default_lines() -> usize {
 }
 
 /// `GET /api/v1/audit/tail?lines=N` — the last N entries of the
-/// BLAKE3-chained audit log. Uses the synchronous
-/// [`shared_audit::read_entries`] off the runtime on a blocking thread.
-/// This is the one-shot "last N" read, not the streaming `audit tail`
-/// job.
+/// BLAKE3-chained audit log. Uses the bounded
+/// [`shared_audit::read_entries_tail`] off the runtime on a blocking
+/// thread, so a remote client can't force a full-chain
+/// decompress+parse on this open-by-default endpoint (issue #201). This
+/// is the one-shot "last N" read, not the streaming `audit tail` job.
 pub async fn audit_tail_handler<S: AuditLogDir>(
     State(state): State<S>,
     Query(q): Query<AuditTailQuery>,
@@ -127,11 +128,9 @@ pub async fn audit_tail_handler<S: AuditLogDir>(
     let dir = state.audit_log_dir();
     let lines = q.lines.clamp(1, 1000);
     let read =
-        tokio::task::spawn_blocking(move || shared_audit::read_entries(&dir, None, None)).await;
+        tokio::task::spawn_blocking(move || shared_audit::read_entries_tail(&dir, lines)).await;
     match read {
-        Ok(Ok(mut entries)) => {
-            let drop = entries.len().saturating_sub(lines);
-            let tail = entries.split_off(drop);
+        Ok(Ok(tail)) => {
             Json(serde_json::json!({ "entries": tail })).into_response()
         }
         _ => (

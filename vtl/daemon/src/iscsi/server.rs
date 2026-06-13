@@ -268,10 +268,12 @@ impl LoginAuditSink for IscsiLibraryLoginAudit {
                 let actor = AuditActor::iscsi(initiator.map(str::to_string), peer.to_string());
                 let user_label = user.unwrap_or("-");
                 let key = format!("iscsi.chap.failure:{peer}:{user_label}:{reason}");
-                if matches!(
-                    self.ratelimiter.decide(key, "iscsi.chap.failure", &actor),
-                    AuditRateLimitDecision::Suppress
-                ) {
+                let (decision, displaced) =
+                    self.ratelimiter.decide(key, "iscsi.chap.failure", &actor);
+                if let Some(rollup) = displaced {
+                    chan.append_rollup(&rollup);
+                }
+                if matches!(decision, AuditRateLimitDecision::Suppress) {
                     return;
                 }
                 chan.try_append(

@@ -163,6 +163,7 @@ impl AlertingDispatcher {
         // Backend-reachability is special-cased: we only emit on
         // status transitions (healthy->failing or failing->healthy).
         // Drop repeats inside the same status.
+        let mut pending_backend_commit: Option<(String, BackendStatus)> = None;
         if alert.class == AlertClass::BackendReachability {
             let backend = alert
                 .fields
@@ -178,26 +179,53 @@ impl AlertingDispatcher {
                 "recovery" => BackendStatus::Healthy,
                 _ => BackendStatus::Failing,
             };
-            let mut map = match self.backend_status.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            // Read the prior status without committing the new one yet
+            // (issue #203).
+            let prev = {
+                let map = match self.backend_status.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                map.get(backend).copied()
             };
-            let prev = map.get(backend).copied();
-            map.insert(backend.to_string(), next);
-            drop(map);
-            // Suppress non-transitions and the first-seen-healthy
-            // baseline — a "recovered" alert only makes sense after an
-            // observed failure, so neither the first `storage check`
-            // nor the periodic ticker's first healthy tick pages. A
-            // first-seen *failure* still fires.
+            // Non-firing transitions — same-status repeats and the
+            // first-seen-healthy baseline (a "recovered" alert only makes
+            // sense after an observed failure) — don't page, but we DO
+            // record the status: it tracks observed backends for display
+            // and seeds the transition gate. Committing here is safe
+            // precisely because the gate already returned false.
             if !backend_reachability_should_fire(prev, next) {
+                let mut map = match self.backend_status.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                map.insert(backend.to_string(), next);
                 return;
             }
+            // A *firing* transition: defer the commit until after the
+            // rate-limiter so a suppressed transition leaves `prev`
+            // intact. Committing it here (the old behaviour) let a brief
+            // flap permanently silence an ongoing outage — the
+            // healthy->failing transition passed the gate but was
+            // suppressed by an open dedup window, after which the
+            // already-flipped status made every later failing report a
+            // same-status repeat the gate dropped forever.
+            pending_backend_commit = Some((backend.to_string(), next));
         }
 
         if !self.rate_limiter.allow(&alert) {
             self.record_outcome(&alert, "all", "suppressed");
             return;
+        }
+
+        // The alert is firing — now commit the backend status so a
+        // suppressed transition above never poisons the transition gate.
+        if let Some((backend, next)) = pending_backend_commit {
+            let mut map = match self.backend_status.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            map.insert(backend, next);
         }
 
         self.fan_out(alert);
@@ -523,6 +551,28 @@ mod tests {
         let snap = d.backend_status_snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap.get("s3-a").copied(), Some("failing"));
+    }
+
+    #[tokio::test]
+    async fn suppressed_failing_flap_does_not_poison_status() {
+        // Issue #203: fail (fires, opens the permanent-key dedup window) ->
+        // recover (fires) -> fail again (the same permanent-key window is
+        // still open, so the transition is suppressed). The suppressed
+        // transition must NOT commit the status to Failing — otherwise the
+        // transition gate would treat every later failing report as a
+        // same-status repeat and silence the ongoing outage forever. The
+        // status stays Healthy so the outage re-fires once the window
+        // expires.
+        let d = build_dispatcher(default_cfg(default_chap_failures_threshold()));
+        d.try_emit(backend_alert("s3-a", "permanent"));
+        d.try_emit(backend_alert("s3-a", "recovery"));
+        d.try_emit(backend_alert("s3-a", "permanent")); // suppressed by open window
+        let snap = d.backend_status_snapshot();
+        assert_eq!(
+            snap.get("s3-a").copied(),
+            Some("healthy"),
+            "a suppressed transition must not commit the new status"
+        );
     }
 
     #[tokio::test]

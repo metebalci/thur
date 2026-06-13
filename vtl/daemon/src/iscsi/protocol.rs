@@ -314,11 +314,10 @@ pub(crate) async fn prefetch_read_ahead(
     };
 
     // Read-prefetch buffer occupancy: bytes of the look-ahead window
-    // already warmed into the local pool ahead of the head.
-    shared_telemetry::record::tape_read_buffer_used(
-        &window.cartridge_id,
-        window.read_ahead_buffered_bytes,
-    );
+    // already warmed into the local pool ahead of the head. Reported as
+    // a single library-wide gauge (no per-cartridge label) to bound
+    // metric cardinality (issue #205).
+    shared_telemetry::record::tape_read_buffer_used(window.read_ahead_buffered_bytes);
 
     // Nothing addressable to prefetch (head at end-of-data, or every
     // look-ahead chunk is still in staging).

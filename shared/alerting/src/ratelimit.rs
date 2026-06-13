@@ -48,7 +48,9 @@ impl AlertRateLimiter {
         // bookkeeping is happy. The Rollup it can emit isn't consumed
         // here — alerts are fire-and-forget, no follow-up rollup.
         let actor = shared_audit::AuditActor::daemon();
-        matches!(self.inner.decide(key, "alert", &actor), Decision::Emit)
+        // `.0` is the decision; the displaced rollup (`.1`) the audit
+        // path consumes is irrelevant here — alerts are fire-and-forget.
+        matches!(self.inner.decide(key, "alert", &actor).0, Decision::Emit)
     }
 }
 

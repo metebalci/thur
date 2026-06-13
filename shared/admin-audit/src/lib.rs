@@ -23,7 +23,7 @@ use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
 use shared_audit::{
     AuditActor, AuditConfig, AuditEntry, AuditError, AuditLog, AuditMode, AuditTailCursor,
-    read_entries, tail_step, verify_chain,
+    read_entries, read_entries_tail, tail_step, verify_chain,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,20 +83,34 @@ pub async fn run_tail(emitter: JobEmitter, body: serde_json::Value, dir: PathBuf
         return;
     }
 
-    let initial = match read_entries(&dir, None, None) {
-        Ok(e) => e,
-        Err(e) => {
-            emitter
-                .emit(JobEvent::done_with_error(
-                    2,
-                    format!("read audit entries: {}", e),
-                ))
-                .await;
-            return;
-        }
-    };
-    let start = initial.len().saturating_sub(params.lines);
-    for entry in &initial[start..] {
+    // Bounded backlog read off the runtime: gather only the last N
+    // entries (newest files first) instead of parsing the whole chain
+    // from genesis inline on the async handler (issue #201).
+    let lines = params.lines;
+    let backlog_dir = dir.clone();
+    let initial =
+        match tokio::task::spawn_blocking(move || read_entries_tail(&backlog_dir, lines)).await {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
+                emitter
+                    .emit(JobEvent::done_with_error(
+                        2,
+                        format!("read audit entries: {}", e),
+                    ))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                emitter
+                    .emit(JobEvent::done_with_error(
+                        2,
+                        format!("read audit entries: task join: {}", e),
+                    ))
+                    .await;
+                return;
+            }
+        };
+    for entry in &initial {
         emitter.info(format_entry(entry)).await;
     }
     let mut last_seq = initial.last().map(|e| e.seq).unwrap_or(0);
@@ -177,11 +191,26 @@ pub async fn run_export(emitter: JobEmitter, body: serde_json::Value, dir: PathB
             return;
         }
     };
-    let entries = match read_entries(&dir, from, to) {
-        Ok(e) => e,
-        Err(e) => {
+    // Export is inherently full-range; run the synchronous read +
+    // decompress off the runtime so it doesn't block a worker shared with
+    // the data path (issue #201).
+    let export_dir = dir.clone();
+    let entries = match tokio::task::spawn_blocking(move || read_entries(&export_dir, from, to))
+        .await
+    {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => {
             emitter
                 .emit(JobEvent::done_with_error(2, format!("audit export: {}", e)))
+                .await;
+            return;
+        }
+        Err(e) => {
+            emitter
+                .emit(JobEvent::done_with_error(
+                    2,
+                    format!("audit export: task join: {}", e),
+                ))
                 .await;
             return;
         }
@@ -240,7 +269,22 @@ pub async fn run_verify(emitter: JobEmitter, _body: serde_json::Value, dir: Path
             .await;
         return;
     }
-    match verify_chain(&dir) {
+    // verify_chain reads + decompresses + hashes the whole chain — run it
+    // off the runtime so it doesn't stall a data-path worker (issue #201).
+    let verify_dir = dir.clone();
+    let verify_result = match tokio::task::spawn_blocking(move || verify_chain(&verify_dir)).await {
+        Ok(r) => r,
+        Err(e) => {
+            emitter
+                .emit(JobEvent::done_with_error(
+                    2,
+                    format!("audit verify: task join: {}", e),
+                ))
+                .await;
+            return;
+        }
+    };
+    match verify_result {
         Ok(report) => {
             emitter
                 .info(format!(
