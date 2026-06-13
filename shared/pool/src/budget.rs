@@ -163,6 +163,11 @@ pub struct PoolBudget {
     /// with this mutex for waiters.
     state: Mutex<PoolState>,
     cv: Condvar,
+    /// Async counterpart of `cv`: woken by every release / cap-grow /
+    /// recount so [`PoolBudget::try_reserve_async`] callers (the block
+    /// write path runs on tokio workers) wait without parking a runtime
+    /// worker on the sync condvar. See issue #123.
+    notify: tokio::sync::Notify,
 }
 
 impl PoolBudget {
@@ -207,6 +212,7 @@ impl PoolBudget {
             data_dir,
             state: Mutex::new(PoolState::new()),
             cv: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -241,6 +247,7 @@ impl PoolBudget {
         // to re-evaluate (cap shrank).
         let _g = self.state.lock().expect("PoolBudget mutex poisoned");
         self.cv.notify_all();
+        self.notify.notify_waiters();
     }
 
     pub fn current_bytes(&self) -> u64 {
@@ -399,6 +406,115 @@ impl PoolBudget {
         }
     }
 
+    /// Async counterpart of [`PoolBudget::try_reserve`]: same cap +
+    /// disk-free semantics, but waits on a `tokio::sync::Notify` instead
+    /// of the sync condvar so an async caller (the block-side write path
+    /// runs directly on tokio workers) does not park a runtime worker for
+    /// the whole `deadline`. Parking workers is what froze the daemon
+    /// under sustained backpressure (issue #123): with backpressured
+    /// tasks ≥ worker count the runtime stalled, and the eviction task
+    /// that calls `release` could no longer be polled to wake them.
+    ///
+    /// The brief accounting under the sync mutex is never held across an
+    /// await; the only suspension point is the wait for a release or the
+    /// deadline.
+    #[allow(clippy::unwrap_in_result)]
+    pub async fn try_reserve_async(
+        &self,
+        bytes: u64,
+        namespace: Option<&str>,
+        deadline: Duration,
+    ) -> Result<(), BackpressureError> {
+        // No-gate fast path — mirrors the sync version.
+        let cap = self.cap_bytes();
+        if cap == 0 && self.disk_free_min_bytes == 0 {
+            let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
+            state.add(namespace, bytes);
+            let used = state.total;
+            drop(state);
+            self.report_used(used);
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let mut waiter = WaiterGauge::new(&self.backend);
+        loop {
+            // Register interest BEFORE the room check so a release that
+            // lands between the check and the await is not lost.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            // Accounting under the sync mutex — released before any await.
+            let room = {
+                let mut state = self.state.lock().expect("PoolBudget mutex poisoned");
+                let cap = self.cap_bytes();
+                let pool_room_ok = cap == 0 || state.total.saturating_add(bytes) <= cap;
+                let disk_room_ok = self.disk_free_min_bytes == 0
+                    || disk_free_bytes(&self.data_dir).unwrap_or(u64::MAX)
+                        >= self.disk_free_min_bytes;
+                if pool_room_ok && disk_room_ok {
+                    state.add(namespace, bytes);
+                    Some(state.total)
+                } else {
+                    None
+                }
+            };
+            if let Some(used) = room {
+                let waited = started.elapsed();
+                if waited > Duration::from_millis(0) && !self.backend.is_empty() {
+                    shared_telemetry::record::pool_backpressure_wait(
+                        &self.backend,
+                        waited.as_secs_f64(),
+                    );
+                }
+                self.report_used(used);
+                return Ok(());
+            }
+
+            waiter.activate();
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                let waited_secs = elapsed.as_secs();
+                let (pool_used_bytes, cap) = {
+                    let state = self.state.lock().expect("PoolBudget mutex poisoned");
+                    (state.total, self.cap_bytes())
+                };
+                if !self.backend.is_empty() {
+                    shared_telemetry::record::pool_backpressure_wait(
+                        &self.backend,
+                        elapsed.as_secs_f64(),
+                    );
+                    shared_alerting::record::disk_cache_backpressure_timeout(
+                        &self.backend,
+                        waited_secs,
+                    );
+                }
+                return Err(BackpressureError {
+                    pool_used_bytes,
+                    pool_cap_bytes: cap,
+                    waited_secs,
+                });
+            }
+            warn!(
+                "Upload backpressure (async) waiting: requesting {} bytes, waited {:?}",
+                bytes, elapsed
+            );
+            let remaining = deadline - elapsed;
+            tokio::select! {
+                _ = &mut notified => {
+                    // Release / cap-grow / recount signalled — loop and
+                    // re-check the room.
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    // Deadline window elapsed; loop once more so the top
+                    // re-checks room (a release may have raced) and, if
+                    // still full, the deadline branch returns the error.
+                }
+            }
+        }
+    }
+
     /// Reserve `bytes` *bypassing* the cap and the disk-free floor.
     /// Reserved for `Cartridge::Drop` / `PageCache::flush_all`-time
     /// flushes where returning `Backpressured` would mean dropping
@@ -421,6 +537,7 @@ impl PoolBudget {
         state.sub(namespace, bytes);
         let used = state.total;
         self.cv.notify_all();
+        self.notify.notify_waiters();
         drop(state);
         self.report_used(used);
     }
@@ -439,6 +556,7 @@ impl PoolBudget {
         state.total = total;
         state.per_namespace = buckets;
         self.cv.notify_all();
+        self.notify.notify_waiters();
         drop(state);
         self.report_used(total);
     }
@@ -637,6 +755,84 @@ mod tests {
             .try_reserve(1, None, Duration::from_millis(50))
             .expect_err("over-cap reservation must time out");
         assert_eq!(err.pool_cap_bytes, 512);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_async_blocks_then_admits_after_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
+        b.try_reserve_async(1024, None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(b.current_bytes(), 1024);
+
+        // Release from a separate task after a short delay; the async
+        // reserver must wake without parking a worker.
+        let b_bg = Arc::clone(&b);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            b_bg.release(512, None);
+        });
+
+        let started = Instant::now();
+        b.try_reserve_async(512, None, Duration::from_secs(2))
+            .await
+            .expect("should admit after async release");
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert_eq!(b.current_bytes(), 1024);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_async_times_out_when_no_release_arrives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80);
+        b.try_reserve_async(1024, None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let err = b
+            .try_reserve_async(1, None, Duration::from_millis(120))
+            .await
+            .expect_err("should time out");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(err.pool_used_bytes, 1024);
+        assert_eq!(err.pool_cap_bytes, 1024);
+    }
+
+    #[tokio::test]
+    async fn try_reserve_async_unbounded_admits_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = PoolBudget::unbounded(tmp.path().to_path_buf());
+        b.try_reserve_async(8 * 1024 * 1024, None, Duration::from_secs(1))
+            .await
+            .expect("unbounded async reserve");
+        assert_eq!(b.current_bytes(), 8 * 1024 * 1024);
+    }
+
+    /// Many async reservers backpressured at once must not deadlock: a
+    /// single small cap admits them one at a time as each completes and
+    /// releases. With the old sync condvar this would park N runtime
+    /// workers; the async path lets them all make progress.
+    #[tokio::test]
+    async fn try_reserve_async_many_waiters_drain_serially() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Arc::new(PoolBudget::new(tmp.path().to_path_buf(), 1024, 0, 80));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let b = Arc::clone(&b);
+            handles.push(tokio::spawn(async move {
+                b.try_reserve_async(1024, None, Duration::from_secs(5))
+                    .await
+                    .expect("each reserver admits in turn");
+                // Hold briefly, then release so the next one proceeds.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                b.release(1024, None);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(b.current_bytes(), 0);
     }
 
     #[test]

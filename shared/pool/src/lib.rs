@@ -131,6 +131,32 @@ fn unique_tmp_path(dst: &Path) -> PathBuf {
     dst.with_extension(format!("dat.{}.{n}.tmp", std::process::id()))
 }
 
+/// Copy `src` into the content-addressed `dst` honoring the "tempfile +
+/// atomic rename" contract: copy to a sibling temp of `dst`, fsync, then
+/// rename(2) into place; clean up the temp on any error. Used by
+/// `insert_from_path`'s cross-device fallback (rename(2) can't move across
+/// filesystems). A torn `fs::copy` straight onto `dst` would leave a
+/// truncated file that the dedup short-circuit and the upload worker both
+/// trust as authoritative — permanent corruption (issue #124).
+fn copy_into_pool_atomic(src: &Path, dst: &Path) -> Result<(), ChunkPoolError> {
+    let tmp = unique_tmp_path(dst);
+    if let Err(e) = fs::copy(src, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    {
+        let f = File::open(&tmp)?;
+        f.sync_all()?;
+    }
+    match fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
+}
+
 /// Errors out of the chunk-pool layer. Both products' error enums
 /// implement `From<ChunkPoolError>`, so handler-side `?` propagation
 /// works through.
@@ -405,7 +431,11 @@ impl ChunkPool {
         match fs::rename(src, &dst) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                fs::copy(src, &dst)?;
+                // Cross-device staging: rename(2) can't move across
+                // filesystems. Copy via a fsync'd tempfile + atomic
+                // rename (not straight onto `dst`) so a torn copy can't
+                // be sealed as authoritative — issue #124.
+                copy_into_pool_atomic(src, &dst)?;
                 fs::remove_file(src)?;
                 Ok(())
             }
@@ -663,6 +693,47 @@ mod tests {
             .read_to_end(&mut buf)
             .unwrap();
         assert_eq!(buf, b"hello dedup");
+    }
+
+    #[test]
+    fn copy_into_pool_atomic_roundtrips_and_leaves_no_temp() {
+        // The cross-device fallback helper must land complete content at
+        // the destination and leave no staging temp behind (issue #124).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.dat");
+        std::fs::write(&src, b"cross-device payload").unwrap();
+        let dst_dir = tmp.path().join("pool");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("chunk.dat");
+
+        copy_into_pool_atomic(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"cross-device payload");
+
+        let temps: Vec<_> = std::fs::read_dir(&dst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "no staging temp should remain");
+    }
+
+    #[test]
+    fn copy_into_pool_atomic_missing_source_leaves_no_temp() {
+        // A failed copy (missing source) must not leave a torn file or a
+        // stray temp at the destination.
+        let tmp = TempDir::new().unwrap();
+        let dst_dir = tmp.path().join("pool");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("chunk.dat");
+        let missing = tmp.path().join("does-not-exist.dat");
+
+        assert!(copy_into_pool_atomic(&missing, &dst).is_err());
+        assert!(!dst.exists(), "no torn file at destination");
+        let entries: Vec<_> = std::fs::read_dir(&dst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "no temp left behind on copy failure");
     }
 
     #[test]

@@ -4829,6 +4829,7 @@ dependencies = [
  "shared-telemetry",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
