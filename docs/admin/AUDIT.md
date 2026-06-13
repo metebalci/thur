@@ -72,6 +72,19 @@ value, forming the chain. The `chain.state` cache makes daemon-startup
 tail-verification O(1); the daemon refuses to start if the tail hash
 mismatches.
 
+Startup recovery self-heals the legal crash states of the writer itself,
+so a plain power loss / OOM never brands the chain as tampered. `append`
+fsyncs the entry before persisting `chain.state`, so a crash in between
+leaves the file tail one entry ahead of `chain.state`; startup accepts a
+tail at `last_seq + 1` whose `prev_hash` chains from `chain.state` and
+whose hash recomputes (and resumes from it). A crash on the first append
+of a new UTC day — the orphaned entry lands in a newer day-file while
+`chain.state` still names yesterday's — is recovered by scanning for the
+newest day-file and verifying it chains forward. An uncommitted partial
+trailing line (crash mid-write, before fsync) is truncated. Only a real
+hash/sequence discontinuity (tampering, or bit-rot of a committed entry)
+still refuses startup.
+
 When an operator needs to recover from a genuine break, they run
 `thurvtl system audit rotate --accept-break`. This writes an
 `audit.chain_reset` entry whose `prev_hash` is a sentinel of the form

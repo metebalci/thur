@@ -29,6 +29,7 @@
 //! and async contexts (the daemon's audit calls happen on the
 //! command-dispatch path, not the high-throughput data path).
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -295,20 +296,80 @@ impl AuditLog {
             let raw = fs::read(&chain_state_path)?;
             let state: ChainState = serde_json::from_slice(&raw)
                 .map_err(|e| AuditError::StateCorrupt(format!("chain.state: {e}")))?;
-            let current_file = resolve_audit_file(dir, &state.last_file);
-            verify_tail(&current_file, &state)?;
-            let current_date = parse_date_from_filename(&state.last_file).ok_or_else(|| {
+            let state_date = parse_date_from_filename(&state.last_file).ok_or_else(|| {
                 AuditError::StateCorrupt(format!("cannot parse date from {}", state.last_file))
             })?;
+
+            // Rollover-append crash: a crash on the FIRST append of a new
+            // UTC day (after write_line to today's file, before
+            // write_chain_state) leaves chain.state pointing at
+            // yesterday's file while an orphaned entry sits in a newer
+            // day-file. Scan for the newest day-file; if it's newer than
+            // chain.state's, recover from it (issue #138).
+            let newest = list_audit_files(dir)?
+                .into_iter()
+                .max_by_key(|(d, _)| *d);
+            if let Some((newest_date, newest_path)) = newest
+                && newest_date > state_date
+            {
+                // Drop any uncommitted partial tail so the resumed writer
+                // appends cleanly (issue #138).
+                truncate_torn_tail(&newest_path)?;
+                let entries = read_all_entries(&newest_path)?;
+                let first = entries.first().ok_or_else(|| {
+                    AuditError::StateCorrupt(format!("newer audit file {} is empty", newest_path.display()))
+                })?;
+                let chains = first.seq == state.last_seq + 1
+                    && first
+                        .prev_hash
+                        .as_deref()
+                        .map(|p| bare_hash(p) == bare_hash(&state.last_hash))
+                        .unwrap_or(false);
+                let last = entries.last().expect("non-empty checked above");
+                let tail_recomputed = compute_entry_hash(last);
+                let tail_ok = last
+                    .entry_hash
+                    .as_deref()
+                    .map(|h| h == tail_recomputed)
+                    .unwrap_or(false);
+                if !chains || !tail_ok {
+                    return Err(AuditError::ChainBroken {
+                        seq: state.last_seq,
+                        stored: state.last_hash.clone(),
+                        actual: format!(
+                            "newer audit file {} does not chain from chain.state",
+                            newest_path.display()
+                        ),
+                    });
+                }
+                tracing::warn!(
+                    "audit: chain.state lagged a day-file behind {} (crash on first append of a \
+                     new day); self-healing to seq {}",
+                    newest_path.display(),
+                    last.seq
+                );
+                return Ok(AuditWriter {
+                    current_file: newest_path,
+                    current_date: newest_date,
+                    last_seq: last.seq,
+                    last_hash: last.entry_hash.clone(),
+                });
+            }
+
+            let current_file = resolve_audit_file(dir, &state.last_file);
+            // Drop any uncommitted partial tail so the resumed writer
+            // appends cleanly rather than concatenating onto it (#138).
+            truncate_torn_tail(&current_file)?;
+            let (last_seq, last_hash) = verify_tail(&current_file, &state)?;
             // If we're past midnight relative to the last-written file,
             // that's fine — the next append will trigger rollover. We
             // don't pre-rotate here because pre-rotation with no entry
             // would create empty files.
             Ok(AuditWriter {
                 current_file,
-                current_date,
-                last_seq: state.last_seq,
-                last_hash: Some(state.last_hash),
+                current_date: state_date,
+                last_seq,
+                last_hash: Some(last_hash),
             })
         } else {
             // Fresh chain: pick today as genesis date. last_hash starts
@@ -835,29 +896,69 @@ pub fn verify_chain(dir: &Path) -> Result<VerifyReport> {
     })
 }
 
-/// Verify the tail of the most recent audit file against `chain.state`.
-/// Cheap O(file-length) check used at daemon startup.
-fn verify_tail(file: &Path, state: &ChainState) -> Result<()> {
+/// Strip the `blake3:` namespace prefix for hash comparison.
+fn bare_hash(h: &str) -> &str {
+    h.strip_prefix("blake3:").unwrap_or(h)
+}
+
+/// Verify the tail of the most recent audit file against `chain.state`
+/// and return the *recovered* `(last_seq, last_hash)` the writer should
+/// resume from. Cheap O(file-length) check used at daemon startup.
+///
+/// Self-heals the one legal writer crash state: `append` fsyncs the
+/// entry (`write_line`) before persisting `chain.state`
+/// (`write_chain_state`), so a crash in between leaves the file tail one
+/// entry ahead of `chain.state`. A tail at `state.last_seq + 1` whose
+/// `prev_hash` chains from `state.last_hash` and whose hash recomputes is
+/// accepted (and reported as the recovered tail), rather than branding a
+/// plain crash as a tamper break (issue #138).
+fn verify_tail(file: &Path, state: &ChainState) -> Result<(u64, String)> {
     let entries = read_all_entries(file)?;
     let last = entries.last().ok_or_else(|| {
         AuditError::StateCorrupt(format!("file {} has no entries", file.display()))
     })?;
-    if last.seq != state.last_seq {
-        return Err(AuditError::ChainBroken {
-            seq: state.last_seq,
-            stored: state.last_hash.clone(),
-            actual: format!("seq mismatch: file tail seq={}", last.seq),
-        });
+    // Normal case: the file tail matches chain.state exactly.
+    if last.seq == state.last_seq {
+        let recomputed = compute_entry_hash(last);
+        if recomputed != state.last_hash {
+            return Err(AuditError::ChainBroken {
+                seq: state.last_seq,
+                stored: state.last_hash.clone(),
+                actual: recomputed,
+            });
+        }
+        return Ok((state.last_seq, state.last_hash.clone()));
     }
-    let recomputed = compute_entry_hash(last);
-    if recomputed != state.last_hash {
-        return Err(AuditError::ChainBroken {
-            seq: state.last_seq,
-            stored: state.last_hash.clone(),
-            actual: recomputed,
-        });
+    // Self-heal: chain.state lagged one entry behind the durably-written
+    // file tail. Accept only if that tail chains from state.last_hash and
+    // its own hash recomputes — a tampered tail still fails.
+    if last.seq == state.last_seq + 1 {
+        let prev_ok = last
+            .prev_hash
+            .as_deref()
+            .map(|p| bare_hash(p) == bare_hash(&state.last_hash))
+            .unwrap_or(false);
+        let recomputed = compute_entry_hash(last);
+        let hash_ok = last
+            .entry_hash
+            .as_deref()
+            .map(|h| h == recomputed)
+            .unwrap_or(false);
+        if prev_ok && hash_ok {
+            tracing::warn!(
+                "audit: chain.state lagged one entry behind {} (crash between append and \
+                 state persist); self-healing to seq {}",
+                file.display(),
+                last.seq
+            );
+            return Ok((last.seq, recomputed));
+        }
     }
-    Ok(())
+    Err(AuditError::ChainBroken {
+        seq: state.last_seq,
+        stored: state.last_hash.clone(),
+        actual: format!("seq mismatch: file tail seq={}", last.seq),
+    })
 }
 
 fn filename_for(date: NaiveDate) -> String {
@@ -888,24 +989,73 @@ fn resolve_audit_file(dir: &Path, basename: &str) -> PathBuf {
 }
 
 fn list_audit_files(dir: &Path) -> Result<Vec<(NaiveDate, PathBuf)>> {
-    let mut out = Vec::new();
     if !dir.exists() {
-        return Ok(out);
+        return Ok(Vec::new());
     }
+    // Collect at most one file per date. A crash where `compress_file_zstd`
+    // wrote the `.zst` but failed to unlink the original (or vice-versa)
+    // can leave BOTH variants for one date on disk; reading both would
+    // double-count entries and report a false ChainBroken (issue #139).
+    // Prefer the compressed `.zst` (the rotation target) so a half-done
+    // compression resolves to the durable replacement.
+    let mut by_date: BTreeMap<NaiveDate, PathBuf> = BTreeMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with("audit-") {
             continue;
         }
-        if !(name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")) {
+        let is_zst = name.ends_with(".jsonl.zst");
+        if !(name.ends_with(".jsonl") || is_zst) {
             continue;
         }
         if let Some(date) = parse_date_from_filename(&name) {
-            out.push((date, entry.path()));
+            match by_date.entry(date) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry.path());
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    // Prefer the .zst variant when both exist for a date.
+                    if is_zst {
+                        slot.insert(entry.path());
+                    }
+                }
+            }
         }
     }
-    Ok(out)
+    Ok(by_date.into_iter().collect())
+}
+
+/// Truncate an uncommitted partial trailing line from an active
+/// (`.jsonl`) audit file so a resumed writer appends cleanly. A crash
+/// mid-`writeln` (before the trailing newline + fsync) leaves bytes that
+/// were never durably committed; appending after them would concatenate
+/// into one corrupt line that even `read_all_entries`' read-time
+/// tolerance can't salvage (issue #138). No-op on a clean
+/// (newline-terminated or empty) file, and skips compressed `.zst` files
+/// (immutable, binary — never newline-terminated).
+fn truncate_torn_tail(file: &Path) -> Result<()> {
+    if file.extension().and_then(|e| e.to_str()) == Some("zst") || !file.exists() {
+        return Ok(());
+    }
+    let raw = fs::read(file)?;
+    if raw.is_empty() || raw.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let keep = raw
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    tracing::warn!(
+        "audit: truncating {} uncommitted trailing byte(s) from {} (torn write)",
+        raw.len() - keep,
+        file.display()
+    );
+    let f = OpenOptions::new().write(true).open(file)?;
+    f.set_len(keep as u64)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 fn read_all_entries(file: &Path) -> Result<Vec<AuditEntry>> {
@@ -916,13 +1066,35 @@ fn read_all_entries(file: &Path) -> Result<Vec<AuditEntry>> {
     } else {
         raw
     };
+    let ends_with_newline = bytes.last() == Some(&b'\n');
+    let segments: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    let n = segments.len();
     let mut entries = Vec::new();
-    for line in bytes.split(|&b| b == b'\n') {
+    for (i, line) in segments.iter().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let e: AuditEntry = serde_json::from_slice(line)?;
-        entries.push(e);
+        match serde_json::from_slice::<AuditEntry>(line) {
+            Ok(e) => entries.push(e),
+            Err(err) => {
+                // Tolerate a torn trailing line: a crash mid-`writeln`
+                // (before the trailing newline + the entry's fsync) leaves
+                // an unterminated partial JSON tail that was never durably
+                // committed. Drop it rather than refusing to open the
+                // whole chain (issue #138). A parse failure on any line
+                // that IS newline-terminated is real corruption.
+                let unterminated_tail = i + 1 == n && !ends_with_newline;
+                if unterminated_tail {
+                    tracing::warn!(
+                        "audit: dropping torn trailing line in {} (uncommitted partial write): {}",
+                        file.display(),
+                        err
+                    );
+                    break;
+                }
+                return Err(err.into());
+            }
+        }
     }
     Ok(entries)
 }
@@ -1079,7 +1251,30 @@ fn compress_file_zstd(file: &Path) -> Result<()> {
     let raw = fs::read(file)?;
     let compressed = zstd::encode_all(&raw[..], 3).map_err(|e| AuditError::Zstd(e.to_string()))?;
     let zpath = PathBuf::from(format!("{}.zst", file.display()));
-    fs::write(&zpath, &compressed)?;
+    // Durable replace: write to a temp, fsync it, rename(2) into place,
+    // and only THEN unlink the original. A plain `fs::write` + immediate
+    // unlink could lose the whole day's audit on power loss within the
+    // page-cache window (the unlink journals but the .zst data blocks
+    // never reach disk) — `verify_chain` then reports ChainBroken
+    // forever (issue #139). Mirrors `write_chain_state`'s tmp+rename.
+    let tmp = PathBuf::from(format!("{}.zst.tmp", file.display()));
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&compressed)?;
+        f.sync_data()?;
+    }
+    fs::rename(&tmp, &zpath)?;
+    // fsync the parent dir so the rename (and the impending unlink) are
+    // durable before we drop the original.
+    if let Some(parent) = zpath.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     fs::remove_file(file)?;
     Ok(())
 }
@@ -1092,6 +1287,156 @@ mod tests {
 
     fn open_te(dir: &Path) -> AuditLog {
         AuditLog::open(AuditConfig::new(dir, AuditMode::TamperEvident)).unwrap()
+    }
+
+    #[test]
+    fn self_heals_chain_state_lag_after_crash() {
+        // Issue #138(a): a crash between write_line and write_chain_state
+        // leaves the file tail one entry ahead of chain.state. Reopen
+        // must self-heal (resume from the durable tail), not refuse.
+        let tmp = TempDir::new().unwrap();
+        {
+            let log = open_te(tmp.path());
+            log.append("op", AuditActor::system(), json!({"x":1}), AuditResult::Ok)
+                .unwrap();
+            log.append("op", AuditActor::system(), json!({"x":2}), AuditResult::Ok)
+                .unwrap();
+        }
+        let today = Utc::now().date_naive();
+        let file = tmp.path().join(filename_for(today));
+        let entries = read_all_entries(&file).unwrap();
+        assert_eq!(entries.len(), 2);
+        // Rewind chain.state to seq 1 (lagging behind the file's seq 2).
+        let lagged = ChainState {
+            last_seq: 1,
+            last_hash: entries[0].entry_hash.clone().unwrap(),
+            last_file: filename_for(today),
+        };
+        fs::write(
+            tmp.path().join(CHAIN_STATE_FILE),
+            serde_json::to_vec(&lagged).unwrap(),
+        )
+        .unwrap();
+
+        let log = open_te(tmp.path());
+        let s3 = log
+            .append("op", AuditActor::system(), json!({"x":3}), AuditResult::Ok)
+            .unwrap();
+        assert_eq!(s3, 3, "resumed from durable tail (seq 2), not lagged state");
+        verify_chain(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn tolerates_and_truncates_torn_trailing_line() {
+        // Issue #138: a torn (unterminated) trailing line was never
+        // fsync-committed; reopen drops it and resumes cleanly.
+        let tmp = TempDir::new().unwrap();
+        {
+            let log = open_te(tmp.path());
+            log.append("op", AuditActor::system(), json!({"x":1}), AuditResult::Ok)
+                .unwrap();
+            log.append("op", AuditActor::system(), json!({"x":2}), AuditResult::Ok)
+                .unwrap();
+        }
+        let today = Utc::now().date_naive();
+        let file = tmp.path().join(filename_for(today));
+        {
+            let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+            f.write_all(b"{\"seq\":3,\"ts\":\"2026-").unwrap(); // partial, no newline
+        }
+        let log = open_te(tmp.path());
+        let s3 = log
+            .append("op", AuditActor::system(), json!({"x":3}), AuditResult::Ok)
+            .unwrap();
+        assert_eq!(s3, 3, "torn tail dropped; chain continues");
+        verify_chain(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn recovers_from_newer_day_file_after_rollover_crash() {
+        // Issue #138(b): a crash on the first append of a new day leaves
+        // an orphaned entry in today's file while chain.state still points
+        // at yesterday's. Reopen recovers from the newer (today's) file.
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+
+        // Build yesterday's file with one genesis-chained entry.
+        let mut e1 = AuditEntry {
+            seq: 1,
+            ts: Utc::now(),
+            actor: AuditActor::system(),
+            op: "op".into(),
+            params: json!({"x":1}),
+            result: "ok".into(),
+            error: None,
+            prev_hash: Some(GENESIS_PREV_HASH.to_string()),
+            entry_hash: None,
+        };
+        e1.entry_hash = Some(compute_entry_hash(&e1));
+        let mut l1 = serde_json::to_vec(&e1).unwrap();
+        l1.push(b'\n');
+        fs::write(tmp.path().join(filename_for(yesterday)), &l1).unwrap();
+
+        // chain.state points at yesterday/seq1 (the crash happened on the
+        // first append of today, before chain.state advanced).
+        let state = ChainState {
+            last_seq: 1,
+            last_hash: e1.entry_hash.clone().unwrap(),
+            last_file: filename_for(yesterday),
+        };
+        fs::write(
+            tmp.path().join(CHAIN_STATE_FILE),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        // Today's file holds the orphaned seq-2 entry chaining from state.
+        let mut e2 = AuditEntry {
+            seq: 2,
+            ts: Utc::now(),
+            actor: AuditActor::system(),
+            op: "op".into(),
+            params: json!({"x":2}),
+            result: "ok".into(),
+            error: None,
+            prev_hash: Some(state.last_hash.clone()),
+            entry_hash: None,
+        };
+        e2.entry_hash = Some(compute_entry_hash(&e2));
+        let mut l2 = serde_json::to_vec(&e2).unwrap();
+        l2.push(b'\n');
+        fs::write(tmp.path().join(filename_for(today)), &l2).unwrap();
+
+        let log = open_te(tmp.path());
+        let s3 = log
+            .append("op", AuditActor::system(), json!({"x":3}), AuditResult::Ok)
+            .unwrap();
+        assert_eq!(s3, 3, "recovered from today's orphan (seq 2)");
+        verify_chain(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn compress_is_durable_and_list_dedups_variants() {
+        // Issue #139: compress writes tmp+rename then unlinks the
+        // original; if both variants linger for a date, list_audit_files
+        // returns one (the .zst).
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().date_naive();
+        let jsonl = tmp.path().join(filename_for(today));
+        fs::write(&jsonl, b"{\"seq\":1}\n").unwrap();
+        compress_file_zstd(&jsonl).unwrap();
+        assert!(!jsonl.exists(), "original removed after durable compress");
+        let zst = tmp.path().join(format!("{}.zst", filename_for(today)));
+        assert!(zst.exists(), ".zst replacement present");
+        // Simulate a crash that left both variants for the date.
+        fs::write(&jsonl, b"{\"seq\":1}\n").unwrap();
+        let listed = list_audit_files(tmp.path()).unwrap();
+        assert_eq!(listed.len(), 1, "one entry per date even with both variants");
+        assert!(
+            listed[0].1.to_string_lossy().ends_with(".zst"),
+            "the .zst variant is preferred"
+        );
     }
 
     #[test]
