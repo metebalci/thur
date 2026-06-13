@@ -961,6 +961,7 @@ fn parse_extended_copy(
         16 + tdesc_len,
         sdesc_len,
         registry,
+        req.session_volumes,
         nexus,
         reservations,
     )
@@ -983,6 +984,7 @@ fn resolve_targets_and_plan(
     sdesc_off: usize,
     sdesc_len: usize,
     registry: &Arc<dyn VolumeLookup>,
+    session_volumes: Option<&[String]>,
     nexus: &Nexus,
     reservations: &ReservationManager,
 ) -> Result<(Vec<TargetHandle>, Vec<PlannedSegment>), ExtendedCopyParseError> {
@@ -1010,8 +1012,8 @@ fn resolve_targets_and_plan(
     for i in 0..tdesc_count {
         let off = tdesc_off + i * 32;
         let desc = &plist[off..off + 32];
-        let pair =
-            resolve_target_descriptor(registry, desc).map_err(ExtendedCopyParseError::Sense)?;
+        let pair = resolve_target_descriptor(registry, session_volumes, desc)
+            .map_err(ExtendedCopyParseError::Sense)?;
         targets.push(pair);
     }
 
@@ -1195,6 +1197,7 @@ fn parse_extended_copy_lid4(
         LID4_HEADER_LEN + tdesc_len,
         sdesc_len,
         registry,
+        req.session_volumes,
         nexus,
         reservations,
     )
@@ -1440,8 +1443,28 @@ fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// descriptor has just 20 bytes for the designator, which the T10
 /// form (44 bytes today) doesn't fit. VPD 0x83 publishes NAA
 /// alongside T10 specifically for this path.
+/// True iff `lun` is visible to this session's per-CHAP-user volume
+/// admission set. `None` session_volumes = no admission filter (a
+/// no-CHAP session, or tests). Mirrors the dispatcher's `cache_arc`
+/// gate so the EXTENDED COPY / ODX arm can't reach a non-admitted
+/// tenant's volume (issue #131).
+fn lun_admitted(
+    registry: &Arc<dyn VolumeLookup>,
+    session_volumes: Option<&[String]>,
+    lun: u64,
+) -> bool {
+    match session_volumes {
+        Some(allow) => match registry.name_for_lun(lun) {
+            Some(name) => allow.iter().any(|n| n == &name),
+            None => false,
+        },
+        None => true,
+    }
+}
+
 fn resolve_target_descriptor(
     registry: &Arc<dyn VolumeLookup>,
+    session_volumes: Option<&[String]>,
     desc: &[u8],
 ) -> Result<(u64, Arc<PageCache>), SenseData> {
     if desc.len() < 32 || desc[0] != 0xE4 {
@@ -1463,6 +1486,11 @@ fn resolve_target_descriptor(
         return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
     }
     for lun in registry.luns() {
+        // Skip LUNs outside this session's admission set so a
+        // non-admitted tenant's NAA never resolves (issue #131).
+        if !lun_admitted(registry, session_volumes, lun) {
+            continue;
+        }
         let Some(cache) = registry.get(lun) else {
             continue;
         };
@@ -1683,6 +1711,12 @@ async fn populate_token(
     // POPULATE TOKEN's source is the LUN the CDB was sent to. No
     // CSCD target descriptors.
     let _ = nexus;
+    // Per-CHAP-user admission: refuse to snapshot a LUN this session
+    // isn't admitted to, so a tenant can't POPULATE TOKEN against a
+    // victim's volume to pin + later recrypt its pages (issue #131).
+    if !lun_admitted(registry, req.session_volumes, req.lun) {
+        return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED);
+    }
     let src_cache = match registry.get(req.lun) {
         Some(c) => c,
         None => return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
@@ -1749,6 +1783,15 @@ async fn populate_token(
             return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
         }
         total_blocks = total_blocks.saturating_add(bd.blocks as u64);
+    }
+    // Cap the summed transfer against the MAXIMUM TOKEN TRANSFER SIZE we
+    // advertise in VPD 0x8F (1 GiB / sector). Without this a single BDRD
+    // covering a large volume amplifies to one Vec entry + one index
+    // lookup per page (millions on a multi-TiB volume), all from one
+    // untrusted iSCSI command — a remote OOM/stall DoS (issue #130).
+    let max_token_blocks = (1u64 << 30) / sector;
+    if total_blocks > max_token_blocks {
+        return ScsiResponse::check(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
     }
     // Force a flush of any dirty source pages in the requested range
     // so the page-index snapshot reflects host writes the dispatcher
@@ -1862,6 +1905,12 @@ async fn write_using_token(
     reservations: &ReservationManager,
     tokens: &Arc<TokenManager>,
 ) -> ScsiResponse {
+    // Per-CHAP-user admission: refuse to write to a LUN this session
+    // isn't admitted to, so a tenant can't WRITE USING TOKEN onto a
+    // victim's volume (issue #131).
+    if !lun_admitted(registry, req.session_volumes, req.lun) {
+        return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED);
+    }
     let dst_cache = match registry.get(req.lun) {
         Some(c) => c,
         None => return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED),
@@ -4658,6 +4707,175 @@ mod tests {
             rrti_w.data_in[23],
         ]);
         assert_eq!(transfer, 2 * SECTORS_PER_PAGE as u64);
+    }
+
+    /// Issue #131: POPULATE TOKEN against a LUN this session is not
+    /// admitted to must be refused (LU NOT SUPPORTED), so a tenant can't
+    /// snapshot + pin a victim volume's pages.
+    #[tokio::test]
+    async fn populate_token_refuses_non_admitted_source_lun() {
+        let (_tmp, src, _dst) = fresh_two_volumes_global("src_vol", "dst_vol").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src.clone());
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+        let pt_params = populate_token_param_list(&[(0, 2 * SECTORS_PER_PAGE as u32)]);
+        let pt_cdb = odx_cdb(0x83, 0x10, 0x1111, pt_params.len() as u32);
+        // Session admitted only to a different volume.
+        let admitted = vec!["dst_vol".to_string()];
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &pt_cdb,
+                data_out: &pt_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                initiator_isid: [0u8; 6],
+                cid: 0,
+                peer: "",
+                session_partition: None,
+                session_volumes: Some(&admitted),
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        let sense = r.sense.expect("non-admitted POPULATE TOKEN must be refused");
+        assert_eq!(sense.key, scsi_spc::sense::SenseKey::IllegalRequest);
+        // No token minted under this list id.
+        let rrti_cdb = odx_cdb(0x84, 0x07, 0x1111, 1024);
+        let rrti = receive_copy_results(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &rrti_cdb,
+                data_out: &[],
+                data_in_max: 1024,
+                tsih: 0,
+                initiator_iqn: None,
+                initiator_isid: [0u8; 6],
+                cid: 0,
+                peer: "",
+                session_partition: None,
+                session_volumes: Some(&admitted),
+            },
+            &tokens,
+        );
+        // RESPONSE TO SERVICE ACTION 0 / status not "completed" — no
+        // POPULATE TOKEN job exists for this list id.
+        assert_ne!(rrti.data_in.get(5).copied(), Some(0x02));
+    }
+
+    /// Issue #131: WRITE USING TOKEN onto a LUN this session is not
+    /// admitted to must be refused (LU NOT SUPPORTED) before any token
+    /// processing, so a tenant can't write onto a victim volume.
+    #[tokio::test]
+    async fn write_using_token_refuses_non_admitted_dest_lun() {
+        let (_tmp, src, dst) = fresh_two_volumes_global("src_vol", "dst_vol").await;
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, src.clone());
+            r.register(1, dst.clone());
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+        let dummy = [0u8; ROD_TOKEN_LEN];
+        let wut_params = write_using_token_param_list(&dummy, &[(0, 2 * SECTORS_PER_PAGE as u32)]);
+        let wut_cdb = odx_cdb(0x83, 0x11, 0x2222, wut_params.len() as u32);
+        // Admitted only to src_vol; destination LUN 1 is dst_vol.
+        let admitted = vec!["src_vol".to_string()];
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 1,
+                cdb: &wut_cdb,
+                data_out: &wut_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                initiator_isid: [0u8; 6],
+                cid: 0,
+                peer: "",
+                session_partition: None,
+                session_volumes: Some(&admitted),
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        let sense = r.sense.expect("non-admitted WRITE USING TOKEN must be refused");
+        assert_eq!(sense.key, scsi_spc::sense::SenseKey::IllegalRequest);
+    }
+
+    /// Issue #130: POPULATE TOKEN whose summed block count exceeds the
+    /// advertised MAXIMUM TOKEN TRANSFER SIZE (1 GiB / sector) must be
+    /// rejected before the per-page snapshot loop, capping the
+    /// amplification a single untrusted command can drive.
+    #[tokio::test]
+    async fn populate_token_rejects_over_max_transfer_size() {
+        let tmp = TempDir::new().unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::new(LocalBackend::new(&storage_root).await.unwrap());
+        // 2 GiB logical (thin-provisioned, so cheap) so the over-cap
+        // range is within bounds and the cap — not the range check —
+        // fires.
+        VolumeManifest::new(
+            "big".into(),
+            2 * (1u64 << 30),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let big = PageCache::new(Arc::new(
+            VolumeWriter::open(tmp.path(), "big", backend).unwrap(),
+        ));
+        let registry: Arc<dyn VolumeLookup> = {
+            let r = TestRegistry::new();
+            r.register(0, big.clone());
+            Arc::new(r)
+        };
+        let tokens = test_tokens();
+
+        // max_token_blocks = 1 GiB / 4 KiB = 262144; ask for one page more
+        // (page-aligned) so we exceed it.
+        let over = 262144u32 + SECTORS_PER_PAGE as u32;
+        let pt_params = populate_token_param_list(&[(0, over)]);
+        let pt_cdb = odx_cdb(0x83, 0x10, 0x3333, pt_params.len() as u32);
+        let r = extended_copy(
+            &ScsiRequest {
+                lun: 0,
+                cdb: &pt_cdb,
+                data_out: &pt_params,
+                data_in_max: 0,
+                tsih: 0,
+                initiator_iqn: None,
+                initiator_isid: [0u8; 6],
+                cid: 0,
+                peer: "",
+                session_partition: None,
+                session_volumes: None,
+            },
+            &registry,
+            test_nexus(),
+            &test_mgr(),
+            &tokens,
+        )
+        .await;
+        let sense = r.sense.expect("over-cap POPULATE TOKEN must be rejected");
+        assert_eq!(sense.key, scsi_spc::sense::SenseKey::IllegalRequest);
     }
 
     /// Two volumes on one backend (so they can share the pool under
