@@ -80,6 +80,7 @@ pub async fn run_upload_worker(
     registry: Arc<VolumeRegistry>,
     backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     max_concurrent: usize,
+    evict_notify: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let concurrency = max_concurrent.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -101,9 +102,16 @@ pub async fn run_upload_worker(
         };
         let backends = Arc::clone(&backends);
         let registry = Arc::clone(&registry);
+        let evict_notify = Arc::clone(&evict_notify);
         tokio::spawn(async move {
             let _permit = permit;
-            run_one_task(task, &backends, &registry).await;
+            // A successful upload flips a page LocalOnly -> Both, making
+            // its pool chunk evictable — wake the eviction worker so a
+            // cache-full write burst recovers within the backpressure
+            // deadline rather than the 5 min interval (issue #225).
+            if run_one_task(task, &backends, &registry).await {
+                evict_notify.notify_one();
+            }
         });
     }
     info!("thurvsa upload worker shutting down (channel closed)");
@@ -118,11 +126,14 @@ pub async fn run_upload_worker(
 /// `task.pending.mark_failed` (issue #106): a waiter parked on the
 /// page (SYNCHRONIZE CACHE, flush_all) wakes with a failure verdict
 /// instead of hanging forever on an upload that already gave up.
+/// Returns `true` iff the page was uploaded and its outcome applied
+/// (LocalOnly -> Both) — the caller uses that to wake the eviction
+/// worker (issue #225). Every failure path returns `false`.
 async fn run_one_task(
     task: UploadTask,
     backends: &Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     registry: &VolumeRegistry,
-) {
+) -> bool {
     let page_id = u32::try_from(task.payload.item_id).ok();
     // Share the same map AdminState holds so backends instantiated by
     // a runtime `volume create` (via admin/handlers.rs's
@@ -147,7 +158,7 @@ async fn run_one_task(
                 if let Some(p) = page_id {
                     task.pending.mark_failed(p).await;
                 }
-                return;
+                return false;
             }
         }
     };
@@ -165,7 +176,7 @@ async fn run_one_task(
             if let Some(p) = page_id {
                 task.pending.mark_failed(p).await;
             }
-            return;
+            return false;
         }
     };
     let item_id = task.payload.item_id;
@@ -179,7 +190,7 @@ async fn run_one_task(
             if let Some(p) = page_id {
                 task.pending.mark_failed(p).await;
             }
-            return;
+            return false;
         }
     };
     if let Err(e) = cache.writer().apply_page_upload_outcome(&outcome).await {
@@ -190,7 +201,7 @@ async fn run_one_task(
         if let Some(p) = page_id {
             task.pending.mark_failed(p).await;
         }
-        return;
+        return false;
     }
     // Fold the on-wire PUT size into the volume's backend-write
     // meter. `None` on a cross-namespace dedup hit (no PUT happened).
@@ -201,6 +212,7 @@ async fn run_one_task(
         "upload worker: volume '{}' page {} done (dedup_hit={})",
         task.volume_name, item_id, outcome.dedup_hit
     );
+    true
 }
 
 /// Crash-recovery scan. Walks every volume under `data_dir`, opens

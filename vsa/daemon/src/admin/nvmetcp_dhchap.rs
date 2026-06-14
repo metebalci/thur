@@ -26,7 +26,8 @@ use std::path::PathBuf;
 use super::handlers::AdminState;
 use super::iscsi_users::ApiError;
 use super::nvmetcp_host_file::{
-    AddRequest, Surface, audit, collect_rows, emit_sweep_audits, load, save, sweep_all,
+    AddRequest, NVMETCP_HOST_WRITE_LOCK, Surface, audit, collect_rows, emit_sweep_audits, load,
+    save, sweep_all,
 };
 
 #[derive(Debug, Serialize)]
@@ -130,6 +131,7 @@ pub async fn set_ctrl_key(
     Json(body): Json<SetCtrlKeyRequest>,
 ) -> Result<(StatusCode, Json<DhchapRow>), ApiError> {
     DhchapSurface::validate_key(&body.ctrl_key)?;
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<DhchapSurface>(&state)?;
     let swept = sweep_all::<DhchapSurface>(&mut file);
     let entry = file
@@ -161,6 +163,7 @@ pub async fn clear_ctrl_key(
     peer: PeerCred,
     Json(body): Json<super::nvmetcp_host_file::HostNqnOnlyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<DhchapSurface>(&state)?;
     let swept = sweep_all::<DhchapSurface>(&mut file);
     let entry = file

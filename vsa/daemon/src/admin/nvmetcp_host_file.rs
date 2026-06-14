@@ -32,6 +32,20 @@ use std::path::{Path, PathBuf};
 use super::handlers::AdminState;
 use super::iscsi_users::ApiError;
 
+/// Process-global serialization for the read-modify-write on the
+/// NVMe-TCP credential files (psks + dhchap). The admin server handles
+/// connections concurrently (one task per accepted connection), so
+/// without this two overlapping mutating verbs interleave as lost
+/// updates: both `load()` the same file and each `save()`s its own copy,
+/// last atomic-rename wins — a `revoke` racing a `grant`/`rotate` was
+/// silently discarded, leaving a host admitted to a volume the operator
+/// believed revoked (issue #223). Same fix as the `iscsi-users.json`
+/// analog (issue #207). One global covers both surfaces and the
+/// dhchap ctrl-key verbs; admin mutations are rare and human-driven, so
+/// the coarse grain is fine. Held across the whole load→mutate→save.
+pub(crate) static NVMETCP_HOST_WRITE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 // ---------- shared request types ----------
 //
 // The admin-socket request bodies are identical across the two
@@ -148,6 +162,7 @@ pub async fn add<S: Surface>(
     }
     validate_volumes_exist(&state, names)?;
 
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
 
@@ -174,6 +189,7 @@ pub async fn remove<S: Surface>(
     peer: PeerCred,
     Json(body): Json<HostNqnOnlyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let before = file.entries().len();
@@ -214,6 +230,7 @@ async fn toggle_disabled<S: Surface>(
     host_nqn: String,
     disabled: bool,
 ) -> Result<StatusCode, ApiError> {
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let entry = find_mut::<S>(&mut file, &host_nqn)?;
@@ -241,6 +258,7 @@ pub async fn rotate<S: Surface>(
         ));
     }
 
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let entry = find_mut::<S>(&mut file, &body.host_nqn)?;
@@ -276,6 +294,7 @@ pub async fn rotate_cancel<S: Surface>(
     peer: PeerCred,
     Json(body): Json<HostNqnOnlyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let entry = find_mut::<S>(&mut file, &body.host_nqn)?;
@@ -306,6 +325,7 @@ pub async fn grant<S: Surface>(
         return Err(ApiError::bad_request("at least one --volume required"));
     }
     validate_volumes_exist(&state, &body.volumes)?;
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let entry = find_mut::<S>(&mut file, &body.host_nqn)?;
@@ -340,6 +360,7 @@ pub async fn revoke<S: Surface>(
     if body.volumes.is_empty() {
         return Err(ApiError::bad_request("at least one --volume required"));
     }
+    let _write_guard = NVMETCP_HOST_WRITE_LOCK.lock().await;
     let (path, mut file) = load::<S>(&state)?;
     let swept = sweep_all::<S>(&mut file);
     let entry = find_mut::<S>(&mut file, &body.host_nqn)?;

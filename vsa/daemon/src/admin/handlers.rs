@@ -146,6 +146,17 @@ pub struct AdminState {
     /// handle the HTTP listener's auth middleware reads; the
     /// `system set-admin-password` handler hot-swaps it.
     pub auth: shared_admin_auth::AuthState,
+    /// Serializes the whole `volume create` / `volume clone` LUN
+    /// auto-assign → register critical section (issue #221). The admin
+    /// server runs one task per connection and the CSI driver issues
+    /// concurrent `CreateVolume`s, so without this two auto-assign
+    /// creates both observe the same free LUN from `next_free_lun()`,
+    /// both persist a manifest carrying it, and the second `register`
+    /// silently shadows the first — the first volume reports success but
+    /// is unreachable, and the next daemon start refuses to boot on the
+    /// "manifest LUN collision" guard. Control-plane only and operator /
+    /// CSI-paced, so full serialization is acceptable.
+    pub create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 // `system.monitor` per-tick view. The handler in `shared-admin-monitor`
@@ -353,14 +364,22 @@ pub async fn info(
     // Walk pages.idx for the "used" figure — the same pattern
     // `system stats` uses. On open failure, fall back to 0 so a
     // corrupted index doesn't block the info verb; the operator's
-    // response (investigate) is the same either way.
-    let allocated_pages: u64 = PageIndex::open(
-        &PageIndex::path_for(&vol_dir),
-        manifest.uuid,
-        u64::from(manifest.page_size_bytes),
-    )
-    .ok()
-    .map(|p| p.iter().filter(Result::is_ok).count() as u64)
+    // response (investigate) is the same either way. The walk is a
+    // synchronous pread loop whose cost scales with the volume's
+    // allocated size (up to GiBs of index reads for a multi-TiB
+    // volume), and this handler is reachable from the open-by-default
+    // TCP /api/v1 surface — so offload it to a blocking thread rather
+    // than stalling a runtime worker shared with the data path (#220).
+    let idx_path = PageIndex::path_for(&vol_dir);
+    let uuid = manifest.uuid;
+    let page_size = u64::from(manifest.page_size_bytes);
+    let allocated_pages: u64 = tokio::task::spawn_blocking(move || {
+        PageIndex::open(&idx_path, uuid, page_size)
+            .ok()
+            .map(|p| p.iter().filter(Result::is_ok).count() as u64)
+            .unwrap_or(0)
+    })
+    .await
     .unwrap_or(0);
 
     let mut out = serde_json::to_value(&manifest).unwrap_or_else(|_| json!({}));
@@ -447,6 +466,13 @@ pub async fn create(
             })),
         )
     })?;
+
+    // Serialize the LUN auto-assign → register critical section across
+    // all concurrent creates/clones (issue #221). Held until the
+    // function returns, so a second create can't observe the same free
+    // LUN and shadow this one's registration. Acquired after the
+    // lock-free request validation above.
+    let _create_guard = state.create_lock.lock().await;
 
     // Pin the LUN before we touch the disk so an unavailable
     // explicit `--lun N` refuses cleanly without leaving a
@@ -945,6 +971,11 @@ pub async fn clone_volume(
                 })),
             )
         })?;
+
+    // Serialize the LUN auto-assign → register critical section against
+    // concurrent creates/clones (issue #221) — same guard `create`
+    // takes. Held until the function returns.
+    let _create_guard = state.create_lock.lock().await;
 
     let pinned_lun = match body.lun {
         Some(req) => {

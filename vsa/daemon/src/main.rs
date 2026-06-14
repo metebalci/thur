@@ -97,6 +97,47 @@ fn resolve_discovery_traddr(
     Ok((traddr, port))
 }
 
+/// Resolve the persistent NVMe subsystem serial number (issue #224).
+///
+/// NVMe Base requires the controller SN to be a stable, unique
+/// identifier — hosts key `/dev/disk/by-id/nvme-*` symlinks, multipath
+/// WWID fallbacks, and udev rules on it. The previous value
+/// `THURVSA{volume_count:013}` changed on every volume create/destroy
+/// across a restart (breaking by-id mounts) and collided between two
+/// installs with the same volume count. Mint a 20-ASCII-char serial
+/// ("THURVSA" + 13 random hex) once into `<data_dir>/nvme-serial` and
+/// reuse it across boots; a malformed/legacy file is re-minted.
+fn resolve_nvme_serial(data_dir: &std::path::Path) -> Result<String> {
+    use shared_crypto::RngCore as _;
+
+    let path = data_dir.join("nvme-serial");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let s = existing.trim();
+        if s.len() == 20 && s.is_ascii() {
+            return Ok(s.to_string());
+        }
+        // Malformed / legacy content — fall through and re-mint.
+    }
+
+    let mut buf = [0u8; 7];
+    shared_crypto::OsRng.fill_bytes(&mut buf);
+    let rand_hex: String = hex::encode_upper(buf).chars().take(13).collect();
+    let serial = format!("THURVSA{rand_hex}"); // 7 + 13 = 20 ASCII chars
+
+    // Persist atomically: write a temp file, fsync, rename.
+    let tmp = data_dir.join("nvme-serial.tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(serial.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("persist nvme serial to {}", path.display()))?;
+    Ok(serial)
+}
+
 #[derive(Parser)]
 #[command(name = "thurvsad", about = "ThurVSA daemon", version = THURVSA_VERSION_STR)]
 struct Cli {
@@ -428,6 +469,14 @@ async fn main() -> Result<()> {
     // when no sender is wired.
     let (upload_tx, upload_rx) = upload_worker::upload_channel();
 
+    // Cache-eviction wakeup signal (issue #225). The upload worker
+    // fires it after each successful upload (a chunk that just became
+    // evictable); the eviction worker selects on it (debounced) so a
+    // cache-full write burst recovers within the ~30 s backpressure
+    // deadline instead of waiting up to the 300 s interval backstop.
+    // Same shape as VTL's upload-completion Notify.
+    let disk_cache_evict_notify = Arc::new(tokio::sync::Notify::new());
+
     let (registry, volumes, caches, backends, keystores) = discovery::discover_and_register(
         &data_dir,
         &cfg.storage,
@@ -458,10 +507,16 @@ async fn main() -> Result<()> {
         let registry = Arc::clone(&registry);
         let backends = Arc::clone(&admin_backends);
         let max_concurrent = max_concurrent_flushes;
+        let evict_notify = Arc::clone(&disk_cache_evict_notify);
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                upload_worker::run_upload_worker(upload_rx, registry, backends, max_concurrent)
-                    .await
+            if let Err(e) = upload_worker::run_upload_worker(
+                upload_rx,
+                registry,
+                backends,
+                max_concurrent,
+                evict_notify,
+            )
+            .await
             {
                 tracing::error!("upload worker exited with error: {e:?}");
             }
@@ -696,6 +751,9 @@ async fn main() -> Result<()> {
                 if let Err(e) = shared_naming::validate_nqn(&subnqn) {
                     anyhow::bail!("invalid nvmetcp.subnqn in {}: {e}", config_path.display());
                 }
+                // Persistent NVMe controller serial — minted once, stable
+                // across boots and volume create/destroy (issue #224).
+                let nvme_serial = resolve_nvme_serial(&data_dir)?;
                 // Per-subsystem controller registry + AER hub. One instance
                 // shared between the dispatcher (reservation-event producer)
                 // and the NVMe/TCP transport (CNTLID allocator + AER
@@ -716,11 +774,8 @@ async fn main() -> Result<()> {
                 let handler = Arc::new(nvme_nvm::NvmeNvmDispatcher::new(
                     Arc::clone(&registry) as Arc<dyn nvme_nvm::NamespaceLookup>,
                     subnqn.clone(),
-                    // SN: 20 ASCII chars, fingerprint of the data dir.
-                    // Keep simple for now — the data dir basename plus the
-                    // volume count is stable across reboots for an
-                    // unchanged install.
-                    format!("THURVSA{:013}", volumes.len()),
+                    // SN: 20 ASCII chars, persistent across boots (#224).
+                    nvme_serial.clone(),
                     shared_naming::DISK_PRODUCT.to_string(),
                     // FR: 8 ASCII chars on the wire — IdentifyController
                     // truncates anything longer (the SHA suffix is the
@@ -859,7 +914,7 @@ async fn main() -> Result<()> {
                         io_traddr,
                         sectype,
                         treq,
-                        format!("THURVSA{:013}", volumes.len()),
+                        nvme_serial.clone(),
                         shared_naming::DISK_PRODUCT.to_string(),
                         THURVSA_VERSION_STR.to_string(),
                     ));
@@ -944,6 +999,7 @@ async fn main() -> Result<()> {
         ua_tracker: ua_tracker_for_admin,
         admission: Arc::clone(&admission_view),
         auth: auth_state.clone(),
+        create_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let admin_socket = admin::admin_socket_path();
 
@@ -978,6 +1034,7 @@ async fn main() -> Result<()> {
         let bounds = cfg.disk_cache.bounds();
         let storage_config_clone = cfg.storage.clone();
         let backend_names: Vec<String> = pool_budgets.keys().cloned().collect();
+        let evict_notify = Arc::clone(&disk_cache_evict_notify);
         Some(tokio::spawn(async move {
             run_disk_cache_eviction_worker(
                 data_dir,
@@ -989,6 +1046,7 @@ async fn main() -> Result<()> {
                 default_size,
                 bounds,
                 storage_config_clone,
+                evict_notify,
             )
             .await;
         }))
@@ -1201,12 +1259,16 @@ async fn wait_for_shutdown() -> Result<()> {
 /// Eviction frees pool bytes *and* wakes any `VolumeWriter` parked
 /// on the backend's `PoolBudget` via `release`.
 ///
-/// Mirrors `core_mediachanger::run_disk_cache_eviction_worker`, minus the
-/// upload-completion `Notify` source: VSA's write path uploads
-/// synchronously inside `write_page`, so there's no batched-upload
-/// burst that would justify an event-driven wakeup. The periodic
-/// backstop tick (`disk_cache.eviction_interval_seconds`, default
-/// 5 min) catches steady-state cache growth.
+/// Mirrors `core_mediachanger::run_disk_cache_eviction_worker`,
+/// including its upload-completion `Notify` source (issue #225): the
+/// async upload worker (`write_page_unsynced` enqueue) lets writes
+/// outrun storage PUTs, so a cache-full write burst is now the normal
+/// shape — `evict_notify` (debounced 250 ms) wakes this worker the
+/// moment uploaded chunks become evictable, so backpressure recovery
+/// tracks the ~30 s `backpressure_max_wait_seconds` deadline instead of
+/// the 5 min interval. The periodic backstop tick
+/// (`disk_cache.eviction_interval_seconds`, default 5 min) still
+/// catches steady-state cache growth and re-resolves `auto` caps.
 #[allow(clippy::too_many_arguments)]
 async fn run_disk_cache_eviction_worker(
     data_dir: std::path::PathBuf,
@@ -1218,14 +1280,26 @@ async fn run_disk_cache_eviction_worker(
     default_size: core_block::DiskCacheSize,
     bounds: core_block::DiskCacheBounds,
     storage_config: shared_object_store::ObjectStoreConfig,
+    evict_notify: Arc<tokio::sync::Notify>,
 ) {
     use core_block::DiskCacheManager;
-    let mut tick = tokio::time::interval(interval);
-    tick.tick().await; // skip the immediate first tick
+    // The interval is now a backstop, not the only wakeup (issue #225):
+    // the upload worker fires `evict_notify` after each successful
+    // upload (a chunk that just became evictable), so a cache-full write
+    // burst recovers within the backpressure deadline instead of waiting
+    // up to `interval`. Mirrors VTL's upload-completion Notify.
+    let mut backstop = tokio::time::interval(interval);
+    backstop.tick().await; // skip the immediate first tick
     // Budget divergence detector cadence — see `reconcile` below.
     let mut last_reconcile = std::time::Instant::now();
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = evict_notify.notified() => {
+                // Coalesce a burst of upload completions into one pass.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            _ = backstop.tick() => {}
+        }
 
         // Recompute per-backend caps for `auto`-mode entries against
         // current free space and push the new ceilings into each
@@ -1342,8 +1416,29 @@ async fn run_runtime_persist_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_discovery_traddr;
+    use super::{resolve_discovery_traddr, resolve_nvme_serial};
     use std::net::IpAddr;
+
+    /// Regression for issue #224: the NVMe serial must be minted once
+    /// and stay byte-identical across boots (the previous
+    /// volume-count-derived value changed on every create/destroy).
+    #[test]
+    fn nvme_serial_is_persistent_and_well_formed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = resolve_nvme_serial(dir.path()).expect("mint serial");
+        assert_eq!(first.len(), 20, "NVMe SN is 20 ASCII chars");
+        assert!(first.is_ascii());
+        assert!(first.starts_with("THURVSA"));
+        // A second resolve (simulating a restart) reads the persisted
+        // value rather than re-minting.
+        let second = resolve_nvme_serial(dir.path()).expect("re-read serial");
+        assert_eq!(first, second, "serial stable across boots");
+        // A malformed (wrong-length) file is re-minted to a valid SN.
+        std::fs::write(dir.path().join("nvme-serial"), "short").expect("seed");
+        let reminted = resolve_nvme_serial(dir.path()).expect("re-mint serial");
+        assert_eq!(reminted.len(), 20);
+        assert!(reminted.starts_with("THURVSA"));
+    }
 
     #[test]
     fn discovery_traddr_derives_from_concrete_bind() {
