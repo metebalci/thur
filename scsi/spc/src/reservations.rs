@@ -373,6 +373,16 @@ struct Persist {
 /// locking would just be ceremony.
 pub struct ReservationManager {
     by_lun: Mutex<BTreeMap<u64, LunState>>,
+    /// Serializes mutations (PROUT / Reservation Register) end-to-end,
+    /// including the durable persist, so the `by_lun` data-path lock is
+    /// NOT held during the fsync chain (issue #181). `allow_read` /
+    /// `allow_write` — one per data-path IO on both transports — only
+    /// take `by_lun`, so they no longer stall behind a peer's
+    /// APTPL-persist fsync (which used to run under `by_lun`, freezing
+    /// IO admission on every LUN of the daemon). Mutations stay
+    /// serialized against each other, so persist-before-ack rollback has
+    /// no concurrent mutation to race and the file write can't tear.
+    mutate_lock: Mutex<()>,
     /// `None` = in-memory only (PTPL not capable). `Some` = persist
     /// APTPL/CPTPL-set LUs to disk (persist-before-ack).
     persist: Option<Persist>,
@@ -398,6 +408,7 @@ impl ReservationManager {
     pub fn new() -> Self {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
+            mutate_lock: Mutex::new(()),
             persist: None,
             observers: Mutex::new(Vec::new()),
         }
@@ -411,6 +422,7 @@ impl ReservationManager {
     pub fn with_persistence(path: PathBuf, resolver: Arc<dyn EntityResolver>) -> Self {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
+            mutate_lock: Mutex::new(()),
             persist: Some(Persist { path, resolver }),
             observers: Mutex::new(Vec::new()),
         }
@@ -426,6 +438,7 @@ impl ReservationManager {
         let by_lun = load_file(&path, resolver.as_ref());
         Self {
             by_lun: Mutex::new(by_lun),
+            mutate_lock: Mutex::new(()),
             persist: Some(Persist { path, resolver }),
             observers: Mutex::new(Vec::new()),
         }
@@ -458,12 +471,22 @@ impl ReservationManager {
     /// counterpart of the load-time UUID validation), and rewrites the
     /// persistence file without it. No-op when the LUN has no state.
     pub fn purge_lun(&self, lun: u64) {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        if map.remove(&lun).is_none() {
-            return;
-        }
-        if let Some(persist) = &self.persist
-            && let Err(e) = persist_to_disk(&map, persist)
+        // Serialize against `mutate` and snapshot under `by_lun`, then
+        // rewrite the file off the data-path lock (issue #181) — same
+        // shape as `mutate`. Best-effort: no rollback (the volume is
+        // already destroyed, and a stale persisted record is dropped at
+        // load by the UUID resolver), so a failed rewrite just warns.
+        let _mutate_guard = self.mutate_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = {
+            let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+            if map.remove(&lun).is_none() {
+                return;
+            }
+            self.persist.is_some().then(|| map.clone())
+        };
+        if let Some(snapshot) = snapshot.as_ref()
+            && let Some(persist) = self.persist.as_ref()
+            && let Err(e) = persist_to_disk(snapshot, persist)
         {
             warn!("reservations: rewrite after purging LUN {lun} failed ({e})");
         }
@@ -483,61 +506,85 @@ impl ReservationManager {
     where
         F: FnOnce(&mut LunState) -> PrOutOutcome,
     {
-        let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
-        let was_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
-        // Snapshot the entry (or its absence) so a failed durable write
-        // can be rolled back atomically.
-        let prior = map.get(&lun).cloned();
-        let outcome = f(map.entry(lun).or_default());
-        if outcome != PrOutOutcome::Good {
-            return outcome;
-        }
-        if let Some(persist) = &self.persist {
-            let now_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
-            if (was_eligible || now_eligible)
-                && let Err(e) = persist_to_disk(&map, persist)
-            {
-                warn!(
-                    "reservations: durable persist to {} failed ({e}); rolling back the mutation",
-                    persist.path.display()
-                );
-                match prior {
-                    Some(state) => {
-                        map.insert(lun, state);
-                    }
-                    None => {
-                        map.remove(&lun);
-                    }
-                }
-                return PrOutOutcome::PersistFailed;
-            }
-        }
+        // Serialize mutations (PROUT / Reservation Register) end-to-end,
+        // INCLUDING the off-`by_lun` durable persist below (issue #181).
+        // The data path's `allow_read` / `allow_write` take only `by_lun`,
+        // so releasing it before the fsync chain stops one APTPL-persist
+        // from freezing IO admission on every LUN of the daemon; holding
+        // `mutate_lock` across the persist keeps mutations serialized, so
+        // the persist-before-ack rollback has no concurrent mutation to
+        // race and the temp-file write can't tear.
+        let _mutate_guard = self.mutate_lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Proactive cross-transport notification (issue #67). Only on a
-        // successful, persisted mutation (every non-Good / PersistFailed
-        // path returned above). Capture the pre/post snapshots while
-        // `by_lun` is still held, then RELEASE it before firing observers
-        // — the sinks take other locks (NVMe aer hub, iSCSI UA tracker /
-        // session table) and must never run while `by_lun` is held. The
-        // empty-observer fast path keeps the hot path (and every unit
-        // test) clone-free.
-        let observers = {
-            let obs = self.observers.lock().unwrap_or_else(|p| p.into_inner());
-            if obs.is_empty() {
+        // Apply the in-memory mutation under `by_lun`, snapshot everything
+        // the post-mutation steps need, then release `by_lun` before the
+        // fsync. A non-`Good` outcome touches nothing on disk and returns
+        // immediately. `prior` is the pre-mutation entry, captured so a
+        // failed durable write can be rolled back; `mutate_lock` makes
+        // that rollback unambiguous (no other mutation could have run).
+        let (prior, persist_snapshot, observers, pre, post) = {
+            let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+            let was_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
+            let prior = map.get(&lun).cloned();
+            let outcome = f(map.entry(lun).or_default());
+            if outcome != PrOutOutcome::Good {
                 return outcome;
             }
-            obs.clone()
+            let now_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
+            // Clone the full persist set under the lock; `mutate_lock`
+            // guarantees it's still current when persist_to_disk runs.
+            let persist_snapshot = (self.persist.is_some() && (was_eligible || now_eligible))
+                .then(|| map.clone());
+            // Empty-observer fast path keeps the hot path clone-free.
+            let observers = {
+                let obs = self.observers.lock().unwrap_or_else(|p| p.into_inner());
+                if obs.is_empty() {
+                    None
+                } else {
+                    Some(obs.clone())
+                }
+            };
+            let pre = snapshot_of(prior.as_ref());
+            let post = snapshot_of(map.get(&lun));
+            (prior, persist_snapshot, observers, pre, post)
         };
-        let pre = snapshot_of(prior.as_ref());
-        let post = snapshot_of(map.get(&lun));
-        drop(map);
-        let changes = diff_reservation_changes(action, lun, issuer, &pre, &post);
-        if !changes.is_empty() {
-            for observer in &observers {
-                observer.on_reservation_change(&changes);
+
+        // Durable persist OFF the `by_lun` lock. On failure, roll the
+        // in-memory mutation back (persist-before-ack: a fence the host
+        // believes failed must not silently linger or survive a restart).
+        if let Some(snapshot) = persist_snapshot.as_ref()
+            && let Some(persist) = self.persist.as_ref()
+            && let Err(e) = persist_to_disk(snapshot, persist)
+        {
+            warn!(
+                "reservations: durable persist to {} failed ({e}); rolling back the mutation",
+                persist.path.display()
+            );
+            let mut map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
+            match prior {
+                Some(state) => {
+                    map.insert(lun, state);
+                }
+                None => {
+                    map.remove(&lun);
+                }
+            }
+            return PrOutOutcome::PersistFailed;
+        }
+
+        // Proactive cross-transport notification (issue #67), off every
+        // lock — the sinks take other locks (NVMe aer hub, iSCSI UA
+        // tracker / session table) and must never run while `by_lun` is
+        // held.
+        if let Some(observers) = observers {
+            let changes = diff_reservation_changes(action, lun, issuer, &pre, &post);
+            if !changes.is_empty() {
+                for observer in &observers {
+                    observer.on_reservation_change(&changes);
+                }
             }
         }
-        outcome
+        PrOutOutcome::Good
     }
 
     /// Allow / deny a READ-side opcode. The data path calls this
@@ -2051,6 +2098,49 @@ mod tests {
             snap.generation, 2,
             "generation preserved, not bumped on reload"
         );
+    }
+
+    /// Regression for issue #181: a mutation's durable persist runs OFF
+    /// the `by_lun` data-path lock, so `allow_read` / `allow_write` on
+    /// other LUNs are not gated behind a peer's APTPL-persist fsync.
+    /// Exercises the interleaving for deadlock-freedom and correctness
+    /// (the old code held `by_lun` across the fsync, so this same shape
+    /// would have serialized every read behind the persisting writer).
+    #[test]
+    fn persist_runs_off_the_data_path_lock() {
+        use std::sync::Arc;
+        let dir = tmp_dir("concurrent-persist");
+        let path = dir.join("reservations.json");
+        let resolver: Arc<dyn EntityResolver> =
+            Arc::new(MapResolver(vec![([0xA1u8; 16], 0), ([0xB2u8; 16], 1)]));
+        let mgr = Arc::new(ReservationManager::load_from(path, resolver));
+
+        // Churn the APTPL persist path on LUN 0 from another thread.
+        let writer = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || {
+                let a = Nexus::iscsi(Some("iqn.test:a".into()), [1u8; 6]);
+                for _ in 0..100 {
+                    // REGISTER K then deregister — each persists (APTPL=1).
+                    assert_eq!(
+                        mgr.prout(0, 0x06, 0, 0, &params(0, 0xAAAA, true), 24, &a, true),
+                        PrOutOutcome::Good
+                    );
+                    assert_eq!(
+                        mgr.prout(0, 0x06, 0, 0, &params(0xAAAA, 0, true), 24, &a, true),
+                        PrOutOutcome::Good
+                    );
+                }
+            })
+        };
+
+        // LUN 1 has no reservation, so every read must be allowed and must
+        // not deadlock or stall waiting on LUN 0's persist fsync.
+        let b = Nexus::iscsi(Some("iqn.test:b".into()), [2u8; 6]);
+        for _ in 0..200 {
+            assert!(mgr.allow_read(1, &b), "unrelated LUN must stay readable");
+        }
+        writer.join().expect("persisting thread must not deadlock or panic");
     }
 
     #[test]
