@@ -103,6 +103,17 @@ pub enum SmcError {
     #[error("invalid drive ID: {0}")]
     InvalidDrive(usize),
 
+    /// A `cartridge.migrate` (or tiering move) holds this cartridge:
+    /// the load path refuses to mount it until the migration completes
+    /// so the destructive backend-flip + source-object-delete phase
+    /// cannot race host writes appended through a concurrent MOVE
+    /// MEDIUM (issue #212). Mapped at the iSCSI layer to CHECK
+    /// CONDITION + NOT READY (key 0x02) + ASC/ASCQ 0x04/0x07 ("LOGICAL
+    /// UNIT NOT READY, OPERATION IN PROGRESS") — transient; the load
+    /// succeeds once the migration finishes.
+    #[error("cartridge '{0}' is being migrated — retry after the migration completes")]
+    CartridgeMigrating(String),
+
     #[error("cartridge not found: {0}")]
     CartridgeNotFound(String),
 

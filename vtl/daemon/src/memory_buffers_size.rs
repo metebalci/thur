@@ -1,17 +1,19 @@
 // Copyright (c) 2026 Mete Balci
 // SPDX-License-Identifier: Apache-2.0
 
-//! `memory_buffers.{write,read}_gb_per_tape` config shape — accepts
-//! either an explicit GB count (`write_gb_per_tape: 10`) or the
-//! literal string `auto` (`write_gb_per_tape: auto`).
+//! `memory_buffers.write_gb_per_tape` config shape — accepts either
+//! an explicit GB count (`write_gb_per_tape: 10`) or the literal
+//! string `auto` (`write_gb_per_tape: auto`).
 //!
 //! `Auto` resolves once at daemon boot against `/proc/meminfo
-//! MemTotal` and the chassis `num_drives`. Total memory-buffer
-//! footprint is bounded at boot to `auto_host_fraction_pct` of host
-//! RAM, divided across drives, then split 2:1 between write and read
-//! (preserving the historical `10 GB write` / `5 GB read` default
-//! ratio). Each field is clamped to `[auto_min_gb_per_tape,
-//! auto_max_gb_per_tape]`.
+//! MemTotal` and the chassis `num_drives`. The write-staging buffer
+//! is bounded at boot to a `2/3` share of `auto_host_fraction_pct` of
+//! host RAM divided across drives (preserving the historical `10 GB`
+//! write default — the residual `1/3` once nominally reserved for a
+//! read buffer was never actually allocated and the read-side knob
+//! was removed in issue #215). Clamped to `[auto_min_gb_per_tape,
+//! auto_max_gb_per_tape]`. (Read-ahead is the per-backend prefetch
+//! manager driven by `read_prefetch_chunks_ahead`, not a RAM buffer.)
 //!
 //! Mirrors the `disk_cache_size` pattern in `shared-pool` — same
 //! `Auto | Explicit(u64)` shape, same custom `Deserialize` accepting
@@ -29,16 +31,17 @@ use serde::{Deserialize, Serialize};
 
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 
-/// Numerator / denominator for splitting the per-tape auto budget
-/// between write and read buffers under `Auto`. `2/3` for write,
-/// `1/3` for read preserves the historical `10 GB / 5 GB` default.
+/// Numerator / denominator for the per-tape write-staging buffer's
+/// share of the auto budget. `2/3` preserves the historical `10 GB`
+/// write default (the residual `1/3` once nominally reserved for a
+/// read buffer was never allocated — issue #215). The `READ` pair is
+/// retained only to exercise the generic split in tests.
 pub const AUTO_WRITE_SHARE_NUM: u64 = 2;
 pub const AUTO_WRITE_SHARE_DEN: u64 = 3;
 pub const AUTO_READ_SHARE_NUM: u64 = 1;
 pub const AUTO_READ_SHARE_DEN: u64 = 3;
 
-/// Operator-facing shape of `memory_buffers.write_gb_per_tape` and
-/// `memory_buffers.read_gb_per_tape`.
+/// Operator-facing shape of `memory_buffers.write_gb_per_tape`.
 ///
 /// - `Explicit(n)` pins the per-tape buffer to exactly `n` GB
 ///   (bounds ignored — the operator chose). Total memory_buffers
@@ -77,8 +80,7 @@ impl MemoryBuffersSize {
     ///
     /// `share_num / share_den` is this field's slice of the per-tape
     /// auto budget — use [`AUTO_WRITE_SHARE_NUM`] / [`AUTO_WRITE_SHARE_DEN`]
-    /// for write, [`AUTO_READ_SHARE_NUM`] / [`AUTO_READ_SHARE_DEN`]
-    /// for read.
+    /// for the write-staging buffer (the only production caller).
     pub fn resolve_bytes(
         &self,
         host_mem_bytes: u64,
@@ -154,8 +156,7 @@ impl<'de> Deserialize<'de> for MemoryBuffersSize {
 }
 
 /// Min/max per-tape GB applied when [`MemoryBuffersSize::Auto`]
-/// resolves. Both `write_gb_per_tape` and `read_gb_per_tape` share
-/// the same bounds at the call site; explicit values ignore them.
+/// resolves `write_gb_per_tape`; explicit values ignore them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBuffersBounds {
     pub min_gb: u64,

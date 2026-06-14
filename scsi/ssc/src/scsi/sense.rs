@@ -290,6 +290,14 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
             // surface this when their internal buffer is overcommitted.
             SenseDataBuilder::new(SenseKey::NotReady, ASC_NOT_READY_OPERATION_IN_PROGRESS).build()
         }
+        // A cartridge migrate / tiering move holds this cartridge; the
+        // load was refused so the destructive flip/delete phase can't
+        // race host writes (issue #212). Transient — same NOT READY,
+        // OPERATION IN PROGRESS as backpressure; the load succeeds
+        // once the migration completes.
+        SmcError::CartridgeMigrating(_) => {
+            SenseDataBuilder::new(SenseKey::NotReady, ASC_NOT_READY_OPERATION_IN_PROGRESS).build()
+        }
         // `SmcError` is `#[non_exhaustive]`; new variants from a
         // future revision get a generic Internal Target Failure here
         // until they earn a tailored sense mapping.

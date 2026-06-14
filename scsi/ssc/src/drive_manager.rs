@@ -8,7 +8,7 @@ use core_mediachanger::{
     Cartridge, CartridgeOpenMode, CompressionAlgo, DriveCompressionState, DrivePageStore,
     DriveState, GhostList, LibraryDriveState, PoolBudget,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,6 +80,15 @@ pub struct DriveManager {
     /// not reach the keystore at boot (load_cartridge refuses
     /// rather than silently producing plaintext-vs-ciphertext mix).
     dek_cache: Arc<Mutex<HashMap<String, [u8; shared_crypto::KEY_LEN]>>>,
+    /// Barcodes currently held by a `cartridge.migrate` / tiering
+    /// move. `load_cartridge` refuses to mount a barcode in this set
+    /// so a backup job can't load + append to a cartridge mid-migrate
+    /// — the copy-then-flip-then-delete sequence would otherwise drop
+    /// or orphan chunks sealed during the window (issue #212). The
+    /// daemon's migrate job marks the barcode before the copy phase
+    /// and clears it on completion via [`Self::try_begin_migration`] /
+    /// [`Self::end_migration`].
+    migrating: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Drive - represents a single tape drive
@@ -183,6 +192,7 @@ impl DriveManager {
             state_file,
             library_lto_generation: 0,
             dek_cache: Arc::new(Mutex::new(HashMap::new())),
+            migrating: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -207,6 +217,36 @@ impl DriveManager {
         if let Ok(mut g) = self.dek_cache.lock() {
             g.remove(cartridge_label);
         }
+    }
+
+    /// Claim `cartridge_label` for an in-progress migration (issue
+    /// #212). Returns `true` if the claim was taken, `false` if the
+    /// barcode is already being migrated (a second concurrent migrate
+    /// of the same cartridge must refuse). While claimed,
+    /// `load_cartridge` refuses to mount the barcode. The daemon's
+    /// migrate job pairs this with [`Self::end_migration`] on every
+    /// exit path (a poisoned lock fails closed — no claim, so the
+    /// caller refuses the migrate rather than racing host writes).
+    pub fn try_begin_migration(&self, cartridge_label: &str) -> bool {
+        match self.migrating.lock() {
+            Ok(mut g) => g.insert(cartridge_label.to_string()),
+            Err(_) => false,
+        }
+    }
+
+    /// Release a migration claim taken by [`Self::try_begin_migration`].
+    pub fn end_migration(&self, cartridge_label: &str) {
+        if let Ok(mut g) = self.migrating.lock() {
+            g.remove(cartridge_label);
+        }
+    }
+
+    /// True if `cartridge_label` is currently held by a migration.
+    pub fn is_migrating(&self, cartridge_label: &str) -> bool {
+        self.migrating
+            .lock()
+            .map(|g| g.contains(cartridge_label))
+            .unwrap_or(false)
     }
 
     /// Set the library-wide drive LTO generation. Called once during
@@ -473,6 +513,21 @@ impl DriveManager {
     /// cannot create cartridges automatically.
     pub fn load_cartridge(&self, drive_id: usize, cartridge_label: &str) -> Result<(), SmcError> {
         let mut drive = self.drive_lock(drive_id)?;
+
+        // Refuse to mount a cartridge a migrate / tiering move is
+        // copying (issue #212): the migrate's copy-then-flip-then-delete
+        // sequence assumes a stable chunk set, so appending to it here
+        // would orphan or drop chunks sealed during the window. The
+        // SMC MOVE MEDIUM caller rolls the inventory move back and
+        // surfaces NOT READY / OPERATION IN PROGRESS — transient, the
+        // host retries once the migration finishes.
+        if self.is_migrating(cartridge_label) {
+            warn!(
+                "load_cartridge refused: cartridge {} is being migrated",
+                cartridge_label
+            );
+            return Err(SmcError::CartridgeMigrating(cartridge_label.to_string()));
+        }
 
         // Appliance-side at-rest DEK lookup. Peek the manifest first
         // so we know whether the cartridge needs a key; if it does,
@@ -1071,6 +1126,44 @@ mod tests {
         let mut mgr8 = DriveManager::new(1, tapes_root.clone());
         mgr8.set_library_lto_generation(8);
         mgr8.load_cartridge(0, "STD8L8").unwrap();
+    }
+
+    /// Regression for issue #212: while a cartridge is claimed by a
+    /// migration, `load_cartridge` must refuse it (so a concurrent
+    /// MOVE MEDIUM can't append chunks the migrate would then drop or
+    /// orphan); the claim is exclusive, and once released the load
+    /// succeeds again.
+    #[test]
+    fn migrating_cartridge_refuses_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+
+        let mgr = DriveManager::new(1, tapes_root.clone());
+        Cartridge::create_with_chunking(
+            &tapes_root,
+            "MIG001",
+            core_mediachanger::ChunkingMode::fastcdc_default(),
+            8,
+            "primary",
+            false,
+            core_mediachanger::DedupScope::Local,
+        )
+        .unwrap();
+
+        // Claim is exclusive.
+        assert!(mgr.try_begin_migration("MIG001"));
+        assert!(!mgr.try_begin_migration("MIG001"));
+        assert!(mgr.is_migrating("MIG001"));
+
+        // Load is refused with the transient migrating error.
+        let err = mgr.load_cartridge(0, "MIG001").unwrap_err();
+        assert!(matches!(err, SmcError::CartridgeMigrating(ref b) if b == "MIG001"));
+
+        // Release → load succeeds.
+        mgr.end_migration("MIG001");
+        assert!(!mgr.is_migrating("MIG001"));
+        mgr.load_cartridge(0, "MIG001").unwrap();
     }
 
     #[test]

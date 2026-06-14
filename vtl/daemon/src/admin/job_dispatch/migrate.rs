@@ -34,7 +34,37 @@ use serde::Deserialize;
 use serde_json::json;
 use shared_admin_server::{JobEmitter, JobEvent};
 
+use crate::iscsi::drive_manager::DriveManager;
 use crate::state::DaemonState;
+
+/// RAII migration claim (issue #212). Marks the barcode in-migration
+/// in the `DriveManager` so the SCSI/admin load path refuses to mount
+/// it for the migrate's whole lifetime, and clears the mark on drop
+/// (every exit path — Ok, Err, early return, panic). `acquire` returns
+/// `None` if another migration already holds the barcode.
+struct MigrationGuard {
+    drive_manager: Arc<DriveManager>,
+    barcode: String,
+}
+
+impl MigrationGuard {
+    fn acquire(drive_manager: Arc<DriveManager>, barcode: &str) -> Option<Self> {
+        if drive_manager.try_begin_migration(barcode) {
+            Some(Self {
+                drive_manager,
+                barcode: barcode.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        self.drive_manager.end_migration(&self.barcode);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct MigrateParams {
@@ -84,6 +114,32 @@ pub async fn run(emitter: JobEmitter, body: serde_json::Value, state: Arc<Daemon
     // Pre-flight gates. Each emits a Done(2) with an explanatory
     // string and writes a failure audit entry.
     if let Err(reason) = preflight(&params, &state).await {
+        audit_failure(&state, op, actor.clone(), &params, &reason);
+        emitter.emit(JobEvent::done_with_error(2, reason)).await;
+        return;
+    }
+
+    // Hold the cartridge against a concurrent host load for the whole
+    // migrate (issue #212): the load path refuses a migrating barcode,
+    // so a backup job can't MOVE MEDIUM it into a drive and append
+    // chunks while the copy-then-flip-then-delete sequence runs. Held
+    // until `_mig_guard` drops at the end of this function.
+    let _mig_guard = match MigrationGuard::acquire(state.drive_manager.clone(), &params.barcode) {
+        Some(g) => g,
+        None => {
+            let reason = format!("cartridge '{}' is already being migrated", params.barcode);
+            audit_failure(&state, op, actor.clone(), &params, &reason);
+            emitter.emit(JobEvent::done_with_error(2, reason)).await;
+            return;
+        }
+    };
+    // Re-check not-loaded now the claim is set — closes the window
+    // where a load landed between the preflight check and the claim.
+    if let Ok(Some(drive_id)) = find_drive_for_loaded_cartridge(&state.data_dir, &params.barcode) {
+        let reason = format!(
+            "cartridge '{}' was loaded on drive {} during migrate setup — unload it first",
+            params.barcode, drive_id
+        );
         audit_failure(&state, op, actor.clone(), &params, &reason);
         emitter.emit(JobEvent::done_with_error(2, reason)).await;
         return;
@@ -307,6 +363,17 @@ pub(crate) async fn migrate_one(
         }
         Ok(None) => {}
         Err(e) => return Err(format!("inventory check: {e}")),
+    }
+
+    // Hold the cartridge against a concurrent host load for the whole
+    // move (issue #212). Held until `_mig_guard` drops at return.
+    let _mig_guard = MigrationGuard::acquire(state.drive_manager.clone(), barcode)
+        .ok_or_else(|| format!("cartridge '{barcode}' is already being migrated"))?;
+    // Re-check not-loaded with the claim set (closes the preflight→claim window).
+    if let Ok(Some(drive_id)) = find_drive_for_loaded_cartridge(&state.data_dir, barcode) {
+        return Err(format!(
+            "cartridge '{barcode}' was loaded on drive {drive_id} during migrate setup — unload it first"
+        ));
     }
 
     let manifest_path = state

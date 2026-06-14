@@ -32,6 +32,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Upper bound on the best-effort MOVE MEDIUM legal-hold post-hook's
+/// storage round trip (issue #213). The hook runs inline in the
+/// per-connection command loop, so a blackholed backend would
+/// otherwise stall every queued command on the session for the SDK's
+/// full retry budget (minutes). Past this bound we treat the cartridge
+/// as not-held — the same default a fetch failure already yields — so
+/// the response and the commands behind it proceed. Generous enough
+/// for a healthy GET plus first-use backend construction (auth round
+/// trip), well under typical host SCSI command timeouts.
+const LEGAL_HOLD_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -321,13 +333,28 @@ impl ScsiHandler for IscsiLibraryHandler {
             && let Ok(Some((barcode, backend_name))) =
                 self.drive_manager.get_loaded_cartridge_info(drive_id)
         {
-            let held = protocol::read_legal_hold_at_load(
-                &self.storage_backends,
-                &self.storage_config,
-                &backend_name,
-                &barcode,
+            let held = match tokio::time::timeout(
+                LEGAL_HOLD_HOOK_TIMEOUT,
+                protocol::read_legal_hold_at_load(
+                    &self.storage_backends,
+                    &self.storage_config,
+                    &backend_name,
+                    &barcode,
+                ),
             )
-            .await;
+            .await
+            {
+                Ok(h) => h,
+                Err(_) => {
+                    tracing::warn!(
+                        "iSCSI legal-hold post-hook: backend '{}' did not answer within {:?} for cartridge {} - treating as not held",
+                        backend_name,
+                        LEGAL_HOLD_HOOK_TIMEOUT,
+                        barcode
+                    );
+                    false
+                }
+            };
             if let Err(e) = self.drive_manager.set_legal_held(drive_id, held) {
                 tracing::warn!(
                     "iSCSI legal-hold post-hook: failed to set flag on drive {}: {}",

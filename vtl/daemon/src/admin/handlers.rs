@@ -447,15 +447,18 @@ pub async fn cartridge_info(
         }
     };
 
-    let blocks = manifest["blocks"].as_array();
-    let total_blocks = blocks.map_or(0, |b| b.len());
-    let filemarks = blocks.map_or(0, |b| {
-        b.iter()
-            .filter(|x| x["kind"].as_str() == Some("Filemark"))
-            .count()
-    });
-    let data_bytes: u64 = blocks.map_or(0, |b| b.iter().filter_map(|x| x["len"].as_u64()).sum());
-    let chunk_count = manifest["chunks"].as_array().map_or(0, |c| c.len());
+    // Per-block / per-chunk metadata no longer lives in the
+    // creation-frozen manifest — it moved into `blocks-p<N>.idx` /
+    // `chunks.idx` (issue #210). Derive the counts from those index
+    // files; the blocking pread walk runs off the async runtime.
+    let stats_root = tapes_root.join(&barcode);
+    let stats = tokio::task::spawn_blocking(move || derive_cartridge_index_stats(&stats_root))
+        .await
+        .unwrap_or_default();
+    let total_blocks = stats.total_blocks;
+    let filemarks = stats.filemarks;
+    let data_bytes = stats.data_bytes;
+    let chunk_count = stats.chunk_count;
     let backend = manifest["backend"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -2665,23 +2668,110 @@ pub async fn system_reset_stats(
     .into_response()
 }
 
-/// Best-effort read of `next_lba` and total block count from a
-/// loaded cartridge's manifest. Errors collapse to `(None, None)` —
-/// drive status is informational and shouldn't fail just because a
-/// manifest momentarily isn't readable.
+/// On-disk index stats for one cartridge, derived from
+/// `blocks-p<N>.idx` + `chunks.idx` — the authoritative source after
+/// per-block / per-chunk metadata moved out of the creation-frozen
+/// `manifest.json` (issue #210). `total_blocks` and `chunk_count` are
+/// O(1) record counts; `filemarks` and `data_bytes` need a batched
+/// block-record scan. Best-effort: a missing / unreadable / corrupt
+/// index stops the affected scan and the partial counts are returned
+/// (an info call must not hard-fail). Blocking pread I/O — call it
+/// inside `spawn_blocking`.
+#[derive(Default)]
+struct CartridgeIndexStats {
+    total_blocks: usize,
+    filemarks: usize,
+    data_bytes: u64,
+    chunk_count: usize,
+}
+
+fn derive_cartridge_index_stats(root: &std::path::Path) -> CartridgeIndexStats {
+    use core_mediachanger::BlockKind;
+    use core_mediachanger::block_index::BlockIndexFile;
+    use core_mediachanger::chunk_index::ChunkIndexFile;
+
+    const BATCH: usize = 4096;
+    let mut stats = CartridgeIndexStats::default();
+
+    // Partitions are contiguous from 0; stop at the first absent file.
+    // Guard with `is_file()` so we never create an index for a
+    // cartridge that has none (open_or_create would otherwise touch it).
+    for partition in 0u8.. {
+        if !BlockIndexFile::path_for(root, partition).is_file() {
+            break;
+        }
+        let bif = match BlockIndexFile::open_or_create(root, partition) {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+        let next_lba = bif.next_lba();
+        stats.total_blocks = stats.total_blocks.saturating_add(next_lba as usize);
+        let mut lba = 0u64;
+        'scan: while lba < next_lba {
+            let n = ((next_lba - lba) as usize).min(BATCH);
+            let run = match bif.read_run(lba, n) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            for rec in run {
+                let Ok(r) = rec else { break 'scan };
+                if matches!(r.kind, BlockKind::Filemark) {
+                    stats.filemarks += 1;
+                }
+                stats.data_bytes = stats.data_bytes.saturating_add(r.len as u64);
+            }
+            lba += n as u64;
+        }
+    }
+
+    if ChunkIndexFile::path_for(root).is_file()
+        && let Ok(cif) = ChunkIndexFile::open_or_create(root)
+    {
+        stats.chunk_count = cif.next_id() as usize;
+    }
+
+    stats
+}
+
+/// Best-effort read of `next_lba` (active partition's append point)
+/// and whole-cartridge block count from a cartridge's on-disk block
+/// indexes. Both are O(1) record counts; errors / absent cartridge
+/// collapse to `(None, None)` — drive status is informational and
+/// shouldn't fail just because the indexes momentarily aren't readable.
 async fn read_position(data_dir: &std::path::Path, barcode: &str) -> (Option<u64>, Option<usize>) {
-    let manifest_path = data_dir.join("tapes").join(barcode).join("manifest.json");
-    let content = match tokio::fs::read_to_string(&manifest_path).await {
-        Ok(s) => s,
-        Err(_) => return (None, None),
-    };
-    let v: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return (None, None),
-    };
-    let next_lba = v["next_lba"].as_u64();
-    let total_blocks = v["blocks"].as_array().map(|b| b.len());
-    (next_lba, total_blocks)
+    let root = data_dir.join("tapes").join(barcode);
+    // Active partition lives in the runtime sidecar (default 0).
+    let active = tokio::fs::read_to_string(root.join("runtime.json"))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["active_partition"].as_u64())
+        .unwrap_or(0) as u8;
+
+    tokio::task::spawn_blocking(move || {
+        use core_mediachanger::block_index::BlockIndexFile;
+        if !BlockIndexFile::path_for(&root, 0).is_file() {
+            return (None, None);
+        }
+        let mut total_blocks: usize = 0;
+        let mut next_lba: Option<u64> = None;
+        for partition in 0u8.. {
+            if !BlockIndexFile::path_for(&root, partition).is_file() {
+                break;
+            }
+            let Ok(bif) = BlockIndexFile::open_or_create(&root, partition) else {
+                break;
+            };
+            let n = bif.next_lba();
+            total_blocks = total_blocks.saturating_add(n as usize);
+            if partition == active {
+                next_lba = Some(n);
+            }
+        }
+        (next_lba, Some(total_blocks))
+    })
+    .await
+    .unwrap_or((None, None))
 }
 
 #[cfg(test)]
@@ -2902,6 +2992,59 @@ mod tests {
         let (lba, blocks) = rt.block_on(read_position(dir.path(), "ABSENT"));
         assert!(lba.is_none());
         assert!(blocks.is_none());
+    }
+
+    /// Regression for issue #210: cartridge info / drive position must
+    /// derive counts from `blocks-p<N>.idx` + `chunks.idx`, not the
+    /// long-gone `manifest["blocks"]` / `["chunks"]` arrays. A populated
+    /// cartridge must report non-zero blocks / filemarks / bytes /
+    /// chunks rather than the old all-zero result.
+    #[test]
+    fn index_stats_and_position_read_from_index_files() {
+        use core_mediachanger::block_index::{BlockIndexFile, BlockRec};
+        use core_mediachanger::chunk_index::{ChunkIndexFile, ChunkRec, LocationTag};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tapes = dir.path().join("tapes");
+        let root = tapes.join("TAPE210");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        // Partition 0: two data blocks (100 + 250 bytes) + one filemark.
+        let p0 = BlockIndexFile::open_or_create(&root, 0).expect("p0");
+        let mut data = BlockRec::data();
+        data.len = 100;
+        p0.append(&data).expect("d0");
+        data.len = 250;
+        p0.append(&data).expect("d1");
+        p0.append(&BlockRec::filemark(0, 0)).expect("fm");
+        p0.fsync().expect("fsync p0");
+
+        // Two chunk records.
+        let cif = ChunkIndexFile::open_or_create(&root).expect("cif");
+        for byte in [1u8, 2u8] {
+            cif.append(&ChunkRec {
+                size: 4096,
+                hash: Some("a".repeat(64)),
+                location: LocationTag::LocalOnly,
+                uploaded: false,
+                compression: None,
+            })
+            .expect("append chunk");
+            let _ = byte;
+        }
+        cif.fsync().expect("fsync cif");
+
+        let stats = derive_cartridge_index_stats(&root);
+        assert_eq!(stats.total_blocks, 3);
+        assert_eq!(stats.filemarks, 1);
+        assert_eq!(stats.data_bytes, 350);
+        assert_eq!(stats.chunk_count, 2);
+
+        // Active partition 0: next_lba = record count = 3.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (lba, blocks) = rt.block_on(read_position(dir.path(), "TAPE210"));
+        assert_eq!(lba, Some(3));
+        assert_eq!(blocks, Some(3));
     }
 
     #[test]

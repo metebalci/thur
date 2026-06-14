@@ -21,7 +21,7 @@ use clap::Parser;
 use memory_buffer_manager::MemoryBufferManager;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 // `THURVTL_VERSION` is set by build.rs to "<crate-ver> (<sha>[-dirty])".
@@ -328,23 +328,21 @@ impl OtlpFileConfig {
 /// working set is large (sequential streams with deep prefetch) and
 /// you have RAM to spare.
 ///
-/// `write_gb_per_tape` / `read_gb_per_tape` each accept either an
-/// integer GB count or the literal `"auto"`. Under `auto` the
-/// daemon reads `/proc/meminfo MemTotal` once at boot, divides
-/// `auto_host_fraction_pct` of host RAM across `library.num_drives`,
-/// splits 2:1 between write and read, and clamps each field to
+/// `write_gb_per_tape` accepts either an integer GB count or the
+/// literal `"auto"`. Under `auto` the daemon reads `/proc/meminfo
+/// MemTotal` once at boot, divides `auto_host_fraction_pct` of host
+/// RAM across `library.num_drives`, and clamps to
 /// `[auto_min_gb_per_tape, auto_max_gb_per_tape]`. Total resolved
-/// footprint (`(write + read) × num_drives`) is then safety-checked
-/// against `safety_max_host_fraction_pct` of MemTotal and the
-/// daemon refuses to start if exceeded.
+/// footprint (`write × num_drives`) is then safety-checked against
+/// `safety_max_host_fraction_pct` of MemTotal and the daemon refuses
+/// to start if exceeded. (Read-ahead is governed separately by
+/// `read_prefetch_chunks_ahead` + the per-backend prefetch manager;
+/// there is deliberately no read-side RAM buffer knob — issue #215.)
 #[derive(Debug, Deserialize, Clone)]
 struct MemoryBuffersConfig {
     /// Write-staging buffer size per tape. Integer GB or `"auto"`.
     #[serde(default)]
     write_gb_per_tape: memory_buffers_size::MemoryBuffersSize,
-    /// Read-prefetch buffer size per tape. Integer GB or `"auto"`.
-    #[serde(default)]
-    read_gb_per_tape: memory_buffers_size::MemoryBuffersSize,
     /// How many chunks ahead of the current read LBA the prefetcher
     /// pulls. 0 disables prefetch; 1-3 typical.
     #[serde(default = "default_read_prefetch_chunks_ahead")]
@@ -356,9 +354,9 @@ struct MemoryBuffersConfig {
     #[serde(default = "default_auto_host_fraction_pct")]
     auto_host_fraction_pct: u64,
     /// Fraction (percent) of `MemTotal` that the resolved total
-    /// memory_buffers footprint (`(write + read) × num_drives`) is
-    /// not allowed to exceed. Applies to both auto- and explicit-
-    /// resolved fields — catches operator overrides that overcommit.
+    /// memory_buffers footprint (`write × num_drives`) is not allowed
+    /// to exceed. Applies to both auto- and explicit-resolved values —
+    /// catches operator overrides that overcommit.
     /// The daemon refuses to start if exceeded. Range 1-100.
     #[serde(default = "default_safety_max_host_fraction_pct")]
     safety_max_host_fraction_pct: u64,
@@ -393,7 +391,6 @@ impl Default for MemoryBuffersConfig {
     fn default() -> Self {
         Self {
             write_gb_per_tape: memory_buffers_size::MemoryBuffersSize::default(),
-            read_gb_per_tape: memory_buffers_size::MemoryBuffersSize::default(),
             read_prefetch_chunks_ahead: default_read_prefetch_chunks_ahead(),
             auto_host_fraction_pct: default_auto_host_fraction_pct(),
             safety_max_host_fraction_pct: default_safety_max_host_fraction_pct(),
@@ -862,9 +859,8 @@ async fn main() -> Result<()> {
         memory_buffers_size::MemoryBuffersSize::Explicit(n) => format!("{n} GiB"),
     };
     info!(
-        "write memory buffer per tape: {}, read memory buffer per tape: {}, per-backend disk cache default: {}",
+        "write memory buffer per tape: {}, per-backend disk cache default: {}",
         fmt_mem(cfg.memory_buffers.write_gb_per_tape),
-        fmt_mem(cfg.memory_buffers.read_gb_per_tape),
         match cfg.disk_cache.size_gb {
             core_mediachanger::DiskCacheSize::Auto => format!(
                 "auto (min {} GiB, max {} GiB)",
@@ -1344,11 +1340,6 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<memory_buffer_manager::UploadRequest>(100);
     info!("Upload request channel created (capacity: 100 requests)");
 
-    // 🔸 Create prefetch request channel (Phase 5: Event-Driven Prefetch)
-    let (prefetch_tx, prefetch_rx) =
-        tokio::sync::mpsc::channel::<memory_buffer_manager::PrefetchRequest>(100);
-    info!("Prefetch request channel created (capacity: 100 requests)");
-
     // 🔸 Cache-eviction wakeup signal. Notify coalesces a burst of
     // upload-completion notifications into a single eviction pass.
     let disk_cache_evict_notify = Arc::new(tokio::sync::Notify::new());
@@ -1469,15 +1460,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 🔸 Start event-driven prefetch worker (Phase 5: Event-Driven Prefetch)
-    info!("Starting event-driven storage prefetch worker");
-    let cfg_clone = cfg.clone();
-    let prefetch_worker_handle = tokio::spawn(async move {
-        if let Err(e) = run_event_driven_prefetch_worker(&cfg_clone, prefetch_rx).await {
-            warn!("Prefetch worker error: {e:?}");
-        }
-    });
-
     // 🔸 Start cache-pool eviction worker (event-driven on upload-completion)
     info!("Starting cache-pool eviction worker (event-driven)");
     let cfg_clone = cfg.clone();
@@ -1516,13 +1498,15 @@ async fn main() -> Result<()> {
         }))
     };
 
-    // 🔸 Resolve per-tape memory buffers against host RAM + drive
-    // count. Each field is either an explicit GB integer or `auto`;
-    // auto sizes against `/proc/meminfo MemTotal` once at boot,
-    // splitting `auto_host_fraction_pct` of host RAM across drives
-    // and then 2:1 between write and read. Resolution is one-shot
-    // (no mid-run resize), matching how `upload.max_concurrent`
-    // resolves at start; full design is in issue #27.
+    // 🔸 Resolve per-tape write-staging buffer against host RAM + drive
+    // count. The field is either an explicit GB integer or `auto`; auto
+    // sizes against `/proc/meminfo MemTotal` once at boot, taking
+    // `auto_host_fraction_pct` of host RAM across drives. Resolution is
+    // one-shot (no mid-run resize), matching how `upload.max_concurrent`
+    // resolves at start; full design is in issue #27. (There is no
+    // read-side RAM buffer — read-ahead is the per-backend prefetch
+    // manager, not a staged buffer — so only the write side counts
+    // against host RAM; issue #215.)
     let host_mem_bytes = memory_buffers_size::read_host_mem_bytes();
     let bounds = memory_buffers_size::MemoryBuffersBounds {
         min_gb: cfg.memory_buffers.auto_min_gb_per_tape,
@@ -1537,54 +1521,37 @@ async fn main() -> Result<()> {
         memory_buffers_size::AUTO_WRITE_SHARE_DEN,
         bounds,
     );
-    let read_buffer_limit = cfg.memory_buffers.read_gb_per_tape.resolve_bytes(
-        host_mem_bytes,
-        num_drives_u32,
-        cfg.memory_buffers.auto_host_fraction_pct,
-        memory_buffers_size::AUTO_READ_SHARE_NUM,
-        memory_buffers_size::AUTO_READ_SHARE_DEN,
-        bounds,
-    );
     let bytes_per_gib = 1024u64 * 1024 * 1024;
     let write_source = if cfg.memory_buffers.write_gb_per_tape.is_auto() {
         "auto-detected from /proc/meminfo"
     } else {
         "operator override"
     };
-    let read_source = if cfg.memory_buffers.read_gb_per_tape.is_auto() {
-        "auto-detected from /proc/meminfo"
-    } else {
-        "operator override"
-    };
     info!(
-        "memory_buffers resolved: write={} GiB ({}), read={} GiB ({}); host_mem={} GiB, drives={}",
+        "memory_buffers resolved: write={} GiB ({}); host_mem={} GiB, drives={}",
         write_buffer_limit / bytes_per_gib,
         write_source,
-        read_buffer_limit / bytes_per_gib,
-        read_source,
         host_mem_bytes / bytes_per_gib,
         num_drives_u32,
     );
 
-    // Safety check: the resolved per-drive total times num_drives
+    // Safety check: the resolved per-drive write buffer times num_drives
     // must not exceed safety_max_host_fraction_pct of MemTotal.
     // Auto resolution can't exceed this by construction (auto fraction
     // <= safety fraction in default config), so this catches explicit
     // operator overrides that overcommit on a small host.
     if host_mem_bytes > 0 {
-        let total_footprint =
-            (write_buffer_limit + read_buffer_limit).saturating_mul(num_drives_u32.max(1) as u64);
+        let total_footprint = write_buffer_limit.saturating_mul(num_drives_u32.max(1) as u64);
         let safety_fraction = cfg.memory_buffers.safety_max_host_fraction_pct.min(100);
         let safety_limit = host_mem_bytes.saturating_mul(safety_fraction) / 100;
         if total_footprint > safety_limit {
             anyhow::bail!(
-                "memory_buffers total footprint ({} GiB = (write {} + read {}) GiB * {} drives) \
+                "memory_buffers total footprint ({} GiB = write {} GiB * {} drives) \
                  exceeds safety_max_host_fraction_pct={}% of host RAM ({} GiB of {} GiB). \
-                 Lower memory_buffers.write_gb_per_tape / read_gb_per_tape, raise \
+                 Lower memory_buffers.write_gb_per_tape, raise \
                  memory_buffers.safety_max_host_fraction_pct, or switch to `auto`.",
                 total_footprint / bytes_per_gib,
                 write_buffer_limit / bytes_per_gib,
-                read_buffer_limit / bytes_per_gib,
                 num_drives_u32,
                 safety_fraction,
                 safety_limit / bytes_per_gib,
@@ -1593,18 +1560,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 🔸 Start MemoryBufferManager (Phase 3: Per-Tape Buffer Tracking, Phase 4: Event-Driven Uploads, Phase 5: Event-Driven Prefetch)
-    // Clone the upload sender before passing it into the manager so the
-    // boot-time orphan-upload scan can dispatch directly to the same
-    // worker mpsc without going through the manager's event loop.
+    // 🔸 Start MemoryBufferManager (Phase 3: Per-Tape Buffer Tracking,
+    // Phase 4: Event-Driven Uploads). Clone the upload sender before
+    // passing it into the manager so the boot-time orphan-upload scan
+    // can dispatch directly to the same worker mpsc without going
+    // through the manager's event loop.
     let upload_tx_for_recovery = upload_tx.clone();
-    let memory_buffer_manager = MemoryBufferManager::new(
-        event_rx,
-        write_buffer_limit,
-        read_buffer_limit,
-        upload_tx,
-        prefetch_tx,
-    );
+    let memory_buffer_manager = MemoryBufferManager::new(event_rx, write_buffer_limit, upload_tx);
     let memory_buffer_manager_handle = tokio::spawn(async move {
         if let Err(e) = memory_buffer_manager.run().await {
             warn!("MemoryBufferManager error: {e:?}");
@@ -1755,86 +1717,129 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 🔸 At-rest DEK pre-unwrap: walk every cartridge dir, peek
-    // `manifest.json` for an `encryption` block, and (if present)
-    // resolve the named keystore backend and unwrap the wrapped DEK.
-    // Caches the plaintext DEK in `DriveManager::dek_cache` so the
-    // synchronous SCSI MOVE MEDIUM hot path can pick it up without
-    // touching the keystore. A keystore that's unreachable at boot
-    // surfaces as a `load_cartridge` refusal later — better than a
-    // mixed plaintext + ciphertext pool.
-    if let Ok(mut entries) = tokio::fs::read_dir(&tapes_root).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let Some(label) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !entry
-                .file_type()
-                .await
-                .ok()
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
+    // At-rest DEK pre-unwrap (issue #214): peek every cartridge's
+    // `manifest.json` for an `encryption` block and, for each encrypted
+    // cartridge, unwrap the wrapped DEK against the named keystore
+    // backend, caching the plaintext in `DriveManager::dek_cache` so
+    // the synchronous SCSI MOVE MEDIUM hot path picks it up without
+    // touching the keystore. A keystore unreachable at boot surfaces as
+    // a `load_cartridge` refusal later — better than a mixed plaintext
+    // + ciphertext pool. Done in three phases so start time is bounded
+    // for thousands of cartridges: (1) enumerate (manifest reads only);
+    // (2) construct each distinct keystore backend AT MOST ONCE; (3)
+    // fan the unwraps out with bounded concurrency, instead of one
+    // fresh backend construction + serial network unwrap per cartridge.
+    {
+        use futures::stream::{self, StreamExt};
+
+        // Phase 1 — enumerate encrypted cartridges.
+        let mut encrypted: Vec<(
+            String,
+            [u8; 16],
+            core_mediachanger::CartridgeEncryptionMeta,
+        )> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&tapes_root).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let Some(label) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !entry
+                    .file_type()
+                    .await
+                    .ok()
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let (uuid, meta_opt) =
+                    match core_mediachanger::Cartridge::read_manifest_identity(&tapes_root, &label)
+                    {
+                        Ok(p) => p,
+                        Err(_) => continue, // missing/corrupt manifest — load_cartridge will refuse
+                    };
+                if let Some(meta) = meta_opt {
+                    encrypted.push((label, uuid, meta));
+                }
+            }
+        }
+
+        // Phase 2 — construct each distinct keystore backend once. A
+        // construction failure caches `None` so the dependent unwraps
+        // skip with a warning rather than retrying the bad backend.
+        let mut backends: std::collections::HashMap<
+            String,
+            Option<std::sync::Arc<dyn shared_keystore::KeyStoreBackend>>,
+        > = std::collections::HashMap::new();
+        for (_, _, meta) in &encrypted {
+            if backends.contains_key(&meta.keystore_backend) {
                 continue;
             }
-            let (uuid, meta_opt) =
-                match core_mediachanger::Cartridge::read_manifest_identity(&tapes_root, &label) {
-                    Ok(p) => p,
-                    Err(_) => continue, // missing/corrupt manifest — load_cartridge will refuse
-                };
-            let Some(meta) = meta_opt else { continue };
-            let ks = match daemon_state
+            let built = match daemon_state
                 .keystore_config
                 .create_backend_named(&meta.keystore_backend, &daemon_state.data_dir)
                 .await
             {
-                Ok(b) => b,
+                Ok(b) => Some(std::sync::Arc::from(b)),
                 Err(e) => {
                     warn!(
-                        "At-rest DEK pre-unwrap: keystore '{}' for cartridge '{}' \
-                         not usable: {e}. Cartridge load will refuse until the \
-                         keystore is reachable.",
-                        meta.keystore_backend, label
+                        "At-rest DEK pre-unwrap: keystore '{}' not usable: {e}. \
+                         Cartridge load will refuse until the keystore is reachable.",
+                        meta.keystore_backend
                     );
-                    continue;
+                    None
                 }
             };
-            let wrapped = match meta.wrapped_dek.as_deref() {
-                Some(b64) => {
-                    use base64::Engine as _;
-                    match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                "At-rest DEK pre-unwrap: manifest.encryption.wrapped_dek \
-                                 for cartridge '{}' is not valid base64: {e}",
-                                label
-                            );
-                            continue;
+            backends.insert(meta.keystore_backend.clone(), built);
+        }
+
+        // Phase 3 — fan unwraps out, bounded.
+        const DEK_UNWRAP_CONCURRENCY: usize = 16;
+        let unwraps = encrypted.into_iter().filter_map(|(label, uuid, meta)| {
+            let backend = backends.get(&meta.keystore_backend).cloned().flatten()?;
+            Some(async move {
+                let wrapped = match meta.wrapped_dek.as_deref() {
+                    Some(b64) => {
+                        use base64::Engine as _;
+                        match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(
+                                    "At-rest DEK pre-unwrap: manifest.encryption.wrapped_dek \
+                                     for cartridge '{}' is not valid base64: {e}",
+                                    label
+                                );
+                                return None;
+                            }
                         }
                     }
+                    None => Vec::new(), // `local` backend manages the blob itself
+                };
+                match backend.unwrap(&uuid, &wrapped).await {
+                    Ok(dek) => Some((label, meta.keystore_backend, *dek.as_bytes())),
+                    Err(e) => {
+                        warn!(
+                            "At-rest DEK pre-unwrap: keystore '{}' unwrap for cartridge '{}' \
+                             failed: {e}. Cartridge load will refuse until the keystore is \
+                             reachable.",
+                            meta.keystore_backend, label
+                        );
+                        None
+                    }
                 }
-                None => Vec::new(), // `local` backend manages the blob itself
-            };
-            match ks.unwrap(&uuid, &wrapped).await {
-                Ok(dek) => {
-                    daemon_state
-                        .drive_manager
-                        .set_cartridge_dek(&label, *dek.as_bytes());
-                    info!(
-                        "At-rest DEK cached for cartridge '{}' (keystore '{}')",
-                        label, meta.keystore_backend
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "At-rest DEK pre-unwrap: keystore '{}' unwrap for cartridge '{}' \
-                         failed: {e}. Cartridge load will refuse until the keystore is \
-                         reachable.",
-                        meta.keystore_backend, label
-                    );
-                }
-            }
+            })
+        });
+        let results: Vec<Option<(String, String, [u8; shared_keystore::DEK_LEN])>> =
+            stream::iter(unwraps)
+                .buffer_unordered(DEK_UNWRAP_CONCURRENCY)
+                .collect()
+                .await;
+        for (label, backend_name, dek) in results.into_iter().flatten() {
+            daemon_state.drive_manager.set_cartridge_dek(&label, dek);
+            info!(
+                "At-rest DEK cached for cartridge '{}' (keystore '{}')",
+                label, backend_name
+            );
         }
     }
 
@@ -1995,7 +2000,6 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     upload_worker_handle.abort();
-    prefetch_worker_handle.abort();
     disk_cache_worker_handle.abort();
     if let Some(handle) = audit_ratelimit_flush_handle {
         handle.abort();
@@ -2023,51 +2027,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Event-driven prefetch worker (Phase 5: Event-Driven Prefetch)
-///
-/// Listens for prefetch requests from MemoryBufferManager.
-/// Triggered by sequential read pattern detection.
-///
-/// Note: In the current architecture, chunks are automatically downloaded from S3
-/// when there's a cache miss during read_block() operations. This worker tracks
-/// prefetch hints to optimize future reads, but actual downloads happen on-demand.
-/// A full implementation would pre-download chunks to local cache.
-async fn run_event_driven_prefetch_worker(
-    _cfg: &Config,
-    mut prefetch_rx: tokio::sync::mpsc::Receiver<memory_buffer_manager::PrefetchRequest>,
-) -> Result<()> {
-    info!("Event-driven prefetch worker initialized (hint tracking only)");
-
-    // Listen for prefetch requests
-    while let Some(request) = prefetch_rx.recv().await {
-        debug!(
-            "Prefetch hint for {}: chunks {:?} (downloads will happen on next read)",
-            request.tape_id, request.chunk_ids
-        );
-
-        // Phase 5 MVP: Just log prefetch hints
-        // Full implementation would:
-        // 1. Check if chunks exist locally
-        // 2. Download from S3 if missing
-        // 3. Update MemoryBufferManager read_buffer_usage
-        // 4. Track prefetch success/failure
-        //
-        // For now, the existing read_block() logic handles downloads automatically
-        // when there's a cache miss, so prefetch is implicit.
-    }
-
-    info!("Prefetch worker shutting down (channel closed)");
-    Ok(())
-}
-
-// Phase 5: Periodic eviction worker removed - now handled by event-driven MemoryBufferManager
-// The old run_eviction_worker() and cleanup_old_manifests() functions have been removed
-// as eviction is now triggered immediately when read buffer is full (on_block_read)
+// The MemoryBufferManager's read-side prefetch worker (a log-only
+// "Phase 5 MVP" hint sink) and its phantom read RAM buffer were
+// removed (issue #215): real read-ahead is the per-backend prefetch
+// manager driven by `memory_buffers.read_prefetch_chunks_ahead`, and
+// on-demand storage refetch covers cache misses inside read_block().
 
 /// Event-driven worker that enforces the global `cache_gb` budget on
-/// the shared content-addressed chunk pool. Per-tape read/write buffers
-/// are tracked separately by `MemoryBufferManager` and don't share this
-/// ceiling.
+/// the shared content-addressed chunk pool. The per-tape write buffer
+/// is tracked separately by `MemoryBufferManager` and doesn't share
+/// this ceiling.
 ///
 /// Wakeup sources:
 /// - `disk_cache_evict_notify`: fired by the upload worker when one or more
@@ -2471,10 +2440,6 @@ mod config_parse_tests {
         // them against /proc/meminfo at boot.
         assert_eq!(
             cfg.memory_buffers.write_gb_per_tape,
-            memory_buffers_size::MemoryBuffersSize::Auto
-        );
-        assert_eq!(
-            cfg.memory_buffers.read_gb_per_tape,
             memory_buffers_size::MemoryBuffersSize::Auto
         );
         assert_eq!(

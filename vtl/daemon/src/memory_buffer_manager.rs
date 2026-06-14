@@ -24,28 +24,11 @@ pub struct UploadRequest {
     pub chunk_ids: Vec<u32>,
 }
 
-/// Prefetch request sent from MemoryBufferManager to prefetch worker
-#[derive(Debug, Clone)]
-pub struct PrefetchRequest {
-    /// Tape ID
-    pub tape_id: String,
-    /// Chunk IDs to prefetch (in order)
-    pub chunk_ids: Vec<u32>,
-}
-
-/// Eviction request sent from MemoryBufferManager to eviction handler
-#[derive(Debug, Clone)]
-pub struct EvictionRequest {
-    /// Tape ID
-    pub tape_id: String,
-    /// Current head position (evict chunks before this LBA)
-    pub head_position: u64,
-}
-
 /// Per-tape buffer state
 ///
-/// Tracks read/write buffer usage, pending uploads, and prefetch state
-/// for a single tape cartridge.
+/// Tracks write-buffer usage and pending uploads for a single tape
+/// cartridge. (The read-side prefetch buffer was removed — issue #215;
+/// real read-ahead is the per-backend prefetch manager.)
 #[derive(Debug, Clone)]
 pub struct TapeBufferState {
     /// Tape ID (label)
@@ -68,21 +51,11 @@ pub struct TapeBufferState {
     /// (which permanently parks the tape over its buffer limit and
     /// re-fires `trigger_upload_batch` on every block).
     pub chunk_bytes: HashMap<u32, u64>,
-
-    // Read buffer tracking
-    /// Bytes in read buffer (prefetched from S3)
-    pub read_buffer_usage: u64,
-    /// Read buffer limit (per-tape)
-    pub read_buffer_limit: u64,
-    /// Prefetched chunk IDs
-    pub prefetched_chunks: HashSet<u32>,
-    /// Last chunk read (for sequential detection)
-    pub last_read_chunk: Option<u32>,
 }
 
 impl TapeBufferState {
     /// Create new buffer state for a tape
-    pub fn new(tape_id: String, write_limit: u64, read_limit: u64) -> Self {
+    pub fn new(tape_id: String, write_limit: u64) -> Self {
         Self {
             tape_id,
             head_position: 0,
@@ -91,25 +64,15 @@ impl TapeBufferState {
             write_buffer_limit: write_limit,
             pending_uploads: HashSet::new(),
             chunk_bytes: HashMap::new(),
-            read_buffer_usage: 0,
-            read_buffer_limit: read_limit,
-            prefetched_chunks: HashSet::new(),
-            last_read_chunk: None,
         }
     }
 }
 
-fn clear_prefetch_and_break_sequence(tape: &mut TapeBufferState) {
-    tape.prefetched_chunks.clear();
-    tape.last_read_chunk = None;
-}
-
 /// Buffer Manager
 ///
-/// Manages per-tape read/write buffers and coordinates S3 uploads/prefetch.
+/// Manages per-tape write buffers and coordinates storage uploads.
 /// Phase 3: Tracks buffer usage per tape
 /// Phase 4: Event-driven uploads via upload_tx channel
-/// Phase 5: Event-driven prefetch via prefetch_tx channel
 pub struct MemoryBufferManager {
     event_rx: broadcast::Receiver<TapeEvent>,
     /// Per-tape buffer state
@@ -122,40 +85,32 @@ pub struct MemoryBufferManager {
     total_write_buffer_usage: u64,
     /// Default write buffer limit per tape
     write_buffer_limit: u64,
-    /// Default read buffer limit per tape
-    read_buffer_limit: u64,
     /// Channel to send upload requests to upload worker
     upload_tx: mpsc::Sender<UploadRequest>,
-    /// Channel to send prefetch requests to prefetch worker
-    prefetch_tx: mpsc::Sender<PrefetchRequest>,
 }
 
 impl MemoryBufferManager {
-    /// Create a new MemoryBufferManager. `write_buffer_limit` and
-    /// `read_buffer_limit` are per-tape byte counts already resolved
-    /// out of `memory_buffers_size::MemoryBuffersSize::resolve_bytes`
-    /// by the caller — auto vs explicit decisions and the host-RAM
-    /// safety check both live in `main.rs` so this constructor stays
-    /// a pure byte sink.
+    /// Create a new MemoryBufferManager. `write_buffer_limit` is the
+    /// per-tape byte count already resolved out of
+    /// `memory_buffers_size::MemoryBuffersSize::resolve_bytes` by the
+    /// caller — auto vs explicit decisions and the host-RAM safety
+    /// check both live in `main.rs` so this constructor stays a pure
+    /// byte sink.
     pub fn new(
         event_rx: broadcast::Receiver<TapeEvent>,
         write_buffer_limit: u64,
-        read_buffer_limit: u64,
         upload_tx: mpsc::Sender<UploadRequest>,
-        prefetch_tx: mpsc::Sender<PrefetchRequest>,
     ) -> Self {
         info!(
-            "MemoryBufferManager created (write_buffer={} bytes, read_buffer={} bytes per tape)",
-            write_buffer_limit, read_buffer_limit
+            "MemoryBufferManager created (write_buffer={} bytes per tape)",
+            write_buffer_limit
         );
         Self {
             event_rx,
             tapes: HashMap::new(),
             total_write_buffer_usage: 0,
             write_buffer_limit,
-            read_buffer_limit,
             upload_tx,
-            prefetch_tx,
         }
     }
 
@@ -163,11 +118,7 @@ impl MemoryBufferManager {
     fn get_or_create_tape(&mut self, tape_id: &str) -> &mut TapeBufferState {
         self.tapes.entry(tape_id.to_string()).or_insert_with(|| {
             debug!("Creating buffer state for tape {}", tape_id);
-            TapeBufferState::new(
-                tape_id.to_string(),
-                self.write_buffer_limit,
-                self.read_buffer_limit,
-            )
+            TapeBufferState::new(tape_id.to_string(), self.write_buffer_limit)
         })
     }
 
@@ -231,18 +182,18 @@ impl MemoryBufferManager {
             }
             TapeEvent::BlockRead {
                 tape_id,
-                chunk_id,
+                chunk_id: _,
                 lba,
             } => {
-                self.on_block_read(&tape_id, chunk_id, lba).await;
+                self.on_block_read(&tape_id, lba);
             }
             TapeEvent::HeadPositionChanged {
                 tape_id,
-                old_lba,
+                old_lba: _,
                 new_lba,
-                reason,
+                reason: _,
             } => {
-                self.on_head_position_changed(&tape_id, old_lba, new_lba, reason);
+                self.on_head_position_changed(&tape_id, new_lba);
             }
         }
     }
@@ -284,9 +235,6 @@ impl MemoryBufferManager {
             tape.write_buffer_usage = 0;
             tape.pending_uploads.clear();
             tape.chunk_bytes.clear();
-            tape.read_buffer_usage = 0;
-            tape.prefetched_chunks.clear();
-            tape.last_read_chunk = None;
             cleared
         } else {
             0
@@ -341,106 +289,21 @@ impl MemoryBufferManager {
         }
     }
 
-    /// Handle block read event
-    async fn on_block_read(&mut self, tape_id: &str, chunk_id: u32, lba: u64) {
-        debug!(
-            "Block read: tape={} chunk={} lba={}",
-            tape_id, chunk_id, lba
-        );
-
-        // Determine actions before borrowing tape
-        let (should_prefetch, should_evict) = {
-            let tape = self.get_or_create_tape(tape_id);
-
-            // Detect sequential read pattern. `chunk_id == last + 1` —
-            // use `checked_add` so a `last == u32::MAX` never panics
-            // in debug or wraps in release. Re-reading the same chunk
-            // (`chunk_id == last`) is *not* sequential; it's a re-read
-            // and shouldn't trigger prefetch.
-            let is_sequential = tape
-                .last_read_chunk
-                .and_then(|last| last.checked_add(1))
-                .map(|next| chunk_id == next)
-                .unwrap_or(false);
-
-            let needs_eviction = tape.read_buffer_usage > tape.read_buffer_limit;
-
-            (is_sequential, needs_eviction)
-        };
-
-        // Now update tape state
+    /// Handle block read event — tracks the tape's head position for
+    /// observability. The read-ahead prefetch + phantom read buffer
+    /// were removed (issue #215): real read-ahead is the per-backend
+    /// prefetch manager, and cache misses refetch on demand inside
+    /// `read_block`.
+    fn on_block_read(&mut self, tape_id: &str, lba: u64) {
         let tape = self.get_or_create_tape(tape_id);
         tape.head_position = lba + 1; // Advance head
-        tape.last_read_chunk = Some(chunk_id);
-
-        // Trigger prefetch if sequential
-        if should_prefetch {
-            debug!(
-                "Sequential read detected for {}: chunk {}",
-                tape_id, chunk_id
-            );
-            self.trigger_prefetch(tape_id, chunk_id + 1);
-        }
-
-        // Trigger eviction if read buffer full
-        if should_evict {
-            warn!(
-                "Read buffer full for {}: {} / {} bytes",
-                tape_id,
-                self.tapes
-                    .get(tape_id)
-                    .map(|t| t.read_buffer_usage)
-                    .unwrap_or(0),
-                self.read_buffer_limit
-            );
-            self.evict_behind_head(tape_id);
-        }
     }
 
-    /// Handle head position changed event
-    fn on_head_position_changed(
-        &mut self,
-        tape_id: &str,
-        old_lba: u64,
-        new_lba: u64,
-        reason: core_mediachanger::PositionChangeReason,
-    ) {
-        debug!(
-            "Head position changed: tape={} {}->{} ({:?})",
-            tape_id, old_lba, new_lba, reason
-        );
+    /// Handle head position changed event — tracks the tape's head
+    /// position (see [`Self::on_block_read`] re: removed prefetch).
+    fn on_head_position_changed(&mut self, tape_id: &str, new_lba: u64) {
         let tape = self.get_or_create_tape(tape_id);
         tape.head_position = new_lba;
-
-        // Cancel prefetch on non-sequential operations (Phase 5)
-        use core_mediachanger::PositionChangeReason;
-        match reason {
-            PositionChangeReason::Rewind | PositionChangeReason::Locate => {
-                if !tape.prefetched_chunks.is_empty() {
-                    info!(
-                        "Canceling {} prefetched chunks for {} (reason: {:?})",
-                        tape.prefetched_chunks.len(),
-                        tape_id,
-                        reason
-                    );
-                }
-                clear_prefetch_and_break_sequence(tape);
-            }
-            PositionChangeReason::Space => {
-                // SPACE may be sequential (skip records) or not — clear to be safe.
-                if !tape.prefetched_chunks.is_empty() {
-                    debug!(
-                        "Clearing {} prefetched chunks for {} (SPACE operation)",
-                        tape.prefetched_chunks.len(),
-                        tape_id
-                    );
-                }
-                clear_prefetch_and_break_sequence(tape);
-            }
-            PositionChangeReason::SequentialRead | PositionChangeReason::SequentialWrite => {
-                // Sequential operations don't break pattern
-            }
-        }
     }
 
     /// Trigger upload batch for a tape (Phase 4: Event-Driven Uploads)
@@ -595,82 +458,6 @@ impl MemoryBufferManager {
         }
     }
 
-    /// Trigger prefetch for a tape (Phase 5: Event-Driven Prefetch)
-    fn trigger_prefetch(&mut self, tape_id: &str, start_chunk_id: u32) {
-        let needs_prefetch: Vec<u32> = {
-            let Some(tape) = self.tapes.get(tape_id) else {
-                return;
-            };
-            // Prefetch next 1-2 chunks
-            const PREFETCH_COUNT: u32 = 2;
-            (start_chunk_id..start_chunk_id + PREFETCH_COUNT)
-                .filter(|id| !tape.prefetched_chunks.contains(id))
-                .collect()
-        };
-
-        if needs_prefetch.is_empty() {
-            return;
-        }
-
-        debug!(
-            "Triggering prefetch for {}: chunks {:?}",
-            tape_id, needs_prefetch
-        );
-
-        let request = PrefetchRequest {
-            tape_id: tape_id.to_string(),
-            chunk_ids: needs_prefetch,
-        };
-
-        // Non-blocking, like `trigger_upload_batch`: this runs on the
-        // broadcast event-ingestion path, so it must not park and lag
-        // the bus. Prefetch is best-effort read-ahead — a full queue
-        // just drops this hint and the read path fetches on miss.
-        match self.prefetch_tx.try_send(request) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                debug!(
-                    "Prefetch queue full for {}; dropping read-ahead hint",
-                    tape_id
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!(
-                    "Failed to send prefetch request for {} (prefetch channel closed)",
-                    tape_id
-                );
-            }
-        }
-    }
-
-    /// Evict chunks behind the tape head (Phase 5: Event-Driven Prefetch)
-    ///
-    /// Removes old chunks from read buffer when capacity is exceeded.
-    /// Only evicts chunks that:
-    /// - Have LBA < head_position (behind the head)
-    /// - Are already uploaded to S3 (safe to delete locally)
-    fn evict_behind_head(&mut self, tape_id: &str) {
-        if let Some(tape) = self.tapes.get_mut(tape_id) {
-            let head_pos = tape.head_position;
-
-            // For now, just clear prefetched chunks (simplified eviction)
-            // Full implementation would need to:
-            // 1. Find chunks with LBA < head_position
-            // 2. Check if uploaded to S3
-            // 3. Delete local chunk files
-            // 4. Update read_buffer_usage
-            //
-            // This is a simplified version that just clears the prefetch tracking
-            if !tape.prefetched_chunks.is_empty() {
-                let count = tape.prefetched_chunks.len();
-                tape.prefetched_chunks.clear();
-                debug!(
-                    "Evicted {} prefetched chunks for {} (head at LBA {})",
-                    count, tape_id, head_pos
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -678,52 +465,35 @@ mod tests {
     use super::*;
     use core_mediachanger::PositionChangeReason;
 
-    /// Build a manager with small (1 GiB) per-tape limits and 4-deep
-    /// channels. Returns the manager plus the receivers so a test can
-    /// drain dispatched upload/prefetch requests.
-    fn make_manager() -> (
-        MemoryBufferManager,
-        mpsc::Receiver<UploadRequest>,
-        mpsc::Receiver<PrefetchRequest>,
-    ) {
+    /// Build a manager with a small (1 GiB) per-tape write limit and a
+    /// 8-deep upload channel. Returns the manager plus the upload
+    /// receiver so a test can drain dispatched upload requests.
+    fn make_manager() -> (MemoryBufferManager, mpsc::Receiver<UploadRequest>) {
         let (_event_tx, event_rx) = broadcast::channel(16);
         let (upload_tx, upload_rx) = mpsc::channel(8);
-        let (prefetch_tx, prefetch_rx) = mpsc::channel(8);
-        // 1 GiB each — large enough that the test writes (≤ ~10 KiB)
-        // never hit the buffer-full watermark, matching the pre-2026-05
-        // GB-based ctor that passed (1, 1) GB.
+        // 1 GiB — large enough that the test writes (≤ ~10 KiB) never
+        // hit the buffer-full watermark, matching the pre-2026-05
+        // GB-based ctor that passed 1 GB.
         let one_gib = 1024 * 1024 * 1024;
-        let mgr = MemoryBufferManager::new(event_rx, one_gib, one_gib, upload_tx, prefetch_tx);
-        (mgr, upload_rx, prefetch_rx)
+        let mgr = MemoryBufferManager::new(event_rx, one_gib, upload_tx);
+        (mgr, upload_rx)
     }
 
     #[test]
     fn tape_buffer_state_new_starts_empty() {
-        let st = TapeBufferState::new("TAPE001".to_string(), 100, 200);
+        let st = TapeBufferState::new("TAPE001".to_string(), 100);
         assert_eq!(st.tape_id, "TAPE001");
         assert_eq!(st.head_position, 0);
         assert!(st.loaded_drive.is_none());
         assert_eq!(st.write_buffer_usage, 0);
         assert_eq!(st.write_buffer_limit, 100);
-        assert_eq!(st.read_buffer_limit, 200);
         assert!(st.pending_uploads.is_empty());
         assert!(st.chunk_bytes.is_empty());
-        assert!(st.last_read_chunk.is_none());
-    }
-
-    #[test]
-    fn clear_prefetch_resets_sequence_tracking() {
-        let mut st = TapeBufferState::new("T".to_string(), 1, 1);
-        st.prefetched_chunks.insert(7);
-        st.last_read_chunk = Some(5);
-        clear_prefetch_and_break_sequence(&mut st);
-        assert!(st.prefetched_chunks.is_empty());
-        assert!(st.last_read_chunk.is_none());
     }
 
     #[tokio::test]
     async fn block_written_increments_write_buffer_usage() {
-        let (mut mgr, _u, _p) = make_manager();
+        let (mut mgr, _u) = make_manager();
         mgr.on_block_written("T1", 0, 0, 4096).await;
         mgr.on_block_written("T1", 1, 1, 8192).await;
         let tape = mgr.tapes.get("T1").expect("tape created");
@@ -735,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_written_same_chunk_accumulates_bytes() {
-        let (mut mgr, _u, _p) = make_manager();
+        let (mut mgr, _u) = make_manager();
         mgr.on_block_written("T1", 5, 0, 1000).await;
         mgr.on_block_written("T1", 5, 1, 2000).await;
         let tape = mgr.tapes.get("T1").expect("tape created");
@@ -746,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn cartridge_loaded_then_unloaded_resets_state() {
-        let (mut mgr, _u, _p) = make_manager();
+        let (mut mgr, _u) = make_manager();
         mgr.on_cartridge_loaded("T1", 2);
         {
             let tape = mgr.tapes.get("T1").expect("tape created");
@@ -763,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_upload_batch_dispatches_and_decrements() {
-        let (mut mgr, mut upload_rx, _p) = make_manager();
+        let (mut mgr, mut upload_rx) = make_manager();
         for cid in 0..3u32 {
             mgr.on_block_written("T1", cid, cid as u64, 1000).await;
         }
@@ -778,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_queue_depth_aggregates_across_tapes_and_tracks_lifecycle() {
-        let (mut mgr, _u, _p) = make_manager();
+        let (mut mgr, _u) = make_manager();
         assert_eq!(mgr.current_upload_queue_depth(), 0);
         // Two tapes, distinct chunks each — depth is the daemon-wide sum.
         mgr.on_block_written("T1", 0, 0, 1000).await;
@@ -795,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_upload_batch_caps_at_max_batch_size() {
-        let (mut mgr, mut upload_rx, _p) = make_manager();
+        let (mut mgr, mut upload_rx) = make_manager();
         for cid in 0..12u32 {
             mgr.on_block_written("T1", cid, cid as u64, 100).await;
         }
@@ -810,65 +580,37 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_upload_batch_noop_for_unknown_tape() {
-        let (mut mgr, mut upload_rx, _p) = make_manager();
+        let (mut mgr, mut upload_rx) = make_manager();
         mgr.trigger_upload_batch("ghost");
         assert!(upload_rx.try_recv().is_err());
     }
 
+    /// Read + position events only advance the tracked head; the
+    /// removed read RAM buffer / prefetch worker leave no other state
+    /// (issue #215).
     #[tokio::test]
-    async fn sequential_reads_trigger_prefetch() {
-        let (mut mgr, _u, mut prefetch_rx) = make_manager();
-        mgr.on_block_read("T1", 0, 0).await;
-        // chunk 1 follows chunk 0 -> sequential, prefetch fires.
-        mgr.on_block_read("T1", 1, 1).await;
-        let req = prefetch_rx.try_recv().expect("prefetch dispatched");
-        assert_eq!(req.tape_id, "T1");
-        assert!(req.chunk_ids.contains(&2));
-    }
-
-    #[tokio::test]
-    async fn non_sequential_read_does_not_prefetch() {
-        let (mut mgr, _u, mut prefetch_rx) = make_manager();
-        mgr.on_block_read("T1", 0, 0).await;
-        // Re-reading chunk 0 is not sequential.
-        mgr.on_block_read("T1", 0, 1).await;
-        assert!(prefetch_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn head_position_changed_rewind_clears_prefetch() {
-        let (mut mgr, _u, _p) = make_manager();
-        {
-            let tape = mgr.get_or_create_tape("T1");
-            tape.prefetched_chunks.insert(3);
-            tape.last_read_chunk = Some(2);
-        }
-        mgr.on_head_position_changed("T1", 10, 0, PositionChangeReason::Rewind);
-        let tape = mgr.tapes.get("T1").expect("tape tracked");
-        assert_eq!(tape.head_position, 0);
-        assert!(tape.prefetched_chunks.is_empty());
-        assert!(tape.last_read_chunk.is_none());
-    }
-
-    #[tokio::test]
-    async fn head_position_changed_sequential_keeps_prefetch() {
-        let (mut mgr, _u, _p) = make_manager();
-        {
-            let tape = mgr.get_or_create_tape("T1");
-            tape.prefetched_chunks.insert(3);
-            tape.last_read_chunk = Some(2);
-        }
-        mgr.on_head_position_changed("T1", 5, 6, PositionChangeReason::SequentialRead);
-        let tape = mgr.tapes.get("T1").expect("tape tracked");
-        assert_eq!(tape.head_position, 6);
-        // Sequential ops must not break the prefetch window.
-        assert!(tape.prefetched_chunks.contains(&3));
-        assert_eq!(tape.last_read_chunk, Some(2));
+    async fn read_and_position_events_track_head_only() {
+        let (mut mgr, _u) = make_manager();
+        mgr.handle_event(TapeEvent::BlockRead {
+            tape_id: "T1".to_string(),
+            chunk_id: 0,
+            lba: 4,
+        })
+        .await;
+        assert_eq!(mgr.tapes.get("T1").map(|t| t.head_position), Some(5));
+        mgr.handle_event(TapeEvent::HeadPositionChanged {
+            tape_id: "T1".to_string(),
+            old_lba: 5,
+            new_lba: 0,
+            reason: PositionChangeReason::Rewind,
+        })
+        .await;
+        assert_eq!(mgr.tapes.get("T1").map(|t| t.head_position), Some(0));
     }
 
     #[tokio::test]
     async fn handle_event_routes_block_written() {
-        let (mut mgr, _u, _p) = make_manager();
+        let (mut mgr, _u) = make_manager();
         mgr.handle_event(TapeEvent::BlockWritten {
             tape_id: "T1".to_string(),
             chunk_id: 0,

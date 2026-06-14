@@ -277,7 +277,8 @@ fn collect_live_index_pages(data_dir: &Path) -> anyhow::Result<LiveIndexPages> {
     }
     for entry in fs::read_dir(&tapes_dir)? {
         let entry = entry?;
-        let manifest_path = entry.path().join("manifest.json");
+        let tape_path = entry.path();
+        let manifest_path = tape_path.join("manifest.json");
         if !manifest_path.is_file() {
             continue;
         }
@@ -291,7 +292,19 @@ fn collect_live_index_pages(data_dir: &Path) -> anyhow::Result<LiveIndexPages> {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
-        let epoch_obj = match v.get("index_epoch").and_then(|m| m.as_object()) {
+        // `index_epoch` is persisted in the runtime sidecar, not the
+        // creation-frozen manifest (issue #211 — it used to read the
+        // manifest and so always found nothing, silently no-op'ing the
+        // `--storage` index-page sweep). A cartridge with no
+        // runtime.json or no epoch map yet contributes no live pages.
+        let rt_v: serde_json::Value = match fs::read_to_string(tape_path.join("runtime.json")) {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let epoch_obj = match rt_v.get("index_epoch").and_then(|m| m.as_object()) {
             Some(o) => o,
             None => continue,
         };
@@ -824,16 +837,41 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let tape = dir.path().join("tapes").join("TAPE001");
         std::fs::create_dir_all(&tape).expect("mkdir tape");
+        // Identity (backend/label) lives in the manifest; the
+        // index_epoch map lives in the runtime sidecar (issue #211).
         std::fs::write(
             tape.join("manifest.json"),
-            r#"{"backend":"s3b","label":"TAPE001","index_epoch":{"chunks":{"pages":4}}}"#,
+            r#"{"backend":"s3b","label":"TAPE001"}"#,
         )
         .expect("write manifest");
+        std::fs::write(
+            tape.join("runtime.json"),
+            r#"{"index_epoch":{"chunks":{"pages":4,"page_size":1048576,"epoch":1,"file_size":4096}}}"#,
+        )
+        .expect("write runtime");
         let pages = collect_live_index_pages(dir.path()).expect("collect");
         let entry = pages
             .get(&("s3b".to_string(), "TAPE001".to_string()))
             .expect("entry present");
         assert_eq!(entry.get("chunks").copied(), Some(4));
+    }
+
+    /// Regression for issue #211: an `index_epoch` embedded in the
+    /// manifest (where it never legitimately lives) must NOT be picked
+    /// up — only the runtime sidecar is authoritative. Without a
+    /// runtime.json the cartridge contributes no live pages.
+    #[test]
+    fn collect_live_index_pages_ignores_manifest_embedded_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tape = dir.path().join("tapes").join("TAPE002");
+        std::fs::create_dir_all(&tape).expect("mkdir tape");
+        std::fs::write(
+            tape.join("manifest.json"),
+            r#"{"backend":"s3b","label":"TAPE002","index_epoch":{"chunks":{"pages":9}}}"#,
+        )
+        .expect("write manifest");
+        let pages = collect_live_index_pages(dir.path()).expect("collect");
+        assert!(pages.get(&("s3b".to_string(), "TAPE002".to_string())).is_none());
     }
 
     #[test]

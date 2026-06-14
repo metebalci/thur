@@ -93,17 +93,19 @@ This section is consulted only when `nvmetcp` is listed in `transports`.
 ### `memory_buffers` — VTL only
 
 The memory-buffer pool is per-tape RAM that the daemon keeps alive
-between iSCSI operations, used for write staging and read prefetch. It
-is entirely separate from the on-disk `disk_cache`.
+between iSCSI operations, used for write staging before backend
+upload. It is entirely separate from the on-disk `disk_cache`. There
+is no read-side RAM buffer — read-ahead is `read_prefetch_chunks_ahead`
+plus the per-backend prefetch manager, and cache misses refetch on
+demand, so only the write stage counts against host RAM.
 
-`write_gb_per_tape` and `read_gb_per_tape` each accept either an
-integer GB count or the literal `"auto"`. Under `auto` (the default),
-the daemon reads `/proc/meminfo MemTotal` once at boot, budgets
-`auto_host_fraction_pct%` of host RAM across `library.num_drives`,
-splits the per-drive share 2:1 between write and read (preserving the
-historical 10 GB / 5 GB ratio), and clamps each field to
-`[auto_min_gb_per_tape, auto_max_gb_per_tape]`. The resolved total
-footprint, `(write + read) × num_drives`, is then checked against
+`write_gb_per_tape` accepts either an integer GB count or the literal
+`"auto"`. Under `auto` (the default), the daemon reads `/proc/meminfo
+MemTotal` once at boot, budgets `auto_host_fraction_pct%` of host RAM
+across `library.num_drives`, takes a 2/3 share for the write buffer
+(preserving the historical 10 GB write default), and clamps to
+`[auto_min_gb_per_tape, auto_max_gb_per_tape]`. The resolved footprint,
+`write × num_drives`, is then checked against
 `safety_max_host_fraction_pct%` of `MemTotal`; the daemon refuses to
 start if exceeded — that's how an explicit operator override that
 overcommits a small host is caught. Resolution is one-shot at boot;
@@ -112,10 +114,9 @@ changing host RAM, drive count, or these knobs needs a restart.
 | Key | Default | Description |
 |---|---|---|
 | `memory_buffers.write_gb_per_tape` | `auto` | Per-tape write-buffer size. Integer GB pins the value; `auto` resolves against `MemTotal` and takes 2/3 of the per-drive auto budget. |
-| `memory_buffers.read_gb_per_tape` | `auto` | Per-tape read-buffer size. Same shape; under `auto`, takes 1/3 of the per-drive auto budget. |
 | `memory_buffers.read_prefetch_chunks_ahead` | `2` | Chunks prefetched ahead during sequential reads (0 disables; 1–3 typical). |
-| `memory_buffers.auto_host_fraction_pct` | `50` | Fraction of `MemTotal` budgeted across all memory_buffers under `auto`. Range 1–100. |
-| `memory_buffers.safety_max_host_fraction_pct` | `75` | Fraction of `MemTotal` the resolved total footprint must not exceed. Applies to both auto and explicit values; daemon refuses to start if exceeded. Range 1–100. |
+| `memory_buffers.auto_host_fraction_pct` | `50` | Fraction of `MemTotal` budgeted for the memory_buffers write stage under `auto`. Range 1–100. |
+| `memory_buffers.safety_max_host_fraction_pct` | `75` | Fraction of `MemTotal` the resolved footprint must not exceed. Applies to both auto and explicit values; daemon refuses to start if exceeded. Range 1–100. |
 | `memory_buffers.auto_min_gb_per_tape` | `1` | Floor (GB) for the per-tape auto-resolved value. Ignored for explicit GB. |
 | `memory_buffers.auto_max_gb_per_tape` | `32` | Ceiling (GB) for the per-tape auto-resolved value. Ignored for explicit GB. |
 
