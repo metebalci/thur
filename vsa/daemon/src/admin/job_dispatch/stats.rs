@@ -123,7 +123,7 @@ struct VolScan {
     scope: String,
     allocated_pages: u64,
     logical_bytes: u64,
-    hashes: HashSet<String>,
+    hashes: HashSet<[u8; 32]>,
 }
 
 fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
@@ -157,14 +157,15 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
             }
         };
 
-        let mut hashes: HashSet<String> = HashSet::new();
+        let mut hashes: HashSet<[u8; 32]> = HashSet::new();
         let mut allocated_pages: u64 = 0;
         let mut decode_error: Option<String> = None;
         for record in page_index.iter() {
             match record {
                 Ok((_page_id, hash)) => {
                     allocated_pages += 1;
-                    hashes.insert(hex::encode(hash));
+                    // Raw 32-byte hash, not its hex string (issue #222).
+                    hashes.insert(hash);
                 }
                 Err(e) => {
                     decode_error = Some(format!("pages.idx iteration failed: {}", e));
@@ -197,9 +198,12 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
     }
 
     // Size every referenced chunk against its pool. `pages.idx` has
-    // no inline size, so `iter_chunks()` is the only local size
-    // source — one pass per distinct `(backend, namespace)` pool.
-    let mut pool_sizes: HashMap<(String, Option<String>), HashMap<String, u64>> = HashMap::new();
+    // no inline size, so the pool walk is the only local size source —
+    // one pass per distinct `(backend, namespace)` pool. `for_each_chunk`
+    // folds straight into a `[u8; 32]`-keyed map (no transient
+    // whole-pool `Vec<(String, u64)>`, no per-chunk hex string — issue
+    // #222).
+    let mut pool_sizes: HashMap<(String, Option<String>), HashMap<[u8; 32], u64>> = HashMap::new();
     for vs in &vol_scans {
         let key = (vs.backend.clone(), vs.namespace.clone());
         if pool_sizes.contains_key(&key) {
@@ -209,7 +213,10 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
             Some(ns) => ChunkPool::new_namespaced(data_dir, &vs.backend, ns)?,
             None => ChunkPool::new(data_dir, &vs.backend)?,
         };
-        let map: HashMap<String, u64> = pool.iter_chunks()?.into_iter().collect();
+        let mut map: HashMap<[u8; 32], u64> = HashMap::new();
+        pool.for_each_chunk(|hash, size| {
+            map.insert(hash, size);
+        })?;
         pool_sizes.insert(key, map);
     }
 
@@ -219,10 +226,12 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
             let pool_map = pool_sizes
                 .get(&(vs.backend.clone(), vs.namespace.clone()))
                 .expect("every scanned volume's pool was sized above");
-            let chunks: HashMap<String, u64> = vs
+            // `[u8; 32]` is `Copy`, so this is a cheap 32-byte copy per
+            // referenced chunk, not the old heap-allocating hex clone.
+            let chunks: HashMap<[u8; 32], u64> = vs
                 .hashes
                 .iter()
-                .filter_map(|h| pool_map.get(h).map(|&sz| (h.clone(), sz)))
+                .filter_map(|h| pool_map.get(h).map(|&sz| (*h, sz)))
                 .collect();
             EntityScan {
                 label: vs.volume.clone(),

@@ -35,6 +35,7 @@ pub use core_stream::{
 // `crate::legal_hold` (smc-side). Both are re-exported flat below so
 // `core_mediachanger::legal_hold::*` resolves to the union.
 pub use core_stream::legal_hold as ssc_legal_hold;
+pub use core_stream::decode_hash_hex;
 
 // Storage backends + compression layer were lifted into the
 // `shared-object-store` crate so the sibling block-storage product

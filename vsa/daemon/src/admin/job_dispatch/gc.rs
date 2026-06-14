@@ -44,7 +44,10 @@ pub struct GcParams {
 /// Per-(backend, namespace) live-hash bucket. `namespace` is `None`
 /// for `Global`-scope volumes (the shared pool), `Some(uuid-hex)` for
 /// `Local`-scope volumes.
-type LiveSet = HashMap<(String, Option<String>), HashSet<String>>;
+// Live hashes keyed on the raw 32-byte BLAKE3 hash, not its 64-char hex
+// string: ~4x smaller per entry, which keeps the all-volumes-and-
+// snapshots live set off the multi-GB / OOM path at scale (issue #222).
+type LiveSet = HashMap<(String, Option<String>), HashSet<[u8; 32]>>;
 
 /// `(backend, namespace)` buckets whose live set could not be read in
 /// full (a page-index open/iteration error on a volume or snapshot we
@@ -284,7 +287,8 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<(LiveSet, PoisonSet)> 
         for record in page_index.iter() {
             match record {
                 Ok((_page_id, hash)) => {
-                    bucket.insert(hex::encode(hash));
+                    // Raw 32-byte hash, not its hex string (issue #222).
+                    bucket.insert(hash);
                 }
                 Err(e) => {
                     warn!(
@@ -335,7 +339,8 @@ fn collect_live_hashes(data_dir: &Path) -> anyhow::Result<(LiveSet, PoisonSet)> 
         for record in page_index.iter() {
             match record {
                 Ok((_page_id, hash)) => {
-                    bucket.insert(hex::encode(hash));
+                    // Raw 32-byte hash, not its hex string (issue #222).
+                    bucket.insert(hash);
                 }
                 Err(e) => {
                     warn!(
@@ -362,7 +367,7 @@ fn run_local_gc(
 ) -> anyhow::Result<(Vec<String>, u64)> {
     let mut lines: Vec<String> = Vec::new();
     let mut bytes_freed = 0u64;
-    let empty: HashSet<String> = HashSet::new();
+    let empty: HashSet<[u8; 32]> = HashSet::new();
 
     // Shared (Global-scope) pool. Skip entirely if its live set was
     // incomplete this run (#145).
@@ -388,7 +393,7 @@ fn run_local_gc(
     // live set, plus any orphan namespace dir still on disk whose
     // volume was destroyed (empty live set → every chunk is orphaned).
     let pool_root = data_dir.join("chunks").join(backend_name);
-    let mut namespaces: HashMap<String, &HashSet<String>> = HashMap::new();
+    let mut namespaces: HashMap<String, &HashSet<[u8; 32]>> = HashMap::new();
     for ((b, ns), hashes) in live.iter() {
         if b != backend_name {
             continue;
@@ -448,60 +453,72 @@ fn run_local_gc(
 
 fn sweep_one_pool(
     pool: &ChunkPool,
-    live: &HashSet<String>,
+    live: &HashSet<[u8; 32]>,
     dry_run: bool,
     context: &str,
     namespace: Option<&str>,
     budget: Option<&PoolBudget>,
     lines: &mut Vec<String>,
 ) -> anyhow::Result<u64> {
-    let chunks = pool.iter_chunks()?;
-    let total = chunks.len();
+    let mut total = 0usize;
     let mut orphans = 0usize;
     let mut bytes_freed = 0u64;
     let ns_label = namespace.unwrap_or("(shared)");
-
     let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
-    for (hash, size) in chunks {
-        if live.contains(&hash) {
-            continue;
+
+    // Stream the pool (no whole-pool `Vec<(String, u64)>`; issue #222).
+    // The live-set membership test is a raw 32-byte compare; the hex
+    // string the pool ops (`is_pinned` / `chunk_mtime_secs` / `remove` /
+    // log lines) need is materialized only for orphan *candidates*, a
+    // small fraction. A `remove` failure is captured and surfaced after
+    // the walk (the infallible callback can't `?`).
+    let mut remove_err: Option<anyhow::Error> = None;
+    pool.for_each_chunk(|hash, size| {
+        if remove_err.is_some() {
+            return;
         }
-        if pool.is_pinned(&hash) {
+        total += 1;
+        if live.contains(&hash) {
+            return;
+        }
+        let hex = hex::encode(hash);
+        if pool.is_pinned(&hex) {
             lines.push(format!(
                 "  skipped orphan chunk {}.. ({} bytes, {}) - pinned by outstanding ROD token",
-                &hash[..hash.len().min(8)],
+                &hex[..hex.len().min(8)],
                 size,
                 ns_label,
             ));
-            continue;
+            return;
         }
         // Recent-seal grace window (issue #141): a chunk sealed after the
         // phase-1 live-set snapshot looks like an orphan but is referenced
         // by an in-flight WRITE GC hasn't observed; deleting it loses
         // host-acked data before its upload completes. A genuine orphan
         // ages past the window and is reclaimed on a later run.
-        if let Some(mtime) = pool.chunk_mtime_secs(&hash)
+        if let Some(mtime) = pool.chunk_mtime_secs(&hex)
             && mtime >= recent_cutoff
         {
             lines.push(format!(
                 "  skipped recent chunk {}.. ({} bytes, {}) - sealed within grace window",
-                &hash[..hash.len().min(8)],
+                &hex[..hex.len().min(8)],
                 size,
                 ns_label,
             ));
-            continue;
+            return;
         }
         orphans += 1;
         bytes_freed += size;
         if dry_run {
             lines.push(format!(
                 "  [dry-run] would delete local chunk {}.. ({} bytes, {})",
-                &hash[..hash.len().min(8)],
+                &hex[..hex.len().min(8)],
                 size,
                 ns_label,
             ));
+        } else if let Err(e) = pool.remove(&hex) {
+            remove_err = Some(e.into());
         } else {
-            pool.remove(&hash)?;
             // Release the freed bytes back to the per-backend budget so
             // `current_bytes()` stays equal to on-disk pool bytes (the
             // eviction worker reads the budget instead of rescanning).
@@ -511,11 +528,14 @@ fn sweep_one_pool(
             }
             lines.push(format!(
                 "  deleted local chunk {}.. ({} bytes, {})",
-                &hash[..hash.len().min(8)],
+                &hex[..hex.len().min(8)],
                 size,
                 ns_label,
             ));
         }
+    })?;
+    if let Some(e) = remove_err {
+        return Err(e);
     }
 
     lines.push(format!(
@@ -570,8 +590,8 @@ async fn run_storage_gc(
     let mut total = 0usize;
     let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
 
-    let empty: HashSet<String> = HashSet::new();
-    let live_for_backend: HashMap<Option<&str>, &HashSet<String>> = live
+    let empty: HashSet<[u8; 32]> = HashSet::new();
+    let live_for_backend: HashMap<Option<&str>, &HashSet<[u8; 32]>> = live
         .iter()
         .filter(|((b, _), _)| b == backend_name)
         .map(|((_, ns), hashes)| (ns.as_deref(), hashes))
@@ -592,7 +612,13 @@ async fn run_storage_gc(
             .get(&parsed.namespace.as_deref())
             .copied()
             .unwrap_or(&empty);
-        if live_set.contains(&parsed.hash) {
+        // The live set is keyed on the raw 32-byte hash (issue #222);
+        // decode the object key's hex. A key that doesn't decode can't
+        // be matched to a live chunk and is left in place (never deleted).
+        let Some(hash_bytes) = shared_pool::decode_hash_hex(&parsed.hash) else {
+            continue;
+        };
+        if live_set.contains(&hash_bytes) {
             continue;
         }
         let ns_label = parsed.namespace.as_deref().unwrap_or("(shared)");
@@ -784,7 +810,7 @@ mod tests {
             assert!(poisoned.is_empty());
             assert_eq!(
                 live.get(&("primary".to_string(), Some(ns.clone()))),
-                Some(&HashSet::from([live_hash.clone()])),
+                Some(&HashSet::from([live_bytes])),
                 "only the chunk still mapped into pages.idx is live"
             );
 
@@ -977,10 +1003,10 @@ mod tests {
             .get(&("primary".to_string(), Some(ns.clone())))
             .expect("namespace bucket present");
         assert!(
-            bucket.contains(&old_hash),
+            bucket.contains(&old_bytes),
             "snapshot keeps overwritten chunk"
         );
-        assert!(bucket.contains(&new_hash), "parent's current chunk is live");
+        assert!(bucket.contains(&new_bytes), "parent's current chunk is live");
 
         // GC while the snapshot exists: nothing reclaimed.
         run_local_gc(data_dir, "primary", &live, &PoisonSet::new(), false, None).unwrap();

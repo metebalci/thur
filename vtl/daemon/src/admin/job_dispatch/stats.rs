@@ -214,7 +214,7 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
             }
         };
 
-        let mut cart_hashes: HashMap<String, u64> = HashMap::new();
+        let mut cart_hashes: HashMap<[u8; 32], u64> = HashMap::new();
         let mut logical_bytes: u64 = 0;
         let mut sealed_chunks: u64 = 0;
         let mut location = LocationCounts::default();
@@ -230,15 +230,20 @@ fn collect_stats(data_dir: &Path) -> anyhow::Result<StatsReport> {
                     break;
                 }
             };
-            let Some(hash) = rec.hash.as_ref() else {
+            let Some(hash_hex) = rec.hash.as_ref() else {
                 continue;
             };
             sealed_chunks += 1;
             logical_bytes = logical_bytes.saturating_add(rec.size);
-            cart_hashes
-                .entry(hash.clone())
-                .and_modify(|s| *s = (*s).max(rec.size))
-                .or_insert(rec.size);
+            // Dedup map keyed on the raw 32-byte hash, not the hex string
+            // chunks.idx stores (issue #222). A hash that doesn't decode
+            // (corruption) is still counted above but skips the dedup map.
+            if let Some(hash) = core_mediachanger::decode_hash_hex(hash_hex) {
+                cart_hashes
+                    .entry(hash)
+                    .and_modify(|s| *s = (*s).max(rec.size))
+                    .or_insert(rec.size);
+            }
             match rec.location {
                 LocationTag::LocalOnly => location.local_only += 1,
                 LocationTag::Both => location.both += 1,

@@ -343,7 +343,8 @@ disk; the binaries they produce are `thurvtl-{daemon,cli}` and
 - **shared-pool** — content-addressed chunk pool. One `ChunkPool`
   carrying both insertion APIs (`insert_bytes(&[u8])` for buffer-driven
   block writes, `insert_from_path(src, hash)` for staging-file-driven
-  tape writes), namespace-aware `object_key`, `iter_chunks` for GC,
+  tape writes), namespace-aware `object_key`, `iter_chunks` (hex) /
+  `for_each_chunk` (streaming, raw `[u8; 32]`) for GC + stats,
   atomic tmp+rename inserts. Layout
   `<root>/chunks/<backend>/[<namespace>/]<aa>/<bb>/<hash>.dat`.
   core-stream's `chunk_store.rs` aliases `ChunkPool` as `ChunkStore`

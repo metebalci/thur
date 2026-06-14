@@ -34,10 +34,14 @@ pub struct EntityScan {
     /// keys the dedup bucket — chunks only dedup within one bucket.
     pub namespace: Option<String>,
     /// Distinct chunk hashes this entity references, each mapped to
-    /// its byte size. When two entities report different sizes for
-    /// the same hash the larger wins (mirrors the on-disk index's
-    /// max-size reconciliation).
-    pub chunks: HashMap<String, u64>,
+    /// its byte size. Keyed on the raw 32-byte BLAKE3 hash rather than
+    /// its 64-char hex string: ~4x smaller per entry and no per-entry
+    /// heap allocation, which is what keeps `system stats` off the
+    /// multi-GB / OOM path at the tens-of-millions-of-chunks scale a
+    /// TiB-class entity reaches (issue #222). When two entities report
+    /// different sizes for the same hash the larger wins (mirrors the
+    /// on-disk index's max-size reconciliation).
+    pub chunks: HashMap<[u8; 32], u64>,
 }
 
 /// Per-entity dedup contribution. Returned in the same order as the
@@ -80,16 +84,17 @@ pub fn compute_dedup(scans: &[EntityScan]) -> (Vec<EntityContribution>, Vec<Back
     // once — a plain counter is an exact replacement for the previous
     // `HashSet<String>` of labels, which cost ~250+ B/chunk (≈15 GB of
     // `system stats` job RAM at the ~60 M-chunk documented scale) for a
-    // value never inspected (issue #168).
-    type Bucket = HashMap<String, (u64, u32)>;
+    // value never inspected (issue #168). The key is the raw 32-byte
+    // hash, not its hex string (issue #222).
+    type Bucket = HashMap<[u8; 32], (u64, u32)>;
 
     let mut buckets: HashMap<BucketKey, Bucket> = HashMap::new();
     for scan in scans {
         let bucket = buckets
             .entry((scan.backend.clone(), scan.namespace.clone()))
             .or_default();
-        for (h, &sz) in &scan.chunks {
-            let entry = bucket.entry(h.clone()).or_insert((sz, 0));
+        for (&h, &sz) in &scan.chunks {
+            let entry = bucket.entry(h).or_insert((sz, 0));
             entry.0 = entry.0.max(sz);
             entry.1 += 1;
         }
@@ -142,12 +147,22 @@ pub fn compute_dedup(scans: &[EntityScan]) -> (Vec<EntityContribution>, Vec<Back
 mod tests {
     use super::*;
 
+    // Map a short test label to a distinct 32-byte hash by writing its
+    // bytes into a zero-filled array (test hashes are short + unique).
+    fn h(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let b = s.as_bytes();
+        let n = b.len().min(32);
+        out[..n].copy_from_slice(&b[..n]);
+        out
+    }
+
     fn scan(label: &str, ns: Option<&str>, chunks: &[(&str, u64)]) -> EntityScan {
         EntityScan {
             label: label.to_string(),
             backend: "primary".to_string(),
             namespace: ns.map(str::to_string),
-            chunks: chunks.iter().map(|(h, s)| ((*h).to_string(), *s)).collect(),
+            chunks: chunks.iter().map(|(hs, s)| (h(hs), *s)).collect(),
         }
     }
 

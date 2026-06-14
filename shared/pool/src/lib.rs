@@ -584,11 +584,42 @@ impl ChunkPool {
     /// look like `<64-hex>.dat`, so partially-written tempfiles
     /// won't be reported as live chunks.
     pub fn iter_chunks(&self) -> Result<Vec<(String, u64)>, ChunkPoolError> {
+        let mut out = Vec::new();
+        self.walk_chunk_files(|hash_hex, size| out.push((hash_hex.to_string(), size)))?;
+        Ok(out)
+    }
+
+    /// Streaming counterpart of [`iter_chunks`]: invokes `f` with each
+    /// chunk's 32-byte hash + size **without** materializing the whole
+    /// pool. The `system stats` / `system gc` dedup scans fold straight
+    /// into a `[u8; 32]`-keyed map this way, avoiding both the per-chunk
+    /// 64-char hex `String` and the one giant `Vec<(String, u64)>`
+    /// `iter_chunks` builds — multi-GB of job RAM (OOM risk) at the
+    /// ~tens-of-millions-of-chunks scale a TiB-class entity reaches
+    /// (issue #222). A malformed `<64-hex>.dat` filename that somehow
+    /// passes the walk's validation but fails to decode is skipped.
+    pub fn for_each_chunk(
+        &self,
+        mut f: impl FnMut([u8; 32], u64),
+    ) -> Result<(), ChunkPoolError> {
+        self.walk_chunk_files(|hash_hex, size| {
+            if let Some(bytes) = decode_hash_hex(hash_hex) {
+                f(bytes, size);
+            }
+        })
+    }
+
+    /// Shared two-level shard walk behind [`iter_chunks`] /
+    /// [`for_each_chunk`]. Calls `f(hash_hex, size)` once per file named
+    /// `<64-hex>.dat`; skips everything else (tempfiles, stray dirs).
+    fn walk_chunk_files(
+        &self,
+        mut f: impl FnMut(&str, u64),
+    ) -> Result<(), ChunkPoolError> {
         let pool = self.pool_dir();
         if !pool.is_dir() {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let mut out = Vec::new();
         for s1_entry in fs::read_dir(&pool)? {
             let s1_entry = s1_entry?;
             if !s1_entry.file_type()?.is_dir() {
@@ -615,12 +646,31 @@ impl ChunkPool {
                     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                         continue;
                     }
-                    out.push((hash.to_string(), meta.len()));
+                    f(hash, meta.len());
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
+}
+
+/// Decode a 64-char lowercase/uppercase hex chunk hash into its 32 raw
+/// bytes, allocation-free. Returns `None` on a wrong length or a
+/// non-hex digit. Public so callers that already hold a hash as hex (a
+/// parsed storage object key, say) can fold into the same `[u8; 32]`
+/// keyed live set the streaming pool walk produces (issue #222).
+pub fn decode_hash_hex(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *slot = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
 }
 
 /// First and second 2-hex-char shard for a chunk hash. Falls back to
@@ -889,6 +939,46 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
         assert!(pool.iter_chunks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn for_each_chunk_matches_iter_chunks_decoded() {
+        // The streaming `[u8; 32]` walk (issue #222) must see exactly the
+        // same (hash, size) set the hex `iter_chunks` does, just decoded.
+        use std::collections::HashMap;
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        for body in [b"alpha".as_slice(), b"beta", b"gamma-payload"] {
+            pool.insert_bytes(body).unwrap();
+        }
+        let mut want: HashMap<[u8; 32], u64> = HashMap::new();
+        for (hex, size) in pool.iter_chunks().unwrap() {
+            want.insert(decode_hash_hex(&hex).expect("valid pool hash"), size);
+        }
+        let mut got: HashMap<[u8; 32], u64> = HashMap::new();
+        pool.for_each_chunk(|hash, size| {
+            got.insert(hash, size);
+        })
+        .unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn decode_hash_hex_round_trips_and_rejects_bad_input() {
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        let (hash, _) = pool.insert_bytes(b"round-trip").unwrap();
+        // hex -> bytes -> hex is the identity for a real 64-char hash.
+        let bytes = decode_hash_hex(&hash).expect("valid hash decodes");
+        let mut rehex = String::with_capacity(64);
+        for b in bytes {
+            use std::fmt::Write as _;
+            write!(rehex, "{b:02x}").unwrap();
+        }
+        assert_eq!(rehex, hash);
+        assert!(decode_hash_hex("tooshort").is_none());
+        assert!(decode_hash_hex(&"z".repeat(64)).is_none());
     }
 
     #[test]
