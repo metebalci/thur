@@ -82,6 +82,28 @@ impl Cli {
         )
     }
 
+    /// True for verbs whose work is CPU-bound and parallel enough to
+    /// want a multi-thread tokio runtime instead of the default
+    /// current-thread one (issue #226). Only `system storage benchmark`
+    /// qualifies: it drives `buffer_unordered(concurrency)` uploads /
+    /// downloads whose per-MB stages (TLS encryption, SigV4 payload
+    /// hashing, compression, the `to_vec` copy) are all CPU work — on a
+    /// current-thread runtime they serialize onto one core and
+    /// understate the backend's real multi-core ceiling, which is the
+    /// tool's whole purpose. thurvtl's bench already runs multi-thread
+    /// (its `#[tokio::main]`), so this also keeps the two co-resident
+    /// applications reporting the same ceiling for the same backend.
+    fn wants_worker_threads(&self) -> bool {
+        matches!(
+            self.command,
+            Commands::System {
+                action: SystemAction::Storage {
+                    action: StorageAction::Benchmark { .. }
+                }
+            }
+        )
+    }
+
     /// True for the daemon-down subset that needs `data_dir` resolved
     /// up front: `volume key` reads / rewrites the volume manifest and
     /// keystore sidecar under `<data_dir>`. The other daemon-down
@@ -122,13 +144,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Build a current-thread tokio runtime for the admin-socket
-    // calls. Multi-threaded would be overkill for a one-shot CLI;
-    // current-thread keeps thread spawn cost off the cold path.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("starting tokio runtime")?;
+    // Build the tokio runtime. Most verbs are one-shot admin-socket
+    // calls where current-thread keeps thread-spawn cost off the cold
+    // path, but `system storage benchmark` is CPU-bound and parallel
+    // and must run multi-thread to measure the backend's real ceiling
+    // (issue #226).
+    let runtime = if cli.wants_worker_threads() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("starting multi-thread tokio runtime")?
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("starting tokio runtime")?
+    };
     runtime.block_on(run(cli))
 }
 
@@ -562,6 +593,16 @@ mod cli_parse_tests {
     fn storage_benchmark_is_daemon_down() {
         let cli = parse(["thurvsa", "system", "storage", "benchmark"]);
         assert!(cli.is_daemon_down());
+    }
+
+    /// Regression for issue #226: only `system storage benchmark` wants
+    /// a multi-thread runtime (to measure the backend's real multi-core
+    /// ceiling); every other verb stays current-thread.
+    #[test]
+    fn only_storage_benchmark_wants_worker_threads() {
+        assert!(parse(["thurvsa", "system", "storage", "benchmark"]).wants_worker_threads());
+        assert!(!parse(["thurvsa", "system", "storage", "check"]).wants_worker_threads());
+        assert!(!parse(["thurvsa", "volume", "list"]).wants_worker_threads());
     }
 
     #[test]
