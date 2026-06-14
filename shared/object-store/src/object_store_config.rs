@@ -453,9 +453,12 @@ pub struct UploadConfig {
     /// `min(16, available_parallelism * 4)`. Explicit `>=1` honored
     /// as-is. Bigger values trade memory for throughput: each
     /// in-flight upload pins one chunk in RAM, so `N × chunk_size`
-    /// memory per backend per cartridge. The auto cap of 16 keeps
-    /// the in-flight footprint at 128 MiB per backend per cartridge
-    /// for 8 MiB chunks while capturing most of the available
+    /// memory per backend. A shared per-backend semaphore enforces
+    /// this ceiling across *all* cartridges/volumes uploading to the
+    /// backend at once (VTL runs one upload task per tape concurrently),
+    /// so the footprint stays bounded no matter how many are active. The
+    /// auto cap of 16 keeps the in-flight footprint at 128 MiB per
+    /// backend for 8 MiB chunks while capturing most of the available
     /// throughput on storage backends (S3 / GCS / Azure all saturate
     /// well before c=32 on a single 10 Gbps link).
     #[serde(default = "default_max_concurrent")]

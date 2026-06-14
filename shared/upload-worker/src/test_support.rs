@@ -32,6 +32,13 @@ pub(crate) struct MockBackend {
     pub put_err: Mutex<Option<ObjectStoreError>>,
     pub put_compressed_as: Mutex<Option<(u64, CompressionAlgo)>>,
     pub fail_put_for_keys: Mutex<HashSet<String>>,
+    // Concurrency observability (off by default). When `put_delay_ms`
+    // is non-zero each PUT sleeps that long while `in_flight` /
+    // `max_in_flight` track the high-water mark of overlapping PUTs —
+    // used by the per-backend-semaphore bound test (issue #216).
+    pub in_flight: AtomicUsize,
+    pub max_in_flight: AtomicUsize,
+    pub put_delay_ms: AtomicUsize,
 }
 
 impl Default for MockBackend {
@@ -43,6 +50,9 @@ impl Default for MockBackend {
             put_err: Mutex::new(None),
             put_compressed_as: Mutex::new(None),
             fail_put_for_keys: Mutex::new(HashSet::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            put_delay_ms: AtomicUsize::new(0),
         }
     }
 }
@@ -55,6 +65,10 @@ impl MockBackend {
     pub fn heads(&self) -> usize {
         self.counters.heads.load(Ordering::SeqCst)
     }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -65,6 +79,15 @@ impl ObjectStoreBackend for MockBackend {
         data: &[u8],
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         self.counters.puts.fetch_add(1, Ordering::SeqCst);
+        // Track the high-water mark of overlapping PUTs across the
+        // optional `put_delay_ms` window.
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let delay = self.put_delay_ms.load(Ordering::SeqCst) as u64;
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         if let Some(e) = self.put_err.lock().unwrap().take() {
             return Err(e);
         }

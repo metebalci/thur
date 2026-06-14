@@ -282,14 +282,17 @@ storage:
 
   # Upload worker (S3/GCS/Azure only — ignored for local backend).
   upload:
-    # Maximum concurrent in-flight chunk uploads per backend per
-    # cartridge. `0` (default) means "auto-scale": at daemon start,
-    # resolve to min(16, available_parallelism * 4). On 4+ core hosts
-    # this caps at 16, which captures most storage-backend throughput
-    # while bounding the in-flight memory footprint (N × chunk_size).
-    # Operators who want higher concurrency at the cost of memory can
-    # set this to an explicit value (e.g. 32). Resolved value + source
-    # ("auto-detected" vs "operator override") is logged at startup.
+    # Maximum concurrent in-flight chunk uploads per backend. `0`
+    # (default) means "auto-scale": at daemon start, resolve to
+    # min(16, available_parallelism * 4). On 4+ core hosts this caps at
+    # 16, which captures most storage-backend throughput while bounding
+    # the in-flight memory footprint (N × chunk_size). A shared
+    # per-backend semaphore enforces this across every tape uploading to
+    # the backend at once (tapes upload concurrently), so the bound holds
+    # no matter how many drives are active. Operators who want higher
+    # concurrency at the cost of memory can set an explicit value (e.g.
+    # 32). Resolved value + source ("auto-detected" vs "operator
+    # override") is logged at startup.
     max_concurrent: 0
     # Maximum retry attempts per upload (exponential backoff 1 s -> 30 s).
     retry_max_attempts: 10

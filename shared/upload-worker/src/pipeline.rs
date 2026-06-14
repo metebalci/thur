@@ -9,9 +9,11 @@
 //! shared scaffold.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use shared_object_store::ObjectStoreBackend;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::inert::upload_chunk_inert;
@@ -34,6 +36,17 @@ use crate::payload::{PendingUpload, UploadOutcome};
 /// `buffer_unordered` stream so a slow hook gates only its own task,
 /// not its siblings.
 ///
+/// `backend_permits`, when `Some`, is a per-backend [`Semaphore`]
+/// **shared across every concurrent caller bound to that backend** —
+/// each chunk acquires one permit immediately before
+/// [`upload_chunk_inert`] reads the file and PUTs, releasing on
+/// completion. `buffer_unordered` only bounds a single call's in-flight
+/// futures; the shared semaphore is what keeps the *combined* in-flight
+/// PUT count (hence the chunk-pinned RAM) at `max_concurrent` per
+/// backend once independent tapes/volumes upload concurrently
+/// (issue #216). `None` falls back to the per-call `buffer_unordered`
+/// bound alone.
+///
 /// Single attempt per payload — the per-backend retry inside
 /// [`shared_object_store::ObjectStoreBackend`] implementations already runs the
 /// configured jittered exponential retries with classify-and-fail-fast
@@ -50,6 +63,7 @@ pub async fn run_upload_pipeline<F, Fut>(
     label: &str,
     payloads: Vec<PendingUpload>,
     max_concurrent: usize,
+    backend_permits: Option<Arc<Semaphore>>,
     on_complete: F,
 ) -> Vec<UploadOutcome>
 where
@@ -78,7 +92,17 @@ where
     let results: Vec<Option<UploadOutcome>> = stream::iter(payloads)
         .map(|payload| {
             let on_complete = &on_complete;
+            let backend_permits = &backend_permits;
             async move {
+                // Hold a per-backend permit (when configured) across the
+                // file-read + PUT so concurrent tapes can't exceed the
+                // backend's `max_concurrent` in-flight ceiling. Acquired
+                // here — not before the file read — so a future merely
+                // queued behind the semaphore pins no chunk in RAM.
+                let _permit = match backend_permits {
+                    Some(sem) => sem.acquire().await.ok(),
+                    None => None,
+                };
                 match upload_chunk_inert(storage_backend, &payload).await {
                     Ok(outcome) => {
                         debug!(
@@ -193,7 +217,7 @@ mod tests {
         let backend = MockBackend::default();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_hook = hits.clone();
-        let outcomes = run_upload_pipeline(&backend, "label", vec![], 4, move |_| {
+        let outcomes = run_upload_pipeline(&backend, "label", vec![], 4, None, move |_| {
             let hits = hits_for_hook.clone();
             async move {
                 hits.fetch_add(1, Ordering::SeqCst);
@@ -211,7 +235,8 @@ mod tests {
         let backend = MockBackend::default();
         let tmp = TempDir::new().unwrap();
         let payloads: Vec<PendingUpload> = (0..3).map(|i| make_payload(i, tmp.path())).collect();
-        let outcomes = run_upload_pipeline(&backend, "label", payloads, 0, |_| async {}).await;
+        let outcomes =
+            run_upload_pipeline(&backend, "label", payloads, 0, None, |_| async {}).await;
         assert_eq!(outcomes.len(), 3);
         assert_eq!(backend.puts(), 3);
     }
@@ -231,7 +256,7 @@ mod tests {
 
         let hook_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
         let hook_ids_for_hook = hook_ids.clone();
-        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, move |o| {
+        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, None, move |o| {
             let hook_ids = hook_ids_for_hook.clone();
             async move {
                 hook_ids.lock().unwrap().push(o.item_id);
@@ -268,7 +293,7 @@ mod tests {
 
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let hook_calls_for_hook = hook_calls.clone();
-        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, move |o| {
+        let outcomes = run_upload_pipeline(&backend, "label", payloads, 2, None, move |o| {
             let hook_calls = hook_calls_for_hook.clone();
             async move {
                 assert!(o.dedup_hit, "every outcome must reflect the HEAD hit");
@@ -282,5 +307,61 @@ mod tests {
         assert_eq!(hook_calls.load(Ordering::SeqCst), 3);
         assert_eq!(backend.heads(), 3);
         assert_eq!(backend.puts(), 0);
+    }
+
+    /// Issue #216: a shared per-backend semaphore caps the *combined*
+    /// in-flight PUT count across concurrent pipeline calls (independent
+    /// tapes uploading at once), even though each call's own
+    /// `buffer_unordered` would let more overlap. Without it the calls
+    /// overlap freely — the control half proves the cap is the
+    /// semaphore's doing, not incidental scheduling.
+    #[tokio::test]
+    async fn shared_semaphore_bounds_per_backend_concurrency() {
+        use tokio::sync::Semaphore;
+
+        // One "tape": 4 chunks, each call permitted 4-wide locally.
+        async fn drive(
+            backend: &MockBackend,
+            dir: &Path,
+            base: u64,
+            sem: Option<Arc<Semaphore>>,
+        ) {
+            let payloads: Vec<PendingUpload> =
+                (0..4).map(|i| make_payload(base + i, dir)).collect();
+            run_upload_pipeline(backend, "tape", payloads, 4, sem, |_| async {}).await;
+        }
+
+        // Bounded: three concurrent 4-wide calls share one Semaphore(2),
+        // so at most 2 PUTs are ever in flight despite 12 being eligible.
+        let dir = TempDir::new().unwrap();
+        let backend = MockBackend::default();
+        backend.put_delay_ms.store(20, Ordering::SeqCst);
+        let sem = Arc::new(Semaphore::new(2));
+        tokio::join!(
+            drive(&backend, dir.path(), 0, Some(sem.clone())),
+            drive(&backend, dir.path(), 10, Some(sem.clone())),
+            drive(&backend, dir.path(), 20, Some(sem.clone())),
+        );
+        assert_eq!(backend.puts(), 12, "every chunk must still PUT");
+        assert!(
+            backend.max_in_flight() <= 2,
+            "shared semaphore must cap combined in-flight PUTs at 2, saw {}",
+            backend.max_in_flight()
+        );
+
+        // Control: no shared semaphore → the three calls overlap past 2.
+        let dir2 = TempDir::new().unwrap();
+        let backend2 = MockBackend::default();
+        backend2.put_delay_ms.store(20, Ordering::SeqCst);
+        tokio::join!(
+            drive(&backend2, dir2.path(), 0, None),
+            drive(&backend2, dir2.path(), 10, None),
+            drive(&backend2, dir2.path(), 20, None),
+        );
+        assert!(
+            backend2.max_in_flight() > 2,
+            "without the shared semaphore the calls should overlap beyond 2, saw {}",
+            backend2.max_in_flight()
+        );
     }
 }

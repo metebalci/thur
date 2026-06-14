@@ -95,8 +95,14 @@ end-to-end between both applications:
 - **`shared/upload-worker/` crate** — `PendingUpload` /
   `UploadOutcome` payload types, `upload_chunk_inert` (stateless
   PUT + HEAD probe), `run_upload_pipeline` (bounded-concurrency
-  scaffold). VTL drives the pipeline from
-  `vtl/daemon/src/upload_worker.rs`; VSA drives a Semaphore-capped
+  scaffold, with an optional shared per-backend `Semaphore` so the
+  `upload.max_concurrent` ceiling holds across concurrent callers).
+  VTL's `vtl/daemon/src/upload_worker.rs` dispatches one worker task
+  **per tape**, so distinct tapes — even on the same backend — upload
+  concurrently and one slow/backpressured backend no longer stalls
+  every other drive; each tape coalesces a burst of batches into a
+  single debounced manifest backup, and a shared per-backend semaphore
+  caps total in-flight PUTs (issue #216). VSA drives a Semaphore-capped
   per-task fan-out from `vsa/daemon/src/upload_worker.rs`. Both
   applications' per-completion hooks (legal-hold reapply on VTL, sidecar
   flip on VSA) plug into the same scaffold.
