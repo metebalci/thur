@@ -899,11 +899,12 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         match cart.read_next() {
             Ok(blk) => {
                 is_filemark = matches!(blk.kind, core_mediachanger::BlockKind::Filemark);
-                data_out = if blk.data.is_empty() {
-                    vec![]
-                } else {
-                    blk.data.to_vec()
-                };
+                // Move the decoded payload straight into the response —
+                // `Block.data` is an owned `Vec<u8>` now, so this is a
+                // zero-copy move instead of the old full-payload
+                // `Bytes::to_vec()` memcpy (issue #184). An LBP CRC32C
+                // trailer (RDPROTECT != 0) is appended in place below.
+                data_out = blk.data;
                 // Return info for event emission
                 Ok((
                     cart.label().to_string(),

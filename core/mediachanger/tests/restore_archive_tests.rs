@@ -159,7 +159,7 @@ async fn archive_then_restore_round_trip() {
     cart.rewind();
     for (i, expected) in written.iter().enumerate() {
         let block = cart.read_block_async(i as u64).await.expect("read");
-        assert_eq!(block.data.as_ref(), expected.as_slice(), "block {}", i);
+        assert_eq!(block.data.as_slice(), expected.as_slice(), "block {}", i);
     }
 }
 
@@ -243,7 +243,7 @@ async fn restore_archive_rename_via_as_barcode() {
     cart.rewind();
     for (i, expected) in written.iter().enumerate() {
         let block = cart.read_block_async(i as u64).await.expect("read");
-        assert_eq!(block.data.as_ref(), expected.as_slice());
+        assert_eq!(block.data.as_slice(), expected.as_slice());
     }
 }
 

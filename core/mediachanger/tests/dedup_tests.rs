@@ -123,7 +123,7 @@ fn reads_resolve_through_shared_pool() {
     let tapes_path = dir.path().join("tapes");
     let mut a = Cartridge::open(&tapes_path, "READ_A", CartridgeOpenMode::Open).unwrap();
     let blk = a.read_block(0).unwrap();
-    assert_eq!(blk.data.as_ref(), payload.as_slice());
+    assert_eq!(blk.data.as_slice(), payload.as_slice());
 
     // The cartridge directory should no longer carry a `chunks/` subdir
     // (sealed chunks moved to the shared pool); only `.staging/` for the

@@ -118,7 +118,7 @@ async fn cold_bucket_dr_via_index_pages() {
         match block.kind {
             core_mediachanger::BlockKind::Data => {
                 assert_eq!(
-                    block.data.as_ref(),
+                    block.data.as_slice(),
                     expected.as_slice(),
                     "block {} contents diverged after cold-bucket restore",
                     i

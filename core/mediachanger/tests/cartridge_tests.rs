@@ -588,7 +588,7 @@ async fn read_block_async_refetches_when_pool_file_missing() {
     cart.rewind();
     let block = cart.read_block_async(0).await.expect("read block");
     assert_eq!(block.kind, BlockKind::Data);
-    assert_eq!(block.data.as_ref(), test_data.as_slice());
+    assert_eq!(block.data.as_slice(), test_data.as_slice());
     assert!(
         pool_path_for_chunk.is_file(),
         "pool file should be restored after refetch"

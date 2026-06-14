@@ -1977,7 +1977,7 @@ impl Cartridge {
         if kind == BlockKind::Filemark {
             return Ok(Block {
                 kind,
-                data: Bytes::new(),
+                data: Vec::new(),
                 lba,
             });
         }
@@ -1999,7 +1999,7 @@ impl Cartridge {
             .saturating_add(plaintext.len() as u64);
         Ok(Block {
             kind,
-            data: Bytes::from(plaintext),
+            data: plaintext,
             lba,
         })
     }
@@ -2202,7 +2202,7 @@ impl Cartridge {
         if kind == BlockKind::Filemark {
             return Ok(Block {
                 kind,
-                data: Bytes::new(),
+                data: Vec::new(),
                 lba,
             });
         }
@@ -2340,7 +2340,7 @@ impl Cartridge {
 
         Ok(Block {
             kind,
-            data: Bytes::from(plaintext),
+            data: plaintext,
             lba,
         })
     }
@@ -4445,7 +4445,7 @@ mod at_rest_decrypt_cache {
 
         // First read decrypts chunk 0 and caches it.
         let b0 = cart.read_block(0).unwrap();
-        assert_eq!(b0.data.as_ref(), &a[..]);
+        assert_eq!(b0.data.as_slice(), &a[..]);
         assert!(
             matches!(cart.last_decrypted_chunk, Some((0, _))),
             "first at-rest read must populate the decrypt cache"
@@ -4454,6 +4454,6 @@ mod at_rest_decrypt_cache {
         // Second read of the same chunk is a cache hit and must return
         // identical plaintext.
         let b1 = cart.read_block(1).unwrap();
-        assert_eq!(b1.data.as_ref(), &b[..]);
+        assert_eq!(b1.data.as_slice(), &b[..]);
     }
 }

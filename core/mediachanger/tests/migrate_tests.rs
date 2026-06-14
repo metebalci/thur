@@ -280,7 +280,7 @@ async fn migrate_move_global_dedup_round_trip() {
         let block = cart.read_block_async(i as u64).await.expect("read block");
         match block.kind {
             core_mediachanger::BlockKind::Data => {
-                assert_eq!(block.data.as_ref(), expected.as_slice())
+                assert_eq!(block.data.as_slice(), expected.as_slice())
             }
             other => panic!("block {} unexpected kind {:?}", i, other),
         }
@@ -485,7 +485,7 @@ async fn migrate_rebind_verify_happy_path() {
     cart.rewind();
     for (i, expected) in written.iter().enumerate() {
         let block = cart.read_block_async(i as u64).await.expect("test setup");
-        assert_eq!(block.data.as_ref(), expected.as_slice());
+        assert_eq!(block.data.as_slice(), expected.as_slice());
     }
 }
 

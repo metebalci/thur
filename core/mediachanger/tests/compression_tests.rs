@@ -56,7 +56,7 @@ fn write_with_compression_then_read_back_plaintext() {
 
     cart.rewind();
     let block = cart.read_next().unwrap();
-    assert_eq!(block.data.as_ref(), plaintext.as_slice());
+    assert_eq!(block.data.as_slice(), plaintext.as_slice());
 }
 
 #[test]
@@ -81,9 +81,9 @@ fn dce_toggles_mid_tape_each_block_decompresses_correctly() {
 
     // Reads: per-block flag drives decompress; current DCE doesn't matter.
     cart.rewind();
-    assert_eq!(cart.read_next().unwrap().data.as_ref(), plain.as_slice());
-    assert_eq!(cart.read_next().unwrap().data.as_ref(), comp.as_slice());
-    assert_eq!(cart.read_next().unwrap().data.as_ref(), plain2.as_slice());
+    assert_eq!(cart.read_next().unwrap().data.as_slice(), plain.as_slice());
+    assert_eq!(cart.read_next().unwrap().data.as_slice(), comp.as_slice());
+    assert_eq!(cart.read_next().unwrap().data.as_slice(), plain2.as_slice());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn turning_dce_off_does_not_break_reading_existing_compressed_blocks() {
     cart.set_compression_state(DriveCompressionState::disabled());
     cart.rewind();
     let block = cart.read_next().unwrap();
-    assert_eq!(block.data.as_ref(), payload.as_slice());
+    assert_eq!(block.data.as_slice(), payload.as_slice());
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn compress_then_encrypt_roundtrip() {
 
     cart.rewind();
     let block = cart.read_next().unwrap();
-    assert_eq!(block.data.as_ref(), payload.as_slice());
+    assert_eq!(block.data.as_slice(), payload.as_slice());
 }
 
 /// Without DCE, two cartridges that write the same payload share one

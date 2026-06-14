@@ -153,7 +153,7 @@ async fn run_restore_batch_round_trip_three_cartridges() {
                 .unwrap_or_else(|e| panic!("read block {} of {} failed: {:?}", i, label, e));
             match block.kind {
                 core_mediachanger::BlockKind::Data => assert_eq!(
-                    block.data.as_ref(),
+                    block.data.as_slice(),
                     expected.as_slice(),
                     "block {} of {} diverged after batch restore",
                     i,
