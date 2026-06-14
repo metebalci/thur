@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use core_mediachanger::{Library, LibraryPartition, SlotRange, check_daemon_not_running};
+use core_mediachanger::{DaemonLock, Library, LibraryPartition, SlotRange};
 use shared_object_store::ObjectStoreConfig;
 use std::path::{Path, PathBuf};
 
@@ -26,9 +26,16 @@ pub async fn cmd_restore(
     dry_run: bool,
     allow_existing: bool,
 ) -> Result<i32> {
-    // Safety check: refuse if daemon is running. Restore writes into
-    // <data_dir>/tapes/<barcode>/ — the live daemon owns those paths.
-    check_daemon_not_running(data_dir)?;
+    // Hold the daemon lock for the whole restore. Restore writes into
+    // <data_dir>/tapes/<barcode>/ and rewrites inventory.json — the
+    // live daemon owns those paths. A bare point-check left a TOCTOU
+    // window: a thurvtld started mid-restore (systemd auto-start,
+    // another operator) would acquire the lock and serve half-restored
+    // cartridges while the final inventory rebuild raced its persists
+    // (issue #219). Acquiring the lock both refuses while a live PID
+    // holds it AND blocks a daemon from starting until `_daemon_lock`
+    // drops at function exit.
+    let _daemon_lock = DaemonLock::acquire(data_dir)?;
 
     let library_root = PathBuf::from(data_dir).join("library");
     let tapes_dir = PathBuf::from(data_dir).join("tapes");
@@ -588,7 +595,9 @@ pub async fn cmd_partition_create(
     mail_end: u32,
     drives: Vec<u32>,
 ) -> Result<()> {
-    check_daemon_not_running(data_dir)?;
+    // Hold the lock for the duration (not a point-check) so a daemon
+    // can't start mid-mutation and race the library.json write (#219).
+    let _daemon_lock = DaemonLock::acquire(data_dir)?;
     let mut library = open_library_for_chassis(data_dir)?;
 
     if library.get_partition(&name).is_some() {
@@ -641,7 +650,9 @@ pub async fn cmd_partition_modify(
     mail_end: Option<u32>,
     drives: Option<Vec<u32>>,
 ) -> Result<()> {
-    check_daemon_not_running(data_dir)?;
+    // Hold the lock for the duration (not a point-check) so a daemon
+    // can't start mid-mutation and race the library.json write (#219).
+    let _daemon_lock = DaemonLock::acquire(data_dir)?;
     let mut library = open_library_for_chassis(data_dir)?;
 
     if storage_start.is_none()
@@ -707,7 +718,9 @@ pub async fn cmd_partition_delete(
     name: String,
     merge_into: Option<String>,
 ) -> Result<()> {
-    check_daemon_not_running(data_dir)?;
+    // Hold the lock for the duration (not a point-check) so a daemon
+    // can't start mid-mutation and race the library.json write (#219).
+    let _daemon_lock = DaemonLock::acquire(data_dir)?;
     let mut library = open_library_for_chassis(data_dir)?;
 
     let existing: Vec<LibraryPartition> = library.partitions().to_vec();

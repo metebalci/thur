@@ -167,7 +167,13 @@ pub async fn cmd_key_migrate(
     // manifest. We do this last so a crash between persist and purge
     // leaves the sidecar present (recoverable rollback) rather than
     // a half-migrated cartridge with no key material reachable.
-    let sidecar_warning = if purge_local && from_label == "local" {
+    // Gate on the backend *type* (does it manage an on-disk sidecar?),
+    // not the entry *name*: keystore entries are free-form named with
+    // the type in a `type:` tag (the shipped example names the local
+    // entry `local-example`), so keying on the literal "local" left the
+    // plaintext DEK sidecar on disk whenever the operator named it
+    // anything else — issue #218.
+    let sidecar_warning = if purge_local && old_backend.manages_local_blob() {
         match old_backend.forget(&uuid).await {
             Ok(()) => Some(true),
             Err(e) => {
@@ -197,7 +203,7 @@ pub async fn cmd_key_migrate(
         );
     }
     println!("  Restart thurvtld to pick up the new keystore binding.");
-    if from_label == "local" {
+    if old_backend.manages_local_blob() {
         match sidecar_warning {
             Some(true) => println!(
                 "  Local sidecar at <data_dir>/keys/{}.key removed (--purge-local).",
