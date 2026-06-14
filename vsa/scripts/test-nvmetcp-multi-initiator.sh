@@ -224,7 +224,21 @@ create_volume() {
         || { log_error "Failed to create volume"; exit 1; }
 }
 
-list_ns_devs() { ls /dev/nvme*n1 2>/dev/null | sort; }
+# Namespace devices under *our* subsystem only. A bare `ls /dev/nvme*n1`
+# also enumerates the host's real NVMe drives, and the `head -1` fallback
+# below (taken when the kernel coalesces a reconnect, so connect_host
+# yields no new device) would then pick one of them — firing reservation
+# commands, or worse a fencing `dd`, at e.g. the boot SSD. Match each
+# namespace's controller subsystem NQN against ours via sysfs.
+list_ns_devs() {
+    local dev ns
+    for dev in /dev/nvme*n1; do
+        [[ -e "$dev" ]] || continue
+        ns=$(basename "$dev")
+        [[ "$(cat "/sys/block/$ns/device/subsysnqn" 2>/dev/null)" == "$SUBNQN" ]] \
+            && echo "$dev"
+    done | sort
+}
 
 # Connect one host identity; echo the namespace device that appeared
 # (empty if the kernel coalesced it onto an existing one).
@@ -431,7 +445,7 @@ test_ptpl_survives_restart() {
 
     # Force a clean state: register A ignoring any existing key, CLEAR
     # everything, then register A fresh with CPTPL=set + acquire WE.
-    nvme resv-register "$dev_a" --rrega=0 --iekey=1 --nrkey="$KEY_A" >>"$TEST_DIR/ptpl.log" 2>&1
+    nvme resv-register "$dev_a" --rrega=0 --iekey --nrkey="$KEY_A" >>"$TEST_DIR/ptpl.log" 2>&1
     nvme resv-release "$dev_a" --crkey="$KEY_A" --rrela=1 >>"$TEST_DIR/ptpl.log" 2>&1
     nvme resv-register "$dev_a" --rrega=0 --nrkey="$KEY_A" --cptpl=3 >>"$TEST_DIR/ptpl.log" 2>&1 \
         || { log_fail "PTPL: host A register (CPTPL=set) failed"; cat "$TEST_DIR/ptpl.log"; return; }

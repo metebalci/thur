@@ -267,6 +267,18 @@ test_pr_survives_daemon_restart() {
     sg_persist --out --clear --param-rk=0xCAFE "$dev_a" >/dev/null 2>&1 \
         || { log_error "CLEAR (reset) failed"; return 1; }
 
+    # The CLEAR above unregisters every *other* I_T nexus and, per
+    # SPC-4 §6.14.2, leaves a RESERVATIONS PREEMPTED unit attention
+    # pending on each. B still carried its key from the matrix test
+    # (registrations survive logout under initiator_port: iqn), so B now
+    # has that UA queued; A issued the CLEAR and has none. The
+    # cross-transport notification that delivers it (issue #67) is
+    # correct SCSI behavior — a real initiator just retries past a UA,
+    # but sg_persist does not, so drain B's UA with a throwaway PR-IN
+    # before B's APTPL register below would otherwise trip on it. (The
+    # first read returns the UA and clears it; the rest are clean.)
+    for _ in 1 2 3; do sg_persist --in --read-keys "$dev_b" >/dev/null 2>&1 && break; done
+
     # A registers WITH APTPL (--param-aptpl) then reserves Write
     # Exclusive; B registers (also APTPL) so its key persists too.
     sg_persist --out --register --param-sark=0xA1A1 --param-aptpl "$dev_a" >/dev/null 2>&1 \
