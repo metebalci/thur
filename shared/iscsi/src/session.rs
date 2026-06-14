@@ -414,6 +414,47 @@ impl SessionManager {
         Ok(CmdSnVerdict::OutOfWindow)
     }
 
+    /// The ExpCmdSN to advertise in a response PDU's serial fields.
+    ///
+    /// Returns the connection's current `exp_cmd_sn` once it has been
+    /// seeded (the first non-immediate command adopts the initiator's
+    /// starting CmdSN — see [`check_cmdsn`]); before seeding it returns
+    /// `fallback` (the per-request `next_exp_cmdsn`). Using the session
+    /// counter rather than each command's own `cmdsn + 1` keeps the
+    /// advertised window **monotonic** when responses are produced out
+    /// of CmdSN order — the concurrent per-LU executor lets a command
+    /// with a lower CmdSN finish after a higher one (issue #173), and a
+    /// regressing ExpCmdSN would shrink the initiator's command window
+    /// or confuse its acknowledgment tracking. The pre-seed fallback
+    /// preserves the correct echo for an immediate NOP-Out that arrives
+    /// before the first command (its `cmdsn` is the initiator's next
+    /// CmdSN, which must not be undercut by a still-zero counter).
+    ///
+    /// [`check_cmdsn`]: Self::check_cmdsn
+    pub fn exp_cmdsn_for_response(
+        &self,
+        tsih: u16,
+        cid: u16,
+        fallback: u32,
+    ) -> Result<u32, IscsiError> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| IscsiError::InvalidOp("session manager mutex poisoned"))?;
+        let session = sessions
+            .get(&tsih)
+            .ok_or(IscsiError::InvalidSession(tsih))?;
+        let connection = session
+            .connections
+            .get(&cid)
+            .ok_or(IscsiError::InvalidSession(tsih))?;
+        if connection.cmd_sn_initialized {
+            Ok(connection.exp_cmd_sn)
+        } else {
+            Ok(fallback)
+        }
+    }
+
     /// Read the current `exp_cmd_sn` for a connection. Used to stamp
     /// outbound responses' ExpCmdSN/MaxCmdSN fields (advertising flow
     /// control to the initiator).
@@ -657,7 +698,10 @@ mod tests {
         }
         mgr.cleanup_stale_sessions(300);
         let alive = mgr.active_tsihs();
-        assert!(alive.contains(&live), "live-connection session must survive");
+        assert!(
+            alive.contains(&live),
+            "live-connection session must survive"
+        );
         assert!(!alive.contains(&orphan), "idle orphan must be reaped");
     }
 
@@ -688,6 +732,29 @@ mod tests {
         assert_eq!(sn1, 1);
         assert_eq!(sn2, 2);
         assert_eq!(sn3, 3);
+    }
+
+    #[test]
+    fn exp_cmdsn_for_response_uses_fallback_before_seed_then_session_counter() {
+        // #173: before the first non-immediate command seeds exp_cmd_sn,
+        // a response (e.g. an immediate NOP-Out) must echo the request's
+        // own value (the fallback); after seeding it must track the
+        // monotonic session counter so out-of-order completions never
+        // regress the advertised ExpCmdSN.
+        let mgr = SessionManager::new();
+        let tsih = mgr.create_session([0, 1, 2, 3, 4, 5]);
+        mgr.add_connection(tsih, 0, 131072).unwrap();
+
+        // Not seeded yet: returns the fallback verbatim.
+        assert_eq!(mgr.exp_cmdsn_for_response(tsih, 0, 0x1000).unwrap(), 0x1000);
+
+        // First non-immediate command seeds exp_cmd_sn = 0x1001.
+        mgr.check_cmdsn(tsih, 0, 0x1000, false).unwrap();
+        // Now the session counter wins regardless of the fallback — even
+        // a fallback for an earlier (lower) command can't drag it back.
+        assert_eq!(mgr.exp_cmdsn_for_response(tsih, 0, 0x0001).unwrap(), 0x1001);
+        mgr.check_cmdsn(tsih, 0, 0x1001, false).unwrap();
+        assert_eq!(mgr.exp_cmdsn_for_response(tsih, 0, 0x0001).unwrap(), 0x1002);
     }
 
     #[test]

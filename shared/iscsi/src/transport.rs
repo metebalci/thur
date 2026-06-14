@@ -18,8 +18,14 @@
 //! - [`collect_write_data`] — drains the unsolicited Data-Out burst
 //!   and runs the R2T loop for the post-FirstBurst tail.
 //! - [`serve_connection`] / [`run`] — accept loop and per-connection
-//!   FFP loop, dispatching SCSI commands through
-//!   [`crate::ScsiHandler::dispatch`].
+//!   Full-Feature-Phase machinery. Each connection runs three tasks: a
+//!   PDU reader (read half), a writer (write half, the single response
+//!   serializer), and the routing loop, which is the CmdSN gate. SCSI
+//!   commands fan out to per-LU worker tasks — ordered within a LU,
+//!   concurrent across LUs — so one slow [`crate::ScsiHandler::dispatch`]
+//!   can't head-of-line-block other LUs or starve a NOP-Out keepalive
+//!   (issue #173). A per-connection send-lock keeps StatSN monotonic
+//!   across every producer.
 //!
 //! Audit / business-logic hooks (legal-hold sentinel readback, storage
 //! prefetch on READ, MOVE MEDIUM post-hooks, async SEND DIAGNOSTIC
@@ -577,37 +583,27 @@ pub fn build_nop_in_response(itt: u32) -> Pdu {
     nop_in
 }
 
-/// Send an R2T PDU (RFC 3720 §10.8) soliciting `ddtl` bytes starting
-/// at `buffer_offset`. R2T does not advance StatSN — it carries the
-/// StatSN that the next Status-bearing PDU will use.
-async fn send_r2t<W: AsyncWrite + Unpin>(
-    sock: &mut W,
+/// Build an R2T PDU (RFC 3720 §10.8) soliciting `ddtl` bytes starting
+/// at `buffer_offset`, with the R2TSN / BufferOffset / DDTL fields set
+/// but the serial fields (StatSN / ExpCmdSN / MaxCmdSN) left for the
+/// emitter to stamp under the per-connection send-lock. R2T does not
+/// advance StatSN — it carries (via [`Responder::emit_r2t`]) the StatSN
+/// the next Status-bearing PDU will use.
+fn build_r2t_pdu(
     cmd: &Pdu,
     r2tsn: u32,
     ttt: u32,
     buffer_offset: u32,
     desired_data_transfer_length: u32,
-    session_manager: &Arc<SessionManager>,
-    tsih: u16,
-    cid: u16,
-) -> Result<()> {
+) -> Pdu {
     let mut r2t = build_empty_pdu(0x31, false, true);
     r2t.itt = cmd.itt;
     r2t.ttt = ttt;
     r2t.bhs[8..16].copy_from_slice(&cmd.lun);
-    let statsn = session_manager.current_stat_sn(tsih, cid)?;
-    let exp_cmdsn = next_exp_cmdsn(cmd);
-    // The PDU reader runs concurrently with the R2T waiter (see the
-    // demux in `serve_connection`), so the initiator may legitimately
-    // pipeline new Cmd PDUs into the CmdSN window while we're parked
-    // on Data-Out. Advertise the full window — `ADVERTISED_CMDSN_WINDOW`
-    // is what gates how many in-flight Cmds the initiator may have.
-    let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-    stamp_serials_for_response(&mut r2t.bhs, statsn, exp_cmdsn, max_cmdsn);
     r2t.bhs[36..40].copy_from_slice(&r2tsn.to_be_bytes());
     r2t.bhs[40..44].copy_from_slice(&buffer_offset.to_be_bytes());
     r2t.bhs[44..48].copy_from_slice(&desired_data_transfer_length.to_be_bytes());
-    write_pdu(sock, &mut r2t).await
+    r2t
 }
 
 /// Drain trailing Data-Out PDUs (and issue R2Ts for the
@@ -618,21 +614,24 @@ async fn send_r2t<W: AsyncWrite + Unpin>(
 ///
 /// Data-Out PDUs are received over `data_out_rx`, which the PDU
 /// reader task fills via the ITT-keyed route registered before
-/// dispatch. R2T PDUs are written through `sock` (the connection's
-/// write half). This decoupling lets the reader continue to demux
+/// dispatch. R2T PDUs are emitted through `responder` (which stamps
+/// the serials under the per-connection send-lock and hands the PDU to
+/// the writer task). This decoupling lets the reader continue to demux
 /// other in-flight Cmd / NopOut / Data-Out PDUs on the same TCP
-/// stream concurrently with the R2T waiter — see `serve_connection`.
+/// stream concurrently — and, with the per-LU executor (issue #173),
+/// lets other LUs' commands keep flowing while this WRITE collects.
+///
+/// `req_exp_cmdsn` is the command's `next_exp_cmdsn` fallback, used
+/// only before the session's CmdSN counter is seeded.
 #[allow(clippy::too_many_arguments)]
-pub async fn collect_write_data<W: AsyncWrite + Unpin>(
-    sock: &mut W,
+pub async fn collect_write_data(
+    responder: &Responder,
     cmd: &mut Pdu,
     edtl: u32,
     max_burst_length: u32,
     first_burst_length: u32,
-    session_manager: &Arc<SessionManager>,
-    tsih: u16,
-    cid: u16,
     data_out_rx: &mut tokio::sync::mpsc::Receiver<Pdu>,
+    req_exp_cmdsn: u32,
 ) -> Result<()> {
     // Phase 1: drain unsolicited Data-Out, if any.
     if !cmd.final_bit && (cmd.data.len() as u32) < first_burst_length.min(edtl) {
@@ -701,18 +700,8 @@ pub async fn collect_write_data<W: AsyncWrite + Unpin>(
         let ddtl = max_burst_length.min(remaining);
         let ttt = derive_r2t_ttt(cmd.itt, r2tsn);
 
-        send_r2t(
-            sock,
-            cmd,
-            r2tsn,
-            ttt,
-            already,
-            ddtl,
-            session_manager,
-            tsih,
-            cid,
-        )
-        .await?;
+        let r2t = build_r2t_pdu(cmd, r2tsn, ttt, already, ddtl);
+        responder.emit_r2t(r2t, req_exp_cmdsn)?;
 
         let burst_end = already + ddtl;
         loop {
@@ -1043,7 +1032,9 @@ fn negotiate_session_params(negotiated: &mut SessionParams, req_keys: &HashMap<S
         negotiated.initial_r2t = negotiated.initial_r2t || v.eq_ignore_ascii_case("Yes");
     }
     // FirstBurstLength must not exceed MaxBurstLength (RFC 7143).
-    negotiated.first_burst_length = negotiated.first_burst_length.min(negotiated.max_burst_length);
+    negotiated.first_burst_length = negotiated
+        .first_burst_length
+        .min(negotiated.max_burst_length);
 }
 
 fn append_opneg_response_keys(
@@ -1453,6 +1444,469 @@ async fn recv_data_out_or_timeout(
     }
 }
 
+// ===== Concurrent per-LU dispatch (issue #173) =====
+//
+// The FFP loop no longer awaits `handler.dispatch()` inline. Instead:
+//   - a single **writer task** owns the TCP write half and drains an
+//     unbounded `WriterMsg` channel, so every response goes out through
+//     one serializer (no socket-write race);
+//   - a per-connection **send-lock** makes `[allocate StatSN -> stamp ->
+//     enqueue]` atomic, so StatSN is monotonic in the order PDUs hit the
+//     writer regardless of which task produced them;
+//   - the main loop stays the CmdSN gate + router, answering NOP-Out /
+//     Text / TMF / Logout / Reject **out-of-band** (so a slow dispatch
+//     can never starve a keepalive — harm B) and routing SCSI commands
+//     to **per-LU worker tasks** (ordered within a LU, concurrent across
+//     LUs — harm A).
+//
+// Per-LU serialization is what keeps reservation / UA / per-LU command
+// ordering correct under concurrency: two commands to the same LU still
+// run in CmdSN order; only commands to *different* LUs overlap.
+
+/// A unit of work for the per-connection writer task.
+enum WriterMsg {
+    /// A fully-stamped, ready-to-frame PDU (control, status, R2T, or a
+    /// single small Data-In). Written verbatim.
+    Pdu(Box<Pdu>),
+    /// A Data-In response the writer expands into one or more
+    /// DataSN-stamped Data-In PDUs (RFC 7143 §11.7), each at most
+    /// `chunk_size` bytes. The final PDU carries F=1 + S=1 + the SCSI
+    /// status and the pre-allocated `statsn`; non-final PDUs leave StatSN
+    /// reserved. Keeping the payload owned here preserves the bulk
+    /// Data-In zero-copy write (no per-chunk copy out of the response
+    /// buffer).
+    DataIn(DataInJob),
+}
+
+/// A chunked Data-In response handed to the writer task. The producer
+/// (a per-LU worker) allocates the final PDU's StatSN under the
+/// send-lock so it is monotonic with every other status-bearing PDU.
+struct DataInJob {
+    itt: u32,
+    data: Vec<u8>,
+    residual: u32,
+    status_code: u8,
+    statsn: u32,
+    exp_cmdsn: u32,
+    max_cmdsn: u32,
+    chunk_size: usize,
+}
+
+/// Expand a [`DataInJob`] into back-to-back Data-In PDUs. Mirrors the
+/// historical inline chunking in the FFP loop: DataSN / BufferOffset on
+/// every PDU, F=1 + S=1 + status + residual on the final one only.
+async fn write_data_in_job<W: AsyncWrite + Unpin>(sock: &mut W, job: DataInJob) -> Result<()> {
+    let total_len = job.data.len();
+    let chunk_size = job.chunk_size.max(1);
+    let mut cursor = 0usize;
+    let mut data_sn: u32 = 0;
+    while cursor < total_len {
+        let end = total_len.min(cursor + chunk_size);
+        let is_last = end == total_len;
+        let mut din = build_empty_pdu(0x25, true, is_last);
+        din.itt = job.itt;
+        din.ttt = 0xFFFFFFFF;
+        if is_last {
+            din.bhs[1] = 0x80 | 0x01; // F | S
+            if job.residual > 0 {
+                din.bhs[1] |= 0x02; // U (underflow)
+            }
+            din.bhs[3] = job.status_code;
+            din.bhs[44..48].copy_from_slice(&job.residual.to_be_bytes());
+        }
+        din.bhs[36..40].copy_from_slice(&data_sn.to_be_bytes());
+        din.bhs[40..44].copy_from_slice(&(cursor as u32).to_be_bytes());
+        if is_last {
+            stamp_serials_for_response(&mut din.bhs, job.statsn, job.exp_cmdsn, job.max_cmdsn);
+        } else {
+            // Non-final Data-In: StatSN reserved (S=0). Still advertise
+            // ExpCmdSN / MaxCmdSN so the initiator's window stays open.
+            din.bhs[28..32].copy_from_slice(&job.exp_cmdsn.to_be_bytes());
+            din.bhs[32..36].copy_from_slice(&job.max_cmdsn.to_be_bytes());
+        }
+        write_pdu_with_data(sock, &mut din, &job.data[cursor..end]).await?;
+        data_sn = data_sn.wrapping_add(1);
+        cursor = end;
+    }
+    Ok(())
+}
+
+/// The per-connection writer task. Owns the TCP write half and is the
+/// single serializer of every outbound PDU. Drains `rx` in receive
+/// order (== StatSN order, guaranteed by the send-lock on the producer
+/// side). On any write error it signals `shutdown` so the main loop
+/// tears the connection down, then exits — dropping `rx` makes any
+/// producer's subsequent `send` fail so the workers unwind too.
+async fn writer_task(
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WriterMsg>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let res = match msg {
+            WriterMsg::Pdu(mut p) => write_pdu(&mut write_half, &mut p).await,
+            WriterMsg::DataIn(job) => write_data_in_job(&mut write_half, job).await,
+        };
+        if let Err(e) = res {
+            tracing::debug!("writer task: write error: {} — tearing down connection", e);
+            shutdown.notify_one();
+            return;
+        }
+    }
+    // All senders dropped (clean teardown / logout): nothing left to
+    // flush. Returning drops `write_half`, which sends the TCP FIN.
+}
+
+/// Per-connection response emitter shared by the main loop and every
+/// per-LU worker. Each emit method takes the send-lock for the duration
+/// of `[allocate/peek StatSN -> stamp serials -> enqueue to writer]`, so
+/// the StatSN stamped on a PDU matches its position in the writer's
+/// FIFO and the on-wire StatSN sequence is monotonic no matter which
+/// task produced the PDU or in what order commands completed.
+#[derive(Clone)]
+pub struct Responder {
+    tsih: u16,
+    cid: u16,
+    session_manager: Arc<SessionManager>,
+    writer_tx: tokio::sync::mpsc::UnboundedSender<WriterMsg>,
+    /// Serializes `[alloc StatSN -> stamp -> enqueue]`. A plain
+    /// `std::sync::Mutex` held only across synchronous work (the writer
+    /// channel is unbounded, so `send` never blocks) — never across an
+    /// `.await`.
+    send_lock: Arc<std::sync::Mutex<()>>,
+    /// StatSN source for discovery sessions (TSIH=0), which have no
+    /// `SessionManager` entry. Normal sessions ignore this and use the
+    /// `SessionManager` per-connection counter.
+    discovery_statsn: Arc<std::sync::Mutex<u32>>,
+    /// Initiator-declared MaxRecvDataSegmentLength — the Data-In chunk
+    /// size threaded into every [`DataInJob`].
+    peer_max_recv: u32,
+}
+
+impl Responder {
+    /// Allocate the next StatSN (advances the counter). Caller holds the
+    /// send-lock.
+    fn alloc_statsn(&self) -> std::result::Result<u32, crate::error::IscsiError> {
+        if self.tsih == 0 {
+            let mut s = self
+                .discovery_statsn
+                .lock()
+                .map_err(|_| crate::error::IscsiError::InvalidOp("discovery statsn poisoned"))?;
+            let v = *s;
+            *s = s.wrapping_add(1);
+            Ok(v)
+        } else {
+            self.session_manager
+                .get_and_increment_statsn(self.tsih, self.cid)
+        }
+    }
+
+    /// Peek the current StatSN without advancing it (for R2T / non-final
+    /// Data-In). Caller holds the send-lock.
+    fn peek_statsn(&self) -> std::result::Result<u32, crate::error::IscsiError> {
+        if self.tsih == 0 {
+            Ok(*self
+                .discovery_statsn
+                .lock()
+                .map_err(|_| crate::error::IscsiError::InvalidOp("discovery statsn poisoned"))?)
+        } else {
+            self.session_manager.current_stat_sn(self.tsih, self.cid)
+        }
+    }
+
+    /// The ExpCmdSN to advertise: the session's monotonic counter once
+    /// seeded, else `fallback` (the per-request `next_exp_cmdsn`).
+    fn exp_cmdsn(&self, fallback: u32) -> u32 {
+        if self.tsih == 0 {
+            fallback
+        } else {
+            self.session_manager
+                .exp_cmdsn_for_response(self.tsih, self.cid, fallback)
+                .unwrap_or(fallback)
+        }
+    }
+
+    /// Emit a single status-bearing PDU (NOP-In, SCSI Response, TMF
+    /// Response, Logout Response, Reject, Text Response). Allocates a
+    /// fresh StatSN.
+    fn emit_status(&self, mut pdu: Pdu, req_exp_cmdsn: u32) -> Result<()> {
+        let _g = self
+            .send_lock
+            .lock()
+            .map_err(|_| anyhow!("send lock poisoned"))?;
+        let exp = self.exp_cmdsn(req_exp_cmdsn);
+        let max = exp.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+        let sn = self.alloc_statsn()?;
+        stamp_serials_for_response(&mut pdu.bhs, sn, exp, max);
+        self.writer_tx
+            .send(WriterMsg::Pdu(Box::new(pdu)))
+            .map_err(|_| anyhow!("writer task gone"))?;
+        Ok(())
+    }
+
+    /// Emit an R2T. R2T does not consume a StatSN — it carries the
+    /// StatSN the next status-bearing PDU will use (peeked here).
+    fn emit_r2t(&self, mut r2t: Pdu, req_exp_cmdsn: u32) -> Result<()> {
+        let _g = self
+            .send_lock
+            .lock()
+            .map_err(|_| anyhow!("send lock poisoned"))?;
+        let exp = self.exp_cmdsn(req_exp_cmdsn);
+        let max = exp.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+        let sn = self.peek_statsn()?;
+        stamp_serials_for_response(&mut r2t.bhs, sn, exp, max);
+        self.writer_tx
+            .send(WriterMsg::Pdu(Box::new(r2t)))
+            .map_err(|_| anyhow!("writer task gone"))?;
+        Ok(())
+    }
+
+    /// Emit a (possibly chunked) Data-In response. Truncates the payload
+    /// to the initiator-advertised EDTL, computes the residual, allocates
+    /// the final PDU's StatSN, and hands the owned buffer to the writer.
+    fn emit_data_in(
+        &self,
+        itt: u32,
+        data: Vec<u8>,
+        edtl: u32,
+        status_code: u8,
+        req_exp_cmdsn: u32,
+    ) -> Result<()> {
+        let mut data = data;
+        if data.len() as u32 > edtl {
+            data.truncate(edtl as usize);
+        }
+        let residual = edtl.saturating_sub(data.len() as u32);
+        let _g = self
+            .send_lock
+            .lock()
+            .map_err(|_| anyhow!("send lock poisoned"))?;
+        let exp = self.exp_cmdsn(req_exp_cmdsn);
+        let max = exp.wrapping_add(ADVERTISED_CMDSN_WINDOW);
+        let sn = self.alloc_statsn()?;
+        let job = DataInJob {
+            itt,
+            data,
+            residual,
+            status_code,
+            statsn: sn,
+            exp_cmdsn: exp,
+            max_cmdsn: max,
+            chunk_size: self.peer_max_recv as usize,
+        };
+        self.writer_tx
+            .send(WriterMsg::DataIn(job))
+            .map_err(|_| anyhow!("writer task gone"))?;
+        Ok(())
+    }
+}
+
+/// Per-LU worker channel depth. The advertised CmdSN window bounds the
+/// initiator's total outstanding non-immediate commands at
+/// `ADVERTISED_CMDSN_WINDOW`; even if every one of them targets a single
+/// LU, this depth holds them without the router (main loop) ever
+/// blocking on `try_send`. A `Full` therefore means the initiator
+/// exceeded its window (or streamed immediate SCSI commands past it) —
+/// a flow-control violation the router treats as a teardown.
+const LU_QUEUE_DEPTH: usize = ADVERTISED_CMDSN_WINDOW as usize + 16;
+
+/// One SCSI command routed to a per-LU worker. The router computes the
+/// transfer-length fields once (in CmdSN arrival order) and hands the
+/// PDU plus its Data-Out route (for WRITEs) to the LU's queue.
+struct LuJob {
+    pdu: Pdu,
+    data_out_rx: Option<tokio::sync::mpsc::Receiver<Pdu>>,
+    edtl: u32,
+    w_bit: bool,
+    edtl_over_cap: bool,
+    req_exp_cmdsn: u32,
+}
+
+/// A live per-LU worker: its bounded job queue plus the task handle the
+/// teardown path joins (so an in-flight dispatch always runs to
+/// completion — workers are never aborted mid-`dispatch()`).
+struct LuWorker {
+    tx: tokio::sync::mpsc::Sender<LuJob>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Immutable per-connection context every LU worker shares (Arc-wrapped,
+/// one cheap clone per worker). Owns the session-derived fields a
+/// [`ScsiRequest`] borrows from, so the worker can build requests with
+/// no per-command allocation beyond the CDB copy.
+struct ConnCtx<H: ScsiHandler + ?Sized> {
+    handler: Arc<H>,
+    responder: Responder,
+    routes: Arc<std::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Pdu>>>>,
+    shutdown: Arc<tokio::sync::Notify>,
+    tsih: u16,
+    cid: u16,
+    peer: String,
+    initiator_iqn: Option<String>,
+    pr_isid: [u8; 6],
+    authenticated_partition: Option<String>,
+    authenticated_volumes: Option<Vec<String>>,
+    authenticated_user: Option<String>,
+    negotiated_max_burst_length: u32,
+    negotiated_first_burst_length: u32,
+}
+
+/// Drop a registered Data-Out route. Safe even if `itt` was never
+/// registered (no-op).
+fn drop_route(routes: &std::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Pdu>>>, itt: u32) {
+    let mut routes = routes.lock().expect("route map mutex poisoned");
+    routes.remove(&itt);
+}
+
+/// One per-LU worker task. Consumes its queue in order (so commands to
+/// the same LU execute in CmdSN order) and processes each command to
+/// completion — Data-Out collection (WRITE), `handler.dispatch()`, then
+/// the response emit. A fatal per-command error tears the whole
+/// connection down via `shutdown`.
+async fn lu_worker<H: ScsiHandler + ?Sized>(
+    lun: u64,
+    mut rx: tokio::sync::mpsc::Receiver<LuJob>,
+    ctx: Arc<ConnCtx<H>>,
+) {
+    while let Some(job) = rx.recv().await {
+        if let Err(e) = process_scsi_command(lun, job, &ctx).await {
+            tracing::debug!("LU {} worker: fatal error: {} — tearing down", lun, e);
+            ctx.shutdown.notify_one();
+            return;
+        }
+    }
+}
+
+/// Run one SCSI command end-to-end inside its LU worker: collect WRITE
+/// Data-Out (R2T loop) if needed, dispatch into the handler, then emit
+/// the Data-In / SCSI Response through the connection's [`Responder`].
+async fn process_scsi_command<H: ScsiHandler + ?Sized>(
+    lun: u64,
+    job: LuJob,
+    ctx: &ConnCtx<H>,
+) -> Result<()> {
+    let LuJob {
+        mut pdu,
+        mut data_out_rx,
+        edtl,
+        w_bit,
+        edtl_over_cap,
+        req_exp_cmdsn,
+    } = job;
+
+    // Drain Data-Out (R2T loop) before dispatch so the handler sees a
+    // complete payload. Mirrors the historical inline WRITE path.
+    if edtl_over_cap {
+        // #125: oversized EDTL — never solicit Data-Out; just drop the
+        // route the reader pre-registered and fall through to the
+        // CHECK CONDITION below.
+        if data_out_rx.is_some() {
+            drop_route(&ctx.routes, pdu.itt);
+        }
+        error!(
+            "WRITE EDTL {} from {} exceeds cap {} — rejecting (CHECK CONDITION)",
+            edtl, ctx.peer, MAX_WRITE_EDTL
+        );
+    } else if w_bit && edtl as usize > pdu.data.len() {
+        let rx = data_out_rx.as_mut().ok_or_else(|| {
+            anyhow!(
+                "reader did not register Data-Out route for ITT=0x{:08x}",
+                pdu.itt
+            )
+        })?;
+        let outcome = collect_write_data(
+            &ctx.responder,
+            &mut pdu,
+            edtl,
+            ctx.negotiated_max_burst_length,
+            ctx.negotiated_first_burst_length,
+            rx,
+            req_exp_cmdsn,
+        )
+        .await;
+        drop_route(&ctx.routes, pdu.itt);
+        outcome?;
+    } else if w_bit {
+        // W-bit set but unsolicited data already covers EDTL — still drop
+        // the registered route to release the bounded channel slot.
+        drop_route(&ctx.routes, pdu.itt);
+    }
+
+    let cdb_slice: [u8; 16] = {
+        let mut c = [0u8; 16];
+        c.copy_from_slice(&pdu.bhs[32..48]);
+        c
+    };
+
+    // VSA dynamic admission: re-read the user's current admitted-volume
+    // set each command so a post-login `iscsi users grant` / `revoke`
+    // takes effect. Falls back to the login snapshot when the handler
+    // exposes no live admission (VTL, or auth disabled).
+    let live_admission = ctx
+        .authenticated_user
+        .as_deref()
+        .and_then(|u| ctx.handler.live_admission(u));
+    let session_volumes = match &live_admission {
+        Some(set) => Some(set.as_slice()),
+        None => ctx.authenticated_volumes.as_deref(),
+    };
+
+    let req = ScsiRequest {
+        tsih: ctx.tsih,
+        cid: ctx.cid,
+        lun,
+        cdb: &cdb_slice,
+        data_out: &pdu.data,
+        data_in_max: edtl as usize,
+        initiator_iqn: ctx.initiator_iqn.as_deref(),
+        initiator_isid: ctx.pr_isid,
+        peer: &ctx.peer,
+        session_partition: ctx.authenticated_partition.as_deref(),
+        session_volumes,
+    };
+
+    let resp = if edtl_over_cap {
+        // INVALID FIELD IN CDB (0x05/0x24) — the host-requested transfer
+        // length is unsupported (#125).
+        crate::handler::ScsiResponse::check(scsi_spc::sense::SenseData::new(
+            scsi_spc::sense::SenseKey::IllegalRequest,
+            0x24,
+            0x00,
+        ))
+    } else {
+        ctx.handler.dispatch(req).await
+    };
+
+    if !resp.data_in.is_empty() {
+        ctx.responder.emit_data_in(
+            pdu.itt,
+            resp.data_in,
+            edtl,
+            resp.status.code(),
+            req_exp_cmdsn,
+        )?;
+    } else {
+        let mut sresp = build_empty_pdu(0x21, true, true);
+        sresp.itt = pdu.itt;
+        sresp.bhs[3] = resp.status.code();
+        if matches!(resp.status, ScsiStatus::CheckCondition) {
+            let sense = match resp.sense {
+                Some(s) => s.to_bytes(),
+                None => vec![
+                    0x70, 0, 0x05, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0,
+                ],
+            };
+            let len = sense.len() as u16;
+            let mut payload = Vec::with_capacity(2 + sense.len());
+            payload.extend_from_slice(&len.to_be_bytes());
+            payload.extend_from_slice(&sense);
+            sresp.data = payload;
+        }
+        ctx.responder.emit_status(sresp, req_exp_cmdsn)?;
+    }
+    Ok(())
+}
+
 /// Per-connection PDU reader. Owns the read half of the TCP stream
 /// and runs as a spawned task. Demuxes inbound PDUs by ITT:
 ///
@@ -1562,7 +2016,7 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
     let LoginOutcome {
         tsih,
         cid,
-        mut statsn,
+        statsn,
         initiator_iqn,
         isid,
         authenticated_partition,
@@ -1590,9 +2044,16 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
         isid
     };
 
-    // Split the socket so the PDU reader task can drain the read half
-    // concurrently with the FFP dispatch loop's writes + R2T waits.
-    let (read_half, mut write_half) = sock.into_split();
+    // Capture the local address before the split — SendTargets needs it
+    // and the write half moves into the writer task afterward.
+    const FALLBACK_LOCAL: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 3260));
+    let local_addr = sock.local_addr().unwrap_or(FALLBACK_LOCAL);
+
+    // Split the socket three ways: the reader task drains the read half,
+    // the writer task owns the write half, and the routing loop here
+    // only gates CmdSN + dispatches to per-LU workers (issue #173).
+    let (read_half, write_half) = sock.into_split();
     let routes: Arc<std::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Pdu>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (main_tx, mut main_rx) =
@@ -1608,14 +2069,146 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
     }
     let _reader_guard = AbortOnDrop(reader_task);
 
+    // Writer task + the send-lock that keeps StatSN monotonic across all
+    // producers (routing loop + every LU worker).
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterMsg>();
+    let writer_handle = tokio::spawn(writer_task(write_half, writer_rx, Arc::clone(&shutdown)));
+
+    let responder = Responder {
+        tsih,
+        cid,
+        session_manager: Arc::clone(&session_manager),
+        writer_tx: writer_tx.clone(),
+        send_lock: Arc::new(std::sync::Mutex::new(())),
+        discovery_statsn: Arc::new(std::sync::Mutex::new(statsn)),
+        peer_max_recv: peer_max_recv_data_segment_length,
+    };
+
+    // Immutable per-connection context every LU worker borrows its
+    // ScsiRequest fields from.
+    let ctx = Arc::new(ConnCtx {
+        handler: Arc::clone(&handler),
+        responder: responder.clone(),
+        routes: Arc::clone(&routes),
+        shutdown: Arc::clone(&shutdown),
+        tsih,
+        cid,
+        peer: peer.to_string(),
+        initiator_iqn,
+        pr_isid,
+        authenticated_partition,
+        authenticated_volumes,
+        authenticated_user,
+        negotiated_max_burst_length,
+        negotiated_first_burst_length,
+    });
+
+    let mut lu_workers: HashMap<u64, LuWorker> = HashMap::new();
+
+    // Drive the routing loop, capturing its terminal result *without*
+    // `?` so the teardown below always runs.
+    let result = routing_loop(
+        &mut main_rx,
+        &mut lu_workers,
+        &ctx,
+        target_iqn,
+        advertised_portals,
+        connection_tpgt,
+        local_addr,
+    )
+    .await;
+
+    // ===== Teardown =====
+    // 1. Clear the route map so any worker parked in `collect_write_data`
+    //    (awaiting Data-Out) sees its per-ITT channel close and unwinds
+    //    promptly rather than waiting out the 60 s backstop.
+    routes.lock().expect("route map mutex poisoned").clear();
+    // 2. Close each worker's queue and join it. Workers are NEVER aborted
+    //    mid-`dispatch()`: an in-flight command always runs to completion
+    //    (its response then flushes through the still-open writer), so
+    //    handler state is never torn in half at an await point.
+    let mut handles = Vec::with_capacity(lu_workers.len());
+    for (_lun, w) in lu_workers.drain() {
+        drop(w.tx);
+        handles.push(w.handle);
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    // 3. Drop every writer_tx clone (this loop's two plus the one inside
+    //    ctx) so the writer drains what's queued — the logout response,
+    //    any late command responses — and exits, flushing the write half
+    //    before it drops.
+    drop(responder);
+    drop(writer_tx);
+    drop(ctx);
+    // Bound the flush: a non-reading initiator could otherwise block the
+    // writer's socket write indefinitely and leak this connection's
+    // session state (SessionGuard runs only once we return).
+    let writer_abort = writer_handle.abort_handle();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), writer_handle)
+        .await
+        .is_err()
+    {
+        writer_abort.abort();
+    }
+
+    result
+}
+
+/// The CmdSN gate + dispatch router. Reads classified PDUs from the
+/// reader, enforces CmdSN ordering in arrival order, then either answers
+/// control PDUs (NOP-Out / Text / TMF / Logout / Reject) **out-of-band**
+/// through the [`Responder`] — so a slow `dispatch()` can never starve a
+/// keepalive — or routes a SCSI Command to its per-LU worker (ordered
+/// within a LU, concurrent across LUs). Returns when the connection ends
+/// (logout, reader EOF/error, a worker/writer fatal error via
+/// `shutdown`, or a protocol violation).
+#[allow(clippy::too_many_arguments)]
+async fn routing_loop<H: ScsiHandler + ?Sized>(
+    main_rx: &mut tokio::sync::mpsc::Receiver<Result<RoutedPdu>>,
+    lu_workers: &mut HashMap<u64, LuWorker>,
+    ctx: &Arc<ConnCtx<H>>,
+    target_iqn: &str,
+    advertised_portals: &[Portal],
+    connection_tpgt: u16,
+    local_addr: SocketAddr,
+) -> Result<()> {
+    let responder = &ctx.responder;
+    let session_manager = &ctx.responder.session_manager;
+    let routes = &ctx.routes;
+    let shutdown = &ctx.shutdown;
+    let tsih = ctx.tsih;
+    let cid = ctx.cid;
+    let peer = ctx.peer.as_str();
+
+    // Build a protocol-error / unsupported Reject PDU (opcode 0x3F, F=1)
+    // with the given ITT and reason code.
+    let build_reject = |itt: u32, reason: u8| {
+        let mut rej = build_empty_pdu(0x3F, true, true);
+        rej.itt = itt;
+        rej.bhs[2] = reason;
+        rej
+    };
+
     loop {
-        let routed = match main_rx.recv().await {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => return Err(e),
-            None => return Err(anyhow!("PDU reader exited without forwarding error")),
+        let routed = tokio::select! {
+            biased;
+            // A worker or the writer hit a fatal error and signaled
+            // teardown. `notify_one` stores a permit, so a signal raised
+            // while we were processing a PDU is caught on the next poll.
+            _ = shutdown.notified() => {
+                return Err(anyhow!("connection torn down by worker/writer error"));
+            }
+            msg = main_rx.recv() => match msg {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => return Err(e),
+                None => return Err(anyhow!("PDU reader exited without forwarding error")),
+            },
         };
-        let mut pdu = routed.pdu;
-        let mut data_out_rx = routed.data_out_rx;
+        let pdu = routed.pdu;
+        let data_out_rx = routed.data_out_rx;
 
         let _ = session_manager.update_activity(tsih);
 
@@ -1630,93 +2223,32 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                         cid
                     ));
                 }
-                Err(e) => {
-                    return Err(anyhow!("CmdSN check failed: {}", e));
-                }
+                Err(e) => return Err(anyhow!("CmdSN check failed: {}", e)),
             }
         }
 
-        // Shadow the old `sock` binding: every write below targets
-        // the OwnedWriteHalf the reader task does not touch.
-        let sock = &mut write_half;
-
-        // Helper: drop the Data-Out route once a WRITE-bearing Cmd
-        // finishes (success or error). Safe to call even when the
-        // ITT was never registered (no-op).
-        let drop_route = |itt: u32| {
-            let mut routes = routes.lock().expect("route map mutex poisoned");
-            routes.remove(&itt);
-        };
-
-        // Discovery sessions (TSIH=0) have no SessionManager entry; the
-        // per-connection `statsn` seeded from the Login Response is the
-        // StatSN counter we stamp on every response PDU. Normal sessions
-        // route through SessionManager so concurrent connections of the
-        // same TSIH share the counter. Every responder branch below
-        // (NOP-In, Text, SCSI Response/Data-In, TMF, Logout Response,
-        // Reject) goes through this helper so the gate can't be missed.
-        let mut next_statsn = || -> std::result::Result<u32, crate::error::IscsiError> {
-            if tsih == 0 {
-                let s = statsn;
-                statsn = statsn.wrapping_add(1);
-                Ok(s)
-            } else {
-                session_manager.get_and_increment_statsn(tsih, cid)
-            }
-        };
-
-        // Stamp a response PDU's serial fields (StatSN from
-        // `next_statsn`, ExpCmdSN / MaxCmdSN derived from the request
-        // it answers) and write it. Every single-PDU responder arm
-        // below goes through this so a serial-field change is one edit,
-        // not eight. `$req` is the incoming PDU being answered. (The
-        // chunked Data-In path stamps inline — it spreads DataSN across
-        // multiple PDUs with per-PDU S-bit logic the macro can't model.)
-        macro_rules! stamp_and_write {
-            ($resp:expr, $req:expr) => {{
-                let exp_cmdsn = next_exp_cmdsn($req);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-                let sn = next_statsn()?;
-                stamp_serials_for_response(&mut $resp.bhs, sn, exp_cmdsn, max_cmdsn);
-                write_pdu(sock, &mut $resp).await?;
-            }};
-        }
-
-        // Build a Reject PDU (opcode 0x3F, F=1) with the given
-        // InitiatorTaskTag and reason code (`bhs[2]`). Protocol-error
-        // rejects use ITT 0xFFFFFFFF (unsolicited); a per-command reject
-        // (e.g. unsupported opcode) echoes the command's ITT.
-        let build_reject = |itt: u32, reason: u8| {
-            let mut rej = build_empty_pdu(0x3F, true, true);
-            rej.itt = itt;
-            rej.bhs[2] = reason;
-            rej
-        };
+        // Snapshot the per-request ExpCmdSN fallback before `pdu` may
+        // move into an LuJob.
+        let req_exp_cmdsn = next_exp_cmdsn(&pdu);
 
         match pdu.opcode & 0x3F {
             0x00 => {
-                // NOP-Out ping; answer with a NOP-In. Legal in
-                // discovery sessions (RFC 7143 §6.1).
-                let mut nop_in = build_nop_in_response(pdu.itt);
-                stamp_and_write!(nop_in, &pdu);
+                // NOP-Out — answered out-of-band (keepalive must not wait
+                // behind dispatch). Legal in discovery sessions too.
+                let nop_in = build_nop_in_response(pdu.itt);
+                responder.emit_status(nop_in, req_exp_cmdsn)?;
             }
             0x04 => {
-                // Text Request — SendTargets discovery
+                // Text Request — SendTargets discovery.
                 let req_keys = parse_text_kv(&pdu.data);
                 let mut tx = build_empty_pdu(0x24, false, true);
                 tx.itt = pdu.itt;
 
                 if let Some(st) = req_keys.get("SendTargets") {
-                    // Legacy fallback: matches the pre-multi-portal
-                    // behavior on `sock.local_addr()` failure
-                    // (vanishingly rare after an accepted connection).
-                    const FALLBACK_LOCAL: SocketAddr =
-                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 3260));
-                    let local = sock.local_addr().unwrap_or(FALLBACK_LOCAL);
                     let mut lines = Vec::<u8>::new();
                     if st.eq_ignore_ascii_case("All") || st == target_iqn {
                         push_kv(&mut lines, "TargetName", target_iqn);
-                        for (addr, tpgt) in build_target_addresses(advertised_portals, local) {
+                        for (addr, tpgt) in build_target_addresses(advertised_portals, local_addr) {
                             push_kv(&mut lines, "TargetAddress", &format!("{},{}", addr, tpgt));
                         }
                     }
@@ -1738,247 +2270,97 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     tx.data = keys;
                 }
                 let _ = format_text_data(&tx.data);
-                stamp_and_write!(tx, &pdu);
+                responder.emit_status(tx, req_exp_cmdsn)?;
             }
             0x01 => {
                 // SCSI Command. Illegal in discovery sessions
-                // (RFC 7143 §6.1) — reject with a typed
-                // protocol-error Reject rather than dispatching into
-                // the handler with no LUN context.
+                // (RFC 7143 §6.1) — reject with a typed protocol-error
+                // Reject rather than dispatching with no LUN context.
                 if tsih == 0 {
                     tracing::warn!(
                         "SCSI Command on discovery session from {peer} — protocol violation"
                     );
                     // The reader pre-registered an ITT-keyed Data-Out
                     // route for any W-bit SCSI Command before it knew the
-                    // session type. Drop it here too, or a discovery
+                    // session type — drop it here too, or a discovery
                     // session streaming W-bit commands with distinct ITTs
-                    // would leak one route-map entry each — unbounded
-                    // per-connection memory growth, reachable
-                    // unauthenticated (issue #172).
+                    // would leak one route-map entry each (issue #172).
                     if data_out_rx.is_some() {
-                        drop_route(pdu.itt);
+                        drop_route(routes, pdu.itt);
                     }
-                    let mut rej = build_reject(0xFFFFFFFF, 0x04);
-                    stamp_and_write!(rej, &pdu);
+                    responder.emit_status(build_reject(0xFFFFFFFF, 0x04), req_exp_cmdsn)?;
                     continue;
                 }
 
-                // Drain Data-Out (R2T loop) before dispatch — the
-                // handler sees a complete payload. The reader
-                // pre-registered an ITT-keyed Data-Out route iff the
-                // W-bit was set; drop it after the burst completes
-                // (success or error).
                 let edtl = pdu_expected_xfer_len(&pdu);
                 let w_bit = (pdu.bhs[1] & 0x20) != 0;
-                // #125: reject an oversized WRITE EDTL before soliciting
-                // any Data-Out, so an initiator can't grow the
-                // per-connection buffer toward 4 GiB and OOM the daemon
-                // (reachable unauthenticated under the no-auth default).
-                // We never send R2T for it, so the initiator stops after
-                // its (FirstBurst-bounded) unsolicited data already read.
+                // #125: reject an oversized WRITE EDTL — the worker emits
+                // CHECK CONDITION and never solicits Data-Out.
                 let edtl_over_cap = w_bit && edtl > MAX_WRITE_EDTL;
-                if edtl_over_cap {
-                    if data_out_rx.is_some() {
-                        drop_route(pdu.itt);
-                    }
-                    error!(
-                        "WRITE EDTL {} from {} exceeds cap {} — rejecting (CHECK CONDITION)",
-                        edtl, peer, MAX_WRITE_EDTL
-                    );
-                } else if w_bit && edtl as usize > pdu.data.len() {
-                    let rx = data_out_rx.as_mut().ok_or_else(|| {
-                        anyhow!(
-                            "reader did not register Data-Out route for ITT=0x{:08x}",
-                            pdu.itt
-                        )
-                    })?;
-                    let outcome =
-                        collect_write_data(
-                            sock,
-                            &mut pdu,
-                            edtl,
-                            negotiated_max_burst_length,
-                            negotiated_first_burst_length,
-                            &session_manager,
-                            tsih,
-                            cid,
-                            rx,
-                        )
-                        .await;
-                    drop_route(pdu.itt);
-                    outcome?;
-                } else if w_bit {
-                    // W-bit set but unsolicited data already covers EDTL —
-                    // still drop the registered route to release the
-                    // bounded channel slot.
-                    drop_route(pdu.itt);
-                }
-                // data_out_rx drops at end of loop iteration; reader's
-                // subsequent send() on the closed channel is silently
-                // discarded (which is what we want — any straggling
-                // Data-Out PDUs after burst completion are spec-illegal).
-
                 let lun = decode_lun(&pdu.lun);
-                let cdb_slice: [u8; 16] = {
-                    let mut c = [0u8; 16];
-                    c.copy_from_slice(&pdu.bhs[32..48]);
-                    c
-                };
 
-                // VSA dynamic admission: for a CHAP session, re-read the
-                // user's *current* admitted-volume set from the handler's
-                // live view each command, so an `iscsi users grant` /
-                // `revoke` issued after login takes effect on this session.
-                // Falls back to the login snapshot when the handler exposes
-                // no live admission (VTL, or auth disabled).
-                let live_admission = authenticated_user
-                    .as_deref()
-                    .and_then(|u| handler.live_admission(u));
-                let session_volumes = match &live_admission {
-                    Some(set) => Some(set.as_slice()),
-                    None => authenticated_volumes.as_deref(),
-                };
-
-                let req = ScsiRequest {
-                    tsih,
-                    cid,
-                    lun,
-                    cdb: &cdb_slice,
-                    data_out: &pdu.data,
-                    data_in_max: edtl as usize,
-                    initiator_iqn: initiator_iqn.as_deref(),
-                    initiator_isid: pr_isid,
-                    peer,
-                    session_partition: authenticated_partition.as_deref(),
-                    session_volumes,
-                };
-
-                let resp = if edtl_over_cap {
-                    // INVALID FIELD IN CDB (0x05/0x24) — the transfer
-                    // length the host asked for is unsupported (#125).
-                    crate::handler::ScsiResponse::check(scsi_spc::sense::SenseData::new(
-                        scsi_spc::sense::SenseKey::IllegalRequest,
-                        0x24,
-                        0x00,
-                    ))
+                // Route to the LU's worker, spawning it on first use.
+                // Cloning the Sender (cheap — Arc inside) sidesteps the
+                // get-or-insert borrow conflict.
+                let tx = if let Some(w) = lu_workers.get(&lun) {
+                    w.tx.clone()
                 } else {
-                    handler.dispatch(req).await
+                    let (tx, rx) = tokio::sync::mpsc::channel::<LuJob>(LU_QUEUE_DEPTH);
+                    let handle = tokio::spawn(lu_worker(lun, rx, Arc::clone(ctx)));
+                    lu_workers.insert(
+                        lun,
+                        LuWorker {
+                            tx: tx.clone(),
+                            handle,
+                        },
+                    );
+                    tx
                 };
 
-                let exp_cmdsn = next_exp_cmdsn(&pdu);
-                let max_cmdsn = exp_cmdsn.wrapping_add(ADVERTISED_CMDSN_WINDOW);
-
-                if !resp.data_in.is_empty() {
-                    // Truncate to initiator-advertised EDTL.
-                    let mut data_in = resp.data_in;
-                    if data_in.len() as u32 > edtl {
-                        data_in.truncate(edtl as usize);
-                    }
-                    let total_len = data_in.len();
-                    let residual = edtl.saturating_sub(total_len as u32);
-
-                    // RFC 7143 §11.7: chunk the Data-In stream into
-                    // PDUs of at most peer-declared MaxRecvData-
-                    // SegmentLength bytes, stamping DataSN (0, 1,
-                    // 2, …) and BufferOffset on every PDU. Only the
-                    // final PDU carries F=1 + S=1 + the SCSI status
-                    // byte; non-final PDUs leave the StatSN field
-                    // zero (S=0 makes it reserved). A single PDU
-                    // smaller than the cap collapses to the
-                    // historical one-PDU path.
-                    let chunk_size = peer_max_recv_data_segment_length as usize;
-                    let status_code = resp.status.code();
-                    let mut cursor = 0usize;
-                    let mut data_sn: u32 = 0;
-                    while cursor < total_len {
-                        let end = total_len.min(cursor + chunk_size);
-                        let is_last = end == total_len;
-                        let mut din = build_empty_pdu(0x25, true, is_last);
-                        din.itt = pdu.itt;
-                        din.ttt = 0xFFFFFFFF;
-                        if is_last {
-                            din.bhs[1] = 0x80 | 0x01; // F | S
-                            if residual > 0 {
-                                din.bhs[1] |= 0x02; // U
-                            }
-                            din.bhs[3] = status_code;
-                            din.bhs[44..48].copy_from_slice(&residual.to_be_bytes());
-                        }
-                        din.bhs[36..40].copy_from_slice(&data_sn.to_be_bytes());
-                        din.bhs[40..44].copy_from_slice(&(cursor as u32).to_be_bytes());
-                        if is_last {
-                            let sn = next_statsn()?;
-                            stamp_serials_for_response(&mut din.bhs, sn, exp_cmdsn, max_cmdsn);
-                        } else {
-                            // Non-final Data-In: StatSN reserved
-                            // (S=0). Still stamp ExpCmdSN /
-                            // MaxCmdSN so the initiator's CmdSN
-                            // window stays open while it gathers
-                            // the burst.
-                            din.bhs[28..32].copy_from_slice(&exp_cmdsn.to_be_bytes());
-                            din.bhs[32..36].copy_from_slice(&max_cmdsn.to_be_bytes());
-                        }
-                        write_pdu_with_data(sock, &mut din, &data_in[cursor..end]).await?;
-                        data_sn = data_sn.wrapping_add(1);
-                        cursor = end;
-                    }
-                } else {
-                    // SCSI Response only.
-                    let mut sresp = build_empty_pdu(0x21, true, true);
-                    sresp.itt = pdu.itt;
-                    sresp.bhs[3] = resp.status.code();
-                    if matches!(resp.status, ScsiStatus::CheckCondition) {
-                        let sense = match resp.sense {
-                            Some(s) => s.to_bytes(),
-                            None => {
-                                // Default sense (ILLEGAL REQUEST /
-                                // INVALID COMMAND OPERATION CODE) —
-                                // should never happen because handlers
-                                // fill it in, but we'd rather emit a
-                                // usable wire response than an empty
-                                // data segment.
-                                vec![
-                                    0x70, 0, 0x05, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0,
-                                ]
-                            }
-                        };
-                        let len = sense.len() as u16;
-                        let mut payload = Vec::with_capacity(2 + sense.len());
-                        payload.extend_from_slice(&len.to_be_bytes());
-                        payload.extend_from_slice(&sense);
-                        sresp.data = payload;
-                    }
-                    stamp_and_write!(sresp, &pdu);
+                let job = LuJob {
+                    pdu,
+                    data_out_rx,
+                    edtl,
+                    w_bit,
+                    edtl_over_cap,
+                    req_exp_cmdsn,
+                };
+                if tx.try_send(job).is_err() {
+                    // Full == the initiator exceeded its CmdSN window;
+                    // Closed == the worker already died (and signaled
+                    // shutdown). Either way the stream is unrecoverable.
+                    return Err(anyhow!(
+                        "LU {} command queue overflow or worker gone (flow-control violation)",
+                        lun
+                    ));
                 }
             }
             0x02 => {
-                // Task Management. Illegal in discovery sessions
-                // (RFC 7143 §6.1) — reject with a typed protocol-
-                // error Reject rather than fabricating a "function
-                // complete" TMF Response without session state.
+                // Task Management. Illegal in discovery sessions. Answered
+                // out-of-band with a function-complete ack — the same stub
+                // behavior as before (no real abort semantics exist yet,
+                // so concurrency doesn't regress it).
                 if tsih == 0 {
                     tracing::warn!(
                         "Task Management on discovery session from {peer} — protocol violation"
                     );
-                    let mut rej = build_reject(0xFFFFFFFF, 0x04);
-                    stamp_and_write!(rej, &pdu);
+                    responder.emit_status(build_reject(0xFFFFFFFF, 0x04), req_exp_cmdsn)?;
                     continue;
                 }
                 let mut tmf = build_empty_pdu(0x22, true, true);
                 tmf.itt = pdu.itt;
                 tmf.bhs[2] = 0x00;
-                stamp_and_write!(tmf, &pdu);
+                responder.emit_status(tmf, req_exp_cmdsn)?;
             }
             0x06 => {
-                // Logout — connection closed successfully. Legal in
-                // both normal and discovery sessions (RFC 7143 §6.1);
-                // the latter is how libiscsi tears down `iscsi-ls`.
+                // Logout — emit the response out-of-band and stop routing.
+                // Teardown joins in-flight workers (flushing their
+                // responses) before the writer closes the connection.
                 let mut logout_resp = build_empty_pdu(0x26, true, true);
                 logout_resp.itt = pdu.itt;
                 logout_resp.bhs[2] = 0x00;
-                stamp_and_write!(logout_resp, &pdu);
-                break;
+                responder.emit_status(logout_resp, req_exp_cmdsn)?;
+                return Ok(());
             }
             0x05 => {
                 // Stray Data-Out at the FFP top — protocol error.
@@ -1987,22 +2369,19 @@ pub async fn serve_connection<H: ScsiHandler + ?Sized>(
                     pdu.itt,
                     pdu.ttt
                 );
-                let mut rej = build_reject(0xFFFFFFFF, 0x04); // Protocol error
-                stamp_and_write!(rej, &pdu);
+                responder.emit_status(build_reject(0xFFFFFFFF, 0x04), req_exp_cmdsn)?;
             }
-            0xFF => break,
+            0xFF => return Ok(()),
             _ => {
                 error!(
                     "Unsupported opcode: 0x{:02x} ({})",
                     pdu.opcode & 0x3F,
                     opcode_name(pdu.opcode)
                 );
-                let mut rej = build_reject(pdu.itt, 0x09); // Command not supported
-                stamp_and_write!(rej, &pdu);
+                responder.emit_status(build_reject(pdu.itt, 0x09), req_exp_cmdsn)?;
             }
         }
     }
-    Ok(())
 }
 
 // ===== Server bind / accept loop =====
@@ -2251,7 +2630,11 @@ where
                 // filemark/sync). Every mainstream iSCSI target sets
                 // TCP_NODELAY at accept (issue #174).
                 if let Err(e) = stream.set_nodelay(true) {
-                    tracing::warn!("set_nodelay failed for {}: {} (latency may suffer)", addr, e);
+                    tracing::warn!(
+                        "set_nodelay failed for {}: {} (latency may suffer)",
+                        addr,
+                        e
+                    );
                 }
                 let handler = Arc::clone(&handler);
                 let session_manager = Arc::clone(&session_manager);
@@ -2624,7 +3007,10 @@ mod tests {
         req.insert("MaxBurstLength".to_string(), "256".to_string()); // < 512, ignored
         req.insert("FirstBurstLength".to_string(), "999999999".to_string()); // > 2^24-1, ignored
         negotiate_session_params(&mut p, &req);
-        assert_eq!(p.max_burst_length, MAX_BURST_LENGTH, "garbage MaxBurst ignored");
+        assert_eq!(
+            p.max_burst_length, MAX_BURST_LENGTH,
+            "garbage MaxBurst ignored"
+        );
         // FirstBurst default capped at MaxBurst (both unchanged here).
         assert!(p.first_burst_length <= p.max_burst_length);
     }
@@ -2871,8 +3257,9 @@ mod tests {
         p
     }
 
-    /// Spin up a session + connection so collect_write_data can read
-    /// the StatSN for its R2T PDUs.
+    /// Spin up a session + connection plus a capturing [`Responder`] so
+    /// collect_write_data can emit its R2T PDUs (into the returned
+    /// channel) and peek the StatSN.
     fn session_with_connection() -> (Arc<SessionManager>, u16, u16) {
         let mgr = Arc::new(SessionManager::new());
         let tsih = mgr.create_session([9, 9, 9, 9, 9, 9]);
@@ -2881,11 +3268,41 @@ mod tests {
         (mgr, tsih, 0)
     }
 
+    /// A [`Responder`] whose writer channel is captured here, for tests
+    /// that drive `collect_write_data` (R2T) or the emit helpers directly.
+    fn capturing_responder(
+        mgr: Arc<SessionManager>,
+        tsih: u16,
+        cid: u16,
+    ) -> (Responder, tokio::sync::mpsc::UnboundedReceiver<WriterMsg>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriterMsg>();
+        let r = Responder {
+            tsih,
+            cid,
+            session_manager: mgr,
+            writer_tx: tx,
+            send_lock: Arc::new(std::sync::Mutex::new(())),
+            discovery_statsn: Arc::new(std::sync::Mutex::new(1)),
+            peer_max_recv: MAX_RECV_DATA_SEGMENT_LENGTH,
+        };
+        (r, rx)
+    }
+
+    /// Drain the next emitted PDU from a capture channel, asserting it is
+    /// a single `WriterMsg::Pdu` (not a Data-In job).
+    fn next_emitted_pdu(rx: &mut tokio::sync::mpsc::UnboundedReceiver<WriterMsg>) -> Pdu {
+        match rx.try_recv().expect("expected an emitted PDU") {
+            WriterMsg::Pdu(p) => *p,
+            WriterMsg::DataIn(_) => panic!("expected a single PDU, got a Data-In job"),
+        }
+    }
+
     #[tokio::test]
     async fn collect_write_data_unsolicited_burst_then_done() {
         // cmd carries no immediate data, final_bit clear → phase 1
         // drains one unsolicited Data-Out that completes the EDTL.
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x1000;
         let edtl = 8u32;
@@ -2902,10 +3319,17 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, edtl, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap();
+        collect_write_data(
+            &responder,
+            &mut cmd,
+            edtl,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(cmd.data, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -2914,6 +3338,7 @@ mod tests {
         // cmd.final_bit set so phase 1 is skipped; phase 2 issues one
         // R2T and the matching Data-Out completes the burst.
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, mut cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, true);
         cmd.itt = 0x2000;
         let edtl = 4u32;
@@ -2931,14 +3356,20 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, edtl, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap();
+        collect_write_data(
+            &responder,
+            &mut cmd,
+            edtl,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(cmd.data, [0xDE, 0xAD, 0xBE, 0xEF]);
-        // An R2T PDU (opcode 0x31) was written to the sink.
-        let mut cursor = std::io::Cursor::new(sink);
-        let r2t = read_pdu(&mut cursor).await.unwrap();
+        // An R2T PDU (opcode 0x31) was emitted to the writer.
+        let r2t = next_emitted_pdu(&mut cap);
         assert_eq!(r2t.opcode & 0x3F, 0x31, "an R2T was sent");
         assert_eq!(r2t.itt, 0x2000);
     }
@@ -2946,6 +3377,7 @@ mod tests {
     #[tokio::test]
     async fn collect_write_data_rejects_wrong_opcode() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x3000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
@@ -2954,16 +3386,24 @@ mod tests {
         wrong.itt = 0x3000;
         tx.send(wrong).await.unwrap();
         drop(tx);
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            8,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("expected unsolicited Data-Out"));
     }
 
     #[tokio::test]
     async fn collect_write_data_rejects_itt_mismatch() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x4000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
@@ -2971,16 +3411,24 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            8,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("ITT mismatch"));
     }
 
     #[tokio::test]
     async fn collect_write_data_rejects_unsolicited_non_default_ttt() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x5000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
@@ -2989,16 +3437,24 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            8,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("non-default TTT"));
     }
 
     #[tokio::test]
     async fn collect_write_data_rejects_buffer_offset_gap() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x6000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
@@ -3007,16 +3463,24 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            8,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("BufferOffset"));
     }
 
     #[tokio::test]
     async fn collect_write_data_rejects_edtl_overrun() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x7000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
@@ -3025,24 +3489,39 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 4, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            4,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("overruns EDTL"));
     }
 
     #[tokio::test]
     async fn collect_write_data_channel_close_is_error() {
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, _cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, false);
         cmd.itt = 0x8000;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
         drop(tx); // reader "closed" before any Data-Out arrived
-        let mut sink = Vec::new();
-        let err = collect_write_data(&mut sink, &mut cmd, 8, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap_err();
+        let err = collect_write_data(
+            &responder,
+            &mut cmd,
+            8,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("PDU reader closed"));
     }
 
@@ -3051,16 +3530,24 @@ mod tests {
         // cmd.final_bit set and data already covers EDTL → both phases
         // are no-ops, returns Ok immediately.
         let (mgr, tsih, cid) = session_with_connection();
+        let (responder, mut cap) = capturing_responder(mgr, tsih, cid);
         let mut cmd = build_empty_pdu(0x01, false, true);
         cmd.itt = 0x9000;
         cmd.data = vec![1, 2, 3, 4];
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<Pdu>(4);
-        let mut sink = Vec::new();
-        collect_write_data(&mut sink, &mut cmd, 4, MAX_BURST_LENGTH, FIRST_BURST_LENGTH, &mgr, tsih, cid, &mut rx)
-            .await
-            .unwrap();
+        collect_write_data(
+            &responder,
+            &mut cmd,
+            4,
+            MAX_BURST_LENGTH,
+            FIRST_BURST_LENGTH,
+            &mut rx,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(cmd.data, [1, 2, 3, 4]);
-        assert!(sink.is_empty(), "no R2T needed");
+        assert!(cap.try_recv().is_err(), "no R2T needed");
     }
 
     // ===== End-to-end: handle_login_phase / serve_connection / run =====
@@ -3405,6 +3892,182 @@ mod tests {
 
         server.await.unwrap().unwrap();
         // Session was cleaned up by the SessionGuard on exit.
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_emits_keep_statsn_monotonic_in_writer_order() {
+        // #173 core invariant: many tasks emitting status PDUs through one
+        // Responder concurrently must produce a StatSN sequence that is
+        // contiguous and monotonic in *writer-FIFO* order — the send-lock
+        // makes [alloc StatSN -> enqueue] atomic, so enqueue order (what
+        // the writer flushes) equals StatSN order with no gap or dup. A
+        // gap/dup here would make a real initiator drop the session.
+        let mgr = Arc::new(SessionManager::new());
+        let tsih = mgr.create_session([7, 7, 7, 7, 7, 7]);
+        mgr.add_connection(tsih, 0, MAX_RECV_DATA_SEGMENT_LENGTH)
+            .unwrap();
+        // Seed exp_cmd_sn so emit_status takes the session-counter path.
+        mgr.check_cmdsn(tsih, 0, 100, false).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WriterMsg>();
+        let responder = Responder {
+            tsih,
+            cid: 0,
+            session_manager: Arc::clone(&mgr),
+            writer_tx: tx,
+            send_lock: Arc::new(std::sync::Mutex::new(())),
+            discovery_statsn: Arc::new(std::sync::Mutex::new(1)),
+            peer_max_recv: MAX_RECV_DATA_SEGMENT_LENGTH,
+        };
+
+        let n: u32 = 200;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let r = responder.clone();
+            handles.push(tokio::spawn(async move {
+                let mut p = build_empty_pdu(0x21, true, true);
+                p.itt = i;
+                r.emit_status(p, 101).unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        drop(responder);
+
+        // Drain in writer order. StatSN must be 1, 2, 3, … contiguous
+        // (add_connection seeds stat_sn = 1).
+        let mut statsns = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let WriterMsg::Pdu(p) = msg {
+                statsns.push(u32::from_be_bytes([
+                    p.bhs[24], p.bhs[25], p.bhs[26], p.bhs[27],
+                ]));
+            }
+        }
+        assert_eq!(statsns.len(), n as usize, "every emit reached the writer");
+        for (idx, sn) in statsns.iter().enumerate() {
+            assert_eq!(
+                *sn,
+                1 + idx as u32,
+                "StatSN must be contiguous + monotonic in writer-FIFO order"
+            );
+        }
+    }
+
+    /// Handler whose dispatch for `slow_lun` parks on a gate until the
+    /// test releases it; every other LU answers GOOD immediately. Lets a
+    /// test prove cross-LU concurrency + NOP keepalive are not starved by
+    /// an in-flight slow command (issue #173).
+    struct GatedHandler {
+        iqn: String,
+        gate: Arc<tokio::sync::Notify>,
+        slow_lun: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ScsiHandler for GatedHandler {
+        fn target_iqn(&self) -> &str {
+            &self.iqn
+        }
+        async fn dispatch(&self, req: ScsiRequest<'_>) -> ScsiResponse {
+            if req.lun == self.slow_lun {
+                // Park until the test releases the gate.
+                self.gate.notified().await;
+            }
+            ScsiResponse::good(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_command_on_one_lu_does_not_block_other_lus_or_nop() {
+        // #173 end-to-end: a command parked in dispatch on LU 1 must not
+        // stall a NOP-Out keepalive nor a command to LU 2. In the old
+        // serial loop the gated LU-1 dispatch would wedge the single
+        // PDU loop and these reads would time out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mgr = Arc::new(SessionManager::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GatedHandler {
+            iqn: "iqn.test:tgt".into(),
+            gate: Arc::clone(&gate),
+            slow_lun: 1,
+        });
+        let mgr_srv = Arc::clone(&mgr);
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(
+                sock,
+                handler,
+                mgr_srv,
+                None,
+                &NoopLoginAudit,
+                "127.0.0.1:9",
+                &[],
+                1,
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut login = make_login_pdu(
+            STAGE_SECURITY,
+            STAGE_FULL,
+            true,
+            0,
+            &[("InitiatorName", "iqn.init:conc")],
+        );
+        write_pdu(&mut client, &mut login).await.unwrap();
+        let _ = read_pdu(&mut client).await.unwrap();
+
+        // Park LU 1 (cmdsn 1), then send a NOP-Out (immediate) and a LU 2
+        // command (cmdsn 2). LU 1's response is gated; the other two must
+        // come back regardless.
+        let mut slow = make_scsi_cmd(0x1111, 1, 1, 0x00, 0);
+        write_pdu(&mut client, &mut slow).await.unwrap();
+        let mut nop = build_empty_pdu(0x00, true, true);
+        nop.itt = 0x2222;
+        write_pdu(&mut client, &mut nop).await.unwrap();
+        let mut fast = make_scsi_cmd(0x3333, 2, 2, 0x00, 0);
+        write_pdu(&mut client, &mut fast).await.unwrap();
+
+        // The NOP-In and the LU-2 response must arrive while LU 1 is still
+        // parked. Bounded reads so a regression (serial dispatch) fails as
+        // a timeout rather than hanging.
+        async fn read_bounded(client: &mut TcpStream) -> Pdu {
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_pdu(client))
+                .await
+                .expect("read timed out — slow LU blocked the connection (regression)")
+                .unwrap()
+        }
+        let a = read_bounded(&mut client).await;
+        let b = read_bounded(&mut client).await;
+        let mut got: Vec<(u8, u32)> = vec![(a.opcode & 0x3F, a.itt), (b.opcode & 0x3F, b.itt)];
+        got.sort_unstable();
+        let mut want = vec![(0x20u8, 0x2222u32), (0x21u8, 0x3333u32)];
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "NOP-In + LU2 response must arrive while LU1 dispatch is parked"
+        );
+
+        // Release LU 1; its response now arrives.
+        gate.notify_one();
+        let slow_resp = read_bounded(&mut client).await;
+        assert_eq!(slow_resp.opcode & 0x3F, 0x21, "LU1 SCSI Response");
+        assert_eq!(slow_resp.itt, 0x1111);
+
+        // Clean logout (cmdsn 3).
+        let mut logout = build_empty_pdu(0x06, false, true);
+        logout.itt = 0x4444;
+        logout.bhs[24..28].copy_from_slice(&3u32.to_be_bytes());
+        write_pdu(&mut client, &mut logout).await.unwrap();
+        let logout_resp = read_bounded(&mut client).await;
+        assert_eq!(logout_resp.opcode & 0x3F, 0x26, "Logout Response");
+
+        server.await.unwrap().unwrap();
         assert_eq!(mgr.session_count(), 0);
     }
 
