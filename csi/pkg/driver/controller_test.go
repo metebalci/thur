@@ -167,6 +167,66 @@ func TestCloneFromVolume(t *testing.T) {
 	}
 }
 
+// TestCloneRestoreToLargerResizes is the regression for issue #227: the
+// daemon clones at the source's size, so a clone whose source is smaller
+// than the requested PVC must be grown to the request before returning,
+// or the provisioned volume violates the CSI >= required_bytes contract.
+func TestCloneRestoreToLargerResizes(t *testing.T) {
+	cs := testController(t)
+	ctx := context.Background()
+	if _, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{Name: "pvc-src", CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30}, VolumeCapabilities: singleNodeCaps()}); err != nil {
+		t.Fatalf("create src: %v", err)
+	}
+	resp, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               "pvc-big",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 2 << 30},
+		VolumeCapabilities: singleNodeCaps(),
+		VolumeContentSource: &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Volume{Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "pvc-src"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("clone-to-larger: %v", err)
+	}
+	if got := resp.GetVolume().GetCapacityBytes(); got != 2<<30 {
+		t.Errorf("restored volume capacity = %d, want %d (must grow to the request)", got, 2<<30)
+	}
+}
+
+// TestCloneRetryReconcilesSizeUp covers the issue #227 retry path: when
+// the first (size-copying) clone landed and the provisioner re-drives
+// CreateVolume at the larger request, the daemon 409 must be reconciled
+// by resizing up, not failing permanently with ALREADY_EXISTS.
+func TestCloneRetryReconcilesSizeUp(t *testing.T) {
+	cs := testController(t)
+	ctx := context.Background()
+	if _, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{Name: "pvc-src", CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30}, VolumeCapabilities: singleNodeCaps()}); err != nil {
+		t.Fatalf("create src: %v", err)
+	}
+	src := &csi.VolumeContentSource{
+		Type: &csi.VolumeContentSource_Volume{Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "pvc-src"}},
+	}
+	// First clone at the source's own size — lands at 1Gi, no resize.
+	if _, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "pvc-c", CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30},
+		VolumeCapabilities: singleNodeCaps(), VolumeContentSource: src,
+	}); err != nil {
+		t.Fatalf("first clone: %v", err)
+	}
+	// Provisioner re-drives the same clone at the larger PVC size: the
+	// daemon 409s (name exists), and reconcile must resize up, not fail.
+	resp, err := cs.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "pvc-c", CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30},
+		VolumeCapabilities: singleNodeCaps(), VolumeContentSource: src,
+	})
+	if err != nil {
+		t.Fatalf("clone retry must reconcile by resizing up, got: %v", err)
+	}
+	if got := resp.GetVolume().GetCapacityBytes(); got != 2<<30 {
+		t.Errorf("reconciled capacity = %d, want %d", got, 2<<30)
+	}
+}
+
 func TestCloneMissingSource(t *testing.T) {
 	cs := testController(t)
 	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{

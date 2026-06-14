@@ -149,7 +149,33 @@ func (s *controllerServer) createFromSource(ctx context.Context, name string, re
 			return nil, toStatus(err)
 		}
 	}
+	// The daemon clones at the source's size, so a restore-to-larger PVC
+	// must be grown to the request before returning or the CSI contract
+	// (volume >= required_bytes) is violated (issue #227).
+	row, err = s.ensureMinSize(ctx, name, row, requested)
+	if err != nil {
+		return nil, err
+	}
 	return createResponse(row, params, src), nil
+}
+
+// ensureMinSize grows a freshly-cloned (or retried-clone) volume up to
+// `requested` when the clone landed smaller — the daemon's clone API copies
+// the source's size, so restore-to-larger-PVC needs a follow-up resize
+// (issue #227), mirroring what ControllerExpandVolume does. A request at or
+// below the current size is already satisfied. Returns the row with its size
+// updated to the post-resize value so createResponse reports the real
+// capacity.
+func (s *controllerServer) ensureMinSize(ctx context.Context, name string, row *vsa.VolumeRow, requested uint64) (*vsa.VolumeRow, error) {
+	if requested <= row.SizeBytes {
+		return row, nil
+	}
+	rs, err := s.vsa.ResizeVolume(ctx, name, requested)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	row.SizeBytes = rs.SizeBytes
+	return row, nil
 }
 
 // reconcileExisting implements CreateVolume idempotency: a name that already
@@ -164,6 +190,20 @@ func (s *controllerServer) reconcileExisting(ctx context.Context, name string, r
 		return nil, status.Errorf(codes.Internal, "volume %q reported as existing but not found", name)
 	}
 	if existing.SizeBytes != requested {
+		// A retried clone whose source was smaller than the requested PVC:
+		// the daemon cloned at source size, so finish the restore-to-larger
+		// by growing up to the request rather than failing the
+		// provisioner's idempotent retry permanently with ALREADY_EXISTS
+		// (issue #227). Only the grow direction is reconcilable; a
+		// size-mismatched plain create (src == nil), or an existing volume
+		// already larger than requested, is a genuine name collision.
+		if src != nil && existing.SizeBytes < requested {
+			grown, err := s.ensureMinSize(ctx, name, existing, requested)
+			if err != nil {
+				return nil, err
+			}
+			return createResponse(grown, params, src), nil
+		}
 		return nil, status.Errorf(codes.AlreadyExists,
 			"volume %q already exists with size %d, requested %d", name, existing.SizeBytes, requested)
 	}

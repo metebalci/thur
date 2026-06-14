@@ -188,12 +188,20 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	}
 	// Every volume a node mounts shares one iSCSI session (one (target
 	// IQN, portal) per node under per-node CHAP, issue #15), so a logout
-	// would tear every other volume's LUN off this node. Drop this
-	// volume's connector first, then log out only when it was the last
-	// staged volume on the node. The daemon revokes the volume from the
-	// node's CHAP user on ControllerUnpublishVolume; a surviving session
-	// drops the now-unadmitted LUN on its next rescan.
-	_ = os.Remove(s.connPath(req.GetVolumeId()))
+	// would tear every other volume's LUN off this node. We therefore log
+	// out only when this was the last staged volume — and crucially we
+	// remove this volume's connector file LAST, after the device delete
+	// and (if last) the logout both succeed. The connector is the only
+	// state this RPC has (it gets no PublishContext); removing it before
+	// the teardown meant a failed Detach returned Internal but the
+	// kubelet retry then hit os.IsNotExist on loadConn and returned
+	// success without ever logging out — leaking the session, the
+	// open-iscsi node DB record (with since-revoked CHAP creds), and the
+	// stale devices until reboot (issue #228). Keeping the connector
+	// until the end makes the retry re-run the full teardown; DeleteDevice
+	// and Detach both tolerate already-cleaned state, so the rerun is
+	// idempotent.
+	//
 	// Delete this LUN's kernel device so it can't linger and be handed to
 	// a later volume that reuses the same LUN number (issue #149). The
 	// session stays up for the node's other volumes; iscsiadm -R never
@@ -201,7 +209,12 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	if err := s.attacher.DeleteDevice(ctx, conn); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete stale device: %v", err)
 	}
-	last, err := s.isLastConnector()
+	// Last-volume check excludes this volume's own (still-present)
+	// connector — "last" means no OTHER connector remains. The daemon
+	// revokes the volume from the node's CHAP user on
+	// ControllerUnpublishVolume; a surviving session drops the
+	// now-unadmitted LUN on its next rescan.
+	last, err := s.isLastConnector(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "scan node state: %v", err)
 	}
@@ -210,6 +223,9 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 			return nil, status.Errorf(codes.Internal, "iscsi detach: %v", err)
 		}
 	}
+	// Teardown succeeded — now drop this volume's connector. Until this
+	// point any earlier failure left it on disk so the retry re-ran.
+	_ = os.Remove(s.connPath(req.GetVolumeId()))
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -304,11 +320,13 @@ func (s *nodeServer) connPath(volID string) string {
 	return filepath.Join(s.stateDir, volID+".json")
 }
 
-// isLastConnector reports whether no per-volume connector files remain in
-// the node state dir — i.e. the volume just unstaged was the last one
-// sharing the node's single iSCSI session, so it is safe to log out.
-// A missing dir counts as "last" (nothing left to keep the session for).
-func (s *nodeServer) isLastConnector() (bool, error) {
+// isLastConnector reports whether the volume being unstaged (excludeVolID)
+// is the last one sharing the node's single iSCSI session — i.e. no OTHER
+// per-volume connector file remains — so it is safe to log out. It is
+// called BEFORE the volume's own connector is removed (issue #228), so
+// that file is excluded from the count. A missing dir counts as "last"
+// (nothing left to keep the session for).
+func (s *nodeServer) isLastConnector(excludeVolID string) (bool, error) {
 	entries, err := os.ReadDir(s.stateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -316,8 +334,9 @@ func (s *nodeServer) isLastConnector() (bool, error) {
 		}
 		return false, err
 	}
+	self := excludeVolID + ".json"
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") && e.Name() != self {
 			return false, nil
 		}
 	}

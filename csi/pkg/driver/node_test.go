@@ -5,6 +5,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +23,9 @@ type fakeAttacher struct {
 	rescanned []iscsi.Connector
 	detached  [][2]string
 	deleted   []iscsi.Connector
+	// detachErr, when non-nil, makes Detach fail without recording a
+	// logout — used to exercise the unstage retry path (issue #228).
+	detachErr error
 }
 
 func (f *fakeAttacher) Attach(_ context.Context, c iscsi.Connector) (string, error) {
@@ -40,6 +44,9 @@ func (f *fakeAttacher) Rescan(_ context.Context, c iscsi.Connector) (string, err
 }
 
 func (f *fakeAttacher) Detach(_ context.Context, iqn, portal string) error {
+	if f.detachErr != nil {
+		return f.detachErr
+	}
 	f.detached = append(f.detached, [2]string{iqn, portal})
 	return nil
 }
@@ -278,6 +285,52 @@ func TestNodeUnstageDetachesOnlyOnLastVolume(t *testing.T) {
 	}
 	if len(fa.deleted) != 2 {
 		t.Fatalf("both volumes' devices must be deleted: %+v", fa.deleted)
+	}
+}
+
+// TestNodeUnstageRetriesDetachAfterFailure is the regression for issue
+// #228: a failed Detach on the last volume must leave the connector file
+// on disk so the kubelet retry re-runs the logout, instead of removing it
+// up front and short-circuiting the retry on os.IsNotExist (which leaks
+// the session + node DB record).
+func TestNodeUnstageRetriesDetachAfterFailure(t *testing.T) {
+	ns, fa, _ := testNode(t)
+	ctx := context.Background()
+	staging := filepath.Join(t.TempDir(), "s")
+	if _, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+		VolumeId: "pvc-1", StagingTargetPath: staging,
+		VolumeCapability: singleNodeCaps()[0], PublishContext: nodePubCtx(),
+	}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// First unstage: Detach fails -> Internal, and the connector must
+	// survive so the retry can log out.
+	fa.detachErr = errors.New("iscsid unresponsive")
+	if _, err := ns.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{
+		VolumeId: "pvc-1", StagingTargetPath: staging,
+	}); err == nil {
+		t.Fatalf("expected unstage to fail when detach fails")
+	}
+	if _, err := os.Stat(ns.connPath("pvc-1")); err != nil {
+		t.Fatalf("connector must survive a failed detach for the retry: %v", err)
+	}
+	if len(fa.detached) != 0 {
+		t.Fatalf("a failed detach must not record a logout: %+v", fa.detached)
+	}
+
+	// Retry: detach succeeds, the session logs out, the connector is gone.
+	fa.detachErr = nil
+	if _, err := ns.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{
+		VolumeId: "pvc-1", StagingTargetPath: staging,
+	}); err != nil {
+		t.Fatalf("retry unstage: %v", err)
+	}
+	if len(fa.detached) != 1 {
+		t.Fatalf("retry must log out the session: %+v", fa.detached)
+	}
+	if _, err := os.Stat(ns.connPath("pvc-1")); !os.IsNotExist(err) {
+		t.Errorf("connector must be removed after a successful detach: %v", err)
 	}
 }
 
