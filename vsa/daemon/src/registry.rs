@@ -191,6 +191,19 @@ impl nvme_nvm::NamespaceLookup for VolumeRegistry {
             .filter_map(|lun| u32::try_from(lun + 1).ok())
             .collect()
     }
+    fn is_admitted(&self, nsid: u32, allow: &[String]) -> bool {
+        if nsid == 0 {
+            return false;
+        }
+        // One read lock, compare the volume name in place against the
+        // admission slice — no String clone per I/O (issue #244).
+        let lun = u64::from(nsid - 1);
+        let map = self.by_lun.read().unwrap_or_else(|p| p.into_inner());
+        match map.get(&lun) {
+            Some(c) => allow.iter().any(|n| n == &c.manifest().name),
+            None => false,
+        }
+    }
 }
 
 /// Resolves a runtime LUN to its volume's stable manifest UUID and
@@ -383,5 +396,25 @@ mod tests {
 
         // NSID 0 is never resolved (reserved by NVMe).
         assert!(<VolumeRegistry as NamespaceLookup>::name_for_nsid(&reg, 0).is_none());
+    }
+
+    /// Issue #244: the non-allocating admission override must agree with
+    /// the name-clone path it replaces.
+    #[tokio::test]
+    async fn is_admitted_matches_name_for_nsid() {
+        use nvme_nvm::NamespaceLookup;
+        let tmp = TempDir::new().unwrap();
+        let reg = VolumeRegistry::new();
+        reg.register(0, fixture_cache("alpha", tmp.path()).await); // nsid 1
+        reg.register(1, fixture_cache("beta", tmp.path()).await); // nsid 2
+
+        let allow = vec!["alpha".to_string()];
+        assert!(reg.is_admitted(1, &allow), "alpha (nsid 1) is admitted");
+        assert!(!reg.is_admitted(2, &allow), "beta (nsid 2) is not admitted");
+        // Unknown NSID and reserved NSID 0 are never admitted.
+        assert!(!reg.is_admitted(99, &allow));
+        assert!(!reg.is_admitted(0, &allow));
+        // Empty allow set admits nothing.
+        assert!(!reg.is_admitted(1, &[]));
     }
 }

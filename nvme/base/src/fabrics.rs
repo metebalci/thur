@@ -177,7 +177,16 @@ pub fn connect_response_dw0(cntlid: u16, auth_required: bool) -> u32 {
 
 fn read_nul_padded_ascii(field: &'static str, buf: &[u8]) -> Result<String, NvmeError> {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let s = std::str::from_utf8(&buf[..end]).map_err(|_| NvmeError::NonAsciiField(field))?;
+    let bytes = &buf[..end];
+    // NVMe-oF requires ASCII NQNs; reject non-ASCII at the wire boundary
+    // rather than letting a multi-byte UTF-8 hostnqn flow into audit/log
+    // output (which the project keeps plain-ASCII) and the per-host
+    // volume-admission string compare. `from_utf8` alone accepted any
+    // valid UTF-8, leaving NonAsciiField unreachable (issue #249).
+    if !bytes.is_ascii() {
+        return Err(NvmeError::NonAsciiField(field));
+    }
+    let s = std::str::from_utf8(bytes).map_err(|_| NvmeError::NonAsciiField(field))?;
     Ok(s.to_string())
 }
 
@@ -375,6 +384,24 @@ mod tests {
     fn connect_data_short_buffer_errors() {
         let err = ConnectData::parse(&[0u8; 512]).unwrap_err();
         assert!(matches!(err, NvmeError::ConnectDataLength(512)));
+    }
+
+    /// Issue #249: a non-ASCII (valid-UTF-8) HOSTNQN must be rejected at
+    /// the wire boundary, not accepted and flowed into log/admission.
+    #[test]
+    fn connect_data_rejects_non_ascii_hostnqn() {
+        let mut wire = vec![0u8; 1024];
+        // Valid SUBNQN (ASCII).
+        let subnqn = b"nqn.2025-10.com.metebalci:thurvsa";
+        wire[256..256 + subnqn.len()].copy_from_slice(subnqn);
+        // HOSTNQN with a multi-byte UTF-8 char (accented e).
+        let hostnqn = "nqn.2014-08.org.nvmexpress:caf\u{00e9}".as_bytes();
+        wire[512..512 + hostnqn.len()].copy_from_slice(hostnqn);
+        let err = ConnectData::parse(&wire).unwrap_err();
+        assert!(
+            matches!(err, NvmeError::NonAsciiField("HOSTNQN")),
+            "expected NonAsciiField(HOSTNQN), got {err:?}"
+        );
     }
 
     #[test]

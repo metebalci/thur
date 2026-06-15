@@ -215,6 +215,14 @@ struct ControllerState {
     /// (`AEN_CFG_NAMESPACE_ATTRIBUTE`) gates namespace-change notices;
     /// defaults to 0 (host hasn't opted in yet).
     aen_config: u32,
+    /// FID 0x07 Number of Queues grant `(nsq, ncq)`, both zero-based.
+    /// Per-controller — one host's Set Features must not clobber
+    /// another's negotiated count (issue #245). `None` until the host
+    /// negotiates; the dispatcher then reports its cap.
+    num_io_queues: Option<(u16, u16)>,
+    /// FID 0x0F Keep Alive Timeout in ms, per-controller (issue #245).
+    /// Defaults to 0 (host hasn't set it).
+    kato_ms: u32,
 }
 
 struct Inner {
@@ -270,6 +278,8 @@ impl ControllerRegistry {
                 masks: HashMap::new(),
                 changed_ns: BTreeSet::new(),
                 aen_config: 0,
+                num_io_queues: None,
+                kato_ms: 0,
             },
         );
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -402,17 +412,30 @@ impl ControllerRegistry {
         }
     }
 
-    /// Build the LID 0x80 page for a controller's Get Log Page: pop its
-    /// oldest unread notification (decrementing the available count) or
-    /// return the all-zero empty page when the queue is drained / the
-    /// controller is unknown.
-    pub fn take_log_entry(&self, cntlid: u16) -> [u8; log_page::RESERVATION_NOTIFICATION_LEN] {
+    /// Build the LID 0x80 page for a controller's Get Log Page: read its
+    /// oldest unread notification, or the all-zero empty page when the
+    /// queue is drained / the controller is unknown. `consume` removes
+    /// the entry (decrementing the available count); `false` peeks
+    /// without clearing — used when the host set RAE or supplied a buffer
+    /// too short to hold the full page, so the notification isn't lost
+    /// (issue #247). The reported `num_available` (entries beyond the
+    /// head) is identical either way.
+    pub fn take_log_entry(
+        &self,
+        cntlid: u16,
+        consume: bool,
+    ) -> [u8; log_page::RESERVATION_NOTIFICATION_LEN] {
         let mut inner = self.lock();
-        if let Some(state) = inner.controllers.get_mut(&cntlid)
-            && let Some((count, type_byte, nsid)) = state.pending.pop_front()
-        {
-            let num_available = state.pending.len().min(u8::MAX as usize) as u8;
-            return log_page::reservation_notification(count, type_byte, num_available, nsid);
+        if let Some(state) = inner.controllers.get_mut(&cntlid) {
+            if consume {
+                if let Some((count, type_byte, nsid)) = state.pending.pop_front() {
+                    let num_available = state.pending.len().min(u8::MAX as usize) as u8;
+                    return log_page::reservation_notification(count, type_byte, num_available, nsid);
+                }
+            } else if let Some(&(count, type_byte, nsid)) = state.pending.front() {
+                let num_available = (state.pending.len() - 1).min(u8::MAX as usize) as u8;
+                return log_page::reservation_notification(count, type_byte, num_available, nsid);
+            }
         }
         log_page::reservation_notification(0, resv_notif_type::EMPTY, 0, 0)
     }
@@ -471,14 +494,18 @@ impl ControllerRegistry {
         }
     }
 
-    /// Drain a controller's Changed Namespace List (LID 0x04) for a Get
-    /// Log Page: return its changed NSIDs ascending and clear the set.
-    /// Empty when nothing changed since the last read / the controller
-    /// is unknown — the dispatcher renders that as the all-zero page.
-    pub fn take_changed_namespaces(&self, cntlid: u16) -> Vec<u32> {
+    /// Read a controller's Changed Namespace List (LID 0x04) for a Get
+    /// Log Page: return its changed NSIDs ascending. `consume` clears the
+    /// set; `false` peeks without clearing — used when the host set RAE
+    /// or supplied a buffer too short to hold the full page, so the
+    /// change list isn't lost (issue #247). Empty when nothing changed
+    /// since the last read / the controller is unknown — the dispatcher
+    /// renders that as the all-zero page.
+    pub fn take_changed_namespaces(&self, cntlid: u16, consume: bool) -> Vec<u32> {
         let mut inner = self.lock();
         match inner.controllers.get_mut(&cntlid) {
-            Some(state) => std::mem::take(&mut state.changed_ns).into_iter().collect(),
+            Some(state) if consume => std::mem::take(&mut state.changed_ns).into_iter().collect(),
+            Some(state) => state.changed_ns.iter().copied().collect(),
             None => Vec::new(),
         }
     }
@@ -500,6 +527,43 @@ impl ControllerRegistry {
             .controllers
             .get(&cntlid)
             .map(|s| s.aen_config)
+            .unwrap_or(0)
+    }
+
+    /// Store the FID 0x07 Number of Queues grant `(nsq, ncq)` for this
+    /// controller. No-op if the controller is unknown (issue #245).
+    pub fn set_num_io_queues(&self, cntlid: u16, nsq: u16, ncq: u16) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.controllers.get_mut(&cntlid) {
+            state.num_io_queues = Some((nsq, ncq));
+        }
+    }
+
+    /// Read this controller's FID 0x07 grant `(nsq, ncq)`, or `None` if
+    /// the host hasn't negotiated yet / the controller is unknown — the
+    /// dispatcher then reports its cap (issue #245).
+    pub fn get_num_io_queues(&self, cntlid: u16) -> Option<(u16, u16)> {
+        let inner = self.lock();
+        inner.controllers.get(&cntlid).and_then(|s| s.num_io_queues)
+    }
+
+    /// Store the FID 0x0F Keep Alive Timeout (ms) for this controller.
+    /// No-op if the controller is unknown (issue #245).
+    pub fn set_kato_ms(&self, cntlid: u16, ms: u32) {
+        let mut inner = self.lock();
+        if let Some(state) = inner.controllers.get_mut(&cntlid) {
+            state.kato_ms = ms;
+        }
+    }
+
+    /// Read this controller's FID 0x0F Keep Alive Timeout (ms); 0 when
+    /// unset or the controller is unknown (issue #245).
+    pub fn get_kato_ms(&self, cntlid: u16) -> u32 {
+        let inner = self.lock();
+        inner
+            .controllers
+            .get(&cntlid)
+            .map(|s| s.kato_ms)
             .unwrap_or(0)
     }
 
@@ -717,18 +781,18 @@ mod tests {
             kind: ReservationEventKind::ReservationPreempted,
         });
         // Oldest first: type 1, nsid 1, one more available.
-        let first = reg.take_log_entry(c);
+        let first = reg.take_log_entry(c, true);
         assert_eq!(first[8], resv_notif_type::REGISTRATION_PREEMPTED);
         assert_eq!(first[9], 1);
         assert_eq!(u32::from_le_bytes(first[12..16].try_into().unwrap()), 1);
         assert_ne!(u64::from_le_bytes(first[0..8].try_into().unwrap()), 0);
         // Next: type 3, nsid 7, none remaining.
-        let second = reg.take_log_entry(c);
+        let second = reg.take_log_entry(c, true);
         assert_eq!(second[8], resv_notif_type::RESERVATION_PREEMPTED);
         assert_eq!(second[9], 0);
         assert_eq!(u32::from_le_bytes(second[12..16].try_into().unwrap()), 7);
         // Drained → empty page.
-        let empty = reg.take_log_entry(c);
+        let empty = reg.take_log_entry(c, true);
         assert!(empty.iter().all(|&b| b == 0));
     }
 
@@ -736,9 +800,9 @@ mod tests {
     fn empty_queue_returns_zero_page() {
         let reg = ControllerRegistry::new();
         let c = reg.connect_admin(HOST_A).unwrap().cntlid();
-        assert!(reg.take_log_entry(c).iter().all(|&b| b == 0));
+        assert!(reg.take_log_entry(c, true).iter().all(|&b| b == 0));
         // An unknown controller also yields the empty page.
-        assert!(reg.take_log_entry(0xABCD).iter().all(|&b| b == 0));
+        assert!(reg.take_log_entry(0xABCD, true).iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -751,11 +815,11 @@ mod tests {
         reg.notify(ev(HOST_A, ReservationEventKind::ReservationReleased));
         // Each controller has its own log entry.
         assert_eq!(
-            reg.take_log_entry(c1)[8],
+            reg.take_log_entry(c1, true)[8],
             resv_notif_type::RESERVATION_RELEASED
         );
         assert_eq!(
-            reg.take_log_entry(c2)[8],
+            reg.take_log_entry(c2, true)[8],
             resv_notif_type::RESERVATION_RELEASED
         );
     }
@@ -767,11 +831,11 @@ mod tests {
         let cb = reg.connect_admin(HOST_B).unwrap().cntlid();
         reg.notify(ev(HOST_A, ReservationEventKind::ReservationReleased));
         assert_eq!(
-            reg.take_log_entry(ca)[8],
+            reg.take_log_entry(ca, true)[8],
             resv_notif_type::RESERVATION_RELEASED
         );
         // HOST_B's controller is untouched.
-        assert!(reg.take_log_entry(cb).iter().all(|&b| b == 0));
+        assert!(reg.take_log_entry(cb, true).iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -805,7 +869,7 @@ mod tests {
             rx.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        assert!(reg.take_log_entry(c).iter().all(|&b| b == 0));
+        assert!(reg.take_log_entry(c, true).iter().all(|&b| b == 0));
         // A different (unmasked) kind still fires.
         reg.notify(ev(HOST_A, ReservationEventKind::ReservationReleased));
         assert_eq!(
@@ -849,7 +913,7 @@ mod tests {
             "masks did not survive controller free"
         );
         assert!(
-            reg.take_log_entry(c).iter().all(|&b| b == 0),
+            reg.take_log_entry(c, true).iter().all(|&b| b == 0),
             "log did not survive controller free"
         );
     }
@@ -897,8 +961,8 @@ mod tests {
         enable_ns_notices(&reg, ca);
         enable_ns_notices(&reg, cb);
         reg.notify_namespace_attribute_changed(5);
-        assert_eq!(reg.take_changed_namespaces(ca), vec![5]);
-        assert_eq!(reg.take_changed_namespaces(cb), vec![5]);
+        assert_eq!(reg.take_changed_namespaces(ca, true), vec![5]);
+        assert_eq!(reg.take_changed_namespaces(cb, true), vec![5]);
     }
 
     #[test]
@@ -909,8 +973,8 @@ mod tests {
         enable_ns_notices(&reg, optin);
         // `silent` never set FID 0x0B bit 8.
         reg.notify_namespace_attribute_changed(3);
-        assert_eq!(reg.take_changed_namespaces(optin), vec![3]);
-        assert!(reg.take_changed_namespaces(silent).is_empty());
+        assert_eq!(reg.take_changed_namespaces(optin, true), vec![3]);
+        assert!(reg.take_changed_namespaces(silent, true).is_empty());
     }
 
     #[test]
@@ -919,7 +983,7 @@ mod tests {
         // NVMe transport up but no host connected (or transport off):
         // the call simply finds no targets.
         reg.notify_namespace_attribute_changed(1);
-        assert!(reg.take_changed_namespaces(1).is_empty());
+        assert!(reg.take_changed_namespaces(1, true).is_empty());
     }
 
     #[test]
@@ -963,9 +1027,9 @@ mod tests {
         reg.notify_namespace_attribute_changed(7);
         reg.notify_namespace_attribute_changed(1);
         reg.notify_namespace_attribute_changed(7);
-        assert_eq!(reg.take_changed_namespaces(c), vec![1, 7]);
+        assert_eq!(reg.take_changed_namespaces(c, true), vec![1, 7]);
         // Drained — a second read is empty until the next change.
-        assert!(reg.take_changed_namespaces(c).is_empty());
+        assert!(reg.take_changed_namespaces(c, true).is_empty());
     }
 
     #[test]
@@ -986,7 +1050,7 @@ mod tests {
         );
         // Host drains the reservation log (Get Log Page LID 0x80); the
         // re-park then sees only the namespace change still queued.
-        let _ = reg.take_log_entry(c);
+        let _ = reg.take_log_entry(c, true);
         let (tx2, mut rx2) = oneshot::channel();
         reg.park(token, tx2);
         assert_eq!(
@@ -1008,7 +1072,7 @@ mod tests {
         assert_eq!(again.cntlid(), c);
         assert_eq!(reg.get_aen_config(c), 0, "AEN config did not survive free");
         assert!(
-            reg.take_changed_namespaces(c).is_empty(),
+            reg.take_changed_namespaces(c, true).is_empty(),
             "changed list did not survive free"
         );
     }
@@ -1043,11 +1107,11 @@ mod tests {
                 kind: ReservationChangeKind::ReservationReleased,
             },
         ]);
-        let page = reg.take_log_entry(c);
+        let page = reg.take_log_entry(c, true);
         assert_eq!(page[8], resv_notif_type::RESERVATION_PREEMPTED);
         assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 1); // nsid = lun + 1
         // Only the one (NVMe) entry was queued.
-        assert!(reg.take_log_entry(c).iter().all(|&b| b == 0));
+        assert!(reg.take_log_entry(c, true).iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1060,7 +1124,7 @@ mod tests {
             affected: RegistrantId::nvme(HOST_A),
             kind: ReservationChangeKind::RegistrationPreempted,
         }]);
-        let page = reg.take_log_entry(c);
+        let page = reg.take_log_entry(c, true);
         assert_eq!(page[8], resv_notif_type::REGISTRATION_PREEMPTED);
         assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 7);
     }
@@ -1094,8 +1158,68 @@ mod tests {
             ReservationType::ExclusiveAccess.as_u8(),
         );
 
-        let page = aer.take_log_entry(cntlid);
+        let page = aer.take_log_entry(cntlid, true);
         assert_eq!(page[8], resv_notif_type::RESERVATION_PREEMPTED);
         assert_eq!(u32::from_le_bytes(page[12..16].try_into().unwrap()), 1);
+    }
+
+    /// Issue #245: Number of Queues + Keep Alive Timer feature state is
+    /// per-controller — one controller's Set must not clobber another's.
+    #[test]
+    fn queue_and_kato_feature_state_is_per_controller() {
+        let reg = ControllerRegistry::new();
+        let c1 = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let c2 = reg.connect_admin(HOST_B).unwrap().cntlid();
+
+        // Fresh controllers haven't negotiated — None / 0.
+        assert_eq!(reg.get_num_io_queues(c1), None);
+        assert_eq!(reg.get_kato_ms(c2), 0);
+
+        reg.set_num_io_queues(c1, 3, 3);
+        reg.set_kato_ms(c1, 10_000);
+        // c2 is unaffected by c1's negotiation.
+        assert_eq!(reg.get_num_io_queues(c1), Some((3, 3)));
+        assert_eq!(reg.get_num_io_queues(c2), None);
+        assert_eq!(reg.get_kato_ms(c1), 10_000);
+        assert_eq!(reg.get_kato_ms(c2), 0);
+
+        // c2 negotiates a different grant; c1 stays put.
+        reg.set_num_io_queues(c2, 7, 7);
+        assert_eq!(reg.get_num_io_queues(c1), Some((3, 3)));
+        assert_eq!(reg.get_num_io_queues(c2), Some((7, 7)));
+    }
+
+    /// Issue #247: a RAE (peek) Get Log Page must NOT drain the
+    /// per-controller event state — a later consuming read still sees it.
+    #[test]
+    fn rae_peek_does_not_consume_log_pages() {
+        use scsi_spc::reservations::ReservationManager;
+        let reg = Arc::new(ControllerRegistry::new());
+        let c = reg.connect_admin(HOST_A).unwrap().cntlid();
+        let mgr = ReservationManager::new();
+        mgr.register_observer(Arc::new(AerReservationSink::new(Arc::clone(&reg))));
+
+        // Queue a reservation notification + a changed-namespace entry.
+        AerReservationSink::new(Arc::clone(&reg)).on_reservation_change(&[ReservationChange {
+            lun: 0,
+            affected: RegistrantId::nvme(HOST_A),
+            kind: ReservationChangeKind::ReservationPreempted,
+        }]);
+        reg.set_aen_config(c, AEN_CFG_NAMESPACE_ATTRIBUTE);
+        reg.notify_namespace_attribute_changed(42);
+
+        // Peek (consume=false): the entries are reported but retained.
+        let peek = reg.take_log_entry(c, false);
+        assert_eq!(peek[8], resv_notif_type::RESERVATION_PREEMPTED);
+        assert_eq!(reg.take_changed_namespaces(c, false), vec![42]);
+
+        // A consuming read still sees them (peek didn't drain).
+        let drained = reg.take_log_entry(c, true);
+        assert_eq!(drained[8], resv_notif_type::RESERVATION_PREEMPTED);
+        assert_eq!(reg.take_changed_namespaces(c, true), vec![42]);
+
+        // Now they're gone.
+        assert!(reg.take_log_entry(c, true).iter().all(|&b| b == 0));
+        assert!(reg.take_changed_namespaces(c, true).is_empty());
     }
 }

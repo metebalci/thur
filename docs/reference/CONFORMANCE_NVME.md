@@ -116,7 +116,7 @@ rather than via these commands, so a host that submits them receives
 |-------:|---------|--------|:----:|-------|
 | 0x00 | Delete I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Disconnect. Returns `Invalid Command Opcode`. |
 | 0x01 | Create I/O Submission Queue | 🟩 N/A | M (PCIe) | PCIe-only; fabrics uses Connect on a new TCP connection. |
-| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller), 0x04 Changed Namespace List (the NSIDs that changed since this controller last read it, drained on read; empty 4 KiB page when nothing changed — see *Namespace-change notifications* below), 0x80 Reservation Notification (one 64-byte entry per call, oldest-first; empty page when the host's queue is drained — see *Reservation notifications* below). Other LIDs return `Invalid Field in Command`. |
+| 0x02 | Get Log Page | 🟩 Partial | M | LIDs 0x01 Error Information (zero-entry), 0x02 SMART / Health (composite temperature + spare capacity, both static), 0x03 Firmware Slot Information (single slot, slot 1 active, FR mirrors Identify Controller), 0x04 Changed Namespace List (the NSIDs that changed since this controller last read it; empty 4 KiB page when nothing changed — see *Namespace-change notifications* below), 0x80 Reservation Notification (one 64-byte entry per call, oldest-first; empty page when the host's queue is drained — see *Reservation notifications* below). For the two event-bearing pages (0x04, 0x80) the per-controller state is consumed (cleared / popped) only when CDW10 bit 15 **RAE** is clear *and* the host supplied a buffer large enough for the full fixed-size page; an RAE=1 read or a short buffer returns the data without clearing it, so a notification is never silently lost. Other LIDs return `Invalid Field in Command`. |
 | 0x04 | Delete I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x05 | Create I/O Completion Queue | 🟩 N/A | M (PCIe) | PCIe-only. |
 | 0x06 | Identify | 🟩 Partial | M | See CNS table below. |
@@ -161,12 +161,12 @@ rather than via these commands, so a host that submits them receives
 | 0x04 | Temperature Threshold | 🟨 No | No thermal model. |
 | 0x05 | Error Recovery | 🟨 No | |
 | 0x06 | Volatile Write Cache | 🟨 No | VSA exposes a write-back cache that cannot be disabled at runtime. |
-| 0x07 | Number of Queues | 🟩 Yes | Set / Get round-trip. Granted = min(host-requested, internal cap = 64) for both NSQ and NCQ; echoed in CQE.DW0. |
+| 0x07 | Number of Queues | 🟩 Yes | Set / Get round-trip, stored per-controller (one host's grant can't clobber another's under multi-host export). Granted = min(host-requested, internal cap = 64) for both NSQ and NCQ; echoed in CQE.DW0. A controller that hasn't negotiated reports the cap. |
 | 0x08 | Interrupt Coalescing | 🟩 N/A | PCIe-only (no MSI-X on fabrics). |
 | 0x09 | Interrupt Vector Configuration | 🟩 N/A | PCIe-only. |
 | 0x0A | Write Atomicity Normal | 🟨 No | |
 | 0x0B | Async Event Configuration | 🟩 Yes | Controller-wide (CDW11). Bit 8 (Namespace Attribute Notices) enables the Namespace Attribute Changed AER; default clear, so a host opts in explicitly. Stored keyed by CNTLID so one controller's config can't change another's; Set echoes the stored value in CDW0, Get returns it. Other Notice classes (firmware-activation, thermal) have no event source, so setting their bits is accepted but inert. Distinct from the reservation-notification mask (FID 0x82 below). |
-| 0x0F | Keep Alive Timer | 🟩 Partial | KATO captured on Set, echoed on Get. No watchdog — KA admin commands are unconditionally acknowledged — so the value is stored only for symmetry. |
+| 0x0F | Keep Alive Timer | 🟩 Partial | KATO captured on Set, echoed on Get, stored per-controller. No watchdog — KA admin commands are unconditionally acknowledged — so the value is stored only for symmetry. |
 | 0x10 | Host Identifier | 🟨 No | Host identity is captured at Connect via HOSTID in `ConnectData`. |
 | 0x82 | Reservation Notification Mask | 🟩 Yes | Per-namespace (CDW1 NSID). CDW11 bits 1 / 2 / 3 suppress Registration Preempted / Reservation Released / Reservation Preempted notifications respectively (0 = all enabled). Stored keyed by (HOSTID, NSID) so one host's masking cannot silence another's; Set echoes the stored value in CQE.DW0, Get returns it. The host's enable/disable knob for reservation async events. |
 

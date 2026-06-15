@@ -700,6 +700,13 @@ Changed Namespace List log page (LID 0x04, 4096 bytes):
   up to 1024 × u32 LE NSIDs, ascending, zero-terminated; reading drains
   the list. First dword = 0xFFFFFFFF means "> 1024 changed, re-scan all".
 
+Both event-bearing pages (LID 0x80 and LID 0x04) consume their
+per-controller state (pop / clear) only when the Get Log Page CDW10
+bit 15 RAE (Retain Asynchronous Event) is clear *and* the host's
+transfer length covers the full fixed-size page. An RAE=1 read or a
+buffer shorter than the page returns the data without clearing it, so a
+notification is never lost to an inspect-only or undersized read.
+
 Async Event Configuration (Set/Get Features FID 0x0B, controller-wide):
   CDW11 bit 8  enable Namespace Attribute Changed notices (0 = disabled)
 ```

@@ -75,4 +75,15 @@ pub trait NamespaceLookup: Send + Sync {
     fn active_namespaces(&self) -> Vec<u32>;
     fn name_for_nsid(&self, nsid: u32) -> Option<String>;
     fn active_namespaces_filtered(&self, allow: Option<&[String]>) -> Vec<u32>;
+    /// Per-I/O admission check: is `nsid`'s volume in the admitted-name
+    /// `allow` set? The default delegates to [`Self::name_for_nsid`]
+    /// (one String clone per call); the daemon overrides it to compare
+    /// in place under a single registry lock with no allocation on the
+    /// 4 KiB-read hot path (issue #244).
+    fn is_admitted(&self, nsid: u32, allow: &[String]) -> bool {
+        match self.name_for_nsid(nsid) {
+            Some(name) => allow.iter().any(|n| n == &name),
+            None => false,
+        }
+    }
 }

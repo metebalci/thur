@@ -28,7 +28,6 @@
 //! `handle_fused_compare_write`).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
@@ -55,12 +54,12 @@ const DEFAULT_NUM_IO_QUEUES: u16 = 64;
 /// NSID's volume name must be in the slice. NSID 0 is reserved and
 /// never admitted; the dispatcher catches that before this call.
 fn nsid_admitted(registry: &dyn NamespaceLookup, nsid: u32, allow: Option<&[String]>) -> bool {
-    let Some(names) = allow else {
-        return true;
-    };
-    match registry.name_for_nsid(nsid) {
-        Some(name) => names.iter().any(|n| n == &name),
-        None => false,
+    match allow {
+        // No fence (legacy / no PSK admission entry — see-everything).
+        None => true,
+        // Non-allocating in-place compare under one registry lock —
+        // avoids the per-I/O volume-name String clone (issue #244).
+        Some(names) => registry.is_admitted(nsid, names),
     }
 }
 
@@ -98,19 +97,6 @@ pub struct NvmeNvmDispatcher {
     controller_sn: String,
     controller_mn: String,
     controller_fr: String,
-    /// Number of I/O Submission Queues granted to the host
-    /// (zero-based). Set Features can lower this; it tops out at
-    /// [`DEFAULT_NUM_IO_QUEUES`] minus 1. Atomic so concurrent
-    /// command dispatch is safe.
-    num_io_sqs_zero_based: AtomicU16,
-    /// Same shape for Completion Queues.
-    num_io_cqs_zero_based: AtomicU16,
-    /// Host-negotiated Keep Alive Timeout, in ms. Stored on Set
-    /// Features 0x0F, echoed on Get Features 0x0F. We don't enforce
-    /// the timer ourselves — the dispatcher just acknowledges Keep
-    /// Alive admin commands when they arrive — so this is purely
-    /// host-visible state.
-    kato_ms: AtomicU32,
     /// Shared reservation state machine, keyed by LUN. Injected by
     /// the daemon (`load_from(<data_dir>/reservations.json, ...)`) so
     /// CPTPL-set reservations survive a daemon restart (issue #57); the
@@ -153,9 +139,6 @@ impl NvmeNvmDispatcher {
             controller_sn,
             controller_mn,
             controller_fr,
-            num_io_sqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
-            num_io_cqs_zero_based: AtomicU16::new(DEFAULT_NUM_IO_QUEUES - 1),
-            kato_ms: AtomicU32::new(0),
             reservations,
             aer,
             caw_locks: Arc::new(CawLocks::new()),
@@ -353,13 +336,17 @@ impl NvmeNvmDispatcher {
         let fid = (sqe.cdw10 & 0xFF) as u8;
         match fid {
             FID_NUMBER_OF_QUEUES => {
-                let nsq = self.num_io_sqs_zero_based.load(Ordering::Acquire);
-                let ncq = self.num_io_cqs_zero_based.load(Ordering::Acquire);
+                // Per-controller (issue #245): report this controller's
+                // negotiated grant, or the cap if it hasn't negotiated.
+                let cntlid = cntlid.unwrap_or(0);
+                let cap = DEFAULT_NUM_IO_QUEUES - 1;
+                let (nsq, ncq) = self.aer.get_num_io_queues(cntlid).unwrap_or((cap, cap));
                 let dw0 = u32::from(ncq) | (u32::from(nsq) << 16);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, dw0))
             }
             FID_KEEP_ALIVE_TIMER => {
-                let kato = self.kato_ms.load(Ordering::Acquire);
+                let cntlid = cntlid.unwrap_or(0);
+                let kato = self.aer.get_kato_ms(cntlid);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, kato))
             }
             FID_RESERVATION_NOTIF_MASK => {
@@ -423,10 +410,10 @@ impl NvmeNvmDispatcher {
                 let cap = DEFAULT_NUM_IO_QUEUES - 1;
                 let granted_ncq = req_ncq.min(cap);
                 let granted_nsq = req_nsq.min(cap);
-                self.num_io_cqs_zero_based
-                    .store(granted_ncq, Ordering::Release);
-                self.num_io_sqs_zero_based
-                    .store(granted_nsq, Ordering::Release);
+                // Per-controller (issue #245): one host's grant must not
+                // clobber another's.
+                let cntlid = cntlid.unwrap_or(0);
+                self.aer.set_num_io_queues(cntlid, granted_nsq, granted_ncq);
                 let dw0 = u32::from(granted_ncq) | (u32::from(granted_nsq) << 16);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, dw0))
             }
@@ -434,9 +421,11 @@ impl NvmeNvmDispatcher {
                 // CDW11 carries the timer in ms (Linux nvme-tcp's
                 // nvme_set_keep_alive passes `kato * 1000`). We don't
                 // run a watchdog — Keep Alive admin commands are
-                // acknowledged unconditionally — so the value is
-                // stored only for Get Features symmetry.
-                self.kato_ms.store(sqe.cdw11, Ordering::Release);
+                // acknowledged unconditionally — so the value is stored
+                // per-controller (issue #245) only for Get Features
+                // symmetry.
+                let cntlid = cntlid.unwrap_or(0);
+                self.aer.set_kato_ms(cntlid, sqe.cdw11);
                 NvmeResponse::just(Cqe::success(cid, 0, 0, sqe.cdw11))
             }
             _ => NvmeResponse::just(Cqe::failure(cid, 0, 0, StatusField::invalid_field())),
@@ -457,6 +446,11 @@ impl NvmeNvmDispatcher {
         let numdu = sqe.cdw11 & 0xFFFF;
         let total_dwords = numdl | (numdu << 16);
         let total_bytes = total_dwords.saturating_add(1).saturating_mul(4) as usize;
+        // CDW10 bit 15 = RAE (Retain Asynchronous Event): when set, the
+        // host reads the log to inspect it without clearing, so the
+        // event-bearing pages must not drain their per-controller state
+        // (issue #247).
+        let rae = (sqe.cdw10 >> 15) & 1 == 1;
         let payload: Vec<u8> = match lid {
             nvme_base::log_page::lid::ERROR_INFO => {
                 let entry = nvme_base::log_page::error_info_zero_entry();
@@ -471,22 +465,30 @@ impl NvmeNvmDispatcher {
                 log[..total_bytes.min(log.len())].to_vec()
             }
             nvme_base::log_page::lid::RESERVATION_NOTIFICATION => {
-                // Pop this controller's oldest reservation notification
-                // (or an all-zero empty page when the queue is
-                // drained). Outside a real connection (no CNTLID) there
-                // is no per-controller queue — return the empty page.
+                // Read this controller's oldest reservation notification
+                // (or an all-zero empty page when the queue is drained).
+                // Only consume it when the host did NOT set RAE and gave a
+                // buffer large enough for the full fixed-size page —
+                // otherwise the notification would be silently lost
+                // (issue #247). Outside a real connection (no CNTLID)
+                // there is no per-controller queue — the empty page.
                 let cntlid = cntlid.unwrap_or(0);
-                let log = self.aer.take_log_entry(cntlid);
+                let consume = !rae
+                    && total_bytes >= nvme_base::log_page::RESERVATION_NOTIFICATION_LEN;
+                let log = self.aer.take_log_entry(cntlid, consume);
                 log[..total_bytes.min(log.len())].to_vec()
             }
             nvme_base::log_page::lid::CHANGED_NAMESPACE_LIST => {
-                // Drain this controller's Changed Namespace List (the
-                // NSIDs that changed since its last read; reading clears
-                // it). Outside a real connection (no CNTLID) there is no
-                // per-controller list — return the empty (all-zero)
-                // page.
+                // Read this controller's Changed Namespace List. Only
+                // clear it when the host did NOT set RAE and gave a buffer
+                // large enough for the full fixed-size page, so a short /
+                // RAE read doesn't drop the change list (issue #247).
+                // Outside a real connection (no CNTLID) there is no
+                // per-controller list — the empty (all-zero) page.
                 let cntlid = cntlid.unwrap_or(0);
-                let nsids = self.aer.take_changed_namespaces(cntlid);
+                let consume = !rae
+                    && total_bytes >= nvme_base::log_page::CHANGED_NAMESPACE_LIST_LEN;
+                let nsids = self.aer.take_changed_namespaces(cntlid, consume);
                 let log = nvme_base::log_page::changed_namespace_list(&nsids);
                 log[..total_bytes.min(log.len())].to_vec()
             }
