@@ -1009,9 +1009,27 @@ impl Library {
     /// protects against a stale or hand-edited inventory.json with extra entries.
     /// Returns (occupied_slots, loaded_drives) for logging/events.
     pub fn reload_inventory(&mut self, data_dir: &Path) -> Result<(usize, usize)> {
-        let inv_path = data_dir.join("library/inventory.json");
-        let mut inventory: LibraryInventory = serde_json::from_str(&fs::read_to_string(inv_path)?)?;
+        let inventory = Self::parse_inventory_file(data_dir)?;
+        Ok(self.apply_reloaded_inventory(inventory))
+    }
 
+    /// Read + parse `inventory.json` from disk. This is the expensive
+    /// half of a reload — a multi-MB JSON deserialize at the documented
+    /// 65535-slot scale — and needs no `&self`, so callers run it OFF
+    /// the global library lock and hand the result to
+    /// [`Self::apply_reloaded_inventory`] under a short lock, instead of
+    /// parsing under the mutex that serializes every changer / facade
+    /// command (issue #261).
+    pub fn parse_inventory_file(data_dir: &Path) -> Result<LibraryInventory> {
+        let inv_path = data_dir.join("library/inventory.json");
+        Ok(serde_json::from_str(&fs::read_to_string(inv_path)?)?)
+    }
+
+    /// Swap a freshly-parsed inventory in, dropping any elements that
+    /// fall outside the current topology, and return
+    /// `(occupied_slots, loaded_drives)`. Fast (a few `retain` passes +
+    /// a move), so it runs under the global library lock.
+    pub fn apply_reloaded_inventory(&mut self, mut inventory: LibraryInventory) -> (usize, usize) {
         let max_storage = self.topology.num_storage_slots;
         let max_mail = self.topology.num_mail_slots;
         let max_drives = self.topology.num_drives;
@@ -1057,7 +1075,7 @@ impl Library {
             .count();
         let loaded_drives = self.inventory.drives.iter().filter(|d| d.occupied).count();
 
-        Ok((occupied_slots, loaded_drives))
+        (occupied_slots, loaded_drives)
     }
 }
 
@@ -1308,6 +1326,32 @@ mod tests {
         assert_eq!(
             library.storage_slots()[1].barcode,
             Some("TAPE002L8".to_string())
+        );
+    }
+
+    /// Issue #261: the off-lock parse + under-lock apply two-step must be
+    /// equivalent to the combined reload (the changer path now parses
+    /// inventory.json before taking the global library lock).
+    #[test]
+    fn parse_then_apply_matches_reload_inventory() {
+        let temp_dir = TempDir::new().unwrap();
+        let lib_root = temp_dir.path().join("library");
+        let tapes_root = temp_dir.path().join("tapes");
+        let data_dir = temp_dir.path();
+
+        let mut library =
+            Library::initialize(&lib_root, &tapes_root, 10, 0, 2, 8, None, 0, 1001, 101, 1)
+                .unwrap();
+        library.add_or_create_tape("TAPE001L8", "primary").unwrap();
+
+        // Parse off "the lock", then apply.
+        let parsed = Library::parse_inventory_file(data_dir).unwrap();
+        let (occupied, loaded) = library.apply_reloaded_inventory(parsed);
+        assert_eq!(occupied, 1);
+        assert_eq!(loaded, 0);
+        assert_eq!(
+            library.storage_slots()[0].barcode,
+            Some("TAPE001L8".to_string())
         );
     }
 

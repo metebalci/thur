@@ -159,10 +159,20 @@ pub fn handle_initialize_element_status(
 ) -> Result<(), SmcError> {
     tracing::debug!("INITIALIZE ELEMENT STATUS - reloading inventory from disk");
 
-    let mut lib = library
-        .lock()
-        .map_err(|_| SmcError::InvalidOp("library mutex poisoned"))?;
-    let (occupied_slots, loaded_drives) = lib.reload_inventory(data_dir)?;
+    // Read + parse inventory.json OFF the global library lock: the
+    // multi-MB JSON deserialize at the 65535-slot scale used to run under
+    // the mutex that serializes every changer command, every facade-based
+    // drive identity command, and every partitioned session's fence — so
+    // any logged-in initiator could buy a full file read + parse of
+    // lock-hold time with a single 1-byte CDB (issue #261). Only the fast
+    // swap-in runs under the lock.
+    let parsed = Library::parse_inventory_file(data_dir)?;
+    let (occupied_slots, loaded_drives) = {
+        let mut lib = library
+            .lock()
+            .map_err(|_| SmcError::InvalidOp("library mutex poisoned"))?;
+        lib.apply_reloaded_inventory(parsed)
+    };
 
     tracing::info!(
         "Inventory reloaded: {} occupied slots, {} loaded drives",
