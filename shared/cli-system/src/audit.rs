@@ -46,19 +46,28 @@ pub async fn cmd_export(
         "to": to,
     });
     // Export emits one log event per audit row — those land on stdout
-    // unchanged so a redirect captures the JSONL/CSV cleanly.
+    // unchanged so a redirect captures the JSONL/CSV cleanly. Buffer
+    // stdout (locked once) so a multi-year export of millions of rows
+    // batches ~hundreds of rows per write(2) instead of one syscall per
+    // row through line-buffered println! — the bulk export path is
+    // normally redirected to a file, where per-line flushing is pure
+    // overhead (issue #275). cmd_tail's interactive follow keeps its
+    // per-line flush.
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let exit = client
         .run_job("system.audit.export", &body, |ev| {
             if let JobEvent::Log { level, message } = ev {
                 if level == "warn" || level == "error" {
                     eprintln!("{}", message);
                 } else {
-                    println!("{}", message);
+                    let _ = writeln!(out, "{}", message);
                 }
             }
         })
         .await
         .context("audit export stream")?;
+    out.flush().context("flushing buffered audit export to stdout")?;
     Ok(u8::try_from(exit.max(0)).unwrap_or(2))
 }
 

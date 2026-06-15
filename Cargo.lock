@@ -4638,6 +4638,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "humantime",
+ "rpassword",
  "serde",
  "serde_json",
  "shared-admin-client",

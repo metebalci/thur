@@ -53,6 +53,17 @@ pub fn write_mode_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
+    // Fsync the containing directory so the new directory entry is
+    // durable too: sync_all() flushes only the file's data + metadata,
+    // not the dirent, so on ext4/xfs a power loss right after this
+    // returns (and the CLI prints success) could drop the just-created
+    // file. For a mode-0600 key-recovery artifact whose whole purpose is
+    // crash-honest durability, the contract must be complete (issue #276).
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::File::open(&parent)?.sync_all()?;
     Ok(())
 }
 

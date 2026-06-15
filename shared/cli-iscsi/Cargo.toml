@@ -25,6 +25,9 @@ shared-naming = { path = "../naming" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 humantime = "2"
+# tty passphrase prompt so credentials need not be passed on argv
+# (world-readable via /proc/<pid>/cmdline) — issue #278.
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

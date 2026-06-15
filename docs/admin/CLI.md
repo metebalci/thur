@@ -316,8 +316,12 @@ a direct file mutation.
 
 **Verb shapes worth knowing:**
 
-- `add NAME --password VALUE` / `--password-stdin` (mutex). The stdin
-  variant reads one line, strips trailing CR/LF, never echoes. VSA
+- `add NAME --password VALUE` / `--password-stdin` (mutex). With
+  neither flag the verb prompts for the password on the tty (no echo)
+  — prefer this or `--password-stdin` over `--password VALUE`, whose
+  value is world-readable via `/proc/<pid>/cmdline` for the command's
+  lifetime and lands in shell history (issue #278). The stdin variant
+  reads one line, strips trailing CR/LF, never echoes. VSA
   **requires** at least one `--volume NAME` (repeatable) on every
   `add` — admission is mandatory. Names must currently resolve to a
   volume. VTL has no `--volume` flag (the analogous per-partition

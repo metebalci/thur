@@ -31,6 +31,13 @@ pub struct UserRow {
     pub username: String,
     pub mutual_chap: bool,
     pub partition: Option<String>,
+    /// VSA per-user volume-admission allow-list (the security boundary
+    /// for which LUNs a CHAP session sees). The daemon sends it; the CLI
+    /// must round-trip it so `iscsi users list` can audit grant/revoke
+    /// state instead of silently dropping it (issue #277). `None` /
+    /// missing for VTL (which ignores the field).
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
     pub disabled: bool,
     pub in_grace: bool,
     pub previous_expires_at: Option<DateTime<Utc>>,
@@ -260,7 +267,22 @@ pub fn resolve_password(arg: Option<&str>, stdin: bool) -> Result<String> {
             Ok(s)
         }
         (Some(_), true) => bail!("pass either --password or --password-stdin, not both"),
-        (None, false) => bail!("pass either --password VALUE or --password-stdin"),
+        (None, false) => {
+            // No flag given: prompt on the tty rather than requiring the
+            // secret on argv. `--password VALUE` is world-readable via
+            // /proc/<pid>/cmdline for the command's lifetime (and lands
+            // in shell history), so any co-resident unprivileged user
+            // could harvest live CHAP / TLS-PSK / DH-CHAP secrets —
+            // contradicting the peer-cred-gated admin socket's own threat
+            // model. Mirrors `system set-admin-password`'s posture
+            // (issue #278).
+            let p = rpassword::prompt_password("Password: ")
+                .context("reading password from tty")?;
+            if p.is_empty() {
+                bail!("empty password rejected");
+            }
+            Ok(p)
+        }
     }
 }
 
@@ -297,21 +319,29 @@ fn print_users_table(rows: &[UserRow]) {
         return;
     }
     println!(
-        "{:<24} {:<8} {:<14} {:<14} GRACE-UNTIL",
-        "USERNAME", "MUTUAL", "PARTITION", "STATE"
+        "{:<24} {:<8} {:<14} {:<20} {:<14} GRACE-UNTIL",
+        "USERNAME", "MUTUAL", "PARTITION", "VOLUMES", "STATE"
     );
     for r in rows {
         let state = if r.disabled { "disabled" } else { "active" };
         let part = r.partition.as_deref().unwrap_or("-");
+        // VSA volume-admission list; "-" for VTL (field absent) and
+        // "(none)" for an explicit empty list (a see-nothing CHAP user).
+        let volumes = match &r.volumes {
+            None => "-".to_string(),
+            Some(v) if v.is_empty() => "(none)".to_string(),
+            Some(v) => v.join(","),
+        };
         let grace = match (r.in_grace, r.previous_expires_at) {
             (true, Some(t)) => t.to_rfc3339(),
             _ => "-".to_string(),
         };
         println!(
-            "{:<24} {:<8} {:<14} {:<14} {}",
+            "{:<24} {:<8} {:<14} {:<20} {:<14} {}",
             r.username,
             if r.mutual_chap { "yes" } else { "no" },
             part,
+            volumes,
             state,
             grace
         );
@@ -366,14 +396,10 @@ mod tests {
         assert!(err.contains("not both"), "got: {err}");
     }
 
-    #[test]
-    fn resolve_password_rejects_no_source() {
-        let err = resolve_password(None, false).unwrap_err().to_string();
-        assert!(
-            err.contains("--password VALUE or --password-stdin"),
-            "got: {err}"
-        );
-    }
+    // NB: `resolve_password(None, false)` no longer bails — it prompts on
+    // the tty (issue #278). That path opens /dev/tty and would block /
+    // fail in a headless test, so it isn't unit-tested here; the
+    // arg/stdin paths above stay covered.
 
     // ---------- wire-type serde round-trips ----------
 
@@ -396,6 +422,32 @@ mod tests {
         // Re-serialize and parse back — fields must survive the trip.
         let again: UserRow = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
         assert_eq!(again.username, "alice");
+        // No `volumes` in the wire (VTL) → None, not an error.
+        assert_eq!(again.volumes, None);
+    }
+
+    /// Issue #277: the daemon's `volumes` admission list (VSA) must
+    /// round-trip through the CLI UserRow instead of being silently
+    /// dropped on deserialize.
+    #[test]
+    fn user_row_preserves_volumes_admission_list() {
+        let json = r#"{
+            "username": "backup",
+            "mutual_chap": false,
+            "partition": null,
+            "volumes": ["db", "logs"],
+            "disabled": false,
+            "in_grace": false,
+            "previous_expires_at": null
+        }"#;
+        let row: UserRow = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            row.volumes,
+            Some(vec!["db".to_string(), "logs".to_string()])
+        );
+        // Survives re-serialization (the --json output path).
+        let again: UserRow = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(again.volumes, Some(vec!["db".to_string(), "logs".to_string()]));
     }
 
     #[test]
@@ -444,6 +496,7 @@ mod tests {
                 username: "alice".into(),
                 mutual_chap: true,
                 partition: Some("p1".into()),
+                volumes: Some(vec!["db".into(), "logs".into()]),
                 disabled: false,
                 in_grace: true,
                 previous_expires_at: Some(Utc::now()),
@@ -452,6 +505,7 @@ mod tests {
                 username: "bob".into(),
                 mutual_chap: false,
                 partition: None,
+                volumes: Some(vec![]),
                 disabled: true,
                 in_grace: false,
                 previous_expires_at: None,
