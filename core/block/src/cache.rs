@@ -309,6 +309,20 @@ pub enum RangeError {
     OutOfRange,
 }
 
+/// Single-flight coordination cell for one cold page id. The first
+/// miss for a page installs this in [`PageCache::inflight`] and runs
+/// the (expensive) `read_page` — backend GET + decrypt; concurrent
+/// misses for the same page find the cell, wait on it, then re-check
+/// the cache instead of issuing a duplicate fetch (issue #229).
+///
+/// `done` + [`Notify::notify_waiters`] together are race-free against
+/// the `enable()`-then-recheck idiom on the wait side: a follower
+/// either observes `done` after registering or is woken by the leader.
+struct PageLoad {
+    done: AtomicBool,
+    notify: Notify,
+}
+
 /// Per-volume page cache. Holds the underlying `VolumeWriter` so a
 /// single boot-time construction binds the cache to its volume +
 /// storage backend; the daemon hands `Arc<PageCache>` to the SCSI
@@ -316,6 +330,13 @@ pub enum RangeError {
 pub struct PageCache {
     writer: Arc<VolumeWriter>,
     inner: Mutex<CacheInner>,
+    /// Single-flight registry of cold-page loads in progress, keyed by
+    /// page id. A miss installs a [`PageLoad`] here before fetching;
+    /// concurrent misses coalesce onto it rather than each running the
+    /// full backend GET + decrypt (issue #229). A plain `std::sync`
+    /// mutex — every critical section is a map get/insert/remove with
+    /// no `.await` held across it.
+    inflight: std::sync::Mutex<HashMap<PageId, Arc<PageLoad>>>,
     flush_notify: Notify,
     shutdown: AtomicBool,
     budget_pages: usize,
@@ -399,6 +420,7 @@ impl PageCache {
         Arc::new(Self {
             writer,
             inner: Mutex::new(CacheInner::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
             flush_notify: Notify::new(),
             shutdown: AtomicBool::new(false),
             budget_pages,
@@ -1133,16 +1155,78 @@ impl PageCache {
     /// materialize as a zeroed buffer (and stay marked Clean — the
     /// page index entry is still absent).
     async fn acquire_page(&self, page_id: PageId) -> Result<Arc<Vec<u8>>, UploaderError> {
-        // Hot path: cache hit.
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(entry) = inner.pages.get(&page_id) {
-                let bytes = Arc::clone(&entry.bytes);
-                inner.lru_touch(page_id);
-                return Ok(bytes);
+        loop {
+            // Hot path: cache hit.
+            {
+                let mut inner = self.inner.lock().await;
+                if let Some(entry) = inner.pages.get(&page_id) {
+                    let bytes = Arc::clone(&entry.bytes);
+                    inner.lru_touch(page_id);
+                    return Ok(bytes);
+                }
             }
-        }
 
+            // Cache miss. Single-flight the load: the first miss for a
+            // page becomes the leader and runs the fetch; concurrent
+            // misses become followers that await the leader and then
+            // re-loop to pick up the freshly-inserted entry — avoiding a
+            // redundant backend GET + decrypt per duplicate (issue #229).
+            let leader = {
+                let mut flight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+                match flight.get(&page_id) {
+                    Some(load) => Err(Arc::clone(load)),
+                    None => {
+                        let load = Arc::new(PageLoad {
+                            done: AtomicBool::new(false),
+                            notify: Notify::new(),
+                        });
+                        flight.insert(page_id, Arc::clone(&load));
+                        Ok(load)
+                    }
+                }
+            };
+
+            let load = match leader {
+                Err(follower) => {
+                    // Follower: wait for the leader to finish, then
+                    // re-loop. `enable()` registers interest *before*
+                    // re-reading `done`, so we never miss the leader's
+                    // `notify_waiters` (the canonical `tokio::Notify`
+                    // race-free wait), and we never re-fetch.
+                    while !follower.done.load(Ordering::Acquire) {
+                        let notified = follower.notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if follower.done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    continue;
+                }
+                Ok(load) => load,
+            };
+
+            // Leader: run the miss path, then publish completion to any
+            // followers and clear the slot — on success *and* error, so a
+            // failed fetch doesn't strand waiters (they re-loop and retry,
+            // the pre-single-flight behavior).
+            let result = self.load_page_miss(page_id).await;
+            {
+                let mut flight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+                flight.remove(&page_id);
+            }
+            load.done.store(true, Ordering::Release);
+            load.notify.notify_waiters();
+            return result;
+        }
+    }
+
+    /// The cold-page miss path: fetch the page bytes from the writer
+    /// (local pool, else storage), size-check, make room, and commit to
+    /// the cache. Factored out of [`Self::acquire_page`] so the
+    /// single-flight leader can run exactly this once per cold page.
+    async fn load_page_miss(&self, page_id: PageId) -> Result<Arc<Vec<u8>>, UploaderError> {
         // Cache miss → fetch from the writer (storage or pool). Drop
         // the lock during the await so unrelated cache ops don't
         // block on a slow storage read.
@@ -2707,6 +2791,13 @@ mod tests {
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         fail_keys: Arc<std::sync::Mutex<HashSet<String>>>,
+        /// Number of `download_chunk` calls — lets the single-flight
+        /// test (issue #229) assert N concurrent cold-page reads issue
+        /// exactly one backend GET.
+        download_count: Arc<AtomicUsize>,
+        /// Sleep injected before each `download_chunk` so concurrent
+        /// readers all reach the miss path before the leader returns.
+        download_delay: Duration,
     }
 
     impl DelayingBackend {
@@ -2717,11 +2808,29 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 fail_keys: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                download_count: Arc::new(AtomicUsize::new(0)),
+                download_delay: Duration::ZERO,
+            })
+        }
+
+        fn with_download_delay(inner: Arc<dyn ObjectStoreBackend>, download_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                delay: Duration::ZERO,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+                fail_keys: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                download_count: Arc::new(AtomicUsize::new(0)),
+                download_delay,
             })
         }
 
         fn observed_max_in_flight(&self) -> usize {
             self.max_in_flight.load(Ordering::Relaxed)
+        }
+
+        fn downloads(&self) -> usize {
+            self.download_count.load(Ordering::Relaxed)
         }
 
         fn add_fail_key(&self, key: String) {
@@ -2767,6 +2876,10 @@ mod tests {
         }
 
         async fn download_chunk(&self, key: &str) -> StorageResult<Vec<u8>> {
+            self.download_count.fetch_add(1, Ordering::AcqRel);
+            if !self.download_delay.is_zero() {
+                tokio::time::sleep(self.download_delay).await;
+            }
             self.inner.download_chunk(key).await
         }
 
@@ -2817,6 +2930,8 @@ mod tests {
                 in_flight: Arc::clone(&self.in_flight),
                 max_in_flight: Arc::clone(&self.max_in_flight),
                 fail_keys: Arc::clone(&self.fail_keys),
+                download_count: Arc::clone(&self.download_count),
+                download_delay: self.download_delay,
             })
         }
     }
@@ -2858,6 +2973,64 @@ mod tests {
             max_concurrent_flushes,
         );
         (tmp, cache, writer, delaying)
+    }
+
+    /// Issue #229: N concurrent readers of the same cold (storage-only)
+    /// page must coalesce onto a single backend GET, not one per reader.
+    #[tokio::test]
+    async fn concurrent_cold_page_misses_single_flight() {
+        let tmp = TempDir::new().unwrap();
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let local = LocalBackend::new(&storage).await.unwrap();
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(local);
+        // A 150 ms download delay keeps the leader in-flight long enough
+        // for every follower to reach the miss path and coalesce.
+        let delaying =
+            DelayingBackend::with_download_delay(Arc::clone(&local), Duration::from_millis(150));
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&delaying) as _;
+        VolumeManifest::new(
+            "vol1".into(),
+            4 * (1u64 << 20),
+            DEFAULT_SECTOR_BYTES,
+            DEFAULT_PAGE_SIZE_BYTES,
+            "primary".into(),
+            DedupScope::Local,
+            false,
+            0,
+        )
+        .unwrap()
+        .create(tmp.path())
+        .unwrap();
+        let writer = Arc::new(VolumeWriter::open(tmp.path(), "vol1", backend).unwrap());
+        let cache = PageCache::new(writer.clone());
+
+        // Seal page 0 into the pool + storage, then make it storage-only:
+        // drop the cache entry and delete the local pool chunk so the
+        // next read must hit the backend.
+        let payload = pattern(0x33, PAGE);
+        cache.write_bytes(0, &payload).await.unwrap();
+        cache.flush_all().await.unwrap();
+        let hash = writer.page_index().get_entry(0).unwrap().unwrap().hash;
+        let hash_hex = hex::encode(hash);
+        cache.invalidate_all().await;
+        writer.pool().remove(&hash_hex).unwrap();
+        assert!(!writer.pool().exists(&hash_hex), "pool chunk removed");
+
+        // Fire 12 concurrent reads of the same cold page.
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move { c.read_bytes(0, PAGE).await.unwrap() }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), payload, "every reader gets the page bytes");
+        }
+        assert_eq!(
+            delaying.downloads(),
+            1,
+            "single-flight collapses concurrent cold-page misses to one backend GET"
+        );
     }
 
     #[tokio::test]

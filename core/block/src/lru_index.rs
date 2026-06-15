@@ -37,13 +37,23 @@
 //! bytes 12..32  reserved, zero
 //! ```
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use thiserror::Error;
 
 use crate::page_index::PageId;
+
+/// Cap on the in-memory last-written-timestamp dedup map. ~64K entries
+/// (`PageId` u32 key + u64 value ≈ 16 bytes apiece plus map overhead,
+/// well under 2 MiB) comfortably covers the hot read/seal working set
+/// of even a multi-GiB page cache, while bounding memory regardless of
+/// how large the volume is — the map is cleared when it fills rather
+/// than tracking one entry per allocated page (issue #230).
+const MAX_TRACKED_TIMESTAMPS: usize = 1 << 16;
 
 /// On-disk record size: 8 bytes = u64 LE epoch seconds.
 pub const RECORD_SIZE: u64 = 8;
@@ -77,6 +87,16 @@ pub enum LruIndexError {
 #[derive(Debug)]
 pub struct LruIndexFile {
     file: File,
+    /// In-memory cache of the last timestamp written per page. A
+    /// repeated `touch` within the same recency second — the common
+    /// case for a hot page hammered by sequential reads, where the
+    /// 1-second granularity stores an identical value — skips the
+    /// redundant 8-byte `pwrite`, so a pure-read workload no longer
+    /// turns into a write workload on the data_dir filesystem (issue
+    /// #230). Bounded by [`MAX_TRACKED_TIMESTAMPS`]; pure cache hint,
+    /// so a cleared / lost entry only means one extra (harmless)
+    /// pwrite.
+    last_written: Mutex<HashMap<PageId, u64>>,
 }
 
 impl LruIndexFile {
@@ -101,12 +121,12 @@ impl LruIndexFile {
         let len = file.metadata()?.len();
         if len == 0 {
             Self::write_header(&file)?;
-            return Ok(Self { file });
+            return Ok(Self::from_file(file));
         }
         if len < HEADER_SIZE {
             file.set_len(0)?;
             Self::write_header(&file)?;
-            return Ok(Self { file });
+            return Ok(Self::from_file(file));
         }
         let mut hdr = [0u8; HEADER_SIZE as usize];
         file.read_exact_at(&mut hdr, 0)?;
@@ -123,7 +143,14 @@ impl LruIndexFile {
             file.set_len(0)?;
             Self::write_header(&file)?;
         }
-        Ok(Self { file })
+        Ok(Self::from_file(file))
+    }
+
+    fn from_file(file: File) -> Self {
+        Self {
+            file,
+            last_written: Mutex::new(HashMap::new()),
+        }
     }
 
     fn write_header(file: &File) -> Result<(), LruIndexError> {
@@ -144,8 +171,28 @@ impl LruIndexFile {
     /// pages naturally extend the file. The pwrite goes through to
     /// the OS page cache; call [`Self::sync`] for durability.
     pub fn touch(&self, page_id: PageId, ts: u64) -> Result<(), LruIndexError> {
+        // Skip the pwrite when this page's last on-disk timestamp is
+        // already `ts` (a repeated touch within the same recency
+        // second). Checked before the write so a hot page touched many
+        // times per second costs at most one pwrite per second per page
+        // (issue #230).
+        {
+            let seen = self.last_written.lock().unwrap_or_else(|p| p.into_inner());
+            if seen.get(&page_id) == Some(&ts) {
+                return Ok(());
+            }
+        }
         let off = Self::record_offset(page_id);
         self.file.write_all_at(&ts.to_le_bytes(), off)?;
+        // Record the value only after a successful write, so a failed
+        // pwrite never leaves a stale entry that would suppress a later
+        // retry. Clear the map when it fills to bound memory regardless
+        // of volume size.
+        let mut seen = self.last_written.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() >= MAX_TRACKED_TIMESTAMPS && !seen.contains_key(&page_id) {
+            seen.clear();
+        }
+        seen.insert(page_id, ts);
         Ok(())
     }
 
@@ -204,6 +251,14 @@ impl LruIndexFile {
         self.file.set_len(0)?;
         Self::write_header(&self.file)?;
         self.file.sync_data()?;
+        // The on-disk records are gone (every slot now reads 0), so the
+        // in-memory dedup cache must be dropped too — otherwise a touch
+        // with a value the cache still remembers would be skipped,
+        // leaving the truncated slot at 0 (issue #230).
+        self.last_written
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         Ok(())
     }
 }
@@ -236,6 +291,49 @@ mod tests {
         assert_eq!(lru.read(7).unwrap(), 1_700_000_000);
         lru.touch(7, 1_800_000_000).unwrap();
         assert_eq!(lru.read(7).unwrap(), 1_800_000_000);
+    }
+
+    #[test]
+    fn touch_same_second_skips_redundant_pwrite() {
+        // Issue #230: a repeated touch of the same page within the same
+        // recency second must not re-issue the 8-byte pwrite. Observe it
+        // by corrupting the on-disk slot behind the cache's back, then
+        // re-touching with the same ts: a skipped write leaves the
+        // sentinel intact; a different ts overwrites it.
+        let tmp = TempDir::new().unwrap();
+        let lru = LruIndexFile::open_or_create(tmp.path()).unwrap();
+        lru.touch(7, 100).unwrap();
+        assert_eq!(lru.read(7).unwrap(), 100);
+
+        // Overwrite page 7's record out-of-band.
+        let raw = OpenOptions::new()
+            .write(true)
+            .open(LruIndexFile::path_for(tmp.path()))
+            .unwrap();
+        raw.write_all_at(&999u64.to_le_bytes(), LruIndexFile::record_offset(7))
+            .unwrap();
+        assert_eq!(lru.read(7).unwrap(), 999);
+
+        // Same ts → dedup skips the pwrite, sentinel survives.
+        lru.touch(7, 100).unwrap();
+        assert_eq!(lru.read(7).unwrap(), 999);
+
+        // Different ts → write goes through.
+        lru.touch(7, 200).unwrap();
+        assert_eq!(lru.read(7).unwrap(), 200);
+    }
+
+    #[test]
+    fn reset_to_clean_clears_dedup_cache() {
+        // After reset, a touch with a ts the cache previously saw must
+        // still write (the on-disk slot was truncated to 0).
+        let tmp = TempDir::new().unwrap();
+        let lru = LruIndexFile::open_or_create(tmp.path()).unwrap();
+        lru.touch(3, 100).unwrap();
+        lru.reset_to_clean().unwrap();
+        assert_eq!(lru.read(3).unwrap(), 0);
+        lru.touch(3, 100).unwrap();
+        assert_eq!(lru.read(3).unwrap(), 100);
     }
 
     #[test]
