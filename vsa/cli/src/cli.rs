@@ -335,10 +335,12 @@ enum StorageAction {
 enum VolumeAction {
     /// Create a new volume.
     ///
-    /// Tries the daemon's admin socket first; falls back to a
-    /// daemon-down manifest write under `data_dir` when the
-    /// socket is unreachable. The chosen backend, page size, and
-    /// dedup scope are sticky for the volume's lifetime.
+    /// Daemon-routed only: the edit travels through the daemon's admin
+    /// socket (which serializes the manifest write and emits an audit
+    /// row). When the socket is unreachable the command refuses with a
+    /// "start the daemon" message rather than mutating state directly.
+    /// The chosen backend, page size, and dedup scope are sticky for the
+    /// volume's lifetime.
     Create {
         /// Volume name (1-64 chars: letters, digits, '-', '_').
         name: String,
@@ -434,10 +436,10 @@ enum VolumeAction {
 
     /// List every volume.
     ///
-    /// Reads the live LUN map via the admin socket; falls back to
-    /// walking `<data_dir>/volumes/` when the socket is
-    /// unreachable. The socket view includes the assigned LUN per
-    /// volume; the offline view doesn't.
+    /// Daemon-routed only: reads the live LUN map (with the assigned LUN
+    /// per volume) via the admin socket. When the socket is unreachable
+    /// the command refuses with a "start the daemon" message — there is
+    /// no offline directory-walk fallback.
     List {
         /// Emit the response as JSON for automation.
         #[arg(long)]

@@ -59,6 +59,7 @@ pub async fn cmd_stats(json: bool) -> Result<u8> {
     // purpose — the daemon owns the canonical shape.
     let mut raw: Option<serde_json::Value> = None;
     let mut typed: Option<StatsReport> = None;
+    let mut decode_err: Option<String> = None;
 
     let exit = client
         .run_job("system.stats", &serde_json::json!({}), |ev| match ev {
@@ -66,8 +67,9 @@ pub async fn cmd_stats(json: bool) -> Result<u8> {
                 eprintln!("{}", message);
             }
             JobEvent::Result { data } => {
-                if let Ok(r) = serde_json::from_value::<StatsReport>(data.clone()) {
-                    typed = Some(r);
+                match serde_json::from_value::<StatsReport>(data.clone()) {
+                    Ok(r) => typed = Some(r),
+                    Err(e) => decode_err = Some(e.to_string()),
                 }
                 raw = Some(data);
             }
@@ -77,11 +79,25 @@ pub async fn cmd_stats(json: bool) -> Result<u8> {
         .context("stats job stream")?;
 
     if json {
-        if let Some(v) = raw {
-            println!("{}", serde_json::to_string_pretty(&v)?);
+        match raw {
+            Some(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+            None => {
+                eprintln!("error: daemon returned no stats report");
+                return Ok(2);
+            }
         }
     } else if let Some(report) = typed {
         print_human(&report);
+    } else {
+        // No decodable report — surface the error to stderr and return a
+        // non-zero exit instead of printing nothing and exiting 0, which
+        // masked any daemon-side StatsReport shape drift as a "successful"
+        // empty run (issue #291). Mirrors verify.rs.
+        match decode_err {
+            Some(e) => eprintln!("error: failed to decode stats report: {e}"),
+            None => eprintln!("error: daemon returned no stats report"),
+        }
+        return Ok(2);
     }
 
     Ok(u8::try_from(exit.max(0)).unwrap_or(2))
