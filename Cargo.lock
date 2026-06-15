@@ -5620,6 +5620,7 @@ dependencies = [
  "chrono",
  "clap",
  "core-block",
+ "futures",
  "hex",
  "hyper",
  "hyper-util",

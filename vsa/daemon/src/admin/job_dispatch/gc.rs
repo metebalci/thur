@@ -24,6 +24,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use futures::stream::{self, StreamExt};
+
 use core_block::{ChunkPool, PageIndex, SnapshotManifest, VolumeManifest};
 use serde::Deserialize;
 use shared_admin_server::{JobEmitter, JobEvent};
@@ -588,6 +590,11 @@ async fn run_storage_gc(
     let keys = backend.list_objects("chunks/").await?;
     let mut orphans = 0usize;
     let mut total = 0usize;
+    // Orphan keys to delete, collected first so the deletes run with
+    // bounded concurrency and continue past a per-object failure instead
+    // of one serial round-trip-per-object that aborts the whole sweep on
+    // the first transient error (issue #280).
+    let mut to_delete: Vec<(String, String)> = Vec::new();
     let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
 
     let empty: HashSet<[u8; 32]> = HashSet::new();
@@ -656,21 +663,43 @@ async fn run_storage_gc(
                 ))
                 .await;
         } else {
-            backend.delete_object(key).await?;
-            emitter
-                .info(format!(
-                    "  deleted storage object {} (hash {}.., {})",
-                    key,
-                    &parsed.hash[..parsed.hash.len().min(8)],
-                    ns_label,
-                ))
-                .await;
+            to_delete.push((key.clone(), ns_label.to_string()));
+        }
+    }
+
+    // Delete with bounded concurrency, continuing past per-object
+    // failures (the old serial `?` aborted the sweep on the first
+    // transient DELETE error) and emitting one summary instead of one
+    // NDJSON line per object (issue #280).
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    if !to_delete.is_empty() {
+        const GC_DELETE_CONCURRENCY: usize = 16;
+        let backend_ref = &backend;
+        let mut delete_stream =
+            stream::iter(to_delete.into_iter().map(|(key, ns_label)| async move {
+                let res = backend_ref.delete_object(&key).await;
+                (key, ns_label, res)
+            }))
+            .buffer_unordered(GC_DELETE_CONCURRENCY);
+        while let Some((key, ns_label, res)) = delete_stream.next().await {
+            match res {
+                Ok(()) => deleted += 1,
+                Err(e) => {
+                    failed += 1;
+                    emitter
+                        .warn(format!(
+                            "  failed to delete storage object {key} ({ns_label}): {e}"
+                        ))
+                        .await;
+                }
+            }
         }
     }
     emitter
         .info(format!(
-            "  Storage bucket: {} total chunk objects, {} orphans removed",
-            total, orphans
+            "  Storage bucket: {total} total chunk objects, {orphans} orphans found, \
+             {deleted} deleted, {failed} delete failure(s)"
         ))
         .await;
     Ok(())
