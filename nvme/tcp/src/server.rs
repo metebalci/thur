@@ -188,6 +188,15 @@ pub async fn accept_loop(
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        // NVMe/TCP is a latency-sensitive request/response protocol that
+        // emits many small PDUs (24-byte R2T / CapsuleResp, sub-100-byte
+        // auth messages). Disable Nagle so a small write following
+        // unacked data isn't held for the peer's delayed-ACK timer
+        // (~40 ms per affected exchange), e.g. R2T -> H2CData -> CapsuleResp
+        // or the multi-message DH-HMAC-CHAP handshake (issue #243).
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::warn!(%peer, error = %e, "nvme/tcp: set_nodelay failed");
+        }
         // Local address this connection landed on, captured before any
         // TLS wrap. The Discovery controller reflects its IP into the
         // Discovery Log Page TRADDR when the I/O listener is bound to a
@@ -1420,12 +1429,18 @@ where
                     let can_fold =
                         cqe.status == StatusField::SUCCESS && cqe.dw0 == 0 && cqe.dw1 == 0;
                     let extra = if can_fold { pdu::C2H_FLAGS_SUCCESS } else { 0 };
-                    write
-                        .write_all(&pdu::apply_digests(
-                            pdu::build_c2hdata_pdu_with_flags(cqe.cid, &data_in, extra),
-                            dgst,
-                        ))
-                        .await?;
+                    // Zero-copy emit: write the small header, then the
+                    // borrowed payload, then the optional data digest —
+                    // the (up to 128 KiB) read payload is never copied
+                    // into a PDU buffer (issue #242).
+                    let header =
+                        pdu::build_c2hdata_header(cqe.cid, data_in.len(), extra, dgst);
+                    write.write_all(&header).await?;
+                    write.write_all(&data_in).await?;
+                    if dgst.data && !data_in.is_empty() {
+                        let crc = crc32c::crc32c(&data_in).to_le_bytes();
+                        write.write_all(&crc).await?;
+                    }
                     if !can_fold {
                         write
                             .write_all(&pdu::apply_digests(pdu::build_capsule_resp_pdu(&cqe), dgst))

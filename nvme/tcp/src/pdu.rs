@@ -467,6 +467,57 @@ pub fn build_c2hdata_pdu_with_flags(cccid: u16, data: &[u8], extra_flags: u8) ->
     buf
 }
 
+/// Build only the C2HData PDU **header** (common header + 16-byte
+/// type-specific header, plus the 4-byte header digest when negotiated)
+/// for a single-PDU read response carrying `data_len` payload bytes.
+///
+/// The header's PLEN / PDO / FLAGS account for the (separately written)
+/// payload and the optional trailing data digest, so the caller can
+/// write `[header][payload][data digest?]` straight to the socket
+/// without ever copying the (up to 128 KiB) payload into a PDU buffer
+/// (issue #242). Byte-for-byte equivalent to
+/// `apply_digests(build_c2hdata_pdu_with_flags(...), dgst)` minus the
+/// payload + data-digest tail, which the caller emits.
+pub fn build_c2hdata_header(
+    cccid: u16,
+    data_len: usize,
+    extra_flags: u8,
+    dgst: DigestCfg,
+) -> Vec<u8> {
+    const HLEN: u8 = (CommonHeader::WIRE_LEN + 16) as u8; // 24
+    let hdr_dig = if dgst.header { DIGEST_LEN } else { 0 };
+    let data_dig = if dgst.data && data_len > 0 { DIGEST_LEN } else { 0 };
+    let plen = u32::from(HLEN) + hdr_dig as u32 + data_len as u32 + data_dig as u32;
+    let mut flags = C2H_FLAGS_LAST_PDU | extra_flags;
+    if dgst.header {
+        flags |= FLAGS_HDGSTF;
+    }
+    if dgst.data && data_len > 0 {
+        flags |= FLAGS_DDGSTF;
+    }
+    // Data starts after the header and its digest.
+    let pdo = HLEN + hdr_dig as u8;
+    let mut buf = Vec::with_capacity(HLEN as usize + hdr_dig);
+    let header = CommonHeader {
+        pdu_type: PduType::C2HData,
+        flags,
+        hlen: HLEN,
+        pdo,
+        plen,
+    };
+    header.write_to(&mut buf);
+    buf.extend_from_slice(&cccid.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes()); // DATAO = 0
+    buf.extend_from_slice(&(data_len as u32).to_le_bytes()); // DATAL
+    buf.extend_from_slice(&[0u8; 4]); // reserved
+    if dgst.header {
+        let crc = crc32c::crc32c(&buf).to_le_bytes();
+        buf.extend_from_slice(&crc);
+    }
+    buf
+}
+
 /// Encode an R2T PDU (NVMe/TCP §3.6.8). Used by the controller to
 /// solicit host-to-controller data when a write command's data
 /// payload was not (fully) carried in the CapsuleCmd's in-capsule
@@ -1041,6 +1092,35 @@ mod tests {
         let pdu = build_c2hdata_pdu(0x1234, &[1, 2, 3, 4]);
         let out = apply_digests(pdu.clone(), DigestCfg::NONE);
         assert_eq!(pdu, out);
+    }
+
+    /// Issue #242: the zero-copy split emit (header builder + borrowed
+    /// payload + optional data digest) must produce byte-identical wire
+    /// output to the old build-then-apply_digests path, across digest
+    /// configs and the SUCCESS-fold flag.
+    #[test]
+    fn zero_copy_c2hdata_matches_apply_digests() {
+        let data = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+        for cfg in [
+            DigestCfg::NONE,
+            DigestCfg { header: true, data: false },
+            DigestCfg { header: false, data: true },
+            DigestCfg { header: true, data: true },
+        ] {
+            for extra in [0u8, C2H_FLAGS_SUCCESS] {
+                let old = apply_digests(
+                    build_c2hdata_pdu_with_flags(0x55AA, &data, extra),
+                    cfg,
+                );
+                // Reconstruct the wire bytes the writer emits split.
+                let mut new = build_c2hdata_header(0x55AA, data.len(), extra, cfg);
+                new.extend_from_slice(&data);
+                if cfg.data && !data.is_empty() {
+                    new.extend_from_slice(&crc32c::crc32c(&data).to_le_bytes());
+                }
+                assert_eq!(old, new, "cfg={cfg:?} extra={extra}");
+            }
+        }
     }
 
     #[test]
