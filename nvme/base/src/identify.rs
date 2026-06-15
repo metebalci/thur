@@ -48,8 +48,9 @@ pub enum CNS {
     /// even against a 1.4-versioned controller; refusing it (Invalid
     /// Field) propagates into the namespace-attach path and `/dev/
     /// nvmeXn1` never appears. The wire layout is a 4 KiB structure
-    /// whose every field is a "no specific limit" hint when zero,
-    /// so all-zeros is the right minimal response.
+    /// whose every field is a "no specific limit" hint when zero; we
+    /// fill DMRSL (see [`nvm_command_set_identify_controller`]) so the
+    /// host caps discard size, leaving the rest zero.
     IoCommandSetIdentifyController = 0x06,
 }
 
@@ -131,11 +132,15 @@ pub struct IdentifyController {
     /// "no limit" — never use that for a host-facing target.
     pub mdts: u8,
     /// ONCS — Optional NVM Command Support (NVMe Base §5.17.2.1 bytes
-    /// 520..522). Bit 5 = Reservations supported, which is what makes
-    /// a host issue Reservation Register/Acquire/Release/Report. Other
-    /// implemented-but-currently-unadvertised optional commands
-    /// (Compare bit 0, Write Zeroes bit 3, Dataset Management bit 2)
-    /// stay zero here — out of scope for the reservations work.
+    /// 520..522). Bit 5 = Reservations supported (makes a host issue
+    /// Reservation Register/Acquire/Release/Report) and bit 2 = Dataset
+    /// Management supported. Without the DSM bit Linux disables discard
+    /// for the namespace entirely (`discard_max_bytes` = 0) and never
+    /// reads the DMRSL cap, so thin-provisioned volumes are never
+    /// reclaimed from an NVMe host — the iSCSI/SBC surface already
+    /// advertises the equivalent thin-provisioning UNMAP, so this is
+    /// transport parity (issue #248). Compare (bit 0) and Write Zeroes
+    /// (bit 3) are implemented but stay unadvertised for now.
     pub oncs: u16,
     /// OAES — Optional Asynchronous Events Supported (NVMe Base
     /// §5.17.2.1 bytes 92..96). Bit 8 = Namespace Attribute Changed:
@@ -215,8 +220,10 @@ impl IdentifyController {
             // NVMe/TCP transport's MAX_TRANSFER_BYTES ceiling. Keep the
             // two in lockstep.
             mdts: 8,
-            // ONCS bit 5 = Reservations supported. 0x0020.
-            oncs: 0x0020,
+            // ONCS bit 5 = Reservations + bit 2 = Dataset Management. The
+            // DSM bit is what makes Linux enable discard and read DMRSL
+            // (issue #248). 0x0024.
+            oncs: 0x0024,
             // OAES bit 8 = Namespace Attribute Changed supported, so a
             // host enables namespace-change async events (Set Features
             // FID 0x0B) and learns about out-of-band volume create /
@@ -287,8 +294,9 @@ impl IdentifyController {
         // async-event support so the host enables it via Set Features
         // FID 0x0B. CTRATT etc stay zero.
         out[92..96].copy_from_slice(&self.oaes.to_le_bytes());
-        // ONCS at 520..522 — bit 5 advertises Reservations support so
-        // hosts issue the reservation command set.
+        // ONCS at 520..522 — bit 5 advertises Reservations (hosts issue
+        // the reservation command set) and bit 2 advertises Dataset
+        // Management (Linux enables discard + reads DMRSL — issue #248).
         out[520..522].copy_from_slice(&self.oncs.to_le_bytes());
         // KAS at 320..322 — mandatory non-zero for NVMe-oF
         // controllers (Linux nvme-tcp logs "keep-alive support is
@@ -445,6 +453,33 @@ pub fn namespace_id_descriptor_list(nguid: [u8; 16]) -> [u8; crate::IDENTIFY_DAT
     out
 }
 
+/// Build the NVM Command Set specific Identify Controller data
+/// structure (CNS = 0x06, CSI = 0x00; NVM Command Set Specification
+/// §4.1.5.1). The layout the Linux NVMe driver parses as
+/// `struct nvme_id_ctrl_nvm`:
+///
+/// | bytes | field  | meaning                                         |
+/// |-------|--------|-------------------------------------------------|
+/// | 0     | VSL    | Verify Size Limit (0 = no limit)                |
+/// | 1     | WZSL   | Write Zeroes Size Limit (0 = no limit)          |
+/// | 2     | WUSL   | Write Uncorrectable Size Limit (0 = no limit)   |
+/// | 3     | DMRL   | DSM Ranges Limit (0 = no limit, host caps at 256)|
+/// | 4..8  | DMRSL  | DSM Range Size Limit, le32, in **logical blocks**|
+/// | 8..16 | DMSL   | DSM Size Limit, le64 (0 = no limit)             |
+///
+/// We set only DMRSL: Linux honors it via `nvme_config_discard` to cap
+/// `max_discard_sectors`, so a host `mkfs`/`fstrim` full-device discard
+/// is split into bounded DSM Deallocate commands instead of one
+/// unbounded range that would run past the host's 30 s I/O timeout and
+/// reset the controller (issue #248). Every other field stays zero —
+/// "no specific limit" — which is the right reply for a software target
+/// that doesn't constrain the other I/O Command Set ops.
+pub fn nvm_command_set_identify_controller(dmrsl_lbas: u32) -> [u8; crate::IDENTIFY_DATA_SIZE] {
+    let mut out = [0u8; crate::IDENTIFY_DATA_SIZE];
+    out[4..8].copy_from_slice(&dmrsl_lbas.to_le_bytes());
+    out
+}
+
 /// Build the Active Namespace ID List (CNS = 0x02) payload from a
 /// sorted list of attached NSIDs. The host passes a starting NSID in
 /// SQE.NSID; the response is up to 1024 u32 NSIDs *greater than*
@@ -508,8 +543,10 @@ mod tests {
         // MDTS at byte 77 — non-zero so the host bounds its transfers.
         // 8 → 2^8 * 4 KiB = 1 MiB.
         assert_eq!(bytes[77], 8);
-        // ONCS at 520..522 — bit 5 (Reservations) set.
-        assert_eq!(&bytes[520..522], &0x0020u16.to_le_bytes());
+        // ONCS at 520..522 — bit 5 (Reservations) + bit 2 (Dataset
+        // Management) set. The DSM bit makes Linux enable discard and
+        // read DMRSL (issue #248); dropping it disables discard entirely.
+        assert_eq!(&bytes[520..522], &0x0024u16.to_le_bytes());
         // OAES at 92..96 — bit 8 (Namespace Attribute Changed) set so
         // the host enables namespace-change async events.
         assert_eq!(
@@ -550,6 +587,19 @@ mod tests {
         // OAES at 92..96 = 0 — a Discovery controller exposes no
         // namespaces, so no namespace-attribute notices.
         assert_eq!(&bytes[92..96], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn nvm_command_set_identify_controller_sets_dmrsl() {
+        // CNS 0x06 (CSI 0x00): only DMRSL (bytes 4..8, le32, in logical
+        // blocks) is advertised; VSL/WZSL/WUSL/DMRL/DMSL stay zero.
+        let dmrsl = 65_536u32; // 256 MiB at a 4 KiB LBA
+        let bytes = nvm_command_set_identify_controller(dmrsl);
+        assert_eq!(bytes.len(), crate::IDENTIFY_DATA_SIZE);
+        assert_eq!(&bytes[4..8], &dmrsl.to_le_bytes(), "DMRSL at bytes 4..8");
+        // VSL/WZSL/WUSL/DMRL (bytes 0..4) and DMSL (bytes 8..16) untouched.
+        assert_eq!(&bytes[0..4], &[0u8; 4], "VSL/WZSL/WUSL/DMRL zero");
+        assert_eq!(&bytes[8..16], &[0u8; 8], "DMSL zero");
     }
 
     #[test]

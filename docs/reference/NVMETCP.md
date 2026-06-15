@@ -272,7 +272,7 @@ Transport behavior:
 | Read                      | 0x02 | `PageCache::read_bytes(slba * lba, nlb * lba)`           |
 | Compare                   | 0x05 | `read_bytes` + dispatcher-side byte equality             |
 | Write Zeroes              | 0x08 | DEAC set → `unmap_bytes`; else `write_bytes(&vec![0;…])` |
-| Dataset Management (AD=1) | 0x09 | per-range `PageCache::unmap_bytes(off, len)`             |
+| Dataset Management (AD=1) | 0x09 | per-range `PageCache::unmap_bytes(off, len)` in 256 MiB windows, yielding between (issue #248) |
 | Verify                    | 0x0C | `read_bytes` (payload discarded)                         |
 | Compare + Write fused     | 0x05 + 0x01 with FUSE bits | `PageCache::compare_and_write_bytes(...)` |
 
@@ -283,7 +283,7 @@ Implemented:
 | Admin opcode      | Code | Notes                                                                              |
 | ----------------- | ---- | ---------------------------------------------------------------------------------- |
 | Get Log Page      | 0x02 | LID 0x01 Error Info, 0x02 SMART/Health (temperature + spare), 0x03 FW Slot, 0x80 Reservation Notification (one 64-byte entry per call, oldest-first) |
-| Identify          | 0x06 | CNS 0x00 Namespace, 0x01 Controller (NN from live registry, KAS=120 = 12 s), 0x02 Active List, 0x03 NS ID Descriptor List (NGUID + CSI=NVM), 0x06 I/O Command Set Identify Controller (4 KiB of zeros) |
+| Identify          | 0x06 | CNS 0x00 Namespace, 0x01 Controller (NN from live registry, KAS=120 = 12 s), 0x02 Active List, 0x03 NS ID Descriptor List (NGUID + CSI=NVM), 0x06 I/O Command Set Identify Controller (DMRSL = 65 536 LBAs caps host discard size; rest zero) |
 | Abort             | 0x08 | Returns DW0 bit 0 = 1 (command already complete) — we don't queue at dispatcher    |
 | Set Features      | 0x09 | FID 0x07 Number of Queues — clamps to internal cap (64), echoes granted count. FID 0x0F Keep Alive Timer — stores host-negotiated KATO in ms, no watchdog. FID 0x82 Reservation Notification Mask — per (HOSTID, NSID), echoes stored value |
 | Get Features      | 0x0A | FID 0x07 Number of Queues, FID 0x0F Keep Alive Timer, FID 0x82 Reservation Notification Mask |

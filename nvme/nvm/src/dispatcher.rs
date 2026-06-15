@@ -87,6 +87,21 @@ const FID_RESERVATION_NOTIF_MASK: u8 = 0x82;
 /// events — distinct from FID 0x82, which gates reservation notices.
 const FID_ASYNC_EVENT_CONFIG: u8 = 0x0B;
 
+/// DMRSL (DSM Range Size Limit) advertised in the NVM Command Set
+/// Identify Controller (CNS 0x06), in **logical blocks**. Caps a single
+/// host discard so a full-device `mkfs`/`fstrim` is split into bounded
+/// DSM Deallocate commands rather than one unbounded range that walks
+/// millions of page-index records past the host's I/O timeout (issue
+/// #248). 65 536 LBAs = 256 MiB at the fixed 4 KiB VSA sector; this is a
+/// host hint — `cmd_dsm` re-windows defensively regardless.
+const DSM_RANGE_SIZE_LIMIT_LBAS: u32 = 65_536;
+
+/// Byte window `cmd_dsm` processes per `unmap_bytes` call before
+/// yielding to the runtime. Bounds the no-yield burst of buffered
+/// page-index writes a single DSM command can hold a tokio worker for,
+/// independent of whether the host honored DMRSL (issue #248).
+const DSM_YIELD_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+
 pub struct NvmeNvmDispatcher {
     registry: Arc<dyn NamespaceLookup>,
     subnqn: String,
@@ -628,10 +643,14 @@ impl NvmeNvmDispatcher {
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), payload.to_vec())
             }
             CNS::IoCommandSetIdentifyController => {
-                // 4 KiB of zeros = "no specific I/O Command Set
-                // limits" — the right reply for a controller that
-                // doesn't advertise any extra NVM-Command-Set caps.
-                let payload = vec![0u8; nvme_base::IDENTIFY_DATA_SIZE];
+                // Advertise DMRSL (DSM Range Size Limit) so the host caps
+                // a full-device discard instead of issuing one unbounded
+                // range that would run past its I/O timeout and reset the
+                // controller (issue #248). Every other field stays zero
+                // ("no specific limit").
+                let payload =
+                    nvme_base::identify::nvm_command_set_identify_controller(DSM_RANGE_SIZE_LIMIT_LBAS)
+                        .to_vec();
                 NvmeResponse::with_data(Cqe::success(cid, 0, 0, 0), payload)
             }
         }
@@ -840,9 +859,26 @@ impl NvmeNvmDispatcher {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            if let Err(e) = cache.unmap_bytes(byte_off, len).await {
-                tracing::warn!(error = %e, "dsm deallocate failed");
-                return NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)));
+            // Process the range in bounded byte windows, yielding to the
+            // runtime between them. DMRSL (advertised in CNS 0x06) asks a
+            // compliant host to keep each range under the window already,
+            // but a non-compliant host can still send an oversized range;
+            // windowing here is the hard guarantee that one DSM command
+            // can't monopolize the tokio worker and starve other NVMe
+            // connections while it walks the page index (issue #248).
+            let mut off = byte_off;
+            let mut remaining = len;
+            while remaining > 0 {
+                let this = remaining.min(DSM_YIELD_WINDOW_BYTES);
+                if let Err(e) = cache.unmap_bytes(off, this).await {
+                    tracing::warn!(error = %e, "dsm deallocate failed");
+                    return NvmeResponse::just(Cqe::failure(cid, 0, 0, write_failure_status(&e)));
+                }
+                off += this;
+                remaining -= this;
+                if remaining > 0 {
+                    tokio::task::yield_now().await;
+                }
             }
         }
         NvmeResponse::just(Cqe::success(cid, 0, 0, 0))
@@ -2147,6 +2183,38 @@ mod tests {
             assert_eq!(resp.cqe.status, StatusField::SUCCESS, "CNS {cns:#x}");
             assert!(!resp.data_in.is_empty(), "CNS {cns:#x} returned no data");
         }
+    }
+
+    #[tokio::test]
+    async fn identify_io_command_set_controller_advertises_dmrsl() {
+        // CNS 0x06 (NVM Command Set Identify Controller) must carry the
+        // DMRSL cap (bytes 4..8, le32) so the host bounds discard size
+        // (issue #248) — a regression to all-zeros would let a host
+        // mkfs issue an unbounded full-device discard.
+        let (_tmp, disp) = fixture_dispatcher().await;
+        let resp = disp
+            .handle_admin(AdminCommand {
+                sqe: sqe_admin(0x06, 1, 0x06), // CNS 0x06
+                data_out: None,
+                data_in_max: 4096,
+                session_volumes: None,
+                cntlid: None,
+                local_addr: None,
+            })
+            .await;
+        assert_eq!(resp.cqe.status, StatusField::SUCCESS);
+        assert_eq!(resp.data_in.len(), 4096);
+        let dmrsl = u32::from_le_bytes([
+            resp.data_in[4],
+            resp.data_in[5],
+            resp.data_in[6],
+            resp.data_in[7],
+        ]);
+        assert_eq!(dmrsl, DSM_RANGE_SIZE_LIMIT_LBAS);
+        assert_ne!(dmrsl, 0, "DMRSL must be a real cap, not unbounded");
+        // VSL/WZSL/WUSL/DMRL (bytes 0..4) and DMSL (bytes 8..16) stay zero.
+        assert_eq!(&resp.data_in[0..4], &[0u8; 4]);
+        assert_eq!(&resp.data_in[8..16], &[0u8; 8]);
     }
 
     #[tokio::test]
