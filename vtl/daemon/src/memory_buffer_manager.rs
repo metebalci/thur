@@ -592,7 +592,7 @@ mod tests {
     async fn read_and_position_events_track_head_only() {
         let (mut mgr, _u) = make_manager();
         mgr.handle_event(TapeEvent::BlockRead {
-            tape_id: "T1".to_string(),
+            tape_id: "T1".into(),
             chunk_id: 0,
             lba: 4,
         })
@@ -612,7 +612,7 @@ mod tests {
     async fn handle_event_routes_block_written() {
         let (mut mgr, _u) = make_manager();
         mgr.handle_event(TapeEvent::BlockWritten {
-            tape_id: "T1".to_string(),
+            tape_id: "T1".into(),
             chunk_id: 0,
             lba: 0,
             size: 2048,

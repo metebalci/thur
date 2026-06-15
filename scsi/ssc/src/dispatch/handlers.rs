@@ -906,11 +906,7 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 // trailer (RDPROTECT != 0) is appended in place below.
                 data_out = blk.data;
                 // Return info for event emission
-                Ok((
-                    cart.label().to_string(),
-                    cart.current_chunk_id(),
-                    lba_before,
-                ))
+                Ok((cart.label_arc(), cart.current_chunk_id(), lba_before))
             }
             Err(e) => Err(e),
         }
@@ -1073,11 +1069,7 @@ pub fn handle_write_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         );
 
         // Return info for event emission
-        Ok((
-            cart.label().to_string(),
-            cart.current_chunk_id(),
-            lba_before,
-        ))
+        Ok((cart.label_arc(), cart.current_chunk_id(), lba_before))
     }) {
         Ok((tape_id, chunk_id, lba)) => {
             // Emit BlockWritten event

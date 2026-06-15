@@ -8,9 +8,17 @@
 // S3 uploads, prefetching, and eviction.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-/// Events emitted during tape operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Events emitted during tape operations.
+///
+/// In-process only (a `tokio::broadcast` payload), so this is deliberately
+/// not `Serialize`/`Deserialize`: the per-IO `BlockRead` / `BlockWritten`
+/// variants carry the cartridge label as `Arc<str>` (a refcount bump off
+/// the loaded cartridge, issue #257) rather than a fresh per-command
+/// `String`, and an owned-`String` derive would force a heap allocation
+/// back onto that path.
+#[derive(Debug, Clone)]
 pub enum TapeEvent {
     /// A cartridge was loaded into a drive
     CartridgeLoaded { tape_id: String, drive_num: u8 },
@@ -21,7 +29,7 @@ pub enum TapeEvent {
     /// A block was written to tape
     /// This triggers buffer tracking and potentially S3 upload
     BlockWritten {
-        tape_id: String,
+        tape_id: Arc<str>,
         chunk_id: u32,
         lba: u64,
         size: u64,
@@ -30,7 +38,7 @@ pub enum TapeEvent {
     /// A block was read from tape
     /// This triggers prefetch for sequential reads
     BlockRead {
-        tape_id: String,
+        tape_id: Arc<str>,
         chunk_id: u32,
         lba: u64,
     },

@@ -604,6 +604,11 @@ pub struct SpaceRecordsResult {
 pub struct Cartridge {
     root: PathBuf,
     manifest: Manifest,
+    /// Cheap shared clone of `manifest.label`. The label is
+    /// creation-frozen, so this is filled once at open and handed out by
+    /// [`Cartridge::label_arc`] as a refcount bump — the per-IO READ/WRITE
+    /// broadcast event (issue #257) no longer heap-allocates the label.
+    label_arc: Arc<str>,
     /// Per-cartridge runtime sidecar (`runtime.json`). Holds the
     /// fields the daemon mutates on the hot path: partition layout,
     /// active partition, pending format, set-capacity proportion,
@@ -1213,9 +1218,11 @@ impl Cartridge {
         let f = open_staging_for_append(&staging_path(&root, cur_chunk_id))?;
         let (chunking, cdc_state) = build_chunking_state(&root, &m, cur_chunk_id, &first)?;
         let block_indexes = open_block_indexes(&root, runtime.partitions.len())?;
+        let label_arc: Arc<str> = Arc::from(m.label.as_str());
         let mut cart = Self {
             root,
             manifest: m,
+            label_arc,
             runtime,
             chunk_store,
             chunk_index,
@@ -1297,9 +1304,11 @@ impl Cartridge {
         let cur_chunk_hasher = build_cur_chunk_hasher(&root, cur_chunk_id, &cur_chunk)?;
         let block_indexes = open_block_indexes(&root, partition_count)?;
         let sealed_bytes = Self::initial_sealed_bytes(&chunk_index, cur_chunk_id);
+        let label_arc: Arc<str> = Arc::from(m.label.as_str());
         Ok(Self {
             root,
             manifest: m,
+            label_arc,
             runtime,
             chunk_store,
             chunk_index,
@@ -2351,6 +2360,13 @@ impl Cartridge {
     }
     pub fn label(&self) -> &str {
         &self.manifest.label
+    }
+    /// Cheap shared clone of the cartridge label (refcount bump, no
+    /// allocation). Used on the per-IO data path to populate the
+    /// broadcast [`TapeEvent`] without a fresh `String` per command
+    /// (issue #257).
+    pub fn label_arc(&self) -> Arc<str> {
+        self.label_arc.clone()
     }
     /// Sticky storage backend name this cartridge is bound to. Set at
     /// create time, persisted in the manifest. The open path rejects
