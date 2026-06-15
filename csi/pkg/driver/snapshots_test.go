@@ -64,6 +64,26 @@ func TestCreateSnapshotIdempotent(t *testing.T) {
 	}
 }
 
+// TestCreateSnapshotGlobalNameConflict exercises the CSI global
+// snapshot-name uniqueness guard: the daemon scopes snapshot names per
+// volume, so the driver's cross-volume findSnapshot (now the daemon-side
+// find endpoint, issue #294) must turn the same name on a *different*
+// source into ALREADY_EXISTS rather than silently minting a second
+// snapshot the external-snapshotter would see as a duplicate.
+func TestCreateSnapshotGlobalNameConflict(t *testing.T) {
+	cs := testController(t)
+	ctx := context.Background()
+	createSrcVolume(t, cs, "pvc-a")
+	createSrcVolume(t, cs, "pvc-b")
+	if _, err := cs.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "pvc-a", Name: "shared-name"}); err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	_, err := cs.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{SourceVolumeId: "pvc-b", Name: "shared-name"})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("expected AlreadyExists for same name on a different source, got %v", err)
+	}
+}
+
 func TestCreateSnapshotMissingSource(t *testing.T) {
 	cs := testController(t)
 	_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{SourceVolumeId: "absent", Name: "snapshot-z"})

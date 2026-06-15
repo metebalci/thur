@@ -84,6 +84,9 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/volumes/:name",
             get(handlers::info).delete(handlers::destroy),
         )
+        // Cheap by-name row lookup (no pages.idx walk) — what the CSI
+        // driver uses to resolve a volume by name (issue #297).
+        .route("/api/v1/volumes/:name/row", get(handlers::row))
         .route(
             "/api/v1/volumes/:name/sync-after",
             post(handlers::set_sync_after),
@@ -106,6 +109,10 @@ pub async fn run_admin_server(socket_path: PathBuf, state: AdminState) -> Result
             "/api/v1/volumes/:name/snapshots/:snap/restore",
             post(snapshots::restore),
         )
+        // Cross-volume snapshot-name lookup — the CSI driver enforces its
+        // global snapshot-name uniqueness through this one round trip
+        // instead of an O(volumes) per-volume scan (issue #294).
+        .route("/api/v1/snapshots", get(snapshots::find))
         .route("/api/v1/volumes/:name/clone", post(handlers::clone_volume))
         // iSCSI CHAP users (list / add / remove / disable / enable / rotate)
         .route(

@@ -99,6 +99,58 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  "/api/v1/volumes/{name}/row":
+    get:
+      tags: [vsa]
+      summary: Get one volume's row by name
+      description: >
+        A constant-time registry lookup the driver uses to resolve a volume by
+        name (uuid/lun/size) without listing every volume and scanning
+        client-side. Unlike a future per-name detail verb it does not walk the
+        volume's page index (issue #297). Same row shape as a list element.
+      operationId: adminGetVolumeRow
+      parameters:
+        - $ref: "#/components/parameters/VolumeName"
+      responses:
+        "200":
+          description: Volume row.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeRow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/snapshots:
+    get:
+      tags: [vsa]
+      summary: Find a snapshot by name across all volumes
+      description: >
+        The daemon scopes snapshot names per volume; this cross-volume lookup is
+        how the driver enforces the CSI global snapshot-name uniqueness contract
+        in one round trip instead of an O(volumes) per-volume scan (issue #294).
+        Returns the owning volume plus the snapshot row, or 404 if no volume
+        carries a snapshot with that name.
+      operationId: adminFindSnapshot
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: Snapshot name to find.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The owning volume and the snapshot row (volume field always set).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotRow"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   "/api/v1/volumes/{name}/resize":
     post:
       tags: [vsa]

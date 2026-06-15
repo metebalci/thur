@@ -123,6 +123,35 @@ func TestSnapshotLifecycle(t *testing.T) {
 	}
 }
 
+func TestFindSnapshot(t *testing.T) {
+	c := startFake(t)
+	ctx := context.Background()
+	for _, v := range []string{"va", "vb"} {
+		if _, err := c.CreateVolume(ctx, vsa.CreateVolumeRequest{Name: v, SizeBytes: 1 << 30}); err != nil {
+			t.Fatalf("create %s: %v", v, err)
+		}
+	}
+	if _, err := c.CreateSnapshot(ctx, "vb", "only-on-vb"); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	// Found: the daemon-side scan reports the owning volume + row.
+	where, row, err := c.FindSnapshot(ctx, "only-on-vb")
+	if err != nil || row == nil {
+		t.Fatalf("FindSnapshot(present): where=%q row=%+v err=%v", where, row, err)
+	}
+	if where != "vb" || row.Snapshot != "only-on-vb" {
+		t.Errorf("FindSnapshot located %q/%q, want vb/only-on-vb", where, row.Snapshot)
+	}
+	// Absent: ("", nil, nil) — not an error, the documented contract.
+	where, row, err = c.FindSnapshot(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("FindSnapshot(absent): %v", err)
+	}
+	if where != "" || row != nil {
+		t.Errorf("expected empty result for absent snapshot, got %q/%+v", where, row)
+	}
+}
+
 func TestClone(t *testing.T) {
 	c := startFake(t)
 	ctx := context.Background()

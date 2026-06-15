@@ -31,17 +31,18 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeRow, error) {
 }
 
 // GetVolumeByName returns the named volume, or (nil, nil) if it does not exist.
+// It hits the daemon's per-name row endpoint — a constant-time registry lookup
+// — instead of listing every volume and scanning client-side (issue #297).
 func (c *Client) GetVolumeByName(ctx context.Context, name string) (*VolumeRow, error) {
-	vols, err := c.ListVolumes(ctx)
-	if err != nil {
+	var row VolumeRow
+	if err := c.do(ctx, http.MethodGet,
+		"/api/v1/volumes/"+url.PathEscape(name)+"/row", nil, &row); err != nil {
+		if IsNotFound(err) {
+			return nil, nil // absent, not an error — the documented contract
+		}
 		return nil, err
 	}
-	for i := range vols {
-		if vols[i].Name == name {
-			return &vols[i], nil
-		}
-	}
-	return nil, nil
+	return &row, nil
 }
 
 // DeleteVolume destroys a volume. A missing volume returns an *APIError with

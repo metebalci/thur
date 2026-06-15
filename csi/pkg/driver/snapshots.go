@@ -88,26 +88,15 @@ func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 // volume it lives on and its row (or "", nil if absent). Used to make the CSI
 // snapshot Name globally unique against a daemon that scopes names per volume.
 // Errors are already gRPC-status-wrapped.
+//
+// The cross-volume scan runs daemon-side in a single round trip rather than a
+// client-side ListVolumes + per-volume ListSnapshots fan-out (issue #294).
 func (s *controllerServer) findSnapshot(ctx context.Context, snap string) (string, *vsa.SnapshotRow, error) {
-	vols, err := s.vsa.ListVolumes(ctx)
+	where, row, err := s.vsa.FindSnapshot(ctx, snap)
 	if err != nil {
 		return "", nil, toStatus(err)
 	}
-	for i := range vols {
-		snaps, err := s.vsa.ListSnapshots(ctx, vols[i].Name)
-		if err != nil {
-			if vsa.IsNotFound(err) {
-				continue // volume removed mid-scan
-			}
-			return "", nil, toStatus(err)
-		}
-		for j := range snaps {
-			if snaps[j].Snapshot == snap {
-				return vols[i].Name, &snaps[j], nil
-			}
-		}
-	}
-	return "", nil, nil
+	return where, row, nil
 }
 
 func snapshotResponse(src, snap string, row *vsa.SnapshotRow) *csi.CreateSnapshotResponse {

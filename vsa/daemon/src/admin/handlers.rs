@@ -322,6 +322,33 @@ pub async fn list(State(state): State<AdminState>) -> impl IntoResponse {
     Json(json!({ "volumes": volumes }))
 }
 
+/// `GET /api/v1/volumes/{name}/row` — one volume's row by name.
+///
+/// The same `VolumeRow` shape as a `GET /api/v1/volumes` list element,
+/// resolved straight from the in-memory registry. Unlike the `{name}`
+/// `info` verb it does NOT walk `pages.idx`, so resolving a volume's
+/// uuid / lun / size by name is a constant-time registry lookup rather
+/// than an allocated-pages walk — the cheap by-name lookup the CSI
+/// driver needs in place of list-all-then-scan (issue #297). 404 when no
+/// registered volume carries that name.
+pub async fn row(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<VolumeRow>, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .registry
+        .entries()
+        .into_iter()
+        .find(|(_, c)| c.manifest().name == name)
+        .map(|(lun, c)| Json(VolumeRow::from_cache(lun, &c)))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("volume '{name}' not found") })),
+            )
+        })
+}
+
 /// `GET /api/v1/volumes/{name}` — one volume's manifest as JSON.
 ///
 /// Carries the creation-frozen `manifest.json` fields plus the

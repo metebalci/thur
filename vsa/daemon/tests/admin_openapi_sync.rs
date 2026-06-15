@@ -28,10 +28,12 @@ const CSI_CONTRACT: &[&str] = &[
     "/api/v1/iscsi/users/grant",
     "/api/v1/iscsi/users/remove",
     "/api/v1/iscsi/users/revoke",
+    "/api/v1/snapshots",
     "/api/v1/volumes",
     "/api/v1/volumes/{name}",
     "/api/v1/volumes/{name}/clone",
     "/api/v1/volumes/{name}/resize",
+    "/api/v1/volumes/{name}/row",
     "/api/v1/volumes/{name}/snapshots",
     "/api/v1/volumes/{name}/snapshots/{snap}",
 ];

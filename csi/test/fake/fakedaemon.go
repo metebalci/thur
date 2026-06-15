@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -71,9 +72,11 @@ func (d *Daemon) routes() http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1/volumes", d.listVolumes)
 	mux.HandleFunc("POST /api/v1/volumes", d.createVolume)
+	mux.HandleFunc("GET /api/v1/volumes/{name}/row", d.volumeRow)
 	mux.HandleFunc("DELETE /api/v1/volumes/{name}", d.deleteVolume)
 	mux.HandleFunc("POST /api/v1/volumes/{name}/resize", d.resizeVolume)
 	mux.HandleFunc("POST /api/v1/volumes/{name}/clone", d.cloneVolume)
+	mux.HandleFunc("GET /api/v1/snapshots", d.findSnapshot)
 	mux.HandleFunc("GET /api/v1/volumes/{name}/snapshots", d.listSnapshots)
 	mux.HandleFunc("POST /api/v1/volumes/{name}/snapshots", d.createSnapshot)
 	mux.HandleFunc("DELETE /api/v1/volumes/{name}/snapshots/{snap}", d.deleteSnapshot)
@@ -129,6 +132,18 @@ func (d *Daemon) listVolumes(w http.ResponseWriter, _ *http.Request) {
 		rows = append(rows, *v)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"volumes": rows})
+}
+
+func (d *Daemon) volumeRow(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v, ok := d.volumes[name]
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Sprintf("volume '%s' not found", name))
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 func (d *Daemon) deleteVolume(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +254,35 @@ func (d *Daemon) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, vsa.SnapshotRow{Snapshot: s.Snapshot, SizeBytes: s.SizeBytes, CreatedAt: s.CreatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"volume": vol, "snapshots": rows})
+}
+
+func (d *Daemon) findSnapshot(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, "query parameter 'name' must be non-empty")
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// Sorted volume order mirrors the daemon's deterministic (volume,
+	// snapshot) walk, so the first match is stable across runs.
+	vols := make([]string, 0, len(d.snapshots))
+	for vol := range d.snapshots {
+		vols = append(vols, vol)
+	}
+	sort.Strings(vols)
+	for _, vol := range vols {
+		if s, ok := d.snapshots[vol][name]; ok {
+			writeJSON(w, http.StatusOK, vsa.SnapshotRow{
+				Volume:    vol,
+				Snapshot:  s.Snapshot,
+				SizeBytes: s.SizeBytes,
+				CreatedAt: s.CreatedAt,
+			})
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, fmt.Sprintf("no snapshot named '%s' found", name))
 }
 
 func (d *Daemon) deleteSnapshot(w http.ResponseWriter, r *http.Request) {

@@ -18,7 +18,11 @@
 //! All three verbs are instant (no job protocol): create is a flush +
 //! a sparse index copy, destroy is a directory removal.
 
-use axum::{Json, extract::Path as AxumPath, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path as AxumPath, Query, State},
+    http::StatusCode,
+};
 use core_block::{PageIndex, SnapshotManifest, VolumeManifest};
 use serde::Deserialize;
 use serde_json::json;
@@ -179,6 +183,76 @@ pub async fn list(
         }
     }
     Ok(Json(json!({ "volume": name, "snapshots": snapshots })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FindSnapshotQuery {
+    /// Snapshot name to locate across all volumes.
+    pub name: String,
+}
+
+/// `GET /api/v1/snapshots?name=<snap>` — find a snapshot by name across
+/// every volume.
+///
+/// The daemon scopes snapshot names per-volume, so a name can in
+/// principle exist on more than one volume; this returns the first match
+/// in the same sorted `(volume, snapshot)` order the GC walk uses, so the
+/// result is deterministic. It exists for the CSI driver, whose snapshot
+/// Name must be globally unique: a single round trip here replaces the
+/// driver's prior O(volumes) `ListSnapshots` fan-out (issue #294). 404
+/// when no volume carries a snapshot with that name. The on-disk walk is
+/// offloaded to a blocking thread so it can't stall a runtime worker
+/// shared with the data path.
+pub async fn find(
+    State(state): State<AdminState>,
+    Query(q): Query<FindSnapshotQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if q.name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "query parameter 'name' must be non-empty" })),
+        ));
+    }
+    let data_dir = state.data_dir.clone();
+    let target = q.name.clone();
+    let found = tokio::task::spawn_blocking(
+        move || -> Result<Option<(String, SnapshotManifest)>, core_block::VolumeError> {
+            for (parent, snap) in SnapshotManifest::list_all(&data_dir)? {
+                if snap == target {
+                    return Ok(Some((parent.clone(), SnapshotManifest::load(
+                        &data_dir, &parent, &snap,
+                    )?)));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("snapshot scan task: {e}") })),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("scan snapshots: {e}") })),
+        )
+    })?;
+
+    match found {
+        Some((parent, m)) => Ok(Json(json!({
+            "volume": parent,
+            "snapshot": m.name,
+            "size_bytes": m.size_bytes,
+            "created_at": m.created_at,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no snapshot named '{}' found", q.name) })),
+        )),
+    }
 }
 
 /// `DELETE /api/v1/volumes/{name}/snapshots/{snap}` — remove a snapshot.
@@ -446,5 +520,17 @@ mod tests {
         // The name is mandatory — an empty body is a deserialize error,
         // not a silent default.
         assert!(serde_json::from_value::<CreateSnapshotRequest>(json!({})).is_err());
+    }
+
+    #[test]
+    fn find_query_requires_the_name_param() {
+        // The cross-volume find verb (issue #294) keys off a single
+        // required `name` query parameter. The Deserialize derive is what
+        // axum's Query extractor drives; confirm the field is mandatory
+        // (a missing key is an error, not a silent default) — the handler
+        // additionally rejects an explicit empty value with 400.
+        let q: FindSnapshotQuery = serde_json::from_value(json!({ "name": "daily" })).unwrap();
+        assert_eq!(q.name, "daily");
+        assert!(serde_json::from_value::<FindSnapshotQuery>(json!({})).is_err());
     }
 }
