@@ -56,6 +56,16 @@ pub const DEFAULT_P2C: u32 = 600_000;
 /// (e.g. a hand-crafted hostile envelope) is refused at decode time.
 pub const MIN_P2C: u32 = 100_000;
 
+/// Maximum acceptable PBKDF2 iteration count. The defense against a
+/// hostile envelope must be symmetric: an absurdly-high `p2c` (a header
+/// can claim up to `u32::MAX`) would otherwise run derive_key —
+/// `pbkdf2::<Hmac<Sha512>>` — for hours of single-core CPU *before* any
+/// authenticity check is possible, since the unwrap that detects a
+/// wrong/tampered envelope happens only after key derivation. 10x the
+/// default ceiling keeps a legitimate operator override (`--iter`)
+/// usable while refusing the DoS (issue #268).
+pub const MAX_P2C: u32 = DEFAULT_P2C.saturating_mul(10);
+
 const SALT_LEN: usize = 16;
 const CEK_LEN: usize = 32;
 const GCM_IV_LEN: usize = 12;
@@ -81,6 +91,11 @@ pub enum EnvelopeError {
     #[error("envelope PBKDF2 iteration count {0} below minimum {1}")]
     IterTooLow(u32, u32),
 
+    /// Header's iteration count is above [`MAX_P2C`] — refused before
+    /// running the (attacker-controlled-cost) key derivation (issue #268).
+    #[error("envelope PBKDF2 iteration count {0} above maximum {1}")]
+    IterTooHigh(u32, u32),
+
     /// Uniform decrypt failure — wrong passphrase, tampered
     /// ciphertext, tampered header, tampered wrapped CEK. Mapped
     /// uniformly so the variant doesn't leak which check tripped
@@ -103,6 +118,9 @@ pub fn encode(
 ) -> Result<String, EnvelopeError> {
     if p2c < MIN_P2C {
         return Err(EnvelopeError::IterTooLow(p2c, MIN_P2C));
+    }
+    if p2c > MAX_P2C {
+        return Err(EnvelopeError::IterTooHigh(p2c, MAX_P2C));
     }
 
     let mut salt = [0u8; SALT_LEN];
@@ -226,6 +244,9 @@ pub fn decode(
         .map_err(|_| EnvelopeError::Format("p2c out of u32 range".into()))?;
     if p2c < MIN_P2C {
         return Err(EnvelopeError::IterTooLow(p2c, MIN_P2C));
+    }
+    if p2c > MAX_P2C {
+        return Err(EnvelopeError::IterTooHigh(p2c, MAX_P2C));
     }
 
     let wrapped_cek = B64
@@ -411,6 +432,47 @@ mod tests {
     fn low_iteration_count_refused_on_encode() {
         let err = encode(b"x", "pass", 1, &extras()).expect_err("must fail");
         assert!(matches!(err, EnvelopeError::IterTooLow(1, _)));
+    }
+
+    /// Issue #268: an absurdly-high p2c is refused on encode.
+    #[test]
+    fn high_iteration_count_refused_on_encode() {
+        let err = encode(b"x", "pass", MAX_P2C + 1, &extras()).expect_err("must fail");
+        assert!(matches!(err, EnvelopeError::IterTooHigh(_, _)), "got {err:?}");
+    }
+
+    /// Issue #268: a hostile envelope claiming p2c = u32::MAX is refused
+    /// at decode *before* derive_key runs — so it can't burn hours of CPU.
+    #[test]
+    fn high_iteration_count_refused_on_decode_before_kdf() {
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "alg".into(),
+            serde_json::Value::String("PBES2-HS512+A256KW".into()),
+        );
+        header.insert("enc".into(), serde_json::Value::String("A256GCM".into()));
+        header.insert(
+            "p2s".into(),
+            serde_json::Value::String(B64.encode([0u8; 16])),
+        );
+        header.insert("p2c".into(), serde_json::Value::from(u32::MAX));
+        let header_b64 = B64.encode(serde_json::to_vec(&header).unwrap());
+        let fake = format!(
+            "{}.{}.{}.{}.{}",
+            header_b64,
+            B64.encode([0u8; WRAPPED_CEK_LEN]),
+            B64.encode([0u8; GCM_IV_LEN]),
+            B64.encode([0u8; 0]),
+            B64.encode([0u8; GCM_TAG_LEN]),
+        );
+        let start = std::time::Instant::now();
+        let err = decode(&fake, "pass").expect_err("must fail");
+        // Refused near-instantly (the KDF never ran).
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "decode must refuse before running the expensive KDF"
+        );
+        assert!(matches!(err, EnvelopeError::IterTooHigh(_, _)), "got {err:?}");
     }
 
     #[test]
