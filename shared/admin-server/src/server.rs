@@ -52,8 +52,28 @@ const ADMIN_SOCKET_MODE: u32 = 0o660;
 /// entries.
 pub async fn run_admin_server(socket_path: PathBuf, router: Router) -> Result<()> {
     if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("removing stale admin socket {}", socket_path.display()))?;
+        // Probe whether a live daemon is already serving this socket
+        // before unlinking it. Unconditionally removing it (the old
+        // behavior) clobbered a running peer's socket — the survivor then
+        // served an unlinked socket no new client could reach, so every
+        // daemon-routed CLI verb / CSI admin call failed with "is the
+        // daemon running?" until restart (issue #272). Only a *failed*
+        // connect (stale crash leftover / not a live listener) lets us
+        // reclaim it; a successful connect means a live daemon, so refuse.
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(_) => {
+                anyhow::bail!(
+                    "admin socket {} is already being served by a live daemon — \
+                     refusing to start a second instance (stop the running daemon first)",
+                    socket_path.display()
+                );
+            }
+            Err(_) => {
+                std::fs::remove_file(&socket_path).with_context(|| {
+                    format!("removing stale admin socket {}", socket_path.display())
+                })?;
+            }
+        }
     }
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
@@ -90,6 +110,13 @@ pub async fn run_admin_server(socket_path: PathBuf, router: Router) -> Result<()
             Ok(pair) => pair,
             Err(e) => {
                 warn!("admin accept failed: {e}");
+                // Back off briefly: a persistent accept error — EMFILE /
+                // ENFILE fd exhaustion is plausible in this socket- and
+                // fd-heavy process — would otherwise spin this loop at
+                // 100% CPU and flood the log one line per iteration,
+                // degrading the data path exactly when the process is
+                // already resource-stressed (issue #273).
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -290,4 +317,68 @@ where
         .header("x-content-type-options", "nosniff")
         .body(Body::from_stream(stream))
         .expect("stream response builder")
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    /// Issue #272: starting a second server on a socket a live daemon is
+    /// already serving must refuse rather than unlink the live socket.
+    #[tokio::test]
+    async fn refuses_to_clobber_live_admin_socket() {
+        let dir = std::env::temp_dir().join(format!("thur-adminsrv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("admin.sock");
+
+        // A live daemon already serving the socket (the OS accepts into
+        // the listen backlog, so a probing connect() succeeds).
+        let live = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let err = run_admin_server(path.clone(), Router::new())
+            .await
+            .expect_err("must refuse to clobber a live socket");
+        assert!(
+            err.to_string().contains("already being served"),
+            "got: {err}"
+        );
+        // The live socket file is untouched.
+        assert!(path.exists());
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale socket file (no live listener) is reclaimed: the server
+    /// removes it and binds its own.
+    #[tokio::test]
+    async fn reclaims_stale_admin_socket() {
+        let dir = std::env::temp_dir().join(format!("thur-adminsrv-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("admin.sock");
+
+        // Stale leftover: bind then drop — the std listener leaves the
+        // socket file in place but connect() now refuses.
+        {
+            let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(l);
+        }
+        assert!(path.exists());
+
+        let server = tokio::spawn(run_admin_server(path.clone(), Router::new()));
+        // Reclaim + re-serve should make it connectable again.
+        let mut connected = false;
+        for _ in 0..100 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(connected, "stale socket must be reclaimed and re-served");
+    }
 }

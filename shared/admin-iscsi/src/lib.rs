@@ -293,6 +293,19 @@ pub async fn rotate<S: IscsiUsersState>(
             "grace_seconds must be > 0; use add + remove for an immediate cutover",
         ));
     }
+    // Bound the grace window before any chrono arithmetic. An unchecked
+    // `grace_seconds as i64` wraps negative for values > i64::MAX (yielding
+    // an already-past expiry that drops the old CHAP secret immediately
+    // while the operator believes a window is active), and
+    // `ChronoDuration::seconds` panics above ~9.2e15 — both reachable via
+    // the shipped CLI (`--grace 5000000000years` → ~1.6e17 s). A rotation
+    // grace longer than ~10 years is certainly a mistake (issue #274).
+    const MAX_GRACE_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+    if body.grace_seconds > MAX_GRACE_SECONDS {
+        return Err(ApiError::bad_request(
+            "grace_seconds too large (max ~10 years)",
+        ));
+    }
 
     let _users_guard = USERS_WRITE_LOCK.lock().await;
     let (path, mut file) = load_users(&state)?;
@@ -310,7 +323,11 @@ pub async fn rotate<S: IscsiUsersState>(
         )));
     }
 
-    let expires = Utc::now() + ChronoDuration::seconds(body.grace_seconds as i64);
+    // Bounded above by MAX_GRACE_SECONDS, so `try_seconds` always
+    // succeeds; using the fallible form keeps the panic impossible.
+    let grace = ChronoDuration::try_seconds(body.grace_seconds as i64)
+        .ok_or_else(|| ApiError::bad_request("grace_seconds out of representable range"))?;
+    let expires = Utc::now() + grace;
     let old_password = std::mem::replace(&mut user.password, body.password);
     user.previous_password = Some(old_password);
     user.previous_expires_at = Some(expires);
@@ -963,6 +980,37 @@ mod tests {
         .await
         .expect_err("repeat");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #274: an absurd grace_seconds (reachable via the CLI's
+    /// humantime parse, e.g. `--grace 5000000000years`) must be rejected
+    /// with BAD_REQUEST, not panic the handler (ChronoDuration::seconds
+    /// out of bounds) or wrap negative into an already-expired rotation.
+    #[tokio::test]
+    async fn rotate_rejects_absurd_grace_seconds_without_panicking() {
+        let (_t, state) = fresh_state();
+        let _ = add(
+            State(state.clone()),
+            peer(),
+            axum::Json(add_req("alice", "password-1234")),
+        )
+        .await
+        .expect("add ok");
+
+        for grace in [u64::MAX, 1_600_000_000_000_000_000, (i64::MAX as u64) + 1] {
+            let err = rotate(
+                State(state.clone()),
+                peer(),
+                axum::Json(RotateRequest {
+                    name: "alice".into(),
+                    password: "new-password-5678".into(),
+                    grace_seconds: grace,
+                }),
+            )
+            .await
+            .expect_err("absurd grace must be refused");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "grace={grace}");
+        }
     }
 
     #[tokio::test]
