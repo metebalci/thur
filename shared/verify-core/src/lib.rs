@@ -237,17 +237,19 @@ fn sweep_pool_chunks(
         namespace,
         ..Default::default()
     };
-    match pool.iter_chunks() {
-        Ok(items) => {
-            for (hash, size) in items {
-                sweep.chunks += 1;
-                if !live.contains(&hash) {
-                    sweep.orphans += 1;
-                    sweep.orphan_bytes += size;
-                }
-            }
+    // Stream the pool instead of materializing the whole chunk list:
+    // at the documented ~60 M-chunk scale `iter_chunks` is a multi-GB
+    // allocation per sweep (issue #235). We only need counts + sums, so
+    // an O(1)-memory visitor suffices. `live.contains(hash)` accepts the
+    // borrowed `&str` directly.
+    if let Err(e) = pool.for_each_chunk_hex(|hash, size| {
+        sweep.chunks += 1;
+        if !live.contains(hash) {
+            sweep.orphans += 1;
+            sweep.orphan_bytes += size;
         }
-        Err(e) => errors.push(format!("{} scan failed: {}", context, e)),
+    }) {
+        errors.push(format!("{} scan failed: {}", context, e));
     }
     sweep
 }

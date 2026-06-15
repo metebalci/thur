@@ -55,11 +55,7 @@ pub fn refresh_pool_budget_from_volumes(
     let mut buckets: HashMap<Option<String>, u64> = HashMap::new();
 
     let pool = ChunkPool::new(data_dir, backend_name)?;
-    let global_sum: u64 = pool
-        .iter_chunks()?
-        .into_iter()
-        .map(|(_, sz)| sz)
-        .sum::<u64>();
+    let global_sum = pool.total_chunk_bytes()?;
     if global_sum > 0 {
         buckets.insert(None, global_sum);
     }
@@ -84,11 +80,7 @@ pub fn refresh_pool_budget_from_volumes(
                 continue;
             }
             let ns_pool = ChunkPool::new_namespaced(data_dir, backend_name, &ns)?;
-            let ns_sum: u64 = ns_pool
-                .iter_chunks()?
-                .into_iter()
-                .map(|(_, sz)| sz)
-                .sum::<u64>();
+            let ns_sum = ns_pool.total_chunk_bytes()?;
             if ns_sum > 0 {
                 buckets.insert(Some(ns), ns_sum);
             }
@@ -412,15 +404,19 @@ impl DiskCacheManager {
         // Global per-backend pool (DedupScope::Global volumes share
         // these chunks).
         let pool = ChunkPool::new(&self.data_dir, &self.backend_name)?;
-        for (hash, size) in pool.iter_chunks()? {
+        // Build the candidate list directly from the streaming walk
+        // rather than via an intermediate `iter_chunks` Vec — the
+        // candidate Vec is inherent to eviction, but the duplicate
+        // all-chunks Vec is not (issue #235).
+        pool.for_each_chunk_hex(|hash, size| {
             out.push(EvictableChunk {
-                hash,
+                hash: hash.to_string(),
                 size,
                 last_accessed: 0,
                 namespace: None,
                 uploaded: true,
             });
-        }
+        })?;
 
         // Local-scope per-volume namespaces. A snapshot/clone family
         // shares one namespace (issue #13), so dedup across volumes —
@@ -444,15 +440,15 @@ impl DiskCacheManager {
                     continue;
                 }
                 let ns_pool = ChunkPool::new_namespaced(&self.data_dir, &self.backend_name, &ns)?;
-                for (hash, size) in ns_pool.iter_chunks()? {
+                ns_pool.for_each_chunk_hex(|hash, size| {
                     out.push(EvictableChunk {
-                        hash,
+                        hash: hash.to_string(),
                         size,
                         last_accessed: 0,
                         namespace: Some(ns.clone()),
                         uploaded: true,
                     });
-                }
+                })?;
             }
         }
 

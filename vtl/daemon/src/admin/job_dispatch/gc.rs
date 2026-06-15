@@ -402,16 +402,20 @@ fn sweep_one_pool(
     budget: Option<&PoolBudget>,
     lines: &mut Vec<String>,
 ) -> anyhow::Result<u64> {
-    let pool = store.iter_chunks()?;
-    let total = pool.len();
-    let mut orphans = 0usize;
-    let mut bytes_freed = 0u64;
     let ns_label = namespace.unwrap_or("(shared)");
-
     let recent_cutoff = now_secs().saturating_sub(GC_RECENT_SEAL_GRACE_SECS);
-    for (hash, size) in pool {
-        if live.contains(&hash) {
-            continue;
+
+    // Stream the pool and collect only the orphans rather than
+    // materializing every chunk into one Vec (issue #235): the deletes
+    // run *after* the walk completes, so we never mutate the directory
+    // we're iterating (the reason the materialize-then-delete shape
+    // existed in the first place).
+    let mut total = 0usize;
+    let mut to_delete: Vec<(String, u64)> = Vec::new();
+    store.for_each_chunk_hex(|hash, size| {
+        total += 1;
+        if live.contains(hash) {
+            return;
         }
         // Recent-seal grace window (issue #141): a chunk sealed after the
         // phase-1 live-set snapshot looks like an orphan but is referenced
@@ -419,7 +423,7 @@ fn sweep_one_pool(
         // host-acked data before its upload completes. Skip chunks whose
         // pool file was modified within the grace window; a genuine orphan
         // ages past it and is reclaimed on a later run.
-        if let Some(mtime) = store.chunk_mtime_secs(&hash)
+        if let Some(mtime) = store.chunk_mtime_secs(hash)
             && mtime >= recent_cutoff
         {
             lines.push(format!(
@@ -428,8 +432,15 @@ fn sweep_one_pool(
                 size,
                 ns_label,
             ));
-            continue;
+            return;
         }
+        to_delete.push((hash.to_string(), size));
+    })?;
+
+    let mut orphans = 0usize;
+    let mut bytes_freed = 0u64;
+    for (hash, size) in &to_delete {
+        let size = *size;
         orphans += 1;
         bytes_freed += size;
         if dry_run {
@@ -440,7 +451,7 @@ fn sweep_one_pool(
                 ns_label,
             ));
         } else {
-            store.remove(&hash)?;
+            store.remove(hash)?;
             // Release the freed bytes back to the per-backend budget so
             // `current_bytes()` stays equal to on-disk pool bytes (the
             // eviction worker reads the budget instead of rescanning).
@@ -871,7 +882,7 @@ mod tests {
         )
         .expect("write manifest");
         let pages = collect_live_index_pages(dir.path()).expect("collect");
-        assert!(pages.get(&("s3b".to_string(), "TAPE002".to_string())).is_none());
+        assert!(!pages.contains_key(&("s3b".to_string(), "TAPE002".to_string())));
     }
 
     #[test]

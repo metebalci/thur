@@ -589,6 +589,31 @@ impl ChunkPool {
         Ok(out)
     }
 
+    /// Streaming counterpart of [`iter_chunks`] that yields the chunk's
+    /// hex hash `&str` + size borrowed straight from the walk — no
+    /// per-chunk `String`, no full `Vec`. The O(1)-memory replacement for
+    /// callers that keep their hex-keyed logic (orphan sweeps comparing
+    /// against a `HashSet<String>` live set, eviction candidate builders)
+    /// but must not pay the multi-GB `iter_chunks` Vec at the documented
+    /// pool scale (issue #235). The borrowed `&str` is only valid for the
+    /// callback; clone it if the caller needs to retain it.
+    pub fn for_each_chunk_hex(
+        &self,
+        mut f: impl FnMut(&str, u64),
+    ) -> Result<(), ChunkPoolError> {
+        self.walk_chunk_files(|hash_hex, size| f(hash_hex, size))
+    }
+
+    /// Sum of every chunk file's on-disk size, streamed — the
+    /// O(1)-memory replacement for `iter_chunks().map(|(_, s)| s).sum()`
+    /// on the budget-refresh / usage-calc paths, which discard the hash
+    /// entirely (issue #235).
+    pub fn total_chunk_bytes(&self) -> Result<u64, ChunkPoolError> {
+        let mut total: u64 = 0;
+        self.walk_chunk_files(|_, size| total = total.saturating_add(size))?;
+        Ok(total)
+    }
+
     /// Streaming counterpart of [`iter_chunks`]: invokes `f` with each
     /// chunk's 32-byte hash + size **without** materializing the whole
     /// pool. The `system stats` / `system gc` dedup scans fold straight
@@ -962,6 +987,36 @@ mod tests {
         .unwrap();
         assert_eq!(got, want);
         assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn for_each_chunk_hex_and_total_bytes_match_iter_chunks() {
+        // Issue #235: the streaming hex visitor + size sum must see
+        // exactly the same (hash, size) set / total `iter_chunks` builds.
+        use std::collections::HashMap;
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        for body in [b"one".as_slice(), b"two", b"three-payload", b"four"] {
+            pool.insert_bytes(body).unwrap();
+        }
+        let want: HashMap<String, u64> = pool.iter_chunks().unwrap().into_iter().collect();
+
+        let mut got: HashMap<String, u64> = HashMap::new();
+        pool.for_each_chunk_hex(|hash, size| {
+            got.insert(hash.to_string(), size);
+        })
+        .unwrap();
+        assert_eq!(got, want);
+
+        let want_total: u64 = want.values().sum();
+        assert_eq!(pool.total_chunk_bytes().unwrap(), want_total);
+    }
+
+    #[test]
+    fn total_chunk_bytes_on_empty_pool_is_zero() {
+        let tmp = TempDir::new().unwrap();
+        let pool = ChunkPool::new(tmp.path(), "primary").unwrap();
+        assert_eq!(pool.total_chunk_bytes().unwrap(), 0);
     }
 
     #[test]

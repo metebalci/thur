@@ -134,6 +134,15 @@ pub fn resolve_and_apply_caps(
 /// `disk_cache_watermark` alert (per-backend dedup keeps that to one
 /// emit per dedup window), then returns `false`.
 pub fn check_usage_or_alert(backend: &str, used: u64, cap: u64, budget: &PoolBudget) -> bool {
+    // cap == 0 is "no gate" to PoolBudget (every reserve succeeds,
+    // over_soft_watermark() is false), so it must mean "within budget"
+    // here too. Without this, an operator who sets `size_gb: 0` expecting
+    // "unlimited" — or an `auto` backend whose statvfs failed to 0 —
+    // drives a full-cache eviction storm every tick, since `used <= 0`
+    // is false for any resident byte (issue #237).
+    if cap == 0 {
+        return false;
+    }
     if used <= cap {
         let pct = if cap == 0 {
             0
@@ -181,6 +190,15 @@ mod tests {
     fn zero_cap_with_zero_used_is_within() {
         let budget = PoolBudget::new(std::path::PathBuf::from("/tmp"), 0, 0, 90);
         assert!(!check_usage_or_alert("b", 0, 0, &budget));
+    }
+
+    /// Issue #237: cap == 0 means "no gate", so even a fully-populated
+    /// cache must NOT be flagged for eviction — otherwise size_gb: 0
+    /// triggers a full-cache eviction storm every tick.
+    #[test]
+    fn zero_cap_with_nonzero_used_is_within() {
+        let budget = PoolBudget::new(std::path::PathBuf::from("/tmp"), 0, 0, 90);
+        assert!(!check_usage_or_alert("b", 5_000_000_000, 0, &budget));
     }
 
     /// The divergence detector tolerates small transient skew but flags

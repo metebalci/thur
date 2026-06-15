@@ -144,11 +144,7 @@ impl DiskCacheManager {
 
         // Per-backend sealed shared pool (Global scope)
         if let Ok(store) = ChunkStore::new(&self.data_dir, &self.backend_name) {
-            total_bytes += store
-                .iter_chunks()?
-                .into_iter()
-                .map(|(_, size)| size)
-                .sum::<u64>();
+            total_bytes += store.total_chunk_bytes()?;
         }
 
         // Per-cartridge namespaces (Local scope) + per-cartridge staging
@@ -170,11 +166,7 @@ impl DiskCacheManager {
                     && let Ok(ns_store) =
                         ChunkStore::new_namespaced(&self.data_dir, &self.backend_name, &label)
                 {
-                    total_bytes += ns_store
-                        .iter_chunks()?
-                        .into_iter()
-                        .map(|(_, size)| size)
-                        .sum::<u64>();
+                    total_bytes += ns_store.total_chunk_bytes()?;
                 }
 
                 let staging_dir = entry.path().join(".staging");
@@ -715,11 +707,7 @@ pub fn refresh_pool_budget_from_tapes(
 ) -> Result<()> {
     let mut buckets: HashMap<Option<String>, u64> = HashMap::new();
     let store = ChunkStore::new(data_dir, backend_name)?;
-    let global_sum: u64 = store
-        .iter_chunks()?
-        .into_iter()
-        .map(|(_, sz)| sz)
-        .sum::<u64>();
+    let global_sum = store.total_chunk_bytes()?;
     if global_sum > 0 {
         buckets.insert(None, global_sum);
     }
@@ -740,11 +728,7 @@ pub fn refresh_pool_budget_from_tapes(
                 None => continue,
             };
             let ns_store = ChunkStore::new_namespaced(data_dir, backend_name, &label)?;
-            let ns_sum: u64 = ns_store
-                .iter_chunks()?
-                .into_iter()
-                .map(|(_, sz)| sz)
-                .sum::<u64>();
+            let ns_sum = ns_store.total_chunk_bytes()?;
             if ns_sum > 0 {
                 buckets.insert(Some(label), ns_sum);
             }
