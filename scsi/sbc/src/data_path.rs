@@ -26,6 +26,7 @@
 //! synchronously clears the page-index slot; the storage-side chunk
 //! lingers in the per-backend pool until `system gc` reclaims it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use core_block::PageCache;
@@ -280,7 +281,10 @@ pub(super) async fn synchronize_cache(
         }
         range.blocks
     } else {
-        if range.lba > sz.total_blocks {
+        // `>=`: the last valid LBA is total_blocks - 1, so lba ==
+        // total_blocks (one past the end) is out of range, not a
+        // zero-length no-op at GOOD (issue #254).
+        if range.lba >= sz.total_blocks {
             return ScsiResponse::check(SenseData::LBA_OUT_OF_RANGE);
         }
         // "From LBA to end of medium."
@@ -649,7 +653,9 @@ pub(super) async fn write_same(
     };
 
     let sz = Sizing::from(cache);
-    if lba > sz.total_blocks {
+    // `>=`: lba == total_blocks is one past the last valid LBA, so it's
+    // LBA OUT OF RANGE rather than a zero-length op at GOOD (issue #254).
+    if lba >= sz.total_blocks {
         return ScsiResponse::check(SenseData::LBA_OUT_OF_RANGE);
     }
     let blocks = if blocks_field == 0 {
@@ -702,20 +708,28 @@ pub(super) async fn write_same(
     const TARGET_CHUNK_BYTES: usize = 16 * 1024 * 1024;
     let chunk_sectors = (TARGET_CHUNK_BYTES / sector).max(1);
     let chunk_bytes = chunk_sectors * sector;
-    let mut remaining = len_bytes as usize;
+    let total = len_bytes as usize;
+    // Build the chunk buffer once and reuse it across iterations rather
+    // than re-allocating + re-zeroing/re-filling a fresh (up to 16 MiB)
+    // buffer per chunk (issue #255). The pattern repeats identically and
+    // every chunk is sector-aligned, so a single fill of the max chunk
+    // serves every iteration through a prefix slice. Sized to the actual
+    // transfer so a small WRITE SAME doesn't allocate the full 16 MiB.
+    let buf_len = chunk_bytes.min(total);
+    let buf = if pattern_is_zero {
+        vec![0u8; buf_len]
+    } else {
+        let mut b = Vec::with_capacity(buf_len);
+        while b.len() < buf_len {
+            b.extend_from_slice(pattern);
+        }
+        b
+    };
+    let mut remaining = total;
     let mut cursor = byte_offset;
     while remaining > 0 {
         let this = remaining.min(chunk_bytes);
-        let buf = if pattern_is_zero {
-            vec![0u8; this]
-        } else {
-            let mut b = Vec::with_capacity(this);
-            while b.len() < this {
-                b.extend_from_slice(pattern);
-            }
-            b
-        };
-        if let Err(e) = cache.write_bytes(cursor, &buf).await {
+        if let Err(e) = cache.write_bytes(cursor, &buf[..this]).await {
             return ScsiResponse::check(map_write_error(&e));
         }
         cursor += this as u64;
@@ -1000,13 +1014,16 @@ fn resolve_targets_and_plan(
     // Resolve every target descriptor up front. Each entry pairs the
     // resolved LUN with its PageCache handle so per-segment
     // reservation checks have everything they need without going
-    // back to the registry.
+    // back to the registry. Build the NAA reverse index once per
+    // command so the per-descriptor resolution is a hash lookup, not a
+    // full-registry rescan (issue #256).
+    let naa_index = build_naa_index(registry, session_volumes);
     let mut targets: Vec<TargetHandle> = Vec::with_capacity(tdesc_count);
     for i in 0..tdesc_count {
         let off = tdesc_off + i * 32;
         let desc = &plist[off..off + 32];
-        let pair = resolve_target_descriptor(registry, session_volumes, desc)
-            .map_err(ExtendedCopyParseError::Sense)?;
+        let pair =
+            resolve_target_descriptor(&naa_index, desc).map_err(ExtendedCopyParseError::Sense)?;
         targets.push(pair);
     }
 
@@ -1462,9 +1479,34 @@ fn lun_admitted(
     }
 }
 
-fn resolve_target_descriptor(
+/// Build a reverse `NAA designator → (LUN, PageCache)` index over this
+/// session's admitted volumes in a single registry pass, so each XCOPY
+/// target descriptor resolves by hash lookup instead of rescanning every
+/// volume per descriptor — O(volumes + descriptors) per command rather
+/// than O(volumes × descriptors) (issue #256). One pass per command also
+/// respects the registry's deliberate no-persistent-secondary-index
+/// design (registry.rs).
+fn build_naa_index(
     registry: &Arc<dyn VolumeLookup>,
     session_volumes: Option<&[String]>,
+) -> HashMap<[u8; 8], (u64, Arc<PageCache>)> {
+    let mut index = HashMap::new();
+    for lun in registry.luns() {
+        // Skip LUNs outside this session's admission set so a
+        // non-admitted tenant's NAA never resolves (issue #131).
+        if !lun_admitted(registry, session_volumes, lun) {
+            continue;
+        }
+        if let Some(cache) = registry.get(lun) {
+            let naa = naa_locally_assigned(&cache.manifest().uuid);
+            index.insert(naa, (lun, cache));
+        }
+    }
+    index
+}
+
+fn resolve_target_descriptor(
+    naa_index: &HashMap<[u8; 8], (u64, Arc<PageCache>)>,
     desc: &[u8],
 ) -> Result<(u64, Arc<PageCache>), SenseData> {
     if desc.len() < 32 || desc[0] != 0xE4 {
@@ -1485,21 +1527,15 @@ fn resolve_target_descriptor(
     if designator_type != 0x03 || designator_len != 8 {
         return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
     }
-    for lun in registry.luns() {
-        // Skip LUNs outside this session's admission set so a
-        // non-admitted tenant's NAA never resolves (issue #131).
-        if !lun_admitted(registry, session_volumes, lun) {
-            continue;
-        }
-        let Some(cache) = registry.get(lun) else {
-            continue;
-        };
-        let expected = naa_locally_assigned(&cache.manifest().uuid);
-        if designator == expected.as_slice() {
-            return Ok((lun, cache));
-        }
-    }
-    Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST)
+    // `designator_len == 8` is checked above, so this conversion can't
+    // fail; fall back to the parameter-list error rather than unwrap.
+    let Ok(key) = <[u8; 8]>::try_from(designator) else {
+        return Err(SenseData::INVALID_FIELD_IN_PARAMETER_LIST);
+    };
+    naa_index
+        .get(&key)
+        .map(|(lun, cache)| (*lun, Arc::clone(cache)))
+        .ok_or(SenseData::INVALID_FIELD_IN_PARAMETER_LIST)
 }
 
 /// Build the SPC-3 §6.18.4 OPERATING PARAMETERS response (RECEIVE
@@ -2696,6 +2732,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synchronize_cache_lba_equal_capacity_is_out_of_range() {
+        // Issue #254: LBA == total_blocks (one past the last valid LBA),
+        // blocks=0, must be LBA OUT OF RANGE — not a GOOD zero-length op.
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path(), 4 * (1u64 << 20), false).await; // 1024 blocks
+        let cdb = sync10_cdb(1024, 0);
+        let r = synchronize_cache(
+            &req(&cdb, &[], 0),
+            Some(cache.as_ref()),
+            test_nexus(),
+            &test_mgr(),
+        )
+        .await;
+        assert_eq!(r.sense, Some(SenseData::LBA_OUT_OF_RANGE));
+    }
+
+    #[tokio::test]
     async fn read_after_partial_overwrite_returns_latest_bytes() {
         let tmp = TempDir::new().unwrap();
         let cache = fixture_cache(tmp.path(), 4 * (1u64 << 20), false).await;
@@ -3654,6 +3707,23 @@ mod tests {
         )
         .await;
         assert!(r.sense.is_none(), "{:?}", r.sense);
+    }
+
+    #[tokio::test]
+    async fn write_same_lba_equal_capacity_is_out_of_range() {
+        // Issue #254: WRITE SAME(16) blocks=0 at LBA == total_blocks
+        // (one past the end) must be LBA OUT OF RANGE, not a GOOD no-op.
+        let tmp = TempDir::new().unwrap();
+        let cache = fixture_cache(tmp.path(), 4 * (1u64 << 20), false).await; // 1024 blocks
+        let cdb = write_same_16_cdb(1024, 0, false, true);
+        let r = write_same(
+            &req(&cdb, &[], 0),
+            Some(cache.as_ref()),
+            test_nexus(),
+            &test_mgr(),
+        )
+        .await;
+        assert_eq!(r.sense, Some(SenseData::LBA_OUT_OF_RANGE));
     }
 
     #[tokio::test]
