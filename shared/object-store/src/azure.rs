@@ -266,6 +266,28 @@ impl AzureBackend {
     fn blob(&self, full_key: &str) -> BlobClient {
         self.container.blob_client(full_key)
     }
+
+    /// ARM management-plane host for [`Self::lock_state`], derived from
+    /// the configured data-plane `endpoint_url`'s sovereign-cloud suffix
+    /// so a non-public storage (Azure China / US Gov) queries the correct
+    /// ARM endpoint instead of the hardcoded public one — which used to
+    /// make WORM-retention startup validation target the wrong ARM plane
+    /// even when the operator set `endpoint_url` (issue #263). Defaults to
+    /// the public cloud when no override is set or the suffix is
+    /// unrecognized (Azurite / custom endpoints have no ARM plane anyway).
+    fn arm_management_host(&self) -> &'static str {
+        arm_host_for_endpoint(self.endpoint_url.as_deref())
+    }
+}
+
+/// Map a data-plane blob endpoint to its sovereign cloud's ARM
+/// management host (issue #263). Public cloud is the default.
+fn arm_host_for_endpoint(endpoint: Option<&str>) -> &'static str {
+    match endpoint {
+        Some(ep) if ep.contains("core.chinacloudapi.cn") => "management.chinacloudapi.cn",
+        Some(ep) if ep.contains("core.usgovcloudapi.net") => "management.usgovcloudapi.net",
+        _ => "management.azure.com",
+    }
 }
 
 /// Resolved credential pair: an optional SAS URL override (used when
@@ -849,15 +871,19 @@ impl ObjectStoreBackend for AzureBackend {
             }
         };
 
+        // Honor the configured endpoint's sovereign cloud for both the
+        // token scope and the ARM URL (issue #263).
+        let arm_host = self.arm_management_host();
+        let scope = format!("https://{arm_host}/.default");
         let token = credential
-            .get_token(&["https://management.azure.com/.default"], None)
+            .get_token(&[scope.as_str()], None)
             .await
             .map_err(|e| {
                 ObjectStoreError::Other(format!("Azure ARM token acquisition failed: {e}"))
             })?;
 
         let url = format!(
-            "https://management.azure.com/subscriptions/{}/resourceGroups/{}/\
+            "https://{arm_host}/subscriptions/{}/resourceGroups/{}/\
              providers/Microsoft.Storage/storageAccounts/{}/blobServices/default/\
              containers/{}/immutabilityPolicies/default?api-version=2023-01-01",
             subscription, resource_group, self.account, self.container_name
@@ -992,6 +1018,32 @@ impl ObjectStoreBackend for AzureBackend {
 
 #[cfg(test)]
 mod tests {
+    use super::arm_host_for_endpoint;
+
+    /// Issue #263: the ARM management host must follow the configured
+    /// endpoint's sovereign cloud, not always the public one.
+    #[test]
+    fn arm_host_follows_sovereign_cloud_endpoint() {
+        assert_eq!(arm_host_for_endpoint(None), "management.azure.com");
+        assert_eq!(
+            arm_host_for_endpoint(Some("https://acct.blob.core.windows.net/")),
+            "management.azure.com"
+        );
+        assert_eq!(
+            arm_host_for_endpoint(Some("https://acct.blob.core.chinacloudapi.cn/")),
+            "management.chinacloudapi.cn"
+        );
+        assert_eq!(
+            arm_host_for_endpoint(Some("https://acct.blob.core.usgovcloudapi.net/")),
+            "management.usgovcloudapi.net"
+        );
+        // Azurite / custom endpoints default to public (no ARM plane).
+        assert_eq!(
+            arm_host_for_endpoint(Some("http://127.0.0.1:10000/devstoreaccount1")),
+            "management.azure.com"
+        );
+    }
+
     #[test]
     fn test_full_key_with_prefix() {
         let prefix = "tapes/";

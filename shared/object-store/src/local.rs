@@ -309,6 +309,26 @@ fn synthetic_error(op: &'static str, key: &str, kind: FailureKind) -> ObjectStor
     )
 }
 
+/// Map a filesystem `io::Error` to the typed `ObjectStoreError` so the
+/// retry layer fails fast on permanent faults instead of burning 3-9 s
+/// of jittered backoff on them. A missing object (the corruption /
+/// eviction-race a chunk/manifest read must handle) is `NotFound` and a
+/// permission error is `Authz` — both classify as permanent and can't
+/// heal between attempts; every other IO error stays retryable `Io`.
+/// Only Local lacked this mapping, defeating the crate's own
+/// fail-fast-on-permanent-errors contract for one backend (issue #266).
+fn map_local_io(op: &str, key: &str, e: std::io::Error) -> ObjectStoreError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            ObjectStoreError::NotFound(format!("{op}: object {key} not found ({e})"))
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            ObjectStoreError::Authz(format!("{op}: permission denied for {key} ({e})"))
+        }
+        _ => ObjectStoreError::Io(e),
+    }
+}
+
 #[async_trait]
 impl ObjectStoreBackend for LocalBackend {
     async fn upload_chunk(
@@ -412,8 +432,13 @@ impl ObjectStoreBackend for LocalBackend {
                 self.check_injection("download_chunk", key)?;
                 let path = self.get_path(key);
 
-                // Up to 128 MiB; same reasoning as `upload_chunk`.
-                let data = tokio::fs::read(&path).await?;
+                // Up to 128 MiB; same reasoning as `upload_chunk`. Map a
+                // missing / unreadable file to a permanent error so the
+                // retry layer doesn't sleep 3-9 s on an ENOENT that can't
+                // heal (issue #266).
+                let data = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| map_local_io("download_chunk", key, e))?;
 
                 debug!(
                     "Local backend downloaded chunk: {} ({} bytes)",
@@ -475,7 +500,8 @@ impl ObjectStoreBackend for LocalBackend {
                 self.check_injection("download_manifest", key)?;
                 let path = self.get_path(key);
 
-                let json = fs::read_to_string(&path)?;
+                let json =
+                    fs::read_to_string(&path).map_err(|e| map_local_io("download_manifest", key, e))?;
 
                 debug!("Local backend downloaded manifest: {}", key);
 
@@ -507,34 +533,37 @@ impl ObjectStoreBackend for LocalBackend {
             return Ok(Vec::new());
         }
 
-        let mut results = Vec::new();
-
-        // Walk directory recursively
-        fn visit_dirs(dir: &Path, root: &Path, results: &mut Vec<String>) -> Result<()> {
-            if dir.is_dir() {
-                let entries = fs::read_dir(dir)?;
-
-                for entry in entries {
-                    let entry = entry?;
-                    let path = entry.path();
-
-                    if path.is_dir() {
-                        visit_dirs(&path, root, results)?;
-                    } else {
-                        // Get relative path from root
-                        if let Ok(rel_path) = path.strip_prefix(root) {
-                            let key = rel_path.to_string_lossy().to_string();
-                            // Replace backslashes with forward slashes for Windows compatibility
-                            let key = key.replace('\\', "/");
+        // The recursive walk can touch 10^5-10^6 files on a multi-TB
+        // local pool (the air-gapped production config). Run it on the
+        // blocking pool so a GC / verify / DR-discovery / boot-warmup
+        // listing can't pin a tokio worker for seconds-to-minutes and
+        // stall unrelated iSCSI/NVMe IO scheduled on that worker (#267).
+        let root_dir = self.root_dir.clone();
+        let results = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            // Walk directory recursively
+            fn visit_dirs(dir: &Path, root: &Path, results: &mut Vec<String>) -> Result<()> {
+                if dir.is_dir() {
+                    let entries = fs::read_dir(dir)?;
+                    for entry in entries {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            visit_dirs(&path, root, results)?;
+                        } else if let Ok(rel_path) = path.strip_prefix(root) {
+                            // Forward slashes for Windows compatibility.
+                            let key = rel_path.to_string_lossy().replace('\\', "/");
                             results.push(key);
                         }
                     }
                 }
+                Ok(())
             }
-            Ok(())
-        }
-
-        visit_dirs(&prefix_path, &self.root_dir, &mut results)?;
+            let mut results = Vec::new();
+            visit_dirs(&prefix_path, &root_dir, &mut results)?;
+            Ok(results)
+        })
+        .await
+        .map_err(|e| ObjectStoreError::Other(format!("list_objects spawn_blocking join: {e}")))??;
 
         debug!(
             "Local backend listed {} objects with prefix: {}",
@@ -832,7 +861,16 @@ mod tests {
             .download_chunk("chunks/absent.dat")
             .await
             .expect_err("missing chunk must error");
-        assert!(matches!(err, ObjectStoreError::Io(_)));
+        // Issue #266: a missing chunk is a permanent NotFound (fail fast),
+        // not a retryable Io that burns 3-9 s of backoff.
+        assert!(
+            matches!(err, ObjectStoreError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        assert_eq!(
+            crate::object_store_config::classify(&err),
+            crate::object_store_config::FailureKind::NotFound,
+        );
     }
 
     #[tokio::test]
@@ -942,7 +980,11 @@ mod tests {
             .download_manifest("manifests/absent.json")
             .await
             .expect_err("missing manifest must error");
-        assert!(matches!(err, ObjectStoreError::Io(_)));
+        // Issue #266: a missing manifest is a permanent NotFound.
+        assert!(
+            matches!(err, ObjectStoreError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[tokio::test]

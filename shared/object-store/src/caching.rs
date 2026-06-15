@@ -73,6 +73,33 @@ struct UploadOutcome {
     algo: Option<CompressionAlgo>,
 }
 
+/// Drop guard that removes a stranded `InFlight` entry if the installer
+/// task is cancelled before completing its terminal transition. Without
+/// it, a cancelled installer (an aborted job, a dropped future in a
+/// `select!`/`timeout`) leaves the `InFlight` forever; a later caller
+/// polls its `Shared` future to an `Err`, which `Shared` memoizes, and
+/// every subsequent upload of that key returns the same error instantly
+/// with no backend call — a permanently-poisoned key until restart
+/// (issue #264). The installer disarms it once it has run the terminal
+/// `Uploaded`/remove transition itself.
+struct InFlightGuard {
+    known: Arc<Mutex<LruCache<String, StorageState>>>,
+    key: String,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut map = self.known.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(map.get(&self.key), Some(StorageState::InFlight(_))) {
+            map.pop(&self.key);
+        }
+    }
+}
+
 /// Wrapper around a concrete [`ObjectStoreBackend`] that memoizes upload /
 /// presence facts across the daemon's lifetime. Construct via
 /// [`CachingObjectStoreBackend::new`] at registry-population time; every
@@ -195,6 +222,57 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             Action::Miss => {}
         }
 
+        // Before the (up to 128 MiB) payload copy, re-check the map: in
+        // the concurrent-cold-write storm this wrapper exists to optimize
+        // (e.g. 50 parallel zero-page mkfs writes), every caller's first
+        // check misses, but only one installs — the rest would each copy
+        // the whole payload just to lose the install race and drop it.
+        // Coalesce onto a now-present entry here so only the eventual
+        // installer materializes the buffer (issue #265).
+        {
+            enum PreCheck {
+                Hit(u64, Option<u64>, Option<CompressionAlgo>),
+                Synth,
+                Await(
+                    Shared<
+                        BoxFuture<'static, std::result::Result<UploadOutcome, Arc<ObjectStoreError>>>,
+                    >,
+                ),
+                Miss,
+            }
+            let pre = {
+                let mut map = self.known.lock().expect("cache mutex poisoned");
+                match map.get(key) {
+                    Some(StorageState::Uploaded {
+                        uncompressed,
+                        compressed,
+                        algo,
+                    }) => PreCheck::Hit(*uncompressed, *compressed, *algo),
+                    Some(StorageState::Probed) => PreCheck::Synth,
+                    Some(StorageState::InFlight(fut)) => PreCheck::Await(fut.clone()),
+                    None => PreCheck::Miss,
+                }
+            };
+            match pre {
+                PreCheck::Hit(u, c, a) => {
+                    shared_telemetry::record::chunk_storage_cache_hit(&self.name);
+                    return Ok((u, c, a));
+                }
+                PreCheck::Synth => {
+                    shared_telemetry::record::chunk_storage_cache_hit(&self.name);
+                    return Ok((data.len() as u64, None, None));
+                }
+                PreCheck::Await(waiter) => {
+                    shared_telemetry::record::chunk_storage_cache_inflight_coalesced(&self.name);
+                    return match waiter.await {
+                        Ok(o) => Ok((o.uncompressed, o.compressed, o.algo)),
+                        Err(arc_err) => Err(ObjectStoreError::Other(arc_err.to_string())),
+                    };
+                }
+                PreCheck::Miss => {}
+            }
+        }
+
         // Build a singleflight future. Capture owned key + data so the
         // future is `'static` and `Shared`-able.
         let inner = Arc::clone(&self.inner);
@@ -256,7 +334,23 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
             }
         };
 
+        // Arm a cleanup guard for the installer (install_epoch is Some):
+        // if this task is cancelled during the await below, the guard's
+        // Drop removes our stranded InFlight so it can't poison the key
+        // (issue #264). Joiners (install_epoch None) get no guard.
+        let mut cleanup = install_epoch.map(|_| InFlightGuard {
+            known: Arc::clone(&self.known),
+            key: key.to_string(),
+            armed: true,
+        });
+
         let result = waiter.await;
+
+        // The await is the only cancellation point; it completed, so the
+        // terminal transition below runs synchronously — disarm the guard.
+        if let Some(g) = cleanup.as_mut() {
+            g.armed = false;
+        }
 
         // Joiners don't install — the creator's gated install is the single
         // authority for the terminal cache fact.
@@ -880,6 +974,44 @@ mod tests {
         // Failure cleared the entry; retry hits the backend.
         cache.upload_chunk("k", b"hello").await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 2);
+    }
+
+    /// Issue #264: a cancelled installer (timeout/abort mid-upload) must
+    /// not strand an InFlight whose memoized failure permanently poisons
+    /// the key — subsequent uploads must reach the backend, not return a
+    /// frozen error.
+    #[tokio::test]
+    async fn cancelled_installer_does_not_poison_key() {
+        let (mock, c) = MockBackend::new();
+        c.upload_delay_ms.store(200, Ordering::SeqCst);
+        c.fail_next_upload.store(true, Ordering::SeqCst);
+        let cache = wrap(mock);
+
+        // Call 1: cancel the installer mid-upload (50 ms < 200 ms delay),
+        // before its backend PUT increments `puts` or fails.
+        let r =
+            tokio::time::timeout(Duration::from_millis(50), cache.upload_chunk("k", b"data")).await;
+        assert!(r.is_err(), "first call should time out (installer cancelled)");
+
+        // Call 2: the key is not poisoned — the cleaned-up InFlight forces
+        // a fresh backend PUT, which sleeps and then fails (fail_next).
+        let r2 = cache.upload_chunk("k", b"data").await;
+        assert!(r2.is_err(), "call 2 reaches the backend and fails");
+
+        // Call 3: still not poisoned — another fresh PUT, now succeeding.
+        let r3 = cache.upload_chunk("k", b"data").await;
+        assert!(
+            r3.is_ok(),
+            "call 3 must reach the backend (not a memoized error)"
+        );
+
+        // A poisoned key would have served calls 2/3 from the stranded
+        // InFlight without touching the backend (puts would stay 0/1).
+        assert!(
+            c.puts.load(Ordering::SeqCst) >= 2,
+            "post-cancel uploads must reach the backend, got puts={}",
+            c.puts.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
