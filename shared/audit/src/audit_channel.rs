@@ -199,10 +199,33 @@ async fn writer_loop(mut rx: mpsc::Receiver<AuditMessage>, log: Arc<AuditLog>) {
                 params,
                 result,
             } => {
-                if let Err(e) = log.append(&op, actor, params, result) {
-                    let err_str = e.to_string();
-                    tracing::warn!("audit: writer task: append {op} failed: {err_str}");
-                    audit_append_failed(&op, &err_str);
+                // Run the blocking append on the blocking pool, not inline
+                // on a tokio runtime worker: each append does two
+                // fsync(2)s (entry file + chain.state), and the first
+                // append after UTC midnight additionally reads the whole
+                // previous day's file and zstd-compresses it in memory. On
+                // a loaded data disk a queued burst would otherwise pin a
+                // runtime worker for seconds — delaying co-scheduled
+                // iSCSI/NVMe/HTTP tasks and filling the channel into the
+                // documented audit_queue_drops (issue #270). Awaited, so
+                // entries still append strictly in FIFO chain order.
+                let log_for_append = Arc::clone(&log);
+                let join = tokio::task::spawn_blocking(move || {
+                    log_for_append
+                        .append(&op, actor, params, result)
+                        .map_err(|e| (op, e))
+                })
+                .await;
+                match join {
+                    Ok(Ok(_seq)) => {}
+                    Ok(Err((op, e))) => {
+                        let err_str = e.to_string();
+                        tracing::warn!("audit: writer task: append {op} failed: {err_str}");
+                        audit_append_failed(&op, &err_str);
+                    }
+                    Err(join_err) => {
+                        tracing::warn!("audit: writer task: append join failed: {join_err}");
+                    }
                 }
             }
             AuditMessage::Shutdown(ack) => {

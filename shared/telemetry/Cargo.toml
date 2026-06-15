@@ -25,6 +25,11 @@ prometheus = { version = "0.14", default-features = false }
 thiserror = "2"
 tonic = { version = "0.14", default-features = false }
 tracing = "0.1"
+# Lock-free read-mostly per-backend counter maps for LiveStats: the
+# chunk-seal hot path resolves a backend's `Arc<Counters>` via a
+# `load()` (no mutex, no per-call key allocation) — issue #271. Already
+# in the workspace graph (shared-admin-auth's AuthState).
+arc-swap = "1"
 
 # Optional axum metrics-handler. Enabled by daemons that mount
 # `/metrics` on their TCP HTTP server; off by default so CLI / non-HTTP

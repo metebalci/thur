@@ -26,9 +26,10 @@ pub mod http;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
+
+use arc_swap::ArcSwap;
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider};
@@ -104,19 +105,49 @@ pub struct TelemetryConfig {
 /// methods — one extra `fetch_add` per call site, paid only on the
 /// recorder hot path (no contention because each backend gets its own
 /// counter struct under an `Arc`).
+/// Per-backend counter maps are `ArcSwap`: backends are a small, stable
+/// set (one per configured storage backend, fixed after boot), so the
+/// chunk-seal hot path resolves a backend's `Arc<Counters>` with a
+/// lock-free `load()` + `&str` probe — no global mutex acquisition and
+/// no per-call key `String` allocation (issue #271). The rare first
+/// touch of a new backend does a copy-on-write `rcu` insert.
 #[derive(Default)]
 pub struct LiveStats {
     /// Per-storage-backend cumulative counters.
-    storage: Mutex<HashMap<String, Arc<StorageCounters>>>,
+    storage: ArcSwap<HashMap<String, Arc<StorageCounters>>>,
     /// Per-pool-backend cumulative counters + an instantaneous waiter
     /// gauge.
-    pool: Mutex<HashMap<String, Arc<PoolCounters>>>,
+    pool: ArcSwap<HashMap<String, Arc<PoolCounters>>>,
     /// Per-backend cumulative chunk dedup byte totals. The `scope`
     /// (local/global) dimension is folded away here — the monitor's
     /// dedup ratio is per-backend, so both scopes sum into one pair.
-    chunk: Mutex<HashMap<String, Arc<ChunkCounters>>>,
+    chunk: ArcSwap<HashMap<String, Arc<ChunkCounters>>>,
     /// Audit entries appended since daemon start.
     pub audit_entries_total: AtomicU64,
+}
+
+/// Resolve (or first-touch-create) a backend's counter `Arc` from an
+/// `ArcSwap` map without taking a lock or allocating on the common path.
+fn counter_for<C: Default>(
+    map: &ArcSwap<HashMap<String, Arc<C>>>,
+    backend: &str,
+) -> Arc<C> {
+    // Fast path: lock-free read, `&str` probe — no allocation.
+    if let Some(c) = map.load().get(backend) {
+        return Arc::clone(c);
+    }
+    // First touch of this backend (rare): copy-on-write insert, retried
+    // under contention by `rcu`. Only here do we allocate the key.
+    map.rcu(|cur| {
+        let mut next = HashMap::clone(cur);
+        next.entry(backend.to_string()).or_default();
+        next
+    });
+    Arc::clone(
+        map.load()
+            .get(backend)
+            .expect("entry was just inserted by rcu"),
+    )
 }
 
 #[derive(Default)]
@@ -183,21 +214,15 @@ pub struct ChunkSnapshot {
 
 impl LiveStats {
     fn storage_for(&self, backend: &str) -> Arc<StorageCounters> {
-        let mut map = self
-            .storage
-            .lock()
-            .expect("LiveStats storage mutex poisoned");
-        Arc::clone(map.entry(backend.to_string()).or_default())
+        counter_for(&self.storage, backend)
     }
 
     fn pool_for(&self, backend: &str) -> Arc<PoolCounters> {
-        let mut map = self.pool.lock().expect("LiveStats pool mutex poisoned");
-        Arc::clone(map.entry(backend.to_string()).or_default())
+        counter_for(&self.pool, backend)
     }
 
     fn chunk_for(&self, backend: &str) -> Arc<ChunkCounters> {
-        let mut map = self.chunk.lock().expect("LiveStats chunk mutex poisoned");
-        Arc::clone(map.entry(backend.to_string()).or_default())
+        counter_for(&self.chunk, backend)
     }
 
     /// Mirror of [`Telemetry::storage_record_request`]. `op` is one of
@@ -276,22 +301,19 @@ impl LiveStats {
     pub fn snapshot(&self) -> LiveStatsSnapshot {
         let storage_pairs: Vec<(String, Arc<StorageCounters>)> = self
             .storage
-            .lock()
-            .expect("LiveStats storage mutex poisoned")
+            .load()
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
         let pool_pairs: Vec<(String, Arc<PoolCounters>)> = self
             .pool
-            .lock()
-            .expect("LiveStats pool mutex poisoned")
+            .load()
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
         let chunk_pairs: Vec<(String, Arc<ChunkCounters>)> = self
             .chunk
-            .lock()
-            .expect("LiveStats chunk mutex poisoned")
+            .load()
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
@@ -1623,5 +1645,30 @@ mod tests {
         let archive = snap.chunk.get("archive").expect("archive chunk row");
         assert_eq!(archive.logical_bytes, 200);
         assert_eq!(archive.unique_bytes, 50);
+    }
+
+    /// Issue #271: resolving the same backend repeatedly must return the
+    /// same counter `Arc` (lock-free, no per-call alloc), and a fresh
+    /// backend first-touches a new entry — accumulation is correct either
+    /// way.
+    #[test]
+    fn live_stats_counter_resolution_is_stable_and_first_touch_works() {
+        let stats = LiveStats::default();
+        let a1 = stats.chunk_for("primary");
+        let a2 = stats.chunk_for("primary");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "repeated resolution returns the same Arc (cached)"
+        );
+        a1.logical_bytes.fetch_add(7, Ordering::Relaxed);
+        a2.logical_bytes.fetch_add(3, Ordering::Relaxed);
+
+        // First touch of a new backend.
+        let b = stats.chunk_for("archive");
+        b.logical_bytes.fetch_add(5, Ordering::Relaxed);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.chunk.get("primary").unwrap().logical_bytes, 10);
+        assert_eq!(snap.chunk.get("archive").unwrap().logical_bytes, 5);
     }
 }
