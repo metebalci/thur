@@ -576,6 +576,14 @@ fn default_http_listen() -> String {
     "0.0.0.0:9090".to_string()
 }
 
+/// Build the INQUIRY VPD 0x85 management URL from the resolved HTTP
+/// listener address: `https` iff a TLS cert is configured, host:port
+/// verbatim from `http.listen` (issue #283).
+fn management_url_from_http(listen: &str, tls_enabled: bool) -> String {
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{scheme}://{listen}/")
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -1129,6 +1137,13 @@ async fn main() -> Result<()> {
     // configured, the OTel SDK pushes the same instruments to a
     // Collector / SaaS backend on the chosen interval.
     let http_cfg = cfg.http.as_ref().cloned().unwrap_or_default();
+    // Advertise the resolved HTTP management address in INQUIRY VPD page
+    // 0x85: scheme from TLS presence, host:port from `http.listen` —
+    // instead of the old hardcoded http://0.0.0.0:9090/ (issue #283).
+    iscsi::protocol::set_management_url(management_url_from_http(
+        &http_cfg.listen,
+        !http_cfg.tls.cert_file.is_empty(),
+    ));
     let mut otlp = None;
     if let Some(ref o) = cfg.telemetry.otlp
         && o.enabled
@@ -2643,5 +2658,19 @@ mod config_parse_tests {
         assert_eq!(topo.num_drives, 3);
         assert_eq!(topo.lto_generation, 8);
         assert_eq!(topo.firmware.as_deref(), Some("TVL8"));
+    }
+
+    /// Issue #283: the VPD 0x85 management URL follows the configured
+    /// HTTP listen address + TLS scheme, not a hardcoded value.
+    #[test]
+    fn management_url_reflects_http_config() {
+        assert_eq!(
+            management_url_from_http("10.0.0.5:8443", true),
+            "https://10.0.0.5:8443/"
+        );
+        assert_eq!(
+            management_url_from_http("192.168.1.10:9091", false),
+            "http://192.168.1.10:9091/"
+        );
     }
 }

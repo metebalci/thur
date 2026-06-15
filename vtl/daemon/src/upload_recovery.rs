@@ -122,35 +122,52 @@ pub async fn scan_and_enqueue_orphans(
     let started = Instant::now();
     let tapes_root = data_dir.join("tapes");
 
-    let read_dir = match std::fs::read_dir(&tapes_root) {
-        Ok(d) => d,
+    // The walk (read_dir + per-cartridge chunks.idx scan via preads) is
+    // fully synchronous and, at the documented thousands-of-cartridges /
+    // millions-of-records scale, can pin one tokio worker for
+    // seconds-to-tens-of-seconds on every boot and 10-minute sweep —
+    // adding latency jitter to the iSCSI accept loop / prefetch hooks /
+    // admin handlers scheduled on that worker. Offload it to the blocking
+    // pool, mirroring the eviction worker (issue #284).
+    let scan = tokio::task::spawn_blocking(move || {
+        let mut all_orphans: Vec<CartridgeOrphans> = Vec::new();
+        let mut cartridges_scanned: usize = 0;
+        let read_dir = match std::fs::read_dir(&tapes_root) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(
+                    "Orphan upload scan: tapes root {} not readable ({e}) - nothing to recover",
+                    tapes_root.display()
+                );
+                return (all_orphans, cartridges_scanned);
+            }
+        };
+        for entry in read_dir {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(tape_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            cartridges_scanned += 1;
+            match scan_cartridge(&path, &tape_id) {
+                Ok(Some(orphans)) => all_orphans.push(orphans),
+                Ok(None) => {}
+                Err(e) => warn!("Orphan upload scan: cartridge '{tape_id}' read failed: {e}"),
+            }
+        }
+        (all_orphans, cartridges_scanned)
+    })
+    .await;
+    let (all_orphans, cartridges_scanned) = match scan {
+        Ok(v) => v,
         Err(e) => {
-            debug!(
-                "Orphan upload scan: tapes root {} not readable ({e}) - nothing to recover",
-                tapes_root.display()
-            );
+            warn!("Orphan upload scan: blocking scan task failed to join: {e}");
             return;
         }
     };
-
-    let mut all_orphans: Vec<CartridgeOrphans> = Vec::new();
-    let mut cartridges_scanned: usize = 0;
-    for entry in read_dir {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(tape_id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        cartridges_scanned += 1;
-        match scan_cartridge(&path, &tape_id) {
-            Ok(Some(orphans)) => all_orphans.push(orphans),
-            Ok(None) => {}
-            Err(e) => warn!("Orphan upload scan: cartridge '{tape_id}' read failed: {e}"),
-        }
-    }
 
     let orphans_found: usize = all_orphans.iter().map(|c| c.chunk_ids.len()).sum();
     let audit_gated = audit

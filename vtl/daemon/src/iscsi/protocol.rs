@@ -38,6 +38,30 @@ use super::unit_attention;
 
 use crate::diagnostics::DiagnosticStore;
 
+use std::sync::OnceLock;
+
+/// Management network address advertised in INQUIRY VPD page 0x85
+/// (SPC-4 §7.7.5), derived from the resolved `http:` listener config at
+/// boot rather than the old compile-time `http://0.0.0.0:9090/` literal
+/// that gave consumers a dead link and the wrong port on co-resident
+/// installs (issue #283). Set once via [`set_management_url`]; falls
+/// back to the legacy placeholder when unset (tests / no HTTP listener).
+static MANAGEMENT_URL: OnceLock<String> = OnceLock::new();
+
+/// Record the management URL for VPD 0x85. Called once at daemon boot
+/// from the resolved HTTP listener config (scheme from TLS presence,
+/// host:port from `http.listen`).
+pub(crate) fn set_management_url(url: String) {
+    let _ = MANAGEMENT_URL.set(url);
+}
+
+fn management_url() -> &'static str {
+    MANAGEMENT_URL
+        .get()
+        .map(String::as_str)
+        .unwrap_or("http://0.0.0.0:9090/")
+}
+
 use drive_manager::DriveManager;
 use scsi_smc::SmcScsiCtx;
 use scsi_smc::changer::ElementAddressConfig;
@@ -917,8 +941,9 @@ fn handle_inquiry(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
             0x85 => {
                 // Management Network Address (SPC-4 §7.7.5). One
                 // network-services descriptor: SERVICE TYPE 0x03
-                // (storage management), 4-byte-padded URL body.
-                let url = b"http://0.0.0.0:9090/";
+                // (storage management), 4-byte-padded URL body. The URL
+                // is the resolved HTTP listener address (issue #283).
+                let url = management_url().as_bytes();
                 let pad = (4 - (url.len() % 4)) % 4;
                 let net_len = url.len() + pad;
                 let mut d = vpd_header(
