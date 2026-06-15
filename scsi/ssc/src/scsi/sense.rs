@@ -82,9 +82,10 @@ pub fn error_to_sense(error: &core_mediachanger::errors::SmcError) -> Vec<u8> {
         SmcError::LegalHoldViolation => {
             SenseDataBuilder::new(SenseKey::DataProtect, ASC_WRITE_PROTECTED).build()
         }
-        // Encrypt-Only mode active without an installed encryption
-        // key. Use the SPC-4 "ENCRYPTION KEY ABSENT" code so the host
-        // can distinguish "no key set" from generic write-protect.
+        // Encrypt-Only mode active without an installed encryption key.
+        // 0x74/0x07 ENCRYPTION PARAMETERS NOT USEABLE — distinct from
+        // both generic write-protect and the read-side decrypt error
+        // (0x74/0x01), so the host can tell "no key set" apart (issue #252).
         SmcError::EncryptOnlyKeyAbsent => {
             SenseDataBuilder::new(SenseKey::DataProtect, ASC_ENCRYPTION_KEY_ABSENT).build()
         }

@@ -1119,7 +1119,9 @@ concatenated onto the ciphertext in the chunk file, the standard
 `ciphertext ‖ tag` shape, and the block-index record's `len` field is
 sized to include those 16 bytes. Reading an encrypted block without
 the correct key returns CHECK CONDITION + DATA PROTECT + ASC/ASCQ
-0x74/0x0C (LOGICAL UNIT ENCRYPTION KEY MISMATCH).
+0x74/0x01 (UNABLE TO DECRYPT DATA). The write-side refusal when no key
+is installed (Encrypt-only mode) uses the distinct 0x74/0x07
+(ENCRYPTION PARAMETERS NOT USEABLE) — issue #252.
 
 Next Block Encryption Status (SPSP 0x0021) decodes the head block's
 index record; if the record is unreadable (corrupt index sidecar) the

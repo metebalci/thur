@@ -25,7 +25,7 @@
 
 #![allow(dead_code)]
 
-use tracing::info;
+use tracing::trace;
 
 /// SCSI Sense Keys (SPC-3 Table 27)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,13 +126,17 @@ pub const ASC_CONDITIONAL_WRITE_PROTECT: AdditionalSenseCode = AdditionalSenseCo
     asc: 0x27,
     ascq: 0x06,
 };
-/// Data Protect / "ENCRYPTION KEY ABSENT" (SPC-4 § ASC table 74h
-/// codes). Used when LTO-8+ Encrypt-Only mode (Mode Page 0x10/0x01
-/// WRE bit) refuses a WRITE / WRITE FILEMARKS because no drive
-/// encryption key has been installed via SECURITY PROTOCOL OUT.
+/// Data Protect / 74h/07h "ENCRYPTION PARAMETERS NOT USEABLE". Used
+/// when LTO-8+ Encrypt-Only mode (Mode Page 0x10/0x01 WRE bit) refuses
+/// a WRITE / WRITE FILEMARKS because no drive encryption key has been
+/// installed via SECURITY PROTOCOL OUT — the encryption parameters
+/// aren't usable for the write. Previously aliased 74h/0Ch (UNABLE TO
+/// DECRYPT PARAMETER LIST, a SPOUT parameter-decrypt failure — wrong for
+/// a write refusal) and was indistinguishable from the read-side
+/// decrypt error (issue #252).
 pub const ASC_ENCRYPTION_KEY_ABSENT: AdditionalSenseCode = AdditionalSenseCode {
     asc: 0x74,
-    ascq: 0x0C,
+    ascq: 0x07,
 };
 pub const ASC_INVALID_FIELD_IN_CDB: AdditionalSenseCode = AdditionalSenseCode {
     asc: 0x24,
@@ -220,12 +224,15 @@ pub const ASC_SAVING_PARAMETERS_NOT_SUPPORTED: AdditionalSenseCode = AdditionalS
     asc: 0x39,
     ascq: 0x00,
 };
-/// Data Protect / "Logical block protection / decryption integrity check failed"
-/// Used for AES-GCM authentication failure or when reading an encrypted block
-/// without the correct drive key (SSC-4 §4.2.20).
+/// Data Protect / 74h/01h "UNABLE TO DECRYPT DATA". Used for an
+/// AES-GCM authentication failure or when reading an encrypted block
+/// without the correct drive key (SSC-4 read-side decrypt failure).
+/// Previously aliased 74h/0Ch (UNABLE TO DECRYPT PARAMETER LIST — a
+/// SPOUT parameter-decrypt failure, wrong for a data-read decrypt
+/// error) and collided with the write-side key-absent code (issue #252).
 pub const ASC_DATA_DECRYPTION_ERROR: AdditionalSenseCode = AdditionalSenseCode {
     asc: 0x74,
-    ascq: 0x0C,
+    ascq: 0x01,
 };
 
 /// SCSI sense response code — fixed-format (0x70) carries the full
@@ -579,7 +586,16 @@ impl SenseDataBuilder {
 
     /// Encode and return the 18-byte fixed-format sense block.
     pub fn build(self) -> Vec<u8> {
-        info!(
+        // `trace`, not `info`: every fixed-format sense is built here,
+        // including the steady-state TUR-poll / filemark / EOD / BOT /
+        // ILLEGAL REQUEST traffic that fires on normal backup workloads.
+        // At the daemons' default `info` filter this used to emit one
+        // line per such command — host-driven unbounded log growth, and
+        // a hostile initiator could spam CHECK CONDITIONs to inflate
+        // logs at line rate (the audit path is rate-limited; this wasn't).
+        // Sense content is still observable at the dispatcher's error
+        // paths and at `trace`/`debug` when wanted (issue #253).
+        trace!(
             "Built sense data: key={:?}, ASC/ASCQ={:02x}/{:02x}, ILI={}, EOM={}, FM={}",
             self.0.key, self.0.asc, self.0.ascq, self.0.ili, self.0.eom, self.0.filemark
         );
@@ -670,6 +686,20 @@ pub fn build_invalid_command_sense() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #252: the write-side key-absent code and the read-side
+    /// decrypt-error code must be distinct, and neither may be 0x74/0x0C
+    /// (which T10 assigns to UNABLE TO DECRYPT PARAMETER LIST).
+    #[test]
+    fn encryption_sense_codes_are_distinct_and_not_param_list() {
+        assert_ne!(ASC_ENCRYPTION_KEY_ABSENT, ASC_DATA_DECRYPTION_ERROR);
+        assert_eq!(ASC_ENCRYPTION_KEY_ABSENT.asc, 0x74);
+        assert_eq!(ASC_ENCRYPTION_KEY_ABSENT.ascq, 0x07); // ENCRYPTION PARAMETERS NOT USEABLE
+        assert_eq!(ASC_DATA_DECRYPTION_ERROR.asc, 0x74);
+        assert_eq!(ASC_DATA_DECRYPTION_ERROR.ascq, 0x01); // UNABLE TO DECRYPT DATA
+        assert_ne!(ASC_ENCRYPTION_KEY_ABSENT.ascq, 0x0C);
+        assert_ne!(ASC_DATA_DECRYPTION_ERROR.ascq, 0x0C);
+    }
 
     #[test]
     fn test_build_basic_sense() {

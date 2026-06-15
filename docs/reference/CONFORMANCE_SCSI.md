@@ -712,7 +712,7 @@ LTO-8) rather than by SSC-4.
 | LTO-8 emulation | 🟩 Yes | M | 12 TB native; default. |
 | LTO-9 emulation | 🟨 No | — | Targets SPC-5 / SSC-5 + RAO; out of scope. |
 | Append-only mode | 🟩 Yes | O | LTO-7+ feature. Mode Page 0x10/0x01 WRITE MODE = 1 → drive refuses WRITE / WRITE FILEMARKS at any LBA other than active-partition EOD with DATA PROTECT + 0x27/0x06 (CONDITIONAL WRITE PROTECT). State persists in `<data_dir>/library/drive_state.json` across cartridge swaps when SP=1. |
-| Encrypt-only mode (LTO-8+) | 🟩 Yes | O | Mode Page 0x10/0x01 WRE bit set → drive refuses WRITE / WRITE FILEMARKS without an active drive encryption key (SECURITY PROTOCOL OUT 0x20/0x0010), DATA PROTECT + 0x74/0x0C (ENCRYPTION KEY ABSENT). |
+| Encrypt-only mode (LTO-8+) | 🟩 Yes | O | Mode Page 0x10/0x01 WRE bit set → drive refuses WRITE / WRITE FILEMARKS without an active drive encryption key (SECURITY PROTOCOL OUT 0x20/0x0010), DATA PROTECT + 0x74/0x07 (ENCRYPTION PARAMETERS NOT USEABLE — the write-side key-absent refusal, distinct from the read-side decrypt error 0x74/0x01, issue #252). |
 | Application-Managed Encryption (AES-256-GCM) | 🟩 Yes | O | Per-block IV; key volatile, cleared on UNLOAD. |
 | Drive compression (LZ4/zstd) | 🟩 Yes | O | Per-block algorithm recorded. SLDC reserved (not implemented). |
 | Density: LTO-7 (0x5C) / LTO-8 (0x5E) | 🟩 Yes | M | |
@@ -837,7 +837,8 @@ the supported-list SPSP returns exactly `[0x0000, 0x0001, 0x0010,
 | 0x0021 | IN | Next Block Encryption Status | 🟩 Yes | CC |
 
 Read of an encrypted block without the correct key →
-CHECK CONDITION + DATA PROTECT (0x07) + ASC/ASCQ 0x74/0x0C.
+CHECK CONDITION + DATA PROTECT (0x07) + ASC/ASCQ 0x74/0x01
+(UNABLE TO DECRYPT DATA).
 
 Next Block Encryption Status (0x0021) reads the head block's index
 record. If that record fails to decode (corrupt index sidecar), the

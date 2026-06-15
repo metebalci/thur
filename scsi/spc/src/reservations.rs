@@ -62,6 +62,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -373,6 +374,16 @@ struct Persist {
 /// locking would just be ceremony.
 pub struct ReservationManager {
     by_lun: Mutex<BTreeMap<u64, LunState>>,
+    /// Lock-free fast-path flag: `true` iff some LUN currently holds a
+    /// reservation. `allow_read` / `allow_write` — one per data-path IO
+    /// on every iSCSI session and NVMe queue — read it without locking
+    /// and skip the global `by_lun` mutex entirely in the overwhelmingly
+    /// common no-reservation case, so independent volumes' IO admission
+    /// no longer ping-pongs one cacheline through a shared exclusive lock
+    /// (issue #246). Recomputed under `by_lun` after every mutation, so a
+    /// reader that observes `false` provably has no committed reservation
+    /// to honor, and one that observes `true` takes the lock and sees it.
+    any_reservation: AtomicBool,
     /// Serializes mutations (PROUT / Reservation Register) end-to-end,
     /// including the durable persist, so the `by_lun` data-path lock is
     /// NOT held during the fsync chain (issue #181). `allow_read` /
@@ -408,6 +419,7 @@ impl ReservationManager {
     pub fn new() -> Self {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
+            any_reservation: AtomicBool::new(false),
             mutate_lock: Mutex::new(()),
             persist: None,
             observers: Mutex::new(Vec::new()),
@@ -422,6 +434,7 @@ impl ReservationManager {
     pub fn with_persistence(path: PathBuf, resolver: Arc<dyn EntityResolver>) -> Self {
         Self {
             by_lun: Mutex::new(BTreeMap::new()),
+            any_reservation: AtomicBool::new(false),
             mutate_lock: Mutex::new(()),
             persist: Some(Persist { path, resolver }),
             observers: Mutex::new(Vec::new()),
@@ -436,8 +449,10 @@ impl ReservationManager {
     /// no longer exists is dropped (closes the LUN-reuse fencing hole).
     pub fn load_from(path: PathBuf, resolver: Arc<dyn EntityResolver>) -> Self {
         let by_lun = load_file(&path, resolver.as_ref());
+        let any_reservation = by_lun.values().any(|s| s.reservation.is_some());
         Self {
             by_lun: Mutex::new(by_lun),
+            any_reservation: AtomicBool::new(any_reservation),
             mutate_lock: Mutex::new(()),
             persist: Some(Persist { path, resolver }),
             observers: Mutex::new(Vec::new()),
@@ -482,6 +497,9 @@ impl ReservationManager {
             if map.remove(&lun).is_none() {
                 return;
             }
+            // Removing the LUN may have dropped its reservation —
+            // recompute the fast-path flag (issue #246).
+            self.refresh_any_reservation(&map);
             self.persist.is_some().then(|| map.clone())
         };
         if let Some(snapshot) = snapshot.as_ref()
@@ -530,6 +548,9 @@ impl ReservationManager {
             if outcome != PrOutOutcome::Good {
                 return outcome;
             }
+            // Refresh the lock-free fast-path flag under `by_lun`, while
+            // the committed mutation is visible (issue #246).
+            self.refresh_any_reservation(&map);
             let now_eligible = map.get(&lun).is_some_and(LunState::persist_eligible);
             // Clone the full persist set under the lock; `mutate_lock`
             // guarantees it's still current when persist_to_disk runs.
@@ -569,6 +590,9 @@ impl ReservationManager {
                     map.remove(&lun);
                 }
             }
+            // The rollback may have restored / removed a reservation —
+            // recompute the fast-path flag (issue #246).
+            self.refresh_any_reservation(&map);
             return PrOutOutcome::PersistFailed;
         }
 
@@ -587,9 +611,25 @@ impl ReservationManager {
         PrOutOutcome::Good
     }
 
+    /// Recompute the lock-free "some LUN holds a reservation" flag from
+    /// `map`. Called under `by_lun` after every mutation so the data
+    /// path's lock-free read of [`Self::any_reservation`] is consistent
+    /// with the committed state (issue #246).
+    fn refresh_any_reservation(&self, map: &BTreeMap<u64, LunState>) {
+        let any = map.values().any(|s| s.reservation.is_some());
+        self.any_reservation.store(any, Ordering::Release);
+    }
+
     /// Allow / deny a READ-side opcode. The data path calls this
     /// before issuing the fetch / medium read.
     pub fn allow_read(&self, lun: u64, nexus: &Nexus) -> bool {
+        // Lock-free fast path: no LUN holds a reservation, so nothing can
+        // deny a read — skip the global mutex (issue #246). A reader that
+        // sees `false` provably has no committed reservation to honor
+        // (the flag is set under `by_lun` before a reserve's lock release).
+        if !self.any_reservation.load(Ordering::Acquire) {
+            return true;
+        }
         let map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
         let Some(state) = map.get(&lun) else {
             return true;
@@ -612,6 +652,10 @@ impl ReservationManager {
     /// writes; on tape, medium-mutating opcodes (WRITE, WRITE
     /// FILEMARKS, ERASE, FORMAT MEDIUM) gate the same way.
     pub fn allow_write(&self, lun: u64, nexus: &Nexus) -> bool {
+        // Lock-free fast path — see `allow_read` (issue #246).
+        if !self.any_reservation.load(Ordering::Acquire) {
+            return true;
+        }
         let map = self.by_lun.lock().unwrap_or_else(|p| p.into_inner());
         let Some(state) = map.get(&lun) else {
             return true;
@@ -1189,7 +1233,10 @@ fn prout_reserve(state: &mut LunState, nexus: &Nexus, rk: u64, type_byte: u8) ->
         key: rk,
         r#type,
     });
-    state.bump_generation();
+    // PRGENERATION is deliberately NOT bumped here: SPC-4 6.16.2 lists
+    // the actions that increment it (REGISTER / REGISTER AND IGNORE /
+    // REGISTER AND MOVE / CLEAR / PREEMPT / PREEMPT AND ABORT) and
+    // explicitly excludes a RESERVE service action (issue #251).
     PrOutOutcome::Good
 }
 
@@ -1219,7 +1266,9 @@ fn prout_release(state: &mut LunState, nexus: &Nexus, rk: u64, type_byte: u8) ->
         return PrOutOutcome::Good; // not the holder; no-op
     }
     state.reservation = None;
-    state.bump_generation();
+    // PRGENERATION is deliberately NOT bumped here — SPC-4 6.16.2
+    // excludes a RELEASE service action from the incrementing set
+    // (issue #251).
     PrOutOutcome::Good
 }
 
@@ -1871,6 +1920,72 @@ mod tests {
         assert_eq!(snap.generation, 1);
     }
 
+    /// Issue #251: SPC-4 6.16.2 — PRGENERATION increments on REGISTER /
+    /// CLEAR / PREEMPT, but NOT on a RESERVE or RELEASE service action.
+    #[test]
+    fn reserve_and_release_do_not_bump_prgeneration() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        assert_eq!(
+            mgr.register(0, &a, 0, 0xAAAA, true, None),
+            PrOutOutcome::Good
+        );
+        let after_register = mgr.snapshot(0).generation;
+        assert_eq!(after_register, 1, "REGISTER bumps PRGENERATION");
+
+        assert_eq!(
+            mgr.reserve(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert_eq!(
+            mgr.snapshot(0).generation,
+            after_register,
+            "RESERVE must not bump PRGENERATION"
+        );
+
+        assert_eq!(
+            mgr.release(0, &a, 0xAAAA, ReservationType::WriteExclusive.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert_eq!(
+            mgr.snapshot(0).generation,
+            after_register,
+            "RELEASE must not bump PRGENERATION"
+        );
+    }
+
+    /// Issue #246: the lock-free fast-path flag must track reservation
+    /// lifecycle exactly — a registration alone doesn't fence, a RESERVE
+    /// fences peers, and a RELEASE restores the open fast path.
+    #[test]
+    fn any_reservation_fastpath_tracks_reserve_release() {
+        let mgr = ReservationManager::new();
+        let a = nvme_host(0xA1);
+        let b = nvme_host(0xB2);
+
+        // No reservation anywhere → fast path allows everyone.
+        assert!(mgr.allow_write(0, &b));
+        mgr.register(0, &a, 0, 0xAAAA, true, None);
+        assert!(mgr.allow_write(0, &b), "registration alone does not fence");
+
+        // A takes ExclusiveAccess → B denied, A allowed.
+        assert_eq!(
+            mgr.reserve(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert!(!mgr.allow_write(0, &b));
+        assert!(!mgr.allow_read(0, &b));
+        assert!(mgr.allow_write(0, &a), "holder still allowed");
+
+        // A releases → fast path restored, B allowed again.
+        assert_eq!(
+            mgr.release(0, &a, 0xAAAA, ReservationType::ExclusiveAccess.as_u8()),
+            PrOutOutcome::Good
+        );
+        assert!(mgr.allow_write(0, &b));
+        assert!(mgr.allow_read(0, &b));
+    }
+
     #[test]
     fn nvme_acquire_blocks_other_host_write_not_read() {
         let mgr = ReservationManager::new();
@@ -2094,8 +2209,10 @@ mod tests {
         };
         assert_eq!(&body[8..16], &0xAAAAu64.to_be_bytes());
         let snap = mgr.snapshot(0);
+        // Only the REGISTER bumped PRGENERATION; the RESERVE did not
+        // (SPC-4 6.16.2, issue #251). Reload preserves it (not reset).
         assert_eq!(
-            snap.generation, 2,
+            snap.generation, 1,
             "generation preserved, not bumped on reload"
         );
     }
