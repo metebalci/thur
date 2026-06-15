@@ -550,7 +550,10 @@ impl ChapAuthenticator {
 }
 
 /// Compute CHAP response: H(identifier || password || challenge)
-fn compute_chap_response(
+///
+/// `pub(crate)` so the transport-layer CHAP tests can synthesize a valid
+/// initiator response (e.g. the reflection-attack regression, issue #240).
+pub(crate) fn compute_chap_response(
     algorithm: ChapAlgorithm,
     identifier: u8,
     password: &str,

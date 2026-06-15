@@ -157,6 +157,11 @@ impl ScsiHandler for IscsiLibraryHandler {
         // ran when the connection's TCP stream closed.
         self.drive_manager.release_session_locks(tsih);
         self.drive_manager.clear_prevent_for_session(tsih);
+        // Drop any pending unit-attention entries keyed by this TSIH —
+        // otherwise the map grows unbounded with session churn and a
+        // future session that reuses the TSIH inherits the dead one's
+        // queued UAs (issue #241).
+        self.ua_tracker.clear_session(tsih);
         // Persistent-reservation registrations are NOT released here:
         // SPC-4 persistent reservations survive I_T nexus loss and are
         // keyed by the stable initiator port (IQN + ISID), not the

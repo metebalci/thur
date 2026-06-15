@@ -325,11 +325,18 @@ impl shared_iscsi::ScsiHandler for SbcScsiDispatcher {
         self.dispatch(req).await
     }
 
-    // No `on_session_close` override: persistent reservations survive
-    // I_T nexus loss (SPC-4) and are keyed by the stable initiator port
-    // (IQN + ISID), so a logout / TCP drop must not evict them. They are
-    // removed only by an explicit PROUT or, when APTPL=0, a daemon
-    // restart (issue #57). VSA has no other per-session resources.
+    fn on_session_close(&self, tsih: u16, _cid: u16) {
+        // Drop any pending unit-attention entries keyed by this TSIH so
+        // the map can't grow unbounded with session churn and a future
+        // session reusing the TSIH can't inherit the dead one's queued
+        // UAs (issue #241). Persistent reservations are deliberately NOT
+        // released here: SPC-4 PRs survive I_T nexus loss and are keyed
+        // by the stable initiator port (IQN + ISID), removed only by an
+        // explicit PROUT or, when APTPL=0, a daemon restart (issue #57).
+        if let Some(ua) = self.ua.as_ref() {
+            ua.clear_session(tsih);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +555,25 @@ mod tests {
         // The UA was popped: the same opcode now proceeds normally.
         let resp2 = handler.dispatch(req(&[0x00, 0, 0, 0, 0, 0], 0)).await;
         assert!(resp2.sense.is_none());
+    }
+
+    /// Issue #241: closing a session must drop its pending UAs so the
+    /// map can't leak and a reused TSIH can't inherit stale UAs.
+    #[tokio::test]
+    async fn on_session_close_clears_pending_uas() {
+        use shared_iscsi::ScsiHandler;
+        use shared_iscsi::unit_attention::UnitAttentionCode;
+        let (_tmp, handler, ua) = handler_with_ua().await;
+        ua.add_ua(7, 0, UnitAttentionCode::RESERVATIONS_PREEMPTED);
+        assert!(ua.has_pending_ua(7, 0));
+
+        handler.on_session_close(7, 0);
+
+        assert!(
+            !ua.has_pending_ua(7, 0),
+            "on_session_close must clear the session's queued UAs (a reused \
+             TSIH would otherwise inherit them)"
+        );
     }
 
     #[tokio::test]

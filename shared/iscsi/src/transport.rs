@@ -417,8 +417,10 @@ pub async fn read_pdu<R: AsyncRead + Unpin>(sock: &mut R) -> Result<Pdu> {
         }
         let pad = (4 - (data_segment_len % 4)) % 4;
         if pad > 0 {
-            let mut tmp = vec![0u8; pad as usize];
-            if let Err(e) = sock.read_exact(&mut tmp).await {
+            // Padding is 1-3 bytes; read it into a stack array rather
+            // than a per-PDU heap allocation (issue #239).
+            let mut pad_buf = [0u8; 3];
+            if let Err(e) = sock.read_exact(&mut pad_buf[..pad as usize]).await {
                 match e.kind() {
                     io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => {
                         return Err(anyhow!("graceful disconnect"));
@@ -633,6 +635,17 @@ pub async fn collect_write_data(
     data_out_rx: &mut tokio::sync::mpsc::Receiver<Pdu>,
     req_exp_cmdsn: u32,
 ) -> Result<()> {
+    // Reserve the whole transfer up front so the accumulation buffer
+    // doesn't repeatedly double + recopy as Data-Out bursts arrive — for
+    // a multi-MiB WRITE that is several extra full-buffer copies on the
+    // hot path (issue #239). `edtl` is already capped at MAX_WRITE_EDTL
+    // by the caller (oversized EDTL is rejected before we get here), and
+    // the overrun checks below keep the buffer from exceeding it, so this
+    // is exactly the final size — never a host-driven over-allocation.
+    if let Some(additional) = (edtl as usize).checked_sub(cmd.data.len()) {
+        cmd.data.reserve(additional);
+    }
+
     // Phase 1: drain unsolicited Data-Out, if any.
     if !cmd.final_bit && (cmd.data.len() as u32) < first_burst_length.min(edtl) {
         loop {
@@ -982,6 +995,17 @@ fn negotiate_chap_security_stage(
             .get("CHAP_I")
             .and_then(|s| s.parse::<u8>().ok())
             .ok_or_else(|| anyhow!("Missing CHAP_I for mutual CHAP"))?;
+
+        // RFC 7143 §9.2.1 reflection check: the initiator's challenge
+        // must differ from the challenge the target itself just sent.
+        // A reflected challenge is the textbook CHAP reflection attack;
+        // the responder must detect it and refuse rather than compute a
+        // target response for its own outstanding challenge (issue #240).
+        if state.challenge.as_deref() == Some(init_challenge.as_slice()) {
+            return Err(anyhow!(
+                "CHAP reflection detected: initiator challenge (CHAP_C) equals the target's outstanding challenge"
+            ));
+        }
 
         let target_response =
             authenticator.compute_target_response(&init_challenge, init_identifier, algorithm)?;
@@ -2879,6 +2903,73 @@ mod tests {
             user: "u",
             algorithm: "MD5",
         });
+    }
+
+    /// Drive `negotiate_chap_security_stage` through both phases of a
+    /// mutual-CHAP exchange. `reflect == true` echoes the target's own
+    /// challenge back as the initiator's CHAP_C; otherwise a distinct
+    /// challenge is sent. Returns the phase-2 result.
+    #[allow(clippy::unwrap_in_result)]
+    fn run_mutual_chap_phase2(reflect: bool) -> Result<bool> {
+        use crate::auth::{ChapAlgorithm, ChapAuthenticator, ChapUser, compute_chap_response};
+
+        let auth = ChapAuthenticator::new(
+            vec![ChapUser::new("user1".into(), "password1".into(), true)],
+            Some("target".into()),
+            Some("targetsecret".into()),
+            vec![ChapAlgorithm::Md5],
+        );
+        let audit = NoopLoginAudit;
+        let mut state = ChapState::new();
+
+        // Phase 1: initiator offers CHAP, target sends its challenge.
+        let mut req1: HashMap<String, String> = HashMap::new();
+        req1.insert("AuthMethod".into(), "CHAP".into());
+        req1.insert("CHAP_A".into(), ChapAlgorithm::Md5.id().to_string());
+        let mut resp1 = Vec::new();
+        let transit =
+            negotiate_chap_security_stage(&mut state, &auth, &req1, None, &audit, "peer", &mut resp1)
+                .unwrap();
+        assert!(!transit, "CHAP is mid-flight after phase 1");
+
+        let target_challenge = state.challenge.clone().expect("target sent a challenge");
+        let alg = state.algorithm.expect("algorithm negotiated");
+        let id = state.identifier;
+
+        // Phase 2: a valid one-way response plus the initiator's own
+        // mutual challenge (reflected or distinct).
+        let valid_r = compute_chap_response(alg, id, "password1", &target_challenge);
+        let init_challenge = if reflect {
+            target_challenge.clone()
+        } else {
+            vec![0xAA; target_challenge.len()]
+        };
+        let mut req2: HashMap<String, String> = HashMap::new();
+        req2.insert("CHAP_N".into(), "user1".into());
+        req2.insert("CHAP_R".into(), format!("0x{}", hex::encode(&valid_r)));
+        req2.insert("CHAP_I".into(), "7".into());
+        req2.insert("CHAP_C".into(), format!("0x{}", hex::encode(&init_challenge)));
+        let mut resp2 = Vec::new();
+        negotiate_chap_security_stage(&mut state, &auth, &req2, None, &audit, "peer", &mut resp2)
+    }
+
+    /// Issue #240: a mutual-CHAP login whose initiator reflects the
+    /// target's own challenge back as CHAP_C must be rejected (RFC 7143
+    /// §9.2.1).
+    #[test]
+    fn mutual_chap_rejects_reflected_challenge() {
+        let err = run_mutual_chap_phase2(true).unwrap_err();
+        assert!(
+            err.to_string().contains("reflection"),
+            "expected reflection rejection, got: {err}"
+        );
+    }
+
+    /// A distinct initiator challenge still completes mutual CHAP — the
+    /// reflection guard must not break the normal path.
+    #[test]
+    fn mutual_chap_accepts_distinct_challenge() {
+        assert!(run_mutual_chap_phase2(false).unwrap());
     }
 
     #[test]
