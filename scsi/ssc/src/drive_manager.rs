@@ -743,7 +743,7 @@ impl DriveManager {
             .drives
             .get(&drive_id)?
             .lock()
-            .expect("drive mutex poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         let cart = drive.cartridge.as_ref()?;
         let mut capacity_gb = cart.capacity_gb();
         if capacity_gb == 0 {
@@ -768,7 +768,7 @@ impl DriveManager {
         let Some(drive) = self.drives.get(&drive_id) else {
             return LogSenseCounters::default();
         };
-        let drive = drive.lock().expect("drive mutex poisoned");
+        let drive = drive.lock().unwrap_or_else(|p| p.into_inner());
         let mut counters = LogSenseCounters {
             lifetime_volume_loads: drive.state.lifetime_volume_loads,
             ..LogSenseCounters::default()
@@ -840,7 +840,7 @@ impl DriveManager {
             .drives
             .get(&drive_id)?
             .lock()
-            .expect("drive mutex poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         let cart = drive.cartridge.as_ref()?;
         Some(cart.mam_attributes())
     }
@@ -870,7 +870,7 @@ impl DriveManager {
         let now = Instant::now();
 
         for mtx in self.drives.values() {
-            let mut drive = mtx.lock().expect("drive mutex poisoned");
+            let mut drive = mtx.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(lock_time) = drive.lock_time {
                 let age = now.duration_since(lock_time).as_secs();
                 if age > timeout_seconds {
@@ -936,7 +936,7 @@ impl DriveManager {
     /// session, matching SPC-4 semantics.
     pub fn clear_prevent_for_session(&self, tsih: u16) {
         for mtx in self.drives.values() {
-            let mut drive = mtx.lock().expect("drive mutex poisoned");
+            let mut drive = mtx.lock().unwrap_or_else(|p| p.into_inner());
             drive.prevent.remove(&tsih);
         }
     }
@@ -946,7 +946,7 @@ impl DriveManager {
         let mut count = 0;
 
         for mtx in self.drives.values() {
-            let mut drive = mtx.lock().expect("drive mutex poisoned");
+            let mut drive = mtx.lock().unwrap_or_else(|p| p.into_inner());
             if drive.locked_by_session == Some(tsih) {
                 tracing::info!(
                     "Releasing lock on drive {} (held by closing session TSIH={})",
@@ -969,7 +969,7 @@ impl DriveManager {
         self.drives
             .values()
             .map(|mtx| {
-                let d = mtx.lock().expect("drive mutex poisoned");
+                let d = mtx.lock().unwrap_or_else(|p| p.into_inner());
                 DriveInfo {
                     id: d.id,
                     barcode: d.cartridge.as_ref().map(|c| c.label().to_string()),
@@ -991,7 +991,7 @@ impl DriveManager {
             .drives
             .values()
             .map(|mtx| {
-                let d = mtx.lock().expect("drive mutex poisoned");
+                let d = mtx.lock().unwrap_or_else(|p| p.into_inner());
                 DriveInfo {
                     id: d.id,
                     barcode: d.cartridge.as_ref().map(|c| c.label().to_string()),
@@ -1281,6 +1281,33 @@ mod tests {
         assert_eq!(reloaded.lifetime_volume_loads, 2);
         assert_eq!(reloaded.volume_mounts, Some(2));
         assert_eq!(reloaded.host_bytes_written, b"hello tape".len() as u64);
+    }
+
+    /// Issue #259: a poisoned per-drive mutex must not crash the
+    /// always-on monitor / log-sense / READ ATTRIBUTE read paths — they
+    /// recover the guard instead of `.expect()`-panicking on every call.
+    #[test]
+    fn poisoned_drive_mutex_read_accessors_do_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let tapes_root = temp_dir.path().join("tapes");
+        std::fs::create_dir_all(&tapes_root).unwrap();
+        let mgr = DriveManager::new(1, tapes_root);
+
+        // Poison drive 0's mutex by panicking while holding it.
+        let mtx = Arc::clone(mgr.drives.get(&0).unwrap());
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = mtx.lock().unwrap();
+            panic!("intentionally poison the drive mutex");
+        }));
+        assert!(res.is_err());
+        assert!(mtx.is_poisoned());
+
+        // None of the read accessors may panic on the poisoned lock.
+        let _ = mgr.get_drive_status();
+        let _ = mgr.get_drive_info();
+        let _ = mgr.log_sense_counters(0);
+        let _ = mgr.get_cartridge_capacity(0);
+        let _ = mgr.get_cartridge_mam_attributes(0);
     }
 
     #[test]

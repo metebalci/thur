@@ -287,8 +287,14 @@ pub fn parse_set_data_encryption(
     let key = data[key_start..key_end].to_vec();
 
     // KAD descriptors follow; we accept and stash them as opaque bytes.
+    // Bound the slice end at `key_end` (.max) so a crafted PAGE LENGTH
+    // that declares the page ending *before* the already-validated key
+    // can't produce a reversed range (start > end) and panic the
+    // spawn_blocking SCSI task — a remote DoS reachable from any
+    // logged-in initiator via a single SECURITY PROTOCOL OUT (issue #260).
     let kad = if data.len() > key_end {
-        data[key_end..(4 + page_length).min(data.len())].to_vec()
+        let kad_end = (4 + page_length).max(key_end).min(data.len());
+        data[key_end..kad_end].to_vec()
     } else {
         Vec::new()
     };
@@ -393,6 +399,37 @@ mod tests {
                 assert_eq!(state.key.len(), KEY_LEN);
                 assert_eq!(state.key[0], 0);
                 assert_eq!(state.key[31], 31);
+            }
+            SetDataEncryption::Clear => panic!("expected SetKey"),
+        }
+    }
+
+    /// Issue #260: a crafted page whose declared PAGE LENGTH ends before
+    /// the (validated) 32-byte key must not produce a reversed KAD slice
+    /// and panic the SCSI task — a remote DoS. It parses with an empty
+    /// KAD instead.
+    #[test]
+    fn parse_set_key_crafted_short_page_length_does_not_panic() {
+        let mut page = vec![0u8; 47]; // key_end = 46, one trailing byte
+        page[0..2].copy_from_slice(&PAGE_SET_DATA_ENCRYPTION.to_be_bytes());
+        // Crafted: PAGE LENGTH = 0 (the honest body length would be 43).
+        page[2..4].copy_from_slice(&0u16.to_be_bytes());
+        page[4] = (KeyScope::Public as u8) << 5;
+        page[6] = EncryptionMode::Encrypt as u8;
+        page[7] = DecryptionMode::Decrypt as u8;
+        page[8] = ALGORITHM_INDEX_AES_256_GCM;
+        page[9] = 0x00; // plaintext key format
+        page[12..14].copy_from_slice(&(KEY_LEN as u16).to_be_bytes());
+        for (i, b) in page[14..14 + 32].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        match parse_set_data_encryption(&page).expect("must parse without panicking") {
+            SetDataEncryption::SetKey(state) => {
+                assert_eq!(state.key.len(), KEY_LEN);
+                assert!(
+                    state.kad.is_empty(),
+                    "a short crafted page_length yields an empty KAD, not a panic"
+                );
             }
             SetDataEncryption::Clear => panic!("expected SetKey"),
         }
