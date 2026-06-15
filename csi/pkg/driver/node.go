@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -52,6 +53,14 @@ type nodeServer struct {
 	mounter  volumeMounter
 	resizer  resizeFs
 	stateDir string
+	// Serializes NodeStageVolume / NodeUnstageVolume. kubelet runs
+	// per-volume operations concurrently, and all volumes on a node share
+	// one iSCSI session; without this, an unstage's last-connector scan
+	// could race a concurrent stage's Attach-to-saveConn window — seeing
+	// an empty dir and logging out the session the stage just
+	// established, so the staging volume's device vanishes (issue #292).
+	// Stage/unstage are infrequent, so a node-wide lock is acceptable.
+	mu sync.Mutex
 }
 
 func (s *nodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -75,6 +84,10 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+
+	// Serialize against a concurrent unstage's last-connector scan (#292).
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	device, err := s.attacher.Attach(ctx, conn)
 	if err != nil {
@@ -176,6 +189,11 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	if req.GetVolumeId() == "" || staging == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id and staging_target_path are required")
 	}
+	// Serialize against a concurrent stage's Attach-to-saveConn window so
+	// the last-connector scan below can't race it (#292).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if err := s.unmount(staging); err != nil {
 		return nil, status.Errorf(codes.Internal, "unmount staging: %v", err)
 	}
@@ -225,7 +243,9 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	}
 	// Teardown succeeded — now drop this volume's connector. Until this
 	// point any earlier failure left it on disk so the retry re-ran.
-	_ = os.Remove(s.connPath(req.GetVolumeId()))
+	if path, err := s.connPath(req.GetVolumeId()); err == nil {
+		_ = os.Remove(path)
+	}
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -316,8 +336,18 @@ func connectorFromPublishContext(pc map[string]string) (iscsi.Connector, error) 
 	return c, nil
 }
 
-func (s *nodeServer) connPath(volID string) string {
-	return filepath.Join(s.stateDir, volID+".json")
+func (s *nodeServer) connPath(volID string) (string, error) {
+	// Reject volume_ids that aren't a valid VSA volume name. The driver
+	// only mints [A-Za-z0-9_-] names, but a '/' or '../' in a
+	// statically-provisioned PV's volumeHandle — which never runs through
+	// the CreateVolume sanitizer — would otherwise let saveConn write the
+	// connector JSON (including the CHAP secret) to an arbitrary host path
+	// as root, and loadConn read arbitrary .json files: path traversal out
+	// of --node-state-dir on the privileged node plugin (issue #293).
+	if !isValidVolumeName(volID) {
+		return "", fmt.Errorf("invalid volume id %q: must be 1-%d chars of [A-Za-z0-9_-]", volID, maxVolumeNameLen)
+	}
+	return filepath.Join(s.stateDir, volID+".json"), nil
 }
 
 // isLastConnector reports whether the volume being unstaged (excludeVolID)
@@ -351,11 +381,19 @@ func (s *nodeServer) saveConn(volID string, c iscsi.Connector) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.connPath(volID), b, 0o600)
+	path, err := s.connPath(volID)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
 func (s *nodeServer) loadConn(volID string) (iscsi.Connector, error) {
-	b, err := os.ReadFile(s.connPath(volID))
+	path, err := s.connPath(volID)
+	if err != nil {
+		return iscsi.Connector{}, err
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return iscsi.Connector{}, err
 	}

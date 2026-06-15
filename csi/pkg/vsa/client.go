@@ -48,11 +48,25 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	data, _ := io.ReadAll(resp.Body)
+	// Propagate the body read error: if the daemon dies (or the unix
+	// connection resets) after the status line but before the body, a
+	// swallowed error turned a truncated 2xx into a zero-value success —
+	// e.g. CreateVolume returning an empty VolumeRow (VolumeId "",
+	// CapacityBytes 0) — corrupting control-plane state in exactly the
+	// daemon-restart scenario where a retryable error is expected (#296).
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("%s %s: read response body: %w", method, path, err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return parseAPIError(resp.StatusCode, data)
 	}
-	if out != nil && len(data) > 0 {
+	if out != nil {
+		// A caller that asked to decode a value but got an empty body
+		// must see an error, not a silent all-zero struct.
+		if len(data) == 0 {
+			return fmt.Errorf("%s %s: empty response body where a decoded value was expected", method, path)
+		}
 		if err := json.Unmarshal(data, out); err != nil {
 			return fmt.Errorf("decode response: %w", err)
 		}

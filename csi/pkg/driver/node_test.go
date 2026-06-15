@@ -150,7 +150,7 @@ func TestNodeStagePublishUnpublishUnstageMount(t *testing.T) {
 	if !fm.mounted[staging] {
 		t.Errorf("staging not mounted")
 	}
-	if _, err := os.Stat(ns.connPath("pvc-1")); err != nil {
+	if _, err := os.Stat(connPathOf(t, ns, "pvc-1")); err != nil {
 		t.Errorf("connector state not persisted: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestNodeStagePublishUnpublishUnstageMount(t *testing.T) {
 	if len(fa.detached) != 1 || fa.detached[0] != [2]string{"iqn.2025-10.com.metebalci:thurvsa", "10.0.0.5:3260"} {
 		t.Errorf("detach not called: %+v", fa.detached)
 	}
-	if _, err := os.Stat(ns.connPath("pvc-1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(connPathOf(t, ns, "pvc-1")); !os.IsNotExist(err) {
 		t.Errorf("connector state not removed after unstage: %v", err)
 	}
 }
@@ -272,7 +272,7 @@ func TestNodeUnstageDetachesOnlyOnLastVolume(t *testing.T) {
 	if len(fa.deleted) != 1 {
 		t.Fatalf("the unstaged volume's device must be deleted: %+v", fa.deleted)
 	}
-	if _, err := os.Stat(ns.connPath("pvc-a")); !os.IsNotExist(err) {
+	if _, err := os.Stat(connPathOf(t, ns, "pvc-a")); !os.IsNotExist(err) {
 		t.Errorf("pvc-a connector not removed: %v", err)
 	}
 
@@ -312,7 +312,7 @@ func TestNodeUnstageRetriesDetachAfterFailure(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("expected unstage to fail when detach fails")
 	}
-	if _, err := os.Stat(ns.connPath("pvc-1")); err != nil {
+	if _, err := os.Stat(connPathOf(t, ns, "pvc-1")); err != nil {
 		t.Fatalf("connector must survive a failed detach for the retry: %v", err)
 	}
 	if len(fa.detached) != 0 {
@@ -329,7 +329,7 @@ func TestNodeUnstageRetriesDetachAfterFailure(t *testing.T) {
 	if len(fa.detached) != 1 {
 		t.Fatalf("retry must log out the session: %+v", fa.detached)
 	}
-	if _, err := os.Stat(ns.connPath("pvc-1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(connPathOf(t, ns, "pvc-1")); !os.IsNotExist(err) {
 		t.Errorf("connector must be removed after a successful detach: %v", err)
 	}
 }
@@ -411,5 +411,36 @@ func TestNodeGetInfoAndCapabilities(t *testing.T) {
 	caps, err := ns.NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
 	if err != nil || len(caps.GetCapabilities()) == 0 {
 		t.Fatalf("NodeGetCapabilities: %v / %d", err, len(caps.GetCapabilities()))
+	}
+}
+
+// connPathOf resolves a connector path for a valid volume id, failing the
+// test on the (now-fallible) validation error — issue #293.
+func connPathOf(t *testing.T, ns *nodeServer, volID string) string {
+	t.Helper()
+	p, err := ns.connPath(volID)
+	if err != nil {
+		t.Fatalf("connPath(%q): %v", volID, err)
+	}
+	return p
+}
+
+// Issue #293: connPath must reject volume ids that could traverse out of
+// the node state dir, so a hostile/static volumeHandle can't write the
+// CHAP-bearing connector JSON (or read arbitrary files) as root.
+func TestConnPathRejectsTraversal(t *testing.T) {
+	ns := &nodeServer{stateDir: t.TempDir()}
+	for _, bad := range []string{"../etc/evil", "a/b", "/abs", "..", "with space", ""} {
+		if _, err := ns.connPath(bad); err == nil {
+			t.Errorf("connPath(%q) should be rejected", bad)
+		}
+	}
+	// A driver-minted name is accepted and stays under stateDir.
+	p, err := ns.connPath("pvc-abc123")
+	if err != nil {
+		t.Fatalf("valid name rejected: %v", err)
+	}
+	if filepath.Dir(p) != ns.stateDir {
+		t.Errorf("connector path %q escaped stateDir %q", p, ns.stateDir)
 	}
 }
