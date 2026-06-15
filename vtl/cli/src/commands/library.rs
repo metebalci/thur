@@ -208,15 +208,17 @@ fn rebuild_inventory(
         );
     }
 
-    for barcode in restored_barcodes {
-        // `add_or_create_tape` short-circuits the Create path when
-        // the cartridge dir already exists (which it does — restore
-        // wrote it). Resulting effect is "place existing cartridge
-        // in first free slot", which is what we want.
-        library
-            .add_or_create_tape(barcode, backend_name)
-            .with_context(|| format!("seating cartridge '{}' into a storage slot", barcode))?;
-    }
+    // Seat all restored cartridges and persist inventory.json ONCE,
+    // instead of a full serialize + flock + rewrite per barcode — at the
+    // 65535-slot topology that was ~5-8 MB rewritten N times (tens of GB
+    // for a 5000-cartridge restore) for what needs a single ~6 MB write
+    // (issue #286). `add_or_create_tapes` short-circuits the Create path
+    // per barcode when the cartridge dir already exists (which it does —
+    // restore wrote it), so this just seats each existing cartridge into
+    // the first free slot.
+    library
+        .add_or_create_tapes(restored_barcodes, backend_name)
+        .context("seating restored cartridges into storage slots")?;
     Ok(())
 }
 
@@ -413,7 +415,11 @@ pub async fn cmd_inventory(filter: Option<String>, json: bool) -> Result<()> {
 
     println!();
     let mut table = create_table();
-    table.set_header(vec!["Slot", "Type", "Barcode", "Label"]);
+    // Three columns to match the three cells each row pushes — the old
+    // 4th "Label" header was never populated (the changer-inventory
+    // response carries no separate label; for a tape the barcode is the
+    // label), leaving a permanently-empty column (issue #287).
+    table.set_header(vec!["Slot", "Type", "Barcode"]);
 
     for item in &resp.entries {
         let slot_str = match item.slot_type.as_str() {

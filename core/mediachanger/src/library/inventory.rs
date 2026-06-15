@@ -32,6 +32,35 @@ impl Library {
     /// empty cartridge bound to the named storage backend. Pass
     /// `backend_name` matching an entry in `storage.backends`.
     pub fn add_or_create_tape(&mut self, barcode: &str, backend_name: &str) -> Result<u32> {
+        let slot_id = self.seat_one_tape(barcode, backend_name)?;
+        self.persist()?;
+        Ok(slot_id)
+    }
+
+    /// Seat (creating the cartridge dir if missing) every barcode into
+    /// the first free storage slot, persisting the inventory ONCE after
+    /// the whole batch instead of once per barcode. DR restore seats up
+    /// to thousands of cartridges; the per-barcode persist re-serialized
+    /// and rewrote the full (multi-MB at the 65535-slot scale)
+    /// inventory.json on every call — O(N x slots) writes for what needs
+    /// one (issue #286). Returns the seated slot ids in order.
+    pub fn add_or_create_tapes(
+        &mut self,
+        barcodes: &[String],
+        backend_name: &str,
+    ) -> Result<Vec<u32>> {
+        let mut slot_ids = Vec::with_capacity(barcodes.len());
+        for barcode in barcodes {
+            slot_ids.push(self.seat_one_tape(barcode, backend_name)?);
+        }
+        self.persist()?;
+        Ok(slot_ids)
+    }
+
+    /// Create the cartridge dir if missing and fill the first free
+    /// storage slot — the in-memory half of [`Self::add_or_create_tape`],
+    /// without persisting, so callers can batch the durable write.
+    fn seat_one_tape(&mut self, barcode: &str, backend_name: &str) -> Result<u32> {
         // ensure tape dir exists (create empty cartridge if needed)
         let tape_root = self.tapes_dir.join(barcode);
         if !tape_root.exists() {
@@ -54,21 +83,16 @@ impl Library {
             )?;
         }
 
-        // find empty slot and fill it, but end the mutable borrow before persist()
-        let slot_id = {
-            let slot = self
-                .inventory
-                .storage_slots
-                .iter_mut()
-                .find(|s| !s.occupied)
-                .ok_or(SmcError::InvalidOp("no empty cartridge slots"))?;
-            slot.barcode = Some(barcode.to_string());
-            slot.occupied = true;
-            slot.id
-        };
-
-        self.persist()?;
-        Ok(slot_id)
+        // find empty slot and fill it
+        let slot = self
+            .inventory
+            .storage_slots
+            .iter_mut()
+            .find(|s| !s.occupied)
+            .ok_or(SmcError::InvalidOp("no empty cartridge slots"))?;
+        slot.barcode = Some(barcode.to_string());
+        slot.occupied = true;
+        Ok(slot.id)
     }
 
     /// Remove tape from a cartridge slot (logical removal), does not delete data.
@@ -448,6 +472,35 @@ mod exchange_tests {
 
         assert_eq!(barcode_at(&lib, 0).as_deref(), Some("TAPE002"));
         assert_eq!(barcode_at(&lib, 1).as_deref(), Some("TAPE001"));
+    }
+
+    /// Issue #286: the batch seat places each barcode in the first free
+    /// slot (one persist for the whole batch) and survives a reload.
+    #[test]
+    fn add_or_create_tapes_batch_seats_all_in_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let lib_root = temp_dir.path().join("library");
+        let tapes = temp_dir.path().join("tapes");
+        let mut lib =
+            Library::initialize(&lib_root, &tapes, 8, 0, 2, 8, None, 0, 1001, 101, 1).unwrap();
+
+        let barcodes = vec![
+            "TAPE001".to_string(),
+            "TAPE002".to_string(),
+            "TAPE003".to_string(),
+        ];
+        let slots = lib.add_or_create_tapes(&barcodes, "primary").unwrap();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(barcode_at(&lib, 0).as_deref(), Some("TAPE001"));
+        assert_eq!(barcode_at(&lib, 1).as_deref(), Some("TAPE002"));
+        assert_eq!(barcode_at(&lib, 2).as_deref(), Some("TAPE003"));
+
+        // Persisted: a fresh open sees the same seating.
+        let reopened = Library::open(&lib_root, &tapes).unwrap();
+        assert_eq!(
+            reopened.storage_slots()[2].barcode.as_deref(),
+            Some("TAPE003")
+        );
     }
 
     #[test]

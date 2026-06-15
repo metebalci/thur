@@ -217,6 +217,26 @@ pub async fn cmd_key_migrate(
             Some(false) => {}
         }
     }
+
+    // Queue a tamper-evident audit row for the DEK custody change — the
+    // manifest rewrite above committed it, so it must be visible in the
+    // chain like the sibling daemon-down partition / restore verbs. A
+    // key-custody move is the most security-sensitive daemon-down op;
+    // without this an auditor can't tell when, by whom, or to which
+    // backend a cartridge's DEK wrap-target moved, nor that the
+    // plaintext sidecar was purged (issue #285).
+    crate::audit_helper::record_ok(
+        &data_dir.to_string_lossy(),
+        &config_path.to_string_lossy(),
+        "cartridge.key.migrate",
+        serde_json::json!({
+            "barcode": barcode,
+            "from": from_label,
+            "to": to,
+            "purge_local": purge_local,
+            "sidecar_purged": sidecar_warning,
+        }),
+    );
     Ok(())
 }
 

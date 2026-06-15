@@ -1040,7 +1040,7 @@ enum LibraryAction {
     /// Monitor library activity in real-time
     Monitor {
         /// Update interval in seconds
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
     },
 
