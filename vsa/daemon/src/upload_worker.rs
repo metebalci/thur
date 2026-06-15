@@ -81,6 +81,7 @@ pub async fn run_upload_worker(
     backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
     max_concurrent: usize,
     evict_notify: Arc<tokio::sync::Notify>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let concurrency = max_concurrent.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -88,21 +89,28 @@ pub async fn run_upload_worker(
         "thurvsa upload worker started (max_concurrent={}, channel_depth={})",
         concurrency, UPLOAD_CHANNEL_DEPTH
     );
-    while let Some(task) = rx.recv().await {
-        // Permit acquisition gates concurrency. .acquire_owned()
-        // hands the permit to the spawned task, which drops it on
-        // completion — backpressure folds into how fast tasks
+    // Helper: gate concurrency on a permit and spawn the upload. Returns
+    // false only if the semaphore was closed (never, in practice).
+    async fn spawn_one(
+        task: UploadTask,
+        semaphore: &Arc<Semaphore>,
+        backends: &Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>>,
+        registry: &Arc<VolumeRegistry>,
+        evict_notify: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        // .acquire_owned() hands the permit to the spawned task, which
+        // drops it on completion — backpressure folds into how fast tasks
         // finish, not how fast they're spawned.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
                 warn!("upload worker semaphore closed; exiting");
-                break;
+                return false;
             }
         };
-        let backends = Arc::clone(&backends);
-        let registry = Arc::clone(&registry);
-        let evict_notify = Arc::clone(&evict_notify);
+        let backends = Arc::clone(backends);
+        let registry = Arc::clone(registry);
+        let evict_notify = Arc::clone(evict_notify);
         tokio::spawn(async move {
             let _permit = permit;
             // A successful upload flips a page LocalOnly -> Both, making
@@ -113,8 +121,40 @@ pub async fn run_upload_worker(
                 evict_notify.notify_one();
             }
         });
+        true
     }
-    info!("thurvsa upload worker shutting down (channel closed)");
+
+    loop {
+        let task = tokio::select! {
+            biased;
+            // Explicit shutdown signal: the channel can never close on its
+            // own because every VolumeWriter holds a Sender clone that
+            // outlives this wait (the registry + the final flush keep them
+            // alive), so relying on channel-close hung shutdown for the
+            // full timeout and leaked the task (issue #289). On signal,
+            // drain whatever is already queued (the final flush's uploads)
+            // then exit; anything not yet enqueued / mid-PUT stays
+            // LocalOnly and re-enqueues on the next boot's recovery scan.
+            _ = shutdown.notified() => {
+                info!("thurvsa upload worker: shutdown signalled; draining queued uploads");
+                while let Ok(task) = rx.try_recv() {
+                    if !spawn_one(task, &semaphore, &backends, &registry, &evict_notify).await {
+                        break;
+                    }
+                }
+                break;
+            }
+            maybe = rx.recv() => match maybe {
+                Some(t) => t,
+                // Legacy path: all senders genuinely dropped.
+                None => break,
+            },
+        };
+        if !spawn_one(task, &semaphore, &backends, &registry, &evict_notify).await {
+            break;
+        }
+    }
+    info!("thurvsa upload worker shutting down");
     Ok(())
 }
 
@@ -367,5 +407,38 @@ mod tests {
         pending.mark_pending(0).await;
         run_one_task(task_for("ghost", "local", &pending), &backends, &registry).await;
         assert_eq!(pending.wait_for_range(0..=0).await, DrainOutcome::Failed);
+    }
+
+    /// Issue #289: the worker must exit promptly on the explicit shutdown
+    /// signal even though a Sender clone is still alive (the real bug
+    /// condition — VolumeWriters keep clones, so the channel never closes).
+    #[tokio::test]
+    async fn worker_exits_on_shutdown_signal_with_live_sender() {
+        let (tx, rx) = upload_channel();
+        let registry = Arc::new(VolumeRegistry::new());
+        let backends: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStoreBackend>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let evict = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        let handle = tokio::spawn(run_upload_worker(
+            rx,
+            registry,
+            backends,
+            4,
+            evict,
+            Arc::clone(&shutdown),
+        ));
+
+        // Hold a sender alive — the channel can NEVER close, so only the
+        // explicit signal can stop the worker.
+        let _keep_sender = tx;
+        shutdown.notify_one();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            res.is_ok(),
+            "worker must exit on the shutdown signal even with a live sender (no channel close)"
+        );
     }
 }

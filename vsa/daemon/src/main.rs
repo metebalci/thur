@@ -503,11 +503,16 @@ async fn main() -> Result<()> {
     // in the worker, and every page dispatched against it silently
     // hit "backend unknown" (warned-once-and-drop).
     let admin_backends = Arc::new(Mutex::new(backends));
+    // Explicit upload-worker shutdown signal (issue #289): the channel
+    // can't close on its own (every VolumeWriter keeps a Sender clone),
+    // so shutdown notifies this instead of waiting on channel-close.
+    let upload_shutdown = Arc::new(tokio::sync::Notify::new());
     let upload_worker_handle = {
         let registry = Arc::clone(&registry);
         let backends = Arc::clone(&admin_backends);
         let max_concurrent = max_concurrent_flushes;
         let evict_notify = Arc::clone(&disk_cache_evict_notify);
+        let shutdown = Arc::clone(&upload_shutdown);
         Some(tokio::spawn(async move {
             if let Err(e) = upload_worker::run_upload_worker(
                 upload_rx,
@@ -515,6 +520,7 @@ async fn main() -> Result<()> {
                 backends,
                 max_concurrent,
                 evict_notify,
+                shutdown,
             )
             .await
             {
@@ -1176,14 +1182,16 @@ async fn main() -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
-    // Upload worker shutdown. Drop every sender (the discovery-
-    // resident clones live in each `VolumeWriter`; PageCache's
-    // `flush_all` above already finished and the writers are about
-    // to be dropped) and let the worker drain naturally on channel
-    // close. Bounded wait so a wedged in-flight PUT doesn't block
-    // shutdown — the page stays LocalOnly and the next boot's
-    // recovery scan re-enqueues.
+    // Upload worker shutdown. The channel can never close on its own —
+    // every VolumeWriter (held by the registry + the discovery-resident
+    // caches) keeps a Sender clone alive past this point, so the old
+    // drop-then-drain-on-close always burned the full 5 s timeout and
+    // leaked the worker (issue #289). Signal it explicitly instead: the
+    // worker drains the final flush's queued uploads, then exits well
+    // within the bounded wait (which still backstops a wedged in-flight
+    // PUT — that page stays LocalOnly and re-enqueues on the next boot).
     drop(upload_tx);
+    upload_shutdown.notify_one();
     if let Some(h) = upload_worker_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
     }
