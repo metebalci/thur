@@ -221,21 +221,25 @@ test_empty_bucket_dry_run_then_real() {
     return 0
 }
 
-# Single-cartridge sentinel: --barcodes filter with no matches still
-# exits 0; verify report shape includes the filtered-out barcode.
+# --barcodes filtering: a non-requested barcode is filtered out (benign,
+# exit 0), but a requested barcode that matches no sentinel is reported
+# as NOT FOUND and fails the command (issue #233) — a scripted DR runbook
+# must not exit 0 having restored nothing for an explicitly-named tape.
 test_barcode_filter_with_no_matches() {
-    log_test "library restore --barcodes with no matching sentinel..."
+    log_test "library restore --barcodes filter / not-found semantics..."
     local data_dir="$TEST_DIR/filter"
     local config="$TEST_DIR/filter.yaml"
     local mirror="$TEST_DIR/mirror-filter"
     write_config "$data_dir" "$config" "$mirror"
 
-    # Synthesize a minimal sentinel that our discovery can see. We
-    # don't need it to open as a real cartridge — discovery only
-    # checks for the sentinel key shape.
-    mkdir -p "$mirror/manifests/TAPE_HIDDEN"
-    echo '{"label":"TAPE_HIDDEN","backend":"mirror","dedup":"global","uuid":"00000000000000000000000000000000","index_epoch":{}}' \
-        > "$mirror/manifests/TAPE_HIDDEN/manifest-latest.json"
+    # Synthesize two minimal sentinels discovery can see. We don't need
+    # them to open as real cartridges — discovery only checks the key
+    # shape.
+    for bc in TAPE_HIDDEN TAPE_VISIBLE; do
+        mkdir -p "$mirror/manifests/$bc"
+        echo "{\"label\":\"$bc\",\"backend\":\"mirror\",\"dedup\":\"global\",\"uuid\":\"00000000000000000000000000000000\",\"index_epoch\":{}}" \
+            > "$mirror/manifests/$bc/manifest-latest.json"
+    done
 
     # Materialize library.json by starting the daemon briefly. The
     # daemon writes library.json from the YAML `library:` block on
@@ -245,18 +249,19 @@ test_barcode_filter_with_no_matches() {
     fi
     stop_daemon
 
-    # Filter selects nothing — exit 0, no restore attempted.
+    # Case A: filter selects a present barcode — exit 0, the other is
+    # reported as filtered out, nothing is "not found".
     local out
     out=$("$CLI_PATH" --config "$config" library restore \
-        --backend mirror --barcodes "TAPE_NONE" --dry-run 2>&1)
+        --backend mirror --barcodes "TAPE_VISIBLE" --dry-run 2>&1)
     local rc=$?
     if [[ $rc -ne 0 ]]; then
-        log_error "filter dry-run exited $rc"
+        log_error "filter dry-run (present barcode) exited $rc"
         echo "$out" >&2
         return 1
     fi
-    if ! echo "$out" | grep -q "Discovered: 1 cartridge"; then
-        log_error "discovery did not see the synthesized sentinel:"
+    if ! echo "$out" | grep -q "Discovered: 2 cartridge"; then
+        log_error "discovery did not see both synthesized sentinels:"
         echo "$out" >&2
         return 1
     fi
@@ -265,7 +270,23 @@ test_barcode_filter_with_no_matches() {
         echo "$out" >&2
         return 1
     fi
-    log_info "OK — filter excludes non-matches while preserving discovery"
+
+    # Case B: filter names a barcode absent from the bucket — exit
+    # non-zero and report it as NOT FOUND (issue #233).
+    out=$("$CLI_PATH" --config "$config" library restore \
+        --backend mirror --barcodes "TAPE_NONE" --dry-run 2>&1)
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log_error "filter dry-run (absent barcode) exited 0 — must fail (issue #233):"
+        echo "$out" >&2
+        return 1
+    fi
+    if ! echo "$out" | grep -q "Requested but NOT FOUND in bucket: TAPE_NONE"; then
+        log_error "absent barcode was not reported as not-found:"
+        echo "$out" >&2
+        return 1
+    fi
+    log_info "OK — present filter restores, absent filter fails (not-found)"
     return 0
 }
 

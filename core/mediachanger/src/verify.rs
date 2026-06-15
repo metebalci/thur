@@ -1094,8 +1094,15 @@ async fn sweep_one_backend_storage(
                     && cr.chunks_with_hash > 0
                     && cr.storage_index_pages_missing.unwrap_or(0) == 0
                 {
-                    cr.warnings.push(
-                        "storage sentinel manifest-latest.json missing — cartridge has chunks but never been backed up to storage".into(),
+                    // The cartridge's index pages are all present in the
+                    // bucket, so it demonstrably WAS backed up — a
+                    // missing sentinel here means the one key
+                    // `library restore` discovers cartridges by (bucket
+                    // lifecycle rule / manual cleanup) is gone. Cold-bucket
+                    // DR would silently skip this cartridge, so this is an
+                    // error, not a warning (issue #234).
+                    cr.errors.push(
+                        "storage sentinel manifest-latest.json missing — cartridge is backed up (index pages present) but the DR discovery sentinel was deleted; `library restore` will not find it".into(),
                     );
                 } else {
                     cr.warnings
@@ -1646,6 +1653,65 @@ mod tests {
                 .any(|e| e.contains("index-page object(s) missing from storage")),
             "{:#?}",
             c.errors
+        );
+    }
+
+    /// Issue #234: a deleted DR sentinel on a cartridge that is
+    /// demonstrably backed up (all index pages + chunks present in
+    /// storage) is an ERROR, not a warning — `library restore` discovers
+    /// cartridges only by that sentinel, so otherwise `system verify`
+    /// reports success while cold-bucket DR would silently skip it.
+    #[tokio::test]
+    async fn storage_sweep_deleted_sentinel_on_backed_up_cart_is_error() {
+        use crate::local::LocalBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        fs::create_dir_all(dd.join("library")).unwrap();
+        fs::write(
+            dd.join("library").join("library.json"),
+            r#"{"num_storage_slots":1,"num_mail_slots":0,"num_drives":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            dd.join("library").join("inventory.json"),
+            r#"{"storage_slots":[{"slot_id":1,"barcode":"TAPE003"}],"mail_slots":[],"drives":[]}"#,
+        )
+        .unwrap();
+
+        let backend_dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
+        let h = "a".repeat(64);
+        make_storage_cart(dd, backend_dir.path(), "TAPE003", &h, b"data");
+
+        // Delete ONLY the sentinel — chunk + index page stay, so the
+        // cartridge is demonstrably backed up.
+        fs::remove_file(
+            backend_dir
+                .path()
+                .join("manifests/TAPE003/manifest-latest.json"),
+        )
+        .unwrap();
+
+        let (mut report, cart_sets) = verify_local_inner(dd, &VerifyScope::default()).unwrap();
+        sweep_one_backend_storage(&mut report, &cart_sets, "primary", &backend).await;
+
+        let c = &report.cartridges[0];
+        assert_eq!(c.storage_sentinel_present, Some(false));
+        assert_eq!(c.storage_index_pages_missing, Some(0));
+        assert!(
+            c.errors
+                .iter()
+                .any(|e| e.contains("sentinel manifest-latest.json missing")),
+            "deleted sentinel on a backed-up cartridge must be an error: {:#?}",
+            c.errors
+        );
+        assert!(
+            !c.warnings
+                .iter()
+                .any(|w| w.contains("sentinel manifest-latest.json missing")),
+            "must not be downgraded to a warning: {:#?}",
+            c.warnings
         );
     }
 

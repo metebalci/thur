@@ -43,6 +43,11 @@ pub struct RestoreReport {
     pub discovered: Vec<String>,
     /// Barcodes the operator's `--barcodes` filter excluded.
     pub filtered_out: Vec<String>,
+    /// `--barcodes` entries that matched no discovered sentinel in the
+    /// bucket (typo, or a cartridge whose sentinel upload was torn).
+    /// Surfaced so a scripted DR runbook can't exit 0 having restored
+    /// nothing for an explicitly-requested barcode (issue #233).
+    pub not_found: Vec<String>,
     /// Barcodes skipped because the local cartridge directory already
     /// exists (`--allow-existing`).
     pub skipped_existing: Vec<String>,
@@ -129,6 +134,16 @@ pub async fn run_restore(
             }
         });
 
+    // Filter entries that matched no discovered sentinel. Without this,
+    // `library restore --barcodes TAPE007` for a barcode absent from the
+    // bucket vanishes from every list and the CLI exits 0 (issue #233).
+    let discovered_set: BTreeSet<&str> = discovered.iter().map(|s| s.as_str()).collect();
+    let not_found: Vec<String> = barcode_filter
+        .iter()
+        .filter(|b| !discovered_set.contains(b.as_str()))
+        .cloned()
+        .collect();
+
     let mut skipped_existing = Vec::new();
     let mut cartridges = Vec::new();
 
@@ -139,6 +154,7 @@ pub async fn run_restore(
             backend_name: backend_name.to_string(),
             discovered,
             filtered_out,
+            not_found,
             skipped_existing,
             cartridges,
             dry_run: true,
@@ -183,6 +199,7 @@ pub async fn run_restore(
         backend_name: backend_name.to_string(),
         discovered,
         filtered_out,
+        not_found,
         skipped_existing,
         cartridges,
         dry_run: false,
@@ -336,6 +353,43 @@ mod tests {
         assert_eq!(attempted, vec!["TAPE002"]);
         assert!(report.filtered_out.contains(&"TAPE001".to_string()));
         assert!(report.filtered_out.contains(&"TAPE003".to_string()));
+        // Every requested barcode was discovered → nothing not-found.
+        assert!(report.not_found.is_empty());
+    }
+
+    /// Issue #233: a `--barcodes` entry that matches no discovered
+    /// sentinel must surface in `not_found` (and one that does match
+    /// must not), so the CLI can refuse instead of exiting 0 having
+    /// restored nothing.
+    #[tokio::test]
+    async fn run_restore_filter_miss_surfaces_in_not_found() {
+        let backend_dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(backend_dir.path()).await.unwrap();
+        write_storage_sentinel(backend_dir.path(), "TAPE001");
+
+        let data_dir = TempDir::new().unwrap();
+        let tapes = data_dir.path().join("tapes");
+        fs::create_dir_all(&tapes).unwrap();
+
+        // One present, one absent.
+        let filter = vec!["TAPE001".to_string(), "TAPE_GHOST".to_string()];
+        let report = run_restore(&tapes, &backend, "mirror", &filter, false, false)
+            .await
+            .unwrap();
+        assert_eq!(report.not_found, vec!["TAPE_GHOST".to_string()]);
+        // The present one was still attempted.
+        let attempted: Vec<&str> = report
+            .cartridges
+            .iter()
+            .map(|c| c.barcode.as_str())
+            .collect();
+        assert_eq!(attempted, vec!["TAPE001"]);
+
+        // Dry-run surfaces it too (the runbook's pre-flight check).
+        let dry = run_restore(&tapes, &backend, "mirror", &filter, false, true)
+            .await
+            .unwrap();
+        assert_eq!(dry.not_found, vec!["TAPE_GHOST".to_string()]);
     }
 
     #[tokio::test]

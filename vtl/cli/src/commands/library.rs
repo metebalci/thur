@@ -107,9 +107,19 @@ pub async fn cmd_restore(
     print_restore_report(&report);
 
     if dry_run {
-        // No filesystem mutation, no audit footprint. Always exit 0
-        // — discovery succeeded by definition (run_restore returned
-        // Ok), and there's nothing else to assert.
+        // No filesystem mutation, no audit footprint. Exit non-zero if
+        // the operator's --barcodes named something absent from the
+        // bucket, so a scripted runbook catches the typo before the real
+        // restore (issue #233); otherwise discovery succeeded and
+        // there's nothing else to assert.
+        if !report.not_found.is_empty() {
+            eprintln!(
+                "error: {} requested barcode(s) not found in bucket: {}",
+                report.not_found.len(),
+                report.not_found.join(", ")
+            );
+            return Ok(2);
+        }
         return Ok(0);
     }
 
@@ -132,12 +142,22 @@ pub async fn cmd_restore(
         "selected": report.discovered.len() - report.filtered_out.len(),
         "skipped_existing": report.skipped_existing,
         "filtered_out": report.filtered_out,
+        "not_found": report.not_found,
         "restored": successes,
         "failed": report.failures(),
         "allow_existing": allow_existing,
     });
 
-    let cli_result: Result<()> = if !report.failures().is_empty() {
+    // A requested-but-absent barcode is a failure: the operator named a
+    // cartridge the bucket doesn't hold, so a scripted DR runbook must
+    // not see exit 0 having restored nothing for it (issue #233).
+    let cli_result: Result<()> = if !report.not_found.is_empty() {
+        Err(anyhow::anyhow!(
+            "{} requested barcode(s) not found in bucket: {}",
+            report.not_found.len(),
+            report.not_found.join(", ")
+        ))
+    } else if !report.failures().is_empty() {
         Err(anyhow::anyhow!(
             "{} cartridge(s) failed to restore",
             report.failures().len()
@@ -206,6 +226,12 @@ fn print_restore_report(report: &core_mediachanger::library::restore::RestoreRep
         println!(
             "  Filtered out by --barcodes: {}",
             report.filtered_out.join(", ")
+        );
+    }
+    if !report.not_found.is_empty() {
+        println!(
+            "  Requested but NOT FOUND in bucket: {}",
+            report.not_found.join(", ")
         );
     }
     if report.dry_run {
@@ -976,6 +1002,7 @@ mod tests {
             backend_name: "s3b".to_string(),
             discovered: vec!["A".to_string(), "B".to_string()],
             filtered_out: vec!["B".to_string()],
+            not_found: vec![],
             skipped_existing: vec![],
             cartridges: vec![],
             dry_run: true,
@@ -989,6 +1016,7 @@ mod tests {
             backend_name: "s3b".to_string(),
             discovered: vec!["A".to_string(), "B".to_string()],
             filtered_out: vec![],
+            not_found: vec!["Z".to_string()],
             skipped_existing: vec!["C".to_string()],
             cartridges: vec![
                 CartridgeOutcome {
