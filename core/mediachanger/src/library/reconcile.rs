@@ -778,6 +778,10 @@ impl Library {
             tapes_dir,
             topology,
             inventory,
+            persist_version: 0,
+            persist_deferred: false,
+            pending_persist: false,
+            persister: std::sync::Arc::new(super::InventoryPersister::default()),
         }
     }
 

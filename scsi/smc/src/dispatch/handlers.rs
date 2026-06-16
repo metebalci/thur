@@ -303,36 +303,47 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
     // none of which needs the Library lock; holding it across that work
     // serialized every changer / identity / partition-fence command on
     // all sessions behind one slow cartridge open.
-    if let Err(e) = changer::handle_move_medium(
-        &mut lib,
-        element_config,
-        transport_address,
-        source_address,
-        destination_address,
-        invert,
-    ) {
-        drop(lib);
-        tracing::warn!("MOVE MEDIUM error: {}", e);
-        audit_append(
-            audit_log,
-            audit_ratelimiter,
-            "iscsi.move_medium",
-            actor,
-            serde_json::json!({
-                "action": action_label,
-                "transport": transport_address,
-                "src": source_address,
-                "dst": destination_address,
-                "invert": invert,
-            }),
-            AuditResult::Error(e.to_string()),
-        );
-        return Ok(ScsiResp::check_condition());
-    }
+    // issue #232: defer the inventory persist. The verb mutates in memory
+    // under the lock and `mutate_deferred` serializes the compact snapshot,
+    // but the fsync+rename runs AFTER the guard drops (below) so it no
+    // longer stalls concurrent changer / identity / fence commands on the
+    // single library mutex.
+    let move_outcome = lib.mutate_deferred(|l| {
+        changer::handle_move_medium(
+            l,
+            element_config,
+            transport_address,
+            source_address,
+            destination_address,
+            invert,
+        )
+    });
+    let inventory_snapshot = match move_outcome {
+        Ok((_, snap)) => snap,
+        Err(e) => {
+            drop(lib);
+            tracing::warn!("MOVE MEDIUM error: {}", e);
+            audit_append(
+                audit_log,
+                audit_ratelimiter,
+                "iscsi.move_medium",
+                actor,
+                serde_json::json!({
+                    "action": action_label,
+                    "transport": transport_address,
+                    "src": source_address,
+                    "dst": destination_address,
+                    "invert": invert,
+                }),
+                AuditResult::Error(e.to_string()),
+            );
+            return Ok(ScsiResp::check_condition());
+        }
+    };
 
-    // The inventory move succeeded and is persisted. Capture the
-    // drive-side mirror work (and the rollback target) while still
-    // holding the lock, then drop it before any drive I/O.
+    // The inventory move succeeded (its snapshot is written below, off the
+    // lock). Capture the drive-side mirror work (and the rollback target)
+    // while still holding the lock, then drop it before any drive I/O.
     enum Mirror {
         Load {
             drive_id: u32,
@@ -374,6 +385,32 @@ pub fn handle_move_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         _ => Mirror::None,
     };
     drop(lib); // issue #188: release the Library mutex before drive I/O
+
+    // Persist the inventory snapshot now the library lock is released
+    // (issue #232) — the fsync+rename no longer blocks other sessions'
+    // changer / identity / fence commands. A failure means the in-memory
+    // move isn't durable, so fail the command before any drive I/O, matching
+    // the prior persist-inside-the-verb ordering.
+    if let Some(snap) = inventory_snapshot
+        && let Err(e) = snap.persist()
+    {
+        tracing::error!("MOVE MEDIUM inventory persist failed: {}", e);
+        audit_append(
+            audit_log,
+            audit_ratelimiter,
+            "iscsi.move_medium",
+            actor,
+            serde_json::json!({
+                "action": action_label,
+                "transport": transport_address,
+                "src": source_address,
+                "dst": destination_address,
+                "invert": invert,
+            }),
+            AuditResult::Error(e.to_string()),
+        );
+        return Ok(ScsiResp::check_condition());
+    }
 
     // Drive LUN(s) whose cartridge actually changed — the UA targets.
     let mut affected_drives: Vec<u32> = Vec::new();
@@ -668,8 +705,22 @@ pub fn handle_exchange_medium(ctx: &mut SmcScsiCtx<'_>) -> Result<ScsiResp> {
         }
     };
 
-    if let Err(e) = lib.exchange_medium(src_slot, dst1_slot, dst2_slot) {
-        tracing::warn!("EXCHANGE MEDIUM: {}", e);
+    // issue #232: defer the inventory persist so the fsync+rename happens
+    // off the library lock (below), unblocking concurrent changer /
+    // identity / fence commands.
+    let exchange_snapshot = match lib.mutate_deferred(|l| l.exchange_medium(src_slot, dst1_slot, dst2_slot))
+    {
+        Ok((_, snap)) => snap,
+        Err(e) => {
+            tracing::warn!("EXCHANGE MEDIUM: {}", e);
+            return Ok(ScsiResp::check_condition_with_sense(error_to_sense(&e)));
+        }
+    };
+    drop(lib);
+    if let Some(snap) = exchange_snapshot
+        && let Err(e) = snap.persist()
+    {
+        tracing::error!("EXCHANGE MEDIUM inventory persist failed: {}", e);
         return Ok(ScsiResp::check_condition_with_sense(error_to_sense(&e)));
     }
     Ok(ScsiResp::good())

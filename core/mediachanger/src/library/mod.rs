@@ -559,11 +559,69 @@ pub struct LibraryInventory {
     pub drives: Vec<DriveInfo>,
 }
 
+/// Off-lock inventory writer with monotonic-version gating (issue #232).
+///
+/// MOVE / EXCHANGE MEDIUM serialize the inventory snapshot under the library
+/// lock and write it AFTER releasing the lock, so the fsync+rename no longer
+/// stalls every concurrent changer / identity / partition-fence command on
+/// the single library mutex. Two initiators' moves can reach the (lock-free)
+/// write out of order, so each snapshot carries a version assigned under the
+/// lock; a write is skipped when a newer snapshot has already landed, so
+/// inventory.json never regresses.
+#[derive(Default)]
+struct InventoryPersister {
+    last_written: std::sync::Mutex<u64>,
+}
+
+impl InventoryPersister {
+    fn write_if_newer(&self, version: u64, path: &Path, content: &str) -> Result<()> {
+        let mut last = self.last_written.lock().unwrap_or_else(|e| e.into_inner());
+        if version <= *last {
+            // A newer snapshot already persisted. Versions are assigned
+            // under the library lock, so that snapshot was serialized from
+            // an inventory that already includes this change — skipping is
+            // correct and keeps the on-disk file monotonic.
+            return Ok(());
+        }
+        Library::write_locked(path, content)?;
+        *last = version;
+        Ok(())
+    }
+}
+
+/// A serialized inventory snapshot ready to be written OFF the library lock
+/// (issue #232). Produced by [`Library::mutate_deferred`]; the caller drops
+/// the library guard, then calls [`InventorySnapshot::persist`].
+pub struct InventorySnapshot {
+    version: u64,
+    content: String,
+    path: PathBuf,
+    persister: std::sync::Arc<InventoryPersister>,
+}
+
+impl InventorySnapshot {
+    /// Durably write the snapshot (atomic, lockfile-guarded). Idempotent and
+    /// monotonic: a no-op if a newer snapshot already landed.
+    pub fn persist(&self) -> Result<()> {
+        self.persister
+            .write_if_newer(self.version, &self.path, &self.content)
+    }
+}
+
 pub struct Library {
     root: PathBuf,      // <data_dir>/library
     tapes_dir: PathBuf, // <data_dir>/tapes
     topology: LibraryTopology,
     inventory: LibraryInventory,
+    /// Monotonic persist version (issue #232), assigned under the library
+    /// lock and used to gate off-lock inventory writes so they can't
+    /// regress inventory.json under concurrent MOVE / EXCHANGE MEDIUM.
+    persist_version: u64,
+    /// Set only inside [`Self::mutate_deferred`]: while true, `persist()`
+    /// records that a write is pending instead of doing the fsync inline.
+    persist_deferred: bool,
+    pending_persist: bool,
+    persister: std::sync::Arc<InventoryPersister>,
 }
 
 pub struct LoadedCartridge {
@@ -622,6 +680,10 @@ impl Library {
             tapes_dir,
             topology,
             inventory,
+            persist_version: 0,
+            persist_deferred: false,
+            pending_persist: false,
+            persister: std::sync::Arc::new(InventoryPersister::default()),
         })
     }
 
@@ -800,15 +862,21 @@ impl Library {
             drives,
         };
 
-        // Persist both files with locking
+        // Persist both files with locking. Topology (library.json) stays
+        // pretty — it is tiny, immutable, and occasionally operator-read;
+        // inventory.json is compact to match the hot-path persist (#232).
         Self::write_locked(&lib_path, &serde_json::to_string_pretty(&topology)?)?;
-        Self::write_locked(&inv_path, &serde_json::to_string_pretty(&inventory)?)?;
+        Self::write_locked(&inv_path, &serde_json::to_string(&inventory)?)?;
 
         Ok(Self {
             root,
             tapes_dir,
             topology,
             inventory,
+            persist_version: 0,
+            persist_deferred: false,
+            pending_persist: false,
+            persister: std::sync::Arc::new(InventoryPersister::default()),
         })
     }
 
@@ -877,12 +945,60 @@ impl Library {
         Ok(())
     }
 
-    /// Persist inventory (slot assignments) to disk
-    /// Note: topology is immutable at runtime, so we only persist inventory
-    fn persist(&self) -> Result<()> {
+    /// Persist inventory (slot assignments) to disk. Topology is immutable
+    /// at runtime, so only inventory is rewritten.
+    ///
+    /// Compact (non-pretty) JSON: at the 65535-slot ceiling pretty-printing
+    /// roughly doubled both the serialize cost and the bytes written on every
+    /// MOVE MEDIUM (issue #232). While `persist_deferred` is set (inside
+    /// [`Self::mutate_deferred`]) this only marks a write pending — the
+    /// caller serializes the snapshot and does the fsync OFF the library
+    /// lock. Otherwise (rare admin / CLI / DR verbs) it writes inline,
+    /// routed through the same version-gated writer so an inline write can't
+    /// regress a racing off-lock one.
+    fn persist(&mut self) -> Result<()> {
+        if self.persist_deferred {
+            self.pending_persist = true;
+            return Ok(());
+        }
         let inv_path = self.root.join("inventory.json");
-        let txt = serde_json::to_string_pretty(&self.inventory)?;
-        Self::write_locked(&inv_path, &txt)
+        let txt = serde_json::to_string(&self.inventory)?;
+        self.persist_version += 1;
+        let version = self.persist_version;
+        self.persister.write_if_newer(version, &inv_path, &txt)
+    }
+
+    /// Run inventory mutation `f` with persistence deferred, returning its
+    /// result plus — when the inventory was dirtied — a serialized
+    /// [`InventorySnapshot`] the caller writes AFTER dropping the library
+    /// lock (issue #232).
+    ///
+    /// The defer flag is cleared on every return path below. The verbs
+    /// reached through `f` are panic-free (checked accessors, no
+    /// unwrap/index), so the flag never leaks; and a verb panic would poison
+    /// the library mutex and leave the inventory half-mutated regardless, so
+    /// guarding the flag against unwinding buys nothing real.
+    pub fn mutate_deferred<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(T, Option<InventorySnapshot>)> {
+        self.persist_deferred = true;
+        self.pending_persist = false;
+        let r = f(self);
+        self.persist_deferred = false;
+        let out = r?;
+        let snapshot = if std::mem::take(&mut self.pending_persist) {
+            self.persist_version += 1;
+            Some(InventorySnapshot {
+                version: self.persist_version,
+                content: serde_json::to_string(&self.inventory)?,
+                path: self.root.join("inventory.json"),
+                persister: std::sync::Arc::clone(&self.persister),
+            })
+        } else {
+            None
+        };
+        Ok((out, snapshot))
     }
 
     pub fn storage_slots(&self) -> &[SlotInfo] {
@@ -1199,6 +1315,59 @@ mod tests {
         assert!(library.storage_slots().iter().all(|s| !s.occupied));
         assert!(library.mail_slots().iter().all(|s| !s.occupied));
         assert!(library.drives().iter().all(|d| !d.occupied));
+    }
+
+    /// Issue #232: `mutate_deferred` writes nothing inline (the caller
+    /// persists the returned snapshot OFF the library lock), inventory.json
+    /// is compact, and a stale (lower-version) snapshot can never regress a
+    /// newer one already on disk.
+    #[test]
+    fn mutate_deferred_writes_off_lock_and_never_regresses_inventory() {
+        let temp_dir = TempDir::new().unwrap();
+        let lib_root = temp_dir.path().join("library");
+        let tapes_root = temp_dir.path().join("tapes");
+        let mut library =
+            Library::initialize(&lib_root, &tapes_root, 4, 0, 1, 8, None, 0, 1001, 101, 1).unwrap();
+
+        // Seat a cartridge (inline persist) so there is something to load.
+        let slot = library.add_or_create_tape("DEFER1", "primary").unwrap();
+
+        // inventory.json is compact (no pretty-print newlines) — issue #232.
+        let inv_path = lib_root.join("inventory.json");
+        let raw = std::fs::read_to_string(&inv_path).unwrap();
+        assert!(!raw.contains('\n'), "inventory.json must be compact JSON");
+
+        // Deferred load: the in-memory move applies, but the disk is not
+        // touched until the returned snapshot is persisted.
+        let (_, snapshot) = library.mutate_deferred(|l| l.load_to_drive(slot, 0)).unwrap();
+        let snapshot = snapshot.expect("a load dirties the inventory");
+        let reopened = Library::open(&lib_root, &tapes_root).unwrap();
+        assert!(
+            !reopened.drives()[0].occupied,
+            "deferred snapshot must not be on disk before persist()"
+        );
+
+        // Persisting off-lock lands the load; re-persisting is an idempotent
+        // no-op (same version <= last written).
+        snapshot.persist().unwrap();
+        snapshot.persist().unwrap();
+        let reopened = Library::open(&lib_root, &tapes_root).unwrap();
+        assert!(reopened.drives()[0].occupied, "snapshot.persist must land the load");
+
+        // Monotonicity: an older (unload) snapshot and a newer (reload)
+        // snapshot — persist the NEWER first, then the OLDER. The stale write
+        // must be skipped so inventory.json never regresses.
+        let (_, older) = library.mutate_deferred(|l| l.unload_from_drive(0, slot)).unwrap();
+        let older = older.expect("unload dirties inventory");
+        let (_, newer) = library.mutate_deferred(|l| l.load_to_drive(slot, 0)).unwrap();
+        let newer = newer.expect("reload dirties inventory");
+        newer.persist().unwrap();
+        older.persist().unwrap();
+        let reopened = Library::open(&lib_root, &tapes_root).unwrap();
+        assert!(
+            reopened.drives()[0].occupied,
+            "stale lower-version snapshot regressed inventory.json"
+        );
     }
 
     /// Issue #120: a MOVE / LOAD to an occupied destination must fail
