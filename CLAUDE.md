@@ -642,7 +642,7 @@ Two application-prefixed sets, in increasing order of prereqs / coverage,
 plus one unprefixed cross-application test
 (`scripts/test-coresident-smoke.sh`, the VTL+VSA co-residency smoke):
 
-- `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,backup-storage-failures,backup-storage-resume,crash-audit-append,crash-chunk-seal,legal-hold-lifecycle,lifecycle-cartridge-migrate,lifecycle-dr-restore,lifecycle-many-cartridges,pipeline-layers,tiering-plan-and-run,tiering-legal-hold-interaction,app-bareos,monte-carlo,monte-carlo-multi}.sh`
+- `vtl/scripts/test-{smoke,proto-iscsi,scsi-conformance,backup-workflow,backup-storage,backup-storage-failures,backup-storage-resume,crash-audit-append,crash-chunk-seal,legal-hold-lifecycle,lifecycle-cartridge-migrate,lifecycle-dr-restore,lifecycle-many-cartridges,lifecycle-bulk-create,pipeline-layers,tiering-plan-and-run,tiering-legal-hold-interaction,app-bareos,monte-carlo,monte-carlo-multi}.sh`
 - `vsa/scripts/test-{smoke,proto-iscsi,proto-nvmetcp,dual-transport,scsi-conformance,iscsi-multi-pdu-readin,fs,fs-storage,fs-storage-failures,multi-initiator,nvmetcp-multi-initiator,multi-volume-dedup,pipeline-layers,crash-audit-append,crash-page-flush,keystore,keystore-kmip,snapshot,monte-carlo,monte-carlo-multi,app-postgres,app-vm}.sh`
 
 (the per-application `{vtl,vsa}/scripts/README.md` files catalogue what

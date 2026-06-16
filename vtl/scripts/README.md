@@ -35,6 +35,7 @@ Naming follows `test-<category>-<topic>.sh`:
 | `test-lifecycle-cartridge-migrate.sh` | CLI surface for `cartridge migrate / archive / restore-archive` (preconditions, dry-run, on-disk state). |
 | `test-tiering-plan-and-run.sh` | CLI surface for `system tiering plan / run-now / status` over two local backends — policy match, plan/run/idempotence, `cartridge.tiered` audit. |
 | `test-lifecycle-many-cartridges.sh` | Metadata lifecycle stress: create/destroy ~30 cartridges; inventory + audit chain stay valid. |
+| `test-lifecycle-bulk-create.sh` | `cartridge create --multi N` batch path (issue #279): atomic batch seat, over-capacity clean-fail with no partial seating / orphan dirs, audit stays valid. No sudo. |
 | `test-lifecycle-dr-restore.sh` | Daemon-down `library restore` CLI surface (dry-run, empty-bucket discovery, audit replay). |
 | `test-crash-audit-append.sh` | BLAKE3-chained audit log stays valid under SIGKILL mid-append. |
 | `test-crash-chunk-seal.sh` | Tape blocks fsynced via filemark survive SIGKILL; un-fsynced may not. |

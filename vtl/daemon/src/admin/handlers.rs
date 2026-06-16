@@ -1227,122 +1227,85 @@ pub async fn cartridge_create(
         None => barcodes.iter().map(|_| None).collect(),
     };
 
-    // Lock library for the duration of the create batch — keeps the
-    // free-slot count stable and prevents racing iSCSI MOVE MEDIUM
-    // ops from grabbing slots out from under us.
-    let mut lib = match state.daemon.library.lock() {
-        Ok(g) => g,
-        Err(_) => return server_error("library mutex poisoned"),
+    // ---- resolve lto generation + fast-fail slot pre-check (short lock) ----
+    //
+    // Issue #279: the create loop used to hold the library mutex across
+    // every barcode's synchronous, fsync-bound `Cartridge::create_*`
+    // (directory + manifest/index writes) on a tokio async worker — a
+    // `multi: N` batch on a slow data_dir froze the iSCSI changer surface
+    // (every MOVE MEDIUM / READ ELEMENT STATUS blocks on the same mutex)
+    // for seconds and stalled unrelated async tasks on that worker. Now
+    // the disk I/O runs on `spawn_blocking` with NO lock held; the lock is
+    // taken only for this pre-check and the atomic batch seat below. The
+    // pre-check is advisory (a concurrent inventory mutation could change
+    // the free count before the seat) — the seat re-checks authoritatively.
+    let lto_gen = {
+        let lib = match state.daemon.library.lock() {
+            Ok(g) => g,
+            Err(_) => return server_error("library mutex poisoned"),
+        };
+        let free_slots = lib.storage_slots().iter().filter(|s| !s.occupied).count();
+        if free_slots < barcodes.len() {
+            return bad_request(format!(
+                "not enough free slots: requested {}, free {}",
+                barcodes.len(),
+                free_slots
+            ));
+        }
+        match resolve_lto_generation(&req, &lib) {
+            Ok(x) => x,
+            Err(e) => return bad_request(e),
+        }
     };
 
-    let free_slots = lib.storage_slots().iter().filter(|s| !s.occupied).count();
-    if free_slots < barcodes.len() {
-        return bad_request(format!(
-            "not enough free slots: requested {}, free {}",
-            barcodes.len(),
-            free_slots
-        ));
-    }
+    // Same keystore backend for every barcode in the batch (or None when
+    // unencrypted) — captured once for the response + audit below since
+    // `at_rest_params` moves into the create task.
+    let keystore_name: Option<String> = resolved_keystore.map(str::to_string);
 
-    let lto_gen = match resolve_lto_generation(&req, &lib) {
-        Ok(x) => x,
-        Err(e) => return bad_request(e),
-    };
-
-    // ---- create loop with rollback on failure ----
-    let mut committed: Vec<(String, u32)> = Vec::with_capacity(barcodes.len());
-    let mut created_resp: Vec<CreatedCartridge> = Vec::with_capacity(barcodes.len());
-
-    let create_result: anyhow::Result<()> = (|| {
-        for (bc, at_rest) in barcodes.iter().zip(at_rest_params.into_iter()) {
-            let half_built = tapes_root.join(bc);
-            // Stash the plaintext DEK in the daemon's cartridge-key
-            // cache BEFORE create — that way any drive-load that
-            // races with create finds the key. Removed on rollback.
+    // ---- create cartridge dirs off the lock (spawn_blocking) ----
+    //
+    // Pure per-barcode filesystem work keyed by barcode — no library
+    // state is touched, so a freshly created dir not yet seated into a
+    // storage slot is invisible to the SCSI changer surface. The
+    // plaintext DEK is stashed in the drive-manager cache before each
+    // create so a drive-load that races a later seat finds the key. On any
+    // failure every dir + cached DEK this batch created (`[..=i]`, never a
+    // not-yet-attempted barcode that might pre-exist) is rolled back here,
+    // and nothing reaches the inventory.
+    let dm = Arc::clone(&state.daemon.drive_manager);
+    let create_barcodes = barcodes.clone();
+    let create_backend = resolved_backend.clone();
+    let create_tapes_root = tapes_root.clone();
+    let worm = req.worm;
+    let create_result: anyhow::Result<()> = tokio::task::spawn_blocking(move || {
+        for (i, (bc, at_rest)) in create_barcodes.iter().zip(at_rest_params.iter()).enumerate() {
             if let Some(p) = at_rest.as_ref() {
-                state
-                    .daemon
-                    .drive_manager
-                    .set_cartridge_dek(bc, p.plain_dek);
+                dm.set_cartridge_dek(bc, p.plain_dek);
             }
-            let _ = Cartridge::create_with_chunking_and_at_rest(
-                &tapes_root,
+            if let Err(e) = Cartridge::create_with_chunking_and_at_rest(
+                &create_tapes_root,
                 bc,
                 chunking,
                 lto_gen,
-                &resolved_backend,
-                req.worm,
+                &create_backend,
+                worm,
                 dedup,
                 at_rest.clone(),
-            )
-            .map_err(|e| {
-                if half_built.exists() {
-                    let _ = std::fs::remove_dir_all(&half_built);
+            ) {
+                for done in &create_barcodes[..=i] {
+                    let _ = std::fs::remove_dir_all(create_tapes_root.join(done));
+                    dm.forget_cartridge_dek(done);
                 }
-                state.daemon.drive_manager.forget_cartridge_dek(bc);
-                anyhow::anyhow!("create '{}': {}", bc, e)
-            })?;
-
-            let slot = match lib.add_or_create_tape(bc, &resolved_backend) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(tapes_root.join(bc));
-                    state.daemon.drive_manager.forget_cartridge_dek(bc);
-                    return Err(anyhow::anyhow!("library add '{}': {}", bc, e));
-                }
-            };
-            committed.push((bc.clone(), slot));
-            let keystore_name = at_rest.as_ref().map(|p| p.meta.keystore_backend.clone());
-            created_resp.push(CreatedCartridge {
-                barcode: bc.clone(),
-                slot,
-                backend: resolved_backend.clone(),
-                lto_generation: lto_gen,
-                worm: req.worm,
-                chunking: chunking_str.clone(),
-                chunk_size_bytes: req.chunk_size_bytes,
-                keystore: keystore_name.clone(),
-            });
-            let mut payload = serde_json::json!({
-                "barcode": bc,
-                "lto_generation": lto_gen,
-                "backend": resolved_backend,
-                "worm": req.worm,
-                "slot": slot,
-            });
-            if let Some(name) = keystore_name {
-                payload["encryption"] = serde_json::json!({
-                    "algorithm": "aes_256_gcm",
-                    "keystore_backend": name,
-                });
+                return Err(anyhow::anyhow!("create '{}': {}", bc, e));
             }
-            audit_append(
-                &state.daemon,
-                "cartridge.create",
-                actor.clone(),
-                payload,
-                AuditResult::Ok,
-            );
         }
         Ok(())
-    })();
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("cartridge create task panicked: {e}")));
 
     if let Err(e) = create_result {
-        // Rollback: free committed slots + remove dirs in reverse.
-        for (bc, slot_id) in committed.iter().rev() {
-            let _ = lib.remove_from_slot(*slot_id);
-            let dir = tapes_root.join(bc);
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-            audit_append(
-                &state.daemon,
-                "cartridge.create.rollback",
-                actor.clone(),
-                serde_json::json!({"barcode": bc, "slot": slot_id}),
-                AuditResult::Ok,
-            );
-        }
         audit_append(
             &state.daemon,
             "cartridge.create",
@@ -1351,6 +1314,90 @@ pub async fn cartridge_create(
             AuditResult::Error(e.to_string()),
         );
         return bad_request(e.to_string());
+    }
+
+    // ---- seat the created cartridges into slots atomically (short lock) ----
+    //
+    // The dirs exist now, so `add_or_create_tapes` only fills slots +
+    // persists inventory.json ONCE for the whole batch. Re-check the free
+    // count under this lock: a concurrent inventory mutation (e.g. an
+    // unload) between the pre-check and here could have taken a slot —
+    // clean-fail + roll the created dirs back rather than seat a partial
+    // batch. With the count confirmed and the dirs already present,
+    // `add_or_create_tapes` cannot fail on a slot or a dir-create, so it
+    // seats the whole batch atomically.
+    let slot_ids = {
+        let mut lib = match state.daemon.library.lock() {
+            Ok(g) => g,
+            Err(_) => return server_error("library mutex poisoned"),
+        };
+        let free_slots = lib.storage_slots().iter().filter(|s| !s.occupied).count();
+        let seated = if free_slots < barcodes.len() {
+            Err(anyhow::anyhow!(
+                "not enough free slots: requested {}, free {}",
+                barcodes.len(),
+                free_slots
+            ))
+        } else {
+            lib.add_or_create_tapes(&barcodes, &resolved_backend)
+                .map_err(|e| anyhow::anyhow!("library add: {e}"))
+        };
+        match seated {
+            Ok(ids) => ids,
+            Err(e) => {
+                drop(lib);
+                // Nothing was seated (the pre-check failed before
+                // add_or_create_tapes persisted) — roll back the dirs +
+                // cached DEKs this batch created.
+                for bc in &barcodes {
+                    let _ = std::fs::remove_dir_all(tapes_root.join(bc));
+                    state.daemon.drive_manager.forget_cartridge_dek(bc);
+                }
+                audit_append(
+                    &state.daemon,
+                    "cartridge.create",
+                    actor,
+                    serde_json::json!({"barcode": req.barcode, "multi": req.multi}),
+                    AuditResult::Error(e.to_string()),
+                );
+                return bad_request(e.to_string());
+            }
+        }
+    };
+
+    // ---- success: build response + per-barcode audit ----
+    let mut created_resp: Vec<CreatedCartridge> = Vec::with_capacity(barcodes.len());
+    for (bc, slot) in barcodes.iter().zip(slot_ids.iter().copied()) {
+        created_resp.push(CreatedCartridge {
+            barcode: bc.clone(),
+            slot,
+            backend: resolved_backend.clone(),
+            lto_generation: lto_gen,
+            worm: req.worm,
+            chunking: chunking_str.clone(),
+            chunk_size_bytes: req.chunk_size_bytes,
+            keystore: keystore_name.clone(),
+        });
+        let mut payload = serde_json::json!({
+            "barcode": bc,
+            "lto_generation": lto_gen,
+            "backend": resolved_backend,
+            "worm": req.worm,
+            "slot": slot,
+        });
+        if let Some(name) = keystore_name.as_ref() {
+            payload["encryption"] = serde_json::json!({
+                "algorithm": "aes_256_gcm",
+                "keystore_backend": name,
+            });
+        }
+        audit_append(
+            &state.daemon,
+            "cartridge.create",
+            actor.clone(),
+            payload,
+            AuditResult::Ok,
+        );
     }
 
     info!(
