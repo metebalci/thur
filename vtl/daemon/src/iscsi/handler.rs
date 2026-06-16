@@ -181,39 +181,50 @@ impl ScsiHandler for IscsiLibraryHandler {
         // Storage-prefetch hook for tape READs (CDB op 0x08, LUN >= 1).
         // Pulls the chunk backing the next read LBA from storage into
         // the local pool if missing — best-effort, errors fall
-        // through.
+        // through. Issue #281: a SINGLE drive-lock acquisition snapshots
+        // both the next-read chunk and the look-ahead window (was two
+        // locks per READ); both resolve the same block at head_lba.
         if pdu_lun >= 1 && cdb_opcode == 0x08 {
             let drive_id = (pdu_lun - 1) as usize;
-            if let Err(e) = protocol::ensure_chunk_local_for_next_read(
+            if let Some(plan) = protocol::peek_read_prefetch_plan(
                 &self.drive_manager,
                 drive_id,
                 tsih,
-                &self.storage_backends,
-                &self.storage_config,
-                &self.pool_budgets,
-            )
-            .await
-            {
-                tracing::debug!(
-                    "iSCSI prefetch: refetch hook returned {} - read will proceed without storage refetch",
-                    e
-                );
-            }
-
-            // Background N-chunk read-ahead (issue #97): fan the chunks
-            // *following* the next read out to the shared PrefetchManager
-            // so a sequential restore doesn't stall on storage latency
-            // chunk-by-chunk. Fire-and-forget; never blocks the read.
-            protocol::prefetch_read_ahead(
-                &self.drive_manager,
-                drive_id,
-                tsih,
-                &self.storage_backends,
-                &self.storage_config,
-                &self.prefetch_managers,
                 self.read_prefetch_chunks_ahead,
-            )
-            .await;
+            ) {
+                if let Some(next) = plan.next
+                    && let Err(e) = protocol::ensure_chunk_local_for_next_read(
+                        next,
+                        &self.drive_manager,
+                        drive_id,
+                        tsih,
+                        &self.storage_backends,
+                        &self.storage_config,
+                        &self.pool_budgets,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        "iSCSI prefetch: refetch hook returned {} - read will proceed without storage refetch",
+                        e
+                    );
+                }
+
+                // Background N-chunk read-ahead (issue #97): fan the chunks
+                // *following* the next read out to the shared PrefetchManager
+                // so a sequential restore doesn't stall on storage latency
+                // chunk-by-chunk. Fire-and-forget; never blocks the read.
+                if let Some(window) = plan.window {
+                    protocol::prefetch_read_ahead(
+                        window,
+                        &self.storage_backends,
+                        &self.storage_config,
+                        &self.prefetch_managers,
+                        self.read_prefetch_chunks_ahead,
+                    )
+                    .await;
+                }
+            }
         }
 
         // SEND DIAGNOSTIC pre-hook: SELFTEST=1 (CDB byte 1 bit 2)

@@ -3813,6 +3813,41 @@ mod space_then_write_repro {
         );
     }
 
+    /// Issue #281: the iSCSI READ hook collapses its two drive-lock
+    /// acquisitions into one by snapshotting both look-ahead inputs
+    /// together. That is sound only because `peek_chunk_for_lba(head_lba)`
+    /// and `peek_prefetch_window` both anchor on the same block at
+    /// `head_lba` — so they always agree on the current chunk. Lock that
+    /// invariant in: if a future change decouples them, the single-lock
+    /// merge would silently read inconsistent state and this fails.
+    #[test]
+    fn peek_chunk_and_prefetch_window_agree_on_the_head_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let mut cart = make_cart(&tmp);
+        // Three full 4 KiB records → three sealed chunks (ids 0,1,2).
+        for i in 0..3u8 {
+            cart.write_data(rec(0x10 + i)).unwrap();
+        }
+        cart.flush_and_seal().unwrap();
+
+        // At each head position the two peeks must resolve the same chunk.
+        for lba in 0..3u64 {
+            cart.locate(lba).unwrap();
+            assert_eq!(cart.head_lba(), lba);
+            let next = cart
+                .peek_chunk_for_lba(cart.head_lba())
+                .expect("data block has a next-read chunk");
+            let window = cart
+                .peek_prefetch_window(2)
+                .expect("data block yields a prefetch window");
+            assert_eq!(
+                next.chunk_id, window.current_chunk_id,
+                "peek_chunk_for_lba and peek_prefetch_window disagree at lba {lba}"
+            );
+            assert_eq!(next.chunk_id, lba, "one chunk per record at lba {lba}");
+        }
+    }
+
     /// Issue #154: a view-only open (upload worker / eviction) must NOT
     /// run the crash-recovery reconcile — truncating the staging file or
     /// overwriting the chunk_index record. Those steps are valid only on

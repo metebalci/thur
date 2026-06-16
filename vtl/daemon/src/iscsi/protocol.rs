@@ -70,7 +70,8 @@ use unit_attention::UnitAttentionTracker;
 use anyhow::{Result, anyhow};
 use core_mediachanger::{
     AuditChannel, AuditRateLimiter, ChunkLocationInfo, Library, LibraryFacade, NextReadChunk,
-    ObjectStoreBackend, ObjectStoreConfig, PoolBudget, PrefetchConfig, PrefetchManager, TapeEvent,
+    ObjectStoreBackend, ObjectStoreConfig, PoolBudget, PrefetchConfig, PrefetchManager,
+    PrefetchWindow, TapeEvent,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -141,11 +142,51 @@ const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
 // Re-imported at the top of this module so existing handler bodies
 // keep building unchanged.
 
-/// Storage-prefetch hook for the SCSI READ path. Peeks the loaded
-/// cartridge for the chunk backing the next read LBA and, if the
-/// local pool file is missing, pulls it from the cartridge's bound
-/// storage backend (lazy-initialized via the shared
-/// [`ObjectStoreRegistry`]) and writes it into the pool. This
+/// The two look-ahead snapshots the SCSI READ hook needs, taken under
+/// a single drive-lock acquisition: `next` is the chunk backing the
+/// next read LBA (for the blocking refetch), `window` is the
+/// background read-ahead window. Issue #281.
+pub(crate) struct ReadPrefetchPlan {
+    pub next: Option<NextReadChunk>,
+    pub window: Option<PrefetchWindow>,
+}
+
+/// Snapshot both READ-hook inputs under a **single** `with_drive`
+/// acquisition (issue #281). The hook previously took the drive lock
+/// twice per command — once to peek the next-read chunk
+/// ([`ensure_chunk_local_for_next_read`]) and again to peek the
+/// look-ahead window ([`prefetch_read_ahead`]) — on every READ, even a
+/// warm fully-local sequential restore. Both peeks resolve the same
+/// block at `head_lba`, so one acquisition serves both. The hook runs
+/// entirely before the command is dispatched, so `head_lba` does not
+/// move between the two peeks — merging them is behavior-identical.
+///
+/// Returns `None` when the drive is unloaded (nothing to do). A
+/// `chunks_ahead` of 0 (prefetch disabled) yields `window == None`.
+pub(crate) fn peek_read_prefetch_plan(
+    drive_manager: &Arc<DriveManager>,
+    drive_id: usize,
+    tsih: u16,
+    chunks_ahead: u32,
+) -> Option<ReadPrefetchPlan> {
+    drive_manager
+        .with_drive(drive_id, tsih, |cart| {
+            let next = cart.peek_chunk_for_lba(cart.head_lba());
+            let window = if chunks_ahead == 0 {
+                None
+            } else {
+                cart.peek_prefetch_window(chunks_ahead)
+            };
+            Ok(ReadPrefetchPlan { next, window })
+        })
+        .ok()
+}
+
+/// Storage-prefetch hook for the SCSI READ path. Given the chunk
+/// backing the next read LBA (snapshotted by [`peek_read_prefetch_plan`]
+/// under the drive lock), if the local pool file is missing, pulls it
+/// from the cartridge's bound storage backend (lazy-initialized via the
+/// shared [`ObjectStoreRegistry`]) and writes it into the pool. This
 /// covers two failure modes:
 ///   1. Cold-start daemon facing a wiped chunks directory (e.g.
 ///      operator nuked `/chunks/`, or the host was reimaged) —
@@ -157,12 +198,12 @@ const CHANGER_INQUIRY_FLAGS: InquiryFlags = InquiryFlags {
 ///      the on-disk manifest is updated to S3Only but the
 ///      drive's in-memory cartridge still believes Both.
 ///
-/// Best-effort: returns Ok if there's nothing to do (no chunk for
-/// the LBA, file already present, or cartridge storage-blind by
-/// configuration). Any error is propagated to the caller, which
-/// logs it at debug and lets the sync read path surface its own
-/// I/O error.
+/// Best-effort: returns Ok if there's nothing to do (file already
+/// present, or cartridge storage-blind by configuration). Any error is
+/// propagated to the caller, which logs it at debug and lets the sync
+/// read path surface its own I/O error.
 pub(crate) async fn ensure_chunk_local_for_next_read(
+    next: NextReadChunk,
     drive_manager: &Arc<DriveManager>,
     drive_id: usize,
     tsih: u16,
@@ -170,21 +211,6 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
     storage_config: &Arc<ObjectStoreConfig>,
     pool_budgets: &HashMap<String, Arc<PoolBudget>>,
 ) -> Result<()> {
-    // Snapshot the next-read chunk metadata under the drive lock,
-    // then release the lock before any async I/O. Holding the
-    // sync drive Mutex across an await is forbidden — this is the
-    // whole reason the prefetch lives outside `with_drive`.
-    let next: Option<NextReadChunk> = drive_manager
-        .with_drive(drive_id, tsih, |cart| {
-            let lba = cart.head_lba();
-            Ok(cart.peek_chunk_for_lba(lba))
-        })
-        .ok()
-        .flatten();
-    let Some(next) = next else {
-        return Ok(());
-    };
-
     if next.store_path.is_file() {
         // The next read's chunk is already local — served without a
         // storage round-trip (a prefetch / earlier warm paid off).
@@ -304,39 +330,20 @@ pub(crate) async fn ensure_chunk_local_for_next_read(
 /// look-ahead, or an unreachable backend all simply no-op.
 ///
 /// The manager is driven from here rather than from `Cartridge` because
-/// the SCSI read path is synchronous — `with_drive` can't `await`. We
-/// snapshot the look-ahead window under the drive lock
-/// ([`core_mediachanger::Cartridge::peek_prefetch_window`]), release it,
-/// then run `on_read` outside. One `PrefetchManager` is built per
-/// backend and cached in `prefetch_managers` so its in-flight-task table
-/// (the `prefetch_queue_depth` source, and the dedup that stops
-/// re-fetching a chunk already downloading) persists across reads.
+/// the SCSI read path is synchronous — `with_drive` can't `await`. The
+/// look-ahead window is snapshotted under the drive lock by
+/// [`peek_read_prefetch_plan`] and handed in here so `on_read` runs
+/// outside the lock. One `PrefetchManager` is built per backend and
+/// cached in `prefetch_managers` so its in-flight-task table (the
+/// `prefetch_queue_depth` source, and the dedup that stops re-fetching a
+/// chunk already downloading) persists across reads.
 pub(crate) async fn prefetch_read_ahead(
-    drive_manager: &Arc<DriveManager>,
-    drive_id: usize,
-    tsih: u16,
+    window: PrefetchWindow,
     backends: &ObjectStoreRegistry,
     storage_config: &Arc<ObjectStoreConfig>,
     prefetch_managers: &PrefetchManagerRegistry,
     chunks_ahead: u32,
 ) {
-    if chunks_ahead == 0 {
-        return;
-    }
-
-    // Snapshot the look-ahead window under the drive lock, then release
-    // it before any async I/O (same rule the blocking refetch follows:
-    // holding the sync drive Mutex across an await is forbidden).
-    let Some(window) = drive_manager
-        .with_drive(drive_id, tsih, |cart| {
-            Ok(cart.peek_prefetch_window(chunks_ahead))
-        })
-        .ok()
-        .flatten()
-    else {
-        return;
-    };
-
     // Read-prefetch buffer occupancy: bytes of the look-ahead window
     // already warmed into the local pool ahead of the head. Reported as
     // a single library-wide gauge (no per-cartridge label) to bound
