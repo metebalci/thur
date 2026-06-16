@@ -440,7 +440,7 @@ mod tests {
         ScsiRequest {
             lun,
             cdb,
-            data_out: &[],
+            data_out: Vec::new(),
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
@@ -635,7 +635,7 @@ mod tests {
         ScsiRequest {
             lun,
             cdb,
-            data_out: &[],
+            data_out: Vec::new(),
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
@@ -792,7 +792,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &wcdb,
-                data_out: &payload,
+                data_out: payload.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -812,7 +812,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &rcdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 64 * 1024,
                 tsih: 0,
                 initiator_iqn: None,
@@ -881,7 +881,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &sel_cdb,
-                data_out: &params,
+                data_out: params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -916,7 +916,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &sel_cdb,
-                data_out: &params,
+                data_out: params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -952,7 +952,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &cdb,
-                data_out: &params,
+                data_out: params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -984,7 +984,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &cdb,
-                data_out: &combined,
+                data_out: combined.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -1005,7 +1005,7 @@ mod tests {
             .dispatch(ScsiRequest {
                 lun: 0,
                 cdb: &rcdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 64 * 1024,
                 tsih: 0,
                 initiator_iqn: None,

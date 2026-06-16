@@ -541,7 +541,7 @@ mod tests {
         ScsiRequest {
             lun: 0,
             cdb,
-            data_out: &[],
+            data_out: Vec::new(),
             data_in_max: 4096,
             tsih: 0,
             initiator_iqn: None,
@@ -849,11 +849,11 @@ mod tests {
         cdb
     }
 
-    fn req_with_data_out<'a>(cdb: &'a [u8], data_out: &'a [u8]) -> ScsiRequest<'a> {
+    fn req_with_data_out<'a>(cdb: &'a [u8], data_out: &[u8]) -> ScsiRequest<'a> {
         ScsiRequest {
             lun: 0,
             cdb,
-            data_out,
+            data_out: data_out.to_vec(),
             data_in_max: 0,
             tsih: 0,
             initiator_iqn: None,

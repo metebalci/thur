@@ -45,7 +45,10 @@ impl ScsiStatus {
 /// One SCSI command end-to-end: the transport has already handled
 /// the iSCSI framing and (for write commands) drained Data-Out.
 /// Borrowed lifetimes tie back to the per-PDU buffers — handlers
-/// must finish reading before the next `read_pdu` reuses them.
+/// must finish reading before the next `read_pdu` reuses them. The
+/// Data-Out payload is carried by ownership (not borrowed) so the
+/// hot WRITE path can move it straight into the handler's synthetic
+/// PDU without a per-command copy (issue #282).
 pub struct ScsiRequest<'a> {
     /// Target session identifier allocated at login.
     pub tsih: u16,
@@ -67,8 +70,10 @@ pub struct ScsiRequest<'a> {
     pub cdb: &'a [u8],
     /// Concatenated Data-Out payload (immediate data + every
     /// solicited / unsolicited Data-Out PDU). Empty for read-side
-    /// or no-data commands.
-    pub data_out: &'a [u8],
+    /// or no-data commands. Owned so the transport can `mem::take`
+    /// the drained per-PDU buffer into the request and the handler
+    /// can move it onward without copying (issue #282).
+    pub data_out: Vec<u8>,
     /// `ExpectedDataTransferLength` from the SCSI Command BHS — how
     /// many bytes of Data-In the initiator is willing to accept.
     /// Handlers should truncate their response to this size (the

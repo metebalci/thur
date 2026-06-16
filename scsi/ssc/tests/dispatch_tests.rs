@@ -152,7 +152,7 @@ fn cdb(op: u8) -> [u8; 16] {
 }
 
 fn pdu() -> Pdu {
-    Pdu::synth(&[], 1, 256, &[])
+    Pdu::synth(&[], 1, 256, Vec::new())
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn write_six_then_rewind_then_read_six_round_trips() {
     let payload = vec![0x5Au8; 4096];
 
     // WRITE(6): payload lives in the synthetic PDU's data segment.
-    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
     let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
     let resp = handlers::handle_write_6(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::Good);
@@ -279,7 +279,7 @@ fn write_six_then_rewind_then_read_six_round_trips() {
     handlers::handle_rewind(&mut ctx).unwrap();
 
     // READ(6) returns the block just written.
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     let resp = handlers::handle_read_6(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::Good);
@@ -299,7 +299,7 @@ fn read_six_on_filemark_returns_check_condition_with_fm_bit() {
     let payload = vec![0x5Au8; 4096];
 
     // Write one data record + one filemark, then rewind.
-    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
     let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
     assert_eq!(
         handlers::handle_write_6(&mut ctx).unwrap().status,
@@ -320,7 +320,7 @@ fn read_six_on_filemark_returns_check_condition_with_fm_bit() {
     handlers::handle_rewind(&mut ctx).unwrap();
 
     // Read the data block.
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     assert_eq!(
         handlers::handle_read_6(&mut ctx).unwrap().status,
@@ -333,7 +333,7 @@ fn read_six_on_filemark_returns_check_condition_with_fm_bit() {
     read_cdb[2] = 0x00;
     read_cdb[3] = 0x09;
     read_cdb[4] = 0x40;
-    let mut rp = Pdu::synth(&read_cdb, 1, 2368, &[]);
+    let mut rp = Pdu::synth(&read_cdb, 1, 2368, Vec::new());
     let mut ctx = fx.ctx(&mut rp, read_cdb);
     let resp = handlers::handle_read_6(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition);
@@ -369,7 +369,7 @@ fn read_six_past_eod_returns_check_condition_with_blank_check_and_info() {
     let fx = Fixture::new();
     let payload = vec![0xA5u8; 4096];
 
-    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
     let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
     assert_eq!(
         handlers::handle_write_6(&mut ctx).unwrap().status,
@@ -380,7 +380,7 @@ fn read_six_past_eod_returns_check_condition_with_blank_check_and_info() {
     let mut ctx = fx.ctx(&mut p, cdb(0x01));
     handlers::handle_rewind(&mut ctx).unwrap();
 
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     assert_eq!(
         handlers::handle_read_6(&mut ctx).unwrap().status,
@@ -393,7 +393,7 @@ fn read_six_past_eod_returns_check_condition_with_blank_check_and_info() {
     read_cdb[2] = 0x01;
     read_cdb[3] = 0x00;
     read_cdb[4] = 0x00;
-    let mut rp = Pdu::synth(&read_cdb, 1, 65536, &[]);
+    let mut rp = Pdu::synth(&read_cdb, 1, 65536, Vec::new());
     let mut ctx = fx.ctx(&mut rp, read_cdb);
     let resp = handlers::handle_read_6(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition);
@@ -431,7 +431,7 @@ fn corrupt_index_record_surfaces_medium_error_on_read_space_and_verify() {
 
     // Three data records.
     for _ in 0..3 {
-        let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+        let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
         let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
         assert_eq!(
             handlers::handle_write_6(&mut ctx).unwrap().status,
@@ -468,14 +468,14 @@ fn corrupt_index_record_surfaces_medium_error_on_read_space_and_verify() {
 
     // READ path: record 0 is intact and reads GOOD; record 1 faults.
     rewind();
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     assert_eq!(
         handlers::handle_read_6(&mut ctx).unwrap().status,
         ScsiStatus::Good,
         "record 0 is intact",
     );
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     assert_medium_error(handlers::handle_read_6(&mut ctx).unwrap(), "READ(6)");
 
@@ -521,7 +521,7 @@ fn corrupt_sealed_compressed_chunk_surfaces_medium_error_on_read() {
         .unwrap();
 
     let payload = vec![0xC3u8; 4096];
-    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
     let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
     assert_eq!(
         handlers::handle_write_6(&mut ctx).unwrap().status,
@@ -564,7 +564,7 @@ fn corrupt_sealed_compressed_chunk_surfaces_medium_error_on_read() {
     let mut ctx = fx.ctx(&mut p, cdb(0x01));
     handlers::handle_rewind(&mut ctx).unwrap();
 
-    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, &[]);
+    let mut rp = Pdu::synth(&cdb(0x08), 1, 4096, Vec::new());
     let mut ctx = fx.ctx(&mut rp, cdb(0x08));
     let resp = handlers::handle_read_6(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition, "READ(6): status");
@@ -1000,7 +1000,7 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
     // EXISTING KEY, SA 0x06).
     {
         let plist = prout_params(0, 0xAAAA);
-        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut p = Pdu::synth(&[], 1, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 1, 0, false, 1, a);
         let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
         assert_eq!(r.status, ScsiStatus::Good, "register");
@@ -1022,7 +1022,7 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
     // A reserves EXCLUSIVE ACCESS (type 0x03).
     {
         let plist = prout_params(0xAAAA, 0);
-        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut p = Pdu::synth(&[], 1, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x01, 0x03), 1, 0, false, 1, a);
         let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
         assert_eq!(r.status, ScsiStatus::Good, "reserve");
@@ -1062,7 +1062,7 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
     // A releases the reservation (TYPE must match the held type).
     {
         let plist = prout_params(0xAAAA, 0);
-        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut p = Pdu::synth(&[], 1, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x02, 0x03), 1, 0, false, 1, a);
         let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
         assert_eq!(r.status, ScsiStatus::Good, "release");
@@ -1093,7 +1093,7 @@ fn persistent_reserve_out_registers_reserves_and_fences_other_nexus() {
 fn reserve_drive(fx: &Fixture, tsih: u16, iqn: Option<&str>, key: u64, type_byte: u8) {
     {
         let plist = prout_params(0, key);
-        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut p = Pdu::synth(&[], 1, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 1, 0, false, tsih, iqn);
         assert_eq!(
             handlers::handle_persistent_reserve_out(&mut ctx)
@@ -1105,7 +1105,7 @@ fn reserve_drive(fx: &Fixture, tsih: u16, iqn: Option<&str>, key: u64, type_byte
     }
     {
         let plist = prout_params(key, 0);
-        let mut p = Pdu::synth(&[], 1, 0, &plist);
+        let mut p = Pdu::synth(&[], 1, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x01, type_byte), 1, 0, false, tsih, iqn);
         assert_eq!(
             handlers::handle_persistent_reserve_out(&mut ctx)
@@ -1219,7 +1219,7 @@ fn persistent_reserve_is_handled_on_the_changer_lun() {
     // REGISTER AND IGNORE EXISTING KEY (SA 0x06) on the changer LUN.
     {
         let plist = prout_params(0, 0xAAAA);
-        let mut p = Pdu::synth(&[], 0, 0, &plist);
+        let mut p = Pdu::synth(&[], 0, 0, plist.to_vec());
         let mut ctx = fx.ctx_session(&mut p, prout_cdb(0x06, 0), 0, 0, true, 1, a);
         let r = handlers::handle_persistent_reserve_out(&mut ctx).unwrap();
         assert_eq!(r.status, ScsiStatus::Good, "register on changer");
@@ -1292,7 +1292,7 @@ fn next_block_encryption_status_fails_on_corrupt_head_record() {
     // One data record, then rot record 0's index entry (reserved enc
     // tag; the flag byte sits at record offset 12).
     let payload = vec![0x5Au8; 512];
-    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, &payload);
+    let mut wp = Pdu::synth(&cdb(0x0A), 1, 0, payload.to_vec());
     let mut ctx = fx.ctx(&mut wp, cdb(0x0A));
     assert_eq!(
         handlers::handle_write_6(&mut ctx).unwrap().status,
@@ -1330,7 +1330,7 @@ fn security_protocol_out_clears_the_drive_encryption_key() {
     let fx = Fixture::new();
     // A 16-byte SET DATA ENCRYPTION page with both modes = Disable
     // decodes to "Clear".
-    let mut page = vec![0u8; 16];
+    let mut page = [0u8; 16];
     page[0..2].copy_from_slice(&0x0010u16.to_be_bytes()); // PAGE_SET_DATA_ENCRYPTION
     page[2..4].copy_from_slice(&12u16.to_be_bytes()); // page length
     // bytes 6 (encryption mode) and 7 (decryption mode) stay 0 = Disable.
@@ -1338,7 +1338,7 @@ fn security_protocol_out_clears_the_drive_encryption_key() {
     let mut c = cdb(0xB5);
     c[1] = 0x20; // SECURITY_PROTOCOL_TAPE_DATA_ENC
     c[2..4].copy_from_slice(&0x0010u16.to_be_bytes()); // PAGE_SET_DATA_ENCRYPTION
-    let mut p = Pdu::synth(&c, 1, 0, &page);
+    let mut p = Pdu::synth(&c, 1, 0, page.to_vec());
     let mut ctx = fx.ctx(&mut p, c);
     let resp = handlers::handle_security_protocol_out(&mut ctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::Good);
@@ -1376,7 +1376,7 @@ fn security_protocol_out_rejects_bad_input() {
     let mut c = cdb(0xB5);
     c[1] = 0x20;
     c[2..4].copy_from_slice(&0x0010u16.to_be_bytes());
-    let mut p = Pdu::synth(&c, 1, 0, &[0xFFu8; 4]);
+    let mut p = Pdu::synth(&c, 1, 0, vec![0xFFu8; 4]);
     let mut ctx = fx.ctx(&mut p, c);
     assert_eq!(
         handlers::handle_security_protocol_out(&mut ctx)
@@ -2212,7 +2212,7 @@ fn write_then_read_attribute_round_trips() {
 
     // WRITE ATTRIBUTE 0x0801 (application name) = "Bareos".
     let params = write_attr_param_list(&[(0x0801, 0x01, b"Bareos")]);
-    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, params.to_vec());
     let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
     assert_eq!(
         handlers::handle_write_attribute(&mut wctx).unwrap().status,
@@ -2220,7 +2220,7 @@ fn write_then_read_attribute_round_trips() {
     );
 
     // READ ATTRIBUTE back.
-    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, &[]);
+    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, Vec::new());
     let mut rctx = fx.ctx(&mut rp, read_attr_values_cdb());
     let resp = handlers::handle_read_attribute(&mut rctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::Good);
@@ -2240,7 +2240,7 @@ fn write_attribute_readonly_id_rejected() {
 
     // 0x0400 = MEDIUM MANUFACTURER, device/medium-owned read-only.
     let params = write_attr_param_list(&[(0x0400, 0x01, b"EVILCORP")]);
-    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, params.to_vec());
     let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
     let resp = handlers::handle_write_attribute(&mut wctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition);
@@ -2252,7 +2252,7 @@ fn write_attribute_readonly_id_rejected() {
 
     // Nothing persisted: 0x0400 still reads back as the synthesized
     // manufacturer, not "EVILCORP".
-    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, &[]);
+    let mut rp = Pdu::synth(&read_attr_values_cdb(), 1, 65536, Vec::new());
     let mut rctx = fx.ctx(&mut rp, read_attr_values_cdb());
     let rresp = handlers::handle_read_attribute(&mut rctx).unwrap();
     let (_, val) = find_read_attr(&rresp.data_out, 0x0400).expect("manufacturer present");
@@ -2265,7 +2265,7 @@ fn write_attribute_readonly_id_rejected() {
 fn write_attribute_proper_empty_list_is_good() {
     let fx = Fixture::new();
     let params = [0u8, 0, 0, 0]; // declared length 0
-    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, params.to_vec());
     let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
     assert_eq!(
         handlers::handle_write_attribute(&mut wctx).unwrap().status,
@@ -2288,7 +2288,7 @@ fn write_attribute_drive_reserved_surfaces_not_ready() {
 
     // ctx() drives TSIH 1 -> with_drive rejects with DriveReserved.
     let params = write_attr_param_list(&[(0x0801, 0x01, b"Bareos")]);
-    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, &params);
+    let mut wp = Pdu::synth(&cdb(0x8D), 1, 256, params.to_vec());
     let mut wctx = fx.ctx(&mut wp, cdb(0x8D));
     let resp = handlers::handle_write_attribute(&mut wctx).unwrap();
     assert_eq!(resp.status, ScsiStatus::CheckCondition);
@@ -2369,7 +2369,7 @@ fn log_select_accepts_a_pcr_clear() {
 #[test]
 fn write_buffer_discards_arbitrary_data() {
     let fx = Fixture::new();
-    let mut wp = Pdu::synth(&cdb(0x3B), 1, 0, &vec![0u8; 256]);
+    let mut wp = Pdu::synth(&cdb(0x3B), 1, 0, vec![0u8; 256]);
     let mut ctx = fx.ctx(&mut wp, cdb(0x3B));
     assert_eq!(
         handlers::handle_write_buffer(&mut ctx).unwrap().status,

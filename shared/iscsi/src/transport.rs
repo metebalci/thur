@@ -1880,7 +1880,11 @@ async fn process_scsi_command<H: ScsiHandler + ?Sized>(
         cid: ctx.cid,
         lun,
         cdb: &cdb_slice,
-        data_out: &pdu.data,
+        // Move the drained Data-Out buffer into the request — the
+        // handler moves it onward into its synthetic PDU, so the hot
+        // WRITE path copies the payload zero extra times (issue #282).
+        // `pdu.data` is not read again after this; only `pdu.itt`.
+        data_out: std::mem::take(&mut pdu.data),
         data_in_max: edtl as usize,
         initiator_iqn: ctx.initiator_iqn.as_deref(),
         initiator_isid: ctx.pr_isid,

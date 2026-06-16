@@ -153,11 +153,11 @@ fn sync16_cdb(lba: u64, blocks: u32) -> Vec<u8> {
     cdb
 }
 
-fn req<'a>(lun: u64, cdb: &'a [u8], data_out: &'a [u8], data_in_max: usize) -> ScsiRequest<'a> {
+fn req<'a>(lun: u64, cdb: &'a [u8], data_out: &[u8], data_in_max: usize) -> ScsiRequest<'a> {
     ScsiRequest {
         lun,
         cdb,
-        data_out,
+        data_out: data_out.to_vec(),
         data_in_max,
         tsih: 0,
         initiator_iqn: None,

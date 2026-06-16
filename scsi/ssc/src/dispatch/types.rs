@@ -61,8 +61,10 @@ impl Pdu {
     /// - `bhs[20..24]` — Expected Data Transfer Length, synthesized
     ///   from `data_in_max` so [`pdu_expected_xfer_len`] keeps working
     /// - `bhs[32..48]` — 16-byte CDB, zero-padded if shorter
-    /// - `data` — the Data-Out payload already drained by the transport
-    pub fn synth(cdb: &[u8], lun: u64, data_in_max: usize, data_out: &[u8]) -> Pdu {
+    /// - `data` — the Data-Out payload already drained by the transport,
+    ///   moved in by ownership so the hot WRITE path copies nothing
+    ///   (issue #282)
+    pub fn synth(cdb: &[u8], lun: u64, data_in_max: usize, data_out: Vec<u8>) -> Pdu {
         let mut bhs = [0u8; 48];
         let lun_byte = (lun & 0xFF) as u8;
         bhs[1] = lun_byte;
@@ -86,7 +88,7 @@ impl Pdu {
             cmdsn: 0,
             expstatsn: 0,
             bhs,
-            data: data_out.to_vec(),
+            data: data_out,
         }
     }
 }
@@ -98,7 +100,7 @@ mod pdu_tests {
     #[test]
     fn synth_populates_cdb_lun_and_edtl() {
         let cdb = [0x12u8, 0x00, 0x00, 0x00, 0x60, 0x00];
-        let pdu = Pdu::synth(&cdb, 3, 0x60, &[]);
+        let pdu = Pdu::synth(&cdb, 3, 0x60, Vec::new());
         assert_eq!(pdu.opcode, 0x01);
         assert_eq!(pdu.bhs[1], 3);
         assert_eq!(pdu.lun[1], 3);
@@ -112,7 +114,7 @@ mod pdu_tests {
     fn synth_truncates_overlong_cdb_and_carries_data_out() {
         let cdb = [0xAAu8; 20];
         let data = [1u8, 2, 3, 4];
-        let pdu = Pdu::synth(&cdb, 0, 0, &data);
+        let pdu = Pdu::synth(&cdb, 0, 0, data.to_vec());
         // CDB clamped to the 16-byte BHS window.
         assert_eq!(&pdu.bhs[32..48], &[0xAA; 16]);
         assert_eq!(pdu.data, data);
@@ -121,8 +123,23 @@ mod pdu_tests {
 
     #[test]
     fn synth_clamps_oversized_data_in_max_to_u32_max() {
-        let pdu = Pdu::synth(&[0], 0, usize::MAX, &[]);
+        let pdu = Pdu::synth(&[0], 0, usize::MAX, Vec::new());
         assert_eq!(pdu_expected_xfer_len(&pdu), u32::MAX);
+    }
+
+    /// Issue #282: the Data-Out payload is moved into the synthetic PDU
+    /// by ownership, not copied. Assert the heap allocation is reused
+    /// (same data pointer in, same data pointer out) so a regression
+    /// that reintroduces a `.to_vec()` copy on the hot WRITE path fails
+    /// here.
+    #[test]
+    fn synth_moves_data_out_without_copying() {
+        let data_out: Vec<u8> = (0..256 * 1024).map(|i| i as u8).collect();
+        let ptr_in = data_out.as_ptr();
+        let pdu = Pdu::synth(&[0x0A], 1, 0, data_out);
+        assert_eq!(pdu.data.as_ptr(), ptr_in, "Data-Out buffer was copied, not moved");
+        assert_eq!(pdu.data.len(), 256 * 1024);
+        assert_eq!(pdu.data_segment_len, (256 * 1024) as u32);
     }
 }
 
@@ -362,7 +379,7 @@ mod helper_tests {
 
     #[test]
     fn pdu_expected_xfer_len_reads_edtl_from_the_bhs() {
-        let pdu = Pdu::synth(&[0x12], 0, 0x1234, &[]);
+        let pdu = Pdu::synth(&[0x12], 0, 0x1234, Vec::new());
         assert_eq!(pdu_expected_xfer_len(&pdu), 0x1234);
     }
 

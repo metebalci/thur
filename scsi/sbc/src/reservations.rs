@@ -81,7 +81,7 @@ impl SbcReservations for ReservationManager {
         if cache.is_none() {
             return ScsiResponse::check(SenseData::LU_NOT_SUPPORTED);
         }
-        let Some(f) = reservations::parse_prout_cdb(req.cdb, req.data_out) else {
+        let Some(f) = reservations::parse_prout_cdb(req.cdb, &req.data_out) else {
             return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
         };
         let outcome = self.prout(
@@ -123,13 +123,13 @@ mod tests {
     /// fields the PRIN / PROUT paths read (`lun`, `cdb`, `data_out`,
     /// `data_in_max`, `initiator_iqn`, `initiator_isid`) carry meaning;
     /// the rest are inert.
-    fn req<'a>(cdb: &'a [u8], data_out: &'a [u8], data_in_max: usize) -> ScsiRequest<'a> {
+    fn req<'a>(cdb: &'a [u8], data_out: &[u8], data_in_max: usize) -> ScsiRequest<'a> {
         ScsiRequest {
             tsih: 1,
             cid: 0,
             lun: 0,
             cdb,
-            data_out,
+            data_out: data_out.to_vec(),
             data_in_max,
             initiator_iqn: Some("iqn.2025-10.com.metebalci:host-a"),
             initiator_isid: [1, 2, 3, 4, 5, 6],

@@ -457,7 +457,7 @@ backends:
             .dispatch(scsi_spc::scsi::ScsiRequest {
                 lun: 0,
                 cdb: &cdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 4096,
                 tsih: 0,
                 initiator_iqn: None,

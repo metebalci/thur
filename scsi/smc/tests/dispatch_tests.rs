@@ -180,7 +180,7 @@ impl Fixture {
 }
 
 fn blank_pdu() -> Pdu {
-    Pdu::synth(&[], 0, 0, &[])
+    Pdu::synth(&[], 0, 0, Vec::new())
 }
 
 /// 24-byte PROUT parameter list: RESERVATION KEY + SERVICE ACTION

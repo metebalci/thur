@@ -177,7 +177,7 @@ pub(super) async fn write(
     if req.data_out.len() != want_bytes {
         return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
     }
-    if let Err(e) = cache.write_bytes(byte_offset, req.data_out).await {
+    if let Err(e) = cache.write_bytes(byte_offset, &req.data_out).await {
         return ScsiResponse::check(map_write_error(&e));
     }
     ScsiResponse::good(Vec::new())
@@ -685,7 +685,7 @@ pub(super) async fn write_same(
         if req.data_out.len() != sector {
             return ScsiResponse::check(SenseData::INVALID_FIELD_IN_CDB);
         }
-        req.data_out
+        &req.data_out
     };
     let pattern_is_zero = pattern.iter().all(|&b| b == 0);
 
@@ -2313,20 +2313,20 @@ mod tests {
         cdb
     }
 
-    fn req<'a>(cdb: &'a [u8], data_out: &'a [u8], data_in_max: usize) -> ScsiRequest<'a> {
+    fn req<'a>(cdb: &'a [u8], data_out: &[u8], data_in_max: usize) -> ScsiRequest<'a> {
         req_lun(0, cdb, data_out, data_in_max)
     }
 
     fn req_lun<'a>(
         lun: u64,
         cdb: &'a [u8],
-        data_out: &'a [u8],
+        data_out: &[u8],
         data_in_max: usize,
     ) -> ScsiRequest<'a> {
         ScsiRequest {
             lun,
             cdb,
-            data_out,
+            data_out: data_out.to_vec(),
             data_in_max,
             tsih: 0,
             initiator_iqn: None,
@@ -4701,7 +4701,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &pt_cdb,
-                data_out: &pt_params,
+                data_out: pt_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4750,7 +4750,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &pt_cdb,
-                data_out: &pt_params,
+                data_out: pt_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4774,7 +4774,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &rrti_cdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 1024,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4802,7 +4802,7 @@ mod tests {
             &ScsiRequest {
                 lun: 1,
                 cdb: &wut_cdb,
-                data_out: &wut_params,
+                data_out: wut_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4838,7 +4838,7 @@ mod tests {
             &ScsiRequest {
                 lun: 1,
                 cdb: &rrti_w_cdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 1024,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4886,7 +4886,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &pt_cdb,
-                data_out: &pt_params,
+                data_out: pt_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4910,7 +4910,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &rrti_cdb,
-                data_out: &[],
+                data_out: Vec::new(),
                 data_in_max: 1024,
                 tsih: 0,
                 initiator_iqn: None,
@@ -4949,7 +4949,7 @@ mod tests {
             &ScsiRequest {
                 lun: 1,
                 cdb: &wut_cdb,
-                data_out: &wut_params,
+                data_out: wut_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -5015,7 +5015,7 @@ mod tests {
             &ScsiRequest {
                 lun: 0,
                 cdb: &pt_cdb,
-                data_out: &pt_params,
+                data_out: pt_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
@@ -5654,7 +5654,7 @@ mod tests {
             &ScsiRequest {
                 lun: 1,
                 cdb: &wut_cdb,
-                data_out: &wut_params,
+                data_out: wut_params.to_vec(),
                 data_in_max: 0,
                 tsih: 0,
                 initiator_iqn: None,
