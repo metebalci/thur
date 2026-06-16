@@ -143,6 +143,25 @@ namespace).
 > the meaningful isolation boundary in Kubernetes (a pod is already scheduled to
 > exactly one node).
 
+> **Node-local exposure (issue #295).** `NodeStageVolume` writes the CHAP
+> secret into the iSCSI node DB by passing it as an `iscsiadm … -o update -n
+> node.session.auth.password -v <secret>` argument. With the default
+> `--host-iscsiadm=true`, that command runs under `nsenter --target 1` in the
+> **host** PID namespace, where `/proc/<pid>/cmdline` is world-readable: an
+> unprivileged process or a `hostPID` pod on the node can poll cmdline during
+> any stage / block-publish / expand and capture the node's CHAP
+> username+secret. Because the one per-node credential admits **every** volume
+> published to that node, a local foothold on the node can escalate to iSCSI
+> access to all of the node's volumes from anywhere routable to the portal —
+> the same node-scoped blast radius as the `VolumeAttachment` exposure above,
+> but reachable without cluster RBAC. The node is still the isolation boundary
+> (no cross-node escalation), and a host-root foothold already has the node's
+> volumes mounted; the gap is specifically an *unprivileged* node-local reader.
+> The planned hardening is to write the secret into the node DB record file
+> under `/etc/iscsi/nodes/…` directly (root-only) instead of on the argv, so it
+> never appears in any process command line. Until then, avoid scheduling
+> untrusted `hostPID` workloads on nodes that mount thurvsa volumes.
+
 ## RPC → admin-call mapping
 
 | CSI RPC | Admin call(s) | Notes |
