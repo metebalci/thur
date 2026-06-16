@@ -331,18 +331,19 @@ impl S3Backend {
     pub async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         let full_key = self.full_key(key);
         let uncompressed_size = data.len() as u64;
 
-        // Compress if a storage-side algorithm is configured.
+        // Compress if a storage-side algorithm is configured. `data` is owned,
+        // so it moves straight into the compressor / PUT body — no extra
+        // per-upload buffer (issue #236).
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {
                     let compressed =
-                        compress_data_async(algo, data.to_vec(), self.compression_config.level)
-                            .await?;
+                        compress_data_async(algo, data, self.compression_config.level).await?;
                     let comp_size = compressed.len() as u64;
                     debug!(
                         "Compressed chunk ({}) from {} bytes to {} bytes (ratio: {:.2}%)",
@@ -355,7 +356,7 @@ impl S3Backend {
                 }
                 None => {
                     debug!("Compression disabled for chunk {}", full_key);
-                    (data.to_vec(), None, None)
+                    (data, None, None)
                 }
             };
 
@@ -910,7 +911,7 @@ impl ObjectStoreBackend for S3Backend {
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         S3Backend::upload_chunk(self, key, data).await
     }
@@ -1401,7 +1402,7 @@ mod tests {
             .await;
         let backend = mock_s3_backend(&server).await;
         let (uncompressed, compressed, algo) = backend
-            .upload_chunk("chunks/T1/obj-1.dat", b"payload-bytes")
+            .upload_chunk("chunks/T1/obj-1.dat", b"payload-bytes".to_vec())
             .await
             .expect("upload must succeed against 200 mock");
         assert_eq!(uncompressed, 13);
@@ -1435,7 +1436,7 @@ mod tests {
         // Highly compressible payload so the compressed size is smaller.
         let data = vec![0u8; 4096];
         let (uncompressed, compressed, algo) = backend
-            .upload_chunk("chunks/T1/zeros.dat", &data)
+            .upload_chunk("chunks/T1/zeros.dat", data.to_vec())
             .await
             .expect("compressed upload");
         assert_eq!(uncompressed, 4096);

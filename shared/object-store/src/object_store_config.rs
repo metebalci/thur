@@ -2247,7 +2247,7 @@ backends:
         async fn upload_chunk(
             &self,
             k: &str,
-            d: &[u8],
+            d: Vec<u8>,
         ) -> crate::Result<(
             u64,
             Option<u64>,

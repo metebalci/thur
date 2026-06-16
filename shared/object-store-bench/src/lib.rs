@@ -441,7 +441,7 @@ async fn bench_cell(
             let key = key.clone();
             async move {
                 backend
-                    .upload_chunk(&key, &payload)
+                    .upload_chunk(&key, payload.to_vec())
                     .await
                     .map(|_| ())
                     .map_err(|e| format!("{}: {}", key, e))
@@ -644,7 +644,7 @@ mod tests {
         async fn upload_chunk(
             &self,
             _key: &str,
-            data: &[u8],
+            data: Vec<u8>,
         ) -> StorageResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let n = self.uploads.fetch_add(1, Ordering::Relaxed);
             if Some(n) == self.fail_upload_at {

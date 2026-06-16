@@ -87,7 +87,7 @@ pub async fn upload_chunk_inert(
         logical_bytes
     );
     let (_uncompressed_size, compressed_size, applied_algo) =
-        backend.upload_chunk(&object_key, &data).await?;
+        backend.upload_chunk(&object_key, data).await?;
     shared_telemetry::record::chunk_uploaded_bytes(&payload.backend_name, logical_bytes);
 
     Ok(UploadOutcome {

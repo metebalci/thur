@@ -2843,7 +2843,7 @@ mod tests {
         async fn upload_chunk(
             &self,
             key: &str,
-            data: &[u8],
+            data: Vec<u8>,
         ) -> StorageResult<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let n = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             // Update max watermark with a compare-exchange loop —

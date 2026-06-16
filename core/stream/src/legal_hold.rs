@@ -345,7 +345,7 @@ mod tests {
         async fn upload_chunk(
             &self,
             _key: &str,
-            data: &[u8],
+            data: Vec<u8>,
         ) -> shared_object_store::Result<(
             u64,
             Option<u64>,

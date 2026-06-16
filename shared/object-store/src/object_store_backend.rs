@@ -74,10 +74,15 @@ pub trait ObjectStoreBackend: Debug + Send + Sync {
     /// algorithm was used (None when uploaded uncompressed). The algorithm
     /// is recorded per-chunk in the manifest so reads can decompress
     /// without consulting the daemon's current config.
+    /// `data` is taken by ownership so the backend can move it straight
+    /// into the (optional) compressor and the PUT body without the extra
+    /// per-upload copy the borrowed form forced (issue #236) — at up to
+    /// 128 MiB/chunk × the upload fan-out, that second buffer was the
+    /// dominant transient memory on the ingest path.
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(
         u64,
         Option<u64>,
@@ -100,7 +105,9 @@ pub trait ObjectStoreBackend: Debug + Send + Sync {
     /// size tuple, so concrete backends inherit it for free. Only
     /// the meta-cache wrapper overrides to skip-and-invalidate.
     async fn upload_versioned(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.upload_chunk(key, data).await.map(|_| ())
+        // Versioned writes are small (index pages, backup index files), so
+        // the one copy to satisfy `upload_chunk`'s owned `data` is moot here.
+        self.upload_chunk(key, data.to_vec()).await.map(|_| ())
     }
 
     /// Upload a chunk from a file path using zero-copy streaming

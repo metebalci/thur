@@ -334,7 +334,11 @@ impl ObjectStoreBackend for LocalBackend {
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        // Owned to satisfy the trait (issue #236). The retry closure below
+        // borrows it per attempt, so the local path keeps an inner copy —
+        // local is the dev / air-gapped surface, not the cloud ingest path
+        // the owned-`data` change targets.
+        data: Vec<u8>,
     ) -> Result<(
         u64,
         Option<u64>,
@@ -631,7 +635,7 @@ mod tests {
         // Upload chunk
         let data = b"Hello, Thur VTL!";
         let (size, compressed, applied_algo) = backend
-            .upload_chunk("chunks/TEST001/obj-000001.dat", data)
+            .upload_chunk("chunks/TEST001/obj-000001.dat", data.to_vec())
             .await
             .unwrap();
         assert_eq!(size, data.len() as u64);
@@ -769,14 +773,14 @@ mod tests {
         };
 
         let err = backend
-            .upload_chunk("injected/k", b"x")
+            .upload_chunk("injected/k", b"x".to_vec())
             .await
             .expect_err("expected injected auth failure");
         assert_eq!(classify(&err), FailureKind::Auth);
 
         // Non-matching keys flow through normally.
         backend
-            .upload_chunk("normal/k", b"y")
+            .upload_chunk("normal/k", b"y".to_vec())
             .await
             .expect("non-matching key must not be injected");
     }
@@ -827,11 +831,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
         backend
-            .upload_chunk("chunks/T/a/obj-1.dat", b"1")
+            .upload_chunk("chunks/T/a/obj-1.dat", b"1".to_vec())
             .await
             .unwrap();
         backend
-            .upload_chunk("chunks/T/b/obj-2.dat", b"2")
+            .upload_chunk("chunks/T/b/obj-2.dat", b"2".to_vec())
             .await
             .unwrap();
         let mut listed = backend.list_objects("chunks/T/").await.unwrap();
@@ -993,7 +997,7 @@ mod tests {
         let backend = LocalBackend::new(temp_dir.path()).await.unwrap();
         let data = vec![0xABu8; 4096];
         backend
-            .upload_chunk("chunks/AT/obj-1.dat", &data)
+            .upload_chunk("chunks/AT/obj-1.dat", data.to_vec())
             .await
             .unwrap();
         let manifest = r#"{"v":1}"#;
@@ -1034,12 +1038,12 @@ mod tests {
         let a = {
             let b = backend.clone();
             let d = data.clone();
-            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", &d).await })
+            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", d.to_vec()).await })
         };
         let c = {
             let b = backend.clone();
             let d = data.clone();
-            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", &d).await })
+            tokio::spawn(async move { b.upload_chunk("chunks/RACE/obj.dat", d.to_vec()).await })
         };
         a.await.unwrap().unwrap();
         c.await.unwrap().unwrap();
@@ -1109,15 +1113,15 @@ mod tests {
 
         // Upload multiple chunks
         backend
-            .upload_chunk("chunks/TEST002/obj-000001.dat", b"chunk1")
+            .upload_chunk("chunks/TEST002/obj-000001.dat", b"chunk1".to_vec())
             .await
             .unwrap();
         backend
-            .upload_chunk("chunks/TEST002/obj-000002.dat", b"chunk2")
+            .upload_chunk("chunks/TEST002/obj-000002.dat", b"chunk2".to_vec())
             .await
             .unwrap();
         backend
-            .upload_chunk("chunks/TEST002/obj-000003.dat", b"chunk3")
+            .upload_chunk("chunks/TEST002/obj-000003.dat", b"chunk3".to_vec())
             .await
             .unwrap();
 

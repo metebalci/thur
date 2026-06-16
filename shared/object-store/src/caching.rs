@@ -175,7 +175,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         // Fast path: cache lookup. Compute action under the lock,
         // release it before any await (MutexGuard is not Send and
@@ -274,17 +274,20 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
         }
 
         // Build a singleflight future. Capture owned key + data so the
-        // future is `'static` and `Shared`-able.
+        // future is `'static` and `Shared`-able. `data` is already owned
+        // (issue #236) so it moves in; stash its length first for the
+        // Probed-state synth path below, which still needs it after the move.
         let inner = Arc::clone(&self.inner);
         let key_owned = key.to_string();
-        let data_owned = data.to_vec();
+        let data_len = data.len() as u64;
+        let data_owned = data;
         let name = self.name.clone();
         let upload_fut = async move {
             // Record one storage PUT per actual backend call (the
             // singleflight runs the inner upload once; joiners await the
             // shared future and don't double-count) — issue #204.
             let started = std::time::Instant::now();
-            let res = inner.upload_chunk(&key_owned, &data_owned).await;
+            let res = inner.upload_chunk(&key_owned, data_owned).await;
             let secs = started.elapsed().as_secs_f64();
             match &res {
                 Ok((unc, comp, _)) => shared_telemetry::record::storage_request(
@@ -324,7 +327,7 @@ impl ObjectStoreBackend for CachingObjectStoreBackend {
                     compressed,
                     algo,
                 }) => return Ok((*uncompressed, *compressed, *algo)),
-                Some(StorageState::Probed) => return Ok((data.len() as u64, None, None)),
+                Some(StorageState::Probed) => return Ok((data_len, None, None)),
                 Some(StorageState::InFlight(existing)) => (existing.clone(), None),
                 None => {
                     let epoch = self.epoch.load(Ordering::SeqCst);
@@ -737,7 +740,7 @@ mod tests {
         async fn upload_chunk(
             &self,
             _key: &str,
-            data: &[u8],
+            data: Vec<u8>,
         ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
             let delay = self.c.upload_delay_ms.load(Ordering::SeqCst);
             if delay > 0 {
@@ -847,7 +850,7 @@ mod tests {
             let key = key.clone();
             let zeros = zeros.clone();
             handles.push(tokio::spawn(async move {
-                cache.upload_chunk(&key, &zeros).await
+                cache.upload_chunk(&key, zeros.to_vec()).await
             }));
         }
 
@@ -865,9 +868,9 @@ mod tests {
     async fn cache_hit_skips_put() {
         let (mock, c) = MockBackend::new();
         let cache = wrap(mock);
-        let first = cache.upload_chunk("k", b"hello").await.unwrap();
+        let first = cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 1);
-        let second = cache.upload_chunk("k", b"hello").await.unwrap();
+        let second = cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 1, "second call is cache hit");
         assert_eq!(first, second, "cached tuple matches first PUT");
     }
@@ -880,17 +883,17 @@ mod tests {
         // still-cached key stays a hit.
         let (mock, c) = MockBackend::new();
         let cache = CachingObjectStoreBackend::with_capacity(Box::new(mock), "test", 2);
-        cache.upload_chunk("k1", b"a").await.unwrap();
-        cache.upload_chunk("k2", b"b").await.unwrap();
-        cache.upload_chunk("k3", b"c").await.unwrap(); // evicts k1 (LRU)
+        cache.upload_chunk("k1", b"a".to_vec()).await.unwrap();
+        cache.upload_chunk("k2", b"b".to_vec()).await.unwrap();
+        cache.upload_chunk("k3", b"c".to_vec()).await.unwrap(); // evicts k1 (LRU)
         assert_eq!(c.puts.load(Ordering::SeqCst), 3);
 
         // k3 is still cached — a re-upload coalesces to a hit, no new PUT.
-        cache.upload_chunk("k3", b"c").await.unwrap();
+        cache.upload_chunk("k3", b"c".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 3, "k3 still cached");
 
         // k1 was evicted — its re-upload misses and PUTs again.
-        cache.upload_chunk("k1", b"a").await.unwrap();
+        cache.upload_chunk("k1", b"a".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 4, "evicted k1 re-uploads");
     }
 
@@ -899,11 +902,11 @@ mod tests {
         let (mock, c) = MockBackend::new();
         c.fail_next_upload.store(true, Ordering::SeqCst);
         let cache = wrap(mock);
-        assert!(cache.upload_chunk("k", b"hello").await.is_err());
+        assert!(cache.upload_chunk("k", b"hello".to_vec()).await.is_err());
         // Backend's `fail_next_upload` was a swap-once; subsequent call
         // succeeds. The cache MUST have cleared its failed entry,
         // otherwise puts.load() would still be 1 here.
-        assert!(cache.upload_chunk("k", b"hello").await.is_ok());
+        assert!(cache.upload_chunk("k", b"hello".to_vec()).await.is_ok());
         assert_eq!(c.puts.load(Ordering::SeqCst), 2);
     }
 
@@ -911,10 +914,10 @@ mod tests {
     async fn delete_invalidates_entry() {
         let (mock, c) = MockBackend::new();
         let cache = wrap(mock);
-        cache.upload_chunk("k", b"hello").await.unwrap();
+        cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 1);
         cache.delete_object("k").await.unwrap();
-        cache.upload_chunk("k", b"hello").await.unwrap();
+        cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(
             c.puts.load(Ordering::SeqCst),
             2,
@@ -940,7 +943,7 @@ mod tests {
         // upload_chunk on a Probed entry synthesizes (data.len, None, None) —
         // no PUT on backend.
         let (size, comp, algo) = cache
-            .upload_chunk("chunks/aa/bb/x.dat", b"data")
+            .upload_chunk("chunks/aa/bb/x.dat", b"data".to_vec())
             .await
             .unwrap();
         assert_eq!(size, 4);
@@ -959,7 +962,7 @@ mod tests {
         for _ in 0..10 {
             let cache = Arc::clone(&cache);
             handles.push(tokio::spawn(async move {
-                cache.upload_chunk("k", b"hello").await
+                cache.upload_chunk("k", b"hello".to_vec()).await
             }));
         }
         for r in join_all(handles).await {
@@ -972,7 +975,7 @@ mod tests {
         );
 
         // Failure cleared the entry; retry hits the backend.
-        cache.upload_chunk("k", b"hello").await.unwrap();
+        cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 2);
     }
 
@@ -990,16 +993,16 @@ mod tests {
         // Call 1: cancel the installer mid-upload (50 ms < 200 ms delay),
         // before its backend PUT increments `puts` or fails.
         let r =
-            tokio::time::timeout(Duration::from_millis(50), cache.upload_chunk("k", b"data")).await;
+            tokio::time::timeout(Duration::from_millis(50), cache.upload_chunk("k", b"data".to_vec())).await;
         assert!(r.is_err(), "first call should time out (installer cancelled)");
 
         // Call 2: the key is not poisoned — the cleaned-up InFlight forces
         // a fresh backend PUT, which sleeps and then fails (fail_next).
-        let r2 = cache.upload_chunk("k", b"data").await;
+        let r2 = cache.upload_chunk("k", b"data".to_vec()).await;
         assert!(r2.is_err(), "call 2 reaches the backend and fails");
 
         // Call 3: still not poisoned — another fresh PUT, now succeeding.
-        let r3 = cache.upload_chunk("k", b"data").await;
+        let r3 = cache.upload_chunk("k", b"data".to_vec()).await;
         assert!(
             r3.is_ok(),
             "call 3 must reach the backend (not a memoized error)"
@@ -1076,7 +1079,7 @@ mod tests {
 
         let put = {
             let cache = Arc::clone(&cache);
-            tokio::spawn(async move { cache.upload_chunk("k", b"hello").await })
+            tokio::spawn(async move { cache.upload_chunk("k", b"hello".to_vec()).await })
         };
         tokio::time::sleep(Duration::from_millis(10)).await;
         cache.delete_object("k").await.unwrap();
@@ -1087,7 +1090,7 @@ mod tests {
         // The racing delete must have prevented the Uploaded install, so a
         // follow-up upload of the same content fires a real PUT.
         c.upload_delay_ms.store(0, Ordering::SeqCst);
-        cache.upload_chunk("k", b"hello").await.unwrap();
+        cache.upload_chunk("k", b"hello".to_vec()).await.unwrap();
         assert_eq!(
             c.puts.load(Ordering::SeqCst),
             2,
@@ -1127,7 +1130,7 @@ mod tests {
     async fn clone_box_shares_cache() {
         let (mock, c) = MockBackend::new();
         let cache = wrap(mock);
-        cache.upload_chunk("k", b"hi").await.unwrap();
+        cache.upload_chunk("k", b"hi".to_vec()).await.unwrap();
         let cloned: Box<dyn ObjectStoreBackend> = cache.clone_box();
         assert!(cloned.chunk_exists("k").await.unwrap());
         assert_eq!(
@@ -1162,14 +1165,14 @@ mod tests {
         let (mock, c) = MockBackend::new();
         let cache = wrap(mock);
         // Populate the cache with an Uploaded entry.
-        cache.upload_chunk("k", b"v1").await.unwrap();
+        cache.upload_chunk("k", b"v1".to_vec()).await.unwrap();
         assert_eq!(c.puts.load(Ordering::SeqCst), 1);
         // Versioned overwrite must clear the entry.
         cache.upload_versioned("k", b"v2").await.unwrap();
         assert_eq!(c.versioned_puts.load(Ordering::SeqCst), 1);
         // Subsequent upload_chunk must NOT see the stale Uploaded
         // entry — it must fire a real PUT.
-        cache.upload_chunk("k", b"v3").await.unwrap();
+        cache.upload_chunk("k", b"v3".to_vec()).await.unwrap();
         assert_eq!(
             c.puts.load(Ordering::SeqCst),
             2,
@@ -1191,7 +1194,7 @@ mod tests {
             async fn upload_chunk(
                 &self,
                 _key: &str,
-                data: &[u8],
+                data: Vec<u8>,
             ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
                 self.c.puts.fetch_add(1, Ordering::SeqCst);
                 Ok((data.len() as u64, None, None))
@@ -1319,7 +1322,7 @@ mod tests {
             async fn upload_chunk(
                 &self,
                 _: &str,
-                _: &[u8],
+                _: Vec<u8>,
             ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
                 Ok((0, None, None))
             }
@@ -1413,7 +1416,7 @@ mod tests {
             .expect("get legal hold");
         assert!(!held);
         // Debug printout exercises StorageState::Probed/Uploaded/InFlight arms.
-        cache.upload_chunk("u", b"x").await.unwrap(); // Uploaded
+        cache.upload_chunk("u", b"x".to_vec()).await.unwrap(); // Uploaded
         c.head_returns.store(true, Ordering::SeqCst);
         assert!(cache.chunk_exists("p").await.unwrap()); // Probed
         let dbg = format!("{:?}", cache);

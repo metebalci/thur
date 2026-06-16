@@ -434,17 +434,18 @@ impl ObjectStoreBackend for AzureBackend {
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         let full_key = self.full_key(key);
         let uncompressed_size = data.len() as u64;
 
+        // Owned `data` moves into the compressor / PUT body — no extra
+        // per-upload buffer (issue #236).
         let (data_to_upload, compressed_size, applied_algo) =
             match self.compression_config.algorithm {
                 Some(algo) => {
                     let compressed =
-                        compress_data_async(algo, data.to_vec(), self.compression_config.level)
-                            .await?;
+                        compress_data_async(algo, data, self.compression_config.level).await?;
                     let comp_size = compressed.len() as u64;
                     debug!(
                         "Compressed chunk ({}) from {} bytes to {} bytes (ratio: {:.2}%)",
@@ -457,7 +458,7 @@ impl ObjectStoreBackend for AzureBackend {
                 }
                 None => {
                     debug!("Compression disabled for chunk {}", full_key);
-                    (data.to_vec(), None, None)
+                    (data, None, None)
                 }
             };
 
@@ -1248,7 +1249,7 @@ mod tests {
             .await;
         let backend = mock_azure_backend(&server).await;
         let (uncompressed, compressed, algo) = backend
-            .upload_chunk("chunks/T1/obj-1.dat", b"azure-payload")
+            .upload_chunk("chunks/T1/obj-1.dat", b"azure-payload".to_vec())
             .await
             .expect("upload must succeed against 201 mock");
         assert_eq!(uncompressed, 13);

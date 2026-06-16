@@ -76,7 +76,7 @@ impl ObjectStoreBackend for MockBackend {
     async fn upload_chunk(
         &self,
         key: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> Result<(u64, Option<u64>, Option<CompressionAlgo>)> {
         self.counters.puts.fetch_add(1, Ordering::SeqCst);
         // Track the high-water mark of overlapping PUTs across the

@@ -390,7 +390,7 @@ mod tests {
             let hash = blake3::hash(&data).to_hex().to_string();
             let key = store.object_key_in_store(&hash);
             backend
-                .upload_chunk(&key, &data)
+                .upload_chunk(&key, data)
                 .await
                 .expect("seed storage");
             planned.push((i, hash));

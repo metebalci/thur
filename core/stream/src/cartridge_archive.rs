@@ -264,7 +264,7 @@ pub async fn run_archive(opts: ArchiveOptions<'_>) -> Result<ArchiveReport> {
         }
         let size = bytes.len() as u64;
         opts.target
-            .upload_chunk(&dst_key, &bytes)
+            .upload_chunk(&dst_key, bytes)
             .await
             .map_err(storage_err)?;
         report.chunks_uploaded += 1;

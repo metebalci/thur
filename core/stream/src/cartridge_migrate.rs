@@ -354,7 +354,7 @@ pub async fn run_migrate(opts: MigrateOptions<'_>) -> Result<MigrateReport> {
                         });
                     }
                     let size = bytes.len() as u64;
-                    target.upload_chunk(&key, &bytes).await.map_err(storage_err)?;
+                    target.upload_chunk(&key, bytes).await.map_err(storage_err)?;
                     Ok((true, size))
                 })
                 .buffer_unordered(MIGRATE_CONCURRENCY)
