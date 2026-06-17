@@ -557,31 +557,14 @@ impl ObjectStoreBackend for AzureBackend {
             let account = self.account.clone();
             let container_name = self.container_name.clone();
             async move {
-                // get_properties first so we know the on-blob
-                // compression mode without parsing it out of the
-                // download stream's headers (the new SDK's
-                // BlobClientDownloadResult collects bytes directly,
-                // and exposing per-response metadata alongside the
-                // body would be a duplicated-trait dance). Two
-                // round-trips, both small — the bulk of the time is
-                // the body transfer.
-                let props = blob.get_properties(None).await.map_err(|e| {
-                    ObjectStoreError::classified(
-                        classify_azure_error(&e),
-                        format!(
-                            "Azure chunk get_properties failed: {e} (account: {account}, \
-                             container: {container_name}, key: {full_key})"
-                        ),
-                    )
-                })?;
-                let metadata = props.metadata().map_err(|e| {
-                    ObjectStoreError::Other(format!(
-                        "Azure chunk metadata header parse: {e} (account: {account}, \
-                         container: {container_name}, key: {full_key})"
-                    ))
-                })?;
-                let compression_type = metadata.get("compression").cloned();
-
+                // One round-trip: the download response already carries the
+                // `compression` marker in its `x-ms-meta-*` headers
+                // (`properties.metadata`), so we read it off the GET itself
+                // rather than issuing a separate get_properties HEAD first.
+                // That HEAD doubled the request count + added a full RTT to
+                // every cache-miss chunk fetch — worst for small VSA pages
+                // and prefetch bursts (issue #262). Matches the S3 / GCS
+                // read path, which take the marker off the GET response too.
                 let response = blob.download(None).await.map_err(|e| {
                     ObjectStoreError::classified(
                         classify_azure_error(&e),
@@ -591,6 +574,7 @@ impl ObjectStoreBackend for AzureBackend {
                         ),
                     )
                 })?;
+                let compression_type = response.properties.metadata.get("compression").cloned();
                 let buffer: Vec<u8> = response
                     .body
                     .collect()
@@ -1352,24 +1336,14 @@ mod tests {
     #[tokio::test]
     async fn azure_download_chunk_uncompressed() {
         let server = MockServer::start().await;
-        // HEAD (get_properties) returns the compression metadata.
-        Mock::given(method("HEAD"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", "13")
-                    .insert_header("x-ms-blob-type", "BlockBlob")
-                    .insert_header("x-ms-meta-compression", "none")
-                    .insert_header("ETag", "\"0x1\"")
-                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
-            )
-            .mount(&server)
-            .await;
-        // GET returns the body bytes.
+        // Single GET carries both the body and the `none` compression
+        // marker in its headers (issue #262 — no separate HEAD).
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Length", "13")
                     .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("x-ms-meta-compression", "none")
                     .set_body_bytes(b"azure-content".to_vec()),
             )
             .mount(&server)
@@ -1393,22 +1367,16 @@ mod tests {
         )
         .expect("compress");
         let clen = compressed.len().to_string();
-        Mock::given(method("HEAD"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", clen.as_str())
-                    .insert_header("x-ms-blob-type", "BlockBlob")
-                    .insert_header("x-ms-meta-compression", "zstd")
-                    .insert_header("ETag", "\"0x1\"")
-                    .insert_header("Last-Modified", "Mon, 01 Jan 2026 00:00:00 GMT"),
-            )
-            .mount(&server)
-            .await;
+        // Issue #262: download_chunk is now a single GET — the `compression`
+        // marker rides the download response's `x-ms-meta-*` headers, not a
+        // separate HEAD. No HEAD mock is mounted, so a regression that
+        // reintroduces get_properties would fail with an unmatched request.
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Length", clen.as_str())
                     .insert_header("x-ms-blob-type", "BlockBlob")
+                    .insert_header("x-ms-meta-compression", "zstd")
                     .set_body_bytes(compressed),
             )
             .mount(&server)
@@ -1517,5 +1485,87 @@ mod tests {
         let backend = mock_azure_backend(&server).await;
         let boxed = backend.clone_box();
         assert_eq!(boxed.backend_type(), "azure");
+    }
+
+    /// Issue #262: `download_chunk` reads the `compression` marker off the
+    /// GET response's `x-ms-meta-*` headers in ONE round-trip (no separate
+    /// get_properties HEAD). Round-trips a chunk through a real Azure
+    /// container to prove the marker survives on the download response and
+    /// decompression still works — both the compressed and the
+    /// uncompressed-marker branches.
+    ///
+    /// Ignored by default; run with the AAD service-principal env vars
+    /// (`AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET`) plus
+    /// `THURVTL_TEST_AZURE_ACCOUNT` + `THURVTL_TEST_AZURE_CONTAINER`:
+    ///   cargo test -p shared-object-store -- --ignored azure_download_one_round_trip
+    #[tokio::test]
+    #[ignore = "hits a real Azure container; needs AAD env + THURVTL_TEST_AZURE_* "]
+    async fn azure_download_one_round_trip_real_container() {
+        use crate::compression::CompressionAlgo;
+        let (Ok(account), Ok(container)) = (
+            std::env::var("THURVTL_TEST_AZURE_ACCOUNT"),
+            std::env::var("THURVTL_TEST_AZURE_CONTAINER"),
+        ) else {
+            eprintln!("skipping: set THURVTL_TEST_AZURE_ACCOUNT + _CONTAINER");
+            return;
+        };
+        let prefix = format!("test-262/{}/", std::process::id());
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i / 977) as u8).collect();
+
+        // Compressed branch: backend with zstd on → upload writes
+        // `x-ms-meta-compression: zstd`, download reads it off the GET.
+        let zstd = AzureBackend::new(
+            account.clone(),
+            container.clone(),
+            prefix.clone(),
+            None,
+            None,
+            None,
+            None, // None → AAD env service-principal discovery
+            CompressionConfig::default(), // storage default is zstd
+        )
+        .await
+        .expect("AzureBackend::new (zstd) against real container");
+        let (_, comp, algo) = zstd
+            .upload_chunk("chunks/c.dat", payload.clone())
+            .await
+            .expect("upload (zstd)");
+        assert_eq!(algo, Some(CompressionAlgo::Zstd), "marker should be zstd");
+        assert!(comp.is_some(), "compressed size recorded");
+        let got = zstd
+            .download_chunk("chunks/c.dat")
+            .await
+            .expect("download (zstd)");
+        assert_eq!(got, payload, "zstd chunk must round-trip via the single-GET path");
+
+        // Uncompressed branch: compression off → marker is `none`, download
+        // returns the raw body unchanged.
+        let plain = AzureBackend::new(
+            account,
+            container,
+            prefix.clone(),
+            None,
+            None,
+            None,
+            None,
+            CompressionConfig::disabled(),
+        )
+        .await
+        .expect("AzureBackend::new (plain) against real container");
+        let (_, comp2, algo2) = plain
+            .upload_chunk("chunks/p.dat", payload.clone())
+            .await
+            .expect("upload (plain)");
+        assert_eq!(algo2, None, "no compression applied");
+        assert_eq!(comp2, None);
+        let got2 = plain
+            .download_chunk("chunks/p.dat")
+            .await
+            .expect("download (plain)");
+        assert_eq!(got2, payload, "uncompressed chunk must round-trip");
+
+        // Best-effort cleanup of the two test objects.
+        let _ = zstd.delete_object("chunks/c.dat").await;
+        let _ = plain.delete_object("chunks/p.dat").await;
     }
 }
