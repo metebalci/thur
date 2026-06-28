@@ -82,6 +82,22 @@ jobs:
           { lsscsi -g; echo; lsscsi -t; } > /tmp/mc-diag/lsscsi-vtl.txt 2>&1 || true
           { uname -a; dpkg -l | grep -E 'open-iscsi|sg3-utils|mtx|mt-st|lsscsi'; } \
             > /tmp/mc-diag/env-vtl.txt 2>&1 || true
+          # Capture the exact corruption for offline analysis: the diverging
+          # bytes of the last (failing) read_verify plus the cartridge's
+          # on-disk state (chunks.idx / block index / manifest / chunk pool),
+          # so chunk_id -> hash -> bytes can be reconstructed without a
+          # re-run. The replay-corpus step runs with --keep-data, so the test
+          # dir (incl. scratch.expect / scratch.actual) survives.
+          for d in /tmp/thurvtl-monte-carlo-*/; do
+            [ -f "$d/scratch.expect" ] || continue
+            xxd "$d/scratch.expect" | head -64 > /tmp/mc-diag/expect.hex 2>&1 || true
+            xxd "$d/scratch.actual" | head -64 > /tmp/mc-diag/actual.hex 2>&1 || true
+            { echo "expect_size=$(stat -c%s "$d/scratch.expect") actual_size=$(stat -c%s "$d/scratch.actual")";
+              echo "--- cmp -l (byte: expect actual, octal) ---";
+              cmp -l "$d/scratch.expect" "$d/scratch.actual" 2>&1 | head -200; } \
+              > /tmp/mc-diag/cmp.txt 2>&1 || true
+            tar czf /tmp/mc-diag/cartridge-state.tgz -C "$d" data 2>/dev/null || true
+          done
 
       # Preserve the op log + daemon log + host diagnostics on failure
       # so the seed printed in the run output can be reproduced + the
