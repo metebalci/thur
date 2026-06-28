@@ -680,36 +680,45 @@ ensure_loaded() {
 }
 
 # Position drive $drive_idx at end-of-data so every write_record appends.
-# `mt eom` (SPACE to EOD) reaches true end-of-data regardless of how many
-# filemarks lie behind — unlike `rewind+fsr(N)`, which no longer works now
-# that SPACE over records stops at the first filemark (SSC-4 7.5, issue
-# #102). One wrinkle: the Linux st driver writes a single filemark when a
-# device opened for writing is closed after writing DATA (but writes no
-# extra filemark after a `weof`). To keep the record stream contiguous the
-# next write has to overwrite that trailing close-filemark, so we back over
-# it — but only when the cart's last entry was a data record. A trailing
-# explicit filemark (last entry F) has no close-filemark after it and must
-# not be clobbered.
+#
+# We deliberately do NOT use `mt eom` here. On the CI runner's kernel,
+# `mt eom` (MTEOM) silently issues no SCSI command at all once the st
+# driver's position model has desynced — which it does after a large,
+# non-512-aligned record is read under the driver's direct-I/O path (proven
+# by a per-command head_lba trace from the daemon: the WRITE/READ/`bsr`
+# SPACEs all arrive, but the `mt eom` between them never does). When `mt eom`
+# no-ops, the head stays put and the next write lands mid-medium, where the
+# daemon correctly applies tape "overwrite erases forward" semantics and
+# clobbers a live record — surfacing later as a read_verify mismatch. This
+# is a kernel/position-tracking quirk, not a daemon bug; it reproduces only
+# on CI, never locally.
+#
+# Plain SPACE (fsr/fsf) commands DO reach the daemon reliably, so we replay
+# the cart's recorded demarcation sequence from BOT one step at a time:
+# `fsr 1` over each data record, `fsf 1` over each explicit filemark. This
+# is NOT the old `rewind+fsr(N)` (abandoned because a bulk SPACE-over-records
+# stops at the first filemark, SSC-4 7.5 / issue #102) — stepping one
+# demarcation at a time never crosses a filemark with `fsr`, so #102 can't
+# bite. After the last data record the head lands on its trailing
+# close-filemark (the Linux st driver writes one when a write-opened device
+# is closed after DATA); the next write overwrites it to keep the record
+# stream contiguous. After a trailing explicit filemark there is no
+# close-filemark, and the replay lands at true EOD to append.
 seek_eod() {
     local drive_idx="$1"
     local bc="${DRIVE_LOADED[$drive_idx]}"
     [[ -z "$bc" ]] && return 0
     local nst="${DRIVE_NST_DEV[$drive_idx]}"
-    # Rewind before EOM. `mt eom` is a no-op when the kernel st driver
-    # already believes the head is at end-of-medium — which it can after a
-    # large, non-512-aligned record is read under the driver's direct-I/O
-    # path (the position model desyncs; observed only on the CI runner's
-    # kernel, never locally). When `mt eom` no-ops, the follow-up `bsr 1`
-    # walks back into the *previous* data record instead of its trailing
-    # close-filemark, and the next write overwrites that record — the
-    # daemon correctly applies tape "overwrite erases forward" semantics,
-    # so a real record gets clobbered and read_verify later fails. Rewind
-    # first so EOM is forced to space from BOT, where it cannot no-op.
     mt -f "$nst" rewind >/dev/null 2>&1
-    mt -f "$nst" eom >/dev/null 2>&1
-    if [[ "$(last_entry_kind "$bc")" == "R" ]]; then
-        mt -f "$nst" bsr 1 >/dev/null 2>&1 || true
-    fi
+    local entry kind
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        kind="${entry%%:*}"
+        case "$kind" in
+            R) mt -f "$nst" fsr 1 >/dev/null 2>&1 || true ;;
+            F) mt -f "$nst" fsf 1 >/dev/null 2>&1 || true ;;
+        esac
+    done <<< "${RECORDS[$bc]}"
 }
 
 # Record-list helpers.
