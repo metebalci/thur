@@ -1534,27 +1534,6 @@ impl Cartridge {
         }
         // All chunks sealed — create a fresh staging chunk for future writes.
         let next_id = last_id + 1;
-        // A view-only handle (the upload worker / eviction) must NOT append
-        // a staging chunk here. `append` is a non-atomic load-then-store on
-        // `next_id`; run concurrently against the drive-side primary's own
-        // append at the same id, the loser's empty-staging record
-        // (hash = None) clobbers the primary's just-sealed chunk — turning a
-        // real data chunk into an unsealed one, so the next READ of any block
-        // in it returns wrong bytes at the right length. That is the
-        // single-writer invariant ChunkIndexFile documents (issues #154 /
-        // #28): only the owning primary, reached through `&mut self`, may
-        // mutate the shared index. A view handle never writes data, seals, or
-        // rolls, so it needs no real staging chunk — hand back an in-memory
-        // fresh staging rec plus an inert read-only placeholder `cur_file`.
-        // The write paths that would touch either (`write_data`,
-        // `seal_current_chunk`, `roll_chunk_if_needed`) are unreachable on a
-        // view handle.
-        if view_only {
-            let placeholder = OpenOptions::new()
-                .read(true)
-                .open(ChunkIndexFile::path_for(root))?;
-            return Ok((next_id, ChunkRec::staging(), placeholder));
-        }
         let newc = Self::new_chunk(root, next_id)?;
         chunk_index.append(&newc)?;
         // Keep lru.idx in lockstep with chunks.idx; the caller will
