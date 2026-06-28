@@ -710,15 +710,25 @@ seek_eod() {
     [[ -z "$bc" ]] && return 0
     local nst="${DRIVE_NST_DEV[$drive_idx]}"
     mt -f "$nst" rewind >/dev/null 2>&1
-    local entry kind
+    # Coalesce consecutive data records into a single `fsr <run>` — records
+    # in a run are contiguous (no filemark between them), so a bulk fsr over
+    # them lands on the following demarcation without crossing it, never
+    # tripping #102. Only explicit filemarks break a run (crossed with
+    # fsf 1). This keeps positioning O(filemark-groups) instead of
+    # O(records), so a long soak with large carts doesn't spend all its time
+    # in seek_eod.
+    local entry kind run=0
     while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
         kind="${entry%%:*}"
-        case "$kind" in
-            R) mt -f "$nst" fsr 1 >/dev/null 2>&1 || true ;;
-            F) mt -f "$nst" fsf 1 >/dev/null 2>&1 || true ;;
-        esac
+        if [[ "$kind" == "R" ]]; then
+            run=$(( run + 1 ))
+        else
+            (( run > 0 )) && { mt -f "$nst" fsr "$run" >/dev/null 2>&1 || true; run=0; }
+            mt -f "$nst" fsf 1 >/dev/null 2>&1 || true
+        fi
     done <<< "${RECORDS[$bc]}"
+    (( run > 0 )) && { mt -f "$nst" fsr "$run" >/dev/null 2>&1 || true; }
 }
 
 # Record-list helpers.
