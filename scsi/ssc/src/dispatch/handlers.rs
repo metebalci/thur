@@ -455,22 +455,10 @@ pub fn handle_space_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             }
             _ => (0, false),
         };
-        let new_lba = cart.head_lba();
-        tracing::info!(
-            "DIAG SPACE cart={} code={:#04x} count={} head {}->{} moved={} hit_fm={} next_lba={}",
-            cart.label(),
-            code,
-            count,
-            old_lba,
-            new_lba,
-            moved,
-            hit_filemark,
-            cart.next_lba()
-        );
         Ok((
             cart.label().to_string(),
             old_lba,
-            new_lba,
+            cart.head_lba(),
             moved,
             hit_filemark,
         ))
@@ -581,22 +569,10 @@ pub fn handle_space_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             }
             _ => (0, false),
         };
-        let new_lba = cart.head_lba();
-        tracing::info!(
-            "DIAG SPACE cart={} code={:#04x} count={} head {}->{} moved={} hit_fm={} next_lba={}",
-            cart.label(),
-            code,
-            count,
-            old_lba,
-            new_lba,
-            moved,
-            hit_filemark,
-            cart.next_lba()
-        );
         Ok((
             cart.label().to_string(),
             old_lba,
-            new_lba,
+            cart.head_lba(),
             moved,
             hit_filemark,
         ))
@@ -688,17 +664,7 @@ pub fn handle_write_filemarks_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         ));
     }
     match drive_manager.with_drive(drive_id, tsih, |cart| {
-        let head_before = cart.head_lba();
-        let r = cart.write_filemarks(count).map(|_| ());
-        tracing::info!(
-            "DIAG WFM cart={} count={} head_before={} head_after={} next_lba={}",
-            cart.label(),
-            count,
-            head_before,
-            cart.head_lba(),
-            cart.next_lba()
-        );
-        r
+        cart.write_filemarks(count).map(|_| ())
     }) {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {
@@ -748,17 +714,7 @@ pub fn handle_write_filemarks_16(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
         ));
     }
     match drive_manager.with_drive(drive_id, tsih, |cart| {
-        let head_before = cart.head_lba();
-        let r = cart.write_filemarks(count).map(|_| ());
-        tracing::info!(
-            "DIAG WFM cart={} count={} head_before={} head_after={} next_lba={}",
-            cart.label(),
-            count,
-            head_before,
-            cart.head_lba(),
-            cart.next_lba()
-        );
-        r
+        cart.write_filemarks(count).map(|_| ())
     }) {
         Ok(()) => Ok(ScsiResp::good()),
         Err(e) => {
@@ -949,15 +905,6 @@ pub fn handle_read_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
                 // `Bytes::to_vec()` memcpy (issue #184). An LBP CRC32C
                 // trailer (RDPROTECT != 0) is appended in place below.
                 data_out = blk.data;
-                tracing::info!(
-                    "DIAG READ6 cart={} lba_before={} head_after={} len={} fm={} next_lba={}",
-                    cart.label(),
-                    lba_before,
-                    cart.head_lba(),
-                    data_out.len(),
-                    is_filemark,
-                    cart.next_lba()
-                );
                 // Return info for event emission
                 Ok((cart.label_arc(), cart.current_chunk_id(), lba_before))
             }
@@ -1114,16 +1061,11 @@ pub fn handle_write_6(ctx: &mut ScsiCtx<'_>) -> Result<ScsiResp> {
             data_to_write.len()
         );
         let lba_before = cart.next_lba();
-        let head_before = cart.head_lba();
         cart.write_data(data_to_write.clone())?;
-        tracing::info!(
-            "DIAG WRITE6 cart={} bytes={} head_before={} next_lba_before={} -> head_after={} next_lba_after={}",
-            cart.label(),
+        tracing::debug!(
+            "WRITE(6): Successfully wrote {} bytes to drive {}",
             data_to_write.len(),
-            head_before,
-            lba_before,
-            cart.head_lba(),
-            cart.next_lba()
+            drive_id
         );
 
         // Return info for event emission
