@@ -695,6 +695,17 @@ seek_eod() {
     local bc="${DRIVE_LOADED[$drive_idx]}"
     [[ -z "$bc" ]] && return 0
     local nst="${DRIVE_NST_DEV[$drive_idx]}"
+    # Rewind before EOM. `mt eom` is a no-op when the kernel st driver
+    # already believes the head is at end-of-medium — which it can after a
+    # large, non-512-aligned record is read under the driver's direct-I/O
+    # path (the position model desyncs; observed only on the CI runner's
+    # kernel, never locally). When `mt eom` no-ops, the follow-up `bsr 1`
+    # walks back into the *previous* data record instead of its trailing
+    # close-filemark, and the next write overwrites that record — the
+    # daemon correctly applies tape "overwrite erases forward" semantics,
+    # so a real record gets clobbered and read_verify later fails. Rewind
+    # first so EOM is forced to space from BOT, where it cannot no-op.
+    mt -f "$nst" rewind >/dev/null 2>&1
     mt -f "$nst" eom >/dev/null 2>&1
     if [[ "$(last_entry_kind "$bc")" == "R" ]]; then
         mt -f "$nst" bsr 1 >/dev/null 2>&1 || true
